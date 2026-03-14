@@ -760,6 +760,7 @@ fn make_test_event(event_id: &str, operation: &str) -> GVMEvent {
         status: EventStatus::Pending,
         payload: Default::default(),
         nats_sequence: None,
+        event_hash: None,
     }
 }
 

@@ -458,6 +458,7 @@ async fn ledger_concurrent_spawns_stay_bounded() {
                 status: gvm_proxy::types::EventStatus::Pending,
                 payload: Default::default(),
                 nats_sequence: None,
+                event_hash: None,
             };
             ledger.append_durable(&event).await.unwrap();
         }));
@@ -475,13 +476,16 @@ async fn ledger_concurrent_spawns_stay_bounded() {
         elapsed
     );
 
-    // Verify WAL file has all entries
+    // Verify WAL file has all event entries (exclude MerkleBatchRecord lines)
     let wal_content = tokio::fs::read_to_string(&wal_path).await.unwrap();
-    let line_count = wal_content.lines().count();
+    let event_count = wal_content
+        .lines()
+        .filter(|line| !line.contains("\"merkle_root\""))
+        .count();
     assert_eq!(
-        line_count, 500,
-        "WAL should contain exactly 500 entries, got {}",
-        line_count
+        event_count, 500,
+        "WAL should contain exactly 500 event entries, got {}",
+        event_count
     );
 }
 
@@ -569,6 +573,7 @@ async fn group_commit_fail_close_all_callers_receive_error() {
             status: gvm_proxy::types::EventStatus::Pending,
             payload: Default::default(),
             nats_sequence: None,
+            event_hash: None,
         };
         ledger.append_durable(&event).await.unwrap();
     }
@@ -600,6 +605,7 @@ async fn group_commit_fail_close_all_callers_receive_error() {
                 status: gvm_proxy::types::EventStatus::Pending,
                 payload: Default::default(),
                 nats_sequence: None,
+                event_hash: None,
             };
             ledger.append_durable(&event).await
         }));
@@ -640,6 +646,7 @@ async fn group_commit_fail_close_all_callers_receive_error() {
         status: gvm_proxy::types::EventStatus::Confirmed,
         payload: Default::default(),
         nats_sequence: None,
+        event_hash: None,
     };
     // After disabling error injection, writes should succeed again
     ledger.append_durable(&event).await.unwrap();

@@ -404,6 +404,7 @@ fn build_event(
         status: EventStatus::Pending,
         payload: PayloadDescriptor::default(),
         nats_sequence: None,
+        event_hash: None, // Computed by Ledger during WAL write
     }
 }
 
@@ -646,6 +647,14 @@ fn error_response_detailed(
         .status(status)
         .header("Content-Type", "application/json");
 
+    // Include GVM metadata headers on error responses too,
+    // so SDK clients can read enforcement details from headers.
+    if let Some(d) = decision {
+        builder = builder.header("X-GVM-Decision", d);
+    }
+    if let Some(id) = event_id {
+        builder = builder.header("X-GVM-Event-Id", id);
+    }
     if let Some(secs) = retry_after {
         builder = builder.header("Retry-After", secs.to_string());
     }

@@ -174,11 +174,14 @@ pub fn evaluate_json(input: &str) -> String {
         Ok(req) => {
             let resp = evaluate(&req);
             serde_json::to_string(&resp).unwrap_or_else(|e| {
-                format!(r#"{{"error":"serialization failed: {}"}}"#, e)
+                let error_msg = format!("serialization failed: {}", e);
+                serde_json::json!({"error": error_msg}).to_string()
             })
         }
         Err(e) => {
-            format!(r#"{{"error":"invalid input: {}"}}"#, e)
+            // Use serde_json to properly escape the error message
+            let error_msg = format!("invalid input: {}", e);
+            serde_json::json!({"error": error_msg}).to_string()
         }
     }
 }

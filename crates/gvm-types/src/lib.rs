@@ -185,6 +185,11 @@ pub struct GVMEvent {
     /// NATS JetStream sequence number (real-time integrity anchor).
     /// Hash chain verification runs in a separate async process.
     pub nats_sequence: Option<u64>,
+
+    /// SHA-256 hash of this event's canonical fields (Merkle leaf).
+    /// Computed before WAL write. Used for batch Merkle root verification.
+    #[serde(default)]
+    pub event_hash: Option<String>,
 }
 
 /// Event status machine — prevents phantom records
@@ -251,6 +256,23 @@ pub struct Target {
     pub host: String,
     pub path: String,
     pub query: Option<String>,
+}
+
+/// WAL batch record written after each group commit flush.
+/// Contains the Merkle root of all events in the batch and a chain
+/// pointer to the previous batch's root (inter-batch integrity).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct MerkleBatchRecord {
+    /// Unique batch identifier (monotonic)
+    pub batch_id: u64,
+    /// Merkle root of all event_hash leaves in this batch
+    pub merkle_root: String,
+    /// Merkle root of the previous batch (None for the first batch)
+    pub prev_batch_root: Option<String>,
+    /// Number of events in this batch
+    pub event_count: usize,
+    /// Timestamp of batch flush
+    pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
 /// Select the stricter of two enforcement decisions

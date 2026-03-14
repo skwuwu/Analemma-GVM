@@ -31,3 +31,6 @@ __pycache__/
 *.dll
 *.so
 *.dylib
+
+# Runtime data
+data/wal.log

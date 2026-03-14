@@ -108,6 +108,8 @@ impl NetworkSRR {
 
     /// Check a request against network SRR rules.
     /// Rules are evaluated in order — first match wins.
+    /// IPv6 addresses are normalized before matching to prevent SSRF bypass
+    /// via zero-compression, IPv4-mapped, or bracket variations.
     pub fn check(
         &self,
         method: &str,
@@ -115,6 +117,11 @@ impl NetworkSRR {
         path: &str,
         body: Option<&[u8]>,
     ) -> EnforcementDecision {
+        // Normalize host: resolve IPv6 variants to canonical form so SRR rules
+        // written for "localhost" or "127.0.0.1" also catch IPv6 equivalents.
+        let normalized = normalize_host(host);
+        let effective_host = normalized.as_deref().unwrap_or(host);
+
         for rule in &self.rules {
             // Method match
             if rule.method != method {
@@ -122,7 +129,7 @@ impl NetworkSRR {
             }
 
             // Host match
-            if !match_host(&rule.host_pattern, host) {
+            if !match_host(&rule.host_pattern, effective_host) {
                 continue;
             }
 
@@ -212,6 +219,187 @@ fn match_path(pattern: &str, path: &str) -> bool {
         // Exact match
         path == pattern
     }
+}
+
+/// Normalize IPv6 host addresses to their canonical IPv4 equivalents.
+///
+/// This prevents SSRF bypass via IPv6 variants:
+/// - `[::1]` → `localhost` (IPv6 loopback)
+/// - `[::ffff:127.0.0.1]` → `127.0.0.1` (IPv4-mapped IPv6)
+/// - `[0:0:0:0:0:ffff:127.0.0.1]` → `127.0.0.1` (full-form IPv4-mapped)
+/// - `[::ffff:7f00:1]` → `127.0.0.1` (hex IPv4-mapped)
+/// - `[fd00:ec2::254]` → `metadata.aws.ipv6` (AWS IPv6 metadata)
+/// - `[::ffff:169.254.169.254]` → `169.254.169.254` (cloud metadata IPv4-mapped)
+///
+/// Returns None if no normalization needed (host is already in canonical form).
+fn normalize_host(host: &str) -> Option<String> {
+    // Strip brackets if present: [::1] → ::1
+    let inner = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .or_else(|| {
+            // Also handle [::1]:port → ::1
+            host.strip_prefix('[')
+                .and_then(|h| h.split(']').next())
+        });
+
+    let ipv6 = match inner {
+        Some(addr) => addr,
+        None => return None, // Not an IPv6 address
+    };
+
+    // Normalize: remove leading zeros, lowercase
+    let normalized = ipv6.to_lowercase();
+
+    // Check for loopback variants
+    if is_ipv6_loopback(&normalized) {
+        return Some("localhost".to_string());
+    }
+
+    // Check for IPv4-mapped addresses: ::ffff:a.b.c.d or 0:0:0:0:0:ffff:a.b.c.d
+    if let Some(v4) = extract_ipv4_mapped(&normalized) {
+        return Some(v4);
+    }
+
+    // Check for known cloud metadata IPv6 addresses
+    if is_cloud_metadata_ipv6(&normalized) {
+        return Some("169.254.169.254".to_string());
+    }
+
+    None
+}
+
+/// Check if an IPv6 address (without brackets) is a loopback.
+/// Covers: ::1, 0::1, 0:0:0:0:0:0:0:1 and all zero-compression variants.
+fn is_ipv6_loopback(addr: &str) -> bool {
+    // Parse by expanding :: and checking if result is 0:0:0:0:0:0:0:1
+    let expanded = expand_ipv6(addr);
+    expanded == [0, 0, 0, 0, 0, 0, 0, 1]
+}
+
+/// Extract IPv4 address from an IPv4-mapped IPv6 address.
+/// ::ffff:127.0.0.1 → Some("127.0.0.1")
+/// ::ffff:7f00:1 → Some("127.0.0.1")
+/// 0:0:0:0:0:ffff:a9fe:a9fe → Some("169.254.169.254")
+fn extract_ipv4_mapped(addr: &str) -> Option<String> {
+    let segments = expand_ipv6(addr);
+
+    // IPv4-mapped: first 5 segments zero, 6th = 0xffff
+    if segments[0..5] != [0, 0, 0, 0, 0] || segments[5] != 0xffff {
+        return None;
+    }
+
+    // Check if the original has dotted-decimal notation (::ffff:1.2.3.4)
+    if let Some(dot_pos) = addr.rfind('.') {
+        // Find the IPv4 part after the last colon before the dotted section
+        let colon_before_v4 = addr[..dot_pos].rfind(':').unwrap_or(0);
+        let v4_str = &addr[colon_before_v4 + 1..];
+        if v4_str.contains('.') {
+            return Some(v4_str.to_string());
+        }
+    }
+
+    // Hex form: segments 6 and 7 encode the IPv4 address
+    let a = (segments[6] >> 8) as u8;
+    let b = (segments[6] & 0xff) as u8;
+    let c = (segments[7] >> 8) as u8;
+    let d = (segments[7] & 0xff) as u8;
+    Some(format!("{}.{}.{}.{}", a, b, c, d))
+}
+
+/// Check if an IPv6 address is a known cloud metadata endpoint.
+fn is_cloud_metadata_ipv6(addr: &str) -> bool {
+    let segments = expand_ipv6(addr);
+    // AWS IPv6 metadata: fd00:ec2::254
+    // Expanded: fd00:ec2:0:0:0:0:0:254 → [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
+    if segments == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254] {
+        return true;
+    }
+    false
+}
+
+/// Expand an IPv6 address string into 8 u16 segments.
+/// Handles :: zero-compression and IPv4-mapped dotted notation.
+fn expand_ipv6(addr: &str) -> [u16; 8] {
+    let mut result = [0u16; 8];
+
+    // Handle IPv4-mapped with dotted notation (e.g., ::ffff:127.0.0.1)
+    let (ipv6_part, ipv4_tail) = if let Some(last_colon) = addr.rfind(':') {
+        let after = &addr[last_colon + 1..];
+        if after.contains('.') {
+            // Parse IPv4 part
+            let parts: Vec<&str> = after.split('.').collect();
+            if parts.len() == 4 {
+                if let (Ok(a), Ok(b), Ok(c), Ok(d)) = (
+                    parts[0].parse::<u8>(),
+                    parts[1].parse::<u8>(),
+                    parts[2].parse::<u8>(),
+                    parts[3].parse::<u8>(),
+                ) {
+                    let seg6 = ((a as u16) << 8) | (b as u16);
+                    let seg7 = ((c as u16) << 8) | (d as u16);
+                    (&addr[..last_colon], Some((seg6, seg7)))
+                } else {
+                    (addr, None)
+                }
+            } else {
+                (addr, None)
+            }
+        } else {
+            (addr, None)
+        }
+    } else {
+        (addr, None)
+    };
+
+    // Split on :: for zero-compression
+    let parts: Vec<&str> = ipv6_part.split("::").collect();
+    let max_segments = if ipv4_tail.is_some() { 6 } else { 8 };
+
+    match parts.len() {
+        1 => {
+            // No :: — parse all segments
+            for (i, seg) in parts[0].split(':').enumerate() {
+                if i < max_segments && !seg.is_empty() {
+                    result[i] = u16::from_str_radix(seg, 16).unwrap_or(0);
+                }
+            }
+        }
+        2 => {
+            // Has :: — left segments + gap + right segments
+            let left: Vec<&str> = if parts[0].is_empty() {
+                vec![]
+            } else {
+                parts[0].split(':').collect()
+            };
+            let right: Vec<&str> = if parts[1].is_empty() {
+                vec![]
+            } else {
+                parts[1].split(':').collect()
+            };
+
+            for (i, seg) in left.iter().enumerate() {
+                if !seg.is_empty() {
+                    result[i] = u16::from_str_radix(seg, 16).unwrap_or(0);
+                }
+            }
+
+            let right_start = max_segments - right.len();
+            for (i, seg) in right.iter().enumerate() {
+                if !seg.is_empty() {
+                    result[right_start + i] = u16::from_str_radix(seg, 16).unwrap_or(0);
+                }
+            }
+        }
+        _ => {} // Invalid — return all zeros
+    }
+
+    if let Some((seg6, seg7)) = ipv4_tail {
+        result[6] = seg6;
+        result[7] = seg7;
+    }
+
+    result
 }
 
 /// Parse a decision config into an EnforcementDecision

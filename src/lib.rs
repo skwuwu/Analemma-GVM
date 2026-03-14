@@ -5,6 +5,7 @@ pub mod api;
 pub mod api_keys;
 pub mod config;
 pub mod ledger;
+pub mod merkle;
 pub mod policy;
 pub mod proxy;
 pub mod rate_limiter;

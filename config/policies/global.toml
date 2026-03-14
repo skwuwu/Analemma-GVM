@@ -1,16 +1,39 @@
 # Global policy layer — applies to all tenants/agents, cannot be overridden.
-# Week 2 implementation: ABAC policy engine will load and evaluate these rules.
+
+# ── Priority 1: Critical external operations are blocked ──
 
 [[rules]]
-id = "global-payment-approval"
+id = "global-critical-external-send-deny"
 priority = 1
 layer = "Global"
-description = "All payments require approval"
+description = "Block sending critical data to external targets (exfiltration)"
+
+[[rules.conditions]]
+field = "resource.sensitivity"
+operator = "Eq"
+value = "Critical"
+
+[[rules.conditions]]
+field = "resource.tier"
+operator = "Eq"
+value = "External"
+
+[rules.decision]
+type = "Deny"
+reason = "Critical data transfer to external target is forbidden"
+
+# ──
+
+[[rules]]
+id = "global-payment-charge-approval"
+priority = 2
+layer = "Global"
+description = "Payment charges require approval"
 
 [[rules.conditions]]
 field = "operation"
-operator = "StartsWith"
-value = "gvm.payment"
+operator = "Eq"
+value = "gvm.payment.charge"
 
 [rules.decision]
 type = "RequireApproval"
@@ -20,7 +43,7 @@ urgency = "Immediate"
 
 [[rules]]
 id = "global-storage-delete-deny"
-priority = 2
+priority = 3
 layer = "Global"
 description = "Critical data deletion is forbidden"
 
@@ -41,10 +64,32 @@ reason = "Critical data deletion is forbidden"
 # ──
 
 [[rules]]
+id = "global-critical-read-deny"
+priority = 4
+layer = "Global"
+description = "Critical sensitivity reads are blocked (credentials, secrets)"
+
+[[rules.conditions]]
+field = "operation"
+operator = "Eq"
+value = "gvm.storage.read"
+
+[[rules.conditions]]
+field = "resource.sensitivity"
+operator = "Eq"
+value = "Critical"
+
+[rules.decision]
+type = "Deny"
+reason = "Access to critical/secret data requires elevated permissions"
+
+# ── Priority 10: Customer-facing delays ──
+
+[[rules]]
 id = "global-customer-facing-delay"
 priority = 10
 layer = "Global"
-description = "Customer-facing actions get 300ms delay"
+description = "Customer-facing actions get 300ms safety delay"
 
 [[rules.conditions]]
 field = "resource.tier"
@@ -55,13 +100,13 @@ value = "CustomerFacing"
 type = "Delay"
 milliseconds = 300
 
-# ──
+# ── Priority 50: Safe read operations ──
 
 [[rules]]
 id = "global-read-allow"
-priority = 100
+priority = 50
 layer = "Global"
-description = "Read operations are allowed"
+description = "Non-critical read operations are allowed"
 
 [[rules.conditions]]
 field = "operation"
@@ -72,6 +117,54 @@ value = ".read"
 type = "Allow"
 
 # ──
+
+[[rules]]
+id = "global-query-allow"
+priority = 50
+layer = "Global"
+description = "Query/analytics operations are allowed"
+
+[[rules.conditions]]
+field = "operation"
+operator = "EndsWith"
+value = ".query"
+
+[rules.decision]
+type = "Allow"
+
+# ──
+
+[[rules]]
+id = "global-status-allow"
+priority = 50
+layer = "Global"
+description = "Infrastructure status checks are allowed"
+
+[[rules.conditions]]
+field = "operation"
+operator = "EndsWith"
+value = ".status"
+
+[rules.decision]
+type = "Allow"
+
+# ──
+
+[[rules]]
+id = "global-refund-lookup-allow"
+priority = 50
+layer = "Global"
+description = "Refund lookups (read-only) are allowed"
+
+[[rules.conditions]]
+field = "operation"
+operator = "Eq"
+value = "gvm.payment.refund_lookup"
+
+[rules.decision]
+type = "Allow"
+
+# ── Priority 999: Default fallback ──
 
 [[rules]]
 id = "global-fallback"

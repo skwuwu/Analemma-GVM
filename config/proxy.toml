@@ -33,4 +33,4 @@ key_env = "GVM_SECRETS_KEY"
 # Dev-only: remap external hosts to local mock server.
 # Ignored when GVM_ENV=production.
 [dev]
-host_overrides = { "gmail.googleapis.com" = "127.0.0.1:9090", "api.bank.com" = "127.0.0.1:9090" }
+host_overrides = { "gmail.googleapis.com" = "127.0.0.1:9090", "api.bank.com" = "127.0.0.1:9090", "api.internal.dev" = "127.0.0.1:9090", "evil-exfil.attacker.com" = "127.0.0.1:9090", "webhook.external-dump.com" = "127.0.0.1:9090" }

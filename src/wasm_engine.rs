@@ -11,6 +11,8 @@ use crate::types::*;
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::sync::Mutex;
+use wasmtime_wasi::preview1::WasiP1Ctx;
+use wasmtime_wasi::WasiCtxBuilder;
 
 /// Governance engine mode — Wasm sandbox or native fallback.
 enum EngineMode {
@@ -27,7 +29,7 @@ enum EngineMode {
 }
 
 struct WasmRuntime {
-    store: wasmtime::Store<()>,
+    store: wasmtime::Store<WasiP1Ctx>,
     instance: wasmtime::Instance,
 }
 
@@ -72,7 +74,7 @@ impl WasmEngine {
             "Loading Wasm governance engine"
         );
 
-        // Configure Wasmtime with minimal capabilities (no WASI, no imports)
+        // Configure Wasmtime with Cranelift JIT optimization
         let mut config = wasmtime::Config::new();
         config.cranelift_opt_level(wasmtime::OptLevel::Speed);
 
@@ -82,9 +84,17 @@ impl WasmEngine {
         let module = wasmtime::Module::new(&engine, &wasm_bytes)
             .context("Failed to compile Wasm module")?;
 
-        // Create store and instantiate
-        let mut store = wasmtime::Store::new(&engine, ());
-        let instance = wasmtime::Instance::new(&mut store, &module, &[])
+        // Create WASI preview1 context (minimal: no filesystem, no network, no env)
+        // The governance engine only uses std::alloc which requires WASI shims.
+        let wasi_ctx = WasiCtxBuilder::new().build_p1();
+
+        // Create store with WASI P1 context and instantiate via linker
+        let mut store = wasmtime::Store::new(&engine, wasi_ctx);
+        let mut linker = wasmtime::Linker::new(&engine);
+        wasmtime_wasi::preview1::add_to_linker_sync(&mut linker, |ctx| ctx)
+            .context("Failed to add WASI preview1 to linker")?;
+
+        let instance = linker.instantiate(&mut store, &module)
             .context("Failed to instantiate Wasm module")?;
 
         // Verify required exports exist

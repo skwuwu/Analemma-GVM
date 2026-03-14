@@ -1,4 +1,5 @@
-use crate::types::{EventStatus, GVMEvent};
+use crate::merkle::compute_event_hash;
+use crate::types::{EventStatus, GVMEvent, MerkleBatchRecord};
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -32,21 +33,28 @@ impl Default for GroupCommitConfig {
 struct GroupCommitRequest {
     /// Pre-serialized JSON line (serialization done by caller for CPU parallelism).
     data: Vec<u8>,
+    /// SHA-256 event hash (Merkle leaf) computed by caller before serialization.
+    event_hash: String,
     /// Oneshot sender to notify the caller of success/failure.
     reply: tokio::sync::oneshot::Sender<Result<()>>,
 }
 
-// ─── WAL with Group Commit (PART 5.3) ───
+// ─── WAL with Group Commit + Merkle Tree (PART 5.3) ───
 
-/// Write-Ahead Log with group commit: multiple concurrent writes are batched
-/// into a single fsync, amortizing disk I/O cost across all waiters.
+/// Write-Ahead Log with group commit and Merkle tree integrity.
 ///
 /// Architecture:
 /// ```text
-/// Caller → serialize JSON → channel.send(data, oneshot_tx) → await oneshot_rx
+/// Caller → compute event_hash → serialize JSON (with hash) → channel.send → await
 ///                                      ↓
-///            Batch Task: recv → collect(batch_window) → write_all(batch) → fsync(1回) → notify all
+///            Batch Task: recv → collect(batch_window) →
+///              write_all(events) → compute_merkle_root → write(batch_record) →
+///              fsync(1x) → notify all
 /// ```
+///
+/// Merkle structure:
+/// - Intra-batch: events form a binary Merkle tree, root stored in MerkleBatchRecord
+/// - Inter-batch: each batch references the previous batch's root (chain)
 struct WAL {
     /// Sender for submitting write requests to the batch task.
     tx: tokio::sync::mpsc::Sender<GroupCommitRequest>,
@@ -76,7 +84,7 @@ impl WAL {
 
         let batch_task = tokio::spawn(batch_loop(rx, file, config, inject_error.clone()));
 
-        tracing::info!(path = %path.display(), "WAL opened (group commit)");
+        tracing::info!(path = %path.display(), "WAL opened (group commit + merkle)");
 
         Ok(Self {
             tx,
@@ -87,10 +95,14 @@ impl WAL {
     }
 
     /// Append an event to the WAL via group commit.
-    /// The caller serializes JSON (CPU work parallelized across callers),
-    /// sends through the channel, and awaits the batch fsync result.
+    /// Computes event_hash, sets it on the event, serializes, and submits to batch task.
     async fn append(&self, event: &GVMEvent) -> Result<()> {
-        let mut data = serde_json::to_vec(event)?;
+        // Compute event hash and embed it in the serialized output
+        let hash = compute_event_hash(event);
+        let mut stamped = event.clone();
+        stamped.event_hash = Some(hash.clone());
+
+        let mut data = serde_json::to_vec(&stamped)?;
         data.push(b'\n');
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -98,6 +110,7 @@ impl WAL {
         self.tx
             .send(GroupCommitRequest {
                 data,
+                event_hash: hash,
                 reply: reply_tx,
             })
             .await
@@ -110,6 +123,7 @@ impl WAL {
 }
 
 /// Background batch task: collects writes, flushes in batches, single fsync per batch.
+/// After flushing events, computes the Merkle root and appends a batch record.
 async fn batch_loop(
     mut rx: tokio::sync::mpsc::Receiver<GroupCommitRequest>,
     mut file: tokio::fs::File,
@@ -117,6 +131,8 @@ async fn batch_loop(
     inject_error: Arc<AtomicBool>,
 ) {
     let mut batch: Vec<GroupCommitRequest> = Vec::with_capacity(config.max_batch_size);
+    let mut batch_id: u64 = 0;
+    let mut prev_batch_root: Option<String> = None;
 
     loop {
         // Phase 1: Wait for at least one request (blocks until work arrives)
@@ -158,13 +174,25 @@ async fn batch_loop(
         let result = if inject_error.load(Ordering::Relaxed) {
             Err(anyhow!("WAL I/O error (injected for testing)"))
         } else {
-            flush_batch(&mut file, &batch).await
+            flush_batch_with_merkle(
+                &mut file,
+                &batch,
+                batch_id,
+                &prev_batch_root,
+            )
+            .await
         };
+
+        // Update batch chain state on success
+        if let Ok(ref root) = result {
+            prev_batch_root = Some(root.clone());
+            batch_id += 1;
+        }
 
         // Phase 4: Notify all waiters
         for req in batch.drain(..) {
             let notify_result = match &result {
-                Ok(()) => Ok(()),
+                Ok(_) => Ok(()),
                 Err(e) => Err(anyhow!("WAL group commit fsync failed: {}", e)),
             };
             let _ = req.reply.send(notify_result);
@@ -172,21 +200,49 @@ async fn batch_loop(
     }
 }
 
-/// Concatenate all pre-serialized JSON lines into a single buffer,
-/// perform one write_all + one fsync for the entire batch.
-async fn flush_batch(
+/// Flush event data + Merkle batch record in a single fsync.
+///
+/// 1. Concatenate all pre-serialized event JSON lines
+/// 2. Compute Merkle root from event hashes
+/// 3. Serialize and append MerkleBatchRecord
+/// 4. Single write_all + fsync for the entire buffer (events + batch record)
+async fn flush_batch_with_merkle(
     file: &mut tokio::fs::File,
     batch: &[GroupCommitRequest],
-) -> Result<()> {
-    let total_len: usize = batch.iter().map(|r| r.data.len()).sum();
-    let mut buf = Vec::with_capacity(total_len);
+    batch_id: u64,
+    prev_batch_root: &Option<String>,
+) -> Result<String> {
+    // Collect event hashes for Merkle tree
+    let leaf_hashes: Vec<String> = batch.iter().map(|r| r.event_hash.clone()).collect();
+
+    // Compute Merkle root
+    let merkle_root = crate::merkle::compute_merkle_root(&leaf_hashes);
+
+    // Build batch record
+    let batch_record = MerkleBatchRecord {
+        batch_id,
+        merkle_root: merkle_root.clone(),
+        prev_batch_root: prev_batch_root.clone(),
+        event_count: batch.len(),
+        timestamp: chrono::Utc::now(),
+    };
+
+    let mut batch_record_data = serde_json::to_vec(&batch_record)?;
+    batch_record_data.push(b'\n');
+
+    // Single buffer: all events + batch record
+    let event_len: usize = batch.iter().map(|r| r.data.len()).sum();
+    let mut buf = Vec::with_capacity(event_len + batch_record_data.len());
     for req in batch {
         buf.extend_from_slice(&req.data);
     }
+    buf.extend_from_slice(&batch_record_data);
 
+    // Single write + single fsync for the entire batch (events + merkle record)
     file.write_all(&buf).await?;
-    file.sync_data().await?; // Single fsync for entire batch
-    Ok(())
+    file.sync_data().await?;
+
+    Ok(merkle_root)
 }
 
 // ─── Ledger: WAL-first local write + async NATS JetStream forwarding ───
@@ -242,7 +298,7 @@ impl Ledger {
         // 1. Assign monotonic WAL sequence (atomic, lock-free)
         let wal_seq = self.wal_sequence.fetch_add(1, Ordering::SeqCst);
 
-        // 2. Local WAL append (group commit — batched fsync)
+        // 2. Local WAL append (group commit — batched fsync + Merkle)
         self.wal.append(event).await?;
 
         // 3. Async NATS publish (background, non-blocking)
@@ -303,6 +359,11 @@ impl Ledger {
 
         for line in content.lines() {
             if line.trim().is_empty() {
+                continue;
+            }
+
+            // Skip MerkleBatchRecord lines (they have merkle_root field)
+            if line.contains("\"merkle_root\"") {
                 continue;
             }
 

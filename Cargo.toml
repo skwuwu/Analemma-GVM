@@ -36,6 +36,7 @@ thiserror = "1"
 hex = "0.4"
 zeroize = { version = "1", features = ["derive"] }
 wasmtime = "29"
+wasmtime-wasi = "29"
 gvm-engine = { path = "crates/gvm-engine" }
 
 [dev-dependencies]

@@ -1,7 +1,7 @@
-"""Mock Gmail & Bank API server for GVM demo.
+"""Mock API server for GVM demos — Gmail, Bank, DevOps, Analytics.
 
-Simulates Gmail API and Bank API endpoints so the LangChain demo
-can run end-to-end without external credentials.
+Simulates multiple API endpoints so LLM-powered agents can run
+end-to-end without external credentials.
 
 Usage:
     python -m gvm.mock_server          # standalone (port 9090)
@@ -71,7 +71,7 @@ def _get_header(msg, name):
 
 
 class MockHandler(BaseHTTPRequestHandler):
-    """Handles Gmail API and Bank API mock endpoints."""
+    """Handles Gmail, Bank, DevOps, and Analytics mock endpoints."""
 
     def log_message(self, format, *args):
         """Suppress default stderr logging."""
@@ -86,7 +86,7 @@ class MockHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        # GET /gmail/v1/users/me/messages — list inbox
+        # ── Gmail ──
         if self.path == "/gmail/v1/users/me/messages":
             self._send_json({
                 "messages": [
@@ -97,7 +97,6 @@ class MockHandler(BaseHTTPRequestHandler):
             })
             return
 
-        # GET /gmail/v1/users/me/messages/{id} — get single message
         if self.path.startswith("/gmail/v1/users/me/messages/"):
             msg_id = self.path.split("/")[-1]
             for msg in FAKE_MESSAGES:
@@ -107,13 +106,92 @@ class MockHandler(BaseHTTPRequestHandler):
             self._send_json({"error": {"code": 404, "message": "Not found"}}, 404)
             return
 
+        # ── Finance: refund lookup ──
+        if self.path.startswith("/refunds/"):
+            refund_id = self.path.split("/")[-1]
+            self._send_json({
+                "refund_id": refund_id,
+                "status": "pending_review",
+                "amount": 149.99,
+                "customer": "customer-8842",
+                "reason": "Product defect",
+                "created_at": "2026-03-10T14:30:00Z",
+            })
+            return
+
+        # ── Finance: audit log ──
+        if self.path.startswith("/audit-log/"):
+            period = self.path.split("/")[-1]
+            self._send_json({
+                "period": period,
+                "entries": [
+                    {"timestamp": "2026-03-14T09:00:00Z", "action": "refund.created", "actor": "finance-bot"},
+                    {"timestamp": "2026-03-14T09:01:00Z", "action": "email.sent", "actor": "finance-bot"},
+                ],
+                "total": 2,
+            })
+            return
+
+        # ── DevOps: deployment status ──
+        if self.path == "/deployments/latest":
+            self._send_json({
+                "deployment_id": "deploy-2026-03-14-001",
+                "status": "running",
+                "image": "app:v2.3.0",
+                "environment": "production",
+                "replicas": 3,
+                "uptime": "72h",
+                "health": "healthy",
+            })
+            return
+
+        # ── Analytics: page views ──
+        if self.path.startswith("/analytics/page-views"):
+            self._send_json({
+                "metric": "page_views",
+                "range": "7d",
+                "total": 284503,
+                "daily_avg": 40643,
+                "top_pages": [
+                    {"path": "/dashboard", "views": 89201},
+                    {"path": "/settings", "views": 45302},
+                    {"path": "/billing", "views": 31004},
+                ],
+            })
+            return
+
+        # ── Analytics: revenue ──
+        if self.path.startswith("/analytics/revenue"):
+            self._send_json({
+                "metric": "revenue",
+                "range": "30d",
+                "total_usd": 1284500.00,
+                "mrr": 428166.67,
+                "growth_pct": 12.3,
+                "top_plans": [
+                    {"plan": "enterprise", "revenue": 842000},
+                    {"plan": "pro", "revenue": 312500},
+                    {"plan": "starter", "revenue": 130000},
+                ],
+            })
+            return
+
+        # ── Analytics: config/.env (sensitive — should be blocked by GVM) ──
+        if self.path == "/config/.env":
+            self._send_json({
+                "STRIPE_SECRET_KEY": "sk_live_REDACTED",
+                "DATABASE_URL": "postgres://admin:REDACTED@prod-db:5432/main",
+                "JWT_SECRET": "REDACTED",
+            })
+            return
+
         self._send_json({"error": "Unknown endpoint"}, 404)
 
     def do_POST(self):
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length) if content_length > 0 else b""
 
-        # POST /gmail/v1/users/me/messages/send — send email
+        # ── Gmail: send email ──
         if self.path == "/gmail/v1/users/me/messages/send":
             try:
                 payload = json.loads(body) if body else {}
@@ -129,7 +207,7 @@ class MockHandler(BaseHTTPRequestHandler):
             })
             return
 
-        # POST /transfer/{id} — bank transfer (mock; normally blocked by SRR)
+        # ── Bank: wire transfer ──
         if self.path.startswith("/transfer/"):
             self._send_json({
                 "status": "completed",
@@ -137,13 +215,50 @@ class MockHandler(BaseHTTPRequestHandler):
             })
             return
 
+        # ── DevOps: deploy to environment ──
+        if self.path.startswith("/deployments/"):
+            try:
+                payload = json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                payload = {}
+            env = self.path.split("/")[-1]
+            self._send_json({
+                "deployment_id": f"deploy-{env}-001",
+                "status": "deploying",
+                "environment": env,
+                "image": payload.get("image", "app:latest"),
+                "replicas": payload.get("replicas", 1),
+            })
+            return
+
+        # ── External: catch-all for exfiltration endpoints ──
+        if self.path == "/collect":
+            self._send_json({"status": "received"})
+            return
+
         self._send_json({"error": "Unknown endpoint"}, 404)
 
     def do_DELETE(self):
-        # DELETE /gmail/v1/users/me/messages/{id} — delete message
+        # ── Gmail: delete message ──
         if self.path.startswith("/gmail/v1/users/me/messages/"):
             msg_id = self.path.split("/")[-1]
             self._send_json({"deleted": msg_id})
+            return
+
+        # ── Gmail: batch delete ──
+        if self.path == "/gmail/v1/users/me/messages/batch-delete":
+            self._send_json({"deleted": "batch"})
+            return
+
+        # ── Finance: delete audit log ──
+        if self.path.startswith("/audit-log/"):
+            period = self.path.split("/")[-1]
+            self._send_json({"deleted": period})
+            return
+
+        # ── DevOps: drop database ──
+        if self.path.startswith("/database/"):
+            self._send_json({"status": "dropped"})
             return
 
         self._send_json({"error": "Unknown endpoint"}, 404)
@@ -159,7 +274,7 @@ def start(port=None):
 
 
 if __name__ == "__main__":
-    print(f"Mock Gmail/Bank server listening on http://127.0.0.1:{MOCK_PORT}")
+    print(f"Mock API server listening on http://127.0.0.1:{MOCK_PORT}")
     server = HTTPServer(("127.0.0.1", MOCK_PORT), MockHandler)
     try:
         server.serve_forever()

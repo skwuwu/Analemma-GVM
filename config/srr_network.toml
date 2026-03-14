@@ -1,5 +1,33 @@
 # Network SRR rules — Layer 2 fallback defense for direct HTTP calls bypassing SDK
 
+# ── SSRF Prevention: IPv4 + IPv6 loopback/metadata/private ──
+
+[[rules]]
+method = "*"
+pattern = "localhost/{any}"
+decision = { type = "Deny", reason = "SSRF: localhost access blocked" }
+description = "Block all localhost access (also catches IPv6 [::1] via normalization)"
+
+[[rules]]
+method = "*"
+pattern = "127.0.0.1/{any}"
+decision = { type = "Deny", reason = "SSRF: loopback access blocked" }
+description = "Block IPv4 loopback (also catches [::ffff:127.0.0.1] via normalization)"
+
+[[rules]]
+method = "*"
+pattern = "169.254.169.254/{any}"
+decision = { type = "Deny", reason = "SSRF: cloud metadata access blocked" }
+description = "Block cloud metadata (also catches [fd00:ec2::254] via normalization)"
+
+[[rules]]
+method = "*"
+pattern = "metadata.google.internal/{any}"
+decision = { type = "Deny", reason = "SSRF: GCP metadata access blocked" }
+description = "Block GCP metadata endpoint"
+
+# ── Deny rules (highest priority) ──
+
 [[rules]]
 method = "POST"
 pattern = "api.bank.com/transfer/{any}"
@@ -8,9 +36,35 @@ description = "Block all direct wire transfer attempts"
 
 [[rules]]
 method = "DELETE"
+pattern = "api.bank.com/audit-log/{any}"
+decision = { type = "Deny", reason = "Audit log deletion — blocked by proxy" }
+description = "Block audit trail deletion"
+
+[[rules]]
+method = "DELETE"
 pattern = "{host}.database.com/{any}"
 decision = { type = "Deny", reason = "Database deletion — blocked by proxy" }
 description = "Block all database delete operations"
+
+[[rules]]
+method = "DELETE"
+pattern = "api.internal.dev/database/{any}"
+decision = { type = "Deny", reason = "Database deletion — blocked by proxy" }
+description = "Block database drop operations"
+
+[[rules]]
+method = "POST"
+pattern = "evil-exfil.attacker.com/{any}"
+decision = { type = "Deny", reason = "External exfiltration — blocked by proxy" }
+description = "Block data exfiltration to known malicious hosts"
+
+[[rules]]
+method = "POST"
+pattern = "webhook.external-dump.com/{any}"
+decision = { type = "Deny", reason = "External data dump — blocked by proxy" }
+description = "Block data export to external dump services"
+
+# ── Delay rules (monitored operations) ──
 
 [[rules]]
 method = "POST"
@@ -19,16 +73,58 @@ decision = { type = "Delay", milliseconds = 300 }
 description = "Delay Slack message sends for review window"
 
 [[rules]]
+method = "POST"
+pattern = "gmail.googleapis.com/{any}"
+decision = { type = "Delay", milliseconds = 300 }
+description = "Delay Gmail sends for review window"
+
+[[rules]]
+method = "POST"
+pattern = "api.internal.dev/deployments/{any}"
+decision = { type = "Delay", milliseconds = 300 }
+description = "Delay deployments for review window"
+
+# ── Allow rules (safe operations) ──
+
+[[rules]]
 method = "GET"
 pattern = "gmail.googleapis.com/{any}"
 decision = { type = "Allow" }
 description = "Gmail inbox read — IC-1 instant"
 
 [[rules]]
-method = "POST"
+method = "GET"
+pattern = "api.bank.com/{any}"
+decision = { type = "Allow" }
+description = "Bank API reads — IC-1 instant"
+
+[[rules]]
+method = "GET"
+pattern = "api.internal.dev/deployments/{any}"
+decision = { type = "Allow" }
+description = "Deployment status checks — IC-1 instant"
+
+[[rules]]
+method = "GET"
+pattern = "api.internal.dev/analytics/{any}"
+decision = { type = "Allow" }
+description = "Analytics queries — IC-1 instant"
+
+# ── Critical reads blocked ──
+
+[[rules]]
+method = "GET"
+pattern = "api.internal.dev/config/{any}"
+decision = { type = "Deny", reason = "Config/secret file access — blocked by proxy" }
+description = "Block access to config files containing secrets"
+
+# ── Delete Gmail blocked ──
+
+[[rules]]
+method = "DELETE"
 pattern = "gmail.googleapis.com/{any}"
-decision = { type = "Delay", milliseconds = 300 }
-description = "Delay Gmail sends for review window"
+decision = { type = "Deny", reason = "Email deletion — blocked by proxy" }
+description = "Block all email deletion operations"
 
 # ── Payload Inspection (GraphQL/gRPC defense) ──
 
