@@ -211,13 +211,13 @@ pub struct TransportInfo {
     pub status_code: Option<u16>,
 }
 
-/// Classification source for audit trail
+/// Classification source — which enforcement layer produced the final decision
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ClassificationSource {
-    /// SDK-routed request with semantic operation metadata
-    Semantic,
-    /// Direct HTTP request classified by network SRR
-    Network,
+    /// Layer 1: ABAC policy engine (semantic operation matching)
+    ABAC,
+    /// Layer 2: Network SRR (host/path/method matching)
+    SRR,
 }
 
 /// Internal classification result

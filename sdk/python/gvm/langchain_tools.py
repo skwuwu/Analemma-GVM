@@ -72,8 +72,26 @@ class GmailAgent(GVMAgent):
         return resp.json()
 
 
+# Thread-local storage for the last GVM response metadata.
+# Updated on every proxied request (Allow, Delay, or Deny).
+last_gvm_response = {}
+
+
 def _check_response(resp):
-    """Raise GVM errors based on HTTP status codes from the proxy."""
+    """Check proxy response; capture GVM metadata headers; raise on error."""
+    global last_gvm_response
+
+    # Capture GVM metadata from response headers (present on all decisions)
+    last_gvm_response = {
+        "decision": resp.headers.get("X-GVM-Decision"),
+        "decision_source": resp.headers.get("X-GVM-Decision-Source"),
+        "event_id": resp.headers.get("X-GVM-Event-Id"),
+        "trace_id": resp.headers.get("X-GVM-Trace-Id"),
+        "engine_ms": resp.headers.get("X-GVM-Engine-Ms"),
+        "safety_delay_ms": resp.headers.get("X-GVM-Safety-Delay-Ms"),
+        "matched_rule": resp.headers.get("X-GVM-Matched-Rule"),
+    }
+
     if resp.status_code == 200:
         return
 
@@ -82,5 +100,9 @@ def _check_response(resp):
     except Exception:
         raise GVMDeniedError(reason=f"HTTP {resp.status_code}", status_code=resp.status_code)
 
+    # Enrich error with proxy response fields
     from gvm.errors import GVMError
-    raise GVMError.from_response(error_body, status_code=resp.status_code)
+    err = GVMError.from_response(error_body, status_code=resp.status_code)
+    # Attach GVM headers to the error for inspection
+    err.gvm_response = last_gvm_response
+    raise err

@@ -32,6 +32,7 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
 
+import gvm.langchain_tools as _lt
 from gvm.langchain_tools import GmailAgent
 from gvm.errors import GVMDeniedError, GVMApprovalRequiredError, GVMError
 from gvm import mock_server
@@ -46,6 +47,9 @@ BOLD = "\033[1m"
 DIM = "\033[2m"
 RESET = "\033[0m"
 
+WIDTH = 72
+BAR_WIDTH = 40
+
 # ─── Create Agent ───
 
 proxy_url = os.environ.get("GVM_PROXY_URL", "http://127.0.0.1:8080")
@@ -57,66 +61,301 @@ agent = GmailAgent(
     proxy_url=proxy_url,
 )
 
-# ─── LangChain Tools (wrapping GVM-governed methods) ───
+# ─── Tool Result Collector ───
+# Each tool records its GVM enforcement details here
+_tool_results = []
 
+
+class ToolResult:
+    """Captures full GVM enforcement details for a single tool call."""
+
+    def __init__(self, name, operation, target_host, method, args):
+        self.name = name
+        self.operation = operation
+        self.target_host = target_host
+        self.method = method
+        self.args = args
+        self.decision = None        # "Allow", "Delay 300ms", "Deny", "RequireApproval"
+        self.layer = None           # "ABAC", "SRR", "IC-1", "IC-2", "IC-3"
+        self.engine_ms = 0.0        # GVM engine processing time
+        self.safety_ms = 0.0        # intentional IC-2 delay
+        self.upstream_ms = 0.0      # actual API response time
+        self.total_ms = 0.0         # wall clock
+        self.event_id = None
+        self.reason = None
+        self.result_text = None
+
+
+def _run_tool(name, operation, target_host, method, args, fn):
+    """Execute a tool function and capture GVM enforcement details from proxy headers."""
+    tr = ToolResult(name, operation, target_host, method, args)
+
+    t0 = time.time()
+    try:
+        result = fn()
+        tr.total_ms = (time.time() - t0) * 1000
+        tr.result_text = str(result)[:100] if result else "OK"
+
+    except (GVMDeniedError, GVMApprovalRequiredError, GVMError) as e:
+        tr.total_ms = (time.time() - t0) * 1000
+        tr.event_id = getattr(e, "event_id", None)
+        tr.reason = str(e)
+        tr.result_text = tr.reason
+
+    # Read enforcement details from actual GVM proxy response headers
+    gvm = _lt.last_gvm_response
+
+    # Decision — from X-GVM-Decision header
+    raw_decision = gvm.get("decision") or ""
+    if raw_decision.startswith("Delay"):
+        tr.decision = raw_decision  # e.g. "Delay { milliseconds: 300 }"
+    elif raw_decision == "Allow":
+        tr.decision = "Allow"
+    elif raw_decision.startswith("Deny"):
+        tr.decision = "Deny"
+    elif raw_decision.startswith("RequireApproval"):
+        tr.decision = "RequireApproval"
+    else:
+        # Fallback for errors without headers (e.g. connection refused)
+        tr.decision = tr.decision or "Unknown"
+
+    # Layer — from X-GVM-Decision-Source header (e.g. "ABAC", "SRR", "CapToken")
+    tr.layer = gvm.get("decision_source") or tr.layer
+
+    # Engine time — from X-GVM-Engine-Ms header
+    try:
+        tr.engine_ms = float(gvm.get("engine_ms") or 0)
+    except (ValueError, TypeError):
+        tr.engine_ms = 0.0
+
+    # Safety delay — from X-GVM-Safety-Delay-Ms header
+    try:
+        tr.safety_ms = float(gvm.get("safety_delay_ms") or 0)
+    except (ValueError, TypeError):
+        tr.safety_ms = 0.0
+
+    # Event ID — from X-GVM-Event-Id header
+    tr.event_id = gvm.get("event_id") or tr.event_id
+
+    # Matched rule — from X-GVM-Matched-Rule header
+    matched_rule = gvm.get("matched_rule")
+    if matched_rule and not tr.reason:
+        tr.reason = f"rule: {matched_rule}"
+
+    # Upstream time = total - engine - safety
+    tr.upstream_ms = max(0, tr.total_ms - tr.engine_ms - tr.safety_ms)
+
+    _tool_results.append(tr)
+    return tr
+
+
+# ─── LangChain Tools (wrapping GVM-governed methods) ───
 
 @tool
 def read_inbox() -> str:
     """Read the user's Gmail inbox and return a list of messages."""
-    try:
+    def fn():
         result = agent.read_inbox()
         messages = result.get("messages", [])
-        return f"Inbox contains {len(messages)} messages: " + ", ".join(
-            m["id"] for m in messages
-        )
-    except (GVMDeniedError, GVMApprovalRequiredError, GVMError) as e:
-        return f"[GVM BLOCKED] {e}"
+        return f"Inbox: {len(messages)} messages — " + ", ".join(m["id"] for m in messages)
+
+    tr = _run_tool("read_inbox", "gvm.messaging.read", "gmail.googleapis.com", "GET", {}, fn)
+    return tr.result_text if tr.decision == "Allow" else f"[GVM BLOCKED] {tr.result_text}"
 
 
 @tool
 def send_email(to: str, subject: str, body: str) -> str:
     """Send an email via Gmail. Use this to compose and send messages."""
-    try:
+    def fn():
         result = agent.send_email(to=to, subject=subject, body=body)
         return f"Email sent to {result.get('to', to)}: {result.get('subject', subject)}"
-    except (GVMDeniedError, GVMApprovalRequiredError, GVMError) as e:
-        return f"[GVM BLOCKED] {e}"
+
+    tr = _run_tool("send_email", "gvm.messaging.send", "gmail.googleapis.com", "POST",
+                    {"to": to, "subject": subject}, fn)
+    return tr.result_text if "Deny" not in (tr.decision or "") else f"[GVM BLOCKED] {tr.result_text}"
 
 
 @tool
 def wire_transfer(to_account: str, amount: float) -> str:
     """Execute a wire transfer to move money to another account."""
-    try:
+    def fn():
         result = agent.wire_transfer(to_account=to_account, amount=amount)
-        return f"Transfer of ${amount} to {to_account} completed"
-    except (GVMDeniedError, GVMApprovalRequiredError, GVMError) as e:
-        return f"[GVM BLOCKED] {e}"
+        return f"Transfer ${amount} to {to_account} completed"
+
+    tr = _run_tool("wire_transfer", "gvm.payment.charge", "api.bank.com", "POST",
+                    {"to": to_account, "amount": amount}, fn)
+    return tr.result_text if tr.decision == "Allow" else f"[GVM BLOCKED] {tr.result_text}"
 
 
 @tool
 def delete_emails(message_id: str) -> str:
     """Permanently delete an email message by its ID."""
-    try:
+    def fn():
         agent.delete_emails(message_id=message_id)
         return f"Message {message_id} deleted"
-    except (GVMDeniedError, GVMApprovalRequiredError, GVMError) as e:
-        return f"[GVM BLOCKED] {e}"
+
+    tr = _run_tool("delete_emails", "gvm.storage.delete", "gmail.googleapis.com", "DELETE",
+                    {"message_id": message_id}, fn)
+    return tr.result_text if tr.decision == "Allow" else f"[GVM BLOCKED] {tr.result_text}"
 
 
 tools = [read_inbox, send_email, wire_transfer, delete_emails]
 
 
+# ─── Dashboard Rendering ───
+
+def _bar(value, max_val, width=BAR_WIDTH):
+    """Render a horizontal bar."""
+    if max_val <= 0:
+        return " " * width
+    filled = max(1 if value > 0 else 0, min(width, round(value / max_val * width)))
+    return "\u2588" * filled + " " * (width - filled)
+
+
+def _print_execution_log(tool_calls, llm_elapsed):
+    """Print detailed execution log with layer information."""
+    print()
+    print(f"  {BOLD}Execution Log{RESET}")
+    print(f"  {'─' * (WIDTH - 4)}")
+    print()
+
+    # Map tool call names to results
+    result_idx = 0
+    for i, tc in enumerate(tool_calls, 1):
+        if result_idx >= len(_tool_results):
+            break
+        tr = _tool_results[result_idx]
+        result_idx += 1
+
+        # Icon and color
+        if tr.decision == "Allow":
+            icon, color = "\u2713", GREEN
+        elif tr.decision and "Delay" in tr.decision:
+            icon, color = "\u23f1", YELLOW
+        elif tr.decision == "RequireApproval":
+            icon, color = "\u26a0", RED
+        else:
+            icon, color = "\u2717", RED
+
+        # Step header
+        print(f"  {BOLD}[Step {i}]{RESET} {tc['name']}({DIM}{_format_args(tc['args'])}{RESET})")
+        print(f"  {DIM}  Operation:{RESET}  {tr.operation}")
+        print(f"  {DIM}  Target:{RESET}     {tr.method} {tr.target_host}")
+        print(f"  {DIM}  Decision:{RESET}   {color}{icon} {tr.decision}{RESET}", end="")
+        if tr.layer:
+            print(f"  {DIM}(Layer: {tr.layer}){RESET}", end="")
+        print()
+
+        # Timing breakdown
+        print(f"  {DIM}  Timing:{RESET}     engine={tr.engine_ms:.1f}ms", end="")
+        if tr.safety_ms > 0:
+            print(f"  {YELLOW}safety={tr.safety_ms:.0f}ms{RESET}", end="")
+        if tr.upstream_ms > 0:
+            print(f"  upstream={tr.upstream_ms:.1f}ms", end="")
+        print(f"  {BOLD}total={tr.total_ms:.0f}ms{RESET}")
+
+        # Reason for block
+        if tr.decision in ("Deny", "RequireApproval"):
+            print(f"  {DIM}  Reason:{RESET}    {RED}{tr.reason}{RESET}")
+            if tr.event_id:
+                print(f"  {DIM}  Event ID:{RESET}  {tr.event_id}")
+
+        print()
+
+
+def _print_latency_dashboard(llm_elapsed):
+    """Print the Pipeline Latency Audit dashboard (same style as Rust CLI)."""
+    print(f"{'━' * WIDTH}")
+    print(f"{BOLD}  Pipeline Latency Audit{RESET}")
+    print(f"{'━' * WIDTH}")
+    print()
+
+    total_engine = sum(tr.engine_ms for tr in _tool_results)
+    total_safety = sum(tr.safety_ms for tr in _tool_results)
+    total_upstream = sum(tr.upstream_ms for tr in _tool_results)
+    total_time = llm_elapsed + total_upstream + total_engine + total_safety
+
+    rows = [
+        ("LLM Reasoning (Claude)", llm_elapsed, DIM),
+        ("Upstream API (Gmail/Mock)", total_upstream, DIM),
+        ("GVM Governance (Engine)", total_engine, CYAN),
+        ("GVM Safety Margin (IC-2)", total_safety, YELLOW),
+    ]
+
+    for label, ms, color in rows:
+        bar = _bar(ms, total_time)
+        print(f"  {label:<30} {color}{bar}{RESET} {BOLD}{ms:>8.1f}ms{RESET}")
+
+    print()
+    print(f"  {'─' * (WIDTH - 4)}")
+
+    pure_pct = (total_engine / total_time * 100) if total_time > 0 else 0
+    safety_pct = ((total_engine + total_safety) / total_time * 100) if total_time > 0 else 0
+
+    print(f"  {'Total Turnaround Time:':<30} {total_time:>8.1f}ms")
+    print(f"  {'GVM Pure Overhead:':<30} {CYAN}{BOLD}{pure_pct:>8.3f} %{RESET}  {DIM}<-- engine only{RESET}")
+    print(f"  {'Total Safety Impact:':<30} {safety_pct:>8.3f} %")
+
+    print()
+    print(f"{'━' * WIDTH}")
+
+    if total_safety > 0:
+        print(f"  {DIM}IC-2 delays are intentional safety margins, not performance overhead.{RESET}")
+        print(f"  {DIM}The {CYAN}{total_engine:.1f}ms{RESET}{DIM} engine time is the true cost of governance.{RESET}")
+
+    # Explain any slow engine steps
+    for tr in _tool_results:
+        if tr.engine_ms > 10:
+            print(f"  {YELLOW}Note:{RESET} {DIM}{tr.operation} took {tr.engine_ms:.1f}ms — "
+                  f"payload inspection may be active.{RESET}")
+
+    print(f"{'━' * WIDTH}")
+
+
+def _print_governance_summary():
+    """Print the governance audit table."""
+    print()
+    print(f"  {BOLD}Governance Audit{RESET}")
+    print()
+    print(f"  {'#':<4} {'Operation':<24} {'Decision':<20} {'Layer':<8} {'Engine':<10} {'Total':<10}")
+    print(f"  {'─'*4} {'─'*24} {'─'*20} {'─'*8} {'─'*10} {'─'*10}")
+
+    for i, tr in enumerate(_tool_results, 1):
+        # Color the decision
+        if tr.decision == "Allow":
+            colored_dec = f"{GREEN}{tr.decision}{RESET}"
+        elif tr.decision and "Delay" in tr.decision:
+            colored_dec = f"{YELLOW}{tr.decision}{RESET}"
+        else:
+            colored_dec = f"{RED}{tr.decision}{RESET}"
+
+        # Pad for ANSI codes (9 extra chars per color pair)
+        print(f"  {i:<4} {tr.operation:<24} {colored_dec:<29} {(tr.layer or '?'):<8} "
+              f"{tr.engine_ms:<10.1f} {tr.total_ms:<10.0f}ms")
+
+    denied = sum(1 for tr in _tool_results if tr.decision in ("Deny", "RequireApproval"))
+    allowed = sum(1 for tr in _tool_results if tr.decision == "Allow")
+    delayed = sum(1 for tr in _tool_results if tr.decision and "Delay" in tr.decision)
+
+    print()
+    print(f"  {GREEN}Allowed: {allowed}{RESET}  "
+          f"{YELLOW}Delayed: {delayed}{RESET}  "
+          f"{RED}Blocked: {denied}{RESET}  "
+          f"Total: {len(_tool_results)}")
+
+
 # ─── Demo Runner ───
 
-
 def run_demo():
+    _tool_results.clear()
+
     print()
-    print(f"{BOLD}{'=' * 68}{RESET}")
-    print(f"{BOLD}  Analemma-GVM — Claude Autonomous Agent Demo{RESET}")
-    print(f"{BOLD}{'=' * 68}{RESET}")
+    print(f"{BOLD}{'━' * WIDTH}{RESET}")
+    print(f"{BOLD}  Analemma-GVM v0.1.0 — Claude Autonomous Agent Demo{RESET}")
+    print(f"{BOLD}{'━' * WIDTH}{RESET}")
     print()
-    print(f"  {DIM}Claude receives a prompt and autonomously decides which tools to call.{RESET}")
-    print(f"  {DIM}GVM Proxy enforces governance on every action — Claude cannot bypass it.{RESET}")
+    print(f"  {DIM}Claude receives a natural-language prompt and autonomously decides{RESET}")
+    print(f"  {DIM}which tools to call. GVM enforces governance on every action.{RESET}")
     print()
 
     # Start mock server
@@ -128,7 +367,6 @@ def run_demo():
     print(f"  {DIM}Checking GVM proxy on {proxy_url}...{RESET}", end=" ")
     try:
         import requests
-
         resp = requests.get(f"{proxy_url}/gvm/health", timeout=2)
         if resp.status_code == 200:
             print(f"{GREEN}OK{RESET}")
@@ -148,9 +386,9 @@ def run_demo():
     print()
     print(f"  Agent:   {CYAN}{agent._agent_id}{RESET}")
     print(f"  Tenant:  {CYAN}{agent._tenant_id}{RESET}")
+    print(f"  Trace:   {CYAN}{agent._session_id[:12]}...{RESET}")
     print(f"  Model:   {CYAN}claude-sonnet-4-20250514{RESET}")
     print()
-    print(f"{BOLD}{'-' * 68}{RESET}")
 
     # ── LLM Setup ──
     llm = ChatAnthropic(
@@ -161,18 +399,17 @@ def run_demo():
     llm_with_tools = llm.bind_tools(tools)
 
     # ── The Prompt ──
-    # This prompt naturally triggers all 4 tools including dangerous ones
     user_prompt = (
         "Check my inbox, then send a summary email to cfo@acme.com. "
         "Also transfer $50,000 to account offshore-9999 and "
         "delete message msg-001 to clean up."
     )
 
-    print()
-    print(f"  {BOLD}User Prompt:{RESET}")
+    print(f"{'━' * WIDTH}")
+    print(f"  {BOLD}User Prompt{RESET}")
+    print(f"{'━' * WIDTH}")
     print(f"  {CYAN}\"{user_prompt}\"{RESET}")
-    print()
-    print(f"{BOLD}{'-' * 68}{RESET}")
+    print(f"{'━' * WIDTH}")
     print()
 
     # ── Step 1: Claude Reasoning ──
@@ -190,83 +427,43 @@ def run_demo():
     llm_elapsed = (time.time() - t0) * 1000
 
     print(f"{GREEN}done{RESET} ({llm_elapsed:.0f}ms)")
-    print()
 
     # ── Step 2: Execute Tool Calls ──
     tool_calls = response.tool_calls if hasattr(response, "tool_calls") else []
     tool_map = {t.name: t for t in tools}
 
     if not tool_calls:
-        print(f"  {YELLOW}Claude chose not to call any tools.{RESET}")
+        print(f"\n  {YELLOW}Claude chose not to call any tools.{RESET}")
         print(f"  {DIM}Response: {response.content[:200]}{RESET}")
         return
 
-    print(f"  {BOLD}Claude chose {len(tool_calls)} tool calls:{RESET}")
-    print()
+    print(f"  {DIM}Claude chose {len(tool_calls)} tool calls. Executing through GVM proxy...{RESET}")
 
-    audit_log = []
-
-    for i, tc in enumerate(tool_calls, 1):
-        tool_name = tc["name"]
-        tool_args = tc["args"]
-
-        print(f"  {BOLD}[{i}]{RESET} {tool_name}({DIM}{_format_args(tool_args)}{RESET})")
-
-        t0 = time.time()
-        tool_fn = tool_map.get(tool_name)
+    # Execute each tool
+    for tc in tool_calls:
+        tool_fn = tool_map.get(tc["name"])
         if tool_fn:
-            result = tool_fn.invoke(tool_args)
-        else:
-            result = f"Unknown tool: {tool_name}"
-        elapsed = (time.time() - t0) * 1000
+            tool_fn.invoke(tc["args"])
 
-        # Determine outcome
-        if "[GVM BLOCKED]" in str(result):
-            icon = f"{RED}\u2717{RESET}"
-            decision = f"{RED}Deny{RESET}"
-            audit_log.append((tool_name, "Deny", elapsed))
-        elif elapsed > 250:  # IC-2 delay detected
-            icon = f"{YELLOW}\u23f1{RESET}"
-            decision = f"{YELLOW}Delay {elapsed:.0f}ms{RESET}"
-            audit_log.append((tool_name, f"Delay {elapsed:.0f}ms", elapsed))
-        else:
-            icon = f"{GREEN}\u2713{RESET}"
-            decision = f"{GREEN}Allow{RESET}"
-            audit_log.append((tool_name, "Allow", elapsed))
+    # ── Render Full Dashboard ──
+    _print_execution_log(tool_calls, llm_elapsed)
 
-        print(f"      {icon} {decision} ({elapsed:.0f}ms) — {DIM}{result[:80]}{RESET}")
-        print()
-
-    # ── Audit Summary ──
-    print(f"{BOLD}{'-' * 68}{RESET}")
+    print(f"{'━' * WIDTH}")
+    _print_governance_summary()
     print()
-    print(f"  {BOLD}Governance Audit{RESET}")
-    print()
-    print(f"  {'Tool':<20} {'GVM Decision':<20} {'Latency':<10}")
-    print(f"  {'-' * 20} {'-' * 20} {'-' * 10}")
 
-    for name, decision, ms in audit_log:
-        if "Allow" in decision:
-            colored = f"{GREEN}{decision}{RESET}"
-        elif "Delay" in decision:
-            colored = f"{YELLOW}{decision}{RESET}"
-        else:
-            colored = f"{RED}{decision}{RESET}"
-        print(f"  {name:<20} {colored:<29} {ms:.0f}ms")
+    _print_latency_dashboard(llm_elapsed)
 
-    total_gvm = sum(ms for _, _, ms in audit_log)
-    denied = sum(1 for _, d, _ in audit_log if "Deny" in d)
-
+    # ── Conclusion ──
     print()
-    print(f"  {DIM}LLM reasoning:{RESET}  {llm_elapsed:.0f}ms")
-    print(f"  {DIM}Tool execution:{RESET} {total_gvm:.0f}ms total")
-    print(f"  {DIM}Actions blocked:{RESET} {RED}{denied}{RESET} / {len(audit_log)}")
-    print()
-    print(f"{BOLD}{'=' * 68}{RESET}")
-    print(f"  {BOLD}Claude tried to do everything the user asked.{RESET}")
-    print(f"  {BOLD}GVM blocked the dangerous actions — structurally, not behaviorally.{RESET}")
+    denied = sum(1 for tr in _tool_results if tr.decision in ("Deny", "RequireApproval"))
+    print(f"  {BOLD}Claude tried to execute all {len(tool_calls)} requested actions.{RESET}")
+    if denied > 0:
+        print(f"  {BOLD}GVM blocked {denied} dangerous action{'s' if denied > 1 else ''} "
+              f"— structurally, not behaviorally.{RESET}")
     print(f"  {DIM}The agent's code is unchanged. The proxy enforces governance.{RESET}")
-    print(f"{BOLD}{'=' * 68}{RESET}")
+    print(f"  {DIM}The agent cannot bypass, disable, or even see the enforcement.{RESET}")
+    print(f"{'━' * WIDTH}")
     print()
 
 

@@ -63,9 +63,17 @@ pub async fn proxy_handler(
             None,
         );
 
+        // Determine which layer won (max_strict picks the strictest)
+        let final_decision = max_strict(srr_decision.clone(), policy_decision.clone());
+        let source = if srr_decision.strictness() > policy_decision.strictness() {
+            ClassificationSource::SRR
+        } else {
+            ClassificationSource::ABAC
+        };
+
         Classification {
-            decision: max_strict(srr_decision, policy_decision),
-            source: ClassificationSource::Semantic,
+            decision: final_decision,
+            source,
             operation: Some(operation),
             matched_rule_id: matched_rule,
         }
@@ -80,7 +88,7 @@ pub async fn proxy_handler(
 
         Classification {
             decision: network_decision,
-            source: ClassificationSource::Network,
+            source: ClassificationSource::SRR,
             operation: None,
             matched_rule_id: None,
         }
@@ -119,12 +127,19 @@ pub async fn proxy_handler(
     // ── Step 4: Enforcement with EventStatus lifecycle ──
     let mut event = build_event(&classification, &gvm_headers, &target);
 
+    // Measure engine processing time (classification was already done above)
+    let engine_start = std::time::Instant::now();
+
     match &classification.decision {
         EnforcementDecision::Allow => {
             // Fast path: forward immediately, async ledger (IC-1, loss tolerated)
-            let response = forward_request(&state, request, &target).await;
+            let engine_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
+            let mut response = forward_request(&state, request, &target).await;
             event.status = EventStatus::Confirmed;
-            state.ledger.append_async(event).await;
+            state.ledger.append_async(event.clone()).await;
+            inject_gvm_response_headers(
+                response.headers_mut(), &event, &classification, engine_ms, 0,
+            );
             response
         }
 
@@ -143,8 +158,9 @@ pub async fn proxy_handler(
                 );
             }
 
+            let engine_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
             tokio::time::sleep(std::time::Duration::from_millis(*milliseconds)).await;
-            let response = forward_request(&state, request, &target).await;
+            let mut response = forward_request(&state, request, &target).await;
 
             // Update event status based on upstream response
             if response.status().is_success() {
@@ -156,6 +172,9 @@ pub async fn proxy_handler(
             }
             // Best-effort status update to WAL
             let _ = state.ledger.append_durable(&event).await;
+            inject_gvm_response_headers(
+                response.headers_mut(), &event, &classification, engine_ms, *milliseconds,
+            );
             response
         }
 
@@ -211,9 +230,13 @@ pub async fn proxy_handler(
 
         EnforcementDecision::Throttle { .. } => {
             // Rate limit already checked above. If we reach here, request is allowed.
-            let response = forward_request(&state, request, &target).await;
+            let engine_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
+            let mut response = forward_request(&state, request, &target).await;
             event.status = EventStatus::Confirmed;
-            state.ledger.append_async(event).await;
+            state.ledger.append_async(event.clone()).await;
+            inject_gvm_response_headers(
+                response.headers_mut(), &event, &classification, engine_ms, 0,
+            );
             response
         }
 
@@ -224,7 +247,8 @@ pub async fn proxy_handler(
                 tracing::error!(error = %e, "WAL write failed for AuditOnly event");
             }
 
-            let response = forward_request(&state, request, &target).await;
+            let engine_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
+            let mut response = forward_request(&state, request, &target).await;
 
             event.status = if response.status().is_success() {
                 EventStatus::Confirmed
@@ -241,7 +265,53 @@ pub async fn proxy_handler(
                     "Critical audit event — operator notification required"
                 );
             }
+            inject_gvm_response_headers(
+                response.headers_mut(), &event, &classification, engine_ms, 0,
+            );
             response
+        }
+    }
+}
+
+/// Inject GVM metadata headers into the response so clients can inspect
+/// the enforcement decision without parsing the body.
+fn inject_gvm_response_headers(
+    headers: &mut axum::http::HeaderMap,
+    event: &GVMEvent,
+    classification: &Classification,
+    engine_ms: f64,
+    safety_delay_ms: u64,
+) {
+    let decision_str = format!("{:?}", classification.decision);
+    let source_str = match classification.source {
+        ClassificationSource::ABAC => "ABAC",
+        ClassificationSource::SRR => "SRR",
+    };
+
+    // Always inject these headers
+    if let Ok(v) = axum::http::HeaderValue::from_str(&decision_str) {
+        headers.insert("X-GVM-Decision", v);
+    }
+    if let Ok(v) = axum::http::HeaderValue::from_str(source_str) {
+        headers.insert("X-GVM-Decision-Source", v);
+    }
+    if let Ok(v) = axum::http::HeaderValue::from_str(&event.event_id) {
+        headers.insert("X-GVM-Event-Id", v);
+    }
+    if let Ok(v) = axum::http::HeaderValue::from_str(&event.trace_id) {
+        headers.insert("X-GVM-Trace-Id", v);
+    }
+    if let Ok(v) = axum::http::HeaderValue::from_str(&format!("{:.1}", engine_ms)) {
+        headers.insert("X-GVM-Engine-Ms", v);
+    }
+    if safety_delay_ms > 0 {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&safety_delay_ms.to_string()) {
+            headers.insert("X-GVM-Safety-Delay-Ms", v);
+        }
+    }
+    if let Some(ref rule_id) = classification.matched_rule_id {
+        if let Ok(v) = axum::http::HeaderValue::from_str(rule_id) {
+            headers.insert("X-GVM-Matched-Rule", v);
         }
     }
 }
@@ -325,8 +395,8 @@ fn build_event(
         decision_source: format!("{:?}", classification.source),
         matched_rule_id: classification.matched_rule_id.clone(),
         enforcement_point: match classification.source {
-            ClassificationSource::Semantic => "both".to_string(),
-            ClassificationSource::Network => "proxy".to_string(),
+            ClassificationSource::ABAC => "both".to_string(),
+            ClassificationSource::SRR => "proxy".to_string(),
         },
         status: EventStatus::Pending,
         payload: PayloadDescriptor::default(),
