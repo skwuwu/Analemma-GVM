@@ -590,6 +590,7 @@ milliseconds = 300
         ledger,
         vault,
         rate_limiter,
+        wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         http_client,
         host_overrides: std::collections::HashMap::new(),
     };

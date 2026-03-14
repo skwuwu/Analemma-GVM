@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/gvm-types", "crates/gvm-cli"]
+members = [".", "crates/gvm-types", "crates/gvm-cli", "crates/gvm-engine"]
 resolver = "2"
 
 [package]
@@ -35,6 +35,8 @@ anyhow = "1"
 thiserror = "1"
 hex = "0.4"
 zeroize = { version = "1", features = ["derive"] }
+wasmtime = "29"
+gvm-engine = { path = "crates/gvm-engine" }
 
 [dev-dependencies]
 tempfile = "3"

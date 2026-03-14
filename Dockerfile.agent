@@ -1,0 +1,42 @@
+# GVM Agent Container — Layer 3: OS-Level Containment
+#
+# This container isolates AI agents so they can ONLY communicate through
+# the GVM proxy. Direct API access is blocked by Docker network rules.
+#
+# Security properties:
+# - Agent cannot reach external APIs directly (network isolation)
+# - Agent can only reach gvm-proxy on the gvm-internal network
+# - No host filesystem access (read-only root, tmpfs for /tmp)
+# - No privilege escalation (no-new-privileges, non-root user)
+# - Resource limits enforced by Docker (CPU, memory)
+#
+# Usage:
+#   gvm run --image my-agent:latest
+#   # or manually:
+#   docker run --network gvm-internal --env HTTP_PROXY=http://gvm-proxy:8080 my-agent
+
+FROM python:3.12-slim
+
+# Create non-root user for agent execution
+RUN groupadd -r gvm-agent && useradd -r -g gvm-agent -d /home/agent -m agent
+
+# Install GVM Python SDK
+COPY sdk/python/ /opt/gvm-sdk/
+RUN pip install --no-cache-dir /opt/gvm-sdk/ && \
+    rm -rf /opt/gvm-sdk/
+
+# Set proxy environment — all HTTP traffic routes through GVM proxy
+ENV HTTP_PROXY=http://gvm-proxy:8080
+ENV HTTPS_PROXY=http://gvm-proxy:8080
+ENV http_proxy=http://gvm-proxy:8080
+ENV https_proxy=http://gvm-proxy:8080
+
+# Agent workspace
+WORKDIR /home/agent/workspace
+
+# Switch to non-root user
+USER agent
+
+# Default: run the agent script mounted at /home/agent/workspace/agent.py
+ENTRYPOINT ["python"]
+CMD ["agent.py"]

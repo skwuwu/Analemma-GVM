@@ -6,6 +6,7 @@ use crate::registry::OperationRegistry;
 use crate::srr::NetworkSRR;
 use crate::types::*;
 use crate::vault::Vault;
+use crate::wasm_engine::WasmEngine;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Request, Response, StatusCode, Uri};
@@ -22,6 +23,8 @@ pub struct AppState {
     pub ledger: Arc<Ledger>,
     pub vault: Arc<Vault>,
     pub rate_limiter: Arc<RateLimiter>,
+    /// Layer 1: Wasm governance engine (immutable policy sandbox)
+    pub wasm_engine: Arc<WasmEngine>,
     pub http_client: hyper_util::client::legacy::Client<
         hyper_util::client::legacy::connect::HttpConnector,
         Body,

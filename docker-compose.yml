@@ -1,3 +1,16 @@
+# Analemma GVM — 3-Layer Security Architecture
+#
+# Layer 1: Governance Engine (Wasm sandbox inside proxy)
+# Layer 2: Enforcement Point (gvm-proxy)
+# Layer 3: Containment (Docker network isolation)
+#
+# Network topology:
+#   gvm-external: proxy ↔ internet (outbound API calls)
+#   gvm-internal: proxy ↔ agents (agents CANNOT reach external)
+#
+# Agents on gvm-internal can ONLY talk to gvm-proxy.
+# All external API calls are forced through the governance pipeline.
+
 services:
   gvm-proxy:
     build: .
@@ -11,6 +24,10 @@ services:
       - GVM_CONFIG=/app/config/proxy.toml
     depends_on:
       - nats
+    networks:
+      - gvm-external
+      - gvm-internal
+    restart: unless-stopped
 
   nats:
     image: nats:2-alpine
@@ -20,7 +37,45 @@ services:
       - "8222:8222"
     volumes:
       - nats-data:/data
+    networks:
+      - gvm-external
+    restart: unless-stopped
+
+  # Example: run a contained agent
+  # Uncomment and customize, or use `gvm run` CLI command.
+  #
+  # agent:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.agent
+  #   volumes:
+  #     - ./my_agent:/home/agent/workspace:ro
+  #   environment:
+  #     - GVM_AGENT_ID=my-agent-001
+  #     - HTTP_PROXY=http://gvm-proxy:8080
+  #     - HTTPS_PROXY=http://gvm-proxy:8080
+  #   networks:
+  #     - gvm-internal
+  #   depends_on:
+  #     - gvm-proxy
+  #   read_only: true
+  #   tmpfs:
+  #     - /tmp
+  #   security_opt:
+  #     - no-new-privileges:true
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         cpus: "1.0"
+  #         memory: 512M
 
 volumes:
   gvm-data:
   nats-data:
+
+networks:
+  gvm-external:
+    driver: bridge
+  gvm-internal:
+    driver: bridge
+    internal: true   # No external connectivity — agents are jailed

@@ -4,6 +4,7 @@ mod check;
 mod demo;
 mod events;
 mod init;
+mod run;
 mod ui;
 
 #[derive(Parser)]
@@ -41,6 +42,36 @@ enum Commands {
         /// Config output directory
         #[arg(long, default_value = "config")]
         config_dir: String,
+    },
+
+    /// Run an agent inside a GVM containment container (Layer 3)
+    Run {
+        /// Path to agent script (e.g. agent.py)
+        script: String,
+
+        /// Agent ID for audit trail
+        #[arg(long, default_value = "agent-001")]
+        agent_id: String,
+
+        /// GVM proxy URL (inside Docker network)
+        #[arg(long, default_value = "http://gvm-proxy:8080")]
+        proxy: String,
+
+        /// Docker image to use
+        #[arg(long, default_value = "python:3.12-slim")]
+        image: String,
+
+        /// Memory limit
+        #[arg(long, default_value = "512m")]
+        memory: String,
+
+        /// CPU limit
+        #[arg(long, default_value = "1.0")]
+        cpus: String,
+
+        /// Run in background (detached)
+        #[arg(long)]
+        detach: bool,
     },
 
     /// Dry-run policy check without calling external APIs
@@ -136,6 +167,18 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Demo { proxy, mock_port } => {
             demo::run_demo(&proxy, mock_port).await?;
+        }
+
+        Commands::Run {
+            script,
+            agent_id,
+            proxy,
+            image,
+            memory,
+            cpus,
+            detach,
+        } => {
+            run::run_agent(&script, &agent_id, &proxy, &image, &memory, &cpus, detach).await?;
         }
 
         Commands::Check {

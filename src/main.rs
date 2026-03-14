@@ -1,24 +1,14 @@
-mod api;
-mod api_keys;
-mod config;
-mod ledger;
-mod policy;
-mod proxy;
-mod rate_limiter;
-mod registry;
-mod srr;
-mod types;
-mod vault;
-
-use crate::api_keys::APIKeyStore;
-use crate::config::ProxyConfig;
-use crate::ledger::Ledger;
-use crate::policy::PolicyEngine;
-use crate::proxy::{proxy_handler, AppState};
-use crate::rate_limiter::RateLimiter;
-use crate::registry::OperationRegistry;
-use crate::srr::NetworkSRR;
-use crate::vault::Vault;
+use gvm_proxy::api;
+use gvm_proxy::api_keys::APIKeyStore;
+use gvm_proxy::config::ProxyConfig;
+use gvm_proxy::ledger::Ledger;
+use gvm_proxy::policy::PolicyEngine;
+use gvm_proxy::proxy::{proxy_handler, AppState};
+use gvm_proxy::rate_limiter::RateLimiter;
+use gvm_proxy::registry::OperationRegistry;
+use gvm_proxy::srr::NetworkSRR;
+use gvm_proxy::vault::Vault;
+use gvm_proxy::wasm_engine::WasmEngine;
 use axum::Router;
 use std::path::Path;
 use std::sync::Arc;
@@ -141,6 +131,18 @@ async fn main() {
     let vault = Vault::new(ledger.clone()).expect("Failed to initialize vault");
     tracing::info!("Vault initialized");
 
+    // 8.5. Initialize Wasm Governance Engine (Layer 1: Immutable Logic)
+    let wasm_engine = WasmEngine::load(Path::new("data/gvm_engine.wasm"))
+        .expect("Failed to initialize Wasm engine");
+    if wasm_engine.is_wasm() {
+        tracing::info!(
+            hash = %wasm_engine.module_hash.as_deref().unwrap_or("unknown"),
+            "Layer 1: Wasm governance engine ACTIVE (immutable sandbox)"
+        );
+    } else {
+        tracing::info!("Layer 1: Using native policy engine (Wasm module not loaded)");
+    }
+
     // 9. Build HTTP client for upstream forwarding
     let http_client =
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
@@ -174,6 +176,7 @@ async fn main() {
         ledger,
         vault: Arc::new(vault),
         rate_limiter: Arc::new(RateLimiter::new()),
+        wasm_engine: Arc::new(wasm_engine),
         http_client,
         host_overrides,
     };

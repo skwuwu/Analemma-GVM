@@ -12,3 +12,4 @@ pub mod registry;
 pub mod srr;
 pub mod types;
 pub mod vault;
+pub mod wasm_engine;
