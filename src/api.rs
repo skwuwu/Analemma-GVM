@@ -82,6 +82,102 @@ pub async fn vault_delete(
     }
 }
 
+// ─── Dry-Run Policy Check ───
+
+#[derive(Deserialize)]
+pub struct CheckRequest {
+    pub operation: String,
+    #[serde(default = "default_service")]
+    pub resource_service: Option<String>,
+    #[serde(default)]
+    pub resource: Option<serde_json::Value>,
+    #[serde(default = "default_host")]
+    pub target_host: String,
+    #[serde(default = "default_method")]
+    pub method: String,
+}
+
+fn default_service() -> Option<String> {
+    Some("unknown".to_string())
+}
+fn default_host() -> String {
+    "example.com".to_string()
+}
+fn default_method() -> String {
+    "POST".to_string()
+}
+
+/// POST /gvm/check — Dry-run policy evaluation. No forwarding, no WAL write, no API keys.
+pub async fn check(
+    State(state): State<AppState>,
+    Json(body): Json<CheckRequest>,
+) -> Response<Body> {
+    let t0 = std::time::Instant::now();
+
+    // Parse resource descriptor from JSON if provided
+    let resource: crate::types::ResourceDescriptor = body
+        .resource
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+
+    // Layer 1: ABAC policy evaluation
+    let operation = crate::types::OperationMetadata {
+        operation: body.operation.clone(),
+        resource: resource.clone(),
+        subject: crate::types::SubjectDescriptor {
+            agent_id: "dry-run".to_string(),
+            tenant_id: None,
+            session_id: "dry-run".to_string(),
+        },
+        context: crate::types::OperationContext {
+            attributes: Default::default(),
+        },
+        payload: crate::types::PayloadDescriptor::default(),
+    };
+    let (policy_decision, matched_rule) = state.policy.evaluate(&operation);
+
+    // Layer 2: Network SRR evaluation
+    let srr_decision = state.srr.check(&body.method, &body.target_host, "/", None);
+
+    // Combined decision
+    let decision = crate::types::max_strict(srr_decision, policy_decision);
+    let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let (decision_str, next_action) = match &decision {
+        crate::types::EnforcementDecision::Allow => ("Allow".to_string(), None),
+        crate::types::EnforcementDecision::Delay { milliseconds } => (
+            format!("Delay {}ms", milliseconds),
+            Some(format!("Request will be delayed {}ms before forwarding", milliseconds)),
+        ),
+        crate::types::EnforcementDecision::RequireApproval { .. } => (
+            "RequireApproval".to_string(),
+            Some("Administrator approval required before execution".to_string()),
+        ),
+        crate::types::EnforcementDecision::Deny { .. } => (
+            "Deny".to_string(),
+            Some("This operation is blocked by policy. Contact your administrator.".to_string()),
+        ),
+        _ => (format!("{:?}", decision), None),
+    };
+
+    let mut resp = serde_json::json!({
+        "decision": decision_str,
+        "engine_ms": (elapsed * 10.0).round() / 10.0,
+        "operation": body.operation,
+        "method": body.method,
+        "target_host": body.target_host,
+        "matched_rule": matched_rule,
+        "dry_run": true,
+    });
+
+    if let Some(action) = &next_action {
+        resp["next_action"] = serde_json::Value::String(action.clone());
+    }
+
+    json_response(StatusCode::OK, &resp)
+}
+
 // ─── Health / Admin Endpoints ───
 
 /// GET /gvm/health — Liveness check

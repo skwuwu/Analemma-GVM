@@ -38,13 +38,8 @@ async fn main() {
 
     tracing::info!("Analemma GVM Proxy v0.1.0 starting...");
 
-    // 1. Load configuration
-    let config_path =
-        std::env::var("GVM_CONFIG").unwrap_or_else(|_| "config/proxy.toml".to_string());
-    let config =
-        ProxyConfig::load(Path::new(&config_path)).expect("Failed to load proxy configuration");
-
-    tracing::info!(listen = %config.server.listen, "Configuration loaded");
+    // 1. Load configuration (tries GVM_CONFIG env, CWD, home dir, then defaults)
+    let config = ProxyConfig::load_or_default();
 
     // 2. Load Operation Registry (Fail-Close: invalid registry → panic)
     let registry = OperationRegistry::load(Path::new(&config.operations.registry_file))
@@ -140,6 +135,7 @@ async fn main() {
     let app = Router::new()
         .route("/gvm/health", axum::routing::get(api::health))
         .route("/gvm/info", axum::routing::get(api::info))
+        .route("/gvm/check", axum::routing::post(api::check))
         .route(
             "/gvm/vault/:key",
             axum::routing::put(api::vault_write)

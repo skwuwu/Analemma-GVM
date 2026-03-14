@@ -1,0 +1,34 @@
+# GVM Proxy — Finance Template
+# Strict enforcement for banking/payment operations.
+
+[server]
+listen = "0.0.0.0:8080"
+
+[enforcement]
+default_decision = { type = "Delay", milliseconds = 500 }
+ic1_async_ledger = true
+ic1_loss_threshold = 0.0001
+
+[nats]
+url = "nats://127.0.0.1:4222"
+stream = "gvm-audit-finance"
+max_age_days = 2555
+
+[redis]
+url = "redis://127.0.0.1:6379"
+
+[srr]
+network_file = "config/templates/finance/srr_network.toml"
+semantic_file = "config/srr_semantic.toml"
+hot_reload = true
+
+[policies]
+directory = "config/templates/finance/policies/"
+hot_reload = true
+
+[operations]
+registry_file = "config/templates/finance/operation_registry.toml"
+
+[secrets]
+file = "config/secrets.toml"
+key_env = "GVM_SECRETS_KEY"

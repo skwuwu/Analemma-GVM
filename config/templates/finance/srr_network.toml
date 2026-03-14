@@ -1,0 +1,47 @@
+# Network SRR rules — Finance template
+# Strict: block transfers, deny dangerous endpoints, delay everything else.
+
+[[rules]]
+method = "POST"
+pattern = "api.bank.com/transfer/{any}"
+decision = { type = "Deny", reason = "Wire transfer requires offline authorization" }
+description = "Block all wire transfers"
+
+[[rules]]
+method = "POST"
+pattern = "{host}.stripe.com/{any}"
+decision = { type = "Deny", reason = "Direct Stripe calls are prohibited — use approved payment gateway" }
+description = "Block direct Stripe API calls"
+
+[[rules]]
+method = "POST"
+pattern = "api.plaid.com/{any}"
+decision = { type = "Deny", reason = "Plaid API calls require pre-authorization" }
+description = "Block Plaid API calls"
+
+[[rules]]
+method = "DELETE"
+pattern = "{any}"
+decision = { type = "Deny", reason = "DELETE operations are not permitted in finance mode" }
+description = "Block all DELETE requests"
+
+[[rules]]
+method = "POST"
+pattern = "api.bank.com/graphql"
+payload_field = "operationName"
+payload_match = ["TransferFunds", "DeleteAccount", "ModifyPermissions", "OverrideLimit"]
+max_body_bytes = 65536
+decision = { type = "Deny", reason = "Dangerous GraphQL operation" }
+description = "Block high-risk GraphQL mutations"
+
+[[rules]]
+method = "GET"
+pattern = "{any}"
+decision = { type = "Allow" }
+description = "Allow all GET requests (read-only)"
+
+[[rules]]
+method = "*"
+pattern = "{any}"
+decision = { type = "Delay", milliseconds = 500 }
+description = "Default: 500ms delay for review"

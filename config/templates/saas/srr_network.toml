@@ -1,0 +1,32 @@
+# Network SRR rules — SaaS template
+# Allow reads, delay sends, block dangerous operations.
+
+[[rules]]
+method = "DELETE"
+pattern = "{host}.database.com/{any}"
+decision = { type = "Deny", reason = "Database deletion blocked" }
+description = "Block database deletions"
+
+[[rules]]
+method = "GET"
+pattern = "{any}"
+decision = { type = "Allow" }
+description = "Allow all GET requests"
+
+[[rules]]
+method = "POST"
+pattern = "api.slack.com/{any}"
+decision = { type = "Delay", milliseconds = 300 }
+description = "Delay Slack messages for review"
+
+[[rules]]
+method = "POST"
+pattern = "gmail.googleapis.com/{any}"
+decision = { type = "Delay", milliseconds = 300 }
+description = "Delay email sends for review"
+
+[[rules]]
+method = "*"
+pattern = "{any}"
+decision = { type = "Delay", milliseconds = 300 }
+description = "Default: 300ms delay"

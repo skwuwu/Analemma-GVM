@@ -154,32 +154,95 @@ Any request that doesn't match a known rule gets a 300ms delay (not Allow, not D
 
 ---
 
-## Quick Start
+## Quick Start (5 minutes)
+
+### 1. Install
+
+```bash
+# Proxy (Rust)
+git clone https://github.com/skwuwu/Analemma-GVM.git
+cd Analemma-GVM
+cargo build --release
+
+# SDK (Python)
+pip install -e sdk/python
+```
+
+### 2. Start the proxy
+
+```bash
+cargo run
+# Or with Docker:
+# docker compose up
+```
+
+### 3. Run the demo
+
+```bash
+# LangChain + Gmail E2E demo (30 seconds)
+python -m gvm.langchain_demo
+```
+
+Output:
+```
+[Step 1] read_inbox()     → Allow  (IC-1, 3ms)
+[Step 2] send_email()     → Delay  (IC-2, 310ms)
+[Step 3] wire_transfer()  → Deny   (SRR, 4ms)
+[Step 4] delete_emails()  → Deny   (ABAC, 3ms)
+```
+
+### 4. Write your own agent (10 lines)
+
+```python
+from gvm import GVMAgent, ic, Resource
+
+class MyAgent(GVMAgent):
+    @ic(operation="gvm.messaging.send",
+        resource=Resource(service="slack", tier="customer-facing"))
+    def notify(self, channel: str, msg: str):
+        session = self.create_session()
+        return session.post(f"http://api.slack.com/post/{channel}",
+                           json={"text": msg}).json()
+
+agent = MyAgent(agent_id="my-agent", tenant_id="my-org")
+agent.notify("#alerts", "Deploy complete")
+# → Delayed 300ms by proxy, then forwarded. Audit trail recorded.
+```
+
+**What happened**: Your agent's HTTP request was transparently routed through the GVM proxy. The proxy classified the operation, applied policy (300ms delay for customer-facing messaging), injected API credentials, forwarded the request, and recorded the event in the WAL — all without any changes to your agent code.
+
+### Industry templates
+
+```bash
+# Finance (strict: payments IC-3, transfers denied)
+GVM_CONFIG=config/templates/finance/proxy.toml cargo run
+
+# SaaS (balanced: reads IC-1, sends IC-2, exports IC-3)
+GVM_CONFIG=config/templates/saas/proxy.toml cargo run
+```
+
+### CLI tools
+
+```bash
+# List recent events
+cargo run -p gvm-cli -- events list --wal-file data/wal.log --last 1h
+
+# Trace a specific request chain
+cargo run -p gvm-cli -- events trace --trace-id <id> --wal-file data/wal.log
+```
+
+### Run tests
+
+```bash
+cargo test --workspace   # 41 tests
+```
+
+---
 
 ### Prerequisites
 
-- Rust 1.70+
+- Rust 1.75+
 - Python 3.9+ (for SDK)
-
-### Run
-
-```bash
-# Start the proxy
-cargo run
-
-# Run all tests (60 tests)
-cargo test
-
-# Run hostile environment tests
-cargo test --test hostile
-
-# Python SDK demo (with proxy running)
-cd sdk/python
-python -m gvm.demo
-
-# Python hostile tests (with proxy down for Fail-Close)
-python -m gvm.hostile_demo
-```
 
 ---
 
@@ -204,7 +267,7 @@ The full technical whitepaper is in [`docs/`](docs/):
 
 ## Test Coverage
 
-60 tests. Zero failures.
+41 tests across 3 crates. Zero failures.
 
 | Category | Count |
 |----------|-------|
@@ -212,8 +275,9 @@ The full technical whitepaper is in [`docs/`](docs/):
 | Unit: ABAC Policy Engine | 4 |
 | Unit: Network SRR | 10 |
 | Unit: Encrypted Vault | 7 |
-| Integration: Hostile Environment | 10 |
-| **Total** | **60** (25 lib + 25 bin + 10 integration) |
+| Hostile Environment | 11 |
+| Integration (E2E) | 5 |
+| **Total** | **41** |
 
 ---
 
@@ -223,7 +287,7 @@ Analemma-GVM is the kernel. The vision is an **Agentic Operating System** — a 
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| **v0.1 — Kernel** | 3-layer enforcement, WAL ledger, encrypted vault, Python SDK | Done |
+| **v0.1 — Kernel** | 3-layer enforcement, WAL ledger, encrypted vault, Python SDK, LangChain demo, CLI | Done |
 | **v0.2 — Multi-Agent** | Agent identity management, inter-agent communication governance, session isolation | Planned |
 | **v0.3 — Approval Workflows** | Human-in-the-loop approval UI, escalation chains, SLA-based auto-expiry | Planned |
 | **v0.4 — Observability** | Real-time enforcement dashboard, anomaly detection, cost attribution per agent | Planned |

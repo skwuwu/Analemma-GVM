@@ -1,0 +1,116 @@
+# Operation Registry — schema-backed operation definitions (PART 1.7)
+# Core operations are platform-defined. Custom operations are vendor-defined.
+
+# ── Core Operations (platform-defined, immutable) ──
+
+[[core]]
+name = "gvm.messaging.send"
+description = "Send a message to an external recipient"
+version = 1
+status = "stable"
+default_ic = 2
+required_context = ["recipient", "channel"]
+semantic_contract = "Deliver text/media to external recipient. recipient and channel are the key policy inputs."
+
+[[core]]
+name = "gvm.messaging.read"
+description = "Read messages/mailbox"
+version = 1
+status = "stable"
+default_ic = 1
+required_context = ["source"]
+semantic_contract = "Read-only mailbox query. Default IC-1, but may be promoted based on source sensitivity."
+
+[[core]]
+name = "gvm.payment.charge"
+description = "Execute a payment"
+version = 1
+status = "stable"
+default_ic = 3
+required_context = ["amount", "currency"]
+semantic_contract = "Execute financial transaction. amount and currency are the key policy inputs."
+
+[[core]]
+name = "gvm.payment.refund"
+description = "Execute a refund"
+version = 1
+status = "stable"
+default_ic = 3
+required_context = ["amount", "currency", "original_transaction_id"]
+semantic_contract = "Refund an existing payment. Financial transaction, IC-3. amount is the key policy input."
+
+[[core]]
+name = "gvm.storage.read"
+description = "Read file/DB"
+version = 1
+status = "stable"
+default_ic = 1
+required_context = []
+semantic_contract = "Data query. Read-only, default IC-1. Repeated reads of critical data are monitored."
+
+[[core]]
+name = "gvm.storage.write"
+description = "Write file/DB"
+version = 1
+status = "stable"
+default_ic = 2
+required_context = []
+semantic_contract = "Data create or modify. Compensable (snapshot previous value), default IC-2."
+
+[[core]]
+name = "gvm.storage.delete"
+description = "Delete file/DB"
+version = 1
+status = "stable"
+default_ic = 3
+required_context = []
+semantic_contract = "Permanent data deletion. Combined with sensitivity to determine IC."
+
+[[core]]
+name = "gvm.data.export"
+description = "Export data to external system"
+version = 1
+status = "stable"
+default_ic = 3
+required_context = ["destination", "data_classification"]
+semantic_contract = "Transfer internal data externally. Data exfiltration risk, default IC-3."
+
+[[core]]
+name = "gvm.identity.modify"
+description = "Modify account/permissions"
+version = 1
+status = "stable"
+default_ic = 3
+required_context = ["target_identity", "modification_type"]
+semantic_contract = "Create/modify/delete user accounts, roles, permissions. Privilege escalation risk, default IC-3."
+
+[[core]]
+name = "gvm.system.execute"
+description = "Execute system command/code"
+version = 1
+status = "stable"
+default_ic = 3
+required_context = ["command_type"]
+semantic_contract = "Shell commands, code execution, process creation. Arbitrary code execution risk, default IC-3."
+
+# ── Custom Operations (vendor-defined, vendor prefix required) ──
+
+[[custom]]
+name = "custom.acme.banking.wire_transfer"
+description = "Interbank wire transfer"
+vendor = "acme"
+version = 1
+status = "stable"
+default_ic = 3
+required_context = ["amount", "currency", "destination_bank"]
+maps_to = "gvm.payment.charge"
+
+[[custom]]
+name = "custom.acme.crm.email_customer"
+description = "Send email to CRM customer"
+vendor = "acme"
+version = 1
+status = "stable"
+default_ic = 2
+required_context = ["recipient"]
+maps_to = "gvm.messaging.send"

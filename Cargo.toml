@@ -1,9 +1,17 @@
+[workspace]
+members = [".", "crates/gvm-types", "crates/gvm-cli"]
+resolver = "2"
+
 [package]
 name = "gvm-proxy"
 version = "0.1.0"
 edition = "2021"
+description = "Analemma Governance Virtual Machine — AI agent enforcement proxy"
+license = "Apache-2.0"
+repository = "https://github.com/skwuwu/Analemma-GVM"
 
 [dependencies]
+gvm-types = { path = "crates/gvm-types" }
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
 tower = { version = "0.4", features = ["limit", "util"] }

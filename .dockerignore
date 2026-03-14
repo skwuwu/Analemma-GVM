@@ -1,0 +1,8 @@
+target/
+.git/
+data/
+sdk/
+docs/
+*.md
+.env*
+.claude/

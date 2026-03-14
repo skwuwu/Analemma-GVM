@@ -4,10 +4,49 @@
 class GVMError(Exception):
     """Base exception for all GVM enforcement errors."""
 
-    def __init__(self, message: str, status_code: int = None, event_id: str = None):
+    def __init__(
+        self,
+        message: str,
+        status_code: int = None,
+        event_id: str = None,
+        next_action: str = None,
+        retry_after: int = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
         self.event_id = event_id
+        self.next_action = next_action
+        self.retry_after = retry_after
+
+    @classmethod
+    def from_response(cls, resp_json: dict, status_code: int = None):
+        """Create the appropriate GVMError subclass from a proxy error response."""
+        decision = resp_json.get("decision", "")
+        error_msg = resp_json.get("error", "Unknown error")
+        event_id = resp_json.get("event_id")
+        next_action = resp_json.get("next_action")
+        retry_after = resp_json.get("retry_after")
+
+        if decision == "RequireApproval":
+            err = GVMApprovalRequiredError(
+                urgency=error_msg, status_code=status_code, event_id=event_id
+            )
+        elif decision == "Deny":
+            err = GVMDeniedError(
+                reason=error_msg, status_code=status_code, event_id=event_id
+            )
+        elif decision == "Throttle" or status_code == 429:
+            err = GVMRateLimitError(
+                status_code=status_code, event_id=event_id
+            )
+        else:
+            err = cls(
+                message=error_msg, status_code=status_code, event_id=event_id
+            )
+
+        err.next_action = next_action
+        err.retry_after = retry_after
+        return err
 
 
 class GVMDeniedError(GVMError):

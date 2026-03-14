@@ -4,7 +4,7 @@ Analemma-GVM-architecture-*
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is tracked for reproducible builds (binary project)
 
 # IDE
 .idea/

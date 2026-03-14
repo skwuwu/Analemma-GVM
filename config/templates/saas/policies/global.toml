@@ -1,0 +1,68 @@
+# SaaS Global Policy — balanced enforcement.
+# Customer-facing comms delayed, data export controlled, reads allowed.
+
+[[rules]]
+id = "saas-data-export-approval"
+priority = 1
+layer = "Global"
+description = "Data exports require approval"
+decision = { type = "RequireApproval", urgency = "Standard" }
+[[rules.conditions]]
+field = "operation"
+operator = "Eq"
+value = "gvm.data.export"
+
+[[rules]]
+id = "saas-identity-modify-approval"
+priority = 2
+layer = "Global"
+description = "Account/permission changes require approval"
+decision = { type = "RequireApproval", urgency = "Immediate" }
+[[rules.conditions]]
+field = "operation"
+operator = "Eq"
+value = "gvm.identity.modify"
+
+[[rules]]
+id = "saas-delete-deny"
+priority = 3
+layer = "Global"
+description = "Critical data deletion is forbidden"
+decision = { type = "Deny", reason = "Critical data deletion is not permitted" }
+[[rules.conditions]]
+field = "operation"
+operator = "Eq"
+value = "gvm.storage.delete"
+[[rules.conditions]]
+field = "resource.sensitivity"
+operator = "Eq"
+value = "Critical"
+
+[[rules]]
+id = "saas-customer-facing-delay"
+priority = 10
+layer = "Global"
+description = "Customer-facing operations get 300ms review window"
+decision = { type = "Delay", milliseconds = 300 }
+[[rules.conditions]]
+field = "resource.tier"
+operator = "Eq"
+value = "CustomerFacing"
+
+[[rules]]
+id = "saas-read-allow"
+priority = 100
+layer = "Global"
+description = "Read operations are allowed (IC-1)"
+decision = { type = "Allow" }
+[[rules.conditions]]
+field = "operation"
+operator = "EndsWith"
+value = ".read"
+
+[[rules]]
+id = "saas-fallback"
+priority = 999
+layer = "Global"
+description = "Default: delay 300ms (Fail-Close)"
+decision = { type = "Delay", milliseconds = 300 }

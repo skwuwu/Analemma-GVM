@@ -81,6 +81,49 @@ pub struct SecretsConfig {
     pub key_env: String,
 }
 
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+            },
+            enforcement: EnforcementConfig {
+                default_decision: DefaultDecisionConfig {
+                    decision_type: "Delay".to_string(),
+                    milliseconds: Some(300),
+                },
+                ic1_async_ledger: true,
+                ic1_loss_threshold: 0.001,
+            },
+            nats: NatsConfig {
+                url: "nats://127.0.0.1:4222".to_string(),
+                stream: "gvm-audit".to_string(),
+                max_age_days: 2555,
+            },
+            redis: RedisConfig {
+                url: "redis://127.0.0.1:6379".to_string(),
+            },
+            srr: SrrConfig {
+                network_file: "config/srr_network.toml".to_string(),
+                semantic_file: "config/srr_semantic.toml".to_string(),
+                hot_reload: true,
+            },
+            policies: PoliciesConfig {
+                directory: "config/policies/".to_string(),
+                hot_reload: true,
+            },
+            operations: OperationsConfig {
+                registry_file: "config/operation_registry.toml".to_string(),
+            },
+            secrets: SecretsConfig {
+                file: "config/secrets.toml".to_string(),
+                key_env: "GVM_SECRETS_KEY".to_string(),
+            },
+            dev: None,
+        }
+    }
+}
+
 impl ProxyConfig {
     /// Load proxy configuration from a TOML file.
     pub fn load(path: &Path) -> Result<Self> {
@@ -90,4 +133,37 @@ impl ProxyConfig {
             .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
         Ok(config)
     }
+
+    /// Try loading config from multiple locations, falling back to defaults.
+    pub fn load_or_default() -> Self {
+        let candidates = [
+            std::env::var("GVM_CONFIG").ok(),
+            Some("config/proxy.toml".to_string()),
+            dirs_home().map(|h| format!("{}/.config/gvm/proxy.toml", h)),
+        ];
+
+        for candidate in candidates.iter().flatten() {
+            let path = Path::new(candidate);
+            if path.exists() {
+                match Self::load(path) {
+                    Ok(config) => {
+                        tracing::info!(path = %path.display(), "Configuration loaded");
+                        return config;
+                    }
+                    Err(e) => {
+                        tracing::error!(path = %path.display(), error = %e, "Failed to load config");
+                    }
+                }
+            }
+        }
+
+        tracing::warn!("No config file found — using built-in defaults (listen 0.0.0.0:8080)");
+        Self::default()
+    }
+}
+
+fn dirs_home() -> Option<String> {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
 }

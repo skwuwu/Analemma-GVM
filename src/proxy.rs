@@ -105,7 +105,14 @@ pub async fn proxy_handler(
     // ── Step 3: Rate Limit check ──
     if let EnforcementDecision::Throttle { max_per_minute } = &classification.decision {
         if !state.rate_limiter.check(agent_id, *max_per_minute) {
-            return error_response(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded");
+            return error_response_detailed(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Rate limit exceeded",
+                Some("Throttle"),
+                None,
+                Some("Wait and retry after the rate limit window resets"),
+                Some(60),
+            );
         }
     }
 
@@ -126,9 +133,13 @@ pub async fn proxy_handler(
             event.status = EventStatus::Pending;
             if let Err(e) = state.ledger.append_durable(&event).await {
                 tracing::error!(error = %e, "WAL write failed — rejecting request (Fail-Close)");
-                return error_response(
+                return error_response_detailed(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Audit log unavailable — request rejected for safety",
+                    None,
+                    None,
+                    Some("Check proxy logs. The WAL ledger may be full or the disk may be unavailable."),
+                    None,
                 );
             }
 
@@ -161,12 +172,16 @@ pub async fn proxy_handler(
                 urgency = ?urgency,
                 "Request requires approval — blocked"
             );
-            error_response(
+            error_response_detailed(
                 StatusCode::FORBIDDEN,
                 &format!(
                     "IC-3: Administrator approval required (urgency: {:?})",
                     urgency
                 ),
+                Some("RequireApproval"),
+                Some(&event.event_id),
+                Some("Submit approval request to your GVM administrator"),
+                None,
             )
         }
 
@@ -184,7 +199,14 @@ pub async fn proxy_handler(
                 reason = %reason,
                 "Request denied by policy"
             );
-            error_response(StatusCode::FORBIDDEN, reason)
+            error_response_detailed(
+                StatusCode::FORBIDDEN,
+                reason,
+                Some("Deny"),
+                Some(&event.event_id),
+                Some("This operation is blocked by policy. Contact your GVM administrator to review the rule."),
+                None,
+            )
         }
 
         EnforcementDecision::Throttle { .. } => {
@@ -516,16 +538,46 @@ fn remove_gvm_headers(headers: &mut axum::http::HeaderMap) {
     }
 }
 
-/// Build a JSON error response
+/// Build a JSON error response with optional actionable details.
 fn error_response(status: StatusCode, message: &str) -> Response<Body> {
-    let body = serde_json::json!({
+    error_response_detailed(status, message, None, None, None, None)
+}
+
+fn error_response_detailed(
+    status: StatusCode,
+    message: &str,
+    decision: Option<&str>,
+    event_id: Option<&str>,
+    next_action: Option<&str>,
+    retry_after: Option<u64>,
+) -> Response<Body> {
+    let mut body = serde_json::json!({
         "error": message,
         "status": status.as_u16(),
     });
 
-    Response::builder()
+    if let Some(d) = decision {
+        body["decision"] = serde_json::Value::String(d.to_string());
+    }
+    if let Some(id) = event_id {
+        body["event_id"] = serde_json::Value::String(id.to_string());
+    }
+    if let Some(action) = next_action {
+        body["next_action"] = serde_json::Value::String(action.to_string());
+    }
+    if let Some(secs) = retry_after {
+        body["retry_after"] = serde_json::Value::Number(secs.into());
+    }
+
+    let mut builder = Response::builder()
         .status(status)
-        .header("Content-Type", "application/json")
+        .header("Content-Type", "application/json");
+
+    if let Some(secs) = retry_after {
+        builder = builder.header("Retry-After", secs.to_string());
+    }
+
+    builder
         .body(Body::from(body.to_string()))
         .unwrap_or_else(|_| {
             Response::builder()

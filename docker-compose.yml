@@ -1,0 +1,26 @@
+services:
+  gvm-proxy:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config:/app/config:ro
+      - gvm-data:/app/data
+    environment:
+      - RUST_LOG=info
+      - GVM_CONFIG=/app/config/proxy.toml
+    depends_on:
+      - nats
+
+  nats:
+    image: nats:2-alpine
+    command: ["--jetstream", "--store_dir", "/data"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - nats-data:/data
+
+volumes:
+  gvm-data:
+  nats-data:

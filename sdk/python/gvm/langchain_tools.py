@@ -79,16 +79,8 @@ def _check_response(resp):
 
     try:
         error_body = resp.json()
-        error_msg = error_body.get("error", f"HTTP {resp.status_code}")
     except Exception:
-        error_msg = f"HTTP {resp.status_code}"
+        raise GVMDeniedError(reason=f"HTTP {resp.status_code}", status_code=resp.status_code)
 
-    if resp.status_code == 403:
-        if "approval" in error_msg.lower():
-            raise GVMApprovalRequiredError(urgency="Immediate")
-        raise GVMDeniedError(reason=error_msg)
-    elif resp.status_code == 429:
-        from gvm.errors import GVMRateLimitError
-        raise GVMRateLimitError()
-    else:
-        raise GVMDeniedError(reason=error_msg, status_code=resp.status_code)
+    from gvm.errors import GVMError
+    raise GVMError.from_response(error_body, status_code=resp.status_code)
