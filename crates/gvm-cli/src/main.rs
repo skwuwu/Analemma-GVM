@@ -22,8 +22,11 @@ enum Commands {
         action: EventsAction,
     },
 
-    /// Run interactive demo (no API keys needed)
+    /// Run interactive demo: finance, assistant, devops, data
     Demo {
+        /// Scenario name (finance, assistant, devops, data)
+        scenario: Option<String>,
+
         /// Proxy URL
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         proxy: String,
@@ -44,7 +47,7 @@ enum Commands {
         config_dir: String,
     },
 
-    /// Run an agent inside a GVM containment container (Layer 3)
+    /// Run an agent through GVM governance (proxy + audit trail)
     Run {
         /// Path to agent script (e.g. agent.py)
         script: String,
@@ -53,23 +56,27 @@ enum Commands {
         #[arg(long, default_value = "agent-001")]
         agent_id: String,
 
-        /// GVM proxy URL (inside Docker network)
-        #[arg(long, default_value = "http://gvm-proxy:8080")]
+        /// GVM proxy URL
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
         proxy: String,
 
-        /// Docker image to use
+        /// Use Docker containment (Layer 3: network isolation)
+        #[arg(long)]
+        contained: bool,
+
+        /// Docker image (only with --contained)
         #[arg(long, default_value = "python:3.12-slim")]
         image: String,
 
-        /// Memory limit
+        /// Memory limit (only with --contained)
         #[arg(long, default_value = "512m")]
         memory: String,
 
-        /// CPU limit
+        /// CPU limit (only with --contained)
         #[arg(long, default_value = "1.0")]
         cpus: String,
 
-        /// Run in background (detached)
+        /// Run in background (only with --contained)
         #[arg(long)]
         detach: bool,
     },
@@ -165,20 +172,21 @@ async fn main() -> anyhow::Result<()> {
             init::run_init(&industry, &config_dir)?;
         }
 
-        Commands::Demo { proxy, mock_port } => {
-            demo::run_demo(&proxy, mock_port).await?;
+        Commands::Demo { scenario, proxy, mock_port } => {
+            demo::run_demo(&proxy, mock_port, scenario.as_deref()).await?;
         }
 
         Commands::Run {
             script,
             agent_id,
             proxy,
+            contained,
             image,
             memory,
             cpus,
             detach,
         } => {
-            run::run_agent(&script, &agent_id, &proxy, &image, &memory, &cpus, detach).await?;
+            run::run_agent(&script, &agent_id, &proxy, &image, &memory, &cpus, detach, contained).await?;
         }
 
         Commands::Check {
