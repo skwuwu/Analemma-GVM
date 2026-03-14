@@ -1,0 +1,36 @@
+[server]
+listen = "0.0.0.0:8080"
+
+[enforcement]
+default_decision = { type = "Delay", milliseconds = 300 }
+ic1_async_ledger = true
+ic1_loss_threshold = 0.001
+
+[nats]
+url = "nats://localhost:4222"
+stream = "gvm-audit"
+max_age_days = 2555
+
+[redis]
+url = "redis://localhost:6379"
+
+[srr]
+network_file = "config/srr_network.toml"
+semantic_file = "config/srr_semantic.toml"
+hot_reload = true
+
+[policies]
+directory = "config/policies/"
+hot_reload = true
+
+[operations]
+registry_file = "config/operation_registry.toml"
+
+[secrets]
+file = "config/secrets.toml"
+key_env = "GVM_SECRETS_KEY"
+
+# Dev-only: remap external hosts to local mock server.
+# Ignored when GVM_ENV=production.
+[dev]
+host_overrides = { "gmail.googleapis.com" = "127.0.0.1:9090", "api.bank.com" = "127.0.0.1:9090" }

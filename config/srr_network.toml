@@ -1,0 +1,56 @@
+# Network SRR rules — Layer 2 fallback defense for direct HTTP calls bypassing SDK
+
+[[rules]]
+method = "POST"
+pattern = "api.bank.com/transfer/{any}"
+decision = { type = "Deny", reason = "Wire transfer — blocked by proxy" }
+description = "Block all direct wire transfer attempts"
+
+[[rules]]
+method = "DELETE"
+pattern = "{host}.database.com/{any}"
+decision = { type = "Deny", reason = "Database deletion — blocked by proxy" }
+description = "Block all database delete operations"
+
+[[rules]]
+method = "POST"
+pattern = "api.slack.com/{any}"
+decision = { type = "Delay", milliseconds = 300 }
+description = "Delay Slack message sends for review window"
+
+[[rules]]
+method = "GET"
+pattern = "gmail.googleapis.com/{any}"
+decision = { type = "Allow" }
+description = "Gmail inbox read — IC-1 instant"
+
+[[rules]]
+method = "POST"
+pattern = "gmail.googleapis.com/{any}"
+decision = { type = "Delay", milliseconds = 300 }
+description = "Delay Gmail sends for review window"
+
+# ── Payload Inspection (GraphQL/gRPC defense) ──
+
+[[rules]]
+method = "POST"
+pattern = "api.bank.com/graphql"
+payload_field = "operationName"
+payload_match = ["TransferFunds", "DeleteAccount", "ModifyPermissions"]
+max_body_bytes = 65536
+decision = { type = "Deny", reason = "Dangerous GraphQL operation" }
+description = "Block high-risk GraphQL operations on banking API"
+
+[[rules]]
+method = "POST"
+pattern = "api.bank.com/graphql"
+decision = { type = "Delay", milliseconds = 300 }
+description = "Default delay for non-dangerous GraphQL operations"
+
+# ── Default-to-Caution (catch-all) ──
+
+[[rules]]
+method = "*"
+pattern = "{any}"
+decision = { type = "Delay", milliseconds = 300 }
+description = "Default-to-Caution: unregistered URLs get 300ms delay"

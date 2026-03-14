@@ -1,0 +1,84 @@
+# Global policy layer — applies to all tenants/agents, cannot be overridden.
+# Week 2 implementation: ABAC policy engine will load and evaluate these rules.
+
+[[rules]]
+id = "global-payment-approval"
+priority = 1
+layer = "Global"
+description = "All payments require approval"
+
+[[rules.conditions]]
+field = "operation"
+operator = "StartsWith"
+value = "gvm.payment"
+
+[rules.decision]
+type = "RequireApproval"
+urgency = "Immediate"
+
+# ──
+
+[[rules]]
+id = "global-storage-delete-deny"
+priority = 2
+layer = "Global"
+description = "Critical data deletion is forbidden"
+
+[[rules.conditions]]
+field = "operation"
+operator = "Eq"
+value = "gvm.storage.delete"
+
+[[rules.conditions]]
+field = "resource.sensitivity"
+operator = "Eq"
+value = "Critical"
+
+[rules.decision]
+type = "Deny"
+reason = "Critical data deletion is forbidden"
+
+# ──
+
+[[rules]]
+id = "global-customer-facing-delay"
+priority = 10
+layer = "Global"
+description = "Customer-facing actions get 300ms delay"
+
+[[rules.conditions]]
+field = "resource.tier"
+operator = "Eq"
+value = "CustomerFacing"
+
+[rules.decision]
+type = "Delay"
+milliseconds = 300
+
+# ──
+
+[[rules]]
+id = "global-read-allow"
+priority = 100
+layer = "Global"
+description = "Read operations are allowed"
+
+[[rules.conditions]]
+field = "operation"
+operator = "EndsWith"
+value = ".read"
+
+[rules.decision]
+type = "Allow"
+
+# ──
+
+[[rules]]
+id = "global-fallback"
+priority = 999
+layer = "Global"
+description = "Default: Delay 300ms (Fail-Close)"
+
+[rules.decision]
+type = "Delay"
+milliseconds = 300
