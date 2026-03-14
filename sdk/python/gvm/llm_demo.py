@@ -82,6 +82,7 @@ class ToolResult:
         self.upstream_ms = 0.0      # actual API response time
         self.total_ms = 0.0         # wall clock
         self.event_id = None
+        self.trace_id = None
         self.reason = None
         self.result_text = None
 
@@ -134,8 +135,9 @@ def _run_tool(name, operation, target_host, method, args, fn):
     except (ValueError, TypeError):
         tr.safety_ms = 0.0
 
-    # Event ID — from X-GVM-Event-Id header
+    # Event ID + Trace ID — from X-GVM-Event-Id / X-GVM-Trace-Id headers
     tr.event_id = gvm.get("event_id") or tr.event_id
+    tr.trace_id = gvm.get("trace_id") or tr.trace_id
 
     # Matched rule — from X-GVM-Matched-Rule header
     matched_rule = gvm.get("matched_rule")
@@ -257,8 +259,10 @@ def _print_execution_log(tool_calls, llm_elapsed):
         # Reason for block
         if tr.decision in ("Deny", "RequireApproval"):
             print(f"  {DIM}  Reason:{RESET}    {RED}{tr.reason}{RESET}")
-            if tr.event_id:
-                print(f"  {DIM}  Event ID:{RESET}  {tr.event_id}")
+
+        # Event/Trace IDs
+        if tr.event_id:
+            print(f"  {DIM}  Event ID:{RESET}  {tr.event_id}")
 
         print()
 
@@ -463,6 +467,14 @@ def run_demo():
               f"— structurally, not behaviorally.{RESET}")
     print(f"  {DIM}The agent's code is unchanged. The proxy enforces governance.{RESET}")
     print(f"  {DIM}The agent cannot bypass, disable, or even see the enforcement.{RESET}")
+
+    # Show trace_id for causal chain tracking
+    trace_ids = set(tr.trace_id for tr in _tool_results if tr.trace_id)
+    if trace_ids:
+        print()
+        for tid in trace_ids:
+            print(f"  {DIM}Trace the full causal chain:{RESET}")
+            print(f"  {CYAN}gvm events trace --trace-id {tid}{RESET}")
     print(f"{'━' * WIDTH}")
     print()
 

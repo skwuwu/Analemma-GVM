@@ -64,6 +64,11 @@ impl APIKeyStore {
         })
     }
 
+    /// Returns true if no credentials are configured.
+    pub fn is_empty(&self) -> bool {
+        self.credentials.is_empty()
+    }
+
     /// Inject the appropriate credential into the request for the given host.
     /// This is Layer 3 (Capability Token) — the agent never has direct access to API keys.
     pub fn inject(

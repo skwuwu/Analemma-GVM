@@ -41,25 +41,76 @@ async fn main() {
     // 1. Load configuration (tries GVM_CONFIG env, CWD, home dir, then defaults)
     let config = ProxyConfig::load_or_default();
 
-    // 2. Load Operation Registry (Fail-Close: invalid registry → panic)
-    let registry = OperationRegistry::load(Path::new(&config.operations.registry_file))
-        .expect("Failed to load operation registry — startup aborted");
-    tracing::info!("Operation registry loaded and validated");
+    // 2. Load Operation Registry (Fail-Close: invalid registry → abort with guidance)
+    let registry_path = Path::new(&config.operations.registry_file);
+    let registry = match OperationRegistry::load(registry_path) {
+        Ok(r) => {
+            tracing::info!("Operation registry loaded and validated");
+            r
+        }
+        Err(e) => {
+            tracing::error!(
+                path = %registry_path.display(),
+                error = %e,
+                "Failed to load operation registry"
+            );
+            eprintln!();
+            eprintln!("  ERROR: Cannot start — operation registry not found or invalid.");
+            eprintln!("  Expected: {}", registry_path.display());
+            eprintln!();
+            eprintln!("  Quick fix:");
+            eprintln!("    git clone https://github.com/skwuwu/Analemma-GVM && cd Analemma-GVM");
+            eprintln!("    cargo run   # config/ directory is included in the repo");
+            eprintln!();
+            eprintln!("  Or run: gvm init --industry saas");
+            eprintln!();
+            std::process::exit(1);
+        }
+    };
 
-    // 3. Load Network SRR rules
-    let srr = NetworkSRR::load(Path::new(&config.srr.network_file))
-        .expect("Failed to load network SRR rules");
-    tracing::info!("Network SRR rules loaded");
+    // 3. Load Network SRR rules (Fail-Close: invalid SRR → abort with guidance)
+    let srr_path = Path::new(&config.srr.network_file);
+    let srr = match NetworkSRR::load(srr_path) {
+        Ok(s) => {
+            tracing::info!("Network SRR rules loaded");
+            s
+        }
+        Err(e) => {
+            tracing::error!(
+                path = %srr_path.display(),
+                error = %e,
+                "Failed to load network SRR rules"
+            );
+            eprintln!();
+            eprintln!("  ERROR: Cannot start — network SRR rules not found or invalid.");
+            eprintln!("  Expected: {}", srr_path.display());
+            eprintln!();
+            eprintln!("  Quick fix:");
+            eprintln!("    Ensure config/srr_network.toml exists in the working directory.");
+            eprintln!("    Or run: gvm init --industry saas");
+            eprintln!();
+            std::process::exit(1);
+        }
+    };
 
-    // 4. Load ABAC policy engine
+    // 4. Load ABAC policy engine (graceful: empty dir → empty policy set)
     let policy = PolicyEngine::load(Path::new(&config.policies.directory))
         .expect("Failed to load policy engine");
     tracing::info!("ABAC policy engine loaded");
 
-    // 5. Load API key store
+    // 5. Load API key store (graceful: missing file → empty store with warning)
     let api_keys = APIKeyStore::load(Path::new(&config.secrets.file))
         .expect("Failed to load API key store");
-    tracing::info!("API key store loaded");
+    if api_keys.is_empty() {
+        tracing::warn!(
+            "No API keys configured. Running in passthrough mode. \
+             Layer 3 (API key isolation) is INACTIVE. \
+             Agents can bypass proxy by calling APIs directly. \
+             Run `gvm init` to configure API key isolation."
+        );
+    } else {
+        tracing::info!("API key store loaded");
+    }
 
     // 6. Initialize Ledger (WAL + NATS stub)
     let ledger = Ledger::new(

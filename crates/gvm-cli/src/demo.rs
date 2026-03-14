@@ -2,8 +2,19 @@ use anyhow::Result;
 use crate::ui::{self, StepResult, BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
 use std::time::Instant;
 
-/// Run the interactive demo — spins up a mock server, sends requests through the proxy,
-/// and displays the latency audit dashboard.
+/// Scenario definition for each demo step.
+struct Scenario {
+    index: usize,
+    operation: &'static str,
+    method: &'static str,
+    url: &'static str,
+    target_host: &'static str,
+    resource_json: &'static str,
+    body: Option<serde_json::Value>,
+}
+
+/// Run the interactive demo — sends requests through the proxy,
+/// reads X-GVM-* response headers, and displays the dashboard.
 pub async fn run_demo(proxy_url: &str, mock_port: u16) -> Result<()> {
     println!();
     println!("{BOLD}Analemma-GVM — Interactive Demo{RESET}");
@@ -47,9 +58,6 @@ pub async fn run_demo(proxy_url: &str, mock_port: u16) -> Result<()> {
             println!(
                 "  {DIM}Start it with: python -m gvm.mock_server{RESET}"
             );
-            println!(
-                "  {DIM}Or run the Python demo: python -m gvm.langchain_demo{RESET}"
-            );
             println!();
             return Ok(());
         }
@@ -62,149 +70,126 @@ pub async fn run_demo(proxy_url: &str, mock_port: u16) -> Result<()> {
         .proxy(reqwest::Proxy::https(proxy_url)?)
         .build()?;
 
-    let mut steps: Vec<StepResult> = Vec::new();
+    // ── Define scenarios ──
+    let scenarios = vec![
+        Scenario {
+            index: 1,
+            operation: "gvm.messaging.read",
+            method: "GET",
+            url: "http://gmail.googleapis.com/gmail/v1/users/me/messages",
+            target_host: "gmail.googleapis.com",
+            resource_json: r#"{"service":"gmail","tier":"External","sensitivity":"Low"}"#,
+            body: None,
+        },
+        Scenario {
+            index: 2,
+            operation: "gvm.messaging.send",
+            method: "POST",
+            url: "http://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            target_host: "gmail.googleapis.com",
+            resource_json: r#"{"service":"gmail","tier":"CustomerFacing","sensitivity":"Medium"}"#,
+            body: Some(serde_json::json!({"to": "cfo@acme.com", "subject": "Report", "body": "Q4 summary"})),
+        },
+        Scenario {
+            index: 3,
+            operation: "gvm.payment.charge",
+            method: "POST",
+            url: "http://api.bank.com/transfer/123",
+            target_host: "api.bank.com",
+            resource_json: r#"{"service":"bank","tier":"External","sensitivity":"Critical"}"#,
+            body: Some(serde_json::json!({"amount": 50000, "to": "offshore-9999"})),
+        },
+        Scenario {
+            index: 4,
+            operation: "gvm.storage.delete",
+            method: "DELETE",
+            url: "http://gmail.googleapis.com/gmail/v1/users/me/messages/msg-001",
+            target_host: "gmail.googleapis.com",
+            resource_json: r#"{"service":"gmail","tier":"External","sensitivity":"Critical"}"#,
+            body: None,
+        },
+    ];
 
-    // ── Step 1: read_inbox → Allow (IC-1) ──
-    println!("  {DIM}Running 4-step demo scenario...{RESET}");
+    println!("  {DIM}Running {}-step demo scenario...{RESET}", scenarios.len());
     println!();
 
-    let t0 = Instant::now();
-    let resp = client
-        .get("http://gmail.googleapis.com/gmail/v1/users/me/messages")
-        .header("X-GVM-Agent-Id", "demo-agent")
-        .header("X-GVM-Trace-Id", &session_id)
-        .header("X-GVM-Event-Id", uuid::Uuid::new_v4().to_string())
-        .header("X-GVM-Operation", "gvm.messaging.read")
-        .header(
-            "X-GVM-Resource",
-            r#"{"service":"gmail","tier":"External","sensitivity":"Low"}"#,
-        )
-        .header("X-GVM-Target-Host", "gmail.googleapis.com")
-        .send()
-        .await;
-    let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
+    let mut steps: Vec<StepResult> = Vec::new();
 
-    let (decision, engine_ms, safety_ms, upstream_ms) = match &resp {
-        Ok(r) if r.status().is_success() => ("Allow".to_string(), 2.0_f64.min(elapsed), 0.0, (elapsed - 2.0).max(0.0)),
-        Ok(r) => (format!("HTTP {}", r.status()), elapsed, 0.0, 0.0),
-        Err(e) => (format!("Error: {}", e), elapsed, 0.0, 0.0),
-    };
+    for scenario in &scenarios {
+        let t0 = Instant::now();
 
-    steps.push(StepResult {
-        index: 1,
-        operation: "gvm.messaging.read".to_string(),
-        label: "inbox".to_string(),
-        decision,
-        engine_ms,
-        safety_ms,
-        upstream_ms,
-    });
+        // Build request with GVM headers
+        let mut req = match scenario.method {
+            "GET" => client.get(scenario.url),
+            "POST" => client.post(scenario.url),
+            "DELETE" => client.delete(scenario.url),
+            _ => client.get(scenario.url),
+        };
 
-    // ── Step 2: send_email → Delay 300ms (IC-2) ──
-    let t0 = Instant::now();
-    let resp = client
-        .post("http://gmail.googleapis.com/gmail/v1/users/me/messages/send")
-        .header("X-GVM-Agent-Id", "demo-agent")
-        .header("X-GVM-Trace-Id", &session_id)
-        .header("X-GVM-Event-Id", uuid::Uuid::new_v4().to_string())
-        .header("X-GVM-Operation", "gvm.messaging.send")
-        .header(
-            "X-GVM-Resource",
-            r#"{"service":"gmail","tier":"CustomerFacing","sensitivity":"Medium"}"#,
-        )
-        .header("X-GVM-Target-Host", "gmail.googleapis.com")
-        .json(&serde_json::json!({"to": "cfo@acme.com", "subject": "Report", "body": "Q4 summary"}))
-        .send()
-        .await;
-    let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
+        req = req
+            .header("X-GVM-Agent-Id", "demo-agent")
+            .header("X-GVM-Trace-Id", &session_id)
+            .header("X-GVM-Event-Id", uuid::Uuid::new_v4().to_string())
+            .header("X-GVM-Operation", scenario.operation)
+            .header("X-GVM-Resource", scenario.resource_json)
+            .header("X-GVM-Target-Host", scenario.target_host);
 
-    let (decision, engine_ms, safety_ms, upstream_ms) = match &resp {
-        Ok(r) if r.status().is_success() => {
-            let eng = 3.0_f64.min(elapsed);
-            let safety = 300.0_f64.min((elapsed - eng).max(0.0));
-            let up = (elapsed - eng - safety).max(0.0);
-            ("Delay 300ms".to_string(), eng, safety, up)
+        if let Some(ref body) = scenario.body {
+            req = req.json(body);
         }
-        Ok(r) => (format!("HTTP {}", r.status()), elapsed, 0.0, 0.0),
-        Err(e) => (format!("Error: {}", e), elapsed, 0.0, 0.0),
-    };
 
-    steps.push(StepResult {
-        index: 2,
-        operation: "gvm.messaging.send".to_string(),
-        label: "email".to_string(),
-        decision,
-        engine_ms,
-        safety_ms,
-        upstream_ms,
-    });
+        let resp = req.send().await;
+        let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
 
-    // ── Step 3: wire_transfer → Deny (SRR) ──
-    let t0 = Instant::now();
-    let resp = client
-        .post("http://api.bank.com/transfer/123")
-        .header("X-GVM-Agent-Id", "demo-agent")
-        .header("X-GVM-Trace-Id", &session_id)
-        .header("X-GVM-Event-Id", uuid::Uuid::new_v4().to_string())
-        .header("X-GVM-Operation", "gvm.payment.charge")
-        .header(
-            "X-GVM-Resource",
-            r#"{"service":"bank","tier":"External","sensitivity":"Critical"}"#,
-        )
-        .header("X-GVM-Target-Host", "api.bank.com")
-        .json(&serde_json::json!({"amount": 50000, "to": "offshore"}))
-        .send()
-        .await;
-    let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
+        // Read enforcement details from X-GVM-* response headers
+        let step = match resp {
+            Ok(r) => {
+                let headers = StepResult::from_response_headers(&r);
+                let upstream_ms = (elapsed - headers.engine_ms - headers.safety_ms).max(0.0);
 
-    let decision = match &resp {
-        Ok(r) if r.status() == 403 => "Deny (SRR)".to_string(),
-        Ok(r) => format!("HTTP {}", r.status()),
-        Err(e) => format!("Error: {}", e),
-    };
+                // Extract reason from response body for blocked requests
+                let reason = if r.status() == 403 {
+                    r.json::<serde_json::Value>().await.ok()
+                        .and_then(|v| v.get("error").and_then(|e| e.as_str().map(String::from)))
+                } else {
+                    None
+                };
 
-    steps.push(StepResult {
-        index: 3,
-        operation: "gvm.payment.charge".to_string(),
-        label: "wire".to_string(),
-        decision,
-        engine_ms: elapsed.min(5.0),
-        safety_ms: 0.0,
-        upstream_ms: 0.0,
-    });
+                StepResult {
+                    index: scenario.index,
+                    operation: scenario.operation.to_string(),
+                    target_host: scenario.target_host.to_string(),
+                    method: scenario.method.to_string(),
+                    decision: headers.decision,
+                    layer: headers.layer,
+                    engine_ms: headers.engine_ms,
+                    safety_ms: headers.safety_ms,
+                    upstream_ms,
+                    event_id: headers.event_id,
+                    trace_id: headers.trace_id,
+                    matched_rule: headers.matched_rule,
+                    reason,
+                }
+            }
+            Err(e) => StepResult {
+                index: scenario.index,
+                operation: scenario.operation.to_string(),
+                target_host: scenario.target_host.to_string(),
+                method: scenario.method.to_string(),
+                decision: format!("Error"),
+                layer: String::new(),
+                engine_ms: elapsed,
+                safety_ms: 0.0,
+                upstream_ms: 0.0,
+                event_id: String::new(),
+                trace_id: session_id.clone(),
+                matched_rule: String::new(),
+                reason: Some(e.to_string()),
+            },
+        };
 
-    // ── Step 4: delete_emails → Deny (ABAC) ──
-    let t0 = Instant::now();
-    let resp = client
-        .delete("http://gmail.googleapis.com/gmail/v1/users/me/messages/msg-001")
-        .header("X-GVM-Agent-Id", "demo-agent")
-        .header("X-GVM-Trace-Id", &session_id)
-        .header("X-GVM-Event-Id", uuid::Uuid::new_v4().to_string())
-        .header("X-GVM-Operation", "gvm.storage.delete")
-        .header(
-            "X-GVM-Resource",
-            r#"{"service":"gmail","tier":"External","sensitivity":"Critical"}"#,
-        )
-        .header("X-GVM-Target-Host", "gmail.googleapis.com")
-        .send()
-        .await;
-    let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
-
-    let decision = match &resp {
-        Ok(r) if r.status() == 403 => "Deny (ABAC)".to_string(),
-        Ok(r) => format!("HTTP {}", r.status()),
-        Err(e) => format!("Error: {}", e),
-    };
-
-    steps.push(StepResult {
-        index: 4,
-        operation: "gvm.storage.delete".to_string(),
-        label: "delete".to_string(),
-        decision,
-        engine_ms: elapsed.min(5.0),
-        safety_ms: 0.0,
-        upstream_ms: 0.0,
-    });
+        steps.push(step);
+    }
 
     // ── Render Dashboard ──
     // Simulate LLM reasoning time (typical Claude call)

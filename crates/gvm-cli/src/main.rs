@@ -1,8 +1,9 @@
 use clap::{Parser, Subcommand};
 
+mod check;
 mod demo;
 mod events;
-mod check;
+mod init;
 mod ui;
 
 #[derive(Parser)]
@@ -29,6 +30,17 @@ enum Commands {
         /// Mock server port
         #[arg(long, default_value = "9090")]
         mock_port: u16,
+    },
+
+    /// Initialize or customize config from industry templates
+    Init {
+        /// Industry template: finance, saas
+        #[arg(long)]
+        industry: String,
+
+        /// Config output directory
+        #[arg(long, default_value = "config")]
+        config_dir: String,
     },
 
     /// Dry-run policy check without calling external APIs
@@ -117,6 +129,10 @@ async fn main() -> anyhow::Result<()> {
                 events::trace_events(&trace_id, wal_file.as_deref()).await?;
             }
         },
+
+        Commands::Init { industry, config_dir } => {
+            init::run_init(&industry, &config_dir)?;
+        }
 
         Commands::Demo { proxy, mock_port } => {
             demo::run_demo(&proxy, mock_port).await?;
