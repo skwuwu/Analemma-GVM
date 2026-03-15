@@ -235,7 +235,7 @@ class MyAgent(GVMAgent):
     auto_checkpoint = "ic2+"  # Checkpoint before IC-2 and IC-3 operations
 ```
 
-**Token economics**: Without rollback, a denied operation at step 4 of a 5-step workflow requires re-executing steps 1-3 (~55% token waste). With rollback, the agent resumes from the checkpoint. At scale (1,000 denied actions/day), this saves ~740,000 tokens/day.
+**Token economics**: Without rollback, a denied operation requires re-executing all prior steps from scratch. With rollback, the agent resumes from the last checkpoint. Actual savings depend on where in the workflow the deny occurs — the later the deny, the greater the savings. In the reference 4-step Finance Agent workflow, a deny at step 3 saves ~42% of tokens (670 tokens per blocked action).
 
 ---
 

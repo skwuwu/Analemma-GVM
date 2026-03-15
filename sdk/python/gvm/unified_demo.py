@@ -588,7 +588,7 @@ def run_demo():
         ("Checkpoint/Rollback",
          f"Auto-saved at Step 2, restored after Step 3 deny"),
         ("Token Savings",
-         f"{pct:.0f}% reduction ({saved} tokens saved per blocked action)"),
+         f"{pct:.0f}% reduction in this workflow (varies by deny position)"),
         ("WAL-First Audit",
          "IC-2/IC-3: WAL fsync BEFORE forward. Fail-close on WAL failure."),
         ("API Key Isolation",

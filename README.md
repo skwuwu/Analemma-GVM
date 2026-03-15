@@ -229,7 +229,7 @@ pip install -e sdk/python
 | Rate limiting | By source IP | By agent_id |
 | Operation classification | `"unknown"` | `"gvm.messaging.send"` etc. |
 | State checkpoint/rollback | None (full restart on deny) | Auto-checkpoint + Merkle-verified rollback |
-| Token savings on deny | 0% | ~55% per blocked action |
+| Token savings on deny | 0% | ~42% per blocked action |
 
 **SDK agent example (10 lines):**
 
@@ -393,24 +393,24 @@ except GVMRollbackError as e:
 |----------|-----------------|---------------|
 | Operation denied | Error returned, no state recovery | State rolled back to last checkpoint |
 | LLM agent recovery | Must restart entire workflow from scratch | Resumes from checkpoint with full context |
-| Token cost on deny | Re-run all prior steps (~950 tokens) | Resume cost only (~210 tokens) |
+| Token cost on deny | Re-run all prior steps (~670 tokens) | Resume cost only (~60 tokens) |
 | State integrity | Manual reconstruction | Merkle-verified restoration |
 | Developer effort | None (proxy-only) | One decorator per method (`@ic`) |
 
 **Token savings demo:**
 
 ```bash
-python -m gvm.rollback_demo
+python -m gvm.unified_demo
 ```
 
 Output:
 ```
-[Level 0] Full restart on deny:     1,340 tokens
-[Level 2] Resume from checkpoint:   1,340 tokens
-Tokens saved by rollback: 740 tokens (55.2% reduction)
+Level 0 (no SDK):   1,580 tokens (run all steps + restart from scratch on deny)
+Level 2 (SDK):        910 tokens (run all steps + resume from checkpoint on deny)
+Saved: 670 tokens (42.4% reduction)
 ```
 
-At scale (1,000 denied actions/day), this translates to ~740,000 tokens/day saved.
+Savings are not a fixed percentage — they depend on where in the workflow the deny occurs. The later the deny, the more prior steps are skipped by resuming from a checkpoint instead of restarting. In this 4-step workflow with a deny at step 3, the saving is ~42%. A longer workflow with a later deny would save proportionally more.
 
 ### Run tests
 

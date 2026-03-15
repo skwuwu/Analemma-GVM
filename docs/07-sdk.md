@@ -326,11 +326,13 @@ Without rollback (Level 0), a denied action forces the LLM to restart the entire
 | Metric | Level 0 (No SDK) | Level 2 (SDK) |
 |--------|-----------------|---------------|
 | Recovery strategy | Full restart | Resume from checkpoint |
-| Tokens per denied action | ~1,340 | ~600 |
-| Token savings | — | ~55% |
-| At 1,000 denials/day | ~1.34M tokens | ~600K tokens |
+| Tokens per denied action (4-step workflow, deny at step 3) | ~1,580 | ~910 |
+| Token savings | — | ~42% |
+| At 1,000 denials/day | ~1.58M tokens | ~910K tokens |
 
-Run the demo: `python -m gvm.rollback_demo`
+Actual savings vary by workflow length and deny position — the later in the workflow a deny occurs, the more tokens are saved by resuming from a checkpoint instead of restarting.
+
+Run the demo: `python -m gvm.unified_demo`
 
 ---
 
