@@ -465,7 +465,9 @@ Analemma-GVM does the same for AI agents. The agent can *try* to wire-transfer $
 
 ## License
 
-Apache-2.0
+Licensed under the [Apache License, Version 2.0](LICENSE).
+
+You may use, modify, and distribute this software under the terms of the Apache 2.0 license. See the [LICENSE](LICENSE) file for the full text.
 
 ---
 
