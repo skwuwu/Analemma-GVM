@@ -138,7 +138,23 @@ async fn batch_loop(
         // Phase 1: Wait for at least one request (blocks until work arrives)
         match rx.recv().await {
             Some(req) => batch.push(req),
-            None => break, // Channel closed — all senders dropped, shutdown
+            None => {
+                // Channel closed — all senders dropped, shutdown.
+                // Flush any remaining events that arrived before channel close.
+                if !batch.is_empty() {
+                    let result = flush_batch_with_merkle(
+                        &mut file, &batch, batch_id, &prev_batch_root,
+                    ).await;
+                    for req in batch.drain(..) {
+                        let notify = match &result {
+                            Ok(_) => Ok(()),
+                            Err(e) => Err(anyhow!("WAL shutdown flush failed: {}", e)),
+                        };
+                        let _ = req.reply.send(notify);
+                    }
+                }
+                break;
+            }
         }
 
         // Phase 2a: Non-blocking drain of all immediately available requests.
@@ -261,6 +277,10 @@ pub struct Ledger {
     /// Monotonic WAL sequence number.
     /// Guarantees ordering: NATS consumers can reconstruct WAL order
     /// even if async-published messages arrive out of order.
+    ///
+    /// NOTE: Resets to 0 on restart. When NATS is connected (P2),
+    /// this should be initialized from the WAL event count during recovery
+    /// to avoid duplicate sequences across restarts.
     wal_sequence: AtomicU64,
 }
 
@@ -357,6 +377,12 @@ impl Ledger {
         let mut pending_count = 0u64;
         let mut expired_count = 0u64;
 
+        // Track event_ids we've already seen to handle duplicates.
+        // WAL may contain both the original Pending event and a later Expired
+        // version (from a previous recovery). We process forward, and skip
+        // event_ids we've already processed to avoid re-expiring them.
+        let mut processed_ids = std::collections::HashSet::new();
+
         for line in content.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -374,6 +400,14 @@ impl Ledger {
                     continue;
                 }
             };
+
+            // Record all event_ids we encounter (including non-Pending).
+            // If a later Pending entry has an event_id we already saw as
+            // Expired/Confirmed, skip it (it was already resolved).
+            if !processed_ids.insert(event.event_id.clone()) {
+                // Already processed this event_id — skip duplicate
+                continue;
+            }
 
             if matches!(event.status, EventStatus::Pending) {
                 pending_count += 1;

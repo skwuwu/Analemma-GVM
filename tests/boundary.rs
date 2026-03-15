@@ -20,13 +20,13 @@ use std::sync::Arc;
 // 1. Wasm <-> Rust Host Boundary
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// ── 1.1 Wasm engine native fallback: invalid decision string maps to Allow ──
+// ── 1.1 Wasm engine native fallback: unknown decision string defaults to Delay (fail-close) ──
 
 #[test]
-fn wasm_invalid_decision_string_maps_to_allow() {
+fn wasm_invalid_decision_string_maps_to_delay() {
     use gvm_proxy::wasm_engine::WasmEngine;
 
-    // response_to_decision should gracefully handle unknown decision strings
+    // response_to_decision should default to Delay (fail-close) for unknown decision strings
     let resp = gvm_engine::EvalResponse {
         decision: "InvalidDecisionType".to_string(),
         delay_ms: None,
@@ -38,8 +38,8 @@ fn wasm_invalid_decision_string_maps_to_allow() {
 
     let (decision, _rule_id) = WasmEngine::response_to_decision(&resp);
     assert!(
-        matches!(decision, EnforcementDecision::Allow),
-        "Unknown decision type must map to Allow (fail-open for unknown), got {:?}",
+        matches!(decision, EnforcementDecision::Delay { milliseconds: 300 }),
+        "Unknown decision type must map to Delay 300ms (fail-close), got {:?}",
         decision
     );
 }

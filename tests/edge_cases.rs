@@ -431,7 +431,13 @@ fn edge_max_strict_strictness_ordering_complete() {
     }
 }
 
-/// Empty policy directory — engine should return Allow for everything.
+/// Empty policy directory — PolicyEngine returns Allow (no rules = no restrictions).
+///
+/// This is intentional and NOT a Fail-Open gap: the system-level decision is
+/// max_strict(policy_decision, srr_decision). SRR provides Default-to-Caution
+/// (Delay 300ms) for uncategorized hosts, so the overall system remains Fail-Close
+/// even when PolicyEngine has zero rules. The PolicyEngine itself only evaluates
+/// ABAC rules and correctly returns "no match = Allow" for its layer.
 #[test]
 fn edge_empty_policy_directory() {
     let dir = tempfile::tempdir().unwrap();

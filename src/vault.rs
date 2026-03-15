@@ -60,13 +60,15 @@ impl VaultEncryption {
             }
             Err(_) => {
                 tracing::warn!(
-                    "⚠ {} not set — using deterministic dev key. NOT SAFE FOR PRODUCTION.",
+                    "⚠ {} not set — generating random ephemeral key. \
+                     Data will NOT survive restart. NOT SAFE FOR PRODUCTION.",
                     env_var
                 );
-                // Deterministic dev key derived from a fixed string
-                let mut key = [0u8; 32];
-                let seed = b"gvm-dev-vault-key-not-for-prod!!";
-                key.copy_from_slice(seed);
+                // Random ephemeral key: safe even if WAL is leaked (unlike
+                // a hardcoded key which would let anyone decrypt WAL data).
+                // In MVP with in-memory store, restart already loses state,
+                // so an ephemeral key has no additional downside.
+                let key: [u8; 32] = rand::random();
                 Ok(Self::new(key))
             }
         }
@@ -195,17 +197,28 @@ impl Vault {
     }
 
     /// List all keys visible to an agent (prefix-scoped).
-    pub async fn list_keys(&self, prefix: &str) -> Vec<String> {
+    /// Audit-logged for consistency with other vault operations.
+    pub async fn list_keys(&self, prefix: &str, agent_id: &str) -> Vec<String> {
         let store = self.store.read().await;
-        store
+        let keys: Vec<String> = store
             .keys()
             .filter(|k| k.starts_with(prefix))
             .cloned()
-            .collect()
+            .collect();
+
+        // Async audit log for key enumeration (consistent with read/write/delete)
+        let event = build_vault_event(prefix, agent_id, "vault_list_keys", None);
+        self.ledger.append_async(event).await;
+
+        keys
     }
 }
 
 /// Build a GVMEvent for vault operations.
+///
+/// NOTE: WAL records metadata only (hash + size), not the encrypted value.
+/// State recovery from WAL is NOT possible in MVP (in-memory store).
+/// Redis integration (P2) will enable durable state with WAL-based recovery.
 fn build_vault_event(
     key: &str,
     agent_id: &str,

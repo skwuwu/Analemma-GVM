@@ -402,10 +402,12 @@ expires_at = "2027-01-01T00:00:00Z"
 
     let store = APIKeyStore::load(&secrets_path).unwrap();
 
+    let passthrough = gvm_proxy::api_keys::MissingCredentialPolicy::Passthrough;
+
     // ── Test Bearer injection (Stripe) ──
     {
         let mut headers = axum::http::HeaderMap::new();
-        store.inject(&mut headers, "api.stripe.com").unwrap();
+        store.inject(&mut headers, "api.stripe.com", &passthrough).unwrap();
 
         let auth = headers
             .get("authorization")
@@ -419,7 +421,7 @@ expires_at = "2027-01-01T00:00:00Z"
     // ── Test ApiKey injection (SendGrid) ──
     {
         let mut headers = axum::http::HeaderMap::new();
-        store.inject(&mut headers, "api.sendgrid.com").unwrap();
+        store.inject(&mut headers, "api.sendgrid.com", &passthrough).unwrap();
 
         let api_key = headers
             .get("x-api-key")
@@ -436,7 +438,7 @@ expires_at = "2027-01-01T00:00:00Z"
     // ── Test OAuth2 injection (GitHub) ──
     {
         let mut headers = axum::http::HeaderMap::new();
-        store.inject(&mut headers, "api.github.com").unwrap();
+        store.inject(&mut headers, "api.github.com", &passthrough).unwrap();
 
         let auth = headers
             .get("authorization")
@@ -447,14 +449,42 @@ expires_at = "2027-01-01T00:00:00Z"
         );
     }
 
-    // ── Test unknown host — no injection ──
+    // ── Test unknown host — passthrough mode (no injection, no error) ──
     {
         let mut headers = axum::http::HeaderMap::new();
-        store.inject(&mut headers, "unknown.example.com").unwrap();
+        store.inject(&mut headers, "unknown.example.com", &passthrough).unwrap();
 
         assert!(
             headers.is_empty(),
-            "No credentials should be injected for unknown host"
+            "No credentials should be injected for unknown host in passthrough mode"
+        );
+    }
+
+    // ── Test unknown host — deny mode (must return error) ──
+    {
+        let deny = gvm_proxy::api_keys::MissingCredentialPolicy::Deny;
+        let mut headers = axum::http::HeaderMap::new();
+        let result = store.inject(&mut headers, "unknown.example.com", &deny);
+        assert!(
+            result.is_err(),
+            "Deny mode must reject requests to hosts without credentials"
+        );
+    }
+
+    // ── Test agent-supplied Authorization header is stripped ──
+    {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer agent-smuggled-token"),
+        );
+        store.inject(&mut headers, "api.stripe.com", &passthrough).unwrap();
+
+        let auth = headers.get("authorization").unwrap();
+        assert_eq!(
+            auth.to_str().unwrap(),
+            "Bearer sk_test_stripe_secret_key_123",
+            "Proxy credential must replace agent-supplied Authorization header"
         );
     }
 

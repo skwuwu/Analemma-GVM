@@ -27,10 +27,14 @@ use crate::types::{GVMEvent, MerkleBatchRecord};
 
 // ─── Event Hash Computation ───
 
-/// Compute the SHA-256 hash of an event's canonical fields.
+/// Compute the SHA-256 hash of an event's audit-critical fields.
+///
 /// Fields included: event_id, trace_id, agent_id, operation, decision,
-/// timestamp, payload.content_hash. This set is deterministic and
-/// covers the audit-critical fields.
+/// decision_source, status, enforcement_point, timestamp, payload.content_hash.
+///
+/// These fields cover all audit-significant properties. In particular,
+/// `status` prevents undetected Pending→Confirmed tampering, and
+/// `decision_source` / `enforcement_point` prevent attribution falsification.
 pub fn compute_event_hash(event: &GVMEvent) -> String {
     let mut hasher = Sha256::new();
     hasher.update(event.event_id.as_bytes());
@@ -42,6 +46,12 @@ pub fn compute_event_hash(event: &GVMEvent) -> String {
     hasher.update(event.operation.as_bytes());
     hasher.update(b"|");
     hasher.update(event.decision.as_bytes());
+    hasher.update(b"|");
+    hasher.update(event.decision_source.as_bytes());
+    hasher.update(b"|");
+    hasher.update(format!("{:?}", event.status).as_bytes());
+    hasher.update(b"|");
+    hasher.update(event.enforcement_point.as_bytes());
     hasher.update(b"|");
     hasher.update(event.timestamp.to_rfc3339().as_bytes());
     hasher.update(b"|");
@@ -108,7 +118,11 @@ pub fn generate_merkle_proof(leaf_hashes: &[String], index: usize) -> Vec<(Strin
     let mut idx = index;
 
     while current_level.len() > 1 {
-        // Pad with duplicate if odd
+        // Pad with duplicate if odd number of nodes at this level.
+        // This means for the last leaf at an odd level, its sibling in the
+        // proof will be itself (a duplicate). This is the standard Bitcoin
+        // Merkle tree behavior and is intentional — it preserves the
+        // property that every node has a sibling for proof construction.
         if current_level.len() % 2 == 1 {
             let last = *current_level.last().unwrap();
             current_level.push(last);
@@ -183,6 +197,16 @@ pub struct VerificationReport {
     pub total_batches: usize,
     pub valid_batches: usize,
     pub invalid_batches: Vec<u64>,
+    /// Event IDs whose content hash does not match the stored hash.
+    /// These events were tampered with after being written to WAL.
+    /// Note: the stored hash is still used for Merkle root verification
+    /// so we can distinguish "event content tampered but batch root intact"
+    /// from "batch root itself tampered".
+    pub tampered_events: Vec<String>,
+    /// Event IDs that had no event_hash (legacy or IC-1 async records).
+    /// These events cannot be individually verified but are included in
+    /// batch Merkle root computation via on-the-fly hash calculation.
+    pub unhashed_events: Vec<String>,
     pub chain_intact: bool,
 }
 
@@ -196,6 +220,8 @@ pub fn verify_wal(wal_content: &str) -> VerificationReport {
     let mut total_batches = 0usize;
     let mut valid_batches = 0usize;
     let mut invalid_batches: Vec<u64> = Vec::new();
+    let mut tampered_events: Vec<String> = Vec::new();
+    let mut unhashed_events: Vec<String> = Vec::new();
     let mut chain_intact = true;
     let mut prev_root: Option<String> = None;
 
@@ -235,15 +261,27 @@ pub fn verify_wal(wal_content: &str) -> VerificationReport {
         // Parse as event
         if let Ok(event) = serde_json::from_str::<GVMEvent>(trimmed) {
             total_events += 1;
-            if let Some(ref hash) = event.event_hash {
-                // Verify the event hash
-                let computed = compute_event_hash(&event);
-                if computed == *hash {
+
+            match event.event_hash {
+                Some(ref hash) => {
+                    // Verify the event hash matches recomputed value
+                    let computed = compute_event_hash(&event);
+                    if computed != *hash {
+                        // Event content was tampered — hash doesn't match.
+                        // Track the tampered event for the report.
+                        tampered_events.push(event.event_id.clone());
+                    }
+                    // Always use the stored hash for batch root verification.
+                    // This lets us distinguish "event content tampered but batch
+                    // root intact" from "batch root itself tampered".
                     events_in_current_batch.push(hash.clone());
-                } else {
-                    // Tampered event — use the stored hash to preserve batch structure
-                    // but mark it for investigation
-                    events_in_current_batch.push(hash.clone());
+                }
+                None => {
+                    // No stored hash (legacy event or IC-1 async record).
+                    // Compute hash on-the-fly so batch Merkle root stays correct.
+                    unhashed_events.push(event.event_id.clone());
+                    let computed = compute_event_hash(&event);
+                    events_in_current_batch.push(computed);
                 }
             }
         }
@@ -254,6 +292,8 @@ pub fn verify_wal(wal_content: &str) -> VerificationReport {
         total_batches,
         valid_batches,
         invalid_batches,
+        tampered_events,
+        unhashed_events,
         chain_intact,
     }
 }

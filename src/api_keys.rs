@@ -22,6 +22,18 @@ pub enum Credential {
     },
 }
 
+/// Policy for handling requests to hosts without configured credentials.
+#[derive(Clone, Debug, Default)]
+pub enum MissingCredentialPolicy {
+    /// Forward request as-is (development mode). Agent-supplied auth headers
+    /// pass through unmodified. This is the default for MVP convenience.
+    #[default]
+    Passthrough,
+    /// Reject request if no credential configured (production mode).
+    /// Prevents agents from using their own credentials to bypass Layer 3.
+    Deny,
+}
+
 /// API Key Store — holds credentials keyed by host.
 /// The proxy injects the appropriate credential into forwarded requests (Layer 3).
 #[derive(Clone, Debug)]
@@ -71,18 +83,34 @@ impl APIKeyStore {
 
     /// Inject the appropriate credential into the request for the given host.
     /// This is Layer 3 (Capability Token) — the agent never has direct access to API keys.
+    ///
+    /// Security: strips any agent-supplied Authorization header before injecting
+    /// the proxy's credential, preventing agents from smuggling their own credentials.
     pub fn inject(
         &self,
         headers: &mut axum::http::HeaderMap,
         host: &str,
+        policy: &MissingCredentialPolicy,
     ) -> Result<()> {
         let cred = match self.credentials.get(host) {
             Some(c) => c,
             None => {
-                tracing::debug!("No credential configured for host: {}", host);
-                return Ok(());
+                return match policy {
+                    MissingCredentialPolicy::Passthrough => {
+                        tracing::debug!("No credential for {}, passing through", host);
+                        Ok(())
+                    }
+                    MissingCredentialPolicy::Deny => {
+                        tracing::warn!("No credential for {} — request denied", host);
+                        Err(anyhow!("No API credential configured for {}", host))
+                    }
+                };
             }
         };
+
+        // Strip any agent-supplied auth headers before injecting proxy credentials.
+        // This prevents agents from bypassing Layer 3 by smuggling their own credentials.
+        headers.remove(axum::http::header::AUTHORIZATION);
 
         match cred {
             Credential::Bearer { token } => {
@@ -92,6 +120,8 @@ impl APIKeyStore {
                 );
             }
             Credential::OAuth2 { access_token, .. } => {
+                // TODO: Check expires_at and refresh if expired (P3)
+                // Currently injects access_token regardless of expiry
                 headers.insert(
                     axum::http::header::AUTHORIZATION,
                     HeaderValue::from_str(&format!("Bearer {}", access_token))?,

@@ -20,33 +20,45 @@ pub struct VaultReadResponse {
 }
 
 /// PUT /gvm/vault/:key — Write encrypted value to vault
+///
+/// Security: keys are scoped by agent_id prefix to enforce namespace isolation.
+/// Agent "agent-001" can only write to keys prefixed with "agent-001:".
 pub async fn vault_write(
     State(state): State<AppState>,
     Path(key): Path<String>,
     Json(body): Json<VaultWriteRequest>,
 ) -> Response<Body> {
+    // Namespace isolation: scope key by agent_id to prevent cross-agent access
+    let scoped_key = format!("{}:{}", body.agent_id, key);
+
     match state
         .vault
-        .write(&key, body.value.as_bytes(), &body.agent_id)
+        .write(&scoped_key, body.value.as_bytes(), &body.agent_id)
         .await
     {
         Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"status": "ok", "key": key})),
-        Err(e) => json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &serde_json::json!({"error": e.to_string()}),
-        ),
+        Err(e) => {
+            tracing::error!(key = %key, agent = %body.agent_id, error = %e, "Vault write failed");
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({"error": "Internal vault error"}),
+            )
+        }
     }
 }
 
 /// GET /gvm/vault/:key?agent_id=xxx — Read and decrypt value from vault
+///
+/// Security: reads are scoped by agent_id prefix (namespace isolation).
 pub async fn vault_read(
     State(state): State<AppState>,
     Path(key): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response<Body> {
     let agent_id = params.get("agent_id").map(|s| s.as_str()).unwrap_or("unknown");
+    let scoped_key = format!("{}:{}", agent_id, key);
 
-    match state.vault.read(&key, agent_id).await {
+    match state.vault.read(&scoped_key, agent_id).await {
         Ok(Some(bytes)) => {
             let value = String::from_utf8_lossy(&bytes).to_string();
             json_response(
@@ -58,27 +70,36 @@ pub async fn vault_read(
             )
         }
         Ok(None) => json_response(StatusCode::NOT_FOUND, &serde_json::json!({"error": "Key not found", "key": key})),
-        Err(e) => json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &serde_json::json!({"error": e.to_string()}),
-        ),
+        Err(e) => {
+            tracing::error!(key = %key, agent = %agent_id, error = %e, "Vault read failed");
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({"error": "Internal vault error"}),
+            )
+        }
     }
 }
 
 /// DELETE /gvm/vault/:key?agent_id=xxx — Delete key from vault
+///
+/// Security: deletes are scoped by agent_id prefix (namespace isolation).
 pub async fn vault_delete(
     State(state): State<AppState>,
     Path(key): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response<Body> {
     let agent_id = params.get("agent_id").map(|s| s.as_str()).unwrap_or("unknown");
+    let scoped_key = format!("{}:{}", agent_id, key);
 
-    match state.vault.delete(&key, agent_id).await {
+    match state.vault.delete(&scoped_key, agent_id).await {
         Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"status": "deleted", "key": key})),
-        Err(e) => json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &serde_json::json!({"error": e.to_string()}),
-        ),
+        Err(e) => {
+            tracing::error!(key = %key, agent = %agent_id, error = %e, "Vault delete failed");
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({"error": "Internal vault error"}),
+            )
+        }
     }
 }
 
@@ -93,6 +114,8 @@ pub struct CheckRequest {
     pub resource: Option<serde_json::Value>,
     #[serde(default = "default_host")]
     pub target_host: String,
+    #[serde(default = "default_path")]
+    pub target_path: String,
     #[serde(default = "default_method")]
     pub method: String,
 }
@@ -102,6 +125,9 @@ fn default_service() -> Option<String> {
 }
 fn default_host() -> String {
     "example.com".to_string()
+}
+fn default_path() -> String {
+    "/".to_string()
 }
 fn default_method() -> String {
     "POST".to_string()
@@ -137,8 +163,8 @@ pub async fn check(
     };
     let (policy_decision, matched_rule) = state.policy.evaluate(&operation);
 
-    // Layer 2: Network SRR evaluation
-    let srr_decision = state.srr.check(&body.method, &body.target_host, "/", None);
+    // Layer 2: Network SRR evaluation (use actual target_path for accurate matching)
+    let srr_decision = state.srr.check(&body.method, &body.target_host, &body.target_path, None);
 
     // Combined decision
     let decision = crate::types::max_strict(srr_decision, policy_decision);
@@ -191,9 +217,10 @@ pub async fn health() -> Response<Body> {
     )
 }
 
-/// GET /gvm/info — Proxy info and loaded configuration summary
+/// GET /gvm/info — Proxy info and loaded configuration summary.
+///
+/// Security: returns summary counts only, not internal rule details.
 pub async fn info(State(state): State<AppState>) -> Response<Body> {
-    let registry_info = format!("{:?}", *state.registry);
     json_response(
         StatusCode::OK,
         &serde_json::json!({
@@ -205,7 +232,10 @@ pub async fn info(State(state): State<AppState>) -> Response<Body> {
                 "vault": "active",
                 "ledger": "active",
             },
-            "registry_summary": registry_info,
+            "registry": {
+                "core_operations": state.registry.core_count(),
+                "custom_operations": state.registry.custom_count(),
+            },
         }),
     )
 }

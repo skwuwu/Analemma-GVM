@@ -192,13 +192,28 @@ impl WasmEngine {
             .context("Failed to read result length from Wasm memory")?;
         let result_len = u32::from_le_bytes(len_buf) as usize;
 
+        // Guard against malicious or corrupted length values exhausting host memory
+        const MAX_RESPONSE_LEN: usize = 1024 * 1024; // 1MB
+        if result_len > MAX_RESPONSE_LEN {
+            return Err(anyhow::anyhow!(
+                "Wasm response too large: {} bytes (max {})",
+                result_len, MAX_RESPONSE_LEN
+            ));
+        }
+
         // 5. Read response JSON
         let mut result_buf = vec![0u8; result_len];
         memory.read(&mut rt.store, (result_ptr as usize) + 4, &mut result_buf)
             .context("Failed to read result data from Wasm memory")?;
 
-        // 6. Deallocate input buffer
-        let _ = dealloc_fn.call(&mut rt.store, (input_ptr, input_len));
+        // 6. Deallocate both input and output buffers
+        if let Err(e) = dealloc_fn.call(&mut rt.store, (input_ptr, input_len)) {
+            tracing::warn!("engine_dealloc failed for input buffer: {}", e);
+        }
+        let result_total_len = (result_len as u32) + 4; // length prefix + data
+        if let Err(e) = dealloc_fn.call(&mut rt.store, (result_ptr, result_total_len)) {
+            tracing::warn!("engine_dealloc failed for result buffer: {}", e);
+        }
 
         // 7. Parse response
         let result_str = std::str::from_utf8(&result_buf)
@@ -234,7 +249,13 @@ impl WasmEngine {
             "Throttle" => EnforcementDecision::Throttle {
                 max_per_minute: 60,
             },
-            _ => EnforcementDecision::Allow,
+            other => {
+                tracing::warn!(
+                    decision = %other,
+                    "Unknown decision from Wasm engine — defaulting to Delay"
+                );
+                EnforcementDecision::Delay { milliseconds: 300 }
+            }
         };
 
         (decision, resp.matched_rule.clone())
@@ -250,8 +271,8 @@ impl WasmEngine {
             operation: operation.operation.clone(),
             resource: gvm_engine::ResourceAttrs {
                 service: operation.resource.service.clone(),
-                tier: format!("{:?}", operation.resource.tier),
-                sensitivity: format!("{:?}", operation.resource.sensitivity),
+                tier: tier_to_str(&operation.resource.tier).to_string(),
+                sensitivity: sensitivity_to_str(&operation.resource.sensitivity).to_string(),
             },
             subject: gvm_engine::SubjectAttrs {
                 agent_id: operation.subject.agent_id.clone(),
@@ -259,6 +280,23 @@ impl WasmEngine {
             },
             rules: rules.to_vec(),
         }
+    }
+}
+
+fn tier_to_str(tier: &ResourceTier) -> &'static str {
+    match tier {
+        ResourceTier::Internal => "Internal",
+        ResourceTier::External => "External",
+        ResourceTier::CustomerFacing => "CustomerFacing",
+    }
+}
+
+fn sensitivity_to_str(sensitivity: &Sensitivity) -> &'static str {
+    match sensitivity {
+        Sensitivity::Low => "Low",
+        Sensitivity::Medium => "Medium",
+        Sensitivity::High => "High",
+        Sensitivity::Critical => "Critical",
     }
 }
 

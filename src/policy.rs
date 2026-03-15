@@ -70,6 +70,8 @@ pub struct Condition {
     pub operator: Operator,
     /// Comparison value
     pub value: serde_json::Value,
+    /// Pre-compiled regex (only populated when operator is Regex)
+    pub compiled_regex: Option<regex::Regex>,
 }
 
 #[derive(Clone, Debug)]
@@ -197,6 +199,8 @@ impl PolicyEngine {
         let mut matched_rule_id: Option<String> = None;
 
         // Layer 1: Global rules
+        // Uses >= so that any Global match replaces the initial Allow default
+        // (same strictness still adopts the Global rule's decision and rule_id)
         if let Some((decision, rule_id)) = self.evaluate_layer(&self.global_rules, operation) {
             if matches!(decision, EnforcementDecision::Deny { .. }) {
                 return (decision, Some(rule_id));
@@ -208,6 +212,7 @@ impl PolicyEngine {
         }
 
         // Layer 2: Tenant rules
+        // Uses > (strictly greater) so lower layers only override when actually stricter
         if let Some(tenant_id) = &operation.subject.tenant_id {
             if let Some(rules) = self.tenant_rules.get(tenant_id) {
                 if let Some((decision, rule_id)) = self.evaluate_layer(rules, operation) {
@@ -264,7 +269,7 @@ fn rule_matches(rule: &PolicyRule, operation: &OperationMetadata) -> bool {
 
     rule.conditions.iter().all(|cond| {
         let field_value = resolve_field(&cond.field, operation);
-        evaluate_condition(&cond.operator, &field_value, &cond.value)
+        evaluate_condition(&cond.operator, &field_value, &cond.value, &cond.compiled_regex)
     })
 }
 
@@ -278,9 +283,9 @@ fn resolve_field(field: &str, operation: &OperationMetadata) -> serde_json::Valu
             Some(id) => serde_json::Value::String(id.clone()),
             None => serde_json::Value::Null,
         },
-        "resource.tier" => serde_json::Value::String(format!("{:?}", operation.resource.tier)),
+        "resource.tier" => serde_json::Value::String(tier_as_policy_str(&operation.resource.tier).to_string()),
         "resource.sensitivity" => {
-            serde_json::Value::String(format!("{:?}", operation.resource.sensitivity))
+            serde_json::Value::String(sensitivity_as_policy_str(&operation.resource.sensitivity).to_string())
         }
 
         "subject.agent_id" => serde_json::Value::String(operation.subject.agent_id.clone()),
@@ -313,6 +318,7 @@ fn evaluate_condition(
     operator: &Operator,
     field_value: &serde_json::Value,
     expected: &serde_json::Value,
+    compiled_regex: &Option<regex::Regex>,
 ) -> bool {
     match operator {
         Operator::Eq => field_value == expected,
@@ -342,10 +348,10 @@ fn evaluate_condition(
 
         Operator::Regex => {
             let haystack = value_as_str(field_value);
-            let pattern = value_as_str(expected);
-            regex::Regex::new(&pattern)
-                .map(|re| re.is_match(&haystack))
-                .unwrap_or(false)
+            match compiled_regex {
+                Some(re) => re.is_match(&haystack),
+                None => false,
+            }
         }
 
         Operator::In => {
@@ -402,6 +408,23 @@ fn value_as_f64(v: &serde_json::Value) -> Option<f64> {
     }
 }
 
+fn tier_as_policy_str(tier: &ResourceTier) -> &'static str {
+    match tier {
+        ResourceTier::Internal => "Internal",
+        ResourceTier::External => "External",
+        ResourceTier::CustomerFacing => "CustomerFacing",
+    }
+}
+
+fn sensitivity_as_policy_str(sensitivity: &Sensitivity) -> &'static str {
+    match sensitivity {
+        Sensitivity::Low => "Low",
+        Sensitivity::Medium => "Medium",
+        Sensitivity::High => "High",
+        Sensitivity::Critical => "Critical",
+    }
+}
+
 /// Compile a TOML rule config into a runtime PolicyRule
 fn compile_rule(cfg: &PolicyRuleConfig) -> Result<PolicyRule> {
     let layer = match cfg.layer.as_str() {
@@ -411,35 +434,39 @@ fn compile_rule(cfg: &PolicyRuleConfig) -> Result<PolicyRule> {
         other => anyhow::bail!("Unknown policy layer: {}", other),
     };
 
-    let conditions: Vec<Condition> = cfg
-        .conditions
-        .iter()
-        .map(|c| {
-            let operator = match c.operator.as_str() {
-                "Eq" => Operator::Eq,
-                "NotEq" => Operator::NotEq,
-                "Gt" => Operator::Gt,
-                "Lt" => Operator::Lt,
-                "Gte" => Operator::Gte,
-                "Lte" => Operator::Lte,
-                "Contains" => Operator::Contains,
-                "StartsWith" => Operator::StartsWith,
-                "EndsWith" => Operator::EndsWith,
-                "Regex" => Operator::Regex,
-                "In" => Operator::In,
-                "NotIn" => Operator::NotIn,
-                other => {
-                    tracing::warn!(operator = other, "Unknown operator, defaulting to Eq");
-                    Operator::Eq
-                }
-            };
-            Condition {
-                field: c.field.clone(),
-                operator,
-                value: c.value.clone(),
-            }
-        })
-        .collect();
+    let mut conditions: Vec<Condition> = Vec::with_capacity(cfg.conditions.len());
+    for c in &cfg.conditions {
+        let operator = match c.operator.as_str() {
+            "Eq" => Operator::Eq,
+            "NotEq" => Operator::NotEq,
+            "Gt" => Operator::Gt,
+            "Lt" => Operator::Lt,
+            "Gte" => Operator::Gte,
+            "Lte" => Operator::Lte,
+            "Contains" => Operator::Contains,
+            "StartsWith" => Operator::StartsWith,
+            "EndsWith" => Operator::EndsWith,
+            "Regex" => Operator::Regex,
+            "In" => Operator::In,
+            "NotIn" => Operator::NotIn,
+            other => anyhow::bail!("Unknown operator '{}' in rule {}", other, cfg.id),
+        };
+
+        let compiled_regex = if matches!(operator, Operator::Regex) {
+            let pattern = value_as_str(&c.value);
+            Some(regex::Regex::new(&pattern)
+                .with_context(|| format!("Invalid regex in rule {}: {}", cfg.id, pattern))?)
+        } else {
+            None
+        };
+
+        conditions.push(Condition {
+            field: c.field.clone(),
+            operator,
+            value: c.value.clone(),
+            compiled_regex,
+        });
+    }
 
     let decision = compile_decision(&cfg.decision)?;
 
@@ -533,11 +560,12 @@ mod tests {
             field: "operation".to_string(),
             operator: Operator::StartsWith,
             value: serde_json::Value::String("gvm.payment".to_string()),
+            compiled_regex: None,
         };
 
         let op = make_operation("gvm.payment.charge", Sensitivity::High, ResourceTier::External);
         let field_val = resolve_field(&cond.field, &op);
-        assert!(evaluate_condition(&cond.operator, &field_val, &cond.value));
+        assert!(evaluate_condition(&cond.operator, &field_val, &cond.value, &cond.compiled_regex));
     }
 
     #[test]
@@ -546,11 +574,12 @@ mod tests {
             field: "operation".to_string(),
             operator: Operator::EndsWith,
             value: serde_json::Value::String(".read".to_string()),
+            compiled_regex: None,
         };
 
         let op = make_operation("gvm.storage.read", Sensitivity::Low, ResourceTier::Internal);
         let field_val = resolve_field(&cond.field, &op);
-        assert!(evaluate_condition(&cond.operator, &field_val, &cond.value));
+        assert!(evaluate_condition(&cond.operator, &field_val, &cond.value, &cond.compiled_regex));
     }
 
     #[test]
@@ -559,6 +588,7 @@ mod tests {
             field: "context.amount".to_string(),
             operator: Operator::Gt,
             value: serde_json::json!(500),
+            compiled_regex: None,
         };
 
         let mut op = make_operation("gvm.payment.refund", Sensitivity::High, ResourceTier::External);
@@ -567,7 +597,7 @@ mod tests {
             .insert("amount".to_string(), serde_json::json!(1000));
 
         let field_val = resolve_field(&cond.field, &op);
-        assert!(evaluate_condition(&cond.operator, &field_val, &cond.value));
+        assert!(evaluate_condition(&cond.operator, &field_val, &cond.value, &cond.compiled_regex));
     }
 
     #[test]
@@ -582,6 +612,7 @@ mod tests {
                     field: "operation".to_string(),
                     operator: Operator::EndsWith,
                     value: serde_json::Value::String(".read".to_string()),
+                    compiled_regex: None,
                 }],
                 decision: EnforcementDecision::Allow,
             },
@@ -595,11 +626,13 @@ mod tests {
                         field: "operation".to_string(),
                         operator: Operator::Eq,
                         value: serde_json::Value::String("gvm.storage.delete".to_string()),
+                        compiled_regex: None,
                     },
                     Condition {
                         field: "resource.sensitivity".to_string(),
                         operator: Operator::Eq,
                         value: serde_json::Value::String("Critical".to_string()),
+                        compiled_regex: None,
                     },
                 ],
                 decision: EnforcementDecision::Deny {

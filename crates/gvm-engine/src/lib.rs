@@ -198,12 +198,20 @@ fn decision_strictness(decision_type: &str) -> u8 {
         "Delay" => 3,
         "RequireApproval" => 4,
         "Deny" => 5,
-        _ => 0,
+        // Fail-close: unknown decision types are treated as maximally strict
+        _ => 5,
     }
 }
 
 // ─── Condition Matching ───
 
+/// Build a flat field map from the request for condition matching.
+///
+/// NOTE: Context attributes (e.g., `context.time_of_day`, `context.ip_address`)
+/// are not yet included. The host-side policy engine (policy.rs) handles context
+/// attributes directly. To support context-based conditions in Wasm evaluation,
+/// add a `context: HashMap<String, serde_json::Value>` field to `EvalRequest`
+/// and flatten it here with "context." prefix.
 fn build_field_map(req: &EvalRequest) -> HashMap<String, serde_json::Value> {
     let mut m = HashMap::new();
     m.insert("operation".to_string(), serde_json::Value::String(req.operation.clone()));
@@ -263,10 +271,15 @@ fn condition_matches(cond: &Condition, fields: &HashMap<String, serde_json::Valu
                 false
             }
         }
+        // Numeric comparisons (snake_case canonical, symbols accepted)
         "gt" | ">" => compare_numeric(field_val, &cond.value, |a, b| a > b),
         "gte" | ">=" => compare_numeric(field_val, &cond.value, |a, b| a >= b),
         "lt" | "<" => compare_numeric(field_val, &cond.value, |a, b| a < b),
         "lte" | "<=" => compare_numeric(field_val, &cond.value, |a, b| a <= b),
+        // Fail-close: unknown operators never match (prevents accidental allow)
+        // NOTE: The host (policy.rs) uses PascalCase operators ("Eq", "StartsWith")
+        // and converts to the Wasm engine's snake_case format when building EvalRequest.
+        // If adding new operators here, update the host's conversion logic as well.
         _ => false,
     }
 }
@@ -302,11 +315,34 @@ mod wasm_ffi {
     }
 
     /// Evaluate a policy request. Input: JSON at (ptr, len). Returns pointer
-    /// to response (first 4 bytes = length, then JSON).
+    /// to response (first 4 bytes = little-endian u32 JSON length, then JSON bytes).
+    ///
+    /// # Memory Contract
+    /// The returned pointer is allocated via `engine_alloc`. The **host** is
+    /// responsible for freeing it by calling:
+    ///   `engine_dealloc(result_ptr, 4 + json_len)`
+    /// where `json_len` is read from the first 4 bytes of the result.
+    /// Failure to deallocate will leak Wasm linear memory.
     #[no_mangle]
     pub extern "C" fn engine_evaluate(ptr: *const u8, len: u32) -> *const u8 {
         let input = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-        let input_str = std::str::from_utf8(input).unwrap_or("{}");
+        let input_str = match std::str::from_utf8(input) {
+            Ok(s) => s,
+            Err(_) => {
+                // Fail-close: invalid UTF-8 input → return explicit error, not "{}"
+                let error_output = r#"{"error":"invalid UTF-8 input"}"#;
+                let error_bytes = error_output.as_bytes();
+                let total = 4 + error_bytes.len();
+                let layout = Layout::from_size_align(total, 1).unwrap();
+                let err_ptr = unsafe { alloc(layout) };
+                let len_bytes = (error_bytes.len() as u32).to_le_bytes();
+                unsafe {
+                    std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), err_ptr, 4);
+                    std::ptr::copy_nonoverlapping(error_bytes.as_ptr(), err_ptr.add(4), error_bytes.len());
+                }
+                return err_ptr;
+            }
+        };
 
         let output = evaluate_json(input_str);
         let output_bytes = output.as_bytes();

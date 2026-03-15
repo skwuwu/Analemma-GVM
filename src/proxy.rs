@@ -417,7 +417,10 @@ async fn forward_request(
     let (mut parts, body) = request.into_parts();
 
     // Inject API credentials (Layer 3: Capability Token)
-    if let Err(e) = state.api_keys.inject(&mut parts.headers, &target.host) {
+    // MVP default: Passthrough (no credential = forward as-is).
+    // Production should use Deny to enforce Layer 3 isolation.
+    let credential_policy = crate::api_keys::MissingCredentialPolicy::default();
+    if let Err(e) = state.api_keys.inject(&mut parts.headers, &target.host, &credential_policy) {
         tracing::error!(error = %e, "Failed to inject API key");
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,

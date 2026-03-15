@@ -65,6 +65,9 @@ impl OperationRegistry {
         for op in &file.core {
             Self::validate_core_name(&op.name)?;
             Self::validate_ic(op.default_ic)?;
+            if core_ops.contains_key(&op.name) {
+                anyhow::bail!("Duplicate core operation: '{}'", op.name);
+            }
             core_ops.insert(op.name.clone(), op.clone());
         }
 
@@ -72,6 +75,9 @@ impl OperationRegistry {
         for op in &file.custom {
             Self::validate_custom_name(&op.name, &op.vendor)?;
             Self::validate_ic(op.default_ic)?;
+            if custom_ops.contains_key(&op.name) {
+                anyhow::bail!("Duplicate custom operation: '{}'", op.name);
+            }
             custom_ops.insert(op.name.clone(), op.clone());
         }
 
@@ -131,6 +137,7 @@ impl OperationRegistry {
                 name
             );
         }
+        Self::validate_segments(&parts, name)?;
         Ok(())
     }
 
@@ -143,6 +150,7 @@ impl OperationRegistry {
                 name
             );
         }
+        Self::validate_segments(&parts, name)?;
         if parts[1] != vendor {
             anyhow::bail!(
                 "Vendor mismatch in '{}': name segment '{}' != declared vendor '{}'",
@@ -150,6 +158,23 @@ impl OperationRegistry {
                 parts[1],
                 vendor
             );
+        }
+        Ok(())
+    }
+
+    /// Validate that each segment is non-empty and contains only alphanumeric + underscore.
+    fn validate_segments(parts: &[&str], name: &str) -> Result<()> {
+        for (i, part) in parts.iter().enumerate() {
+            if part.is_empty() {
+                anyhow::bail!("Empty segment at position {} in '{}'", i, name);
+            }
+            if !part.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                anyhow::bail!(
+                    "Invalid characters in segment '{}' of '{}' (only alphanumeric and underscore allowed)",
+                    part,
+                    name
+                );
+            }
         }
         Ok(())
     }
@@ -204,6 +229,16 @@ impl OperationRegistry {
             return Some(name.to_string());
         }
         None
+    }
+
+    /// Number of core operations registered.
+    pub fn core_count(&self) -> usize {
+        self.core_ops.len()
+    }
+
+    /// Number of custom operations registered.
+    pub fn custom_count(&self) -> usize {
+        self.custom_ops.len()
     }
 }
 
