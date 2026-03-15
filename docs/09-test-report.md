@@ -19,10 +19,10 @@ tests/
 src/
 ├── registry.rs         # 4 unit tests
 ├── policy.rs           # 4 unit tests
-├── srr.rs              # 10 unit tests
+├── srr.rs              # 13 unit tests
 ├── vault.rs            # 7 unit tests
 ├── wasm_engine.rs      # 4 unit tests
-├── merkle.rs           # 8 Merkle hash/proof tests
+├── merkle.rs           # 9 Merkle hash/proof tests
 ├── llm_trace.rs        # 8 LLM thinking trace tests
 crates/gvm-engine/
 ├── src/lib.rs          # 5 engine tests
@@ -180,20 +180,23 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 | 3 | [`test_numeric_gt_condition`](src/policy.rs) | Rule: `context.amount > 500`, input: `amount=1000` | Numeric comparison succeeds |
 | 4 | [`test_deny_overrides_all`](src/policy.rs) | Deny (priority 1) + Allow (priority 100) on same request | Deny short-circuits, `matched_rule_id` correct |
 
-### Network SRR (10 tests) — [src/srr.rs](src/srr.rs)
+### Network SRR (13 tests) — [src/srr.rs](src/srr.rs)
 
 | # | Test | Scenario | Verification |
 |---|------|----------|--------------|
-| 1 | [`payload_exceeding_max_body_bytes_falls_back_to_default_caution`](src/srr.rs) | 200B body with `max_body_bytes=100` | Returns Delay 300ms (Default-to-Caution), not Deny |
-| 2 | [`payload_at_exact_limit_is_inspected`](src/srr.rs) | Body at limit with `operationName=TransferFunds` | Returns Deny — payload inspection proceeds |
-| 3 | [`large_64kb_body_does_not_crash_or_oom`](src/srr.rs) | 128KB body | Returns Default-to-Caution, no crash or OOM |
-| 4 | [`malformed_json_body_skips_payload_rule`](src/srr.rs) | Invalid JSON `"this is not json {{{"` | Falls through to next URL-only rule (Delay 300ms) |
-| 5 | [`no_body_for_payload_rule_skips_to_next`](src/srr.rs) | No body for payload inspection rule | Falls through to next rule |
-| 6 | [`srr_catches_url_regardless_of_operation_header`](src/srr.rs) | URL=`api.bank.com/transfer/123` | Deny — SRR ignores semantic headers |
-| 7 | [`unknown_url_gets_default_to_caution`](src/srr.rs) | `totally-unknown.com/some/path` | Delay 300ms (Default-to-Caution) |
-| 8 | [`suffix_host_pattern_blocks_all_subdomains`](src/srr.rs) | `{host}.database.com` pattern | prod/staging/dev.database.com all Denied |
-| 9 | [`method_mismatch_does_not_trigger_rule`](src/srr.rs) | GET to POST-only rule | Not denied (Default-to-Caution) |
-| 10 | [`wildcard_method_matches_all_http_methods`](src/srr.rs) | `method = "*"` on `evil.com` | GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS all Denied |
+| 1 | [`payload_exceeding_max_body_bytes_skips_to_next_rule`](src/srr.rs) | 200B body with `max_body_bytes=100`, fallback rule exists | Skips payload rule, matches URL-only fallback |
+| 2 | [`payload_exceeding_max_body_bytes_no_fallback_gets_default_caution`](src/srr.rs) | 200B body with `max_body_bytes=100`, no fallback rule | Returns Delay 300ms (Default-to-Caution) |
+| 3 | [`payload_at_exact_limit_is_inspected`](src/srr.rs) | Body at limit with `operationName=TransferFunds` | Returns Deny — payload inspection proceeds |
+| 4 | [`large_64kb_body_does_not_crash_or_oom`](src/srr.rs) | 128KB body | Returns Default-to-Caution, no crash or OOM |
+| 5 | [`malformed_json_body_skips_payload_rule`](src/srr.rs) | Invalid JSON `"this is not json {{{"` | Falls through to next URL-only rule (Delay 300ms) |
+| 6 | [`no_body_for_payload_rule_skips_to_next`](src/srr.rs) | No body for payload inspection rule | Falls through to next rule |
+| 7 | [`srr_catches_url_regardless_of_operation_header`](src/srr.rs) | URL=`api.bank.com/transfer/123` | Deny — SRR ignores semantic headers |
+| 8 | [`unknown_url_gets_default_to_caution`](src/srr.rs) | `totally-unknown.com/some/path` | Delay 300ms (Default-to-Caution) |
+| 9 | [`suffix_host_pattern_blocks_all_subdomains`](src/srr.rs) | `{host}.database.com` pattern | prod/staging/dev.database.com all Denied |
+| 10 | [`method_mismatch_does_not_trigger_rule`](src/srr.rs) | GET to POST-only rule | Not denied (Default-to-Caution) |
+| 11 | [`wildcard_method_matches_all_http_methods`](src/srr.rs) | `method = "*"` on `evil.com` | GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS all Denied |
+| 12 | [`host_with_port_matches_exact_pattern`](src/srr.rs) | `api.bank.com:8443` matches `api.bank.com` rule | Port stripped before matching |
+| 13 | [`host_with_port_matches_suffix_pattern`](src/srr.rs) | `prod.database.com:5432` matches `{host}.database.com` | Port stripped, suffix pattern matched |
 
 ### Encrypted Vault (7 tests) — [src/vault.rs](src/vault.rs)
 
