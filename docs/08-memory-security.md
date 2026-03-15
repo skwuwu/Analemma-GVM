@@ -230,7 +230,112 @@ The ratio is within an order of magnitude, making timing-based inference impract
 
 ---
 
-## 8.7 Future Hardening (Roadmap)
+## 8.7 OS-Level Isolation: Architecture & MicroVM Extensibility
+
+### 8.7.1 Current Isolation Model
+
+The `gvm-sandbox` crate provides Linux-native process isolation using four kernel primitives:
+
+| Layer | Mechanism | Source | Purpose |
+|-------|-----------|--------|---------|
+| User namespace | `CLONE_NEWUSER` | `namespace.rs` | Non-privileged root (UID 0 maps to host UID) |
+| PID namespace | `CLONE_NEWPID` | `namespace.rs` | Isolated process tree |
+| Mount namespace | `CLONE_NEWNS` + `pivot_root` | `mount.rs` | Read-only workspace, minimal rootfs (tmpfs 64MB) |
+| Network namespace | `CLONE_NEWNET` + veth pair | `network.rs` | Proxy-only routing via DNAT |
+| Syscall filter | seccomp-BPF (whitelist, ~45 syscalls) | `seccomp.rs` | Default-deny; blocks ptrace, mount, bpf, unshare |
+
+**Network isolation** is the critical enforcement boundary: the agent's sole network path is a veth pair with iptables DNAT that routes all traffic to the GVM proxy. No external IP is reachable. This ensures Layer 2 (SRR) and Layer 3 (API key injection) cannot be bypassed.
+
+```
+Agent (sandbox netns)         Host netns              GVM Proxy
+10.200.X.2/30  ──veth──>  10.200.X.1/30  ──DNAT──>  127.0.0.1:8080
+                          iptables MASQUERADE         3-layer enforcement
+```
+
+**Setup overhead**: ~2ms (clone + veth + pivot_root + seccomp). Supports 16K+ concurrent sandboxes via PID-derived /30 subnets.
+
+### 8.7.2 MicroVM Feasibility Assessment
+
+The architecture is extensible to Firecracker-class MicroVM isolation. This section documents the evaluation and decision rationale.
+
+**Comparison:**
+
+| Property | Current (namespace+seccomp) | MicroVM (Firecracker/Cloud Hypervisor) |
+|----------|---------------------------|---------------------------------------|
+| Kernel sharing | Shared host kernel | Dedicated guest kernel per VM |
+| Isolation boundary | seccomp-BPF (syscall filter) | KVM/vmexit (hardware boundary) |
+| Kernel exploit resistance | Vulnerable (shared kernel) | Isolated (requires KVM + guest kernel dual exploit) |
+| Network path | veth + iptables DNAT | virtio-net + TAP device + bridge/NAT |
+| Filesystem | pivot_root + bind mounts | Separate rootfs image (ext4/squashfs) |
+| Setup latency | **~2ms** | **40-150ms** (VMM boot + guest kernel init) |
+| Memory overhead | **~5MB** (process) | **128-256MB** (guest kernel + initrd + runtime) |
+| Concurrent instances | 16K+ (PID-based subnet) | Tens to low hundreds (memory-bound) |
+| Infrastructure dependency | Linux kernel only | KVM + VMM binary + rootfs images |
+
+**Proxy connectivity invariant**: Both models can maintain the architectural guarantee that the GVM proxy is the agent's sole network gateway. In the MicroVM model, the veth+DNAT path would be replaced by a virtio-net+TAP+bridge configuration, but the enforcement semantics are identical.
+
+### 8.7.3 Threat Model Analysis
+
+GVM's threat model assumes AI agents are adversarial at the application level (prompt injection, header forgery, payload crafting) but not at the kernel level:
+
+| Threat | namespace+seccomp | MicroVM | Assessment |
+|--------|-------------------|---------|------------|
+| Unauthorized API calls (prompt injection) | Blocked by proxy (Layer 2/3) | Blocked by proxy (Layer 2/3) | Isolation mode irrelevant |
+| Network escape attempt | Blocked (no route outside veth) | Blocked (no route outside virtio-net) | Equivalent |
+| API key theft from environment | Blocked (Layer 3 injects post-enforcement) | Blocked (same) | Equivalent |
+| Header forgery / operation spoofing | Blocked (SRR cross-checks URL) | Blocked (same) | Equivalent |
+| Filesystem escape | Blocked (pivot_root + read-only) | Blocked (separate rootfs) | Equivalent |
+| Dangerous syscall (ptrace, mount) | Blocked (seccomp-BPF KILL_PROCESS) | Blocked (guest kernel boundary) | Equivalent |
+| **Host kernel exploit** | **Vulnerable** (shared kernel) | **Isolated** (KVM boundary) | MicroVM advantage |
+
+**Key insight**: AI agents are interpreted processes (Python, Node.js) operating via HTTP. They do not execute arbitrary native code, craft kernel exploits, or attempt privilege escalation through OS-level vulnerabilities. The kernel exploit vector — the sole area where MicroVM provides additional protection — is outside the realistic threat model for governed AI agents.
+
+### 8.7.4 Decision: MicroVM Not Required at Current Stage
+
+**Rationale:**
+
+1. **Threat model mismatch**: The additional kernel-level isolation that MicroVM provides defends against threats (kernel exploits) that AI agents do not realistically pose. The seccomp-BPF whitelist already blocks the syscalls needed for such attacks (ptrace, bpf, mount, unshare, open_by_handle_at).
+
+2. **Performance cost is prohibitive**: 50x setup latency (2ms → 100ms+) and 25x memory overhead (5MB → 128MB+) directly impact the agent orchestration use case where rapid, concurrent sandboxing is required.
+
+3. **Operational complexity**: MicroVM requires rootfs image management (per-interpreter), VMM lifecycle management, and KVM availability — significantly raising the deployment barrier for a governance tool that should be as lightweight as possible.
+
+4. **Current isolation is already strong**: The combination of four Linux namespaces, a 45-syscall seccomp whitelist, pivot_root filesystem isolation, and proxy-only network routing provides defense-in-depth sufficient for the AI agent governance use case. The seccomp filter itself uses Firecracker's `seccompiler` crate, demonstrating shared security heritage.
+
+### 8.7.5 Extensibility Path
+
+The sandbox architecture is designed for future MicroVM support as a third isolation mode:
+
+```
+gvm run agent.py                    # Local mode (Layer 2 only)
+gvm run --sandbox agent.py          # Linux-native (namespace+seccomp, ~2ms)
+gvm run --contained agent.py        # Docker (container runtime, ~50ms)
+gvm run --microvm agent.py          # MicroVM (Firecracker/KVM, ~100ms) [future]
+```
+
+**When MicroVM becomes justified:**
+
+- **Multi-tenant SaaS**: External users submit arbitrary agent code for execution. Untrusted user code (not just untrusted prompts) warrants hardware-level isolation.
+- **Regulatory compliance**: Industries (finance, healthcare) may mandate hardware-boundary isolation for workload separation, regardless of practical threat assessment.
+- **Defense-in-depth requirement**: Security-critical deployments where even theoretical kernel exploit vectors must be mitigated.
+
+**Migration scope** (estimated effort for future implementation):
+
+| Module | Change | Description |
+|--------|--------|-------------|
+| `network.rs` | Rewrite | veth+DNAT → TAP+bridge+virtio-net |
+| `mount.rs` | Replace | pivot_root → rootfs image builder |
+| `namespace.rs` | Remove | Replaced by KVM/VMM namespace isolation |
+| `seccomp.rs` | Reduce | Move to VMM-level seccomp (Firecracker has built-in) |
+| `sandbox_impl.rs` | Rewrite | clone+exec → Firecracker socket API |
+| **New: rootfs builder** | Create | Per-interpreter rootfs image pipeline |
+| **New: VMM manager** | Create | Firecracker lifecycle, config, health |
+
+The proxy layer (`proxy.rs`) and all enforcement logic (SRR, ABAC, WAL, Vault) remain unchanged — isolation is orthogonal to governance enforcement.
+
+---
+
+## 8.8 Future Hardening (Roadmap)
 
 | Enhancement | Priority | Description |
 |-------------|----------|-------------|
@@ -240,6 +345,7 @@ The ratio is within an order of magnitude, making timing-based inference impract
 | Constant-time SRR | Medium | Pad all code paths to fixed execution time |
 | Memory allocator hardening | Low | Use `jemalloc` with security features or custom allocator |
 | Fuzzing CI pipeline | Medium | Continuous fuzzing with `cargo-fuzz` or AFL |
+| MicroVM isolation mode | Low | Firecracker/KVM `--microvm` flag for multi-tenant SaaS (see 8.7) |
 
 ---
 

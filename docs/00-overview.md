@@ -67,6 +67,7 @@ When in doubt, block. The system defaults to **Delay 300ms** (Default-to-Caution
 | 6 | [Proxy Pipeline](06-proxy.md) | `src/proxy.rs` |
 | 7 | [Python SDK](07-sdk.md) | `sdk/python/gvm/` |
 | 8 | [Memory & Runtime Security](08-memory-security.md) | (this whitepaper) |
+| 8.7 | [OS Isolation & MicroVM Assessment](08-memory-security.md) | `crates/gvm-sandbox/` |
 | 9 | [Test Coverage Report](09-test-report.md) | `tests/hostile.rs` |
 
 ---

@@ -325,6 +325,8 @@ gvm run agent.py
 | Overhead | ~2ms setup, no daemon | Docker daemon required |
 | Platform | Linux only | Any Docker-supported OS |
 
+**Why not MicroVM?** The architecture is designed to be extensible to Firecracker-class MicroVM isolation (`--microvm` mode) for multi-tenant SaaS deployments where untrusted user code requires hardware-level (KVM) isolation. However, the current namespace+seccomp approach is sufficient for AI agent governance: agents are non-privileged interpreted processes (Python/Node), not arbitrary binaries capable of kernel exploits. MicroVM would add 50x setup latency (2ms → 100ms+) and 25x memory overhead (5MB → 128MB+) with no practical security gain for this threat model. See [Part 8: Memory & Runtime Security](docs/08-memory-security.md) for the full analysis.
+
 ### LLM provider governance
 
 GVM inspects LLM API calls at the proxy level — no SDK changes needed:
