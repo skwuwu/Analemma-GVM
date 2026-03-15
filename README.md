@@ -5,6 +5,10 @@
 > Smarter models do not mean safer systems.
 > Safety must be structural, not behavioral.
 
+<p align="center">
+  <img src="demo.svg" alt="Analemma-GVM Unified Finance Agent Demo" width="860">
+</p>
+
 ---
 
 ## The Problem
