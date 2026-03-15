@@ -65,6 +65,7 @@ When in doubt, block. The system defaults to **Delay 300ms** (Default-to-Caution
 | 4 | [WAL-First Ledger & Audit](04-ledger.md) | `src/ledger.rs` |
 | 5 | [Encrypted Vault](05-vault.md) | `src/vault.rs` |
 | 6 | [Proxy Pipeline](06-proxy.md) | `src/proxy.rs` |
+| 6.9 | [LLM Thinking Trace Extraction](06-proxy.md) | `src/llm_trace.rs` |
 | 7 | [Python SDK](07-sdk.md) | `sdk/python/gvm/` |
 | 8 | [Memory & Runtime Security](08-memory-security.md) | (this whitepaper) |
 | 8.7 | [OS Isolation & MicroVM Assessment](08-memory-security.md) | `crates/gvm-sandbox/` |
@@ -90,15 +91,18 @@ See [Part 8: Memory & Runtime Security](08-memory-security.md) for full analysis
 
 ---
 
-## Test Coverage: 60 Tests
+## Test Coverage: 141 Tests
 
 | Category | Count | Source |
 |----------|-------|--------|
-| Unit: Policy Engine (ABAC) | 4 | `src/policy.rs` |
-| Unit: Operation Registry | 4 | `src/registry.rs` |
-| Unit: Vault Encryption | 7 | `src/vault.rs` |
-| Unit: Network SRR | 10 | `src/srr.rs` |
-| Integration: Hostile Environment | 10 | `tests/hostile.rs` |
-| **Total** | **60** (25 lib + 25 bin + 10 integration) | |
+| Unit (SRR, Policy, Vault, Registry, Merkle, Wasm, LLM Trace) | 49 | `src/lib.rs` |
+| Integration (E2E) | 5 | `tests/integration.rs` |
+| Boundary | 30 | `tests/boundary.rs` |
+| Edge Cases | 17 | `tests/edge_cases.rs` |
+| Hostile Environment | 11 | `tests/hostile.rs` |
+| Stress | 12 | `tests/stress.rs` |
+| Merkle Tree | 12 | `tests/merkle.rs` |
+| Engine (gvm-engine) | 5 | `crates/gvm-engine/` |
+| **Total** | **141** | |
 
 All tests pass. Zero failures.

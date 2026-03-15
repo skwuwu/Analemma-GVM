@@ -1,8 +1,8 @@
 # Part 9: Test & Benchmark Report
 
-**Total: 100 Rust Tests (29 unit + 71 integration/stress/boundary) — All Pass**
+**Total: 141 Rust Tests (49 unit + 5 engine + 30 boundary + 17 edge + 11 hostile + 5 integration + 12 merkle + 12 stress) — All Pass**
 **Benchmarks: 12 groups, 49 individual measurements (Criterion v0.5)**
-**Last Run: 2026-03-15**
+**Last Run: 2026-03-16**
 
 ---
 
@@ -14,13 +14,18 @@ tests/
 ├── integration.rs      # 5 end-to-end pipeline tests
 ├── edge_cases.rs       # 17 edge case tests
 ├── stress.rs           # 12 stress/performance tests
-├── boundary.rs         # 26 cross-boundary security tests
+├── boundary.rs         # 30 cross-boundary security tests
+├── merkle.rs           # 12 Merkle tree integrity tests
 src/
 ├── registry.rs         # 4 unit tests
 ├── policy.rs           # 4 unit tests
 ├── srr.rs              # 10 unit tests
 ├── vault.rs            # 7 unit tests
 ├── wasm_engine.rs      # 4 unit tests
+├── merkle.rs           # 8 Merkle hash/proof tests
+├── llm_trace.rs        # 8 LLM thinking trace tests
+crates/gvm-engine/
+├── src/lib.rs          # 5 engine tests
 benches/
 ├── pipeline.rs         # 12 benchmark groups (Criterion)
 ```

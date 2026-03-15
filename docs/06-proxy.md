@@ -135,6 +135,7 @@ Latency: ~0ms enforcement overhead.
 → WAL append (fsync) — Fail-Close on failure
 → Sleep(milliseconds)
 → Forward to upstream
+→ Extract LLM thinking trace (if known LLM provider) — see 6.9
 → Update event status (Confirmed/Failed)
 → Best-effort WAL status update
 ```
@@ -231,7 +232,105 @@ The Tower middleware stack provides three layers of runtime protection:
 
 ---
 
-## 6.9 Test Coverage
+## 6.9 LLM Thinking Trace Extraction
+
+**Source**: `src/llm_trace.rs` (379 lines, 8 unit tests)
+
+When the proxy processes an IC-2 (Delay) response from a known LLM provider, it buffers the response body, extracts reasoning/thinking content, and records it in the WAL event for governance audit.
+
+### Activation Conditions
+
+Trace extraction only runs when **all three** conditions are met:
+
+1. The enforcement decision is **Delay** (IC-2 path — response body is already buffered)
+2. The target host matches a **known LLM provider** (`identify_llm_provider()`)
+3. The upstream response status is **2xx** (successful)
+
+IC-1 (Allow) responses are forwarded without buffering. Deny/RequireApproval responses never reach upstream.
+
+### Supported Providers
+
+| Provider | Host Pattern | Thinking Field | Model Field |
+|----------|-------------|---------------|-------------|
+| OpenAI | `api.openai.com` | `choices[0].message.reasoning_content` | `model` |
+| Anthropic | `api.anthropic.com` | `content[].thinking` (type=thinking blocks) | `model` |
+| Google Gemini | `generativelanguage.googleapis.com` | `candidates[0].content.parts[].thought=true` | `modelVersion` |
+
+### Data Flow
+
+```
+Agent → Proxy (IC-2 Delay) → Upstream LLM API
+                                    │
+                                    ▼ (response buffered)
+                          identify_llm_provider(host)
+                                    │
+                              ┌─────┴─────┐
+                              No          Yes
+                              │            │
+                              ▼            ▼
+                         Return       extract_thinking_trace(provider, body)
+                         as-is             │
+                                           ▼
+                                    LLMTrace {
+                                      provider, model, thinking,
+                                      truncated, usage
+                                    }
+                                           │
+                                           ▼
+                                    event.llm_trace = Some(trace)
+                                           │
+                                           ▼
+                                    WAL append (audit record)
+```
+
+### Truncation
+
+Thinking content is truncated to **2,048 bytes** (UTF-8 boundary safe). The `truncated` flag is set to `true` when content exceeds this limit. This prevents unbounded WAL growth while preserving the critical first portion for governance review.
+
+### WAL Event Integration
+
+The `GVMEvent` struct includes an optional `llm_trace` field:
+
+```rust
+// crates/gvm-types/src/lib.rs
+pub struct LLMTrace {
+    pub provider: String,           // "openai" | "anthropic" | "gemini"
+    pub model: Option<String>,      // e.g. "o1-preview", "claude-sonnet-4-20250514"
+    pub thinking: Option<String>,   // Extracted reasoning (truncated to 2KB)
+    pub truncated: bool,            // Whether thinking was truncated
+    pub usage: Option<LLMUsage>,    // Token usage stats
+}
+
+pub struct LLMUsage {
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+}
+```
+
+### Governance Use Cases
+
+- **Audit trail**: Record what the LLM was "thinking" when it decided to take a governed action
+- **Post-incident analysis**: Investigate reasoning behind blocked operations
+- **Cost attribution**: Token usage per agent, per operation, per tenant
+- **Model compliance**: Verify that only approved models are being used
+
+### Test Coverage (8 tests in `src/llm_trace.rs`)
+
+| Test | Scenario |
+|------|----------|
+| `test_identify_llm_provider` | Host matching including port stripping |
+| `test_extract_openai_reasoning` | OpenAI `reasoning_content` extraction |
+| `test_extract_anthropic_thinking` | Anthropic `thinking` block extraction |
+| `test_extract_gemini_thought` | Gemini `thought=true` parts extraction |
+| `test_no_thinking_content_returns_usage_only` | No reasoning, usage data only |
+| `test_non_llm_body_returns_none` | Non-JSON body returns None |
+| `test_truncation` | Content > 2KB truncated with flag |
+| `test_empty_provider_returns_none` | Unknown provider returns None |
+
+---
+
+## 6.10 Test Coverage
 
 Proxy pipeline tests are covered indirectly through:
 
