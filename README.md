@@ -156,42 +156,76 @@ Any request that doesn't match a known rule gets a 300ms delay (not Allow, not D
 
 ## Quick Start (5 minutes)
 
-### 1. Install
+### Prerequisites
+
+- Rust 1.75+
+- Python 3.9+ (only if using the Python SDK or running demos)
+
+### 1. Build and start the proxy
 
 ```bash
-# Proxy (Rust)
 git clone https://github.com/skwuwu/Analemma-GVM.git
 cd Analemma-GVM
-cargo build --release
+cargo run
+```
 
-# SDK (Python)
+The proxy starts on `0.0.0.0:8080`. That's it — governance is now active.
+
+### 2. Route any agent through the proxy
+
+GVM is a **transparent HTTP proxy**. It works with any language, any framework, any agent — no SDK required. Just point your agent's HTTP traffic at the proxy:
+
+```bash
+# Any language, any framework — set the proxy and go
+HTTP_PROXY=http://localhost:8080 HTTPS_PROXY=http://localhost:8080 python my_agent.py
+HTTP_PROXY=http://localhost:8080 HTTPS_PROXY=http://localhost:8080 node my_agent.js
+HTTP_PROXY=http://localhost:8080 HTTPS_PROXY=http://localhost:8080 ./my_agent
+```
+
+Every outbound HTTP request your agent makes now passes through the GVM proxy. The proxy inspects the **actual URL, method, and payload** (Layer 2: Network SRR) and enforces rules — regardless of what framework the agent uses.
+
+```
+ Your agent                GVM Proxy (localhost:8080)           External API
+ ┌──────────┐    HTTP      ┌──────────────────────┐    HTTPS   ┌──────────┐
+ │ Any code │────PROXY────>│ Layer 2: URL check   │──────────>│ Stripe   │
+ │ Any lang │              │ Layer 3: Key inject  │           │ Slack    │
+ │ Any fw   │              │ WAL audit log        │           │ Gmail    │
+ └──────────┘              └──────────────────────┘           └──────────┘
+```
+
+**What the proxy does without the SDK:**
+
+| Layer | What it does | SDK needed? |
+|-------|-------------|-------------|
+| **Layer 2: Network SRR** | Inspects actual URL/method/payload. Blocks `POST api.bank.com/transfer`, delays unknown endpoints 300ms. | No |
+| **Layer 3: Capability Token** | Injects API keys by hostname. Agent never holds credentials. | No |
+| **WAL Audit** | Records every request with tamper-proof Merkle hash chain. | No |
+| **Rate Limiting** | Token-bucket rate limit per agent. | No |
+| **Layer 1: Semantic ABAC** | Evaluates operation name, resource type, agent role against hierarchical policies. | **Yes** (needs `X-GVM-*` headers) |
+
+Without the SDK, Layer 1 (ABAC) has no operation metadata to evaluate, so it defaults to **Default-to-Caution** (300ms delay). Layer 2 and Layer 3 work at full strength because they inspect the actual HTTP request, not agent-declared headers.
+
+### 3. (Optional) Use the Python SDK for richer governance
+
+The SDK is **not required** for enforcement — it's an enhancement. It adds Layer 1 (semantic ABAC policy) by injecting `X-GVM-*` headers that tell the proxy *what the agent thinks it's doing*. The proxy then cross-checks this against *what the agent is actually doing* (Layer 2).
+
+```bash
 pip install -e sdk/python
 ```
 
-### 2. Start the proxy
+**What the SDK adds:**
 
-```bash
-cargo run
-# Or with Docker:
-# docker compose up
-```
+| Feature | Without SDK | With SDK |
+|---------|------------|----------|
+| URL-based blocking (SRR) | Full | Full |
+| API key injection (Layer 3) | Full | Full |
+| Audit trail | URL/method only | Operation name, agent ID, trace chain |
+| ABAC policy evaluation | Skipped (Default-to-Caution) | Full (per-agent, per-tenant, per-operation) |
+| Causal tracing | No parent-child linking | Automatic trace_id + parent_event_id |
+| Rate limiting | By source IP | By agent_id |
+| Operation classification | `"unknown"` | `"gvm.messaging.send"` etc. |
 
-### 3. Run the demo
-
-```bash
-# LangChain + Gmail E2E demo (30 seconds)
-python -m gvm.langchain_demo
-```
-
-Output:
-```
-[Step 1] read_inbox()     → Allow  (IC-1, 3ms)
-[Step 2] send_email()     → Delay  (IC-2, 310ms)
-[Step 3] wire_transfer()  → Deny   (SRR, 4ms)
-[Step 4] delete_emails()  → Deny   (ABAC, 3ms)
-```
-
-### 4. Write your own agent (10 lines)
+**SDK agent example (10 lines):**
 
 ```python
 from gvm import GVMAgent, ic, Resource
@@ -209,7 +243,37 @@ agent.notify("#alerts", "Deploy complete")
 # → Delayed 300ms by proxy, then forwarded. Audit trail recorded.
 ```
 
-**What happened**: Your agent's HTTP request was transparently routed through the GVM proxy. The proxy classified the operation, applied policy (300ms delay for customer-facing messaging), injected API credentials, forwarded the request, and recorded the event in the WAL — all without any changes to your agent code.
+The `@ic()` decorator injects `X-GVM-Operation`, `X-GVM-Agent-Id`, and other headers. `GVMAgent.create_session()` returns a `requests.Session` pre-configured to route through the proxy. The proxy sees both the semantic header *and* the actual URL, and takes the stricter decision.
+
+**Without SDK — same protection, less metadata:**
+
+```python
+import requests
+
+# Just set the proxy — any HTTP library works
+session = requests.Session()
+session.proxies = {"http": "http://localhost:8080", "https": "http://localhost:8080"}
+
+# This request goes through the proxy. Layer 2 (SRR) inspects the URL.
+# If api.bank.com/transfer is in the deny list, it's blocked.
+session.post("http://api.bank.com/transfer/123", json={"amount": 50000})
+# → Denied by SRR. Agent never needed the SDK for this to work.
+```
+
+### 4. Run the demo
+
+```bash
+pip install -e sdk/python
+python -m gvm.langchain_demo
+```
+
+Output:
+```
+[Step 1] read_inbox()     → Allow  (IC-1, 3ms)
+[Step 2] send_email()     → Delay  (IC-2, 310ms)
+[Step 3] wire_transfer()  → Deny   (SRR, 4ms)
+[Step 4] delete_emails()  → Deny   (ABAC, 3ms)
+```
 
 ### Industry templates
 
@@ -221,28 +285,20 @@ GVM_CONFIG=config/templates/finance/proxy.toml cargo run
 GVM_CONFIG=config/templates/saas/proxy.toml cargo run
 ```
 
-### CLI tools
+### Dry-run policy check (no forwarding)
 
 ```bash
-# List recent events
-cargo run -p gvm-cli -- events list --wal-file data/wal.log --last 1h
-
-# Trace a specific request chain
-cargo run -p gvm-cli -- events trace --trace-id <id> --wal-file data/wal.log
+curl -X POST http://localhost:8080/gvm/check \
+  -H "Content-Type: application/json" \
+  -d '{"operation": "gvm.payment.transfer", "target_host": "api.bank.com", "target_path": "/transfer/123"}'
+# → {"decision": "Deny", "engine_ms": 0.1, "dry_run": true, ...}
 ```
 
 ### Run tests
 
 ```bash
-cargo test --workspace   # 41 tests
+cargo test   # 128 tests
 ```
-
----
-
-### Prerequisites
-
-- Rust 1.75+
-- Python 3.9+ (for SDK)
 
 ---
 
@@ -267,17 +323,18 @@ The full technical whitepaper is in [`docs/`](docs/):
 
 ## Test Coverage
 
-41 tests across 3 crates. Zero failures.
+128 tests across unit, integration, boundary, edge-case, hostile, stress, and Merkle suites. Zero failures.
 
 | Category | Count |
 |----------|-------|
-| Unit: Operation Registry | 4 |
-| Unit: ABAC Policy Engine | 4 |
-| Unit: Network SRR | 10 |
-| Unit: Encrypted Vault | 7 |
-| Hostile Environment | 11 |
+| Unit (SRR, Policy, Vault, Registry, Merkle, Wasm) | 41 |
 | Integration (E2E) | 5 |
-| **Total** | **41** |
+| Boundary | 30 |
+| Edge Cases | 17 |
+| Hostile Environment | 11 |
+| Stress | 12 |
+| Merkle Tree | 12 |
+| **Total** | **128** |
 
 ---
 
