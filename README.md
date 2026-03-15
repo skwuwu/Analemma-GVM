@@ -66,15 +66,15 @@ def steal_money(self):
  "gvm.storage.read"           POST api.bank.com/transfer   DENY
        │                              │                       ▲
        ▼                              ▼                       │
- ┌───────────┐               ┌──────────────┐          ┌─────┴──────┐
- │  Layer 1  │               │   Layer 2    │          │ max_strict  │
- │  (ABAC)   │               │   (SRR)     │          │             │
- │           │               │              │          │ Stricter    │
- │  Allow    │               │  DENY        │──────────│ always wins │
- │  (IC-1)   │               │  "Wire       │          │             │
- │           │               │   transfer   │          │ → DENY      │
- └───────────┘               │   blocked"   │          └─────────────┘
-                              └──────────────┘
+ ┌───────────┐               ┌──────────────┐          ┌─────┴────────┐
+ │  Layer 1  │               │   Layer 2    │          │ max_strict   │
+ │  (ABAC)   │               │   (SRR)      │          │              │
+ │           │               │              │          │ Stricter     │
+ │  Allow    │               │  DENY        │──────────│ always wins  │
+ │  (IC-1)   │               │  "Wire       │          │              │
+ │           │               │   transfer   │          │ → DENY       │
+ └───────────┘               │   blocked"   │          └──────────────┘
+                             └──────────────┘
 
  Layer 1 is fooled.           Layer 2 sees the URL.       Agent is blocked.
  Layer 2 is not.              It doesn't care what        403 Forbidden.
@@ -121,16 +121,16 @@ Any request that doesn't match a known rule gets a 300ms delay (not Allow, not D
 
 ```
  Agent (Python SDK)        GVM Proxy (Rust)           External APIs
- ┌──────────────┐    ┌──────────────────────┐    ┌──────────────┐
+ ┌──────────────┐    ┌───────────────────────┐    ┌──────────────┐
  │  @ic()       │───>│ Layer 1: Semantic     │───>│ Stripe       │
  │  decorator   │    │   ABAC Policy Engine  │    │ Slack        │
  │              │    │ Layer 2: Network SRR  │    │ Gmail        │
  │  GVMAgent    │    │ Layer 3: Capability   │    │ Database     │
  │  base class  │    │   Token (API Key)     │    │ ...          │
- └──────────────┘    │                      │    └──────────────┘
-                     │ WAL → NATS Ledger    │
-                     │ AES-256-GCM Vault    │
-                     └──────────────────────┘
+ └──────────────┘    │                       │    └──────────────┘
+                     │ WAL → NATS Ledger     │
+                     │ AES-256-GCM Vault     │
+                     └───────────────────────┘
 ```
 
 ### IC Classification (Enforcement Decisions)
@@ -190,7 +190,7 @@ Every outbound HTTP request your agent makes now passes through the GVM proxy. T
 
 ```
  Your agent                GVM Proxy (localhost:8080)           External API
- ┌──────────┐    HTTP      ┌──────────────────────┐    HTTPS   ┌──────────┐
+ ┌──────────┐    HTTP      ┌──────────────────────┐    HTTPS  ┌──────────┐
  │ Any code │────PROXY────>│ Layer 2: URL check   │──────────>│ Stripe   │
  │ Any lang │              │ Layer 3: Key inject  │           │ Slack    │
  │ Any fw   │              │ WAL audit log        │           │ Gmail    │
