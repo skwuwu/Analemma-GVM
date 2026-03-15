@@ -25,6 +25,71 @@ pattern = "{any}"
 decision = { type = "Deny", reason = "DELETE operations are not permitted in finance mode" }
 description = "Block all DELETE requests"
 
+# ── LLM Provider Control (Finance: strict model pinning) ──
+
+[[rules]]
+method = "POST"
+pattern = "api.openai.com/v1/chat/completions"
+payload_field = "model"
+payload_match = ["gpt-4o"]
+max_body_bytes = 65536
+decision = { type = "Delay", milliseconds = 500 }
+description = "Only gpt-4o approved for finance use"
+
+[[rules]]
+method = "POST"
+pattern = "api.openai.com/v1/{any}"
+decision = { type = "Deny", reason = "Only gpt-4o chat/completions is authorized for finance operations" }
+description = "Block all other OpenAI endpoints and models"
+
+[[rules]]
+method = "POST"
+pattern = "api.anthropic.com/v1/messages"
+payload_field = "model"
+payload_match = ["claude-sonnet-4-20250514"]
+max_body_bytes = 65536
+decision = { type = "Delay", milliseconds = 500 }
+description = "Only Claude Sonnet 4 approved for finance use"
+
+[[rules]]
+method = "POST"
+pattern = "api.anthropic.com/v1/{any}"
+decision = { type = "Deny", reason = "Only Claude Sonnet 4 messages endpoint is authorized" }
+description = "Block all other Anthropic endpoints and models"
+
+# Block all unauthorized LLM providers
+[[rules]]
+method = "POST"
+pattern = "api.together.ai/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider" }
+
+[[rules]]
+method = "POST"
+pattern = "api.groq.com/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider" }
+
+[[rules]]
+method = "POST"
+pattern = "generativelanguage.googleapis.com/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider" }
+
+[[rules]]
+method = "POST"
+pattern = "api.cohere.ai/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider" }
+
+[[rules]]
+method = "POST"
+pattern = "api.mistral.ai/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider" }
+
+[[rules]]
+method = "POST"
+pattern = "api.replicate.com/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider" }
+
+# ── GraphQL defense ──
+
 [[rules]]
 method = "POST"
 pattern = "api.bank.com/graphql"

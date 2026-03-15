@@ -39,6 +39,7 @@ fn make_test_event(agent_id: &str) -> GVMEvent {
         payload: Default::default(),
         nats_sequence: None,
         event_hash: None,
+        llm_trace: None,
     }
 }
 

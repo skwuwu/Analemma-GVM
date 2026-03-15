@@ -1,4 +1,7 @@
-# Analemma GVM — 3-Layer Security Architecture
+# Analemma GVM — 3-Layer Security Architecture (Docker: dev/CI convenience)
+#
+# For production on Linux, prefer `gvm run --sandbox` (namespace + seccomp).
+# Docker containment is provided for dev/CI workflows and non-Linux platforms.
 #
 # Layer 1: Governance Engine (Wasm sandbox inside proxy)
 # Layer 2: Enforcement Point (gvm-proxy)

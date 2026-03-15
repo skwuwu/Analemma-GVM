@@ -190,6 +190,11 @@ pub struct GVMEvent {
     /// Computed before WAL write. Used for batch Merkle root verification.
     #[serde(default)]
     pub event_hash: Option<String>,
+
+    /// LLM reasoning trace extracted from API response (IC-2/IC-3 only).
+    /// Captures thinking/reasoning content for governance audit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_trace: Option<LLMTrace>,
 }
 
 /// Event status machine — prevents phantom records
@@ -273,6 +278,30 @@ pub struct MerkleBatchRecord {
     pub event_count: usize,
     /// Timestamp of batch flush
     pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// LLM reasoning/thinking trace extracted from API responses.
+/// Only captured for IC-2/IC-3 paths where WAL write already occurs.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LLMTrace {
+    /// LLM provider name (openai, anthropic, gemini)
+    pub provider: String,
+    /// Model identifier from the response
+    pub model: Option<String>,
+    /// Extracted reasoning/thinking content (truncated to 2KB)
+    pub thinking: Option<String>,
+    /// Whether the thinking content was truncated
+    pub truncated: bool,
+    /// Token usage from the response
+    pub usage: Option<LLMUsage>,
+}
+
+/// Token usage statistics from LLM API response
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LLMUsage {
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
 }
 
 /// Select the stricter of two enforcement decisions

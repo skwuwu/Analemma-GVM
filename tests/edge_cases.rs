@@ -520,6 +520,7 @@ async fn edge_concurrent_status_update_no_crash() {
                 payload: PayloadDescriptor::default(),
                 nats_sequence: None,
                 event_hash: None,
+        llm_trace: None,
             };
             ledger.append_durable(&event).await.unwrap();
         }));

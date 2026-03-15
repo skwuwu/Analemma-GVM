@@ -3,12 +3,10 @@ use crate::ui::{BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
 
 /// Run an AI agent through GVM governance.
 ///
-/// Default mode (no --contained): runs the script locally with HTTP_PROXY
-/// set to the GVM proxy. After completion, reads the WAL to show an audit
-/// trail of all requests the agent made.
-///
-/// With --contained: runs inside a Docker container on the gvm-internal
-/// network. Agent can ONLY communicate through gvm-proxy.
+/// Three isolation modes:
+/// - Default (no flags): runs locally with HTTP_PROXY set to GVM proxy.
+/// - --sandbox: Linux-native isolation (namespaces + seccomp + veth). Production recommended.
+/// - --contained: Docker-based isolation. Dev/CI or non-Linux platforms.
 pub async fn run_agent(
     script: &str,
     agent_id: &str,
@@ -18,8 +16,14 @@ pub async fn run_agent(
     cpus: &str,
     detach: bool,
     contained: bool,
+    sandbox: bool,
 ) -> Result<()> {
-    if contained {
+    if sandbox && contained {
+        anyhow::bail!("Cannot use --sandbox and --contained together. Choose one isolation mode.");
+    }
+    if sandbox {
+        run_sandboxed(script, agent_id, proxy).await
+    } else if contained {
         run_contained(script, agent_id, proxy, image, memory, cpus, detach).await
     } else {
         run_local(script, agent_id, proxy).await
@@ -65,14 +69,14 @@ async fn run_local(script: &str, agent_id: &str, proxy: &str) -> Result<()> {
     println!("  {DIM}Agent ID:{RESET}     {CYAN}{}{RESET}", agent_id);
     println!("  {DIM}Script:{RESET}       {}", abs_script.display());
     println!("  {DIM}Proxy:{RESET}        {}", proxy);
-    println!("  {DIM}Mode:{RESET}         local {DIM}(Layer 2 only \u{2014} use --contained for Layer 3){RESET}");
+    println!("  {DIM}Mode:{RESET}         local {DIM}(Layer 2 only \u{2014} use --sandbox or --contained for Layer 3){RESET}");
     println!();
 
     // Security summary
     println!("  {BOLD}Security layers active:{RESET}");
     println!("    {GREEN}\u{2713}{RESET} Layer 1: Governance Engine (policy evaluation)");
     println!("    {GREEN}\u{2713}{RESET} Layer 2: Enforcement Proxy (request interception)");
-    println!("    {DIM}\u{25cb}{RESET} Layer 3: OS Containment {DIM}(add --contained for Docker isolation){RESET}");
+    println!("    {DIM}\u{25cb}{RESET} Layer 3: OS Containment {DIM}(add --sandbox for Linux or --contained for Docker){RESET}");
     println!();
 
     // Record WAL position before run (to show only new events)
@@ -128,6 +132,165 @@ async fn run_local(script: &str, agent_id: &str, proxy: &str) -> Result<()> {
     println!();
 
     // ── Read WAL for audit trail ──
+    print_wal_audit(wal_path, wal_start_len, agent_id);
+
+    Ok(())
+}
+
+/// Linux-native sandbox mode: run inside namespace + seccomp isolation.
+/// Production-recommended on Linux. No Docker required.
+async fn run_sandboxed(script: &str, agent_id: &str, proxy: &str) -> Result<()> {
+    println!();
+    println!("{BOLD}Analemma-GVM \u{2014} Linux-Native Sandbox (Layer 3){RESET}");
+    println!("{DIM}Agent will be isolated using namespaces, seccomp-BPF, and veth networking.{RESET}");
+    println!();
+
+    // Check proxy health
+    print!("  {DIM}Checking proxy at {}...{RESET} ", proxy);
+    let health_url = format!("{}/gvm/health", proxy);
+    match reqwest::get(&health_url).await {
+        Ok(resp) if resp.status().is_success() => {
+            println!("{GREEN}OK{RESET}");
+        }
+        _ => {
+            println!("{RED}FAILED{RESET}");
+            println!();
+            println!("  {RED}Proxy is not running.{RESET}");
+            println!("  Start it with: {CYAN}cargo run{RESET}");
+            println!();
+            return Ok(());
+        }
+    }
+
+    // Resolve script path
+    let script_path = std::path::Path::new(script);
+    if !script_path.exists() {
+        println!("  {RED}Script not found: {}{RESET}", script);
+        println!();
+        return Ok(());
+    }
+
+    let abs_script = std::fs::canonicalize(script_path)
+        .with_context(|| format!("Cannot resolve path: {}", script))?;
+    let script_dir = abs_script.parent().unwrap_or(std::path::Path::new("."));
+    let script_name = abs_script.file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(script)
+        .to_string();
+
+    // Determine interpreter from extension
+    let ext = abs_script.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let interpreter = match ext {
+        "py" => "python",
+        "js" => "node",
+        "ts" => "npx",
+        "sh" | "bash" => "bash",
+        _ => "python",
+    };
+
+    let interpreter_args = if ext == "ts" {
+        vec!["ts-node".to_string(), script_name.clone()]
+    } else {
+        vec![script_name.clone()]
+    };
+
+    // Parse proxy address for sandbox config
+    let proxy_url: url::Url = proxy.parse()
+        .with_context(|| format!("Invalid proxy URL: {}", proxy))?;
+    let proxy_host = proxy_url.host_str().unwrap_or("127.0.0.1");
+    let proxy_port = proxy_url.port().unwrap_or(8080);
+    let proxy_addr: std::net::SocketAddr = format!("{}:{}", proxy_host, proxy_port)
+        .parse()
+        .with_context(|| format!("Cannot parse proxy address: {}:{}", proxy_host, proxy_port))?;
+
+    let config = gvm_sandbox::SandboxConfig {
+        script_path: abs_script.clone(),
+        workspace_dir: script_dir.to_path_buf(),
+        interpreter: interpreter.to_string(),
+        interpreter_args,
+        proxy_addr,
+        agent_id: agent_id.to_string(),
+        seccomp_profile: None,
+    };
+
+    // Run pre-flight checks
+    print!("  {DIM}Running pre-flight checks...{RESET} ");
+    let preflight = gvm_sandbox::preflight_check(&config);
+
+    if !preflight.issues.is_empty() {
+        println!("{YELLOW}WARNINGS{RESET}");
+        for issue in &preflight.issues {
+            println!("    {YELLOW}\u{26a0}{RESET} {}", issue);
+        }
+
+        // Fail if critical features are missing
+        if !preflight.user_namespaces || !preflight.seccomp_available {
+            println!();
+            println!("  {RED}Cannot proceed: kernel features required for sandbox are unavailable.{RESET}");
+            println!("  {DIM}Use --contained for Docker-based isolation instead.{RESET}");
+            println!();
+            return Ok(());
+        }
+    } else {
+        println!("{GREEN}OK{RESET}");
+    }
+
+    println!();
+    println!("  {DIM}Agent ID:{RESET}     {CYAN}{}{RESET}", agent_id);
+    println!("  {DIM}Script:{RESET}       {}", abs_script.display());
+    println!("  {DIM}Proxy:{RESET}        {}", proxy);
+    println!("  {DIM}Mode:{RESET}         sandbox {DIM}(Linux-native isolation){RESET}");
+    println!();
+
+    // Security summary
+    println!("  {BOLD}Security layers active:{RESET}");
+    println!("    {GREEN}\u{2713}{RESET} Layer 1: Governance Engine (policy evaluation)");
+    println!("    {GREEN}\u{2713}{RESET} Layer 2: Enforcement Proxy (request interception)");
+    println!("    {GREEN}\u{2713}{RESET} Layer 3: OS Containment (Linux-native sandbox)");
+    println!("      {DIM}\u{2022} User namespace: UID remapping{RESET}");
+    println!("      {DIM}\u{2022} PID namespace: isolated process tree{RESET}");
+    println!("      {DIM}\u{2022} Mount namespace: read-only workspace, minimal rootfs{RESET}");
+    println!("      {DIM}\u{2022} Network namespace: veth pair, proxy-only routing{RESET}");
+    println!("      {DIM}\u{2022} Seccomp-BPF: syscall whitelist (~45 calls){RESET}");
+    println!();
+
+    // Record WAL position before run
+    let wal_path = "data/wal.log";
+    let wal_start_len = std::fs::metadata(wal_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    println!("  {DIM}--- Agent output below ---{RESET}");
+    println!();
+
+    // Launch the sandboxed agent (blocking call — waits for agent to exit)
+    let result = gvm_sandbox::launch_sandboxed(config);
+
+    println!();
+    match result {
+        Ok(sandbox_result) => {
+            if sandbox_result.exit_code == 0 {
+                println!("  {GREEN}Agent completed successfully{RESET}");
+            } else {
+                println!("  {YELLOW}Agent exited with code: {}{RESET}", sandbox_result.exit_code);
+            }
+            println!("  {DIM}Sandbox setup: {}ms{RESET}", sandbox_result.setup_ms);
+            if sandbox_result.seccomp_violations > 0 {
+                println!("  {RED}\u{26a0} {} seccomp violation(s) detected{RESET}",
+                    sandbox_result.seccomp_violations);
+            }
+        }
+        Err(e) => {
+            println!("  {RED}Sandbox execution failed: {}{RESET}", e);
+            println!();
+            println!("  {DIM}If this is not a Linux system, use --contained for Docker isolation.{RESET}");
+        }
+    }
+    println!();
+
+    // Read WAL for audit trail
     print_wal_audit(wal_path, wal_start_len, agent_id);
 
     Ok(())

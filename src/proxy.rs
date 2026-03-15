@@ -1,5 +1,6 @@
 use crate::api_keys::APIKeyStore;
 use crate::ledger::Ledger;
+use crate::llm_trace;
 use crate::policy::PolicyEngine;
 use crate::rate_limiter::RateLimiter;
 use crate::registry::OperationRegistry;
@@ -163,6 +164,7 @@ pub async fn proxy_handler(
 
             let engine_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
             tokio::time::sleep(std::time::Duration::from_millis(*milliseconds)).await;
+            let llm_provider = llm_trace::identify_llm_provider(&target.host);
             let mut response = forward_request(&state, request, &target).await;
 
             // Update event status based on upstream response
@@ -173,6 +175,16 @@ pub async fn proxy_handler(
                     reason: format!("HTTP {}", response.status()),
                 };
             }
+
+            // Extract LLM thinking trace if this is a known LLM provider response
+            if let Some(provider) = llm_provider {
+                if response.status().is_success() {
+                    response = extract_llm_trace_from_response(
+                        response, provider, &mut event,
+                    ).await;
+                }
+            }
+
             // Best-effort status update to WAL
             let _ = state.ledger.append_durable(&event).await;
             inject_gvm_response_headers(
@@ -405,6 +417,7 @@ fn build_event(
         payload: PayloadDescriptor::default(),
         nats_sequence: None,
         event_hash: None, // Computed by Ledger during WAL write
+        llm_trace: None,
     }
 }
 
@@ -478,6 +491,43 @@ async fn forward_request(
                 StatusCode::BAD_GATEWAY,
                 &format!("Upstream error: {}", e),
             )
+        }
+    }
+}
+
+/// Buffer response body to extract LLM thinking trace, then reconstruct the response.
+/// Called only for IC-2 paths targeting known LLM providers.
+async fn extract_llm_trace_from_response(
+    response: Response<Body>,
+    provider: &str,
+    event: &mut GVMEvent,
+) -> Response<Body> {
+    let (parts, body) = response.into_parts();
+
+    // Buffer the body (limit to 256KB to avoid memory issues)
+    const MAX_BUFFER: usize = 256 * 1024;
+    match http_body_util::BodyExt::collect(body).await {
+        Ok(collected) => {
+            let bytes = collected.to_bytes();
+            if bytes.len() <= MAX_BUFFER {
+                if let Some(trace) = llm_trace::extract_thinking_trace(provider, &bytes) {
+                    tracing::info!(
+                        provider = provider,
+                        model = ?trace.model,
+                        has_thinking = trace.thinking.is_some(),
+                        truncated = trace.truncated,
+                        "LLM thinking trace extracted"
+                    );
+                    event.llm_trace = Some(trace);
+                }
+            }
+            // Reconstruct the response with the buffered body
+            Response::from_parts(parts, Body::from(bytes))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to buffer LLM response for trace extraction");
+            // Return an empty body on error — the response was already consumed
+            Response::from_parts(parts, Body::empty())
         }
     }
 }

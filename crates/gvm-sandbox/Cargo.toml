@@ -1,0 +1,16 @@
+[package]
+name = "gvm-sandbox"
+version = "0.1.0"
+edition = "2021"
+description = "Linux-native agent sandboxing — namespace, seccomp-BPF, and network isolation"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29", features = ["sched", "mount", "signal", "user", "process", "fs", "env", "net", "socket"] }
+seccompiler = "0.4"
+libc = "0.2"

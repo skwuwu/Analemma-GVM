@@ -126,6 +126,96 @@ pattern = "gmail.googleapis.com/{any}"
 decision = { type = "Deny", reason = "Email deletion — blocked by proxy" }
 description = "Block all email deletion operations"
 
+# ── LLM Provider Control ──
+
+# Approved models only — unapproved models on the same endpoint are denied.
+# SRR first-match order: model-specific rules must come before the catch-all.
+
+[[rules]]
+method = "POST"
+pattern = "api.openai.com/v1/chat/completions"
+payload_field = "model"
+payload_match = ["gpt-4o", "gpt-4-turbo", "gpt-4o-mini"]
+max_body_bytes = 65536
+decision = { type = "Delay", milliseconds = 300 }
+description = "Approved OpenAI chat models — IC-2 with audit"
+
+[[rules]]
+method = "POST"
+pattern = "api.openai.com/v1/chat/completions"
+decision = { type = "Deny", reason = "Unauthorized model. Only approved models (gpt-4o, gpt-4-turbo, gpt-4o-mini) are permitted." }
+description = "Block unapproved OpenAI chat models"
+
+[[rules]]
+method = "POST"
+pattern = "api.openai.com/v1/embeddings"
+decision = { type = "Delay", milliseconds = 300 }
+description = "OpenAI embeddings — IC-2 with audit"
+
+[[rules]]
+method = "POST"
+pattern = "api.openai.com/v1/{any}"
+decision = { type = "Deny", reason = "Only chat/completions and embeddings endpoints are authorized" }
+description = "Block other OpenAI endpoints (fine-tuning, images, audio, etc.)"
+
+[[rules]]
+method = "POST"
+pattern = "api.anthropic.com/v1/messages"
+payload_field = "model"
+payload_match = ["claude-sonnet-4-20250514", "claude-haiku-4-5-20251001"]
+max_body_bytes = 65536
+decision = { type = "Delay", milliseconds = 300 }
+description = "Approved Anthropic models — IC-2 with audit"
+
+[[rules]]
+method = "POST"
+pattern = "api.anthropic.com/v1/messages"
+decision = { type = "Deny", reason = "Unauthorized Anthropic model" }
+description = "Block unapproved Anthropic models"
+
+[[rules]]
+method = "POST"
+pattern = "api.anthropic.com/v1/{any}"
+decision = { type = "Deny", reason = "Only messages endpoint is authorized" }
+description = "Block other Anthropic endpoints"
+
+# Unauthorized LLM providers
+[[rules]]
+method = "POST"
+pattern = "api.together.ai/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider" }
+description = "Block Together AI"
+
+[[rules]]
+method = "POST"
+pattern = "api.groq.com/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider" }
+description = "Block Groq"
+
+[[rules]]
+method = "POST"
+pattern = "generativelanguage.googleapis.com/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider" }
+description = "Block Google Gemini direct API"
+
+[[rules]]
+method = "POST"
+pattern = "api.cohere.ai/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider" }
+description = "Block Cohere"
+
+[[rules]]
+method = "POST"
+pattern = "api.mistral.ai/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider" }
+description = "Block Mistral"
+
+[[rules]]
+method = "POST"
+pattern = "api.replicate.com/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider" }
+description = "Block Replicate"
+
 # ── Payload Inspection (GraphQL/gRPC defense) ──
 
 [[rules]]

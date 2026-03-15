@@ -7,6 +7,83 @@ pattern = "{host}.database.com/{any}"
 decision = { type = "Deny", reason = "Database deletion blocked" }
 description = "Block database deletions"
 
+# ── LLM Provider Control (SaaS: multiple models allowed) ──
+
+[[rules]]
+method = "POST"
+pattern = "api.openai.com/v1/chat/completions"
+payload_field = "model"
+payload_match = ["gpt-4o", "gpt-4-turbo", "gpt-4o-mini", "gpt-3.5-turbo"]
+max_body_bytes = 65536
+decision = { type = "Delay", milliseconds = 300 }
+description = "Approved OpenAI chat models"
+
+[[rules]]
+method = "POST"
+pattern = "api.openai.com/v1/chat/completions"
+decision = { type = "Deny", reason = "Unauthorized OpenAI model" }
+description = "Block unapproved OpenAI models"
+
+[[rules]]
+method = "POST"
+pattern = "api.openai.com/v1/embeddings"
+decision = { type = "Delay", milliseconds = 300 }
+description = "OpenAI embeddings allowed"
+
+[[rules]]
+method = "POST"
+pattern = "api.openai.com/v1/{any}"
+decision = { type = "Deny", reason = "Only chat/completions and embeddings are authorized" }
+description = "Block other OpenAI endpoints"
+
+[[rules]]
+method = "POST"
+pattern = "api.anthropic.com/v1/messages"
+payload_field = "model"
+payload_match = ["claude-sonnet-4-20250514", "claude-haiku-4-5-20251001"]
+max_body_bytes = 65536
+decision = { type = "Delay", milliseconds = 300 }
+description = "Approved Anthropic models"
+
+[[rules]]
+method = "POST"
+pattern = "api.anthropic.com/v1/{any}"
+decision = { type = "Deny", reason = "Unauthorized Anthropic endpoint or model" }
+description = "Block unapproved Anthropic access"
+
+# Block unauthorized providers
+[[rules]]
+method = "POST"
+pattern = "api.together.ai/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider" }
+
+[[rules]]
+method = "POST"
+pattern = "api.groq.com/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider" }
+
+[[rules]]
+method = "POST"
+pattern = "generativelanguage.googleapis.com/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider" }
+
+[[rules]]
+method = "POST"
+pattern = "api.cohere.ai/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider" }
+
+[[rules]]
+method = "POST"
+pattern = "api.mistral.ai/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider" }
+
+[[rules]]
+method = "POST"
+pattern = "api.replicate.com/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider" }
+
+# ── General rules ──
+
 [[rules]]
 method = "GET"
 pattern = "{any}"

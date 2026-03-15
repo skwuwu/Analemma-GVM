@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/gvm-types", "crates/gvm-cli", "crates/gvm-engine"]
+members = [".", "crates/gvm-types", "crates/gvm-cli", "crates/gvm-engine", "crates/gvm-sandbox"]
 resolver = "2"
 
 [package]

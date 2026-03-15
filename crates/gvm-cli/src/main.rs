@@ -60,7 +60,13 @@ enum Commands {
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         proxy: String,
 
-        /// Use Docker containment (Layer 3: network isolation)
+        /// Use Linux-native sandbox (Layer 3: namespace + seccomp isolation).
+        /// Recommended for production on Linux. No Docker required.
+        #[arg(long)]
+        sandbox: bool,
+
+        /// Use Docker containment (Layer 3: network isolation).
+        /// Alternative to --sandbox for dev/CI or non-Linux platforms.
         #[arg(long)]
         contained: bool,
 
@@ -180,13 +186,14 @@ async fn main() -> anyhow::Result<()> {
             script,
             agent_id,
             proxy,
+            sandbox,
             contained,
             image,
             memory,
             cpus,
             detach,
         } => {
-            run::run_agent(&script, &agent_id, &proxy, &image, &memory, &cpus, detach, contained).await?;
+            run::run_agent(&script, &agent_id, &proxy, &image, &memory, &cpus, detach, contained, sandbox).await?;
         }
 
         Commands::Check {

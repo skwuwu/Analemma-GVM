@@ -297,7 +297,8 @@ fn build_vault_event(
         status: EventStatus::Confirmed,
         payload,
         nats_sequence: None,
-        event_hash: None, // Computed by Ledger during WAL write
+        event_hash: None,
+        llm_trace: None, // Computed by Ledger during WAL write
     }
 }
 

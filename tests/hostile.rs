@@ -459,6 +459,7 @@ async fn ledger_concurrent_spawns_stay_bounded() {
                 payload: Default::default(),
                 nats_sequence: None,
                 event_hash: None,
+        llm_trace: None,
             };
             ledger.append_durable(&event).await.unwrap();
         }));
@@ -574,6 +575,7 @@ async fn group_commit_fail_close_all_callers_receive_error() {
             payload: Default::default(),
             nats_sequence: None,
             event_hash: None,
+        llm_trace: None,
         };
         ledger.append_durable(&event).await.unwrap();
     }
@@ -606,6 +608,7 @@ async fn group_commit_fail_close_all_callers_receive_error() {
                 payload: Default::default(),
                 nats_sequence: None,
                 event_hash: None,
+        llm_trace: None,
             };
             ledger.append_durable(&event).await
         }));
@@ -647,6 +650,7 @@ async fn group_commit_fail_close_all_callers_receive_error() {
         payload: Default::default(),
         nats_sequence: None,
         event_hash: None,
+        llm_trace: None,
     };
     // After disabling error injection, writes should succeed again
     ledger.append_durable(&event).await.unwrap();

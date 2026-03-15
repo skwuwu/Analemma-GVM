@@ -294,10 +294,50 @@ curl -X POST http://localhost:8080/gvm/check \
 # → {"decision": "Deny", "engine_ms": 0.1, "dry_run": true, ...}
 ```
 
+### Agent isolation (Layer 3: OS Containment)
+
+GVM provides two OS-level isolation modes that restrict agents to communicate only through the proxy:
+
+```bash
+# Linux-native sandbox (recommended for production)
+# Uses namespaces (user, PID, mount, network), seccomp-BPF, and veth pair.
+# No Docker required. Analogous to Firecracker's MicroVM approach.
+gvm run --sandbox agent.py
+
+# Docker containment (dev/CI or non-Linux platforms)
+# Uses Docker network isolation, read-only filesystem, resource limits.
+gvm run --contained agent.py --image python:3.12-slim --memory 512m --cpus 1.0
+
+# Local mode (Layer 2 only — no OS isolation)
+gvm run agent.py
+```
+
+**Linux-native sandbox** is the primary deployment target:
+
+| Feature | `--sandbox` (Linux-native) | `--contained` (Docker) |
+|---------|---------------------------|----------------------|
+| Isolation | User/PID/mount/network namespaces | Docker container |
+| Syscall filter | seccomp-BPF (~45 allowed) | Docker default seccomp |
+| Network | veth pair, proxy-only routing | `gvm-internal` network |
+| Filesystem | pivot_root, read-only workspace | `--read-only` mount |
+| Overhead | ~2ms setup, no daemon | Docker daemon required |
+| Platform | Linux only | Any Docker-supported OS |
+
+### LLM provider governance
+
+GVM inspects LLM API calls at the proxy level — no SDK changes needed:
+
+- **Model pinning**: Only approved models allowed (e.g., `gpt-4o`, `claude-sonnet-4-20250514`)
+- **Endpoint restriction**: Only authorized API paths (e.g., `chat/completions` only, not `fine-tuning`)
+- **Provider allowlist**: Unauthorized providers (Together AI, Groq, Mistral, etc.) blocked
+- **Thinking trace audit**: IC-2/IC-3 paths extract reasoning content from LLM responses into the WAL
+
+See [`config/srr_network.toml`](config/srr_network.toml) for the full rule set.
+
 ### Run tests
 
 ```bash
-cargo test   # 128 tests
+cargo test   # 141 tests
 ```
 
 ---
@@ -323,18 +363,19 @@ The full technical whitepaper is in [`docs/`](docs/):
 
 ## Test Coverage
 
-128 tests across unit, integration, boundary, edge-case, hostile, stress, and Merkle suites. Zero failures.
+141 tests across unit, integration, boundary, edge-case, hostile, stress, and Merkle suites. Zero failures.
 
 | Category | Count |
 |----------|-------|
-| Unit (SRR, Policy, Vault, Registry, Merkle, Wasm) | 41 |
+| Unit (SRR, Policy, Vault, Registry, Merkle, Wasm, LLM Trace) | 49 |
 | Integration (E2E) | 5 |
 | Boundary | 30 |
 | Edge Cases | 17 |
 | Hostile Environment | 11 |
 | Stress | 12 |
 | Merkle Tree | 12 |
-| **Total** | **128** |
+| Engine (gvm-engine) | 5 |
+| **Total** | **141** |
 
 ---
 
@@ -345,6 +386,7 @@ Analemma-GVM is the kernel. The vision is an **Agentic Operating System** — a 
 | Phase | Scope | Status |
 |-------|-------|--------|
 | **v0.1 — Kernel** | 3-layer enforcement, WAL ledger, encrypted vault, Python SDK, LangChain demo, CLI | Done |
+| **v0.1.1 — Hardening** | Linux-native sandbox (namespace + seccomp), LLM provider governance, thinking trace audit, model pinning | Done |
 | **v0.2 — Multi-Agent** | Agent identity management, inter-agent communication governance, session isolation | Planned |
 | **v0.3 — Approval Workflows** | Human-in-the-loop approval UI, escalation chains, SLA-based auto-expiry | Planned |
 | **v0.4 — Observability** | Real-time enforcement dashboard, anomaly detection, cost attribution per agent | Planned |

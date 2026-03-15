@@ -59,6 +59,7 @@ fn make_test_event(id: &str) -> GVMEvent {
         payload: PayloadDescriptor::default(),
         nats_sequence: None,
         event_hash: None,
+        llm_trace: None,
     }
 }
 
