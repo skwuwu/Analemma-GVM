@@ -24,6 +24,7 @@ sdk/python/gvm/
 ├── errors.py           # GVM error hierarchy
 ├── checkpoint.py       # CheckpointManager (Merkle-verified state)
 ├── langchain_tools.py  # LangChain adapter with rollback handling
+├── unified_demo.py     # Unified finance demo (all features in one scenario)
 ├── demo.py             # Enforcement demo
 ├── rollback_demo.py    # Rollback + token savings demo
 └── hostile_demo.py     # Hostile environment tests
@@ -216,6 +217,27 @@ except GVMRateLimitError:
 ---
 
 ## 7.8 Demo Scripts
+
+### Unified Finance Demo (`unified_demo.py`) — Primary Demo
+
+One scenario demonstrating every core feature. Run with: `python -m gvm.unified_demo`
+
+| Step | Operation | Decision | Features Shown |
+|------|-----------|----------|----------------|
+| 1 | `read_inbox()` → `gvm.messaging.read` | Allow (IC-1) | ABAC policy, safe read classification |
+| 2 | `send_summary()` → `gvm.messaging.send` | Delay 300ms (IC-2) | SRR delay, **checkpoint #0 saved** |
+| 3 | `wire_transfer()` → `gvm.payment.charge` | **Deny** | SRR URL block, ABAC RequireApproval, `max_strict()`, **rollback to #0** |
+| 4 | `summarize_results()` → `gvm.messaging.read` | Allow (IC-1) | Agent resumes from safe state |
+
+Features covered in one scenario:
+- IC classification (Allow / Delay / Deny)
+- SRR network defense (URL inspected independent of headers)
+- Semantic forgery defense (`max_strict(ABAC, SRR)` catches lies)
+- Checkpoint/rollback (Merkle-verified state restore on deny)
+- Token savings (~42% reduction vs full restart)
+- WAL-first audit trail (fsync before forward)
+- API key isolation (agent never holds credentials)
+- Hierarchical policy (Global > Tenant > Agent)
 
 ### Enforcement Demo (`demo.py`)
 

@@ -70,6 +70,8 @@ When in doubt, block. The system defaults to **Delay 300ms** (Default-to-Caution
 | 8 | [Memory & Runtime Security](08-memory-security.md) | (this whitepaper) |
 | 8.7 | [OS Isolation & MicroVM Assessment](08-memory-security.md) | `crates/gvm-sandbox/` |
 | 9 | [Test Coverage Report](09-test-report.md) | `tests/hostile.rs` |
+| 10 | [Architecture Changes](10-architecture-changes.md) | `docs/10-architecture-changes.md` |
+| 11 | [Competitive Analysis: GVM vs OPA+Envoy](11-competitive-analysis.md) | `docs/11-competitive-analysis.md` |
 
 ---
 

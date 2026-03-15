@@ -266,15 +266,28 @@ session.post("http://api.bank.com/transfer/123", json={"amount": 50000})
 
 ```bash
 pip install -e sdk/python
-python -m gvm.langchain_demo
+python -m gvm.unified_demo
 ```
 
-Output:
+One scenario demonstrates every core feature — IC classification, SRR network defense, semantic forgery detection, checkpoint/rollback, token savings, and WAL-first audit:
+
 ```
-[Step 1] read_inbox()     → Allow  (IC-1, 3ms)
-[Step 2] send_email()     → Delay  (IC-2, 310ms)
-[Step 3] wire_transfer()  → Deny   (SRR, 4ms)
-[Step 4] delete_emails()  → Deny   (ABAC, 3ms)
+[Step 1] read_inbox()        → ✓ Allow     (IC-1, no checkpoint)
+[Step 2] send_summary()      → ⏱ Delay     (IC-2, checkpoint #0 saved)
+[Step 3] wire_transfer()     → ✗ BLOCKED   (Deny, SRR catches URL)
+         ↺ Rollback to checkpoint #0
+         Agent continues from safe state
+[Step 4] summarize_results() → ✓ Allow     (IC-1, agent resumes)
+
+Token savings: 670 tokens saved per blocked action (42% reduction)
+```
+
+Additional demos for specific scenarios:
+
+```bash
+python -m gvm.langchain_demo    # LangChain + Gmail (4-step enforcement)
+python -m gvm.hostile_demo      # Adversarial security tests
+python -m gvm.rollback_demo     # Checkpoint/rollback token analysis
 ```
 
 ### Industry templates
@@ -419,6 +432,7 @@ The full technical whitepaper is in [`docs/`](docs/):
 | [7](docs/07-sdk.md) | Python SDK |
 | [8](docs/08-memory-security.md) | Memory & Runtime Security Report |
 | [9](docs/09-test-report.md) | Test Coverage Report |
+| [11](docs/11-competitive-analysis.md) | Competitive Analysis: GVM vs OPA+Envoy |
 
 ---
 
