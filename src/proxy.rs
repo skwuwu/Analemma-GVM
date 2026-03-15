@@ -206,7 +206,7 @@ pub async fn proxy_handler(
                 urgency = ?urgency,
                 "Request requires approval — blocked"
             );
-            error_response_detailed(
+            let mut response = error_response_detailed(
                 StatusCode::FORBIDDEN,
                 &format!(
                     "IC-3: Administrator approval required (urgency: {:?})",
@@ -216,7 +216,12 @@ pub async fn proxy_handler(
                 Some(&event.event_id),
                 Some("Submit approval request to your GVM administrator"),
                 None,
-            )
+            );
+            // Include trace_id as rollback hint for SDK checkpoint recovery
+            if let Ok(v) = axum::http::HeaderValue::from_str(&event.trace_id) {
+                response.headers_mut().insert("X-GVM-Rollback-Hint", v);
+            }
+            response
         }
 
         EnforcementDecision::Deny { reason } => {
@@ -233,14 +238,19 @@ pub async fn proxy_handler(
                 reason = %reason,
                 "Request denied by policy"
             );
-            error_response_detailed(
+            let mut response = error_response_detailed(
                 StatusCode::FORBIDDEN,
                 reason,
                 Some("Deny"),
                 Some(&event.event_id),
                 Some("This operation is blocked by policy. Contact your GVM administrator to review the rule."),
                 None,
-            )
+            );
+            // Include trace_id as rollback hint for SDK checkpoint recovery
+            if let Ok(v) = axum::http::HeaderValue::from_str(&event.trace_id) {
+                response.headers_mut().insert("X-GVM-Rollback-Hint", v);
+            }
+            response
         }
 
         EnforcementDecision::Throttle { .. } => {

@@ -196,6 +196,11 @@ async fn main() {
                 .get(api::vault_read)
                 .delete(api::vault_delete),
         )
+        .route(
+            "/gvm/vault/checkpoint/:agent_id/:step",
+            axum::routing::put(api::checkpoint_write)
+                .get(api::checkpoint_read),
+        )
         .fallback(proxy_handler)
         .with_state(state)
         .layer(

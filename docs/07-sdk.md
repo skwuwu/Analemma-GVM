@@ -22,7 +22,10 @@ sdk/python/gvm/
 ├── state.py            # AgentState + VaultField
 ├── resource.py         # Resource descriptor
 ├── errors.py           # GVM error hierarchy
+├── checkpoint.py       # CheckpointManager (Merkle-verified state)
+├── langchain_tools.py  # LangChain adapter with rollback handling
 ├── demo.py             # Enforcement demo
+├── rollback_demo.py    # Rollback + token savings demo
 └── hostile_demo.py     # Hostile environment tests
 ```
 
@@ -240,7 +243,76 @@ Demonstrates the full IC classification pipeline:
 
 ---
 
-## 7.9 Security Guarantees
+## 7.9 Checkpoint/Rollback
+
+The SDK provides automatic state checkpoint and rollback for IC-2+ operations. This is the primary value-add over proxy-only (Level 0) enforcement.
+
+### Auto-Checkpoint Modes
+
+Set via class attribute or constructor:
+
+```python
+class MyAgent(GVMAgent):
+    auto_checkpoint = "ic2+"  # Options: None, "ic2+", "ic3", "all"
+```
+
+| Mode | Checkpoints before |
+|------|-------------------|
+| `None` | Disabled (default) |
+| `"ic2+"` | IC-2 (send/write) and IC-3 (payment/delete) |
+| `"ic3"` | IC-3 only |
+| `"all"` | Every `@ic` operation |
+
+### How Rollback Works
+
+1. Before an IC-2+ operation, the SDK saves agent state (conversation history, vault fields) to the Vault checkpoint API
+2. The checkpoint is encrypted (AES-256-GCM) and stored with a Merkle hash
+3. If the proxy denies the operation, the SDK:
+   - Retrieves the last approved checkpoint from the Vault
+   - Verifies Merkle integrity
+   - Restores agent state to the checkpoint
+   - Raises `GVMRollbackError` instead of `GVMDeniedError`
+
+### GVMRollbackError
+
+```python
+try:
+    agent.wire_transfer("attacker-9999", 50000)
+except GVMRollbackError as e:
+    print(e.operation)      # "gvm.payment.charge"
+    print(e.reason)         # "Operation denied: ..."
+    print(e.rolled_back_to) # 0 (checkpoint step)
+    print(e.blocked_at)     # 1 (step where blocked)
+```
+
+For LLM agents, the `gvm_tool()` wrapper converts this to structured JSON:
+
+```json
+{
+  "error": "ACTION_BLOCKED_AND_ROLLED_BACK",
+  "blocked_action": "gvm.payment.charge",
+  "reason": "Operation denied: SRR rule",
+  "state_restored_to": "checkpoint #0",
+  "instruction": "This action was blocked by governance policy. ..."
+}
+```
+
+### Token Savings
+
+Without rollback (Level 0), a denied action forces the LLM to restart the entire workflow. With rollback (Level 2), the agent resumes from the last checkpoint:
+
+| Metric | Level 0 (No SDK) | Level 2 (SDK) |
+|--------|-----------------|---------------|
+| Recovery strategy | Full restart | Resume from checkpoint |
+| Tokens per denied action | ~1,340 | ~600 |
+| Token savings | — | ~55% |
+| At 1,000 denials/day | ~1.34M tokens | ~600K tokens |
+
+Run the demo: `python -m gvm.rollback_demo`
+
+---
+
+## 7.10 Security Guarantees
 
 | Property | Mechanism |
 |----------|-----------|

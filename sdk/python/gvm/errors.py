@@ -72,3 +72,44 @@ class GVMRateLimitError(GVMError):
 
     def __init__(self, status_code: int = 429, event_id: str = None):
         super().__init__("Rate limit exceeded", status_code, event_id)
+
+
+class GVMRollbackError(GVMError):
+    """Raised when an operation was blocked and state was rolled back.
+
+    The agent can catch this error to choose an alternative action path.
+    For LLM agents, include this error message in the conversation history
+    so the LLM selects a different approach.
+
+    Attributes:
+        operation: The blocked operation name.
+        reason: Why the operation was blocked.
+        rolled_back_to: Checkpoint step the state was restored to (None if no prior checkpoint).
+        blocked_at: Checkpoint step saved before the blocked operation.
+    """
+
+    def __init__(
+        self,
+        operation: str,
+        reason: str,
+        rolled_back_to: int = None,
+        blocked_at: int = None,
+    ):
+        self.operation = operation
+        self.reason = reason
+        self.rolled_back_to = rolled_back_to
+        self.blocked_at = blocked_at
+
+        if rolled_back_to is not None:
+            msg = (
+                f"Action '{operation}' blocked: {reason}. "
+                f"State rolled back to checkpoint #{rolled_back_to}. "
+                f"Agent can continue from alternative path."
+            )
+        else:
+            msg = (
+                f"Action '{operation}' blocked: {reason}. "
+                f"No prior checkpoint available for rollback."
+            )
+
+        super().__init__(msg, status_code=403)

@@ -11,7 +11,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from gvm import GVMAgent, ic, Resource
-from gvm.errors import GVMDeniedError, GVMApprovalRequiredError
+from gvm.errors import GVMDeniedError, GVMApprovalRequiredError, GVMRollbackError
 
 
 class GmailAgent(GVMAgent):
@@ -106,3 +106,40 @@ def _check_response(resp):
     # Attach GVM headers to the error for inspection
     err.gvm_response = last_gvm_response
     raise err
+
+
+def gvm_tool(func):
+    """Wrap a GVM agent method as a LangChain-compatible tool.
+
+    Handles GVMRollbackError by returning a structured error message
+    that instructs the LLM to choose an alternative action path.
+
+    Usage:
+        tools = [gvm_tool(agent.read_inbox), gvm_tool(agent.wire_transfer)]
+    """
+
+    def wrapped(*args, **kwargs):
+        try:
+            result = func(*args, **kwargs)
+            return json.dumps(result, indent=2) if isinstance(result, dict) else str(result)
+        except GVMRollbackError as e:
+            return json.dumps({
+                "error": "ACTION_BLOCKED_AND_ROLLED_BACK",
+                "blocked_action": e.operation,
+                "reason": e.reason,
+                "state_restored_to": f"checkpoint #{e.rolled_back_to}" if e.rolled_back_to is not None else "none",
+                "instruction": (
+                    "This action was blocked by governance policy. "
+                    "Your state has been restored to the last safe checkpoint. "
+                    "Please choose an alternative approach."
+                ),
+            })
+        except (GVMDeniedError, GVMApprovalRequiredError) as e:
+            return json.dumps({
+                "error": "ACTION_BLOCKED",
+                "reason": str(e),
+            })
+
+    wrapped.__name__ = func.__name__
+    wrapped.__doc__ = func.__doc__
+    return wrapped

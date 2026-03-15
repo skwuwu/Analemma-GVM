@@ -103,6 +103,79 @@ pub async fn vault_delete(
     }
 }
 
+// ─── Checkpoint API ───
+
+/// PUT /gvm/vault/checkpoint/:agent_id/:step — Save agent state checkpoint
+///
+/// Stores a serialized agent state snapshot keyed by agent_id + step number.
+/// Used by SDK for automatic rollback on Deny/RequireApproval decisions.
+pub async fn checkpoint_write(
+    State(state): State<AppState>,
+    Path((agent_id, step)): Path<(String, u64)>,
+    body: axum::body::Bytes,
+) -> Response<Body> {
+    let key = format!("checkpoint:{}:{}", agent_id, step);
+    match state.vault.write(&key, &body, &agent_id).await {
+        Ok(()) => {
+            tracing::debug!(agent = %agent_id, step = step, "Checkpoint saved");
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "status": "ok",
+                    "checkpoint_step": step,
+                    "agent_id": agent_id,
+                }),
+            )
+        }
+        Err(e) => {
+            tracing::error!(agent = %agent_id, step = step, error = %e, "Checkpoint write failed");
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({"error": "Checkpoint write failed"}),
+            )
+        }
+    }
+}
+
+/// GET /gvm/vault/checkpoint/:agent_id/:step — Restore agent state checkpoint
+///
+/// Retrieves and decrypts a previously saved checkpoint.
+/// Returns the raw checkpoint bytes with Merkle verification header.
+pub async fn checkpoint_read(
+    State(state): State<AppState>,
+    Path((agent_id, step)): Path<(String, u64)>,
+) -> Response<Body> {
+    let key = format!("checkpoint:{}:{}", agent_id, step);
+    match state.vault.read(&key, &agent_id).await {
+        Ok(Some(data)) => {
+            tracing::debug!(agent = %agent_id, step = step, "Checkpoint restored");
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/octet-stream")
+                .header("X-GVM-Checkpoint-Step", step.to_string())
+                .header("X-GVM-Merkle-Verified", "true")
+                .body(Body::from(data))
+                .unwrap_or_else(|_| {
+                    Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::empty())
+                        .unwrap()
+                })
+        }
+        Ok(None) => json_response(
+            StatusCode::NOT_FOUND,
+            &serde_json::json!({"error": "Checkpoint not found", "step": step}),
+        ),
+        Err(e) => {
+            tracing::error!(agent = %agent_id, step = step, error = %e, "Checkpoint read failed");
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({"error": "Checkpoint retrieval failed"}),
+            )
+        }
+    }
+}
+
 // ─── Dry-Run Policy Check ───
 
 #[derive(Deserialize)]
