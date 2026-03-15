@@ -125,6 +125,14 @@ impl VaultEncryption {
     }
 }
 
+/// Maximum number of keys in the in-memory vault store.
+/// Prevents unbounded memory growth from agent writes.
+const MAX_VAULT_KEYS: usize = 10_000;
+
+/// Maximum size of a single encrypted value (1 MB).
+/// Prevents a single write from consuming excessive memory.
+const MAX_VALUE_BYTES: usize = 1024 * 1024;
+
 /// Vault: encrypted key-value store for agent state.
 ///
 /// Design (PART 5.4):
@@ -132,6 +140,11 @@ impl VaultEncryption {
 /// - WAL-first write: encrypted value recorded in WAL before Redis write
 /// - Read operations are logged asynchronously (value not included in audit)
 /// - MVP: in-memory HashMap instead of Redis (Redis integration in production)
+///
+/// Memory bounds:
+/// - Max keys: 10,000 (rejects writes when full)
+/// - Max value size: 1 MB per value
+/// - Total worst case: ~10 GB (10K keys × 1 MB), but typical values are small
 pub struct Vault {
     /// In-memory store (MVP replacement for Redis)
     store: RwLock<HashMap<String, Vec<u8>>>,
@@ -153,14 +166,34 @@ impl Vault {
     /// Write an encrypted value to the vault.
     /// WAL records the encrypted value for crash recovery.
     pub async fn write(&self, key: &str, plaintext: &[u8], agent_id: &str) -> Result<()> {
-        // 1. Encrypt
+        // 0. Enforce value size limit before encryption (fail fast)
+        if plaintext.len() > MAX_VALUE_BYTES {
+            return Err(anyhow!(
+                "Value size {} bytes exceeds maximum {} bytes",
+                plaintext.len(),
+                MAX_VALUE_BYTES
+            ));
+        }
+
+        // 1. Enforce key count limit (allow overwrites of existing keys)
+        {
+            let store = self.store.read().await;
+            if store.len() >= MAX_VAULT_KEYS && !store.contains_key(key) {
+                return Err(anyhow!(
+                    "Vault key limit reached ({} keys). Delete unused keys before adding new ones.",
+                    MAX_VAULT_KEYS
+                ));
+            }
+        }
+
+        // 2. Encrypt
         let ciphertext = self.encryption.encrypt(plaintext)?;
 
-        // 2. WAL-first: record encrypted value for recovery
+        // 3. WAL-first: record encrypted value for recovery
         let event = build_vault_event(key, agent_id, "vault_write", Some(&ciphertext));
         self.ledger.append_durable(&event).await?;
 
-        // 3. Store encrypted value
+        // 4. Store encrypted value
         let mut store = self.store.write().await;
         store.insert(key.to_string(), ciphertext);
 

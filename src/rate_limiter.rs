@@ -22,6 +22,10 @@ struct TokenBucket {
 const BUCKET_IDLE_TTL: Duration = Duration::from_secs(600); // 10 minutes
 /// Clean up stale buckets every N check() calls.
 const CLEANUP_INTERVAL: u64 = 1000;
+/// Hard cap on bucket count. If exceeded, force an immediate cleanup
+/// regardless of CLEANUP_INTERVAL. Prevents unbounded memory growth
+/// from a flood of unique agent IDs (e.g., agent ID spoofing attack).
+const MAX_BUCKETS: usize = 10_000;
 
 impl TokenBucket {
     fn new(max_per_minute: u64) -> Self {
@@ -76,14 +80,40 @@ impl RateLimiter {
             }
         };
 
-        // Periodic cleanup of stale buckets to prevent unbounded memory growth
+        // Periodic cleanup of stale buckets to prevent unbounded memory growth.
+        // Also triggers immediately if bucket count exceeds MAX_BUCKETS (DoS defense).
         let count = self.check_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if count % CLEANUP_INTERVAL == 0 && count > 0 {
+        let force_cleanup = buckets.len() >= MAX_BUCKETS;
+        if force_cleanup || (count % CLEANUP_INTERVAL == 0 && count > 0) {
+            if force_cleanup {
+                tracing::warn!(
+                    buckets = buckets.len(),
+                    "Rate limiter bucket count at capacity ({}) — forcing cleanup",
+                    MAX_BUCKETS
+                );
+            }
             let before = buckets.len();
             buckets.retain(|_, b| b.last_access.elapsed() < BUCKET_IDLE_TTL);
             let evicted = before - buckets.len();
             if evicted > 0 {
                 tracing::debug!(evicted = evicted, remaining = buckets.len(), "Evicted stale rate limit buckets");
+            }
+            // If still at capacity after TTL eviction, evict oldest entries
+            if buckets.len() >= MAX_BUCKETS {
+                let mut entries: Vec<(String, Instant)> = buckets
+                    .iter()
+                    .map(|(k, b)| (k.clone(), b.last_access))
+                    .collect();
+                entries.sort_by_key(|(_, t)| *t);
+                let to_remove = buckets.len() - (MAX_BUCKETS * 3 / 4); // evict 25%
+                for (key, _) in entries.iter().take(to_remove) {
+                    buckets.remove(key);
+                }
+                tracing::warn!(
+                    force_evicted = to_remove,
+                    remaining = buckets.len(),
+                    "Force-evicted oldest rate limit buckets (capacity overflow)"
+                );
             }
         }
 
