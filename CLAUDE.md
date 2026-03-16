@@ -31,7 +31,7 @@ Full specification: `docs/GVM_CODE_STANDARDS.md`
 
 - **Startup**: `bail!()` on invalid config. Proxy must not start with bad state.
 - **Runtime**: `Result<T, E>` always. Graceful degradation (Wasm fails → native fallback with warning).
-- **WAL failure**: Reject the request. Never proceed without audit record (fail-close).
+- **WAL failure**: Reject the request. Never proceed without audit record (fail-close). Use fallback WAL path for resilience. Full disk → auto-rotate. Both paths fail → then reject.
 - **Config**: Required settings → startup error. Optional settings → safe default + visible warning.
 
 ### Performance
@@ -51,6 +51,7 @@ Full specification: `docs/GVM_CODE_STANDARDS.md`
 
 - Prefer channel (ownership transfer) > RwLock (read-heavy) > Mutex (write-heavy)
 - Mutex poison → fail-closed (return error), never panic
+- Never hold `std::sync::Mutex` across `.await` (deadlock risk). Use `tokio::sync::Mutex` if lock must span await, but never on hot path.
 - Never hold two locks simultaneously. Never do I/O under lock.
 - Shutdown must flush pending WAL batch.
 

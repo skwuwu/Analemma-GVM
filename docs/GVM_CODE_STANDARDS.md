@@ -150,6 +150,8 @@ hasher.update(event.event_id.as_bytes());
 Config load errors   → bail!() at startup. Proxy must not start with invalid config.
 Runtime I/O errors   → Result<T, E>. Propagate to caller. Never panic.
 WAL write errors     → Reject the request (fail-close). Never proceed without audit.
+                        Use fallback WAL path for resilience. Full disk → auto-rotate.
+                        Both paths fail → then reject.
 Vault errors         → Return generic error to caller. Log details internally.
 Network errors       → Return appropriate HTTP status. Log with trace context.
 ```
@@ -225,6 +227,15 @@ Other amortizable operations:
 - WAL fsync: group commit batches multiple writes into one fsync
 - Merkle root: computed once per batch, not per event
 - JSON serialization: done by caller before entering batch task (CPU parallelism)
+
+CI enforcement: `Regex::new` outside config/load/test paths is a build error.
+```bash
+# CI check: no runtime regex compilation
+if grep -rn "Regex::new" src/ --include="*.rs" | grep -v "config\|load\|compile\|test"; then
+    echo "ERROR: Regex::new found outside config/load paths"
+    exit 1
+fi
+```
 
 ### 3.3 Bounded Resources
 
@@ -352,7 +363,30 @@ let guard = match self.buckets.lock() {
 };
 ```
 
-### 5.3 Async Discipline
+### 5.3 Async Mutex Rule
+
+Never hold `std::sync::Mutex` across an `.await` point — this blocks the tokio runtime thread and can deadlock under load. If a lock must span an async operation, use `tokio::sync::Mutex`. However, `tokio::sync::Mutex` should never appear on the hot path (policy evaluation, SRR matching) because its overhead is higher than `std::sync::Mutex` for synchronous access.
+
+```rust
+// FORBIDDEN: std::sync::Mutex held across await
+let guard = self.data.lock().unwrap();
+let result = some_async_op(&guard).await; // blocks runtime thread
+drop(guard);
+
+// REQUIRED: tokio::sync::Mutex if lock must span await
+let guard = self.data.lock().await;
+let result = some_async_op(&guard).await;
+drop(guard);
+
+// PREFERRED: release sync lock before await
+let snapshot = {
+    let guard = self.data.lock().map_err(|_| anyhow!("poisoned"))?;
+    guard.clone() // copy what you need
+};
+let result = some_async_op(&snapshot).await;
+```
+
+### 5.4 Async Discipline
 
 - All I/O operations must be async (tokio)
 - CPU-intensive work (JSON serialization, hash computation) should run before entering async critical sections

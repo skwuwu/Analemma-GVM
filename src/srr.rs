@@ -153,7 +153,10 @@ impl NetworkSRR {
         // Normalize host: resolve IPv6 variants to canonical form so SRR rules
         // written for "localhost" or "127.0.0.1" also catch IPv6 equivalents.
         let normalized = normalize_host(host);
-        let effective_host = normalized.as_deref().unwrap_or(host);
+        let raw_host = normalized.as_deref().unwrap_or(host);
+        // Case-insensitive: lowercase once here (O(1) per request) instead of
+        // per-rule in match_host (avoids O(N) allocations for N rules).
+        let effective_host = raw_host.to_lowercase();
 
         // Normalize path: prevent bypass via percent-encoding, dot segments,
         // double slashes, or null bytes.
@@ -167,7 +170,7 @@ impl NetworkSRR {
             }
 
             // Host match
-            if !match_host(&rule.host_pattern, effective_host) {
+            if !match_host(&rule.host_pattern, &effective_host) {
                 continue;
             }
 
@@ -248,10 +251,12 @@ fn parse_pattern(pattern: &str) -> (HostPattern, String) {
         HostPattern::Any
     } else if host_part.starts_with("{") && host_part.contains('.') {
         // e.g. "{host}.database.com" → suffix match on ".database.com"
-        let dot_idx = host_part.find('.').expect("suffix pattern contains '.' (checked by contains('.') guard above)");
-        HostPattern::Suffix(host_part[dot_idx..].to_string())
+        // Safe: contains('.') guard above ensures find('.') always returns Some.
+        // unwrap_or(0) is unreachable but avoids panic for defense-in-depth.
+        let dot_idx = host_part.find('.').unwrap_or(0);
+        HostPattern::Suffix(host_part[dot_idx..].to_lowercase())
     } else {
-        HostPattern::Exact(host_part.to_string())
+        HostPattern::Exact(host_part.to_lowercase())
     };
 
     let path_pattern = path_part.replace("{any}", "*").to_string();
@@ -261,6 +266,9 @@ fn parse_pattern(pattern: &str) -> (HostPattern, String) {
 
 /// Match a host against a HostPattern.
 /// Strips port number before matching (e.g., "api.bank.com:443" → "api.bank.com").
+///
+/// Caller must pass a pre-lowercased host (done once in `check()` for O(1) cost).
+/// Patterns are lowercased at compile time in `parse_pattern()`.
 fn match_host(pattern: &HostPattern, host: &str) -> bool {
     // Strip port if present: "api.bank.com:443" → "api.bank.com"
     // For IPv6 with port like "[::1]:8080", the brackets are already handled
@@ -272,8 +280,13 @@ fn match_host(pattern: &HostPattern, host: &str) -> bool {
     };
 
     match pattern {
-        HostPattern::Exact(expected) => host_without_port == expected,
-        HostPattern::Suffix(suffix) => host_without_port.ends_with(suffix.as_str()),
+        HostPattern::Exact(expected) => host_without_port == expected.as_str(),
+        HostPattern::Suffix(suffix) => {
+            // Dot-boundary enforcement: suffix always starts with '.' from parse_pattern
+            // (e.g., ".database.com"), so "attacker-database.com" cannot match —
+            // it would need to end with ".database.com" which requires a dot boundary.
+            host_without_port.ends_with(suffix.as_str())
+        }
         HostPattern::Any => true,
     }
 }

@@ -119,23 +119,25 @@ impl CheckpointRegistry {
             }
         });
 
-        // Ensure leaves vector is large enough for this step
-        // (steps should be sequential, but handle gaps gracefully)
-        while tree.leaves.len() <= step as usize {
-            // Fill gaps with a placeholder hash (should not happen in normal flow)
-            if tree.leaves.len() < step as usize {
-                let mut gap_hasher = Sha256::new();
-                gap_hasher.update(b"__gap__");
-                gap_hasher.update(tree.leaves.len().to_le_bytes());
-                tree.leaves.push(hex::encode(gap_hasher.finalize()));
-            } else {
-                tree.leaves.push(content_hash.clone());
-            }
+        let step_idx = step as usize;
+
+        // Enforce sequential writes: step must be either the next index or an existing overwrite.
+        // Non-sequential gaps are rejected to prevent Merkle root instability where
+        // gap-filled placeholder hashes would be silently overwritten by later writes,
+        // breaking any external system that verified the intermediate root.
+        if step_idx > tree.leaves.len() {
+            anyhow::bail!(
+                "checkpoint step {} is non-sequential (current len {}): steps must be written in order",
+                step, tree.leaves.len()
+            );
         }
 
-        // If step already exists (overwrite), update the leaf
-        if (step as usize) < tree.leaves.len() {
-            tree.leaves[step as usize] = content_hash.clone();
+        if step_idx == tree.leaves.len() {
+            // Append new leaf
+            tree.leaves.push(content_hash.clone());
+        } else {
+            // Overwrite existing leaf (re-checkpoint at same step)
+            tree.leaves[step_idx] = content_hash.clone();
         }
 
         // Recompute Merkle root over all leaves
@@ -253,6 +255,24 @@ pub struct VaultReadResponse {
     pub value: Option<String>,
 }
 
+/// Validate that an identifier does not contain the namespace separator `:`,
+/// preventing namespace traversal attacks (e.g., agent_id="admin:foo" + key="bar" → "admin:foo:bar").
+fn validate_vault_identifier(id: &str, field_name: &str) -> Result<(), Response<Body>> {
+    if id.contains(':') {
+        return Err(json_response(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({"error": format!("invalid {}: must not contain ':'", field_name)}),
+        ));
+    }
+    if id.is_empty() {
+        return Err(json_response(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({"error": format!("{} must not be empty", field_name)}),
+        ));
+    }
+    Ok(())
+}
+
 /// PUT /gvm/vault/:key — Write encrypted value to vault
 ///
 /// Security: keys are scoped by agent_id prefix to enforce namespace isolation.
@@ -262,6 +282,14 @@ pub async fn vault_write(
     Path(key): Path<String>,
     Json(body): Json<VaultWriteRequest>,
 ) -> Response<Body> {
+    // Validate identifiers to prevent namespace traversal via separator injection
+    if let Err(resp) = validate_vault_identifier(&body.agent_id, "agent_id") {
+        return resp;
+    }
+    if let Err(resp) = validate_vault_identifier(&key, "key") {
+        return resp;
+    }
+
     // Namespace isolation: scope key by agent_id to prevent cross-agent access
     let scoped_key = format!("{}:{}", body.agent_id, key);
 
@@ -290,6 +318,12 @@ pub async fn vault_read(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response<Body> {
     let agent_id = params.get("agent_id").map(|s| s.as_str()).unwrap_or("unknown");
+    if let Err(resp) = validate_vault_identifier(agent_id, "agent_id") {
+        return resp;
+    }
+    if let Err(resp) = validate_vault_identifier(&key, "key") {
+        return resp;
+    }
     let scoped_key = format!("{}:{}", agent_id, key);
 
     match state.vault.read(&scoped_key, agent_id).await {
@@ -323,6 +357,12 @@ pub async fn vault_delete(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response<Body> {
     let agent_id = params.get("agent_id").map(|s| s.as_str()).unwrap_or("unknown");
+    if let Err(resp) = validate_vault_identifier(agent_id, "agent_id") {
+        return resp;
+    }
+    if let Err(resp) = validate_vault_identifier(&key, "key") {
+        return resp;
+    }
     let scoped_key = format!("{}:{}", agent_id, key);
 
     match state.vault.delete(&scoped_key, agent_id).await {
