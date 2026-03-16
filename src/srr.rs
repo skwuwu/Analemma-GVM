@@ -114,6 +114,8 @@ impl NetworkSRR {
     /// Rules are evaluated in order — first match wins.
     /// IPv6 addresses are normalized before matching to prevent SSRF bypass
     /// via zero-compression, IPv4-mapped, or bracket variations.
+    /// Paths are canonicalized (percent-decoded, dot-segment resolved, double
+    /// slashes collapsed) to prevent bypass via path manipulation.
     pub fn check(
         &self,
         method: &str,
@@ -126,6 +128,11 @@ impl NetworkSRR {
         let normalized = normalize_host(host);
         let effective_host = normalized.as_deref().unwrap_or(host);
 
+        // Normalize path: prevent bypass via percent-encoding, dot segments,
+        // double slashes, or null bytes.
+        let canonical = normalize_path(path);
+        let effective_path = canonical.as_deref().unwrap_or(path);
+
         for rule in &self.rules {
             // Method match
             if rule.method != method {
@@ -137,8 +144,13 @@ impl NetworkSRR {
                 continue;
             }
 
-            // Path match
-            if !match_path(&rule.path_pattern, path) {
+            // Path match: check BOTH normalized and original paths.
+            // A rule that matches either form should fire — normalization must
+            // expand what gets caught (e.g., dot-segment traversal attempts
+            // should not escape a deny rule that matched the original prefix).
+            if !match_path(&rule.path_pattern, effective_path)
+                && !match_path(&rule.path_pattern, path)
+            {
                 continue;
             }
 
@@ -239,6 +251,125 @@ fn match_path(pattern: &str, path: &str) -> bool {
     } else {
         // Exact match
         path == pattern
+    }
+}
+
+/// Canonicalize a request path to prevent SRR bypass via path manipulation.
+///
+/// Defenses:
+/// - Percent-decoding: `%2F` → `/`, `%2e` → `.` (prevents encoded bypass)
+/// - Null byte stripping: `/transfer%00` → `/transfer` (prevents null injection)
+/// - Double-slash collapse: `//transfer` → `/transfer`
+/// - Dot-segment resolution: `/a/../transfer` → `/transfer` (RFC 3986 §5.2.4)
+/// - Trailing normalization: preserves trailing slash semantics
+///
+/// Returns None if the path is already in canonical form (avoids allocation).
+fn normalize_path(path: &str) -> Option<String> {
+    // Step 1: Percent-decode the path (only decode unreserved + path-safe chars)
+    let decoded = percent_decode_path(path);
+    let working = decoded.as_deref().unwrap_or(path);
+
+    // Step 2: Strip null bytes
+    let has_null = working.contains('\0');
+
+    // Step 3: Check if any normalization is actually needed
+    let has_double_slash = working.contains("//");
+    let has_dot_segment = working.contains("/./") || working.contains("/../")
+        || working.ends_with("/..") || working.ends_with("/.");
+
+    if decoded.is_none() && !has_null && !has_double_slash && !has_dot_segment {
+        return None; // Already canonical
+    }
+
+    // Step 4: Build canonical path
+    let clean: String = if has_null {
+        working.replace('\0', "")
+    } else {
+        working.to_string()
+    };
+
+    // Step 5: Collapse double slashes
+    let mut result = String::with_capacity(clean.len());
+    let mut prev_slash = false;
+    for ch in clean.chars() {
+        if ch == '/' {
+            if !prev_slash {
+                result.push('/');
+            }
+            prev_slash = true;
+        } else {
+            prev_slash = false;
+            result.push(ch);
+        }
+    }
+
+    // Step 6: Resolve dot segments (RFC 3986 §5.2.4)
+    let resolved = resolve_dot_segments(&result);
+
+    Some(resolved)
+}
+
+/// Percent-decode path-relevant characters.
+/// Decodes %XX sequences to their byte values, focusing on characters that
+/// could be used to bypass path matching (/, ., alphanumerics).
+/// Returns None if no percent-encoded sequences are found.
+fn percent_decode_path(path: &str) -> Option<String> {
+    if !path.contains('%') {
+        return None;
+    }
+
+    let bytes = path.as_bytes();
+    let mut result = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (
+                hex_val(bytes[i + 1]),
+                hex_val(bytes[i + 2]),
+            ) {
+                result.push(hi << 4 | lo);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+
+    String::from_utf8(result).ok()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Resolve dot segments per RFC 3986 §5.2.4.
+/// "/a/b/../c" → "/a/c", "/a/./b" → "/a/b"
+fn resolve_dot_segments(path: &str) -> String {
+    let mut segments: Vec<&str> = Vec::new();
+
+    for segment in path.split('/') {
+        match segment {
+            "." => {} // Skip current-directory references
+            ".." => {
+                // Go up one level, but never above root
+                segments.pop();
+            }
+            s => segments.push(s),
+        }
+    }
+
+    let resolved = segments.join("/");
+    if resolved.starts_with('/') || resolved.is_empty() {
+        resolved
+    } else {
+        format!("/{}", resolved)
     }
 }
 
@@ -786,5 +917,83 @@ mod tests {
             EnforcementDecision::Deny { .. } => {}
             other => panic!("Host with port should match suffix pattern, got {:?}", other),
         }
+    }
+
+    // ── Path normalization tests ──
+
+    #[test]
+    fn percent_encoded_path_is_decoded_before_matching() {
+        let srr = srr_from_toml(r#"
+            [[rules]]
+            method = "POST"
+            pattern = "api.bank.com/transfer/{any}"
+            decision = { type = "Deny", reason = "Wire transfer blocked" }
+        "#);
+
+        // %2F = /, %74 = t, etc. — encoded path that resolves to /transfer/123
+        let decision = srr.check("POST", "api.bank.com", "/%74ransfer/123", None);
+        match decision {
+            EnforcementDecision::Deny { .. } => {}
+            other => panic!("Percent-encoded path must be decoded before matching, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn double_slash_collapsed_before_matching() {
+        let srr = srr_from_toml(r#"
+            [[rules]]
+            method = "POST"
+            pattern = "api.bank.com/transfer/{any}"
+            decision = { type = "Deny", reason = "Wire transfer blocked" }
+        "#);
+
+        let decision = srr.check("POST", "api.bank.com", "//transfer/123", None);
+        match decision {
+            EnforcementDecision::Deny { .. } => {}
+            other => panic!("Double slash must be collapsed, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dot_segment_traversal_does_not_bypass_deny() {
+        let srr = srr_from_toml(r#"
+            [[rules]]
+            method = "POST"
+            pattern = "api.bank.com/transfer/{any}"
+            decision = { type = "Deny", reason = "Wire transfer blocked" }
+        "#);
+
+        // /safe/../transfer/123 resolves to /transfer/123
+        let decision = srr.check("POST", "api.bank.com", "/safe/../transfer/123", None);
+        match decision {
+            EnforcementDecision::Deny { .. } => {}
+            other => panic!("Dot-segment traversal must not bypass deny, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn already_canonical_path_no_allocation() {
+        // Verify normalize_path returns None for clean paths (no allocation)
+        assert!(normalize_path("/transfer/123").is_none());
+        assert!(normalize_path("/").is_none());
+        assert!(normalize_path("/a/b/c").is_none());
+    }
+
+    #[test]
+    fn normalize_path_handles_edge_cases() {
+        // Percent-encoded slash
+        assert_eq!(normalize_path("/a%2Fb").unwrap(), "/a/b");
+
+        // Double dot at end
+        assert_eq!(normalize_path("/a/b/..").unwrap(), "/a");
+
+        // Multiple consecutive slashes
+        assert_eq!(normalize_path("///a///b///").unwrap(), "/a/b/");
+
+        // Single dot
+        assert_eq!(normalize_path("/a/./b").unwrap(), "/a/b");
+
+        // Null byte removal
+        assert_eq!(normalize_path("/a\0b").unwrap(), "/ab");
     }
 }

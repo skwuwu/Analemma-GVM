@@ -1,6 +1,6 @@
 # Part 9: Test & Benchmark Report
 
-**Total: 141 Rust Tests (49 unit + 5 engine + 30 boundary + 17 edge + 11 hostile + 5 integration + 12 merkle + 12 stress) — All Pass**
+**Total: 146 Rust Tests (54 unit + 5 engine + 30 boundary + 17 edge + 11 hostile + 5 integration + 12 merkle + 12 stress) — All Pass**
 **Benchmarks: 12 groups, 49 individual measurements (Criterion v0.5)**
 **Last Run: 2026-03-16**
 
@@ -19,7 +19,7 @@ tests/
 src/
 ├── registry.rs         # 4 unit tests
 ├── policy.rs           # 4 unit tests
-├── srr.rs              # 13 unit tests
+├── srr.rs              # 18 unit tests (13 + 5 path normalization)
 ├── vault.rs            # 7 unit tests
 ├── wasm_engine.rs      # 4 unit tests
 ├── merkle.rs           # 9 Merkle hash/proof tests
@@ -32,12 +32,12 @@ benches/
 
 ---
 
-## 9.2 Test Execution Log (2026-03-15)
+## 9.2 Test Execution Log (2026-03-16)
 
 ```
 $ cargo test
 
-running 29 tests                              (src/lib.rs — unit tests)
+running 54 tests                              (src/lib.rs — unit tests)
 test policy::tests::test_ends_with_condition ... ok
 test policy::tests::test_deny_overrides_all ... ok
 test policy::tests::test_starts_with_condition ... ok
@@ -67,7 +67,33 @@ test srr::tests::wildcard_method_matches_all_http_methods ... ok
 test srr::tests::unknown_url_gets_default_to_caution ... ok
 test srr::tests::payload_at_exact_limit_is_inspected ... ok
 test srr::tests::malformed_json_body_skips_payload_rule ... ok
-test result: ok. 29 passed; 0 failed; 0 ignored; finished in 0.02s
+test srr::tests::host_with_port_matches_exact_pattern ... ok
+test srr::tests::host_with_port_matches_suffix_pattern ... ok
+test srr::tests::payload_exceeding_max_body_bytes_skips_to_next_rule ... ok
+test srr::tests::payload_exceeding_max_body_bytes_no_fallback_gets_default_caution ... ok
+test srr::tests::percent_encoded_path_is_decoded_before_matching ... ok
+test srr::tests::double_slash_collapsed_before_matching ... ok
+test srr::tests::dot_segment_traversal_does_not_bypass_deny ... ok
+test srr::tests::already_canonical_path_no_allocation ... ok
+test srr::tests::normalize_path_handles_edge_cases ... ok
+test llm_trace::tests::test_identify_llm_provider ... ok
+test llm_trace::tests::test_extract_anthropic_thinking ... ok
+test llm_trace::tests::test_extract_openai_reasoning ... ok
+test llm_trace::tests::test_extract_gemini_thought ... ok
+test llm_trace::tests::test_no_thinking_content_returns_usage_only ... ok
+test llm_trace::tests::test_non_llm_body_returns_none ... ok
+test llm_trace::tests::test_empty_provider_returns_none ... ok
+test llm_trace::tests::test_truncation ... ok
+test merkle::tests::merkle_single_leaf ... ok
+test merkle::tests::merkle_two_leaves ... ok
+test merkle::tests::merkle_four_leaves_balanced ... ok
+test merkle::tests::merkle_odd_leaves_duplicates_last ... ok
+test merkle::tests::merkle_different_order_different_root ... ok
+test merkle::tests::merkle_deterministic ... ok
+test merkle::tests::merkle_proof_verifies_each_leaf ... ok
+test merkle::tests::merkle_proof_rejects_wrong_leaf ... ok
+test merkle::tests::merkle_proof_rejects_wrong_root ... ok
+test result: ok. 54 passed; 0 failed; 0 ignored; finished in 0.05s
 
 running 26 tests                              (tests/boundary.rs)
 test api_key_not_leaked_via_gvm_headers ... ok
@@ -180,7 +206,7 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 | 3 | [`test_numeric_gt_condition`](src/policy.rs) | Rule: `context.amount > 500`, input: `amount=1000` | Numeric comparison succeeds |
 | 4 | [`test_deny_overrides_all`](src/policy.rs) | Deny (priority 1) + Allow (priority 100) on same request | Deny short-circuits, `matched_rule_id` correct |
 
-### Network SRR (13 tests) — [src/srr.rs](src/srr.rs)
+### Network SRR (18 tests) — [src/srr.rs](src/srr.rs)
 
 | # | Test | Scenario | Verification |
 |---|------|----------|--------------|
@@ -197,6 +223,11 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 | 11 | [`wildcard_method_matches_all_http_methods`](src/srr.rs) | `method = "*"` on `evil.com` | GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS all Denied |
 | 12 | [`host_with_port_matches_exact_pattern`](src/srr.rs) | `api.bank.com:8443` matches `api.bank.com` rule | Port stripped before matching |
 | 13 | [`host_with_port_matches_suffix_pattern`](src/srr.rs) | `prod.database.com:5432` matches `{host}.database.com` | Port stripped, suffix pattern matched |
+| 14 | [`percent_encoded_path_is_decoded_before_matching`](src/srr.rs) | `/%74ransfer/123` (percent-encoded) | Decoded to `/transfer/123`, denied |
+| 15 | [`double_slash_collapsed_before_matching`](src/srr.rs) | `//transfer/123` | Collapsed to `/transfer/123`, denied |
+| 16 | [`dot_segment_traversal_does_not_bypass_deny`](src/srr.rs) | `/safe/../transfer/123` | Resolved to `/transfer/123`, denied |
+| 17 | [`already_canonical_path_no_allocation`](src/srr.rs) | Clean paths `/transfer/123`, `/`, `/a/b/c` | `normalize_path` returns None (zero allocation) |
+| 18 | [`normalize_path_handles_edge_cases`](src/srr.rs) | `%2F`, `..` at end, `///`, `/./ `, null bytes | All edge cases produce correct canonical paths |
 
 ### Encrypted Vault (7 tests) — [src/vault.rs](src/vault.rs)
 

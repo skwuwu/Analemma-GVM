@@ -93,11 +93,11 @@ See [Part 8: Memory & Runtime Security](08-memory-security.md) for full analysis
 
 ---
 
-## Test Coverage: 141 Tests
+## Test Coverage: 146 Tests
 
 | Category | Count | Source |
 |----------|-------|--------|
-| Unit (SRR, Policy, Vault, Registry, Merkle, Wasm, LLM Trace) | 49 | `src/lib.rs` |
+| Unit (SRR, Policy, Vault, Registry, Merkle, Wasm, LLM Trace) | 54 | `src/lib.rs` |
 | Integration (E2E) | 5 | `tests/integration.rs` |
 | Boundary | 30 | `tests/boundary.rs` |
 | Edge Cases | 17 | `tests/edge_cases.rs` |
@@ -105,6 +105,6 @@ See [Part 8: Memory & Runtime Security](08-memory-security.md) for full analysis
 | Stress | 12 | `tests/stress.rs` |
 | Merkle Tree | 12 | `tests/merkle.rs` |
 | Engine (gvm-engine) | 5 | `crates/gvm-engine/` |
-| **Total** | **141** | |
+| **Total** | **146** | |
 
 All tests pass. Zero failures.

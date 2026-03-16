@@ -2,11 +2,16 @@
 
 import functools
 import json
+import re
 import uuid
 import threading
 from typing import Optional
 
 from gvm.resource import Resource
+
+# Operation names must match: alphanumeric, dots, hyphens, underscores only.
+# Prevents header injection via newlines or special characters in operation names.
+_OPERATION_PATTERN = re.compile(r"^[a-zA-Z0-9._-]+$")
 
 # Thread-local storage for trace context propagation
 _trace_context = threading.local()
@@ -104,6 +109,16 @@ def ic(
     def decorator(func):
         # Auto-generate operation name if not specified
         op = operation or f"custom.auto.{func.__name__}"
+
+        # Validate operation name to prevent header injection attacks.
+        # Operation names are passed as HTTP headers (X-GVM-Operation);
+        # characters like \r\n could break the HTTP protocol.
+        if not _OPERATION_PATTERN.match(op):
+            raise ValueError(
+                f"Invalid operation name: {op!r}. "
+                f"Must match [a-zA-Z0-9._-]+ (no spaces, newlines, or special characters)."
+            )
+
         ic_level = _infer_ic_level(op)
 
         # Store GVM metadata on the function for introspection

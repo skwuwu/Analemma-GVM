@@ -415,7 +415,7 @@ Savings are not a fixed percentage — they depend on where in the workflow the 
 ### Run tests
 
 ```bash
-cargo test   # 141 tests
+cargo test   # 146 tests
 ```
 
 ---
@@ -442,11 +442,11 @@ The full technical whitepaper is in [`docs/`](docs/):
 
 ## Test Coverage
 
-141 tests across unit, integration, boundary, edge-case, hostile, stress, and Merkle suites. Zero failures.
+146 tests across unit, integration, boundary, edge-case, hostile, stress, and Merkle suites. Zero failures.
 
 | Category | Count |
 |----------|-------|
-| Unit (SRR, Policy, Vault, Registry, Merkle, Wasm, LLM Trace) | 49 |
+| Unit (SRR, Policy, Vault, Registry, Merkle, Wasm, LLM Trace) | 54 |
 | Integration (E2E) | 5 |
 | Boundary | 30 |
 | Edge Cases | 17 |
@@ -454,7 +454,7 @@ The full technical whitepaper is in [`docs/`](docs/):
 | Stress | 12 |
 | Merkle Tree | 12 |
 | Engine (gvm-engine) | 5 |
-| **Total** | **141** |
+| **Total** | **146** |
 
 ---
 
@@ -478,6 +478,20 @@ The goal is not to build another agent framework. The goal is to build the **ope
 An OS doesn't tell applications what to do. It controls what they *can* do. It doesn't inspect the source code of every program — it enforces permissions at the syscall boundary. An application can *try* to delete `/etc/passwd`; the kernel says no.
 
 Analemma-GVM does the same for AI agents. The agent can *try* to wire-transfer $50,000; the kernel says no.
+
+---
+
+## Known Limitations & Planned Hardening
+
+We know where the weak points are. Transparency is part of the security posture.
+
+| Area | Current State | Planned Fix |
+|------|--------------|-------------|
+| **Vault Key** | Falls back to ephemeral random key if `GVM_VAULT_KEY` is not set. Safe for development, but encrypted state is lost on restart. | Require explicit key in production mode (`GVM_ENV=production`). Error on missing key instead of fallback. |
+| **JSON Schema Validation** | Proxy responses and checkpoint data are parsed without schema validation. Trusted-environment assumption. | Add Serde-based strict deserialization on proxy side, Pydantic/dataclass validation on SDK side. |
+| **Checkpoint Failure Mode** | Checkpoint save failures are logged as warnings but do not block execution. | Configurable strict mode: fail the operation if checkpoint cannot be saved. |
+| **Thread Safety (SDK)** | `last_gvm_response` in LangChain tools module is not thread-safe. | Wrap with `threading.Lock` or use thread-local storage. |
+| **Rate Limiter Eviction** | Bucket overflow (>10K agents) triggers 25% bulk eviction. | LRU-based eviction with per-tenant isolation. |
 
 ---
 
