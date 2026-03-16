@@ -302,12 +302,32 @@ pub struct LLMTrace {
     pub usage: Option<LLMUsage>,
 }
 
-/// Token usage statistics from LLM API response
+/// Token usage statistics from LLM API response.
+///
+/// Vendors report usage differently:
+/// - OpenAI: provides all three fields
+/// - Anthropic: `input_tokens` + `output_tokens` only (no total)
+/// - Gemini: `promptTokenCount` + `candidatesTokenCount` + `totalTokenCount`
+///
+/// Use `computed_total()` for a normalized total across all providers.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LLMUsage {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
+}
+
+impl LLMUsage {
+    /// Return total_tokens if available, otherwise compute from prompt + completion.
+    /// Normalizes vendor differences (e.g., Anthropic omits total_tokens).
+    pub fn computed_total(&self) -> Option<u64> {
+        self.total_tokens.or_else(|| {
+            match (self.prompt_tokens, self.completion_tokens) {
+                (Some(p), Some(c)) => Some(p + c),
+                _ => None,
+            }
+        })
+    }
 }
 
 /// Select the stricter of two enforcement decisions

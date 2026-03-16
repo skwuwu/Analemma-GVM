@@ -586,6 +586,9 @@ async fn forward_request(
 
 /// Buffer response body to extract LLM thinking trace, then reconstruct the response.
 /// Called only for IC-2 paths targeting known LLM providers.
+///
+/// Supports both non-streaming (JSON) and SSE streaming (`text/event-stream`) responses.
+/// Thinking content is stored as a SHA-256 hash by default for privacy protection.
 async fn extract_llm_trace_from_response(
     response: Response<Body>,
     provider: &str,
@@ -593,18 +596,32 @@ async fn extract_llm_trace_from_response(
 ) -> Response<Body> {
     let (parts, body) = response.into_parts();
 
-    // Buffer the body (limit to 256KB to avoid memory issues)
-    const MAX_BUFFER: usize = 256 * 1024;
+    // Detect SSE streaming from content-type header
+    let is_sse = parts
+        .headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(llm_trace::is_sse_content_type)
+        .unwrap_or(false);
+
+    // Buffer the body (limit to 256KB for JSON, 1MB for SSE)
+    let max_buffer: usize = if is_sse { 1024 * 1024 } else { 256 * 1024 };
     match http_body_util::BodyExt::collect(body).await {
         Ok(collected) => {
             let bytes = collected.to_bytes();
-            if bytes.len() <= MAX_BUFFER {
-                if let Some(trace) = llm_trace::extract_thinking_trace(provider, &bytes) {
+            if bytes.len() <= max_buffer {
+                let trace = if is_sse {
+                    llm_trace::extract_thinking_trace_from_sse(provider, &bytes)
+                } else {
+                    llm_trace::extract_thinking_trace(provider, &bytes)
+                };
+                if let Some(trace) = trace {
                     tracing::info!(
                         provider = provider,
                         model = ?trace.model,
                         has_thinking = trace.thinking.is_some(),
                         truncated = trace.truncated,
+                        streaming = is_sse,
                         "LLM thinking trace extracted"
                     );
                     event.llm_trace = Some(trace);
