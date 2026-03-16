@@ -21,6 +21,20 @@ This document catalogues known adversarial attack vectors for transparency. Each
 
 ---
 
+## Assumption of Trust
+
+GVM assumes the underlying host OS and filesystem are secure. This is consistent with every infrastructure tool that runs as a userspace process (Envoy, OPA, Nginx, HAProxy).
+
+- **Disk integrity**: WAL and config file protection is handled by OS-level file permissions (`0600`) and disk encryption. GVM detects tampering via Merkle chain but does not prevent filesystem writes.
+
+- **Secret management**: GVM Vault encrypts agent state at rest. Master key management should use KMS/HSM in production. GVM is not a secrets manager.
+
+- **Process isolation**: GVM secures the **Agent-to-World boundary**. Host-to-Proxy security is the infrastructure provider's responsibility.
+
+If an attacker has root access to the host, GVM — like any userspace process — cannot provide security guarantees. This is not a limitation specific to GVM; it is a fundamental property of software-based security. Vulnerabilities that require local privilege escalation or filesystem access are not GVM bugs — they belong to the OS, container runtime, or infrastructure layer.
+
+---
+
 ## Known Adversarial Attack Vectors
 
 ### 1. Timing Side Channel
