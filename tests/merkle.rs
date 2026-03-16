@@ -176,7 +176,7 @@ async fn merkle_batch_root_recomputable() {
         if line.contains("\"merkle_root\"") {
             // Batch record — verify Merkle root
             let record: MerkleBatchRecord = serde_json::from_str(line).expect("batch record line must be valid MerkleBatchRecord JSON");
-            let recomputed = merkle::compute_merkle_root(&current_batch_hashes);
+            let recomputed = merkle::compute_merkle_root(&current_batch_hashes).unwrap();
             assert_eq!(
                 record.merkle_root, recomputed,
                 "batch {}: stored root must match recomputed root",
@@ -435,7 +435,7 @@ async fn merkle_proof_proves_event_in_batch() {
 
     // Generate and verify proof for each event in the batch
     for i in 0..batch_event_hashes.len() {
-        let proof = merkle::generate_merkle_proof(&batch_event_hashes, i);
+        let proof = merkle::generate_merkle_proof(&batch_event_hashes, i).unwrap();
         assert!(
             merkle::verify_merkle_proof(&batch_event_hashes[i], &proof, &root),
             "proof must verify for event index {}",
@@ -445,7 +445,7 @@ async fn merkle_proof_proves_event_in_batch() {
 
     // Verify that a forged event hash fails proof verification
     let forged_hash = "0000000000000000000000000000000000000000000000000000000000000000";
-    let proof = merkle::generate_merkle_proof(&batch_event_hashes, 0);
+    let proof = merkle::generate_merkle_proof(&batch_event_hashes, 0).unwrap();
     assert!(
         !merkle::verify_merkle_proof(forged_hash, &proof, &root),
         "forged event must fail proof verification"

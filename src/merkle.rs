@@ -64,18 +64,25 @@ pub fn compute_event_hash(event: &GVMEvent) -> String {
 /// Compute the Merkle root from a list of hex-encoded leaf hashes.
 /// For a single leaf, the root is the leaf itself.
 /// For an odd number of leaves, the last leaf is duplicated.
-pub fn compute_merkle_root(leaf_hashes: &[String]) -> String {
-    assert!(!leaf_hashes.is_empty(), "cannot compute merkle root of empty set");
+///
+/// Returns an error if the leaf list is empty or contains invalid hex data.
+pub fn compute_merkle_root(leaf_hashes: &[String]) -> anyhow::Result<String> {
+    if leaf_hashes.is_empty() {
+        anyhow::bail!("cannot compute merkle root of empty set");
+    }
 
     let mut current_level: Vec<[u8; 32]> = leaf_hashes
         .iter()
         .map(|h| {
-            let bytes = hex::decode(h).expect("leaf hash must be valid hex");
+            let bytes = hex::decode(h).map_err(|e| anyhow::anyhow!("invalid hex in leaf hash: {}", e))?;
+            if bytes.len() != 32 {
+                anyhow::bail!("leaf hash must be 32 bytes, got {}", bytes.len());
+            }
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&bytes);
-            arr
+            Ok(arr)
         })
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     while current_level.len() > 1 {
         let mut next_level = Vec::with_capacity((current_level.len() + 1) / 2);
@@ -96,23 +103,30 @@ pub fn compute_merkle_root(leaf_hashes: &[String]) -> String {
         current_level = next_level;
     }
 
-    hex::encode(current_level[0])
+    Ok(hex::encode(current_level[0]))
 }
 
 /// Generate a Merkle proof (sibling hashes + directions) for a leaf at `index`.
 /// Returns a list of (sibling_hash, is_right) pairs, from leaf to root.
-pub fn generate_merkle_proof(leaf_hashes: &[String], index: usize) -> Vec<(String, bool)> {
-    assert!(index < leaf_hashes.len(), "index out of bounds");
+///
+/// Returns an error if the index is out of bounds or leaf hashes contain invalid hex.
+pub fn generate_merkle_proof(leaf_hashes: &[String], index: usize) -> anyhow::Result<Vec<(String, bool)>> {
+    if index >= leaf_hashes.len() {
+        anyhow::bail!("merkle proof index {} out of bounds (len {})", index, leaf_hashes.len());
+    }
 
     let mut current_level: Vec<[u8; 32]> = leaf_hashes
         .iter()
         .map(|h| {
-            let bytes = hex::decode(h).expect("leaf hash must be valid hex");
+            let bytes = hex::decode(h).map_err(|e| anyhow::anyhow!("invalid hex in leaf hash: {}", e))?;
+            if bytes.len() != 32 {
+                anyhow::bail!("leaf hash must be 32 bytes, got {}", bytes.len());
+            }
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&bytes);
-            arr
+            Ok(arr)
         })
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     let mut proof = Vec::new();
     let mut idx = index;
@@ -124,7 +138,9 @@ pub fn generate_merkle_proof(leaf_hashes: &[String], index: usize) -> Vec<(Strin
         // Merkle tree behavior and is intentional — it preserves the
         // property that every node has a sibling for proof construction.
         if current_level.len() % 2 == 1 {
-            let last = *current_level.last().expect("merkle proof: level is non-empty (checked by while condition)");
+            // Safe: while condition guarantees len >= 2, so last() always succeeds.
+            // After odd-padding, len becomes even.
+            let last = current_level[current_level.len() - 1];
             current_level.push(last);
         }
 
@@ -146,7 +162,7 @@ pub fn generate_merkle_proof(leaf_hashes: &[String], index: usize) -> Vec<(Strin
         idx /= 2;
     }
 
-    proof
+    Ok(proof)
 }
 
 /// Verify a Merkle proof for a given leaf hash against an expected root.
@@ -240,11 +256,18 @@ pub fn verify_wal(wal_content: &str) -> VerificationReport {
                 // No events before this batch record — invalid
                 invalid_batches.push(batch_record.batch_id);
             } else {
-                let computed_root = compute_merkle_root(&events_in_current_batch);
-                if computed_root == batch_record.merkle_root {
-                    valid_batches += 1;
-                } else {
-                    invalid_batches.push(batch_record.batch_id);
+                match compute_merkle_root(&events_in_current_batch) {
+                    Ok(computed_root) => {
+                        if computed_root == batch_record.merkle_root {
+                            valid_batches += 1;
+                        } else {
+                            invalid_batches.push(batch_record.batch_id);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(batch_id = batch_record.batch_id, error = %e, "Failed to compute merkle root during WAL verification");
+                        invalid_batches.push(batch_record.batch_id);
+                    }
                 }
             }
 
@@ -311,7 +334,7 @@ mod tests {
     #[test]
     fn merkle_single_leaf() {
         let leaf = hash_str("event_1");
-        let root = compute_merkle_root(&[leaf.clone()]);
+        let root = compute_merkle_root(&[leaf.clone()]).unwrap();
         assert_eq!(root, leaf, "single leaf should be its own root");
     }
 
@@ -319,7 +342,7 @@ mod tests {
     fn merkle_two_leaves() {
         let a = hash_str("event_1");
         let b = hash_str("event_2");
-        let root = compute_merkle_root(&[a.clone(), b.clone()]);
+        let root = compute_merkle_root(&[a.clone(), b.clone()]).unwrap();
 
         // Manual: H(a || b)
         let mut hasher = Sha256::new();
@@ -335,7 +358,7 @@ mod tests {
         let a = hash_str("event_1");
         let b = hash_str("event_2");
         let c = hash_str("event_3");
-        let root = compute_merkle_root(&[a.clone(), b.clone(), c.clone()]);
+        let root = compute_merkle_root(&[a.clone(), b.clone(), c.clone()]).unwrap();
 
         // Manual: H(H(a,b), H(c,c))
         let mut h_ab = Sha256::new();
@@ -359,7 +382,7 @@ mod tests {
     #[test]
     fn merkle_four_leaves_balanced() {
         let leaves: Vec<String> = (0..4).map(|i| hash_str(&format!("event_{}", i))).collect();
-        let root = compute_merkle_root(&leaves);
+        let root = compute_merkle_root(&leaves).unwrap();
 
         // Manually compute balanced tree
         let mut h01 = Sha256::new();
@@ -383,10 +406,10 @@ mod tests {
     #[test]
     fn merkle_proof_verifies_each_leaf() {
         let leaves: Vec<String> = (0..5).map(|i| hash_str(&format!("event_{}", i))).collect();
-        let root = compute_merkle_root(&leaves);
+        let root = compute_merkle_root(&leaves).unwrap();
 
         for i in 0..leaves.len() {
-            let proof = generate_merkle_proof(&leaves, i);
+            let proof = generate_merkle_proof(&leaves, i).unwrap();
             assert!(
                 verify_merkle_proof(&leaves[i], &proof, &root),
                 "proof failed for leaf index {}",
@@ -398,8 +421,8 @@ mod tests {
     #[test]
     fn merkle_proof_rejects_wrong_leaf() {
         let leaves: Vec<String> = (0..4).map(|i| hash_str(&format!("event_{}", i))).collect();
-        let root = compute_merkle_root(&leaves);
-        let proof = generate_merkle_proof(&leaves, 0);
+        let root = compute_merkle_root(&leaves).unwrap();
+        let proof = generate_merkle_proof(&leaves, 0).unwrap();
 
         let wrong_leaf = hash_str("tampered_event");
         assert!(
@@ -411,7 +434,7 @@ mod tests {
     #[test]
     fn merkle_proof_rejects_wrong_root() {
         let leaves: Vec<String> = (0..4).map(|i| hash_str(&format!("event_{}", i))).collect();
-        let proof = generate_merkle_proof(&leaves, 0);
+        let proof = generate_merkle_proof(&leaves, 0).unwrap();
 
         let wrong_root = hash_str("wrong_root");
         assert!(
@@ -423,8 +446,8 @@ mod tests {
     #[test]
     fn merkle_deterministic() {
         let leaves: Vec<String> = (0..10).map(|i| hash_str(&format!("event_{}", i))).collect();
-        let root1 = compute_merkle_root(&leaves);
-        let root2 = compute_merkle_root(&leaves);
+        let root1 = compute_merkle_root(&leaves).unwrap();
+        let root2 = compute_merkle_root(&leaves).unwrap();
         assert_eq!(root1, root2, "same input must produce same root");
     }
 
@@ -432,8 +455,8 @@ mod tests {
     fn merkle_different_order_different_root() {
         let a = hash_str("event_1");
         let b = hash_str("event_2");
-        let root_ab = compute_merkle_root(&[a.clone(), b.clone()]);
-        let root_ba = compute_merkle_root(&[b, a]);
+        let root_ab = compute_merkle_root(&[a.clone(), b.clone()]).unwrap();
+        let root_ba = compute_merkle_root(&[b, a]).unwrap();
         assert_ne!(root_ab, root_ba, "order must matter");
     }
 }

@@ -232,7 +232,7 @@ async fn flush_batch_with_merkle(
     let leaf_hashes: Vec<String> = batch.iter().map(|r| r.event_hash.clone()).collect();
 
     // Compute Merkle root
-    let merkle_root = crate::merkle::compute_merkle_root(&leaf_hashes);
+    let merkle_root = crate::merkle::compute_merkle_root(&leaf_hashes)?;
 
     // Build batch record
     let batch_record = MerkleBatchRecord {

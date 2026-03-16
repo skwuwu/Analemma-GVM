@@ -62,11 +62,18 @@ pub struct CheckpointVerification {
 /// On read: recomputes content hash, generates Merkle proof, verifies against root.
 /// Reuses `merkle::compute_merkle_root()`, `merkle::generate_merkle_proof()`,
 /// and `merkle::verify_merkle_proof()` — same primitives as WAL batch verification.
+///
+/// Bounded: max 10,000 agents and 10,000 steps per agent to prevent OOM.
 #[derive(Clone, Default)]
 pub struct CheckpointRegistry {
     /// agent_id → AgentCheckpointTree
     trees: Arc<RwLock<HashMap<String, AgentCheckpointTree>>>,
 }
+
+/// Maximum number of distinct agents tracked in checkpoint registry.
+const MAX_CHECKPOINT_AGENTS: usize = 10_000;
+/// Maximum number of checkpoint steps per agent.
+const MAX_CHECKPOINT_STEPS: usize = 10_000;
 
 impl CheckpointRegistry {
     pub fn new() -> Self {
@@ -76,18 +83,35 @@ impl CheckpointRegistry {
     }
 
     /// Register a checkpoint's plaintext hash as a new leaf in the agent's Merkle tree.
-    /// Returns the content hash and updated Merkle root.
+    /// Returns the content hash and updated Merkle root, or an error if bounds are exceeded.
     pub async fn register(
         &self,
         agent_id: &str,
         step: u64,
         plaintext: &[u8],
-    ) -> CheckpointRegistration {
+    ) -> anyhow::Result<CheckpointRegistration> {
+        // Validate step bound before any allocation
+        if step as usize >= MAX_CHECKPOINT_STEPS {
+            anyhow::bail!(
+                "checkpoint step {} exceeds maximum ({})",
+                step, MAX_CHECKPOINT_STEPS
+            );
+        }
+
         let mut hasher = Sha256::new();
         hasher.update(plaintext);
         let content_hash = hex::encode(hasher.finalize());
 
         let mut trees = self.trees.write().await;
+
+        // Validate agent count bound before inserting new agent
+        if !trees.contains_key(agent_id) && trees.len() >= MAX_CHECKPOINT_AGENTS {
+            anyhow::bail!(
+                "checkpoint agent limit reached ({})",
+                MAX_CHECKPOINT_AGENTS
+            );
+        }
+
         let tree = trees.entry(agent_id.to_string()).or_insert_with(|| {
             AgentCheckpointTree {
                 leaves: Vec::new(),
@@ -115,7 +139,7 @@ impl CheckpointRegistry {
         }
 
         // Recompute Merkle root over all leaves
-        tree.merkle_root = merkle::compute_merkle_root(&tree.leaves);
+        tree.merkle_root = merkle::compute_merkle_root(&tree.leaves)?;
 
         tracing::debug!(
             agent = agent_id,
@@ -126,10 +150,10 @@ impl CheckpointRegistry {
             "Checkpoint leaf registered in Merkle tree"
         );
 
-        CheckpointRegistration {
+        Ok(CheckpointRegistration {
             content_hash,
             merkle_root: tree.merkle_root.clone(),
-        }
+        })
     }
 
     /// Verify a decrypted checkpoint against the Merkle tree.
@@ -181,7 +205,17 @@ impl CheckpointRegistry {
         let content_verified = computed_hash == tree.leaves[idx];
 
         // 2. Merkle proof verification: O(log N) proof against the root
-        let proof = merkle::generate_merkle_proof(&tree.leaves, idx);
+        let proof = match merkle::generate_merkle_proof(&tree.leaves, idx) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(agent = agent_id, step = step, error = %e, "Failed to generate merkle proof");
+                return CheckpointVerification {
+                    content_verified,
+                    proof_verified: false,
+                    merkle_root: Some(tree.merkle_root.clone()),
+                };
+            }
+        };
         let proof_verified =
             merkle::verify_merkle_proof(&computed_hash, &proof, &tree.merkle_root);
 
@@ -316,7 +350,16 @@ pub async fn checkpoint_write(
     body: axum::body::Bytes,
 ) -> Response<Body> {
     // Register plaintext hash as Merkle leaf BEFORE encryption
-    let reg = state.checkpoint_registry.register(&agent_id, step, &body).await;
+    let reg = match state.checkpoint_registry.register(&agent_id, step, &body).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(agent = %agent_id, step = step, error = %e, "Checkpoint registration failed");
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({"error": "Checkpoint limit exceeded"}),
+            );
+        }
+    };
 
     let key = format!("checkpoint:{}:{}", agent_id, step);
     match state.vault.write(&key, &body, &agent_id).await {
