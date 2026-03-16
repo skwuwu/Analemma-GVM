@@ -1,10 +1,12 @@
 use clap::{Parser, Subcommand};
 
+mod audit;
 mod check;
 mod demo;
 mod events;
 mod init;
 mod run;
+mod stats;
 mod suggest;
 mod ui;
 
@@ -21,6 +23,18 @@ enum Commands {
     Events {
         #[command(subcommand)]
         action: EventsAction,
+    },
+
+    /// Cost tracking and governance statistics
+    Stats {
+        #[command(subcommand)]
+        action: StatsAction,
+    },
+
+    /// WAL integrity verification and event export
+    Audit {
+        #[command(subcommand)]
+        action: AuditAction,
     },
 
     /// Run interactive demo: finance, assistant, devops, data
@@ -144,6 +158,10 @@ enum EventsAction {
         /// Output format: table or json
         #[arg(long, default_value = "table")]
         format: String,
+
+        /// Filter by decision type (e.g. "Deny", "Delay", "Allow")
+        #[arg(long)]
+        decision: Option<String>,
     },
 
     /// Show causal chain for a trace
@@ -158,6 +176,60 @@ enum EventsAction {
     },
 }
 
+#[derive(Subcommand)]
+enum StatsAction {
+    /// Per-agent token usage and governance summary
+    Tokens {
+        /// Filter by agent ID
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Time window (e.g. "1h", "24h", "7d")
+        #[arg(long, default_value = "24h")]
+        since: String,
+
+        /// Read events from WAL file instead of NATS
+        #[arg(long)]
+        wal_file: Option<String>,
+    },
+
+    /// Show tokens saved by governance (denied LLM calls)
+    RollbackSavings {
+        /// Time window
+        #[arg(long, default_value = "24h")]
+        since: String,
+
+        /// Read events from WAL file instead of NATS
+        #[arg(long)]
+        wal_file: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuditAction {
+    /// Verify WAL file integrity
+    Verify {
+        /// Path to WAL file
+        #[arg(long)]
+        wal: String,
+    },
+
+    /// Export events as JSON or JSONL
+    Export {
+        /// Time window (e.g. "1h", "7d")
+        #[arg(long, default_value = "7d")]
+        since: String,
+
+        /// Path to WAL file
+        #[arg(long)]
+        wal: String,
+
+        /// Output format: json or jsonl
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -169,14 +241,44 @@ async fn main() -> anyhow::Result<()> {
                 last,
                 wal_file,
                 format,
+                decision,
             } => {
-                events::list_events(agent, &last, wal_file.as_deref(), &format).await?;
+                events::list_events(
+                    agent,
+                    &last,
+                    wal_file.as_deref(),
+                    &format,
+                    decision.as_deref(),
+                )
+                .await?;
             }
             EventsAction::Trace {
                 trace_id,
                 wal_file,
             } => {
                 events::trace_events(&trace_id, wal_file.as_deref()).await?;
+            }
+        },
+
+        Commands::Stats { action } => match action {
+            StatsAction::Tokens {
+                agent,
+                since,
+                wal_file,
+            } => {
+                stats::show_token_stats(agent, &since, wal_file.as_deref()).await?;
+            }
+            StatsAction::RollbackSavings { since, wal_file } => {
+                stats::show_rollback_savings(&since, wal_file.as_deref()).await?;
+            }
+        },
+
+        Commands::Audit { action } => match action {
+            AuditAction::Verify { wal } => {
+                audit::verify_wal(&wal).await?;
+            }
+            AuditAction::Export { since, wal, format } => {
+                audit::export_events(&since, &wal, &format).await?;
             }
         },
 

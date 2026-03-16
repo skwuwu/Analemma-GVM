@@ -42,23 +42,31 @@ fn read_wal_events(path: &str) -> Result<Vec<GVMEvent>> {
     Ok(events)
 }
 
+/// Load events from WAL with common fallback message.
+pub fn load_events(wal_file: Option<&str>, cmd_example: &str) -> Result<Option<Vec<GVMEvent>>> {
+    if let Some(path) = wal_file {
+        Ok(Some(read_wal_events(path)?))
+    } else {
+        eprintln!("NATS not yet connected. Use --wal-file to read from WAL directly.");
+        eprintln!("Example: {}", cmd_example);
+        Ok(None)
+    }
+}
+
 /// List events with optional filters.
 pub async fn list_events(
     agent: Option<String>,
     last: &str,
     wal_file: Option<&str>,
     format: &str,
+    decision_filter: Option<&str>,
 ) -> Result<()> {
     let duration_secs = parse_duration(last)?;
     let cutoff = chrono::Utc::now() - chrono::Duration::seconds(duration_secs);
 
-    let events = if let Some(path) = wal_file {
-        read_wal_events(path)?
-    } else {
-        // NATS not yet connected — fall back to default WAL path
-        eprintln!("NATS not yet connected. Use --wal-file to read from WAL directly.");
-        eprintln!("Example: gvm events list --wal-file data/wal.log");
-        return Ok(());
+    let events = match load_events(wal_file, "gvm events list --wal-file data/wal.log")? {
+        Some(e) => e,
+        None => return Ok(()),
     };
 
     let filtered: Vec<&GVMEvent> = events
@@ -67,6 +75,13 @@ pub async fn list_events(
         .filter(|e| {
             if let Some(ref a) = agent {
                 &e.agent_id == a
+            } else {
+                true
+            }
+        })
+        .filter(|e| {
+            if let Some(d) = decision_filter {
+                e.decision.to_lowercase().contains(&d.to_lowercase())
             } else {
                 true
             }
@@ -107,12 +122,9 @@ pub async fn list_events(
 
 /// Show causal chain for a trace ID.
 pub async fn trace_events(trace_id: &str, wal_file: Option<&str>) -> Result<()> {
-    let events = if let Some(path) = wal_file {
-        read_wal_events(path)?
-    } else {
-        eprintln!("NATS not yet connected. Use --wal-file to read from WAL directly.");
-        eprintln!("Example: gvm events trace --trace-id xxx --wal-file data/wal.log");
-        return Ok(());
+    let events = match load_events(wal_file, "gvm events trace --trace-id xxx --wal-file data/wal.log")? {
+        Some(e) => e,
+        None => return Ok(()),
     };
 
     let mut traced: Vec<&GVMEvent> = events

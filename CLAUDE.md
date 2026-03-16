@@ -55,6 +55,14 @@ Full specification: `docs/GVM_CODE_STANDARDS.md`
 - Never hold two locks simultaneously. Never do I/O under lock.
 - Shutdown must flush pending WAL batch.
 
+### Observability
+
+- GVM CLI exposes governance decisions, cost tracking, and audit verification. Application metrics and agent internals are out of scope — use Prometheus and application-level tooling for those.
+- **In scope**: Governance decisions (Allow/Delay/Deny, matched rule, decision layer), cost tracking (per-agent LLM token usage, rollback savings, blocked action count), audit (trace chain, WAL integrity verification, event export).
+- **Out of scope**: Agent internal state (SDK-only), LLM prompt/response body full text (privacy), infrastructure metrics (CPU/memory — Prometheus/Grafana).
+- Every CLI query maps to WAL data — no separate data store required for basic observability.
+- Thinking content stored as SHA-256 hash by default (privacy). Raw storage is opt-in only.
+
 ### Testing & Docs
 
 - Every security claim needs a test. Every performance claim needs a benchmark.
