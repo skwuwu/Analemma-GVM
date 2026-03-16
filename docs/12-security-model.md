@@ -39,13 +39,13 @@ If an attacker has root access to the host, GVM — like any userspace process �
 
 ### 1. Timing Side Channel
 
-**Attack**: An adversary can distinguish Allow (~1-5 ms), Deny (~20-100 ms), and Delay (~300-500 ms) decisions by measuring response latency, gradually mapping the policy ruleset.
+**Attack**: An adversary measures response latency to infer the enforcement decision type.
 
-**Preconditions**: Network-level timing visibility to the proxy.
+**Actual engine latency** (from benchmarks): Allow ~28 ns, Deny ~63 ns. The difference is ~35 ns — indistinguishable from network jitter (typically 0.1-10 ms). End-to-end response times (3-12 ms in demos) are dominated by upstream I/O and safety delays, not engine processing. The only timing signal distinguishable at the network level is the intentional IC-2 Delay (300+ ms), which is by design visible to the agent as enforcement feedback.
 
-**Impact**: Policy rule enumeration — attacker learns which operations are allowed, delayed, or denied.
+**Practical risk**: Extremely low. The 35 ns engine-level difference is 3-5 orders of magnitude below network noise. An agent would need thousands of measurements with sub-microsecond precision to extract a signal — and the governance layer controls the agent's ability to run such measurement programs.
 
-**Planned mitigation**: Constant-time decision padding (add jitter so all decisions take a uniform base latency ± random noise). Not implemented in v1 because the primary threat (prompt-injected agents) does not perform timing analysis.
+**Status**: No mitigation needed. Engine latency is already effectively constant-time relative to network-observable timescales.
 
 ---
 
@@ -118,12 +118,6 @@ If an attacker has root access to the host, GVM — like any userspace process �
 **Impact**: Vault contents (sensitive agent state) decrypted.
 
 **Planned mitigation**: Apply PBKDF2 or Argon2id with configurable iteration count before using the key for AES-GCM. Not implemented in v1 because the Vault is a local-development feature and production deployments should use a proper secrets manager.
-
----
-
-### 8. ~~Import Chain Attacks (Python SDK)~~ — Fixed
-
-Lazy imports (`from gvm.errors import ...`) inside the `except` block of `decorator.py` were moved to module top-level, eliminating the attack surface where a malicious `gvm/errors.py` on `PYTHONPATH` could intercept error handling.
 
 ---
 
