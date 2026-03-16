@@ -232,7 +232,48 @@ This means even if the policy says Allow (e.g., for `gvm.storage.read`), the SRR
 
 ---
 
-## 2.10 Test Coverage
+## 2.10 Policy Conflict Detection
+
+At startup, the policy engine validates all loaded rules for conflicts. This catches configuration mistakes that would otherwise silently produce unexpected behavior.
+
+### Detection Categories
+
+| Category | Severity | Description |
+|----------|----------|-------------|
+| **Duplicate Priority** | Warning | Two rules in the same layer share the same priority. First-loaded wins (file-system order dependent). |
+| **Contradictory Decision** | Error | Two rules have overlapping conditions but opposite decisions (Allow vs Deny). |
+| **Ineffective Rule** | Warning | A lower-layer rule (Tenant/Agent) is always overridden by a stricter upper-layer rule. |
+
+### Example Output
+
+```
+[WARNING] Duplicate priority in Global: "allow-all-reads" and "deny-all-reads"
+          both have priority 10. First loaded wins — consider adjusting priorities.
+
+[ERROR]   Contradictory decisions in Global: "allow-all-reads" (Allow) and
+          "deny-all-reads" (Deny) have overlapping conditions but opposite decisions.
+
+[WARNING] Ineffective rule: Tenant(acme) "tenant-allow-payment" (Allow) is always
+          overridden by Global "global-deny-payment" (Deny).
+```
+
+### Condition Overlap Analysis
+
+The conflict detector uses conservative heuristic overlap analysis:
+
+- Empty conditions (unconditional rules) overlap with everything
+- Same field + same operator + same value = definite overlap
+- `Eq "gvm.payment.charge"` overlaps with `StartsWith "gvm.payment"`
+- `Eq "gvm.storage.read"` overlaps with `EndsWith ".read"`
+- Numeric comparisons on the same field are treated as potentially overlapping
+
+### Strict Mode (CI/CD)
+
+Future: `gvm validate --strict config/policies/` will exit with code 1 if any conflicts are found, enabling policy validation in CI/CD pipelines.
+
+---
+
+## 2.11 Test Coverage
 
 | Test | Assertion |
 |------|-----------|
@@ -240,6 +281,12 @@ This means even if the policy says Allow (e.g., for `gvm.storage.read`), the SRR
 | `test_ends_with_condition` | EndsWith operator matches correctly |
 | `test_numeric_gt_condition` | Numeric Gt comparison on context.amount |
 | `test_deny_overrides_all` | Deny with priority 1 short-circuits evaluation |
+| `test_duplicate_priority_detected` | Same priority in same layer produces warning |
+| `test_contradictory_decisions_detected` | Allow + Deny on same conditions produces error |
+| `test_ineffective_tenant_rule_detected` | Tenant Allow overridden by Global Deny |
+| `test_no_conflict_for_non_overlapping_rules` | Different conditions = no warning |
+| `test_unconditional_rule_overlaps_everything` | Empty conditions overlap with all rules |
+| `test_eq_vs_startswith_overlap` | Eq value matching StartsWith prefix detected |
 
 ---
 

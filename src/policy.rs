@@ -90,6 +90,45 @@ pub enum Operator {
     NotIn,
 }
 
+// ─── Policy Conflict Detection ───
+
+/// Warning about a potential policy conflict or ineffective rule.
+/// Emitted at startup to alert operators without blocking proxy start.
+#[derive(Clone, Debug)]
+pub struct PolicyWarning {
+    pub severity: WarningSeverity,
+    pub kind: WarningKind,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WarningSeverity {
+    /// Ambiguous but not necessarily wrong (e.g. duplicate priority)
+    Warning,
+    /// Likely a mistake (e.g. contradictory decisions on same conditions)
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WarningKind {
+    /// Two rules in the same layer share the same priority
+    DuplicatePriority,
+    /// Two rules have overlapping conditions but opposite decisions
+    ContradictoryDecision,
+    /// A lower-layer rule is overridden by a stricter upper-layer rule
+    IneffectiveRule,
+}
+
+impl std::fmt::Display for PolicyWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let severity_tag = match self.severity {
+            WarningSeverity::Warning => "WARNING",
+            WarningSeverity::Error => "ERROR",
+        };
+        write!(f, "[{}] {}", severity_tag, self.message)
+    }
+}
+
 /// ABAC Policy Engine — evaluates operation metadata against hierarchical rules.
 /// Hierarchy: Global > Tenant > Agent (lower layers can only be stricter).
 pub struct PolicyEngine {
@@ -170,6 +209,21 @@ impl PolicyEngine {
         }
         for rules in agent_rules.values_mut() {
             rules.sort_by_key(|r| r.priority);
+        }
+
+        // Validate policy conflicts at startup
+        let warnings = validate_conflicts(&global_rules, &tenant_rules, &agent_rules);
+        for w in &warnings {
+            match w.severity {
+                WarningSeverity::Warning => tracing::warn!("{}", w),
+                WarningSeverity::Error => tracing::error!("{}", w),
+            }
+        }
+        if !warnings.is_empty() {
+            tracing::warn!(
+                count = warnings.len(),
+                "Policy conflict check complete — review warnings above"
+            );
         }
 
         tracing::info!(
@@ -562,6 +616,305 @@ fn compile_decision(cfg: &DecisionConfig) -> Result<EnforcementDecision> {
     }
 }
 
+// ─── Conflict Detection ───
+
+/// Validate all policy rules for conflicts, contradictions, and ineffective rules.
+///
+/// Three categories of issues:
+/// 1. **Duplicate priority**: Two rules in the same layer have the same priority.
+///    First-loaded wins, which is file-system order dependent and fragile.
+/// 2. **Contradictory decision**: Two rules have overlapping conditions but
+///    produce opposite decisions (e.g. Allow vs Deny on same operation pattern).
+/// 3. **Ineffective rule**: A lower-layer rule (Tenant/Agent) is always overridden
+///    by a stricter upper-layer rule (Global). The lower rule has no effect.
+pub fn validate_conflicts(
+    global_rules: &[PolicyRule],
+    tenant_rules: &HashMap<String, Vec<PolicyRule>>,
+    agent_rules: &HashMap<String, Vec<PolicyRule>>,
+) -> Vec<PolicyWarning> {
+    let mut warnings = Vec::new();
+
+    // 1. Intra-layer: duplicate priority + contradictory decisions
+    check_intra_layer_conflicts(global_rules, "Global", &mut warnings);
+    for (tenant_id, rules) in tenant_rules {
+        check_intra_layer_conflicts(rules, &format!("Tenant({})", tenant_id), &mut warnings);
+    }
+    for (agent_id, rules) in agent_rules {
+        check_intra_layer_conflicts(rules, &format!("Agent({})", agent_id), &mut warnings);
+    }
+
+    // 2. Cross-layer: ineffective rules (lower layer overridden by upper)
+    for (tenant_id, rules) in tenant_rules {
+        check_cross_layer_ineffective(
+            global_rules,
+            rules,
+            "Global",
+            &format!("Tenant({})", tenant_id),
+            &mut warnings,
+        );
+    }
+    for (agent_id, rules) in agent_rules {
+        check_cross_layer_ineffective(
+            global_rules,
+            rules,
+            "Global",
+            &format!("Agent({})", agent_id),
+            &mut warnings,
+        );
+        // Also check agent vs all tenant rules
+        for (tenant_id, tenant) in tenant_rules {
+            check_cross_layer_ineffective(
+                tenant,
+                rules,
+                &format!("Tenant({})", tenant_id),
+                &format!("Agent({})", agent_id),
+                &mut warnings,
+            );
+        }
+    }
+
+    warnings
+}
+
+/// Check for duplicate priorities and contradictory decisions within a single layer.
+fn check_intra_layer_conflicts(
+    rules: &[PolicyRule],
+    layer_name: &str,
+    warnings: &mut Vec<PolicyWarning>,
+) {
+    for i in 0..rules.len() {
+        for j in (i + 1)..rules.len() {
+            let a = &rules[i];
+            let b = &rules[j];
+
+            // Check 1: Same priority
+            if a.priority == b.priority {
+                warnings.push(PolicyWarning {
+                    severity: WarningSeverity::Warning,
+                    kind: WarningKind::DuplicatePriority,
+                    message: format!(
+                        "Duplicate priority in {}: \"{}\" and \"{}\" both have priority {}. \
+                         First loaded wins — consider adjusting priorities.",
+                        layer_name, a.id, b.id, a.priority
+                    ),
+                });
+            }
+
+            // Check 2: Overlapping conditions with contradictory decisions
+            if conditions_overlap(&a.conditions, &b.conditions)
+                && decisions_contradict(&a.decision, &b.decision)
+            {
+                warnings.push(PolicyWarning {
+                    severity: WarningSeverity::Error,
+                    kind: WarningKind::ContradictoryDecision,
+                    message: format!(
+                        "Contradictory decisions in {}: \"{}\" ({}) and \"{}\" ({}) \
+                         have overlapping conditions but opposite decisions. \
+                         Priority {} vs {} — the lower-numbered priority wins.",
+                        layer_name,
+                        a.id,
+                        decision_type_name(&a.decision),
+                        b.id,
+                        decision_type_name(&b.decision),
+                        a.priority,
+                        b.priority,
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// Check if a lower-layer rule is rendered ineffective by a stricter upper-layer rule.
+///
+/// Specifically: if a Global rule matches the same conditions as a Tenant/Agent rule,
+/// and the Global rule is strictly stricter, the lower rule can never take effect
+/// (because max_strict always picks the Global decision).
+fn check_cross_layer_ineffective(
+    upper_rules: &[PolicyRule],
+    lower_rules: &[PolicyRule],
+    upper_name: &str,
+    lower_name: &str,
+    warnings: &mut Vec<PolicyWarning>,
+) {
+    for lower in lower_rules {
+        for upper in upper_rules {
+            // Skip if upper is less strict — the lower rule adds value
+            if upper.decision.strictness() <= lower.decision.strictness() {
+                continue;
+            }
+
+            // If conditions overlap and upper is strictly stricter,
+            // the lower rule is ineffective
+            if conditions_overlap(&upper.conditions, &lower.conditions) {
+                // Special case: lower is Allow and upper is Deny/RequireApproval.
+                // This is the most common "ineffective rule" pattern.
+                warnings.push(PolicyWarning {
+                    severity: WarningSeverity::Warning,
+                    kind: WarningKind::IneffectiveRule,
+                    message: format!(
+                        "Ineffective rule: {} \"{}\" ({}) is always overridden by \
+                         {} \"{}\" ({}). The {} rule has no effect because \
+                         the stricter {} rule matches the same conditions.",
+                        lower_name,
+                        lower.id,
+                        decision_type_name(&lower.decision),
+                        upper_name,
+                        upper.id,
+                        decision_type_name(&upper.decision),
+                        lower_name,
+                        upper_name,
+                    ),
+                });
+            }
+        }
+    }
+}
+
+/// Check if two condition sets overlap (could match the same operation).
+///
+/// Conservative approach: conditions overlap if they reference the same fields
+/// with compatible values. Two empty condition sets always overlap (both are
+/// unconditional). An empty condition set overlaps with everything.
+fn conditions_overlap(a: &[Condition], b: &[Condition]) -> bool {
+    // Unconditional rules overlap with everything
+    if a.is_empty() || b.is_empty() {
+        return true;
+    }
+
+    // Check if any condition in A directly matches or is subsumed by a condition in B
+    // on the same field. This is a conservative heuristic — we check for:
+    // 1. Same field + same operator + same value (exact duplicate)
+    // 2. Same field + compatible operators (e.g. EndsWith ".read" in both)
+    for ca in a {
+        for cb in b {
+            if ca.field == cb.field && values_could_overlap(ca, cb) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Check if two conditions on the same field could match the same input value.
+fn values_could_overlap(a: &Condition, b: &Condition) -> bool {
+    // Exact same operator and value — definitely overlaps
+    if operator_name(&a.operator) == operator_name(&b.operator) && a.value == b.value {
+        return true;
+    }
+
+    // StartsWith/EndsWith with matching prefixes/suffixes
+    let a_str = value_as_str(&a.value);
+    let b_str = value_as_str(&b.value);
+
+    match (&a.operator, &b.operator) {
+        // Both EndsWith the same string → overlap
+        (Operator::EndsWith, Operator::EndsWith) if a_str == b_str => true,
+        // Both StartsWith the same string → overlap
+        (Operator::StartsWith, Operator::StartsWith) if a_str == b_str => true,
+        // Eq vs Eq with same value → overlap
+        (Operator::Eq, Operator::Eq) if a.value == b.value => true,
+        // Eq vs EndsWith — if the Eq value ends with the EndsWith pattern
+        (Operator::Eq, Operator::EndsWith) | (Operator::EndsWith, Operator::Eq) => {
+            let eq_val = if matches!(a.operator, Operator::Eq) {
+                &a_str
+            } else {
+                &b_str
+            };
+            let suffix = if matches!(a.operator, Operator::EndsWith) {
+                &a_str
+            } else {
+                &b_str
+            };
+            eq_val.ends_with(suffix.as_str())
+        }
+        // Eq vs StartsWith — if the Eq value starts with the StartsWith pattern
+        (Operator::Eq, Operator::StartsWith) | (Operator::StartsWith, Operator::Eq) => {
+            let eq_val = if matches!(a.operator, Operator::Eq) {
+                &a_str
+            } else {
+                &b_str
+            };
+            let prefix = if matches!(a.operator, Operator::StartsWith) {
+                &a_str
+            } else {
+                &b_str
+            };
+            eq_val.starts_with(prefix.as_str())
+        }
+        // Contains vs Eq — if the Eq value contains the Contains pattern
+        (Operator::Contains, Operator::Eq) | (Operator::Eq, Operator::Contains) => {
+            let eq_val = if matches!(a.operator, Operator::Eq) {
+                &a_str
+            } else {
+                &b_str
+            };
+            let needle = if matches!(a.operator, Operator::Contains) {
+                &a_str
+            } else {
+                &b_str
+            };
+            eq_val.contains(needle.as_str())
+        }
+        // For numeric comparisons, ranges could overlap but we can't easily determine
+        // without full range analysis. Be conservative: same field = potential overlap.
+        (Operator::Gt | Operator::Gte | Operator::Lt | Operator::Lte,
+         Operator::Gt | Operator::Gte | Operator::Lt | Operator::Lte) => true,
+        // In/NotIn — conservative: could overlap
+        (Operator::In, _) | (_, Operator::In) => true,
+        // Default: different operators on same field — not enough info to determine
+        _ => false,
+    }
+}
+
+/// Get the decision type name for display purposes.
+fn decision_type_name(decision: &EnforcementDecision) -> &'static str {
+    match decision {
+        EnforcementDecision::Allow => "Allow",
+        EnforcementDecision::Delay { .. } => "Delay",
+        EnforcementDecision::RequireApproval { .. } => "RequireApproval",
+        EnforcementDecision::Deny { .. } => "Deny",
+        EnforcementDecision::Throttle { .. } => "Throttle",
+        EnforcementDecision::AuditOnly { .. } => "AuditOnly",
+    }
+}
+
+/// Get operator name for comparison purposes.
+fn operator_name(op: &Operator) -> &'static str {
+    match op {
+        Operator::Eq => "Eq",
+        Operator::NotEq => "NotEq",
+        Operator::Gt => "Gt",
+        Operator::Lt => "Lt",
+        Operator::Gte => "Gte",
+        Operator::Lte => "Lte",
+        Operator::Contains => "Contains",
+        Operator::StartsWith => "StartsWith",
+        Operator::EndsWith => "EndsWith",
+        Operator::Regex => "Regex",
+        Operator::In => "In",
+        Operator::NotIn => "NotIn",
+    }
+}
+
+/// Check if two decisions contradict each other.
+/// Contradiction = one allows traffic and the other blocks it.
+fn decisions_contradict(a: &EnforcementDecision, b: &EnforcementDecision) -> bool {
+    let a_allows = matches!(a, EnforcementDecision::Allow | EnforcementDecision::AuditOnly { .. });
+    let b_allows = matches!(b, EnforcementDecision::Allow | EnforcementDecision::AuditOnly { .. });
+    let a_blocks = matches!(
+        a,
+        EnforcementDecision::Deny { .. } | EnforcementDecision::RequireApproval { .. }
+    );
+    let b_blocks = matches!(
+        b,
+        EnforcementDecision::Deny { .. } | EnforcementDecision::RequireApproval { .. }
+    );
+
+    (a_allows && b_blocks) || (a_blocks && b_allows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,6 +985,250 @@ mod tests {
         let field_val = resolve_field(&cond.field, &op);
         assert!(evaluate_condition(&cond.operator, &field_val, &cond.value, &cond.compiled_regex));
     }
+
+    // ─── Conflict Detection Tests ───
+
+    #[test]
+    fn test_duplicate_priority_detected() {
+        let rules = vec![
+            PolicyRule {
+                id: "rule-a".to_string(),
+                priority: 10,
+                layer: PolicyLayer::Global,
+                description: "Allow reads".to_string(),
+                conditions: vec![Condition {
+                    field: "operation".to_string(),
+                    operator: Operator::EndsWith,
+                    value: serde_json::Value::String(".read".to_string()),
+                    compiled_regex: None,
+                }],
+                decision: EnforcementDecision::Allow,
+            },
+            PolicyRule {
+                id: "rule-b".to_string(),
+                priority: 10,
+                layer: PolicyLayer::Global,
+                description: "Deny reads".to_string(),
+                conditions: vec![Condition {
+                    field: "operation".to_string(),
+                    operator: Operator::EndsWith,
+                    value: serde_json::Value::String(".read".to_string()),
+                    compiled_regex: None,
+                }],
+                decision: EnforcementDecision::Deny {
+                    reason: "Suspended".to_string(),
+                },
+            },
+        ];
+
+        let warnings = validate_conflicts(&rules, &HashMap::new(), &HashMap::new());
+        assert!(
+            warnings.iter().any(|w| w.kind == WarningKind::DuplicatePriority),
+            "should detect duplicate priority"
+        );
+    }
+
+    #[test]
+    fn test_contradictory_decisions_detected() {
+        let rules = vec![
+            PolicyRule {
+                id: "allow-reads".to_string(),
+                priority: 10,
+                layer: PolicyLayer::Global,
+                description: "Allow reads".to_string(),
+                conditions: vec![Condition {
+                    field: "operation".to_string(),
+                    operator: Operator::EndsWith,
+                    value: serde_json::Value::String(".read".to_string()),
+                    compiled_regex: None,
+                }],
+                decision: EnforcementDecision::Allow,
+            },
+            PolicyRule {
+                id: "deny-reads".to_string(),
+                priority: 20,
+                layer: PolicyLayer::Global,
+                description: "Deny reads".to_string(),
+                conditions: vec![Condition {
+                    field: "operation".to_string(),
+                    operator: Operator::EndsWith,
+                    value: serde_json::Value::String(".read".to_string()),
+                    compiled_regex: None,
+                }],
+                decision: EnforcementDecision::Deny {
+                    reason: "Suspended".to_string(),
+                },
+            },
+        ];
+
+        let warnings = validate_conflicts(&rules, &HashMap::new(), &HashMap::new());
+        assert!(
+            warnings.iter().any(|w| w.kind == WarningKind::ContradictoryDecision),
+            "should detect contradictory decisions on same conditions"
+        );
+    }
+
+    #[test]
+    fn test_ineffective_tenant_rule_detected() {
+        let global = vec![PolicyRule {
+            id: "global-deny-payment".to_string(),
+            priority: 1,
+            layer: PolicyLayer::Global,
+            description: "Deny all payments".to_string(),
+            conditions: vec![Condition {
+                field: "operation".to_string(),
+                operator: Operator::StartsWith,
+                value: serde_json::Value::String("gvm.payment".to_string()),
+                compiled_regex: None,
+            }],
+            decision: EnforcementDecision::Deny {
+                reason: "Payments disabled".to_string(),
+            },
+        }];
+
+        let mut tenant_rules = HashMap::new();
+        tenant_rules.insert(
+            "acme".to_string(),
+            vec![PolicyRule {
+                id: "tenant-allow-payment".to_string(),
+                priority: 1,
+                layer: PolicyLayer::Tenant,
+                description: "Allow payments for acme".to_string(),
+                conditions: vec![Condition {
+                    field: "operation".to_string(),
+                    operator: Operator::Eq,
+                    value: serde_json::Value::String("gvm.payment.charge".to_string()),
+                    compiled_regex: None,
+                }],
+                decision: EnforcementDecision::Allow,
+            }],
+        );
+
+        let warnings = validate_conflicts(&global, &tenant_rules, &HashMap::new());
+        assert!(
+            warnings.iter().any(|w| w.kind == WarningKind::IneffectiveRule),
+            "should detect tenant Allow overridden by global Deny"
+        );
+    }
+
+    #[test]
+    fn test_no_conflict_for_non_overlapping_rules() {
+        let rules = vec![
+            PolicyRule {
+                id: "allow-reads".to_string(),
+                priority: 10,
+                layer: PolicyLayer::Global,
+                description: "Allow reads".to_string(),
+                conditions: vec![Condition {
+                    field: "operation".to_string(),
+                    operator: Operator::EndsWith,
+                    value: serde_json::Value::String(".read".to_string()),
+                    compiled_regex: None,
+                }],
+                decision: EnforcementDecision::Allow,
+            },
+            PolicyRule {
+                id: "deny-deletes".to_string(),
+                priority: 20,
+                layer: PolicyLayer::Global,
+                description: "Deny deletes".to_string(),
+                conditions: vec![Condition {
+                    field: "operation".to_string(),
+                    operator: Operator::EndsWith,
+                    value: serde_json::Value::String(".delete".to_string()),
+                    compiled_regex: None,
+                }],
+                decision: EnforcementDecision::Deny {
+                    reason: "Deletes forbidden".to_string(),
+                },
+            },
+        ];
+
+        let warnings = validate_conflicts(&rules, &HashMap::new(), &HashMap::new());
+        assert!(
+            warnings.is_empty(),
+            "non-overlapping rules should not produce warnings, got: {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_unconditional_rule_overlaps_everything() {
+        let rules = vec![
+            PolicyRule {
+                id: "catch-all-allow".to_string(),
+                priority: 100,
+                layer: PolicyLayer::Global,
+                description: "Allow all".to_string(),
+                conditions: vec![], // unconditional
+                decision: EnforcementDecision::Allow,
+            },
+            PolicyRule {
+                id: "deny-specific".to_string(),
+                priority: 1,
+                layer: PolicyLayer::Global,
+                description: "Deny specific".to_string(),
+                conditions: vec![Condition {
+                    field: "operation".to_string(),
+                    operator: Operator::Eq,
+                    value: serde_json::Value::String("gvm.storage.delete".to_string()),
+                    compiled_regex: None,
+                }],
+                decision: EnforcementDecision::Deny {
+                    reason: "Blocked".to_string(),
+                },
+            },
+        ];
+
+        let warnings = validate_conflicts(&rules, &HashMap::new(), &HashMap::new());
+        // Unconditional catch-all (Allow) + specific Deny = contradictory
+        assert!(
+            warnings.iter().any(|w| w.kind == WarningKind::ContradictoryDecision),
+            "unconditional Allow rule should contradict specific Deny"
+        );
+    }
+
+    #[test]
+    fn test_eq_vs_startswith_overlap() {
+        let rules = vec![
+            PolicyRule {
+                id: "allow-charge".to_string(),
+                priority: 10,
+                layer: PolicyLayer::Global,
+                description: "Allow charge".to_string(),
+                conditions: vec![Condition {
+                    field: "operation".to_string(),
+                    operator: Operator::Eq,
+                    value: serde_json::Value::String("gvm.payment.charge".to_string()),
+                    compiled_regex: None,
+                }],
+                decision: EnforcementDecision::Allow,
+            },
+            PolicyRule {
+                id: "deny-payment".to_string(),
+                priority: 20,
+                layer: PolicyLayer::Global,
+                description: "Deny payments".to_string(),
+                conditions: vec![Condition {
+                    field: "operation".to_string(),
+                    operator: Operator::StartsWith,
+                    value: serde_json::Value::String("gvm.payment".to_string()),
+                    compiled_regex: None,
+                }],
+                decision: EnforcementDecision::Deny {
+                    reason: "Payments blocked".to_string(),
+                },
+            },
+        ];
+
+        let warnings = validate_conflicts(&rules, &HashMap::new(), &HashMap::new());
+        assert!(
+            warnings.iter().any(|w| w.kind == WarningKind::ContradictoryDecision),
+            "Eq 'gvm.payment.charge' should overlap with StartsWith 'gvm.payment'"
+        );
+    }
+
+    // ─── Existing Tests ───
 
     #[test]
     fn test_deny_overrides_all() {
