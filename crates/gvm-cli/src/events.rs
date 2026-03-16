@@ -85,17 +85,18 @@ pub async fn list_events(
     }
 
     println!(
-        "{:<24} {:<20} {:<24} {:<18} {:<12}",
-        "Timestamp", "Agent", "Operation", "Decision", "Status"
+        "{:<24} {:<20} {:<24} {:<18} {:<12} {:<10} {:<8}",
+        "Timestamp", "Agent", "Operation", "Decision", "Status", "Provider", "Tokens"
     );
-    println!("{}", "-".repeat(98));
+    println!("{}", "-".repeat(116));
 
     for event in &filtered {
         let ts = event.timestamp.format("%Y-%m-%d %H:%M:%S");
         let status = format!("{:?}", event.status);
+        let (provider, tokens) = format_llm_trace_summary(event);
         println!(
-            "{:<24} {:<20} {:<24} {:<18} {:<12}",
-            ts, event.agent_id, event.operation, event.decision, status,
+            "{:<24} {:<20} {:<24} {:<18} {:<12} {:<10} {:<8}",
+            ts, event.agent_id, event.operation, event.decision, status, provider, tokens,
         );
     }
 
@@ -131,11 +132,70 @@ pub async fn trace_events(trace_id: &str, wal_file: Option<&str>) -> Result<()> 
         let indent = "  ".repeat(i);
         let connector = if i == 0 { "" } else { "\u{2514}\u{2500} " };
         let status = format!("{:?}", event.status);
+        let llm_info = format_llm_trace_detail(event);
         println!(
-            "{}{}{} ({}) \u{2192} {}",
-            indent, connector, event.operation, event.decision, status,
+            "{}{}{} ({}) \u{2192} {}{}",
+            indent, connector, event.operation, event.decision, status, llm_info,
         );
     }
 
     Ok(())
+}
+
+/// Format LLM trace data as a compact summary for table view.
+/// Returns (provider, total_tokens) as display strings.
+fn format_llm_trace_summary(event: &GVMEvent) -> (String, String) {
+    match &event.llm_trace {
+        Some(trace) => {
+            let provider = trace.provider.clone();
+            let tokens = trace
+                .usage
+                .as_ref()
+                .and_then(|u| u.computed_total())
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            (provider, tokens)
+        }
+        None => ("-".to_string(), "-".to_string()),
+    }
+}
+
+/// Format LLM trace data as a detail string for trace view.
+/// Includes provider, model, token usage, thinking hash presence, and streaming indicator.
+fn format_llm_trace_detail(event: &GVMEvent) -> String {
+    match &event.llm_trace {
+        Some(trace) => {
+            let mut parts = Vec::new();
+
+            // Provider and model
+            let model_str = trace
+                .model
+                .as_deref()
+                .map(|m| format!("{}/{}", trace.provider, m))
+                .unwrap_or_else(|| trace.provider.clone());
+            parts.push(model_str);
+
+            // Token usage
+            if let Some(ref usage) = trace.usage {
+                let prompt = usage.prompt_tokens.map(|t| t.to_string()).unwrap_or_else(|| "?".into());
+                let completion = usage.completion_tokens.map(|t| t.to_string()).unwrap_or_else(|| "?".into());
+                let total = usage.computed_total().map(|t| t.to_string()).unwrap_or_else(|| "?".into());
+                parts.push(format!("tokens:{}/{}/{}", prompt, completion, total));
+            }
+
+            // Thinking trace presence
+            if let Some(ref thinking) = trace.thinking {
+                if thinking.starts_with("sha256:") {
+                    parts.push("thinking:hashed".to_string());
+                } else if trace.truncated {
+                    parts.push("thinking:truncated".to_string());
+                } else {
+                    parts.push("thinking:raw".to_string());
+                }
+            }
+
+            format!(" [{}]", parts.join(", "))
+        }
+        None => String::new(),
+    }
 }
