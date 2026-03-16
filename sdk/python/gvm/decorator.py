@@ -38,18 +38,25 @@ def _set_current_event_id(event_id: str):
     _trace_context.current_event_id = event_id
 
 
-# Global GVM header setter — patched by GVMAgent to inject into HTTP requests
-_gvm_header_setter = None
+# Thread-local GVM header setter — each GVMAgent instance registers its own
+# setter on the thread where it operates, avoiding global state races.
+_gvm_context = threading.local()
+
+
+def _register_header_setter(setter):
+    """Register a per-thread header setter (called by GVMAgent.__init__)."""
+    _gvm_context.header_setter = setter
 
 
 def _set_gvm_headers(headers: dict):
     """Inject GVM headers into the outgoing HTTP request context.
 
     This is called by the @ic wrapper before the decorated function executes.
-    The GVMAgent patches this to configure the proxy-aware HTTP session.
+    The GVMAgent registers a per-thread setter to configure the proxy-aware HTTP session.
     """
-    if _gvm_header_setter is not None:
-        _gvm_header_setter(headers)
+    setter = getattr(_gvm_context, "header_setter", None)
+    if setter is not None:
+        setter(headers)
 
 
 def _infer_ic_level(operation: str) -> int:

@@ -491,7 +491,21 @@ async fn forward_request(
     // Forward to upstream
     match state.http_client.request(outbound).await {
         Ok(resp) => {
-            let (parts, body) = resp.into_parts();
+            let (mut parts, body) = resp.into_parts();
+
+            // Strip any X-GVM-* headers from the upstream response to prevent
+            // header poisoning — a malicious upstream could inject fake
+            // X-GVM-Decision headers that the SDK might trust.
+            let gvm_keys: Vec<_> = parts
+                .headers
+                .keys()
+                .filter(|k| k.as_str().starts_with("x-gvm-"))
+                .cloned()
+                .collect();
+            for key in gvm_keys {
+                parts.headers.remove(&key);
+            }
+
             let body_stream = http_body_util::BodyDataStream::new(body);
             Response::from_parts(parts, Body::from_stream(body_stream))
         }

@@ -73,8 +73,8 @@ class GVMAgent:
         if self.state is not None:
             self.state._bind(self)
 
-        # Register the header setter so @ic decorator can inject headers
-        decorator._gvm_header_setter = self._apply_gvm_headers
+        # Register per-thread header setter so @ic decorator can inject headers
+        decorator._register_header_setter(self._apply_gvm_headers)
 
         # Initialize trace context for this agent session
         decorator.set_trace_id(str(uuid.uuid4()))

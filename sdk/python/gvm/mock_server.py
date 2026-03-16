@@ -265,7 +265,16 @@ class MockHandler(BaseHTTPRequestHandler):
 
 
 def start(port=None):
-    """Start the mock server in a background daemon thread. Returns the server instance."""
+    """Start the mock server in a background daemon thread. Returns the server instance.
+
+    Raises RuntimeError if GVM_ENV is set to 'production' to prevent
+    accidental use of mock endpoints in production deployments.
+    """
+    if os.environ.get("GVM_ENV", "").lower() == "production":
+        raise RuntimeError(
+            "Mock server cannot start in production (GVM_ENV=production). "
+            "Configure real API endpoints instead."
+        )
     port = port or MOCK_PORT
     server = HTTPServer(("127.0.0.1", port), MockHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
