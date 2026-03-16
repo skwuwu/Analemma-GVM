@@ -131,6 +131,81 @@ The following issues have been identified and **fixed** as they affect normal op
 | Mock server runs in production | Add `GVM_ENV` guard to prevent accidental production use | Fixed |
 | SRR path traversal via encoding | Path normalization with percent-decode, null-byte strip, dot-segment resolution | Fixed (v0.2) |
 | Operation name header injection | Regex validation `[a-zA-Z0-9._-]+` on operation names | Fixed (v0.2) |
+| IC-1 Allow path sets Confirmed without checking upstream | Check `response.status().is_success()` before setting EventStatus | Fixed |
+| Policy field name typo silently ignored | Validate field names at load time; unknown fields cause load error | Fixed |
+
+---
+
+## Audit Results (2026-03-16)
+
+A comprehensive security audit was conducted covering all Rust proxy modules, Python SDK, and configuration files. The following reported items were analyzed and determined to be **non-issues** in the current architecture:
+
+| Reported Item | Analysis | Why Not a Vulnerability |
+|---|---|---|
+| AES-GCM nonce reuse | 12-byte random nonce, Birthday bound ~2^48 | At 1000 writes/day, collision takes ~770M years. NIST 2^32 limit = 11.7 years at this rate |
+| Unbounded X-GVM-Context header | hyper/axum HTTP parser limits header size (~64KB) | Oversized headers rejected at HTTP layer before deserialization |
+| Operation name CRLF injection (proxy-side) | `HeaderValue::to_str()` rejects non-visible ASCII (\\r\\n) | Returns `None` → falls back to "unknown". CRLF cannot reach application logic |
+| Checkpoint step u64::MAX | `format!("checkpoint:agent:{}", u64::MAX)` = ~50 byte string | No integer overflow, no memory issue. Normal HashMap key |
+| SRR body size bypass | Payload rule skip → next rule continues → Default-to-Caution (Delay) | By design: URL-only rules and fallback catch unmatched requests |
+| Vault `list_keys()` cross-agent | No API endpoint exposes this function | Internal method; not callable from outside the proxy |
+| SDK credential headers pass-through | Proxy `api_keys.rs` already strips Authorization, Cookie, X-API-Key, ApiKey | Enforcement is at proxy (Layer 3), not SDK. Double stripping unnecessary |
+| Rate limiter agent ID spoofing | Same root cause as unauthenticated proxy access | Not a separate vulnerability; addressed by deployment-level authentication |
+| WAL event forgery / batch reordering | Requires WAL file write access | Covered by existing item #6 (WAL periodic re-verification) |
+| Host override config injection | Requires `proxy.toml` write access | Covered by threat model boundary ("Attacker modifies config at rest" = out of scope) |
+
+---
+
+## Deployment Guide
+
+### ABAC Context Attribute Policy
+
+ABAC policy rules only match when the referenced context attribute exists. If an agent omits a context attribute (e.g., `context.amount`), rules conditioned on that attribute will not fire.
+
+**This is by design** — ABAC evaluates declared attributes. However, Layer 2 (SRR) independently inspects the actual HTTP target URL, so even if Layer 1 (ABAC) is bypassed via attribute omission, SRR catches the real operation:
+
+```
+Agent omits context.amount → ABAC rule "amount > 500 → Delay" does not fire → Allow
+SRR sees POST api.bank.com/transfer → Deny
+max_strict(Allow, Deny) = Deny ← SRR catches it
+```
+
+**Recommendation**: For critical operations, write SRR rules matching the target URL/method rather than relying solely on ABAC context attributes. If ABAC-only enforcement is required, add a complementary rule:
+
+```toml
+# Deny operations that should declare amount but don't
+[[rules]]
+id = "missing-amount-deny"
+field = "operation"
+operator = "StartsWith"
+value = "gvm.payment"
+decision = { type = "Deny", reason = "Payment operations must declare context.amount" }
+
+# Override: allow if amount is present and within limits
+[[rules]]
+id = "payment-with-amount"
+priority = 1  # higher priority (evaluated first)
+field = "context.amount"
+operator = "Lte"
+value = 500
+decision = { type = "Allow" }
+```
+
+### Network Binding
+
+The default proxy configuration binds to `0.0.0.0:8080` (all interfaces) for development convenience. In production or shared-network deployments:
+
+```toml
+# config/proxy.toml
+[server]
+listen = "127.0.0.1:8080"  # localhost only
+```
+
+For Kubernetes or multi-tenant environments, additionally apply:
+- **NetworkPolicy**: restrict ingress to the proxy pod from agent pods only
+- **mTLS**: mutual TLS between agent and proxy for identity verification
+- **Service mesh**: Istio/Linkerd sidecar for transparent authentication
+
+Without network-level isolation, any process on the same network can send requests with arbitrary `X-GVM-Agent-Id` headers, bypassing agent identity checks.
 
 ---
 
