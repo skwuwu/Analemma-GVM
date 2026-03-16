@@ -69,7 +69,19 @@ If an attacker has root access to the host, GVM — like any userspace process �
 
 **Impact**: Complete policy bypass — no enforcement, no audit trail.
 
-**Planned mitigation**: Network-level enforcement (iptables/nftables rules that block outbound HTTP except through the proxy port). Container-level enforcement via network policy. SDK-level enforcement already exists (`GVMAgent.create_session()` pre-configures proxy routing), but cannot prevent bypass by determined code.
+**Current (v1)**: Cooperative model — SDK sets `HTTP_PROXY` via `GVMAgent.create_session()`, but enforcement depends on agent cooperation.
+
+**Planned (v2)**: `gvm run` — mandatory interception via Linux network namespace isolation. The agent process runs in an isolated network namespace where all outbound traffic is iptables-redirected to the proxy. No direct internet access is possible:
+
+```
+gvm run my_agent.py
+  → unshare(CLONE_NEWNET)          # isolated network namespace
+  → veth pair: agent ns ↔ host     # controlled network bridge
+  → iptables DNAT: *:80,443 → proxy:8080
+  → iptables REJECT: everything else
+```
+
+This transitions GVM from "SDK proxy model" to "mandatory interception model" (same pattern as Envoy sidecar + iptables redirect). Cross-platform fallback: Docker `--network=container:gvm-proxy` for macOS/Windows.
 
 ---
 
@@ -118,6 +130,14 @@ If an attacker has root access to the host, GVM — like any userspace process �
 **Impact**: Vault contents (sensitive agent state) decrypted.
 
 **Planned mitigation**: Apply PBKDF2 or Argon2id with configurable iteration count before using the key for AES-GCM. Not implemented in v1 because the Vault is a local-development feature and production deployments should use a proper secrets manager.
+
+---
+
+### 8. Agent Identity
+
+**Current (v1)**: Self-declared `X-GVM-Agent-Id` header. Spoofable on shared networks.
+
+**Planned (v2)**: JWT issued by `gvm run` at agent startup, verified by proxy middleware. The agent cannot forge identity without the signing key. Multi-tenant deployments will require JWT or mTLS.
 
 ---
 
