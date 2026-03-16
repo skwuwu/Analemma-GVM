@@ -425,6 +425,35 @@ fn sensitivity_as_policy_str(sensitivity: &Sensitivity) -> &'static str {
     }
 }
 
+/// Known top-level field prefixes for policy conditions.
+/// Fields not matching these are rejected at load time to catch typos.
+const KNOWN_FIELD_PREFIXES: &[&str] = &[
+    "operation",
+    "resource.service",
+    "resource.identifier",
+    "resource.tier",
+    "resource.sensitivity",
+    "subject.agent_id",
+    "subject.tenant_id",
+    "subject.session_id",
+    "context.",  // dynamic context attributes (context.amount, context.currency, etc.)
+];
+
+/// Validate that a condition field name is recognized.
+/// Rejects unknown fields at policy load time instead of silently ignoring them at runtime.
+fn validate_field_name(field: &str, rule_id: &str) -> Result<()> {
+    for prefix in KNOWN_FIELD_PREFIXES {
+        if field == *prefix || field.starts_with(prefix) {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "Unknown field '{}' in rule '{}'. Valid fields: operation, resource.{{service,identifier,tier,sensitivity}}, \
+         subject.{{agent_id,tenant_id,session_id}}, context.*",
+        field, rule_id,
+    )
+}
+
 /// Compile a TOML rule config into a runtime PolicyRule
 fn compile_rule(cfg: &PolicyRuleConfig) -> Result<PolicyRule> {
     let layer = match cfg.layer.as_str() {
@@ -459,6 +488,10 @@ fn compile_rule(cfg: &PolicyRuleConfig) -> Result<PolicyRule> {
         } else {
             None
         };
+
+        // Validate field name at compile time to catch typos early.
+        // Known fields: operation, resource.*, subject.*, context.*
+        validate_field_name(&c.field, &cfg.id)?;
 
         conditions.push(Condition {
             field: c.field.clone(),

@@ -139,7 +139,15 @@ pub async fn proxy_handler(
             // Fast path: forward immediately, async ledger (IC-1, loss tolerated)
             let engine_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
             let mut response = forward_request(&state, request, &target).await;
-            event.status = EventStatus::Confirmed;
+
+            // Set status based on upstream response (same as IC-2 path)
+            if response.status().is_success() {
+                event.status = EventStatus::Confirmed;
+            } else {
+                event.status = EventStatus::Failed {
+                    reason: format!("HTTP {}", response.status()),
+                };
+            }
             state.ledger.append_async(event.clone()).await;
             inject_gvm_response_headers(
                 response.headers_mut(), &event, &classification, engine_ms, 0,
