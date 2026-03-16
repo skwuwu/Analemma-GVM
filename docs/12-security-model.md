@@ -107,15 +107,9 @@ This document catalogues known adversarial attack vectors for transparency. Each
 
 ---
 
-### 8. Import Chain Attacks (Python SDK)
+### 8. ~~Import Chain Attacks (Python SDK)~~ — Fixed
 
-**Attack**: The Python SDK's `from gvm.errors import ...` inside the `except` block of `decorator.py` means that a malicious `gvm/errors.py` on `PYTHONPATH` could intercept error handling.
-
-**Preconditions**: Attacker can place a file on `PYTHONPATH` before the legitimate `gvm` package.
-
-**Impact**: Error handling subverted — denied operations could be silently allowed.
-
-**Planned mitigation**: Move all imports to module top-level (eliminates lazy import attack surface). Use absolute imports with package verification. Low priority because `PYTHONPATH` manipulation requires environment-level access.
+Lazy imports (`from gvm.errors import ...`) inside the `except` block of `decorator.py` were moved to module top-level, eliminating the attack surface where a malicious `gvm/errors.py` on `PYTHONPATH` could intercept error handling.
 
 ---
 
@@ -133,6 +127,7 @@ The following issues have been identified and **fixed** as they affect normal op
 | Operation name header injection | Regex validation `[a-zA-Z0-9._-]+` on operation names | Fixed (v0.2) |
 | IC-1 Allow path sets Confirmed without checking upstream | Check `response.status().is_success()` before setting EventStatus | Fixed |
 | Policy field name typo silently ignored | Validate field names at load time; unknown fields cause load error | Fixed |
+| Import chain attack (lazy import in except block) | Move `from gvm.errors import ...` to module top-level in `decorator.py` | Fixed |
 
 ---
 

@@ -7,6 +7,7 @@ import uuid
 import threading
 from typing import Optional
 
+from gvm.errors import GVMDeniedError, GVMApprovalRequiredError, GVMRollbackError
 from gvm.resource import Resource
 
 # Operation names must match: alphanumeric, dots, hyphens, underscores only.
@@ -192,8 +193,6 @@ def ic(
 
             except Exception as e:
                 # Check if this is a GVM denial that should trigger rollback
-                from gvm.errors import GVMDeniedError, GVMApprovalRequiredError
-
                 if should_checkpoint and checkpoint_step is not None and isinstance(
                     e, (GVMDeniedError, GVMApprovalRequiredError)
                 ):
@@ -209,7 +208,6 @@ def ic(
                             except Exception:
                                 pass  # Rollback best-effort
 
-                        from gvm.errors import GVMRollbackError
                         raise GVMRollbackError(
                             operation=op,
                             reason=str(e),
