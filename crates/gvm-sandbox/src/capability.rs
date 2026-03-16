@@ -41,6 +41,14 @@ pub fn check(config: &SandboxConfig) -> PreflightReport {
         ));
     }
 
+    if !check_command_exists("iptables") {
+        issues.push(
+            "iptables not found. Required for sandbox network lockdown. \
+             Install with: sudo apt install iptables"
+                .to_string(),
+        );
+    }
+
     PreflightReport {
         user_namespaces,
         seccomp_available,
@@ -86,6 +94,15 @@ fn check_ip_forward() -> bool {
 /// Check if the interpreter binary exists in PATH.
 fn check_interpreter(interpreter: &str) -> bool {
     which_interpreter(interpreter).is_some()
+}
+
+/// Check if a command exists in PATH.
+fn check_command_exists(cmd: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(cmd)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Resolve interpreter binary path.

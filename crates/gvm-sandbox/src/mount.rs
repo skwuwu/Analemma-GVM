@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 pub fn setup_mount_namespace(
     workspace_dir: &Path,
     interpreter_path: &Path,
+    dns_server: &str,
 ) -> Result<()> {
     let new_root = PathBuf::from("/tmp/gvm-sandbox-root");
 
@@ -88,8 +89,8 @@ pub fn setup_mount_namespace(
     // Bind-mount interpreter and shared libraries
     bind_mount_interpreter(&new_root, interpreter_path)?;
 
-    // Create minimal /etc files
-    create_minimal_etc(&new_root)?;
+    // Create minimal /etc files (DNS points to veth host IP)
+    create_minimal_etc(&new_root, dns_server)?;
 
     // pivot_root: swap root filesystem
     let old_root = new_root.join("old_root");
@@ -241,7 +242,12 @@ fn bind_mount_library(new_root: &Path, lib_path: &Path) -> Result<()> {
 }
 
 /// Create minimal /etc files needed by most interpreters.
-fn create_minimal_etc(new_root: &Path) -> Result<()> {
+///
+/// `dns_server` must match the iptables OUTPUT rules in the sandbox namespace.
+/// The sandbox only allows UDP 53 to this address, so resolv.conf and firewall
+/// must be consistent. Using any other DNS server will cause DNS resolution to
+/// fail silently.
+fn create_minimal_etc(new_root: &Path, dns_server: &str) -> Result<()> {
     // /etc/passwd — needed by Python for getpwuid
     std::fs::write(
         new_root.join("etc/passwd"),
@@ -254,16 +260,16 @@ fn create_minimal_etc(new_root: &Path) -> Result<()> {
         "agent:x:0:\n",
     )?;
 
-    // /etc/hosts — only localhost and proxy
+    // /etc/hosts — only localhost (no IPv6 since it's disabled in sandbox)
     std::fs::write(
         new_root.join("etc/hosts"),
-        "127.0.0.1 localhost\n::1 localhost\n",
+        "127.0.0.1 localhost\n",
     )?;
 
-    // /etc/resolv.conf — use public DNS (agent can only reach proxy anyway)
+    // /etc/resolv.conf — DNS via host veth IP (matches OUTPUT iptables rule)
     std::fs::write(
         new_root.join("etc/resolv.conf"),
-        "nameserver 8.8.8.8\n",
+        format!("nameserver {}\n", dns_server),
     )?;
 
     Ok(())

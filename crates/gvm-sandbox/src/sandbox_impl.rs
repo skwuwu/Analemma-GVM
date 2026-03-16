@@ -127,7 +127,8 @@ fn child_entry(
     }
 
     // Set up mount namespace (pivot_root)
-    if let Err(e) = setup_mount_namespace(&config.workspace_dir, interpreter_path) {
+    // DNS server must match the OUTPUT iptables rule (host veth IP)
+    if let Err(e) = setup_mount_namespace(&config.workspace_dir, interpreter_path, &veth_config.host_ip) {
         eprintln!("gvm-sandbox: mount namespace setup failed: {}", e);
         return 1;
     }
