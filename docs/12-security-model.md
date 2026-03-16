@@ -45,7 +45,7 @@ If an attacker has root access to the host, GVM — like any userspace process �
 
 **Practical risk**: Extremely low. The 35 ns engine-level difference is 3-5 orders of magnitude below network noise. An agent would need thousands of measurements with sub-microsecond precision to extract a signal — and the governance layer controls the agent's ability to run such measurement programs.
 
-**Status**: No mitigation needed. Engine latency is already effectively constant-time relative to network-observable timescales.
+**Status**: Not constant-time. Practically non-exploitable in the current threat model due to rate limiting and sub-100 ns decision variance. Full constant-time padding is a v2 consideration.
 
 ---
 
@@ -192,6 +192,33 @@ operator = "Lte"
 value = 500
 decision = { type = "Allow" }
 ```
+
+### Single-Endpoint APIs (GraphQL, gRPC)
+
+Layer 2 (SRR) is not limited to URL-only inspection. For APIs that multiplex operations over a single endpoint (e.g., `POST /graphql`, `POST /grpc`), SRR supports **payload-level inspection** via `payload_field` and `payload_match`:
+
+```toml
+# Block dangerous GraphQL mutations at the network layer
+[[rules]]
+method = "POST"
+pattern = "api.bank.com/graphql"
+payload_field = "operationName"
+payload_match = ["TransferFunds", "DeleteAccount", "DropDatabase"]
+max_body_bytes = 65536
+decision = { type = "Deny", reason = "Blocked GraphQL mutation" }
+
+# Allow all other GraphQL operations with standard delay
+[[rules]]
+method = "POST"
+pattern = "api.bank.com/graphql"
+decision = { type = "Delay", milliseconds = 300 }
+```
+
+The proxy parses the request body as JSON and checks the specified field against the match list. This ensures SRR can enforce governance on GraphQL mutations, gRPC methods, and any JSON-RPC style API — not just REST endpoints with distinct URLs.
+
+**Body size limit**: Each rule has a configurable `max_body_bytes` (default 64 KB). Bodies exceeding this limit skip payload inspection but continue to subsequent rules, where URL-only rules or the Default-to-Caution fallback (Delay 300 ms) apply.
+
+---
 
 ### Network Binding
 
