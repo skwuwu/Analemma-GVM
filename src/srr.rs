@@ -209,7 +209,7 @@ fn parse_pattern(pattern: &str) -> (HostPattern, String) {
         HostPattern::Any
     } else if host_part.starts_with("{") && host_part.contains('.') {
         // e.g. "{host}.database.com" → suffix match on ".database.com"
-        let dot_idx = host_part.find('.').unwrap();
+        let dot_idx = host_part.find('.').expect("suffix pattern contains '.' (checked by contains('.') guard above)");
         HostPattern::Suffix(host_part[dot_idx..].to_string())
     } else {
         HostPattern::Exact(host_part.to_string())
@@ -582,10 +582,10 @@ mod tests {
 
     /// Helper: build a NetworkSRR from inline TOML
     fn srr_from_toml(toml_str: &str) -> NetworkSRR {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("temp directory creation must succeed");
         let path = dir.path().join("test_srr.toml");
-        std::fs::write(&path, toml_str).unwrap();
-        NetworkSRR::load(&path).unwrap()
+        std::fs::write(&path, toml_str).expect("writing SRR TOML to temp file must succeed");
+        NetworkSRR::load(&path).expect("valid SRR TOML must load")
     }
 
     // ── Test 1: Payload > max_body_bytes → skips to next rule (continue, not return) ──
@@ -982,18 +982,18 @@ mod tests {
     #[test]
     fn normalize_path_handles_edge_cases() {
         // Percent-encoded slash
-        assert_eq!(normalize_path("/a%2Fb").unwrap(), "/a/b");
+        assert_eq!(normalize_path("/a%2Fb").expect("percent-encoded path must normalize"), "/a/b");
 
         // Double dot at end
-        assert_eq!(normalize_path("/a/b/..").unwrap(), "/a");
+        assert_eq!(normalize_path("/a/b/..").expect("dot-segment path must normalize"), "/a");
 
         // Multiple consecutive slashes
-        assert_eq!(normalize_path("///a///b///").unwrap(), "/a/b/");
+        assert_eq!(normalize_path("///a///b///").expect("multi-slash path must normalize"), "/a/b/");
 
         // Single dot
-        assert_eq!(normalize_path("/a/./b").unwrap(), "/a/b");
+        assert_eq!(normalize_path("/a/./b").expect("dot path must normalize"), "/a/b");
 
         // Null byte removal
-        assert_eq!(normalize_path("/a\0b").unwrap(), "/ab");
+        assert_eq!(normalize_path("/a\0b").expect("null-byte path must normalize"), "/ab");
     }
 }

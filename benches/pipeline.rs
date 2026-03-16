@@ -69,7 +69,7 @@ fn make_test_event(id: &str) -> GVMEvent {
 
 fn bench_srr(c: &mut Criterion) {
     let srr = NetworkSRR::load(Path::new("config/srr_network.toml"))
-        .expect("Failed to load SRR rules");
+        .expect("valid SRR config must exist at config/srr_network.toml");
 
     let mut group = c.benchmark_group("srr");
 
@@ -125,7 +125,7 @@ fn bench_srr(c: &mut Criterion) {
 
 fn bench_policy(c: &mut Criterion) {
     let engine = PolicyEngine::load(Path::new("config/policies"))
-        .expect("Failed to load policies");
+        .expect("valid policy configs must exist at config/policies");
 
     let mut group = c.benchmark_group("policy");
 
@@ -225,9 +225,9 @@ fn bench_max_strict(c: &mut Criterion) {
 // ═══════════════════════════════════════════════
 
 fn bench_vault(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench");
 
-    let tmp_dir = tempfile::tempdir().unwrap();
+    let tmp_dir = tempfile::tempdir().expect("temp directory must be creatable for bench setup");
     let wal_path = tmp_dir.path().join("bench_wal.log");
 
     let ledger = rt.block_on(async {
@@ -238,13 +238,13 @@ fn bench_vault(c: &mut Criterion) {
                 "gvm-bench",
             )
             .await
-            .unwrap(),
+            .expect("ledger must initialize with valid WAL path"),
         )
     });
 
     let vault = rt
         .block_on(async { Vault::new(ledger.clone()) })
-        .expect("Vault init failed");
+        .expect("vault must initialize with valid ledger");
     let vault = Arc::new(vault);
 
     let mut group = c.benchmark_group("vault");
@@ -258,13 +258,13 @@ fn bench_vault(c: &mut Criterion) {
             BenchmarkId::new("write_read_roundtrip_bytes", size),
             &plaintext,
             |b, pt| {
-                b.to_async(tokio::runtime::Runtime::new().unwrap())
+                b.to_async(tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench iteration"))
                     .iter(|| {
                         let v = v.clone();
                         let pt = pt.clone();
                         async move {
-                            v.write("bench-key", &pt, "bench-agent").await.unwrap();
-                            let result = v.read("bench-key", "bench-agent").await.unwrap();
+                            v.write("bench-key", &pt, "bench-agent").await.expect("vault write must succeed with valid key and data");
+                            let result = v.read("bench-key", "bench-agent").await.expect("vault read must succeed for previously written key");
                             black_box(result);
                         }
                     });
@@ -284,9 +284,9 @@ fn bench_wal(c: &mut Criterion) {
 
     // Single durable append (fsync)
     group.bench_function("durable_append_fsync", |b| {
-        b.to_async(tokio::runtime::Runtime::new().unwrap())
+        b.to_async(tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench iteration"))
             .iter_custom(|iters| async move {
-                let tmp_dir = tempfile::tempdir().unwrap();
+                let tmp_dir = tempfile::tempdir().expect("temp directory must be creatable for bench setup");
                 let wal_path = tmp_dir.path().join("bench_wal.log");
                 let ledger = Ledger::new(
                     &wal_path,
@@ -294,12 +294,12 @@ fn bench_wal(c: &mut Criterion) {
                     "gvm-bench",
                 )
                 .await
-                .unwrap();
+                .expect("ledger must initialize with valid WAL path");
 
                 let start = std::time::Instant::now();
                 for i in 0..iters {
                     let event = make_test_event(&i.to_string());
-                    ledger.append_durable(&event).await.unwrap();
+                    ledger.append_durable(&event).await.expect("durable append must succeed for valid event");
                 }
                 start.elapsed()
             });
@@ -307,9 +307,9 @@ fn bench_wal(c: &mut Criterion) {
 
     // Batch of 100 sequential appends
     group.bench_function("100_sequential_appends", |b| {
-        b.to_async(tokio::runtime::Runtime::new().unwrap())
+        b.to_async(tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench iteration"))
             .iter_custom(|iters| async move {
-                let tmp_dir = tempfile::tempdir().unwrap();
+                let tmp_dir = tempfile::tempdir().expect("temp directory must be creatable for bench setup");
                 let wal_path = tmp_dir.path().join("bench_wal.log");
                 let ledger = Ledger::new(
                     &wal_path,
@@ -317,13 +317,13 @@ fn bench_wal(c: &mut Criterion) {
                     "gvm-bench",
                 )
                 .await
-                .unwrap();
+                .expect("ledger must initialize with valid WAL path");
 
                 let start = std::time::Instant::now();
                 for _ in 0..iters {
                     for i in 0..100 {
                         let event = make_test_event(&i.to_string());
-                        ledger.append_durable(&event).await.unwrap();
+                        ledger.append_durable(&event).await.expect("durable append must succeed for valid event");
                     }
                 }
                 start.elapsed()
@@ -339,9 +339,9 @@ fn bench_wal(c: &mut Criterion) {
 
 fn bench_classification(c: &mut Criterion) {
     let srr = NetworkSRR::load(Path::new("config/srr_network.toml"))
-        .expect("Failed to load SRR rules");
+        .expect("valid SRR config must exist at config/srr_network.toml");
     let policy = PolicyEngine::load(Path::new("config/policies"))
-        .expect("Failed to load policies");
+        .expect("valid policy configs must exist at config/policies");
 
     let mut group = c.benchmark_group("classification_e2e");
 
@@ -407,12 +407,12 @@ fn bench_wal_group_commit(c: &mut Criterion) {
             BenchmarkId::new("concurrent_appends", concurrency),
             &concurrency,
             |b, &n| {
-                b.to_async(tokio::runtime::Runtime::new().unwrap())
+                b.to_async(tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench iteration"))
                     .iter_custom(|iters| async move {
-                        let tmp_dir = tempfile::tempdir().unwrap();
+                        let tmp_dir = tempfile::tempdir().expect("temp directory must be creatable for bench setup");
                         let wal_path = tmp_dir.path().join("bench_gc_wal.log");
                         let ledger = Arc::new(
-                            Ledger::new(&wal_path, "", "").await.unwrap(),
+                            Ledger::new(&wal_path, "", "").await.expect("ledger must initialize with valid WAL path"),
                         );
 
                         let start = std::time::Instant::now();
@@ -422,11 +422,11 @@ fn bench_wal_group_commit(c: &mut Criterion) {
                                 let ledger = ledger.clone();
                                 handles.push(tokio::spawn(async move {
                                     let event = make_test_event(&i.to_string());
-                                    ledger.append_durable(&event).await.unwrap();
+                                    ledger.append_durable(&event).await.expect("concurrent durable append must succeed");
                                 }));
                             }
                             for h in handles {
-                                h.await.unwrap();
+                                h.await.expect("spawned task must complete without panic");
                             }
                         }
                         start.elapsed()
@@ -456,10 +456,10 @@ fn bench_srr_scale(c: &mut Criterion) {
         }
         toml.push_str("[[rules]]\nmethod = \"*\"\npattern = \"{any}\"\ndecision = { type = \"Delay\", milliseconds = 300 }\n");
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("temp directory must be creatable for bench setup");
         let path = dir.path().join("srr.toml");
-        std::fs::write(&path, &toml).unwrap();
-        let srr = NetworkSRR::load(&path).unwrap();
+        std::fs::write(&path, &toml).expect("generated SRR config must be writable to temp file");
+        let srr = NetworkSRR::load(&path).expect("generated SRR config must parse as valid rules");
 
         // Best case: first rule match
         group.bench_with_input(
@@ -506,9 +506,9 @@ fn bench_policy_scale(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_scale");
 
     for rule_count in [100, 500, 1_000] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("temp directory must be creatable for bench setup");
         let policy_dir = dir.path().join("policies");
-        std::fs::create_dir(&policy_dir).unwrap();
+        std::fs::create_dir(&policy_dir).expect("policy subdirectory must be creatable in temp dir");
 
         let mut toml = String::new();
         for i in 0..rule_count {
@@ -540,8 +540,8 @@ type = "Allow"
 "#,
         );
 
-        std::fs::write(policy_dir.join("global.toml"), &toml).unwrap();
-        let engine = PolicyEngine::load(&policy_dir).unwrap();
+        std::fs::write(policy_dir.join("global.toml"), &toml).expect("generated policy config must be writable to temp file");
+        let engine = PolicyEngine::load(&policy_dir).expect("generated policy config must parse as valid rules");
 
         // Best case: first rule match
         let op_first = make_operation("gvm.test.op0", Sensitivity::Low, ResourceTier::Internal, None, "bench");
@@ -578,7 +578,7 @@ fn bench_ic2_delay_accuracy(c: &mut Criterion) {
     group.sample_size(10); // Fewer samples since each takes 300ms+
 
     group.bench_function("300ms_delay_accuracy", |b| {
-        b.to_async(tokio::runtime::Runtime::new().unwrap())
+        b.to_async(tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench iteration"))
             .iter(|| async {
                 let target = std::time::Duration::from_millis(300);
                 let start = std::time::Instant::now();
@@ -599,16 +599,16 @@ fn bench_ic2_delay_accuracy(c: &mut Criterion) {
 // ═══════════════════════════════════════════════
 
 fn bench_vault_large(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench");
 
-    let tmp_dir = tempfile::tempdir().unwrap();
+    let tmp_dir = tempfile::tempdir().expect("temp directory must be creatable for bench setup");
     let wal_path = tmp_dir.path().join("bench_vault_large.log");
 
     let ledger = rt.block_on(async {
-        Arc::new(Ledger::new(&wal_path, "", "").await.unwrap())
+        Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger must initialize with valid WAL path"))
     });
 
-    let vault = Arc::new(Vault::new(ledger).expect("Vault init"));
+    let vault = Arc::new(Vault::new(ledger).expect("vault must initialize with valid ledger"));
 
     let mut group = c.benchmark_group("vault_large");
 
@@ -621,13 +621,13 @@ fn bench_vault_large(c: &mut Criterion) {
             BenchmarkId::new("write_read_bytes", size),
             &plaintext,
             |b, pt| {
-                b.to_async(tokio::runtime::Runtime::new().unwrap())
+                b.to_async(tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench iteration"))
                     .iter(|| {
                         let v = v.clone();
                         let pt = pt.clone();
                         async move {
-                            v.write("bench-large", &pt, "bench-agent").await.unwrap();
-                            let result = v.read("bench-large", "bench-agent").await.unwrap();
+                            v.write("bench-large", &pt, "bench-agent").await.expect("vault write must succeed with valid key and data");
+                            let result = v.read("bench-large", "bench-agent").await.expect("vault read must succeed for previously written key");
                             black_box(result);
                         }
                     });
@@ -692,6 +692,7 @@ fn bench_wasm_vs_native(c: &mut Criterion) {
             agent_id: "bench-agent".to_string(),
             tenant_id: None,
         },
+        context: gvm_engine::ContextAttrs::default(),
         rules: rules.clone(),
     };
 
@@ -706,6 +707,7 @@ fn bench_wasm_vs_native(c: &mut Criterion) {
             agent_id: "bench-agent".to_string(),
             tenant_id: None,
         },
+        context: gvm_engine::ContextAttrs::default(),
         rules: rules.clone(),
     };
 
@@ -713,14 +715,14 @@ fn bench_wasm_vs_native(c: &mut Criterion) {
     let native_engine = WasmEngine::native();
     group.bench_function("native_deny", |b| {
         b.iter(|| {
-            let resp = native_engine.evaluate(black_box(&req_deny)).unwrap();
+            let resp = native_engine.evaluate(black_box(&req_deny)).expect("native engine must evaluate valid deny request");
             black_box(resp);
         });
     });
 
     group.bench_function("native_allow", |b| {
         b.iter(|| {
-            let resp = native_engine.evaluate(black_box(&req_allow)).unwrap();
+            let resp = native_engine.evaluate(black_box(&req_allow)).expect("native engine must evaluate valid allow request");
             black_box(resp);
         });
     });
@@ -728,28 +730,28 @@ fn bench_wasm_vs_native(c: &mut Criterion) {
     // ── Wasm evaluation (warm call — module already loaded) ──
     let wasm_path = Path::new("data/gvm_engine.wasm");
     if wasm_path.exists() {
-        let wasm_engine = WasmEngine::load(wasm_path).unwrap();
+        let wasm_engine = WasmEngine::load(wasm_path).expect("wasm module must load from verified existing path");
         assert!(wasm_engine.is_wasm(), "Wasm engine must be in Wasm mode");
 
         group.bench_function("wasm_deny", |b| {
             b.iter(|| {
-                let resp = wasm_engine.evaluate(black_box(&req_deny)).unwrap();
+                let resp = wasm_engine.evaluate(black_box(&req_deny)).expect("wasm engine must evaluate valid deny request");
                 black_box(resp);
             });
         });
 
         group.bench_function("wasm_allow", |b| {
             b.iter(|| {
-                let resp = wasm_engine.evaluate(black_box(&req_allow)).unwrap();
+                let resp = wasm_engine.evaluate(black_box(&req_allow)).expect("wasm engine must evaluate valid allow request");
                 black_box(resp);
             });
         });
 
         // ── End-to-end latency breakdown: Wasm evaluate as % of full pipeline ──
         let srr = NetworkSRR::load(Path::new("config/srr_network.toml"))
-            .expect("Failed to load SRR for e2e bench");
+            .expect("valid SRR config must exist for e2e bench");
         let policy = PolicyEngine::load(Path::new("config/policies"))
-            .expect("Failed to load policy for e2e bench");
+            .expect("valid policy configs must exist for e2e bench");
         let op = make_operation(
             "gvm.messaging.send",
             Sensitivity::Medium,
@@ -762,7 +764,7 @@ fn bench_wasm_vs_native(c: &mut Criterion) {
         group.bench_function("e2e_with_wasm", |b| {
             b.iter(|| {
                 let srr_decision = srr.check("POST", "smtp.gmail.com", "/send", None);
-                let wasm_resp = wasm_engine.evaluate(black_box(&req_allow)).unwrap();
+                let wasm_resp = wasm_engine.evaluate(black_box(&req_allow)).expect("wasm engine must evaluate valid request in e2e pipeline");
                 let (wasm_decision, _) = WasmEngine::response_to_decision(&wasm_resp);
                 let final_d = max_strict(wasm_decision, srr_decision);
                 black_box(final_d);
@@ -799,16 +801,16 @@ fn bench_wasm_vs_native(c: &mut Criterion) {
 // ═══════════════════════════════════════════════
 
 fn bench_vault_p99(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench");
 
-    let tmp_dir = tempfile::tempdir().unwrap();
+    let tmp_dir = tempfile::tempdir().expect("temp directory must be creatable for bench setup");
     let wal_path = tmp_dir.path().join("bench_vault_p99.log");
 
     let ledger = rt.block_on(async {
-        Arc::new(Ledger::new(&wal_path, "", "").await.unwrap())
+        Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger must initialize with valid WAL path"))
     });
 
-    let vault = Arc::new(Vault::new(ledger).expect("Vault init"));
+    let vault = Arc::new(Vault::new(ledger).expect("vault must initialize with valid ledger"));
 
     let mut group = c.benchmark_group("vault_p99_tail");
 
@@ -822,12 +824,12 @@ fn bench_vault_p99(c: &mut Criterion) {
             BenchmarkId::new("write_only_bytes", size),
             &plaintext,
             |b, pt| {
-                b.to_async(tokio::runtime::Runtime::new().unwrap())
+                b.to_async(tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench iteration"))
                     .iter(|| {
                         let v = v.clone();
                         let pt = pt.clone();
                         async move {
-                            v.write("bench-p99", &pt, "bench-agent").await.unwrap();
+                            v.write("bench-p99", &pt, "bench-agent").await.expect("vault write must succeed with valid key and data");
                             black_box(());
                         }
                     });
@@ -841,12 +843,12 @@ fn bench_vault_p99(c: &mut Criterion) {
     // Monolithic 256KB write
     let v = vault.clone();
     group.bench_function("monolithic_256kb", |b| {
-        b.to_async(tokio::runtime::Runtime::new().unwrap())
+        b.to_async(tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench iteration"))
             .iter(|| {
                 let v = v.clone();
                 let data = large_data.clone();
                 async move {
-                    v.write("bench-mono", &data, "bench-agent").await.unwrap();
+                    v.write("bench-mono", &data, "bench-agent").await.expect("vault monolithic write must succeed with valid data");
                     black_box(());
                 }
             });
@@ -855,7 +857,7 @@ fn bench_vault_p99(c: &mut Criterion) {
     // Chunked: 16 x 16KB writes
     let v = vault.clone();
     group.bench_function("chunked_16x16kb", |b| {
-        b.to_async(tokio::runtime::Runtime::new().unwrap())
+        b.to_async(tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench iteration"))
             .iter(|| {
                 let v = v.clone();
                 let data = large_data.clone();
@@ -863,7 +865,7 @@ fn bench_vault_p99(c: &mut Criterion) {
                     for i in 0..16 {
                         let chunk = &data[i * 16384..(i + 1) * 16384];
                         let key = format!("bench-chunk-{}", i);
-                        v.write(&key, chunk, "bench-agent").await.unwrap();
+                        v.write(&key, chunk, "bench-agent").await.expect("vault chunked write must succeed with valid chunk data");
                     }
                     black_box(());
                 }

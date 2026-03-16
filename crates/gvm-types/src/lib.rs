@@ -312,3 +312,96 @@ pub fn max_strict(a: EnforcementDecision, b: EnforcementDecision) -> Enforcement
         b
     }
 }
+
+// ─── Governance Block Response (PART 7) ───
+
+/// How an agent should respond when its operation is blocked by governance.
+///
+/// Configured per-decision type via `[enforcement.on_block]` in proxy.toml.
+/// The proxy includes this in every block response so agents can react
+/// programmatically without hardcoding retry/halt logic.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockResponseMode {
+    /// Stop execution immediately. Agent must not retry or continue.
+    /// Use for Deny decisions where the operation is categorically forbidden.
+    Halt,
+
+    /// Suggest an alternative action. Agent may adapt and retry differently.
+    /// Use for RequireApproval where the agent can downgrade scope or wait.
+    SoftPivot,
+
+    /// Roll back the current transaction and retry after conditions change.
+    /// Use for Throttle/temporary blocks where retry is expected.
+    Rollback,
+}
+
+impl Default for BlockResponseMode {
+    fn default() -> Self {
+        Self::Halt
+    }
+}
+
+/// Standard JSON response body returned when a governance decision blocks an operation.
+///
+/// This is the contract between the proxy and agent SDKs. Every blocked request
+/// (Deny, RequireApproval, Throttle, WAL failure) returns this structure so agents
+/// can programmatically decide their next action without parsing error strings.
+///
+/// ```json
+/// {
+///   "blocked": true,
+///   "decision": "Deny",
+///   "event_id": "evt-abc-123",
+///   "trace_id": "trace-xyz",
+///   "operation": "gvm.messaging.send",
+///   "reason": "Policy rule finance-002 blocks transfers above $10,000",
+///   "mode": "halt",
+///   "next_action": "Contact administrator to request an exception",
+///   "retry_after_secs": null,
+///   "rollback_hint": "trace-xyz",
+///   "matched_rule_id": "finance-002",
+///   "ic_level": 3
+/// }
+/// ```
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct GovernanceBlockResponse {
+    /// Always true for block responses (discriminator for SDK parsing)
+    pub blocked: bool,
+
+    /// The enforcement decision that caused the block
+    pub decision: String,
+
+    /// Unique event ID for audit trail correlation
+    pub event_id: String,
+
+    /// Trace ID for distributed trace correlation
+    pub trace_id: String,
+
+    /// Operation that was blocked (e.g. "gvm.messaging.send")
+    pub operation: String,
+
+    /// Human-readable explanation of why the operation was blocked
+    pub reason: String,
+
+    /// How the agent should respond to this block
+    pub mode: BlockResponseMode,
+
+    /// Actionable next step for the agent or operator
+    pub next_action: String,
+
+    /// Seconds to wait before retrying (only for Rollback mode)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
+
+    /// Trace ID that the SDK can use to roll back to a checkpoint
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollback_hint: Option<String>,
+
+    /// Policy rule that triggered the block (if known)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_rule_id: Option<String>,
+
+    /// Impact Classification level (1-3, higher = more restrictive)
+    pub ic_level: u8,
+}

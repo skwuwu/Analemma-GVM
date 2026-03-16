@@ -133,13 +133,25 @@ const MAX_VAULT_KEYS: usize = 10_000;
 /// Prevents a single write from consuming excessive memory.
 const MAX_VALUE_BYTES: usize = 1024 * 1024;
 
-/// Vault: encrypted key-value store for agent state.
+/// Vault: encrypted agent state cache.
+///
+/// Stores agent checkpoints, conversation history, and intermediate
+/// state with AES-256-GCM encryption. This is a runtime state store,
+/// not a secrets manager. API credentials are handled separately
+/// by [`APIKeyStore`](crate::api_keys::APIKeyStore).
 ///
 /// Design (PART 5.4):
 /// - All values encrypted with AES-256-GCM before storage
-/// - WAL-first write: encrypted value recorded in WAL before Redis write
+/// - Automatic nonce generation (no reuse)
+/// - Key zeroing on drop (zeroize) prevents memory remanence
+/// - WAL-first write: encrypted value recorded in WAL before store write
 /// - Read operations are logged asynchronously (value not included in audit)
-/// - MVP: in-memory HashMap instead of Redis (Redis integration in production)
+/// - MVP: in-memory HashMap (Redis with TLS planned for production)
+///
+/// What Vault does NOT do (and should not be expected to do):
+/// - Key rotation, envelope encryption, or KDF
+/// - HSM/KMS integration (production deployments should use external KMS)
+/// - Access control between agents (single-tenant per proxy instance)
 ///
 /// Memory bounds:
 /// - Max keys: 10,000 (rejects writes when full)
@@ -308,38 +320,38 @@ mod tests {
 
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
-        let enc = VaultEncryption::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").unwrap();
+        let enc = VaultEncryption::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
         let plaintext = b"sensitive agent state data";
 
-        let ciphertext = enc.encrypt(plaintext).unwrap();
+        let ciphertext = enc.encrypt(plaintext).expect("AES-256-GCM encryption must succeed");
         assert_ne!(&ciphertext, plaintext);
         assert!(ciphertext.len() > plaintext.len()); // nonce + tag overhead
 
-        let decrypted = enc.decrypt(&ciphertext).unwrap();
+        let decrypted = enc.decrypt(&ciphertext).expect("decryption of valid ciphertext must succeed");
         assert_eq!(&decrypted, plaintext);
     }
 
     #[test]
     fn test_different_nonces_produce_different_ciphertext() {
-        let enc = VaultEncryption::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").unwrap();
+        let enc = VaultEncryption::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
         let plaintext = b"same data";
 
-        let ct1 = enc.encrypt(plaintext).unwrap();
-        let ct2 = enc.encrypt(plaintext).unwrap();
+        let ct1 = enc.encrypt(plaintext).expect("AES-256-GCM encryption must succeed");
+        let ct2 = enc.encrypt(plaintext).expect("AES-256-GCM encryption must succeed");
 
         // Same plaintext should produce different ciphertext (random nonce)
         assert_ne!(ct1, ct2);
 
         // But both should decrypt to the same plaintext
-        assert_eq!(enc.decrypt(&ct1).unwrap(), enc.decrypt(&ct2).unwrap());
+        assert_eq!(enc.decrypt(&ct1).expect("ct1 decryption"), enc.decrypt(&ct2).expect("ct2 decryption"));
     }
 
     #[test]
     fn test_tampered_ciphertext_fails() {
-        let enc = VaultEncryption::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").unwrap();
+        let enc = VaultEncryption::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
         let plaintext = b"tamper test";
 
-        let mut ciphertext = enc.encrypt(plaintext).unwrap();
+        let mut ciphertext = enc.encrypt(plaintext).expect("AES-256-GCM encryption must succeed");
         // Flip a bit in the ciphertext body (after nonce)
         if ciphertext.len() > 13 {
             ciphertext[13] ^= 0xFF;
@@ -352,7 +364,7 @@ mod tests {
 
     #[test]
     fn test_truncated_ciphertext_returns_integrity_error() {
-        let enc = VaultEncryption::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").unwrap();
+        let enc = VaultEncryption::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
 
         // Less than 12 bytes (nonce size) — must fail with integrity error
         let short_data = vec![0u8; 5];
@@ -370,7 +382,7 @@ mod tests {
         let enc2 = VaultEncryption::new([2u8; 32]);
 
         let plaintext = b"encrypted with key 1";
-        let ciphertext = enc1.encrypt(plaintext).unwrap();
+        let ciphertext = enc1.encrypt(plaintext).expect("enc1 encryption must succeed");
 
         // Decrypt with wrong key — must fail with integrity error, not leak details
         let err = enc2.decrypt(&ciphertext).unwrap_err();
@@ -388,23 +400,23 @@ mod tests {
 
     #[test]
     fn test_empty_plaintext_roundtrip() {
-        let enc = VaultEncryption::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").unwrap();
+        let enc = VaultEncryption::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
 
         // Empty plaintext — edge case, must work
-        let ciphertext = enc.encrypt(b"").unwrap();
-        let decrypted = enc.decrypt(&ciphertext).unwrap();
+        let ciphertext = enc.encrypt(b"").expect("AES-256-GCM encryption of empty plaintext must succeed");
+        let decrypted = enc.decrypt(&ciphertext).expect("decryption of valid ciphertext must succeed");
         assert_eq!(decrypted, b"");
     }
 
     #[test]
     fn test_nonce_reuse_not_possible() {
-        let enc = VaultEncryption::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").unwrap();
+        let enc = VaultEncryption::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
 
         // Encrypt same plaintext 100 times — all nonces must be unique
         let plaintext = b"nonce reuse test";
         let nonces: Vec<Vec<u8>> = (0..100)
             .map(|_| {
-                let ct = enc.encrypt(plaintext).unwrap();
+                let ct = enc.encrypt(plaintext).expect("AES-256-GCM encryption must succeed");
                 ct[..12].to_vec() // Extract 12-byte nonce
             })
             .collect();

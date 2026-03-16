@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use gvm_types::BlockResponseMode;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -36,6 +37,57 @@ pub struct EnforcementConfig {
     pub default_decision: DefaultDecisionConfig,
     pub ic1_async_ledger: bool,
     pub ic1_loss_threshold: f64,
+    /// Per-decision block response modes.
+    /// Controls how agents should react to blocked operations.
+    #[serde(default)]
+    pub on_block: OnBlockConfig,
+}
+
+/// Per-decision block response mode configuration.
+///
+/// ```toml
+/// [enforcement.on_block]
+/// deny = "halt"
+/// require_approval = "soft_pivot"
+/// throttle = "rollback"
+/// ```
+#[derive(Deserialize, Clone, Debug)]
+pub struct OnBlockConfig {
+    /// Mode for Deny decisions (default: halt)
+    #[serde(default = "default_halt")]
+    pub deny: BlockResponseMode,
+    /// Mode for RequireApproval decisions (default: soft_pivot)
+    #[serde(default = "default_soft_pivot")]
+    pub require_approval: BlockResponseMode,
+    /// Mode for Throttle rate-limit blocks (default: rollback)
+    #[serde(default = "default_rollback")]
+    pub throttle: BlockResponseMode,
+    /// Mode for WAL/infrastructure failures (default: halt)
+    #[serde(default = "default_halt")]
+    pub infrastructure_failure: BlockResponseMode,
+}
+
+impl Default for OnBlockConfig {
+    fn default() -> Self {
+        Self {
+            deny: BlockResponseMode::Halt,
+            require_approval: BlockResponseMode::SoftPivot,
+            throttle: BlockResponseMode::Rollback,
+            infrastructure_failure: BlockResponseMode::Halt,
+        }
+    }
+}
+
+fn default_halt() -> BlockResponseMode {
+    BlockResponseMode::Halt
+}
+
+fn default_soft_pivot() -> BlockResponseMode {
+    BlockResponseMode::SoftPivot
+}
+
+fn default_rollback() -> BlockResponseMode {
+    BlockResponseMode::Rollback
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -94,6 +146,7 @@ impl Default for ProxyConfig {
                 },
                 ic1_async_ledger: true,
                 ic1_loss_threshold: 0.001,
+                on_block: OnBlockConfig::default(),
             },
             nats: NatsConfig {
                 url: "nats://127.0.0.1:4222".to_string(),

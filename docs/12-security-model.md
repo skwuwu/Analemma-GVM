@@ -105,7 +105,9 @@ This transitions GVM from "SDK proxy model" to "mandatory interception model" (s
 
 **Impact**: State rollback to an unintended point, potentially replaying approved operations.
 
-**Planned mitigation**: Signed checkpoint IDs with HMAC. Checkpoint restore requires the proxy to validate that the requested step was genuinely approved. Not implemented in v1 because checkpoint restore is triggered only by GVM denial errors, not by agent code directly.
+**Current mitigation (v0.2)**: Merkle tree verification on checkpoint restore. Each checkpoint's `SHA-256(plaintext)` is a leaf in a per-agent Merkle tree — the same tree structure used for WAL audit batch verification (`merkle.rs`). On save, the proxy appends the leaf and recomputes the tree root. On restore, the proxy generates an O(log N) Merkle proof for the requested leaf and verifies it against the root via `verify_merkle_proof()`. The SDK performs additional client-side hash verification. Tampering with any checkpoint invalidates the root, detected on any subsequent restore.
+
+**Planned (v2)**: HMAC-signed checkpoint IDs with proxy-held signing key. The current Merkle tree prevents content tampering but does not prevent step ID spoofing (which requires code-level SDK access).
 
 ---
 
@@ -123,13 +125,13 @@ This transitions GVM from "SDK proxy model" to "mandatory interception model" (s
 
 ### 7. Vault Key Derivation
 
-**Attack**: The current Vault encryption key is derived directly from the `VAULT_KEY` environment variable without a key derivation function (KDF). If the key has low entropy, brute-force is feasible.
+**Attack**: The current Vault (encrypted agent state cache) encryption key is derived directly from the `VAULT_KEY` environment variable without a key derivation function (KDF). If the key has low entropy, brute-force is feasible.
 
 **Preconditions**: Access to the encrypted Vault data and knowledge that no KDF is applied.
 
-**Impact**: Vault contents (sensitive agent state) decrypted.
+**Impact**: Agent state (checkpoints, conversation history) decrypted. Note: Vault does not store API credentials — those are in `APIKeyStore`.
 
-**Planned mitigation**: Apply PBKDF2 or Argon2id with configurable iteration count before using the key for AES-GCM. Not implemented in v1 because the Vault is a local-development feature and production deployments should use a proper secrets manager.
+**Planned mitigation**: Apply PBKDF2 or Argon2id with configurable iteration count before using the key for AES-GCM. Not implemented in v1 because the Vault is a local-development feature and production deployments should use a proper secrets manager. See [Roadmap](13-roadmap.md) for full feature tracking.
 
 ---
 
@@ -156,6 +158,7 @@ The following issues have been identified and **fixed** as they affect normal op
 | IC-1 Allow path sets Confirmed without checking upstream | Check `response.status().is_success()` before setting EventStatus | Fixed |
 | Policy field name typo silently ignored | Validate field names at load time; unknown fields cause load error | Fixed |
 | Import chain attack (lazy import in except block) | Move `from gvm.errors import ...` to module top-level in `decorator.py` | Fixed |
+| Checkpoint Merkle verification hardcoded `"true"` | Real content hash + chain verification; proxy computes SHA-256 of plaintext and chains with previous checkpoint | Fixed (v0.2) |
 
 ---
 

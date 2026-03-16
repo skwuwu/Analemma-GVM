@@ -177,6 +177,8 @@ async fn main() {
         vault: Arc::new(vault),
         rate_limiter: Arc::new(RateLimiter::new()),
         wasm_engine: Arc::new(wasm_engine),
+        checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
+        on_block: config.enforcement.on_block.clone(),
         http_client,
         host_overrides,
     };
@@ -199,7 +201,8 @@ async fn main() {
         .route(
             "/gvm/vault/checkpoint/:agent_id/:step",
             axum::routing::put(api::checkpoint_write)
-                .get(api::checkpoint_read),
+                .get(api::checkpoint_read)
+                .delete(api::checkpoint_delete),
         )
         .fallback(proxy_handler)
         .with_state(state)

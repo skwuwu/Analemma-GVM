@@ -14,10 +14,10 @@ use std::time::Instant;
 
 /// Helper: build a NetworkSRR from inline TOML
 fn srr_from_toml(toml_str: &str) -> NetworkSRR {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let path = dir.path().join("srr.toml");
-    std::fs::write(&path, toml_str).unwrap();
-    NetworkSRR::load(&path).unwrap()
+    std::fs::write(&path, toml_str).expect("writing SRR config to temp file must succeed");
+    NetworkSRR::load(&path).expect("valid SRR TOML config must parse")
 }
 
 // ─── Test 1: 100 Concurrent SRR Evaluations ───
@@ -74,7 +74,7 @@ async fn srr_100_concurrent_checks_complete_without_blocking() {
 
     let mut deny_count = 0;
     for handle in handles {
-        if handle.await.unwrap() {
+        if handle.await.expect("SRR check task must not panic") {
             deny_count += 1;
         }
     }
@@ -117,7 +117,7 @@ async fn rate_limiter_100_concurrent_checks_no_deadlock() {
     let mut allowed = 0;
     let mut denied = 0;
     for handle in handles {
-        if handle.await.unwrap() {
+        if handle.await.expect("rate limiter check task must not panic") {
             allowed += 1;
         } else {
             denied += 1;
@@ -148,12 +148,12 @@ async fn wal_tampered_entry_does_not_crash_recovery() {
     use gvm_proxy::ledger::Ledger;
     use std::io::Write;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
 
     // Write a valid WAL entry, then a tampered/corrupted entry
     {
-        let mut file = std::fs::File::create(&wal_path).unwrap();
+        let mut file = std::fs::File::create(&wal_path).expect("WAL file creation must succeed");
 
         // Valid JSON entry with Pending status
         let valid = serde_json::json!({
@@ -185,10 +185,10 @@ async fn wal_tampered_entry_does_not_crash_recovery() {
             },
             "nats_sequence": null
         });
-        writeln!(file, "{}", serde_json::to_string(&valid).unwrap()).unwrap();
+        writeln!(file, "{}", serde_json::to_string(&valid).expect("valid WAL entry must serialize to JSON")).expect("writing valid WAL entry must succeed");
 
         // Corrupted entry — invalid JSON
-        writeln!(file, "{{CORRUPTED_DATA_TAMPERE{{{{D}}}}").unwrap();
+        writeln!(file, "{{CORRUPTED_DATA_TAMPERE{{{{D}}}}").expect("writing corrupted WAL entry must succeed");
 
         // Another valid entry
         let valid2 = {
@@ -196,12 +196,12 @@ async fn wal_tampered_entry_does_not_crash_recovery() {
             v["event_id"] = serde_json::json!("evt-002");
             v
         };
-        writeln!(file, "{}", serde_json::to_string(&valid2).unwrap()).unwrap();
+        writeln!(file, "{}", serde_json::to_string(&valid2).expect("second WAL entry must serialize to JSON")).expect("writing second WAL entry must succeed");
     }
 
     // Recovery must not crash even with corrupted entries
-    let ledger = Ledger::new(&wal_path, "", "").await.unwrap();
-    let report = ledger.recover_from_wal().await.unwrap();
+    let ledger = Ledger::new(&wal_path, "", "").await.expect("ledger must initialize with tampered WAL");
+    let report = ledger.recover_from_wal().await.expect("WAL recovery must handle corrupted entries gracefully");
 
     // Both valid Pending entries should be processed (corrupted entry skipped)
     assert_eq!(
@@ -221,11 +221,11 @@ async fn vault_concurrent_writes_to_same_key() {
     use gvm_proxy::ledger::Ledger;
     use gvm_proxy::vault::Vault;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
 
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
-    let vault = Arc::new(Vault::new(ledger).unwrap());
+    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger must initialize for vault test"));
+    let vault = Arc::new(Vault::new(ledger).expect("vault must initialize with valid ledger"));
 
     let start = Instant::now();
 
@@ -239,12 +239,12 @@ async fn vault_concurrent_writes_to_same_key() {
             vault
                 .write("shared-key", value.as_bytes(), &agent)
                 .await
-                .unwrap();
+                .expect("concurrent vault write must succeed");
         }));
     }
 
     for handle in handles {
-        handle.await.unwrap();
+        handle.await.expect("vault write task must not panic");
     }
 
     let elapsed = start.elapsed();
@@ -256,13 +256,13 @@ async fn vault_concurrent_writes_to_same_key() {
     );
 
     // Read the final value — it should be one of the written values (last-write-wins)
-    let result = vault.read("shared-key", "reader").await.unwrap();
+    let result = vault.read("shared-key", "reader").await.expect("vault read after concurrent writes must succeed");
     assert!(
         result.is_some(),
         "Key must exist after concurrent writes"
     );
 
-    let value = String::from_utf8(result.unwrap()).unwrap();
+    let value = String::from_utf8(result.expect("key must exist after concurrent writes")).expect("vault value must be valid UTF-8");
     assert!(
         value.starts_with("value-"),
         "Value must be one of the written values, got: {}",
@@ -399,18 +399,18 @@ fn vault_key_is_zeroed_on_drop() {
         use gvm_proxy::vault::Vault;
         use gvm_proxy::ledger::Ledger;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("temp dir creation must succeed");
         let wal_path = dir.path().join("wal.log");
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime creation must succeed");
         rt.block_on(async {
-            let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
-            let vault = Vault::new(ledger).unwrap();
+            let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger must initialize for key zeroing test"));
+            let vault = Vault::new(ledger).expect("vault must initialize with valid ledger");
 
             // Write and read — proves encryption works
-            vault.write("test-key", b"secret-data", "agent-1").await.unwrap();
-            let data = vault.read("test-key", "agent-1").await.unwrap();
-            assert_eq!(data.unwrap(), b"secret-data");
+            vault.write("test-key", b"secret-data", "agent-1").await.expect("vault write must succeed before drop");
+            let data = vault.read("test-key", "agent-1").await.expect("vault read must succeed before drop");
+            assert_eq!(data.expect("written key must be readable"), b"secret-data");
 
             // vault is dropped here — ZeroizeOnDrop zeros the key
         });
@@ -427,10 +427,10 @@ fn vault_key_is_zeroed_on_drop() {
 async fn ledger_concurrent_spawns_stay_bounded() {
     use gvm_proxy::ledger::Ledger;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
 
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
+    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger must initialize for backpressure test"));
     let start = Instant::now();
 
     // Simulate 500 rapid-fire durable appends
@@ -461,12 +461,12 @@ async fn ledger_concurrent_spawns_stay_bounded() {
                 event_hash: None,
         llm_trace: None,
             };
-            ledger.append_durable(&event).await.unwrap();
+            ledger.append_durable(&event).await.expect("durable append must succeed under load");
         }));
     }
 
     for handle in handles {
-        handle.await.unwrap();
+        handle.await.expect("durable append task must not panic");
     }
 
     let elapsed = start.elapsed();
@@ -478,7 +478,7 @@ async fn ledger_concurrent_spawns_stay_bounded() {
     );
 
     // Verify WAL file has all event entries (exclude MerkleBatchRecord lines)
-    let wal_content = tokio::fs::read_to_string(&wal_path).await.unwrap();
+    let wal_content = tokio::fs::read_to_string(&wal_path).await.expect("WAL file must be readable after all appends");
     let event_count = wal_content
         .lines()
         .filter(|line| !line.contains("\"merkle_root\""))
@@ -548,10 +548,10 @@ fn srr_decision_time_is_roughly_constant() {
 async fn group_commit_fail_close_all_callers_receive_error() {
     use gvm_proxy::ledger::Ledger;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
 
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
+    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger must initialize for fail-close test"));
 
     // Verify normal operation works first
     {
@@ -577,7 +577,7 @@ async fn group_commit_fail_close_all_callers_receive_error() {
             event_hash: None,
         llm_trace: None,
         };
-        ledger.append_durable(&event).await.unwrap();
+        ledger.append_durable(&event).await.expect("initial append must succeed before error injection");
     }
 
     // Inject I/O error — simulates disk failure, permission denied, etc.
@@ -616,7 +616,7 @@ async fn group_commit_fail_close_all_callers_receive_error() {
 
     let mut error_count = 0;
     for handle in handles {
-        let result = handle.await.unwrap();
+        let result = handle.await.expect("fail-close task must not panic");
         if result.is_err() {
             error_count += 1;
         }
@@ -653,5 +653,5 @@ async fn group_commit_fail_close_all_callers_receive_error() {
         llm_trace: None,
     };
     // After disabling error injection, writes should succeed again
-    ledger.append_durable(&event).await.unwrap();
+    ledger.append_durable(&event).await.expect("ledger must recover after error injection is disabled");
 }

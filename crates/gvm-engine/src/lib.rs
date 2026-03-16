@@ -34,6 +34,9 @@ pub struct EvalRequest {
     pub resource: ResourceAttrs,
     /// Subject (who is performing the operation)
     pub subject: SubjectAttrs,
+    /// Context attributes for ABAC condition matching (e.g., amount, currency).
+    #[serde(default)]
+    pub context: ContextAttrs,
     /// Rules to evaluate against
     pub rules: Vec<Rule>,
 }
@@ -50,6 +53,15 @@ pub struct SubjectAttrs {
     pub agent_id: String,
     #[serde(default)]
     pub tenant_id: Option<String>,
+}
+
+/// Context attributes for ABAC condition matching (e.g., amount, currency, time_of_day).
+/// Flattened into the field map with "context." prefix so policies can match on
+/// `context.amount > 500` or `context.currency == "USD"`.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ContextAttrs {
+    #[serde(flatten)]
+    pub attributes: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// A single policy rule.
@@ -207,11 +219,9 @@ fn decision_strictness(decision_type: &str) -> u8 {
 
 /// Build a flat field map from the request for condition matching.
 ///
-/// NOTE: Context attributes (e.g., `context.time_of_day`, `context.ip_address`)
-/// are not yet included. The host-side policy engine (policy.rs) handles context
-/// attributes directly. To support context-based conditions in Wasm evaluation,
-/// add a `context: HashMap<String, serde_json::Value>` field to `EvalRequest`
-/// and flatten it here with "context." prefix.
+/// Includes context attributes flattened with "context." prefix so that
+/// Wasm policy rules can match on `context.amount`, `context.currency`, etc.
+/// This mirrors the host-side policy engine's `resolve_field()` behavior.
 fn build_field_map(req: &EvalRequest) -> HashMap<String, serde_json::Value> {
     let mut m = HashMap::new();
     m.insert("operation".to_string(), serde_json::Value::String(req.operation.clone()));
@@ -221,6 +231,10 @@ fn build_field_map(req: &EvalRequest) -> HashMap<String, serde_json::Value> {
     m.insert("subject.agent_id".to_string(), serde_json::Value::String(req.subject.agent_id.clone()));
     if let Some(ref tid) = req.subject.tenant_id {
         m.insert("subject.tenant_id".to_string(), serde_json::Value::String(tid.clone()));
+    }
+    // Flatten context attributes with "context." prefix
+    for (key, value) in &req.context.attributes {
+        m.insert(format!("context.{}", key), value.clone());
     }
     m
 }
@@ -240,9 +254,15 @@ fn condition_matches(cond: &Condition, fields: &HashMap<String, serde_json::Valu
         None => return false,
     };
 
-    match cond.operator.as_str() {
+    // Normalize operator to lowercase for case-insensitive matching.
+    // The host policy.rs uses PascalCase ("Eq", "StartsWith") while the
+    // canonical Wasm format is snake_case ("eq", "starts_with"). Accepting
+    // both prevents silent Fail-Close when operators are passed without
+    // case conversion.
+    let op_lower = cond.operator.to_lowercase();
+    match op_lower.as_str() {
         "eq" | "==" => field_val == &cond.value,
-        "neq" | "!=" => field_val != &cond.value,
+        "noteq" | "neq" | "!=" => field_val != &cond.value,
         "contains" => {
             if let (Some(haystack), Some(needle)) = (field_val.as_str(), cond.value.as_str()) {
                 haystack.contains(needle)
@@ -250,14 +270,14 @@ fn condition_matches(cond: &Condition, fields: &HashMap<String, serde_json::Valu
                 false
             }
         }
-        "starts_with" => {
+        "startswith" | "starts_with" => {
             if let (Some(haystack), Some(needle)) = (field_val.as_str(), cond.value.as_str()) {
                 haystack.starts_with(needle)
             } else {
                 false
             }
         }
-        "ends_with" => {
+        "endswith" | "ends_with" => {
             if let (Some(haystack), Some(needle)) = (field_val.as_str(), cond.value.as_str()) {
                 haystack.ends_with(needle)
             } else {
@@ -271,15 +291,19 @@ fn condition_matches(cond: &Condition, fields: &HashMap<String, serde_json::Valu
                 false
             }
         }
+        "notin" | "not_in" => {
+            if let Some(arr) = cond.value.as_array() {
+                !arr.contains(field_val)
+            } else {
+                true
+            }
+        }
         // Numeric comparisons (snake_case canonical, symbols accepted)
         "gt" | ">" => compare_numeric(field_val, &cond.value, |a, b| a > b),
         "gte" | ">=" => compare_numeric(field_val, &cond.value, |a, b| a >= b),
         "lt" | "<" => compare_numeric(field_val, &cond.value, |a, b| a < b),
         "lte" | "<=" => compare_numeric(field_val, &cond.value, |a, b| a <= b),
         // Fail-close: unknown operators never match (prevents accidental allow)
-        // NOTE: The host (policy.rs) uses PascalCase operators ("Eq", "StartsWith")
-        // and converts to the Wasm engine's snake_case format when building EvalRequest.
-        // If adding new operators here, update the host's conversion logic as well.
         _ => false,
     }
 }
@@ -303,14 +327,14 @@ mod wasm_ffi {
     /// Allocate memory for the host to write input.
     #[no_mangle]
     pub extern "C" fn engine_alloc(size: u32) -> *mut u8 {
-        let layout = Layout::from_size_align(size as usize, 1).unwrap();
+        let layout = Layout::from_size_align(size as usize, 1).expect("layout with align=1 is always valid for non-zero size");
         unsafe { alloc(layout) }
     }
 
     /// Free memory.
     #[no_mangle]
     pub extern "C" fn engine_dealloc(ptr: *mut u8, size: u32) {
-        let layout = Layout::from_size_align(size as usize, 1).unwrap();
+        let layout = Layout::from_size_align(size as usize, 1).expect("layout with align=1 is always valid for non-zero size");
         unsafe { dealloc(ptr, layout) }
     }
 
@@ -333,7 +357,7 @@ mod wasm_ffi {
                 let error_output = r#"{"error":"invalid UTF-8 input"}"#;
                 let error_bytes = error_output.as_bytes();
                 let total = 4 + error_bytes.len();
-                let layout = Layout::from_size_align(total, 1).unwrap();
+                let layout = Layout::from_size_align(total, 1).expect("error response layout with align=1 cannot fail");
                 let err_ptr = unsafe { alloc(layout) };
                 let len_bytes = (error_bytes.len() as u32).to_le_bytes();
                 unsafe {
@@ -348,7 +372,7 @@ mod wasm_ffi {
         let output_bytes = output.as_bytes();
         let total_len = 4 + output_bytes.len();
 
-        let layout = Layout::from_size_align(total_len, 1).unwrap();
+        let layout = Layout::from_size_align(total_len, 1).expect("response layout with align=1 cannot fail");
         let result_ptr = unsafe { alloc(layout) };
 
         // Write length prefix (little-endian u32)
@@ -378,6 +402,7 @@ mod tests {
                 agent_id: "test-agent".to_string(),
                 tenant_id: None,
             },
+            context: ContextAttrs::default(),
             rules,
         }
     }
@@ -455,9 +480,81 @@ mod tests {
             "rules": []
         }"#;
         let output = evaluate_json(input);
-        let resp: EvalResponse = serde_json::from_str(&output).unwrap();
+        let resp: EvalResponse = serde_json::from_str(&output).expect("evaluate_json must return valid JSON");
         assert_eq!(resp.decision, "Allow");
         assert_eq!(resp.engine_version, "0.1.0-wasm");
+    }
+
+    #[test]
+    fn test_pascal_case_operators_accepted() {
+        // Host policy.rs sends PascalCase operators ("Eq", "StartsWith").
+        // Wasm engine must accept them via case normalization.
+        let req = make_request("gvm.messaging.send", "medium", vec![
+            Rule {
+                id: "pascal-delay".to_string(),
+                priority: 10,
+                layer: "global".to_string(),
+                conditions: vec![
+                    Condition {
+                        field: "operation".to_string(),
+                        operator: "StartsWith".to_string(),  // PascalCase
+                        value: serde_json::Value::String("gvm.messaging".to_string()),
+                    },
+                    Condition {
+                        field: "resource.sensitivity".to_string(),
+                        operator: "Eq".to_string(),  // PascalCase
+                        value: serde_json::Value::String("medium".to_string()),
+                    },
+                ],
+                decision: Decision {
+                    decision_type: "Delay".to_string(),
+                    milliseconds: Some(300),
+                    reason: None,
+                },
+            },
+        ]);
+        let resp = evaluate(&req);
+        assert_eq!(resp.decision, "Delay");
+        assert_eq!(resp.matched_rule.as_deref(), Some("pascal-delay"));
+    }
+
+    #[test]
+    fn test_context_attribute_matching() {
+        let mut ctx = ContextAttrs::default();
+        ctx.attributes.insert("amount".to_string(), serde_json::json!(1500));
+        ctx.attributes.insert("currency".to_string(), serde_json::json!("USD"));
+
+        let req = EvalRequest {
+            operation: "gvm.payment.charge".to_string(),
+            resource: ResourceAttrs {
+                service: "stripe".to_string(),
+                tier: "external".to_string(),
+                sensitivity: "high".to_string(),
+            },
+            subject: SubjectAttrs {
+                agent_id: "test-agent".to_string(),
+                tenant_id: None,
+            },
+            context: ctx,
+            rules: vec![Rule {
+                id: "deny-large-payment".to_string(),
+                priority: 1,
+                layer: "global".to_string(),
+                conditions: vec![Condition {
+                    field: "context.amount".to_string(),
+                    operator: "gt".to_string(),
+                    value: serde_json::json!(1000),
+                }],
+                decision: Decision {
+                    decision_type: "Deny".to_string(),
+                    milliseconds: None,
+                    reason: Some("Payment exceeds limit".to_string()),
+                },
+            }],
+        };
+        let resp = evaluate(&req);
+        assert_eq!(resp.decision, "Deny");
+        assert_eq!(resp.matched_rule.as_deref(), Some("deny-large-payment"));
     }
 
     #[test]
@@ -473,6 +570,7 @@ mod tests {
                 agent_id: "test-agent".to_string(),
                 tenant_id: Some("acme".to_string()),
             },
+            context: ContextAttrs::default(),
             rules: vec![
                 Rule {
                     id: "global-delay".to_string(),

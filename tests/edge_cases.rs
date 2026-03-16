@@ -16,10 +16,10 @@ use std::sync::Arc;
 // ─── Helpers ───
 
 fn srr_from_toml(toml_str: &str) -> NetworkSRR {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp directory creation must succeed");
     let path = dir.path().join("srr.toml");
-    std::fs::write(&path, toml_str).unwrap();
-    NetworkSRR::load(&path).unwrap()
+    std::fs::write(&path, toml_str).expect("writing SRR toml to temp file must succeed");
+    NetworkSRR::load(&path).expect("valid SRR toml must parse")
 }
 
 fn make_operation(
@@ -147,9 +147,9 @@ decision = { type = "Delay", milliseconds = 300 }
 /// Unicode operation name — policy evaluation must handle safely.
 #[test]
 fn edge_unicode_operation_name() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp directory creation must succeed");
     let policy_dir = dir.path().join("policies");
-    std::fs::create_dir(&policy_dir).unwrap();
+    std::fs::create_dir(&policy_dir).expect("policy directory creation must succeed");
 
     std::fs::write(
         policy_dir.join("global.toml"),
@@ -164,9 +164,9 @@ type = "Delay"
 milliseconds = 300
 "#,
     )
-    .unwrap();
+    .expect("writing policy toml to temp file must succeed");
 
-    let engine = PolicyEngine::load(&policy_dir).unwrap();
+    let engine = PolicyEngine::load(&policy_dir).expect("valid policy directory must load");
 
     // Unicode operation name (Korean + emoji)
     let op = make_operation(
@@ -253,9 +253,9 @@ decision = { type = "Delay", milliseconds = 300 }
 /// No rules match any condition — engine should return Allow (default).
 #[test]
 fn edge_policy_no_match_returns_allow() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp directory creation must succeed");
     let policy_dir = dir.path().join("policies");
-    std::fs::create_dir(&policy_dir).unwrap();
+    std::fs::create_dir(&policy_dir).expect("policy directory creation must succeed");
 
     // Only very specific rules that won't match our test operation
     std::fs::write(
@@ -274,9 +274,9 @@ type = "Deny"
 reason = "Blocked"
 "#,
     )
-    .unwrap();
+    .expect("writing policy toml to temp file must succeed");
 
-    let engine = PolicyEngine::load(&policy_dir).unwrap();
+    let engine = PolicyEngine::load(&policy_dir).expect("valid policy directory must load");
 
     let op = make_operation(
         "gvm.storage.read",
@@ -299,9 +299,9 @@ reason = "Blocked"
 /// Global says Allow, Tenant says Deny — Deny must win (strictness rule).
 #[test]
 fn edge_policy_conflicting_layers_deny_wins() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp directory creation must succeed");
     let policy_dir = dir.path().join("policies");
-    std::fs::create_dir(&policy_dir).unwrap();
+    std::fs::create_dir(&policy_dir).expect("policy directory creation must succeed");
 
     std::fs::write(
         policy_dir.join("global.toml"),
@@ -318,7 +318,7 @@ conditions = [
 type = "Allow"
 "#,
     )
-    .unwrap();
+    .expect("writing global policy toml must succeed");
 
     std::fs::write(
         policy_dir.join("tenant-restricted.toml"),
@@ -333,9 +333,9 @@ type = "Deny"
 reason = "Tenant suspended"
 "#,
     )
-    .unwrap();
+    .expect("writing tenant policy toml must succeed");
 
-    let engine = PolicyEngine::load(&policy_dir).unwrap();
+    let engine = PolicyEngine::load(&policy_dir).expect("valid policy directory must load");
 
     let op = make_operation(
         "gvm.storage.read",
@@ -351,7 +351,7 @@ reason = "Tenant suspended"
         "Tenant Deny must override Global Allow, got: {:?}",
         decision
     );
-    assert_eq!(rule_id.unwrap(), "tenant-deny-all");
+    assert_eq!(rule_id.expect("tenant deny rule must match"), "tenant-deny-all");
 }
 
 /// SRR says Allow, Policy says Deny — max_strict should pick Deny.
@@ -440,12 +440,12 @@ fn edge_max_strict_strictness_ordering_complete() {
 /// ABAC rules and correctly returns "no match = Allow" for its layer.
 #[test]
 fn edge_empty_policy_directory() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp directory creation must succeed");
     let policy_dir = dir.path().join("policies");
-    std::fs::create_dir(&policy_dir).unwrap();
+    std::fs::create_dir(&policy_dir).expect("policy directory creation must succeed");
 
     // Empty directory — no TOML files
-    let engine = PolicyEngine::load(&policy_dir).unwrap();
+    let engine = PolicyEngine::load(&policy_dir).expect("empty policy directory must load");
 
     let op = make_operation(
         "gvm.storage.delete",
@@ -466,11 +466,11 @@ fn edge_empty_policy_directory() {
 /// Non-existent policy directory — engine should handle gracefully.
 #[test]
 fn edge_nonexistent_policy_directory() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp directory creation must succeed");
     let policy_dir = dir.path().join("does-not-exist");
 
     // Should not panic — returns empty engine
-    let engine = PolicyEngine::load(&policy_dir).unwrap();
+    let engine = PolicyEngine::load(&policy_dir).expect("nonexistent policy directory must return empty engine");
 
     let op = make_operation("gvm.storage.read", Sensitivity::Low, ResourceTier::Internal, None, "agent");
     let (decision, _) = engine.evaluate(&op);
@@ -485,9 +485,9 @@ fn edge_nonexistent_policy_directory() {
 /// Concurrent status updates to the same event_id — no crash (last-write-wins).
 #[tokio::test]
 async fn edge_concurrent_status_update_no_crash() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp directory creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
+    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger initialization must succeed"));
 
     // Write the same event_id from 10 concurrent tasks
     let mut handles = Vec::new();
@@ -522,16 +522,16 @@ async fn edge_concurrent_status_update_no_crash() {
                 event_hash: None,
         llm_trace: None,
             };
-            ledger.append_durable(&event).await.unwrap();
+            ledger.append_durable(&event).await.expect("concurrent WAL append must succeed");
         }));
     }
 
     for h in handles {
-        h.await.unwrap();
+        h.await.expect("spawned task must complete without panic");
     }
 
     // WAL should have 10 event entries (exclude MerkleBatchRecord lines)
-    let content = tokio::fs::read_to_string(&wal_path).await.unwrap();
+    let content = tokio::fs::read_to_string(&wal_path).await.expect("WAL file must be readable after writes");
     let event_count = content
         .lines()
         .filter(|line| !line.contains("\"merkle_root\""))
@@ -545,13 +545,13 @@ async fn edge_concurrent_status_update_no_crash() {
 /// WAL recovery with only Confirmed events — no events should be expired.
 #[tokio::test]
 async fn edge_recovery_no_pending_events() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp directory creation must succeed");
     let wal_path = dir.path().join("wal.log");
 
     // Pre-write a WAL with only Confirmed events
     {
         use std::io::Write;
-        let mut file = std::fs::File::create(&wal_path).unwrap();
+        let mut file = std::fs::File::create(&wal_path).expect("WAL file creation must succeed");
         for i in 0..5 {
             let event = serde_json::json!({
                 "event_id": format!("evt-{}", i),
@@ -573,12 +573,12 @@ async fn edge_recovery_no_pending_events() {
                 "payload": { "content_hash": "", "size_bytes": 0, "flagged_patterns": [] },
                 "nats_sequence": null
             });
-            writeln!(file, "{}", serde_json::to_string(&event).unwrap()).unwrap();
+            writeln!(file, "{}", serde_json::to_string(&event).expect("event JSON serialization must succeed")).expect("writing event to WAL file must succeed");
         }
     }
 
-    let ledger = Ledger::new(&wal_path, "", "").await.unwrap();
-    let report = ledger.recover_from_wal().await.unwrap();
+    let ledger = Ledger::new(&wal_path, "", "").await.expect("ledger must initialize from pre-written WAL");
+    let report = ledger.recover_from_wal().await.expect("WAL recovery must succeed with confirmed-only events");
 
     assert_eq!(report.pending_found, 0, "No Pending events should be found");
     assert_eq!(report.expired_marked, 0, "No events should be expired");
@@ -593,9 +593,9 @@ async fn edge_recovery_no_pending_events() {
 fn edge_empty_registry_file() {
     use gvm_proxy::registry::OperationRegistry;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp directory creation must succeed");
     let path = dir.path().join("empty_registry.toml");
-    std::fs::write(&path, "").unwrap();
+    std::fs::write(&path, "").expect("writing empty registry file must succeed");
 
     let result = OperationRegistry::load(&path);
     assert!(
@@ -610,7 +610,7 @@ fn edge_empty_registry_file() {
 fn edge_registry_custom_only() {
     use gvm_proxy::registry::OperationRegistry;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp directory creation must succeed");
     let path = dir.path().join("custom_only.toml");
     std::fs::write(
         &path,
@@ -625,9 +625,9 @@ default_ic = 2
 required_context = ["amount"]
 "#,
     )
-    .unwrap();
+    .expect("writing custom registry toml must succeed");
 
-    let registry = OperationRegistry::load(&path).unwrap();
+    let registry = OperationRegistry::load(&path).expect("valid custom-only registry must parse");
     let info = registry.lookup("custom.acme.billing.charge");
     assert!(info.is_some(), "Custom operation should be found");
 }

@@ -1,4 +1,4 @@
-# Part 5: Encrypted Vault
+# Part 5: Vault (Encrypted Agent State Cache)
 
 **Source**: `src/vault.rs` | **Config**: `GVM_VAULT_KEY` environment variable
 
@@ -6,7 +6,25 @@
 
 ## 5.1 Overview
 
-The Vault is an encrypted key-value store for agent state. All values are encrypted with AES-256-GCM before storage. The Vault integrates with the Ledger for WAL-first writes, ensuring that encrypted state changes are crash-safe and fully auditable.
+GVM Vault is an encrypted key-value store for agent runtime state (checkpoints, conversation history, intermediate results). It is **NOT** a secrets manager — API credentials are handled separately by `APIKeyStore` (`src/api_keys.rs`).
+
+**What Vault does:**
+- AES-256-GCM encryption at rest
+- Automatic nonce generation (no reuse)
+- Key zeroing on drop (`zeroize`)
+- WAL-first write for crash recovery metadata
+
+**What Vault does NOT do:**
+- Key rotation
+- Envelope encryption
+- KDF (key derivation function) — key is used directly from env var
+- HSM/KMS integration
+- Access control between agents
+
+**Production deployments should:**
+- Use KMS (AWS KMS, GCP KMS) for master key management
+- Use Redis with TLS for persistent backend (planned)
+- Restrict Vault API to localhost or mTLS-authenticated agents
 
 **Design principle**: Agents never handle raw encryption. The proxy encrypts/decrypts transparently. Key material is zeroed on drop to prevent memory remanence attacks.
 

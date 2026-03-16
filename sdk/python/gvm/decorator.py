@@ -208,6 +208,21 @@ def ic(
                             except Exception:
                                 pass  # Rollback best-effort
 
+                        # Inject rollback context into conversation history
+                        # so the LLM knows why it was rolled back and can
+                        # choose an alternative approach on the next turn.
+                        history = getattr(self, "_conversation_history", None)
+                        if history is not None:
+                            history.append({
+                                "role": "system",
+                                "content": (
+                                    f"[GVM GOVERNANCE] Action '{op}' was blocked. "
+                                    f"Reason: {e}. "
+                                    f"Your state has been restored to before this action. "
+                                    f"Please choose an alternative approach."
+                                ),
+                            })
+
                         raise GVMRollbackError(
                             operation=op,
                             reason=str(e),

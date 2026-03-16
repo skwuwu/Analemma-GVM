@@ -278,6 +278,9 @@ impl WasmEngine {
                 agent_id: operation.subject.agent_id.clone(),
                 tenant_id: operation.subject.tenant_id.clone(),
             },
+            context: gvm_engine::ContextAttrs {
+                attributes: operation.context.attributes.clone(),
+            },
             rules: rules.to_vec(),
         }
     }
@@ -328,10 +331,11 @@ mod tests {
                 agent_id: "test-agent".to_string(),
                 tenant_id: None,
             },
+            context: gvm_engine::ContextAttrs::default(),
             rules: vec![],
         };
 
-        let resp = engine.evaluate(&req).unwrap();
+        let resp = engine.evaluate(&req).expect("native engine evaluation must succeed");
         assert_eq!(resp.decision, "Allow");
     }
 
@@ -350,6 +354,7 @@ mod tests {
                 agent_id: "test-agent".to_string(),
                 tenant_id: None,
             },
+            context: gvm_engine::ContextAttrs::default(),
             rules: vec![gvm_engine::Rule {
                 id: "deny-critical".to_string(),
                 priority: 1,
@@ -367,7 +372,7 @@ mod tests {
             }],
         };
 
-        let resp = engine.evaluate(&req).unwrap();
+        let resp = engine.evaluate(&req).expect("native engine evaluation must succeed");
         assert_eq!(resp.decision, "Deny");
         assert_eq!(resp.reason.as_deref(), Some("Critical data protected"));
     }
@@ -390,7 +395,7 @@ mod tests {
 
     #[test]
     fn test_load_missing_wasm() {
-        let engine = WasmEngine::load(Path::new("nonexistent.wasm")).unwrap();
+        let engine = WasmEngine::load(Path::new("nonexistent.wasm")).expect("missing wasm falls back to native mode");
         assert!(!engine.is_wasm());
     }
 }

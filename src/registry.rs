@@ -258,8 +258,8 @@ mod tests {
     use tempfile::NamedTempFile;
 
     fn write_temp_toml(content: &str) -> NamedTempFile {
-        let mut f = NamedTempFile::new().unwrap();
-        f.write_all(content.as_bytes()).unwrap();
+        let mut f = NamedTempFile::new().expect("temp file creation must succeed");
+        f.write_all(content.as_bytes()).expect("writing TOML to temp file must succeed");
         f
     }
 
@@ -286,7 +286,7 @@ required_context = ["recipient"]
 maps_to = "gvm.messaging.send"
 "#;
         let f = write_temp_toml(toml);
-        let registry = OperationRegistry::load(f.path()).unwrap();
+        let registry = OperationRegistry::load(f.path()).expect("valid registry TOML must load");
 
         assert!(registry.lookup("gvm.messaging.send").is_some());
         assert!(registry.lookup("custom.acme.crm.email").is_some());

@@ -124,7 +124,7 @@ pub fn generate_merkle_proof(leaf_hashes: &[String], index: usize) -> Vec<(Strin
         // Merkle tree behavior and is intentional — it preserves the
         // property that every node has a sibling for proof construction.
         if current_level.len() % 2 == 1 {
-            let last = *current_level.last().unwrap();
+            let last = *current_level.last().expect("merkle proof: level is non-empty (checked by while condition)");
             current_level.push(last);
         }
 
@@ -323,8 +323,8 @@ mod tests {
 
         // Manual: H(a || b)
         let mut hasher = Sha256::new();
-        hasher.update(hex::decode(&a).unwrap());
-        hasher.update(hex::decode(&b).unwrap());
+        hasher.update(hex::decode(&a).expect("test hash 'a' must be valid hex"));
+        hasher.update(hex::decode(&b).expect("test hash 'b' must be valid hex"));
         let expected = hex::encode(hasher.finalize());
 
         assert_eq!(root, expected);
@@ -339,13 +339,13 @@ mod tests {
 
         // Manual: H(H(a,b), H(c,c))
         let mut h_ab = Sha256::new();
-        h_ab.update(hex::decode(&a).unwrap());
-        h_ab.update(hex::decode(&b).unwrap());
+        h_ab.update(hex::decode(&a).expect("test hash 'a' must be valid hex"));
+        h_ab.update(hex::decode(&b).expect("test hash 'b' must be valid hex"));
         let hab: [u8; 32] = h_ab.finalize().into();
 
         let mut h_cc = Sha256::new();
-        h_cc.update(hex::decode(&c).unwrap());
-        h_cc.update(hex::decode(&c).unwrap());
+        h_cc.update(hex::decode(&c).expect("test hash 'c' must be valid hex"));
+        h_cc.update(hex::decode(&c).expect("test hash 'c' must be valid hex"));
         let hcc: [u8; 32] = h_cc.finalize().into();
 
         let mut h_root = Sha256::new();
@@ -363,13 +363,13 @@ mod tests {
 
         // Manually compute balanced tree
         let mut h01 = Sha256::new();
-        h01.update(hex::decode(&leaves[0]).unwrap());
-        h01.update(hex::decode(&leaves[1]).unwrap());
+        h01.update(hex::decode(&leaves[0]).expect("test leaf hash must be valid hex"));
+        h01.update(hex::decode(&leaves[1]).expect("test leaf hash must be valid hex"));
         let n01: [u8; 32] = h01.finalize().into();
 
         let mut h23 = Sha256::new();
-        h23.update(hex::decode(&leaves[2]).unwrap());
-        h23.update(hex::decode(&leaves[3]).unwrap());
+        h23.update(hex::decode(&leaves[2]).expect("test leaf hash must be valid hex"));
+        h23.update(hex::decode(&leaves[3]).expect("test leaf hash must be valid hex"));
         let n23: [u8; 32] = h23.finalize().into();
 
         let mut h_root = Sha256::new();

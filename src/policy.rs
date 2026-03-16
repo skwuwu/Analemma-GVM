@@ -687,6 +687,6 @@ mod tests {
         );
         let (decision, rule_id) = engine.evaluate(&op);
         assert!(matches!(decision, EnforcementDecision::Deny { .. }));
-        assert_eq!(rule_id.unwrap(), "deny-critical-delete");
+        assert_eq!(rule_id.expect("deny rule must produce matched_rule_id"), "deny-critical-delete");
     }
 }

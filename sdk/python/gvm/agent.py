@@ -2,11 +2,17 @@
 
 import os
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
 import gvm.decorator as decorator
 from gvm.checkpoint import CheckpointManager
 from gvm.state import AgentState
+
+# Maximum conversation history turns to include in a checkpoint.
+# Older turns are truncated to prevent checkpoint bloat.
+# Override per-agent via class attribute or constructor.
+MAX_HISTORY_TURNS = 50
 
 
 class GVMAgent:
@@ -42,6 +48,7 @@ class GVMAgent:
 
     state: Optional[AgentState] = None
     auto_checkpoint: Optional[str] = None  # None, "ic2+", "ic3", "all"
+    max_history_turns: int = MAX_HISTORY_TURNS
 
     def __init__(
         self,
@@ -50,15 +57,20 @@ class GVMAgent:
         session_id: str = None,
         proxy_url: str = None,
         auto_checkpoint: str = None,
+        max_history_turns: int = None,
     ):
         self._agent_id = agent_id
         self._tenant_id = tenant_id
         self._session_id = session_id or str(uuid.uuid4())
         self._proxy_url = proxy_url or os.environ.get("GVM_PROXY_URL", "http://127.0.0.1:8080")
+        self._actions_taken = []
+        self._last_llm_response = None
 
         # Checkpoint mode: constructor overrides class attribute
         if auto_checkpoint is not None:
             self.auto_checkpoint = auto_checkpoint
+        if max_history_turns is not None:
+            self.max_history_turns = max_history_turns
 
         # Checkpoint manager for state rollback
         self._checkpoint_mgr = CheckpointManager(self._agent_id, self._proxy_url)
@@ -98,24 +110,78 @@ class GVMAgent:
         return headers
 
     def _get_checkpointable_state(self) -> dict:
-        """Collect agent state for checkpoint serialization."""
+        """Collect agent state for checkpoint serialization.
+
+        Snapshot targets (minimum set for agent to resume after rollback):
+          1. Conversation history — without this, rollback is meaningless
+          2. Execution position — step counter, actions taken
+          3. Business state — VaultField + local field values
+          4. Last LLM response — for replay fidelity
+          5. Metadata — version, timestamp, identity
+
+        Explicitly excluded (and why):
+          - Local variables: not serializable, LLM reconstructs from history
+          - File handles / sockets / DB connections: not serializable, reconnect
+          - Third-party library state: inaccessible
+          - Vector DB contents: external service, outside GVM scope
+          - Already-executed side effects: irreversible (proxy prevents these)
+        """
+        # Truncate history to prevent checkpoint bloat
+        history = self._conversation_history
+        if len(history) > self.max_history_turns:
+            history = history[-self.max_history_turns:]
+
         state = {
-            "_conversation_history": self._conversation_history.copy(),
+            # 1. LLM context (most important — rollback is meaningless without this)
+            "_conversation_history": [h.copy() if isinstance(h, dict) else h for h in history],
+            # 2. Execution position
             "_step": self._checkpoint_mgr.current_step,
+            "_actions_taken": self._actions_taken.copy(),
+            # 3. Last LLM response (replay fidelity)
+            "_last_llm_response": self._last_llm_response,
+            # 4. Metadata
+            "_checkpoint_version": "gvm-checkpoint-v1",
+            "_timestamp": datetime.now(timezone.utc).isoformat(),
+            "_agent_id": self._agent_id,
+            "_session_id": self._session_id,
         }
-        # Collect VaultField values
+
+        # 3. Business state: VaultField + local field values
         if self.state is not None:
             for name in self.state.get_vault_fields():
                 state[f"vault:{name}"] = getattr(self.state, name, None)
             for name in self.state._local_fields:
                 state[f"local:{name}"] = getattr(self.state, name, None)
+
         return state
 
     def _restore_from_state(self, checkpoint_state: dict):
-        """Apply checkpoint state to this agent."""
+        """Apply checkpoint state to this agent.
+
+        Restores conversation history, execution position, business state,
+        and last LLM response. Validates checkpoint version for compatibility.
+        """
+        # Version check
+        version = checkpoint_state.get("_checkpoint_version")
+        if version and version != "gvm-checkpoint-v1":
+            import logging
+            logging.getLogger("gvm.agent").warning(
+                "Checkpoint version mismatch: expected gvm-checkpoint-v1, got %s",
+                version,
+            )
+
+        # 1. Conversation history (most important)
         self._conversation_history = checkpoint_state.get(
             "_conversation_history", []
         )
+
+        # 2. Execution position
+        self._actions_taken = checkpoint_state.get("_actions_taken", [])
+
+        # 3. Last LLM response
+        self._last_llm_response = checkpoint_state.get("_last_llm_response")
+
+        # 4. Business state: VaultField + local field values
         if self.state is not None:
             for name in self.state.get_vault_fields():
                 key = f"vault:{name}"

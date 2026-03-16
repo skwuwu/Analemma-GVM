@@ -345,4 +345,60 @@ Proxy pipeline tests are covered indirectly through:
 
 ---
 
+## 6.9 Governance Block Response
+
+When the proxy blocks an operation (Deny, RequireApproval, Throttle, or infrastructure failure), it returns a standard `GovernanceBlockResponse` JSON body. This is the contract between the proxy and all agent SDKs — every blocked request uses this format so agents can react programmatically.
+
+### Response Schema
+
+```json
+{
+  "blocked": true,
+  "decision": "Deny",
+  "event_id": "evt-abc-123",
+  "trace_id": "trace-xyz",
+  "operation": "gvm.messaging.send",
+  "reason": "Policy rule finance-002 blocks transfers above $10,000",
+  "mode": "halt",
+  "next_action": "Contact administrator to request an exception",
+  "retry_after_secs": null,
+  "rollback_hint": "trace-xyz",
+  "matched_rule_id": "finance-002",
+  "ic_level": 3
+}
+```
+
+### Block Response Modes
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `halt` | Stop execution immediately. Agent must not retry. | Deny: categorically forbidden operations |
+| `soft_pivot` | Suggest alternatives. Agent may adapt and retry differently. | RequireApproval: downgrade scope or wait for approval |
+| `rollback` | Roll back current transaction and retry after conditions change. | Throttle: rate limit exceeded, retry after window |
+
+### Configuration
+
+```toml
+[enforcement.on_block]
+deny = "halt"                    # Deny: stop execution immediately
+require_approval = "soft_pivot"  # IC-3: suggest alternatives
+throttle = "rollback"            # Rate limit: roll back and retry later
+infrastructure_failure = "halt"  # WAL/disk failure: halt for safety
+```
+
+### HTTP Headers
+
+Block responses include these headers for SDK consumption:
+
+| Header | Description |
+|--------|-------------|
+| `X-GVM-Decision` | Decision type (Deny, RequireApproval, Throttle) |
+| `X-GVM-Block-Mode` | Block response mode (halt, soft_pivot, rollback) |
+| `X-GVM-Event-Id` | Audit trail correlation ID |
+| `X-GVM-Trace-Id` | Distributed trace correlation ID |
+| `X-GVM-Rollback-Hint` | Trace ID for SDK checkpoint recovery |
+| `Retry-After` | Seconds to wait before retrying (Rollback mode only) |
+
+---
+
 [← Part 5: Encrypted Vault](05-vault.md) | [Part 7: Python SDK →](07-sdk.md)

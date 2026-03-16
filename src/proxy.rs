@@ -1,4 +1,5 @@
 use crate::api_keys::APIKeyStore;
+use crate::config::OnBlockConfig;
 use crate::ledger::Ledger;
 use crate::llm_trace;
 use crate::policy::PolicyEngine;
@@ -26,10 +27,16 @@ pub struct AppState {
     pub rate_limiter: Arc<RateLimiter>,
     /// Layer 1: Wasm governance engine (immutable policy sandbox)
     pub wasm_engine: Arc<WasmEngine>,
+    /// Checkpoint Merkle tree registry — tracks plaintext content hashes
+    /// as leaves for O(log N) Merkle proof verification on restore.
+    pub checkpoint_registry: crate::api::CheckpointRegistry,
     pub http_client: hyper_util::client::legacy::Client<
         hyper_util::client::legacy::connect::HttpConnector,
         Body,
     >,
+    /// Per-decision block response mode configuration.
+    /// Controls how agents should react to blocked operations.
+    pub on_block: OnBlockConfig,
     /// Dev-only: remap external hostnames to local addresses for forwarding.
     /// SRR matching uses the original host; only forwarding is redirected.
     pub host_overrides: HashMap<String, String>,
@@ -117,13 +124,32 @@ pub async fn proxy_handler(
     // ── Step 3: Rate Limit check ──
     if let EnforcementDecision::Throttle { max_per_minute } = &classification.decision {
         if !state.rate_limiter.check(agent_id, *max_per_minute) {
-            return error_response_detailed(
+            let operation_name = gvm_headers
+                .as_ref()
+                .map(|h| h.operation.as_str())
+                .unwrap_or("unknown");
+            return governance_block_response(
                 StatusCode::TOO_MANY_REQUESTS,
-                "Rate limit exceeded",
-                Some("Throttle"),
-                None,
-                Some("Wait and retry after the rate limit window resets"),
-                Some(60),
+                GovernanceBlockResponse {
+                    blocked: true,
+                    decision: "Throttle".to_string(),
+                    event_id: String::new(),
+                    trace_id: gvm_headers
+                        .as_ref()
+                        .map(|h| h.trace_id.clone())
+                        .unwrap_or_default(),
+                    operation: operation_name.to_string(),
+                    reason: format!(
+                        "Rate limit exceeded: {} requests/min maximum",
+                        max_per_minute
+                    ),
+                    mode: state.on_block.throttle.clone(),
+                    next_action: "Wait and retry after the rate limit window resets".to_string(),
+                    retry_after_secs: Some(60),
+                    rollback_hint: None,
+                    matched_rule_id: classification.matched_rule_id.clone(),
+                    ic_level: 2,
+                },
             );
         }
     }
@@ -160,13 +186,22 @@ pub async fn proxy_handler(
             event.status = EventStatus::Pending;
             if let Err(e) = state.ledger.append_durable(&event).await {
                 tracing::error!(error = %e, "WAL write failed — rejecting request (Fail-Close)");
-                return error_response_detailed(
+                return governance_block_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "Audit log unavailable — request rejected for safety",
-                    None,
-                    None,
-                    Some("Check proxy logs. The WAL ledger may be full or the disk may be unavailable."),
-                    None,
+                    GovernanceBlockResponse {
+                        blocked: true,
+                        decision: "InfrastructureFailure".to_string(),
+                        event_id: event.event_id.clone(),
+                        trace_id: event.trace_id.clone(),
+                        operation: event.operation.clone(),
+                        reason: "Audit log unavailable — request rejected for safety".to_string(),
+                        mode: state.on_block.infrastructure_failure.clone(),
+                        next_action: "Check proxy logs. The WAL ledger may be full or the disk may be unavailable.".to_string(),
+                        retry_after_secs: None,
+                        rollback_hint: Some(event.trace_id.clone()),
+                        matched_rule_id: None,
+                        ic_level: 2,
+                    },
                 );
             }
 
@@ -214,22 +249,26 @@ pub async fn proxy_handler(
                 urgency = ?urgency,
                 "Request requires approval — blocked"
             );
-            let mut response = error_response_detailed(
+            governance_block_response(
                 StatusCode::FORBIDDEN,
-                &format!(
-                    "IC-3: Administrator approval required (urgency: {:?})",
-                    urgency
-                ),
-                Some("RequireApproval"),
-                Some(&event.event_id),
-                Some("Submit approval request to your GVM administrator"),
-                None,
-            );
-            // Include trace_id as rollback hint for SDK checkpoint recovery
-            if let Ok(v) = axum::http::HeaderValue::from_str(&event.trace_id) {
-                response.headers_mut().insert("X-GVM-Rollback-Hint", v);
-            }
-            response
+                GovernanceBlockResponse {
+                    blocked: true,
+                    decision: "RequireApproval".to_string(),
+                    event_id: event.event_id.clone(),
+                    trace_id: event.trace_id.clone(),
+                    operation: event.operation.clone(),
+                    reason: format!(
+                        "IC-3: Administrator approval required (urgency: {:?})",
+                        urgency
+                    ),
+                    mode: state.on_block.require_approval.clone(),
+                    next_action: "Submit approval request to your GVM administrator".to_string(),
+                    retry_after_secs: None,
+                    rollback_hint: Some(event.trace_id.clone()),
+                    matched_rule_id: classification.matched_rule_id.clone(),
+                    ic_level: 3,
+                },
+            )
         }
 
         EnforcementDecision::Deny { reason } => {
@@ -246,19 +285,23 @@ pub async fn proxy_handler(
                 reason = %reason,
                 "Request denied by policy"
             );
-            let mut response = error_response_detailed(
+            governance_block_response(
                 StatusCode::FORBIDDEN,
-                reason,
-                Some("Deny"),
-                Some(&event.event_id),
-                Some("This operation is blocked by policy. Contact your GVM administrator to review the rule."),
-                None,
-            );
-            // Include trace_id as rollback hint for SDK checkpoint recovery
-            if let Ok(v) = axum::http::HeaderValue::from_str(&event.trace_id) {
-                response.headers_mut().insert("X-GVM-Rollback-Hint", v);
-            }
-            response
+                GovernanceBlockResponse {
+                    blocked: true,
+                    decision: "Deny".to_string(),
+                    event_id: event.event_id.clone(),
+                    trace_id: event.trace_id.clone(),
+                    operation: event.operation.clone(),
+                    reason: reason.clone(),
+                    mode: state.on_block.deny.clone(),
+                    next_action: "This operation is blocked by policy. Contact your GVM administrator to review the rule.".to_string(),
+                    retry_after_secs: None,
+                    rollback_hint: Some(event.trace_id.clone()),
+                    matched_rule_id: classification.matched_rule_id.clone(),
+                    ic_level: 3,
+                },
+            )
         }
 
         EnforcementDecision::Throttle { .. } => {
@@ -518,10 +561,13 @@ async fn forward_request(
             Response::from_parts(parts, Body::from_stream(body_stream))
         }
         Err(e) => {
+            // Log full error for operators, but return sanitized message to clients.
+            // Hyper errors can reveal internal network topology (hostnames, ports,
+            // connection refused details) which aids reconnaissance attacks.
             tracing::error!(error = %e, "Upstream request failed");
             error_response(
                 StatusCode::BAD_GATEWAY,
-                &format!("Upstream error: {}", e),
+                "Upstream service unavailable",
             )
         }
     }
@@ -750,6 +796,54 @@ fn error_response_detailed(
             Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Body::empty())
-                .unwrap()
+                .expect("fallback 500 response with empty body cannot fail")
+        })
+}
+
+/// Build a structured governance block response.
+///
+/// Returns the standard `GovernanceBlockResponse` JSON body with appropriate
+/// HTTP headers for SDK consumption. This is the contract between the proxy
+/// and all agent SDKs — every blocked request uses this format.
+fn governance_block_response(
+    status: StatusCode,
+    block: GovernanceBlockResponse,
+) -> Response<Body> {
+    let body = serde_json::to_string(&block).unwrap_or_else(|_| {
+        // Serialization of GovernanceBlockResponse should never fail,
+        // but if it does, return a minimal valid JSON.
+        r#"{"blocked":true,"error":"internal serialization error"}"#.to_string()
+    });
+
+    let mut builder = Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .header("X-GVM-Decision", &block.decision)
+        .header("X-GVM-Block-Mode", match &block.mode {
+            BlockResponseMode::Halt => "halt",
+            BlockResponseMode::SoftPivot => "soft_pivot",
+            BlockResponseMode::Rollback => "rollback",
+        });
+
+    if !block.event_id.is_empty() {
+        builder = builder.header("X-GVM-Event-Id", &block.event_id);
+    }
+    if !block.trace_id.is_empty() {
+        builder = builder.header("X-GVM-Trace-Id", &block.trace_id);
+    }
+    if let Some(ref hint) = block.rollback_hint {
+        builder = builder.header("X-GVM-Rollback-Hint", hint.as_str());
+    }
+    if let Some(secs) = block.retry_after_secs {
+        builder = builder.header("Retry-After", secs.to_string());
+    }
+
+    builder
+        .body(Body::from(body))
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::empty())
+                .expect("fallback 500 response with empty body cannot fail")
         })
 }

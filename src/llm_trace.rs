@@ -270,7 +270,7 @@ mod tests {
         });
 
         let trace =
-            extract_thinking_trace("openai", body.to_string().as_bytes()).unwrap();
+            extract_thinking_trace("openai", body.to_string().as_bytes()).expect("valid OpenAI response must parse");
         assert_eq!(trace.provider, "openai");
         assert_eq!(trace.model.as_deref(), Some("o1-preview"));
         assert_eq!(
@@ -278,7 +278,7 @@ mod tests {
             Some("Let me think step by step...")
         );
         assert!(!trace.truncated);
-        assert_eq!(trace.usage.as_ref().unwrap().total_tokens, Some(150));
+        assert_eq!(trace.usage.as_ref().expect("trace must contain usage data").total_tokens, Some(150));
     }
 
     #[test]
@@ -297,14 +297,14 @@ mod tests {
         });
 
         let trace =
-            extract_thinking_trace("anthropic", body.to_string().as_bytes()).unwrap();
+            extract_thinking_trace("anthropic", body.to_string().as_bytes()).expect("valid Anthropic response must parse");
         assert_eq!(trace.provider, "anthropic");
         assert_eq!(trace.model.as_deref(), Some("claude-sonnet-4-20250514"));
         assert_eq!(
             trace.thinking.as_deref(),
             Some("First, I need to consider...")
         );
-        assert_eq!(trace.usage.as_ref().unwrap().prompt_tokens, Some(200));
+        assert_eq!(trace.usage.as_ref().expect("trace must contain usage data").prompt_tokens, Some(200));
     }
 
     #[test]
@@ -327,7 +327,7 @@ mod tests {
         });
 
         let trace =
-            extract_thinking_trace("gemini", body.to_string().as_bytes()).unwrap();
+            extract_thinking_trace("gemini", body.to_string().as_bytes()).expect("valid Gemini response must parse");
         assert_eq!(trace.provider, "gemini");
         assert_eq!(
             trace.model.as_deref(),
@@ -337,7 +337,7 @@ mod tests {
             trace.thinking.as_deref(),
             Some("Reasoning through the problem...")
         );
-        assert_eq!(trace.usage.as_ref().unwrap().total_tokens, Some(80));
+        assert_eq!(trace.usage.as_ref().expect("trace must contain usage data").total_tokens, Some(80));
     }
 
     #[test]
@@ -351,9 +351,9 @@ mod tests {
         });
 
         let trace =
-            extract_thinking_trace("openai", body.to_string().as_bytes()).unwrap();
+            extract_thinking_trace("openai", body.to_string().as_bytes()).expect("valid OpenAI response must parse");
         assert!(trace.thinking.is_none());
-        assert_eq!(trace.usage.as_ref().unwrap().total_tokens, Some(15));
+        assert_eq!(trace.usage.as_ref().expect("trace must contain usage data").total_tokens, Some(15));
     }
 
     #[test]
@@ -367,7 +367,7 @@ mod tests {
         let long_text = "a".repeat(3000);
         let (result, truncated) = truncate_thinking(Some(long_text));
         assert!(truncated);
-        assert!(result.unwrap().len() < 3000);
+        assert!(result.expect("truncated text must be Some").len() < 3000);
     }
 
     #[test]

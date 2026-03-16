@@ -9,6 +9,13 @@ default_decision = { type = "Delay", milliseconds = 500 }
 ic1_async_ledger = true
 ic1_loss_threshold = 0.0001
 
+# Finance: strict block modes — all decisions halt immediately
+[enforcement.on_block]
+deny = "halt"
+require_approval = "halt"
+throttle = "halt"
+infrastructure_failure = "halt"
+
 [nats]
 url = "nats://127.0.0.1:4222"
 stream = "gvm-audit-finance"

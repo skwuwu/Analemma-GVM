@@ -1,9 +1,209 @@
+use crate::merkle;
 use crate::proxy::AppState;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{Response, StatusCode};
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+// ─── Checkpoint Merkle Tree Registry ───
+
+/// Per-agent checkpoint state: ordered leaf hashes and current Merkle root.
+///
+/// Uses the same Merkle tree implementation as the WAL audit ledger (`merkle.rs`).
+/// Each checkpoint's content hash is a leaf. All leaves form a Merkle tree
+/// whose root changes on every new checkpoint. On restore, verification
+/// uses O(log N) Merkle proof — same as WAL event verification.
+///
+/// ```text
+/// Checkpoint 0 hash ─┐
+///                     ├─ H(0,1) ─┐
+/// Checkpoint 1 hash ─┘           │
+///                                ├─ merkle_root
+/// Checkpoint 2 hash ─┐           │
+///                     ├─ H(2,3) ─┘
+/// Checkpoint 3 hash ─┘
+/// ```
+#[derive(Clone, Debug)]
+struct AgentCheckpointTree {
+    /// Ordered leaf hashes (index = step number).
+    leaves: Vec<String>,
+    /// Current Merkle root over all leaves.
+    merkle_root: String,
+}
+
+/// Registration result returned to the checkpoint_write handler.
+#[derive(Clone, Debug)]
+pub struct CheckpointRegistration {
+    /// SHA-256 of the plaintext state.
+    pub content_hash: String,
+    /// Current Merkle root after including this checkpoint.
+    pub merkle_root: String,
+}
+
+/// Verification result returned to the checkpoint_read handler.
+#[derive(Clone, Debug)]
+pub struct CheckpointVerification {
+    /// Whether the content hash matches the stored leaf.
+    pub content_verified: bool,
+    /// Whether the Merkle proof verifies against the root.
+    pub proof_verified: bool,
+    /// Current Merkle root.
+    pub merkle_root: Option<String>,
+}
+
+/// Per-agent checkpoint Merkle tree for integrity verification.
+///
+/// On write: computes plaintext content hash, appends as leaf, recomputes Merkle root.
+/// On read: recomputes content hash, generates Merkle proof, verifies against root.
+/// Reuses `merkle::compute_merkle_root()`, `merkle::generate_merkle_proof()`,
+/// and `merkle::verify_merkle_proof()` — same primitives as WAL batch verification.
+#[derive(Clone, Default)]
+pub struct CheckpointRegistry {
+    /// agent_id → AgentCheckpointTree
+    trees: Arc<RwLock<HashMap<String, AgentCheckpointTree>>>,
+}
+
+impl CheckpointRegistry {
+    pub fn new() -> Self {
+        Self {
+            trees: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Register a checkpoint's plaintext hash as a new leaf in the agent's Merkle tree.
+    /// Returns the content hash and updated Merkle root.
+    pub async fn register(
+        &self,
+        agent_id: &str,
+        step: u64,
+        plaintext: &[u8],
+    ) -> CheckpointRegistration {
+        let mut hasher = Sha256::new();
+        hasher.update(plaintext);
+        let content_hash = hex::encode(hasher.finalize());
+
+        let mut trees = self.trees.write().await;
+        let tree = trees.entry(agent_id.to_string()).or_insert_with(|| {
+            AgentCheckpointTree {
+                leaves: Vec::new(),
+                merkle_root: String::new(),
+            }
+        });
+
+        // Ensure leaves vector is large enough for this step
+        // (steps should be sequential, but handle gaps gracefully)
+        while tree.leaves.len() <= step as usize {
+            // Fill gaps with a placeholder hash (should not happen in normal flow)
+            if tree.leaves.len() < step as usize {
+                let mut gap_hasher = Sha256::new();
+                gap_hasher.update(b"__gap__");
+                gap_hasher.update(tree.leaves.len().to_le_bytes());
+                tree.leaves.push(hex::encode(gap_hasher.finalize()));
+            } else {
+                tree.leaves.push(content_hash.clone());
+            }
+        }
+
+        // If step already exists (overwrite), update the leaf
+        if (step as usize) < tree.leaves.len() {
+            tree.leaves[step as usize] = content_hash.clone();
+        }
+
+        // Recompute Merkle root over all leaves
+        tree.merkle_root = merkle::compute_merkle_root(&tree.leaves);
+
+        tracing::debug!(
+            agent = agent_id,
+            step = step,
+            content_hash = %content_hash,
+            merkle_root = %tree.merkle_root,
+            total_leaves = tree.leaves.len(),
+            "Checkpoint leaf registered in Merkle tree"
+        );
+
+        CheckpointRegistration {
+            content_hash,
+            merkle_root: tree.merkle_root.clone(),
+        }
+    }
+
+    /// Verify a decrypted checkpoint against the Merkle tree.
+    /// Recomputes the content hash, generates a Merkle proof for the leaf,
+    /// and verifies it against the stored root.
+    pub async fn verify(
+        &self,
+        agent_id: &str,
+        step: u64,
+        decrypted: &[u8],
+    ) -> CheckpointVerification {
+        let mut hasher = Sha256::new();
+        hasher.update(decrypted);
+        let computed_hash = hex::encode(hasher.finalize());
+
+        let trees = self.trees.read().await;
+        let tree = match trees.get(agent_id) {
+            Some(t) => t,
+            None => {
+                tracing::warn!(
+                    agent = agent_id,
+                    step = step,
+                    "No checkpoint tree found for agent — cannot verify"
+                );
+                return CheckpointVerification {
+                    content_verified: false,
+                    proof_verified: false,
+                    merkle_root: None,
+                };
+            }
+        };
+
+        let idx = step as usize;
+        if idx >= tree.leaves.len() {
+            tracing::warn!(
+                agent = agent_id,
+                step = step,
+                total_leaves = tree.leaves.len(),
+                "Checkpoint step exceeds tree size — cannot verify"
+            );
+            return CheckpointVerification {
+                content_verified: false,
+                proof_verified: false,
+                merkle_root: Some(tree.merkle_root.clone()),
+            };
+        }
+
+        // 1. Content hash verification: does decrypted data match the stored leaf?
+        let content_verified = computed_hash == tree.leaves[idx];
+
+        // 2. Merkle proof verification: O(log N) proof against the root
+        let proof = merkle::generate_merkle_proof(&tree.leaves, idx);
+        let proof_verified =
+            merkle::verify_merkle_proof(&computed_hash, &proof, &tree.merkle_root);
+
+        if !content_verified || !proof_verified {
+            tracing::warn!(
+                agent = agent_id,
+                step = step,
+                content_ok = content_verified,
+                proof_ok = proof_verified,
+                computed = %computed_hash,
+                stored = %tree.leaves[idx],
+                "Checkpoint Merkle verification FAILED"
+            );
+        }
+
+        CheckpointVerification {
+            content_verified,
+            proof_verified,
+            merkle_root: Some(tree.merkle_root.clone()),
+        }
+    }
+}
 
 // ─── Vault REST API ───
 
@@ -108,22 +308,33 @@ pub async fn vault_delete(
 /// PUT /gvm/vault/checkpoint/:agent_id/:step — Save agent state checkpoint
 ///
 /// Stores a serialized agent state snapshot keyed by agent_id + step number.
-/// Used by SDK for automatic rollback on Deny/RequireApproval decisions.
+/// Computes plaintext content hash, adds it as a leaf in the agent's
+/// Merkle tree, and recomputes the root for integrity verification on restore.
 pub async fn checkpoint_write(
     State(state): State<AppState>,
     Path((agent_id, step)): Path<(String, u64)>,
     body: axum::body::Bytes,
 ) -> Response<Body> {
+    // Register plaintext hash as Merkle leaf BEFORE encryption
+    let reg = state.checkpoint_registry.register(&agent_id, step, &body).await;
+
     let key = format!("checkpoint:{}:{}", agent_id, step);
     match state.vault.write(&key, &body, &agent_id).await {
         Ok(()) => {
-            tracing::debug!(agent = %agent_id, step = step, "Checkpoint saved");
+            tracing::debug!(
+                agent = %agent_id, step = step,
+                content_hash = %reg.content_hash,
+                merkle_root = %reg.merkle_root,
+                "Checkpoint saved as Merkle leaf"
+            );
             json_response(
                 StatusCode::OK,
                 &serde_json::json!({
                     "status": "ok",
                     "checkpoint_step": step,
                     "agent_id": agent_id,
+                    "content_hash": reg.content_hash,
+                    "merkle_root": reg.merkle_root,
                 }),
             )
         }
@@ -139,8 +350,9 @@ pub async fn checkpoint_write(
 
 /// GET /gvm/vault/checkpoint/:agent_id/:step — Restore agent state checkpoint
 ///
-/// Retrieves and decrypts a previously saved checkpoint.
-/// Returns the raw checkpoint bytes with Merkle verification header.
+/// Retrieves and decrypts a previously saved checkpoint, then verifies
+/// the decrypted content via Merkle proof against the tree root.
+/// Returns real `X-GVM-Merkle-Verified` status based on O(log N) proof verification.
 pub async fn checkpoint_read(
     State(state): State<AppState>,
     Path((agent_id, step)): Path<(String, u64)>,
@@ -148,19 +360,47 @@ pub async fn checkpoint_read(
     let key = format!("checkpoint:{}:{}", agent_id, step);
     match state.vault.read(&key, &agent_id).await {
         Ok(Some(data)) => {
-            tracing::debug!(agent = %agent_id, step = step, "Checkpoint restored");
-            Response::builder()
+            // Verify decrypted content via Merkle proof
+            let v = state
+                .checkpoint_registry
+                .verify(&agent_id, step, &data)
+                .await;
+
+            let merkle_verified = v.content_verified && v.proof_verified;
+
+            if !merkle_verified {
+                tracing::warn!(
+                    agent = %agent_id, step = step,
+                    content_ok = v.content_verified,
+                    proof_ok = v.proof_verified,
+                    "Checkpoint Merkle verification FAILED — possible tampering"
+                );
+            } else {
+                tracing::debug!(
+                    agent = %agent_id, step = step,
+                    "Checkpoint restored (Merkle verified)"
+                );
+            }
+
+            let mut builder = Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", "application/octet-stream")
                 .header("X-GVM-Checkpoint-Step", step.to_string())
-                .header("X-GVM-Merkle-Verified", "true")
-                .body(Body::from(data))
-                .unwrap_or_else(|_| {
-                    Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Body::empty())
-                        .unwrap()
-                })
+                .header(
+                    "X-GVM-Merkle-Verified",
+                    if merkle_verified { "true" } else { "false" },
+                );
+
+            if let Some(ref root) = v.merkle_root {
+                builder = builder.header("X-GVM-Merkle-Root", root.as_str());
+            }
+
+            builder.body(Body::from(data)).unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::empty())
+                    .expect("fallback 500 response with empty body cannot fail")
+            })
         }
         Ok(None) => json_response(
             StatusCode::NOT_FOUND,
@@ -171,6 +411,32 @@ pub async fn checkpoint_read(
             json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &serde_json::json!({"error": "Checkpoint retrieval failed"}),
+            )
+        }
+    }
+}
+
+/// DELETE /gvm/vault/checkpoint/:agent_id/:step — Delete a checkpoint (TTL cleanup)
+///
+/// Used by SDK to delete old checkpoints and prevent Vault bloat.
+pub async fn checkpoint_delete(
+    State(state): State<AppState>,
+    Path((agent_id, step)): Path<(String, u64)>,
+) -> Response<Body> {
+    let key = format!("checkpoint:{}:{}", agent_id, step);
+    match state.vault.delete(&key, &agent_id).await {
+        Ok(()) => {
+            tracing::debug!(agent = %agent_id, step = step, "Checkpoint deleted");
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({"status": "deleted", "checkpoint_step": step}),
+            )
+        }
+        Err(e) => {
+            tracing::error!(agent = %agent_id, step = step, error = %e, "Checkpoint delete failed");
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({"error": "Checkpoint delete failed"}),
             )
         }
     }
@@ -322,6 +588,6 @@ fn json_response(status: StatusCode, body: &serde_json::Value) -> Response<Body>
             Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(Body::empty())
-                .unwrap()
+                .expect("fallback 500 response with empty body cannot fail")
         })
 }

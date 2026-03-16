@@ -9,6 +9,13 @@ default_decision = { type = "Delay", milliseconds = 300 }
 ic1_async_ledger = true
 ic1_loss_threshold = 0.001
 
+# SaaS: balanced — allow soft pivot for approvals
+[enforcement.on_block]
+deny = "halt"
+require_approval = "soft_pivot"
+throttle = "rollback"
+infrastructure_failure = "halt"
+
 [nats]
 url = "nats://127.0.0.1:4222"
 stream = "gvm-audit-saas"

@@ -55,6 +55,41 @@ When in doubt, block. The system defaults to **Delay 300ms** (Default-to-Caution
 
 ---
 
+## Why HTTP Proxy?
+
+### Three Enforcement Models and Their Tradeoffs
+
+| Model | Strength | Weakness |
+|-------|----------|----------|
+| **SDK only** | Rich semantic context (operation name, resource, ABAC attributes) | Agent can bypass by not using the SDK |
+| **Sandbox only** (seccomp/gVisor) | Impossible to bypass from userspace | Semantic blindness — sees `write(fd, buf, len)`, not "transfer $50K to account X" |
+| **Proxy only** | Framework-agnostic, no agent cooperation needed | Cannot see agent-internal intent (operation name, IC level) |
+
+No single model covers all requirements. GVM uses a **proxy + SDK hybrid**:
+
+- **Level 0 (proxy only)**: Immediate value with zero agent changes. SRR inspects URLs and payloads, API keys are injected by the proxy, all traffic is audited. This is the "Datadog pattern" — drop in a proxy, get visibility instantly.
+- **Level 1 (+ SDK `@ic` decorator)**: Agent declares operation semantics. ABAC policy evaluates context attributes. Checkpoint/rollback on denial. Progressive adoption — the agent opts in to richer governance.
+- **Level 2 (+ `gvm run` mandatory interception)**: Network namespace isolation ensures the agent cannot bypass the proxy. Full enforcement without agent cooperation.
+
+This progressive adoption path mirrors how observability tools (Datadog, New Relic) gain traction: start with infrastructure-level metrics (free), then instrument application code for traces and custom metrics (opt-in). GVM starts with network-level governance (free), then adds semantic governance (opt-in).
+
+### Why HTTP Layer, Not Syscall Layer
+
+The enforcement layer determines what the system can *see*:
+
+| Layer | Sees | Does Not See |
+|-------|------|-------------|
+| **Syscall** (`write`, `connect`, `sendto`) | File descriptors, raw bytes, IP addresses | HTTP method, hostname, URL path, request body structure |
+| **HTTP** (`POST api.bank.com/transfer`) | Method, host, path, headers, JSON body fields | Raw socket operations, file I/O, process control |
+
+For **governance** (deciding whether an agent *should* perform an action), semantic visibility is essential. A syscall-level monitor sees `connect(fd, 93.184.216.34:443)` + `write(fd, <TLS bytes>)` — it cannot distinguish a balance check from a wire transfer. An HTTP proxy sees `POST api.bank.com/v1/transfers {"amount": 50000, "currency": "USD"}` and can make a meaningful policy decision.
+
+Syscall-level enforcement solves a *different* problem: **containment** (preventing an agent from escaping its sandbox). This is Layer 3 territory — preventing raw socket connections, file system escapes, and process spawning. GVM's planned `gvm run` uses network namespace isolation (a syscall-level mechanism) precisely for this containment purpose.
+
+**Summary**: Syscall for containment (can the agent escape?), HTTP for governance (should the agent do this?). Different layers solve different problems. GVM enforces governance at the HTTP layer where semantic context is available, and plans containment at the syscall/namespace layer where bypass prevention is guaranteed.
+
+---
+
 ## Document Map
 
 | Part | Title | File |
@@ -72,6 +107,8 @@ When in doubt, block. The system defaults to **Delay 300ms** (Default-to-Caution
 | 9 | [Test Coverage Report](09-test-report.md) | `tests/hostile.rs` |
 | 10 | [Architecture Changes](10-architecture-changes.md) | `docs/10-architecture-changes.md` |
 | 11 | [Competitive Analysis: GVM vs OPA+Envoy](11-competitive-analysis.md) | `docs/11-competitive-analysis.md` |
+| 12 | [Security Model & Known Attack Surface](12-security-model.md) | `docs/12-security-model.md` |
+| 13 | [Roadmap: Planned Features & Future Enhancements](13-roadmap.md) | `docs/13-roadmap.md` |
 
 ---
 

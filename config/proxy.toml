@@ -6,6 +6,14 @@ default_decision = { type = "Delay", milliseconds = 300 }
 ic1_async_ledger = true
 ic1_loss_threshold = 0.001
 
+# Agent block response modes: halt | soft_pivot | rollback
+# Controls what action hint agents receive when an operation is blocked.
+[enforcement.on_block]
+deny = "halt"                    # Deny: stop execution immediately
+require_approval = "soft_pivot"  # IC-3: suggest alternatives, allow retry
+throttle = "rollback"            # Rate limit: roll back and retry later
+infrastructure_failure = "halt"  # WAL/disk failure: halt for safety
+
 [nats]
 url = "nats://localhost:4222"
 stream = "gvm-audit"

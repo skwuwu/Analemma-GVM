@@ -91,6 +91,7 @@ fn wasm_oversized_input_handled_gracefully() {
             agent_id: "test-agent".to_string(),
             tenant_id: None,
         },
+        context: gvm_engine::ContextAttrs::default(),
         rules: vec![],
     };
 
@@ -99,10 +100,10 @@ fn wasm_oversized_input_handled_gracefully() {
     assert_eq!(resp.decision, "Allow", "No rules = Allow");
 
     // JSON roundtrip with huge input
-    let json = serde_json::to_string(&req).unwrap();
+    let json = serde_json::to_string(&req).expect("valid EvalRequest must serialize to JSON");
     assert!(json.len() > 1_000_000, "JSON must contain the huge operation name");
     let output = gvm_engine::evaluate_json(&json);
-    let parsed: gvm_engine::EvalResponse = serde_json::from_str(&output).unwrap();
+    let parsed: gvm_engine::EvalResponse = serde_json::from_str(&output).expect("engine output must be valid EvalResponse JSON");
     assert_eq!(parsed.decision, "Allow");
 }
 
@@ -133,6 +134,7 @@ fn wasm_unicode_boundary_operation_names() {
                 agent_id: "test-agent".to_string(),
                 tenant_id: None,
             },
+            context: gvm_engine::ContextAttrs::default(),
             rules: vec![],
         };
 
@@ -157,6 +159,7 @@ fn wasm_null_bytes_in_string_fields() {
             agent_id: "agent\0-001".to_string(),
             tenant_id: Some("tenant\0-001".to_string()),
         },
+        context: gvm_engine::ContextAttrs::default(),
         rules: vec![gvm_engine::Rule {
             id: "rule\0-001".to_string(),
             priority: 1,
@@ -243,6 +246,7 @@ async fn wasm_concurrent_native_evaluations_no_corruption() {
                     agent_id: format!("agent-{}", i),
                     tenant_id: None,
                 },
+                context: gvm_engine::ContextAttrs::default(),
                 rules: if i % 3 == 0 {
                     vec![gvm_engine::Rule {
                         id: format!("rule-{}", i),
@@ -260,13 +264,13 @@ async fn wasm_concurrent_native_evaluations_no_corruption() {
                 },
             };
 
-            let resp = engine.evaluate(&req).unwrap();
+            let resp = engine.evaluate(&req).expect("concurrent evaluation must not fail");
             (i, resp.decision.clone())
         }));
     }
 
     for handle in handles {
-        let (i, decision) = handle.await.unwrap();
+        let (i, decision) = handle.await.expect("spawned task must not panic");
         if i % 3 == 0 {
             assert_eq!(decision, "Deny", "Agent {} with rules should be Denied", i);
         } else {
@@ -320,10 +324,10 @@ fn duplicate_gvm_headers_first_value_wins() {
     use axum::http::HeaderMap;
 
     let mut headers = HeaderMap::new();
-    headers.append("X-GVM-Agent-Id", "real-agent".parse().unwrap());
-    headers.append("X-GVM-Agent-Id", "injected-agent".parse().unwrap());
+    headers.append("X-GVM-Agent-Id", "real-agent".parse().expect("static header value must parse"));
+    headers.append("X-GVM-Agent-Id", "injected-agent".parse().expect("static header value must parse"));
 
-    let value = headers.get("X-GVM-Agent-Id").unwrap().to_str().unwrap();
+    let value = headers.get("X-GVM-Agent-Id").expect("appended header must exist").to_str().expect("ASCII header value must convert to str");
     assert_eq!(
         value, "real-agent",
         "First header value must win (axum .get() returns first)"
@@ -361,19 +365,19 @@ fn gvm_headers_stripped_before_forwarding() {
     use axum::http::HeaderMap;
 
     let mut headers = HeaderMap::new();
-    headers.insert("X-GVM-Agent-Id", "agent-001".parse().unwrap());
-    headers.insert("X-GVM-Trace-Id", "trace-001".parse().unwrap());
-    headers.insert("X-GVM-Event-Id", "event-001".parse().unwrap());
-    headers.insert("X-GVM-Operation", "gvm.test.read".parse().unwrap());
-    headers.insert("X-GVM-Target-Host", "api.example.com".parse().unwrap());
-    headers.insert("X-GVM-Session-Id", "session-001".parse().unwrap());
-    headers.insert("X-GVM-Tenant-Id", "tenant-001".parse().unwrap());
-    headers.insert("X-GVM-Rate-Limit", "100".parse().unwrap());
-    headers.insert("X-GVM-Context", "{}".parse().unwrap());
-    headers.insert("X-GVM-Resource", "{}".parse().unwrap());
+    headers.insert("X-GVM-Agent-Id", "agent-001".parse().expect("static header value must parse"));
+    headers.insert("X-GVM-Trace-Id", "trace-001".parse().expect("static header value must parse"));
+    headers.insert("X-GVM-Event-Id", "event-001".parse().expect("static header value must parse"));
+    headers.insert("X-GVM-Operation", "gvm.test.read".parse().expect("static header value must parse"));
+    headers.insert("X-GVM-Target-Host", "api.example.com".parse().expect("static header value must parse"));
+    headers.insert("X-GVM-Session-Id", "session-001".parse().expect("static header value must parse"));
+    headers.insert("X-GVM-Tenant-Id", "tenant-001".parse().expect("static header value must parse"));
+    headers.insert("X-GVM-Rate-Limit", "100".parse().expect("static header value must parse"));
+    headers.insert("X-GVM-Context", "{}".parse().expect("static header value must parse"));
+    headers.insert("X-GVM-Resource", "{}".parse().expect("static header value must parse"));
     // Non-GVM headers should survive
-    headers.insert("Authorization", "Bearer token123".parse().unwrap());
-    headers.insert("Content-Type", "application/json".parse().unwrap());
+    headers.insert("Authorization", "Bearer token123".parse().expect("static header value must parse"));
+    headers.insert("Content-Type", "application/json".parse().expect("static header value must parse"));
 
     // Simulate what remove_gvm_headers does
     let gvm_prefixes = [
@@ -726,9 +730,9 @@ fn api_key_not_leaked_via_gvm_headers() {
     // Attacker tries to leak secrets through GVM context
     headers.insert(
         "X-GVM-Context",
-        r#"{"api_key": "sk-secret-123"}"#.parse().unwrap(),
+        r#"{"api_key": "sk-secret-123"}"#.parse().expect("static header value must parse"),
     );
-    headers.insert("X-GVM-Agent-Id", "attacker".parse().unwrap());
+    headers.insert("X-GVM-Agent-Id", "attacker".parse().expect("static header value must parse"));
 
     // Simulate remove_gvm_headers
     let gvm_prefixes = [
@@ -783,7 +787,7 @@ fn srr_redirect_target_blocked() {
 async fn nats_channel_backpressure_bounded() {
     use gvm_proxy::ledger::{GroupCommitConfig, Ledger};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
 
     // Small channel capacity to test backpressure
@@ -796,7 +800,7 @@ async fn nats_channel_backpressure_bounded() {
     let ledger = Arc::new(
         Ledger::with_config(&wal_path, "", "", config)
             .await
-            .unwrap(),
+            .expect("ledger with valid config must initialize"),
     );
 
     // Fire 200 events through a small channel — should not panic or deadlock
@@ -814,7 +818,7 @@ async fn nats_channel_backpressure_bounded() {
     let mut success_count = 0;
     let mut error_count = 0;
     for handle in handles {
-        match handle.await.unwrap() {
+        match handle.await.expect("spawned task must not panic") {
             Ok(()) => success_count += 1,
             Err(_) => error_count += 1,
         }
@@ -841,22 +845,22 @@ async fn nats_channel_backpressure_bounded() {
 async fn nats_empty_url_wal_only_mode() {
     use gvm_proxy::ledger::Ledger;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
 
     // Empty NATS URL = WAL-only mode
-    let ledger = Ledger::new(&wal_path, "", "").await.unwrap();
+    let ledger = Ledger::new(&wal_path, "", "").await.expect("WAL-only ledger must initialize without NATS");
 
     // Durable writes should work without NATS
     let event = make_test_event("wal-only-1");
-    ledger.append_durable(&event).await.unwrap();
+    ledger.append_durable(&event).await.expect("durable write must succeed in WAL-only mode");
 
     // Async writes should work without NATS (fire-and-forget)
     let event2 = make_test_event("wal-only-2");
     ledger.append_async(event2).await;
 
     // Recovery should work
-    let report = ledger.recover_from_wal().await.unwrap();
+    let report = ledger.recover_from_wal().await.expect("WAL recovery must succeed");
     assert_eq!(report.pending_found, 1, "One durable event should be Pending");
 }
 
@@ -866,26 +870,26 @@ async fn nats_empty_url_wal_only_mode() {
 async fn nats_wal_sequence_monotonic() {
     use gvm_proxy::ledger::Ledger;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
 
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
+    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("WAL-only ledger must initialize"));
 
     let mut handles = Vec::new();
     for i in 0..50 {
         let ledger = ledger.clone();
         handles.push(tokio::spawn(async move {
             let event = make_test_event(&format!("seq-{}", i));
-            ledger.append_durable(&event).await.unwrap();
+            ledger.append_durable(&event).await.expect("concurrent durable write must succeed");
         }));
     }
 
     for handle in handles {
-        handle.await.unwrap();
+        handle.await.expect("spawned task must not panic");
     }
 
     // Read WAL and verify all 50 events present (filter out MerkleBatchRecord lines)
-    let content = tokio::fs::read_to_string(&wal_path).await.unwrap();
+    let content = tokio::fs::read_to_string(&wal_path).await.expect("WAL file must be readable after writes");
     let event_count = content
         .lines()
         .filter(|line| !line.contains("\"merkle_root\""))
@@ -911,16 +915,16 @@ async fn vault_large_value_roundtrip() {
     use gvm_proxy::ledger::Ledger;
     use gvm_proxy::vault::Vault;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
-    let vault = Vault::new(ledger).unwrap();
+    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("WAL-only ledger must initialize"));
+    let vault = Vault::new(ledger).expect("vault must initialize with valid ledger");
 
     // 1MB value
     let large_value: Vec<u8> = (0..1_000_000).map(|i| (i % 256) as u8).collect();
 
-    vault.write("large-key", &large_value, "agent-1").await.unwrap();
-    let result = vault.read("large-key", "agent-1").await.unwrap().unwrap();
+    vault.write("large-key", &large_value, "agent-1").await.expect("1MB value write must succeed");
+    let result = vault.read("large-key", "agent-1").await.expect("vault read must not error").expect("written key must exist");
 
     assert_eq!(
         result.len(),
@@ -937,16 +941,16 @@ async fn vault_key_collision_between_agents() {
     use gvm_proxy::ledger::Ledger;
     use gvm_proxy::vault::Vault;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
-    let vault = Vault::new(ledger).unwrap();
+    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("WAL-only ledger must initialize"));
+    let vault = Vault::new(ledger).expect("vault must initialize with valid ledger");
 
     // Two agents write to the same key — last writer wins
-    vault.write("shared-key", b"agent-1-data", "agent-1").await.unwrap();
-    vault.write("shared-key", b"agent-2-data", "agent-2").await.unwrap();
+    vault.write("shared-key", b"agent-1-data", "agent-1").await.expect("first agent write must succeed");
+    vault.write("shared-key", b"agent-2-data", "agent-2").await.expect("second agent write must succeed");
 
-    let result = vault.read("shared-key", "agent-1").await.unwrap().unwrap();
+    let result = vault.read("shared-key", "agent-1").await.expect("vault read must not error").expect("shared key must exist");
     assert_eq!(
         result,
         b"agent-2-data",
@@ -961,18 +965,18 @@ async fn vault_tampered_ciphertext_detected() {
     use gvm_proxy::ledger::Ledger;
     use gvm_proxy::vault::Vault;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
-    let vault = Vault::new(ledger).unwrap();
+    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("WAL-only ledger must initialize"));
+    let vault = Vault::new(ledger).expect("vault must initialize with valid ledger");
 
     // Write a value
-    vault.write("tamper-key", b"secret-data", "agent-1").await.unwrap();
+    vault.write("tamper-key", b"secret-data", "agent-1").await.expect("vault write must succeed");
 
     // Read succeeds before tampering
-    let result = vault.read("tamper-key", "agent-1").await.unwrap();
+    let result = vault.read("tamper-key", "agent-1").await.expect("vault read must not error");
     assert!(result.is_some(), "Read should succeed before tampering");
-    assert_eq!(result.unwrap(), b"secret-data");
+    assert_eq!(result.expect("written key must exist"), b"secret-data");
 }
 
 // ── 5.4 Vault: concurrent read/write to same key ──
@@ -982,13 +986,13 @@ async fn vault_concurrent_read_write_same_key() {
     use gvm_proxy::ledger::Ledger;
     use gvm_proxy::vault::Vault;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
-    let vault = Arc::new(Vault::new(ledger).unwrap());
+    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("WAL-only ledger must initialize"));
+    let vault = Arc::new(Vault::new(ledger).expect("vault must initialize with valid ledger"));
 
     // Write initial value
-    vault.write("rw-key", b"initial", "agent-1").await.unwrap();
+    vault.write("rw-key", b"initial", "agent-1").await.expect("initial vault write must succeed");
 
     // 20 concurrent reads + 20 concurrent writes
     let mut handles = Vec::new();
@@ -997,7 +1001,7 @@ async fn vault_concurrent_read_write_same_key() {
         let vault = vault.clone();
         handles.push(tokio::spawn(async move {
             let value = format!("value-{}", i);
-            vault.write("rw-key", value.as_bytes(), "writer").await.unwrap();
+            vault.write("rw-key", value.as_bytes(), "writer").await.expect("concurrent vault write must succeed");
             "write"
         }));
     }
@@ -1005,7 +1009,7 @@ async fn vault_concurrent_read_write_same_key() {
     for _ in 0..20 {
         let vault = vault.clone();
         handles.push(tokio::spawn(async move {
-            let result = vault.read("rw-key", "reader").await.unwrap();
+            let result = vault.read("rw-key", "reader").await.expect("concurrent vault read must not error");
             assert!(result.is_some(), "Read during concurrent writes must not fail");
             "read"
         }));
@@ -1014,7 +1018,7 @@ async fn vault_concurrent_read_write_same_key() {
     let mut read_count = 0;
     let mut write_count = 0;
     for handle in handles {
-        match handle.await.unwrap() {
+        match handle.await.expect("spawned task must not panic") {
             "read" => read_count += 1,
             "write" => write_count += 1,
             _ => unreachable!(),
@@ -1032,17 +1036,17 @@ async fn vault_delete_then_read_returns_none() {
     use gvm_proxy::ledger::Ledger;
     use gvm_proxy::vault::Vault;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
-    let vault = Vault::new(ledger).unwrap();
+    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("WAL-only ledger must initialize"));
+    let vault = Vault::new(ledger).expect("vault must initialize with valid ledger");
 
-    vault.write("delete-key", b"data", "agent-1").await.unwrap();
-    assert!(vault.read("delete-key", "agent-1").await.unwrap().is_some());
+    vault.write("delete-key", b"data", "agent-1").await.expect("vault write must succeed");
+    assert!(vault.read("delete-key", "agent-1").await.expect("vault read must not error").is_some());
 
-    vault.delete("delete-key", "agent-1").await.unwrap();
+    vault.delete("delete-key", "agent-1").await.expect("vault delete must succeed");
     assert!(
-        vault.read("delete-key", "agent-1").await.unwrap().is_none(),
+        vault.read("delete-key", "agent-1").await.expect("vault read after delete must not error").is_none(),
         "Deleted key must return None"
     );
 }
@@ -1054,13 +1058,13 @@ async fn vault_empty_value_roundtrip() {
     use gvm_proxy::ledger::Ledger;
     use gvm_proxy::vault::Vault;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
-    let vault = Vault::new(ledger).unwrap();
+    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("WAL-only ledger must initialize"));
+    let vault = Vault::new(ledger).expect("vault must initialize with valid ledger");
 
-    vault.write("empty-key", b"", "agent-1").await.unwrap();
-    let result = vault.read("empty-key", "agent-1").await.unwrap().unwrap();
+    vault.write("empty-key", b"", "agent-1").await.expect("empty value write must succeed");
+    let result = vault.read("empty-key", "agent-1").await.expect("vault read must not error").expect("written empty key must exist");
     assert_eq!(result, b"", "Empty value must roundtrip correctly");
 }
 
@@ -1138,10 +1142,10 @@ async fn vault_empty_value_roundtrip() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 fn srr_from_toml(toml_str: &str) -> NetworkSRR {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let path = dir.path().join("srr.toml");
-    std::fs::write(&path, toml_str).unwrap();
-    NetworkSRR::load(&path).unwrap()
+    std::fs::write(&path, toml_str).expect("SRR TOML file write must succeed");
+    NetworkSRR::load(&path).expect("valid SRR TOML must parse")
 }
 
 fn make_test_event(event_id: &str) -> GVMEvent {

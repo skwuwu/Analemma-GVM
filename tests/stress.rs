@@ -18,10 +18,10 @@ use std::time::{Duration, Instant};
 // ─── Helpers ───
 
 fn srr_from_toml(toml_str: &str) -> NetworkSRR {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let path = dir.path().join("srr.toml");
-    std::fs::write(&path, toml_str).unwrap();
-    NetworkSRR::load(&path).unwrap()
+    std::fs::write(&path, toml_str).expect("valid TOML string must write to temp file");
+    NetworkSRR::load(&path).expect("valid SRR TOML must parse and load")
 }
 
 fn make_test_event(id: &str) -> GVMEvent {
@@ -251,9 +251,9 @@ decision = { type = "Delay", milliseconds = 300 }
 /// Load 1,000 ABAC rules and verify evaluation works.
 #[test]
 fn policy_1000_rules_load_and_evaluate() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let policy_dir = dir.path().join("policies");
-    std::fs::create_dir(&policy_dir).unwrap();
+    std::fs::create_dir(&policy_dir).expect("policies subdirectory must be creatable");
 
     // Generate 999 specific rules + 1 catch-all
     let mut rules_toml = String::new();
@@ -288,10 +288,10 @@ type = "Allow"
 "#,
     );
 
-    std::fs::write(policy_dir.join("global.toml"), &rules_toml).unwrap();
+    std::fs::write(policy_dir.join("global.toml"), &rules_toml).expect("policy TOML must write to temp file");
 
     let start = Instant::now();
-    let engine = PolicyEngine::load(&policy_dir).unwrap();
+    let engine = PolicyEngine::load(&policy_dir).expect("valid policy directory must load");
     let load_time = start.elapsed();
 
     assert!(
@@ -304,7 +304,7 @@ type = "Allow"
     let op = make_operation("gvm.test.op500", Sensitivity::Low, ResourceTier::Internal, None, "agent");
     let (decision, rule_id) = engine.evaluate(&op);
     assert!(matches!(decision, EnforcementDecision::Deny { .. }));
-    assert_eq!(rule_id.unwrap(), "rule-500");
+    assert_eq!(rule_id.expect("matching rule must return its ID"), "rule-500");
 
     // Verify unmatched operation falls through to catch-all
     let op = make_operation("gvm.unknown.action", Sensitivity::Low, ResourceTier::Internal, None, "agent");
@@ -332,9 +332,9 @@ type = "Allow"
 /// Load Global + 100 Tenant + 1,000 Agent policies simultaneously.
 #[test]
 fn policy_large_hierarchy_100_tenants_1000_agents() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let policy_dir = dir.path().join("policies");
-    std::fs::create_dir(&policy_dir).unwrap();
+    std::fs::create_dir(&policy_dir).expect("policies subdirectory must be creatable");
 
     // Global: deny critical deletes
     std::fs::write(
@@ -362,7 +362,7 @@ description = "Default allow"
 type = "Allow"
 "#,
     )
-    .unwrap();
+    .expect("global policy TOML must write to temp file");
 
     // Generate 100 tenant configs
     for t in 0..100 {
@@ -381,7 +381,7 @@ type = "Delay"
 milliseconds = 300
 "#,
         );
-        std::fs::write(policy_dir.join(format!("tenant-t{}.toml", t)), &content).unwrap();
+        std::fs::write(policy_dir.join(format!("tenant-t{}.toml", t)), &content).expect("tenant policy TOML must write to temp file");
     }
 
     // Generate 1,000 agent configs (10 per tenant)
@@ -398,11 +398,11 @@ type = "AuditOnly"
 alert_level = "Info"
 "#,
         );
-        std::fs::write(policy_dir.join(format!("agent-a{}.toml", a)), &content).unwrap();
+        std::fs::write(policy_dir.join(format!("agent-a{}.toml", a)), &content).expect("agent policy TOML must write to temp file");
     }
 
     let start = Instant::now();
-    let engine = PolicyEngine::load(&policy_dir).unwrap();
+    let engine = PolicyEngine::load(&policy_dir).expect("valid policy hierarchy must load");
     let load_time = start.elapsed();
 
     assert!(
@@ -449,19 +449,19 @@ alert_level = "Info"
 /// Each write goes through WAL (fsync), so we use a count that fits within CI time limits.
 #[tokio::test]
 async fn vault_10k_encrypt_decrypt_no_leak() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
-    let vault = Vault::new(ledger).unwrap();
+    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger with valid path must initialize"));
+    let vault = Vault::new(ledger).expect("vault with valid ledger must initialize");
 
     let plaintext = b"test secret value for stress test";
 
     let start = Instant::now();
     for i in 0..10_000 {
         let key = format!("key-{}", i % 100); // Reuse 100 keys
-        vault.write(&key, plaintext, "stress-agent").await.unwrap();
-        let result = vault.read(&key, "stress-agent").await.unwrap();
-        assert_eq!(result.unwrap(), plaintext);
+        vault.write(&key, plaintext, "stress-agent").await.expect("vault write must succeed for valid key");
+        let result = vault.read(&key, "stress-agent").await.expect("vault read must succeed for existing key");
+        assert_eq!(result.expect("vault read must return data for existing key"), plaintext);
     }
     let elapsed = start.elapsed();
 
@@ -476,10 +476,10 @@ async fn vault_10k_encrypt_decrypt_no_leak() {
 /// Vault handles 1MB plaintext values correctly.
 #[tokio::test]
 async fn vault_1mb_value_roundtrip() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
-    let vault = Vault::new(ledger).unwrap();
+    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger with valid path must initialize"));
+    let vault = Vault::new(ledger).expect("vault with valid ledger must initialize");
 
     // 1MB plaintext
     let plaintext: Vec<u8> = (0..1_048_576).map(|i| (i % 256) as u8).collect();
@@ -487,9 +487,9 @@ async fn vault_1mb_value_roundtrip() {
     vault
         .write("big-key", &plaintext, "agent")
         .await
-        .unwrap();
-    let result = vault.read("big-key", "agent").await.unwrap();
-    assert_eq!(result.unwrap(), plaintext, "1MB roundtrip must be exact");
+        .expect("vault must handle 1MB write");
+    let result = vault.read("big-key", "agent").await.expect("vault must handle 1MB read");
+    assert_eq!(result.expect("vault must return 1MB value after write"), plaintext, "1MB roundtrip must be exact");
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -499,9 +499,9 @@ async fn vault_1mb_value_roundtrip() {
 /// 1,000 concurrent durable appends — all must complete and be recorded.
 #[tokio::test]
 async fn wal_1000_concurrent_durable_appends() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
+    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger with valid path must initialize"));
 
     let start = Instant::now();
 
@@ -510,12 +510,12 @@ async fn wal_1000_concurrent_durable_appends() {
         let ledger = ledger.clone();
         handles.push(tokio::spawn(async move {
             let event = make_test_event(&format!("concurrent-{}", i));
-            ledger.append_durable(&event).await.unwrap();
+            ledger.append_durable(&event).await.expect("concurrent durable append must succeed");
         }));
     }
 
     for h in handles {
-        h.await.unwrap();
+        h.await.expect("concurrent append task must not panic");
     }
 
     let elapsed = start.elapsed();
@@ -528,7 +528,7 @@ async fn wal_1000_concurrent_durable_appends() {
     );
 
     // Verify WAL has exactly 1,000 event entries (exclude MerkleBatchRecord lines)
-    let content = tokio::fs::read_to_string(&wal_path).await.unwrap();
+    let content = tokio::fs::read_to_string(&wal_path).await.expect("WAL file must be readable after concurrent writes");
     let event_count = content
         .lines()
         .filter(|line| !line.contains("\"merkle_root\""))
@@ -544,7 +544,7 @@ async fn wal_1000_concurrent_durable_appends() {
 /// Verifies no OOM and WAL file grows linearly.
 #[tokio::test]
 async fn wal_sustained_load_10k_events() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
 
     let config = GroupCommitConfig {
@@ -556,7 +556,7 @@ async fn wal_sustained_load_10k_events() {
     let ledger = Arc::new(
         Ledger::with_config(&wal_path, "", "", config)
             .await
-            .unwrap(),
+            .expect("ledger with valid config must initialize"),
     );
 
     let total_events = 10_000usize;
@@ -568,12 +568,12 @@ async fn wal_sustained_load_10k_events() {
         let ledger = ledger.clone();
         handles.push(tokio::spawn(async move {
             let event = make_test_event(&format!("sustained-{}", i));
-            ledger.append_durable(&event).await.unwrap();
+            ledger.append_durable(&event).await.expect("sustained load append must succeed");
         }));
     }
 
     for h in handles {
-        h.await.unwrap();
+        h.await.expect("sustained load task must not panic");
     }
 
     let elapsed = start.elapsed();
@@ -586,7 +586,7 @@ async fn wal_sustained_load_10k_events() {
     );
 
     // Verify WAL has all event entries (exclude MerkleBatchRecord lines)
-    let content = tokio::fs::read_to_string(&wal_path).await.unwrap();
+    let content = tokio::fs::read_to_string(&wal_path).await.expect("WAL file must be readable after sustained load");
     let event_count = content
         .lines()
         .filter(|line| !line.contains("\"merkle_root\""))
@@ -598,7 +598,7 @@ async fn wal_sustained_load_10k_events() {
     );
 
     // Verify WAL file size is reasonable (each event ~500 bytes JSON)
-    let file_size = tokio::fs::metadata(&wal_path).await.unwrap().len();
+    let file_size = tokio::fs::metadata(&wal_path).await.expect("WAL file metadata must be accessible").len();
     assert!(
         file_size > 0 && file_size < 100_000_000,
         "WAL file size {} bytes seems unreasonable for {} events",
@@ -659,7 +659,7 @@ decision = { type = "Delay", milliseconds = 300 }
     let mut deny_count = 0usize;
 
     for h in handles {
-        let decision = h.await.unwrap();
+        let decision = h.await.expect("mixed IC decision task must not panic");
         match decision {
             EnforcementDecision::Allow => allow_count += 1,
             EnforcementDecision::Delay { .. } => delay_count += 1,
