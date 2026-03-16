@@ -437,7 +437,7 @@ fn ssrf_localhost_blocked_by_srr() {
     );
 
     // SSRF attempt via localhost
-    let d1 = srr.check("GET", "localhost", "/admin/secrets", None);
+    let d1 = srr.check("GET", "localhost", "/admin/secrets", None).decision;
     assert!(
         matches!(d1, EnforcementDecision::Deny { .. }),
         "SSRF via localhost must be denied, got {:?}",
@@ -445,7 +445,7 @@ fn ssrf_localhost_blocked_by_srr() {
     );
 
     // SSRF attempt via 127.0.0.1
-    let d2 = srr.check("POST", "127.0.0.1", "/internal-api", None);
+    let d2 = srr.check("POST", "127.0.0.1", "/internal-api", None).decision;
     assert!(
         matches!(d2, EnforcementDecision::Deny { .. }),
         "SSRF via 127.0.0.1 must be denied, got {:?}",
@@ -477,21 +477,21 @@ fn ssrf_cloud_metadata_blocked_by_srr() {
     );
 
     // AWS metadata
-    let d1 = srr.check("GET", "169.254.169.254", "/latest/meta-data/", None);
+    let d1 = srr.check("GET", "169.254.169.254", "/latest/meta-data/", None).decision;
     assert!(
         matches!(d1, EnforcementDecision::Deny { .. }),
         "SSRF via AWS metadata must be denied"
     );
 
     // AWS IMDSv2 token endpoint
-    let d2 = srr.check("PUT", "169.254.169.254", "/latest/api/token", None);
+    let d2 = srr.check("PUT", "169.254.169.254", "/latest/api/token", None).decision;
     assert!(
         matches!(d2, EnforcementDecision::Deny { .. }),
         "SSRF via AWS IMDSv2 must be denied"
     );
 
     // GCP metadata
-    let d3 = srr.check("GET", "metadata.google.internal", "/computeMetadata/v1/", None);
+    let d3 = srr.check("GET", "metadata.google.internal", "/computeMetadata/v1/", None).decision;
     assert!(
         matches!(d3, EnforcementDecision::Deny { .. }),
         "SSRF via GCP metadata must be denied"
@@ -545,21 +545,21 @@ fn ssrf_private_ip_ranges_blocked_by_srr() {
     );
 
     assert!(matches!(
-        srr.check("GET", "10.0.0.1", "/internal", None),
+        srr.check("GET", "10.0.0.1", "/internal", None).decision,
         EnforcementDecision::Deny { .. }
     ));
     assert!(matches!(
-        srr.check("GET", "192.168.1.1", "/admin", None),
+        srr.check("GET", "192.168.1.1", "/admin", None).decision,
         EnforcementDecision::Deny { .. }
     ));
     assert!(matches!(
-        srr.check("GET", "172.16.0.1", "/secrets", None),
+        srr.check("GET", "172.16.0.1", "/secrets", None).decision,
         EnforcementDecision::Deny { .. }
     ));
 
     // Public IP should be allowed
     assert!(matches!(
-        srr.check("GET", "8.8.8.8", "/dns", None),
+        srr.check("GET", "8.8.8.8", "/dns", None).decision,
         EnforcementDecision::Allow
     ));
 }
@@ -591,7 +591,7 @@ fn ssrf_ipv6_loopback_blocked_by_srr() {
     ];
 
     for host in &loopback_variants {
-        let d = srr.check("GET", host, "/admin", None);
+        let d = srr.check("GET", host, "/admin", None).decision;
         assert!(
             matches!(d, EnforcementDecision::Deny { .. }),
             "IPv6 loopback {} must be denied, got {:?}",
@@ -601,7 +601,7 @@ fn ssrf_ipv6_loopback_blocked_by_srr() {
     }
 
     // Non-loopback IPv6 should not be affected
-    let d = srr.check("GET", "[2001:db8::1]", "/api", None);
+    let d = srr.check("GET", "[2001:db8::1]", "/api", None).decision;
     assert!(
         !matches!(d, EnforcementDecision::Deny { .. }),
         "Public IPv6 must not be denied"
@@ -632,7 +632,7 @@ fn ssrf_ipv6_mapped_v4_loopback_blocked() {
     ];
 
     for host in &mapped_variants {
-        let d = srr.check("GET", host, "/internal", None);
+        let d = srr.check("GET", host, "/internal", None).decision;
         assert!(
             matches!(d, EnforcementDecision::Deny { .. }),
             "IPv4-mapped loopback {} must be denied, got {:?}",
@@ -659,7 +659,7 @@ fn ssrf_ipv6_cloud_metadata_blocked() {
     );
 
     // AWS IPv6 metadata endpoint
-    let d1 = srr.check("GET", "[fd00:ec2::254]", "/latest/meta-data", None);
+    let d1 = srr.check("GET", "[fd00:ec2::254]", "/latest/meta-data", None).decision;
     assert!(
         matches!(d1, EnforcementDecision::Deny { .. }),
         "AWS IPv6 metadata must be denied, got {:?}",
@@ -667,7 +667,7 @@ fn ssrf_ipv6_cloud_metadata_blocked() {
     );
 
     // IPv4-mapped metadata
-    let d2 = srr.check("GET", "[::ffff:169.254.169.254]", "/latest/meta-data", None);
+    let d2 = srr.check("GET", "[::ffff:169.254.169.254]", "/latest/meta-data", None).decision;
     assert!(
         matches!(d2, EnforcementDecision::Deny { .. }),
         "IPv4-mapped metadata must be denied, got {:?}",
@@ -697,14 +697,14 @@ fn ssrf_ipv6_private_ranges_mapped_blocked() {
     );
 
     // IPv4-mapped private IPs
-    let d1 = srr.check("GET", "[::ffff:10.0.0.1]", "/internal", None);
+    let d1 = srr.check("GET", "[::ffff:10.0.0.1]", "/internal", None).decision;
     assert!(
         matches!(d1, EnforcementDecision::Deny { .. }),
         "IPv4-mapped 10.0.0.1 must be denied, got {:?}",
         d1
     );
 
-    let d2 = srr.check("GET", "[::ffff:192.168.1.1]", "/admin", None);
+    let d2 = srr.check("GET", "[::ffff:192.168.1.1]", "/admin", None).decision;
     assert!(
         matches!(d2, EnforcementDecision::Deny { .. }),
         "IPv4-mapped 192.168.1.1 must be denied, got {:?}",
@@ -770,7 +770,7 @@ fn srr_redirect_target_blocked() {
     "#,
     );
 
-    let decision = srr.check("GET", "httpbin.org", "/redirect/10", None);
+    let decision = srr.check("GET", "httpbin.org", "/redirect/10", None).decision;
     assert!(
         matches!(decision, EnforcementDecision::Deny { .. }),
         "Known redirect endpoint must be blocked"
@@ -1170,5 +1170,6 @@ fn make_test_event(event_id: &str) -> GVMEvent {
         nats_sequence: None,
         event_hash: None,
         llm_trace: None,
+        default_caution: false,
     }
 }

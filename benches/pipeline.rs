@@ -60,6 +60,7 @@ fn make_test_event(id: &str) -> GVMEvent {
         nats_sequence: None,
         event_hash: None,
         llm_trace: None,
+        default_caution: false,
     }
 }
 
@@ -360,7 +361,7 @@ fn bench_classification(c: &mut Criterion) {
             // Layer 2: SRR
             let srr_decision = srr.check("POST", "api.stripe.com", "/v1/refunds", None);
             // Combine
-            let final_decision = max_strict(policy_decision, srr_decision);
+            let final_decision = max_strict(policy_decision, srr_decision.decision);
             black_box(final_decision);
         });
     });
@@ -387,7 +388,7 @@ fn bench_classification(c: &mut Criterion) {
             let (policy_decision, _) = policy.evaluate(&op);
             let srr_decision =
                 srr.check("POST", "smtp.gmail.com", "/send", Some(payload));
-            let final_decision = max_strict(policy_decision, srr_decision);
+            let final_decision = max_strict(policy_decision, srr_decision.decision);
             black_box(final_decision);
         });
     });
@@ -766,7 +767,7 @@ fn bench_wasm_vs_native(c: &mut Criterion) {
                 let srr_decision = srr.check("POST", "smtp.gmail.com", "/send", None);
                 let wasm_resp = wasm_engine.evaluate(black_box(&req_allow)).expect("wasm engine must evaluate valid request in e2e pipeline");
                 let (wasm_decision, _) = WasmEngine::response_to_decision(&wasm_resp);
-                let final_d = max_strict(wasm_decision, srr_decision);
+                let final_d = max_strict(wasm_decision, srr_decision.decision);
                 black_box(final_d);
             });
         });
@@ -776,7 +777,7 @@ fn bench_wasm_vs_native(c: &mut Criterion) {
             b.iter(|| {
                 let srr_decision = srr.check("POST", "smtp.gmail.com", "/send", None);
                 let (policy_decision, _) = policy.evaluate(&op);
-                let final_d = max_strict(policy_decision, srr_decision);
+                let final_d = max_strict(policy_decision, srr_decision.decision);
                 black_box(final_d);
             });
         });

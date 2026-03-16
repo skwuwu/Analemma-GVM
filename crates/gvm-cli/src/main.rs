@@ -5,6 +5,7 @@ mod demo;
 mod events;
 mod init;
 mod run;
+mod suggest;
 mod ui;
 
 #[derive(Parser)]
@@ -59,6 +60,11 @@ enum Commands {
         /// GVM proxy URL
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         proxy: String,
+
+        /// Interactive mode: suggest SRR rules for unregistered URLs after the run.
+        /// When Default-to-Caution triggers, prompts you to add an explicit rule.
+        #[arg(long, short = 'i')]
+        interactive: bool,
 
         /// Use Linux-native sandbox (Layer 3: namespace + seccomp isolation).
         /// Recommended for production on Linux. No Docker required.
@@ -186,6 +192,7 @@ async fn main() -> anyhow::Result<()> {
             script,
             agent_id,
             proxy,
+            interactive,
             sandbox,
             contained,
             image,
@@ -193,7 +200,7 @@ async fn main() -> anyhow::Result<()> {
             cpus,
             detach,
         } => {
-            run::run_agent(&script, &agent_id, &proxy, &image, &memory, &cpus, detach, contained, sandbox).await?;
+            run::run_agent(&script, &agent_id, &proxy, &image, &memory, &cpus, detach, contained, sandbox, interactive).await?;
         }
 
         Commands::Check {

@@ -67,8 +67,8 @@ async fn srr_100_concurrent_checks_complete_without_blocking() {
                 None
             };
 
-            let decision = srr.check(method, host, path, body);
-            matches!(decision, EnforcementDecision::Deny { .. })
+            let result = srr.check(method, host, path, body);
+            matches!(result.decision, EnforcementDecision::Deny { .. })
         }));
     }
 
@@ -305,9 +305,9 @@ fn header_forgery_srr_denies_bank_transfer_regardless() {
     // Agent declares operation as "gvm.storage.read" (safe)
     // but the actual HTTP target is api.bank.com/transfer/123 (dangerous)
     // SRR only cares about the URL, not the header — this must be denied.
-    let decision = srr.check("POST", "api.bank.com", "/transfer/123", None);
+    let result = srr.check("POST", "api.bank.com", "/transfer/123", None);
 
-    match decision {
+    match result.decision {
         EnforcementDecision::Deny { reason } => {
             assert!(reason.contains("Wire transfer"));
         }
@@ -460,6 +460,7 @@ async fn ledger_concurrent_spawns_stay_bounded() {
                 nats_sequence: None,
                 event_hash: None,
         llm_trace: None,
+        default_caution: false,
             };
             ledger.append_durable(&event).await.expect("durable append must succeed under load");
         }));
@@ -576,6 +577,7 @@ async fn group_commit_fail_close_all_callers_receive_error() {
             nats_sequence: None,
             event_hash: None,
         llm_trace: None,
+        default_caution: false,
         };
         ledger.append_durable(&event).await.expect("initial append must succeed before error injection");
     }
@@ -609,6 +611,7 @@ async fn group_commit_fail_close_all_callers_receive_error() {
                 nats_sequence: None,
                 event_hash: None,
         llm_trace: None,
+        default_caution: false,
             };
             ledger.append_durable(&event).await
         }));
@@ -651,6 +654,7 @@ async fn group_commit_fail_close_all_callers_receive_error() {
         nats_sequence: None,
         event_hash: None,
         llm_trace: None,
+        default_caution: false,
     };
     // After disabling error injection, writes should succeed again
     ledger.append_durable(&event).await.expect("ledger must recover after error injection is disabled");

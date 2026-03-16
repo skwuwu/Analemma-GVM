@@ -46,6 +46,7 @@ fn make_test_event(id: &str) -> GVMEvent {
         nats_sequence: None,
         event_hash: None,
         llm_trace: None,
+        default_caution: false,
     }
 }
 
@@ -123,21 +124,21 @@ decision = { type = "Delay", milliseconds = 300 }
     // Verify first rule matches
     let d1 = srr.check("POST", "host-0.example.com", "/test", None);
     assert!(
-        matches!(d1, EnforcementDecision::Deny { .. }),
+        matches!(d1.decision, EnforcementDecision::Deny { .. }),
         "First rule should match"
     );
 
     // Verify last rule matches
     let d2 = srr.check("POST", "host-9999.example.com", "/test", None);
     assert!(
-        matches!(d2, EnforcementDecision::Deny { .. }),
+        matches!(d2.decision, EnforcementDecision::Deny { .. }),
         "Last rule should match"
     );
 
     // Verify unknown host falls through to catch-all
     let d3 = srr.check("GET", "unknown.example.com", "/test", None);
     assert!(
-        matches!(d3, EnforcementDecision::Delay { .. }),
+        matches!(d3.decision, EnforcementDecision::Delay { .. }),
         "Unknown host should get Default-to-Caution"
     );
 
@@ -198,7 +199,7 @@ description = "{}"
 
     // Verify it works
     let d = srr.check("POST", "host-1000.megacorp.internal", "/api/v1/data", None);
-    assert!(matches!(d, EnforcementDecision::Deny { .. }));
+    assert!(matches!(d.decision, EnforcementDecision::Deny { .. }));
 }
 
 /// Payload inspection at exact max_body_bytes boundary — no buffer overflow.
@@ -228,7 +229,7 @@ decision = { type = "Delay", milliseconds = 300 }
     let d = srr.check("POST", "api.example.com", "/graphql", Some(&body_at_limit));
     // At exact limit, inspection should proceed and find the match
     assert!(
-        matches!(d, EnforcementDecision::Deny { .. }),
+        matches!(d.decision, EnforcementDecision::Deny { .. }),
         "Body at exact limit should be inspected"
     );
 
@@ -239,7 +240,7 @@ decision = { type = "Delay", milliseconds = 300 }
     let d = srr.check("POST", "api.example.com", "/graphql", Some(&body_over));
     // Over limit should fall through to Default-to-Caution
     assert!(
-        matches!(d, EnforcementDecision::Delay { .. }),
+        matches!(d.decision, EnforcementDecision::Delay { .. }),
         "Body over limit should get Default-to-Caution"
     );
 }
@@ -659,12 +660,12 @@ decision = { type = "Delay", milliseconds = 300 }
     let mut deny_count = 0usize;
 
     for h in handles {
-        let decision = h.await.expect("mixed IC decision task must not panic");
-        match decision {
+        let result = h.await.expect("mixed IC decision task must not panic");
+        match result.decision {
             EnforcementDecision::Allow => allow_count += 1,
             EnforcementDecision::Delay { .. } => delay_count += 1,
             EnforcementDecision::Deny { .. } => deny_count += 1,
-            _ => panic!("Unexpected decision: {:?}", decision),
+            _ => panic!("Unexpected decision: {:?}", result.decision),
         }
     }
 

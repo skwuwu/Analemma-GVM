@@ -40,6 +40,7 @@ fn make_test_event(agent_id: &str) -> GVMEvent {
         nats_sequence: None,
         event_hash: None,
         llm_trace: None,
+        default_caution: false,
     }
 }
 

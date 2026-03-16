@@ -75,7 +75,7 @@ decision = { type = "Delay", milliseconds = 200 }
 
     // Empty body — payload rule should skip, fall through to URL rule
     let d = srr.check("POST", "api.example.com", "/graphql", Some(b""));
-    match d {
+    match d.decision {
         EnforcementDecision::Delay { milliseconds } => {
             assert_eq!(milliseconds, 200);
         }
@@ -108,7 +108,7 @@ decision = { type = "Delay", milliseconds = 300 }
     let d = srr.check("POST", "api.example.com", "/graphql", Some(png_header));
 
     // Should fall through to next URL-matching rule (Delay 300ms)
-    match d {
+    match d.decision {
         EnforcementDecision::Delay { milliseconds } => {
             assert_eq!(milliseconds, 300);
         }
@@ -138,9 +138,9 @@ decision = { type = "Delay", milliseconds = 300 }
 
     // The path starts with /transfer/ so it should still be caught by the deny rule
     assert!(
-        matches!(d, EnforcementDecision::Deny { .. }),
+        matches!(d.decision, EnforcementDecision::Deny { .. }),
         "Null byte in path must not bypass deny rule, got: {:?}",
-        d
+        d.decision
     );
 }
 
@@ -203,7 +203,7 @@ decision = { type = "Delay", milliseconds = 300 }
     // Must not panic or OOM
     let d = srr.check("GET", &long_host, &long_path, None);
     assert!(
-        matches!(d, EnforcementDecision::Delay { .. }),
+        matches!(d.decision, EnforcementDecision::Delay { .. }),
         "Long inputs should safely match catch-all"
     );
 }
@@ -234,14 +234,14 @@ decision = { type = "Delay", milliseconds = 300 }
     // Dangerous URL should still be blocked
     let d = srr.check("POST", "api.bank.com", "/transfer/123", None);
     assert!(
-        matches!(d, EnforcementDecision::Deny { .. }),
+        matches!(d.decision, EnforcementDecision::Deny { .. }),
         "SRR must block dangerous URLs even without GVM headers"
     );
 
     // Safe URL without headers gets Default-to-Caution
     let d = srr.check("GET", "api.safe.com", "/data", None);
     assert!(
-        matches!(d, EnforcementDecision::Delay { .. }),
+        matches!(d.decision, EnforcementDecision::Delay { .. }),
         "Unknown URL without headers should get Default-to-Caution"
     );
 }
@@ -521,6 +521,7 @@ async fn edge_concurrent_status_update_no_crash() {
                 nats_sequence: None,
                 event_hash: None,
         llm_trace: None,
+        default_caution: false,
             };
             ledger.append_durable(&event).await.expect("concurrent WAL append must succeed");
         }));

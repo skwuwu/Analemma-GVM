@@ -794,6 +794,7 @@ fn make_test_event(event_id: &str, operation: &str) -> GVMEvent {
         nats_sequence: None,
         event_hash: None,
         llm_trace: None,
+        default_caution: false,
     }
 }
 

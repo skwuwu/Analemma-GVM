@@ -141,6 +141,24 @@ This transitions GVM from "SDK proxy model" to "mandatory interception model" (s
 
 **Planned (v2)**: JWT issued by `gvm run` at agent startup, verified by proxy middleware. The agent cannot forge identity without the signing key. Multi-tenant deployments will require JWT or mTLS.
 
+### 9. IPv4-Mapped IPv6 Bypass (Fixed)
+
+**Attack**: Bypass SSRF deny rules by using IPv6 notation (e.g., `[::ffff:127.0.0.1]` instead of `127.0.0.1`).
+
+**Status**: Fixed in v0.2. `normalize_host()` canonicalizes IPv6 loopback, IPv4-mapped, and cloud metadata addresses before SRR matching.
+
+### 10. GraphQL Alias Bypass
+
+**Attack**: Current SRR payload inspection matches the `operationName` field only. An attacker can omit `operationName` or use GraphQL aliases in the query body to bypass detection. For example, a mutation named `TransferFunds` could be aliased as `t: transferFunds(...)` in the `query` field without setting `operationName`.
+
+**Preconditions**: Agent sends requests to a GraphQL endpoint that has payload-based SRR rules.
+
+**Impact**: High-risk GraphQL operations (e.g., `TransferFunds`, `DeleteAccount`) could bypass the Deny rule and fall through to a less restrictive URL-only rule.
+
+**Planned mitigation (v2)**: GraphQL query parser that inspects the `query` field for mutation names, field names, and aliases. Until then, GraphQL endpoints should be treated as elevated risk — consider Deny-by-default for GraphQL endpoints with allowlisted `operationName` values only.
+
+**Why acceptable now**: Current deployments use the operationName-based rules as defense-in-depth behind ABAC policy layer. The ABAC layer evaluates semantic operation names independently of the HTTP payload, so a GraphQL alias bypass only evades Layer 2 SRR, not Layer 1 policy.
+
 ---
 
 ## Non-Adversarial Issues

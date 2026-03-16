@@ -17,22 +17,23 @@ pub async fn run_agent(
     detach: bool,
     contained: bool,
     sandbox: bool,
+    interactive: bool,
 ) -> Result<()> {
     if sandbox && contained {
         anyhow::bail!("Cannot use --sandbox and --contained together. Choose one isolation mode.");
     }
     if sandbox {
-        run_sandboxed(script, agent_id, proxy).await
+        run_sandboxed(script, agent_id, proxy, interactive).await
     } else if contained {
         run_contained(script, agent_id, proxy, image, memory, cpus, detach).await
     } else {
-        run_local(script, agent_id, proxy).await
+        run_local(script, agent_id, proxy, interactive).await
     }
 }
 
 /// Simple mode: run the script locally with HTTP_PROXY pointing to GVM.
 /// After the script exits, read WAL and display audit summary.
-async fn run_local(script: &str, agent_id: &str, proxy: &str) -> Result<()> {
+async fn run_local(script: &str, agent_id: &str, proxy: &str, interactive: bool) -> Result<()> {
     println!();
     println!("{BOLD}Analemma-GVM \u{2014} Agent Governance Monitor{RESET}");
     println!("{DIM}All HTTP traffic will be routed through GVM proxy for governance.{RESET}");
@@ -134,12 +135,21 @@ async fn run_local(script: &str, agent_id: &str, proxy: &str) -> Result<()> {
     // ── Read WAL for audit trail ──
     print_wal_audit(wal_path, wal_start_len, agent_id);
 
+    // ── Interactive SRR rule suggestions ──
+    if interactive {
+        crate::suggest::suggest_rules_interactive(
+            wal_path,
+            wal_start_len,
+            "config/srr_network.toml",
+        );
+    }
+
     Ok(())
 }
 
 /// Linux-native sandbox mode: run inside namespace + seccomp isolation.
 /// Production-recommended on Linux. No Docker required.
-async fn run_sandboxed(script: &str, agent_id: &str, proxy: &str) -> Result<()> {
+async fn run_sandboxed(script: &str, agent_id: &str, proxy: &str, interactive: bool) -> Result<()> {
     println!();
     println!("{BOLD}Analemma-GVM \u{2014} Linux-Native Sandbox (Layer 3){RESET}");
     println!("{DIM}Agent will be isolated using namespaces, seccomp-BPF, and veth networking.{RESET}");
@@ -292,6 +302,15 @@ async fn run_sandboxed(script: &str, agent_id: &str, proxy: &str) -> Result<()> 
 
     // Read WAL for audit trail
     print_wal_audit(wal_path, wal_start_len, agent_id);
+
+    // Interactive SRR rule suggestions
+    if interactive {
+        crate::suggest::suggest_rules_interactive(
+            wal_path,
+            wal_start_len,
+            "config/srr_network.toml",
+        );
+    }
 
     Ok(())
 }

@@ -195,6 +195,12 @@ pub struct GVMEvent {
     /// Captures thinking/reasoning content for governance audit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_trace: Option<LLMTrace>,
+
+    /// True if this event hit the SRR catch-all / Default-to-Caution rule
+    /// (no specific, intentional SRR rule exists for this URL).
+    /// Used by the CLI to suggest adding explicit rules in interactive mode.
+    #[serde(default)]
+    pub default_caution: bool,
 }
 
 /// Event status machine — prevents phantom records

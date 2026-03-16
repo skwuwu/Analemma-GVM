@@ -61,13 +61,13 @@ pub async fn proxy_handler(
     };
 
     // ── Step 2: Classify (IC determination) ──
-    let classification = if let Some(ref headers) = gvm_headers {
+    let (classification, is_default_caution) = if let Some(ref headers) = gvm_headers {
         // SDK-routed: Layer 1 Semantic classification via ABAC policy engine
         let operation = build_operation_metadata(headers, &target);
         let (policy_decision, matched_rule) = state.policy.evaluate(&operation);
 
         // Also check network SRR (Deny in SRR overrides policy)
-        let srr_decision = state.srr.check(
+        let srr_result = state.srr.check(
             request.method().as_str(),
             &target.host,
             &target.path,
@@ -75,34 +75,43 @@ pub async fn proxy_handler(
         );
 
         // Determine which layer won (max_strict picks the strictest)
-        let final_decision = max_strict(srr_decision.clone(), policy_decision.clone());
-        let source = if srr_decision.strictness() > policy_decision.strictness() {
+        let final_decision = max_strict(srr_result.decision.clone(), policy_decision.clone());
+        let srr_won = srr_result.decision.strictness() > policy_decision.strictness();
+        let source = if srr_won {
             ClassificationSource::SRR
         } else {
             ClassificationSource::ABAC
         };
 
-        Classification {
+        // Use SRR description as matched_rule_id when SRR produced the stricter decision
+        let rule_id = if srr_won {
+            srr_result.matched_description.clone()
+        } else {
+            matched_rule
+        };
+
+        (Classification {
             decision: final_decision,
             source,
             operation: Some(operation),
-            matched_rule_id: matched_rule,
-        }
+            matched_rule_id: rule_id,
+        }, srr_result.is_catch_all)
     } else {
         // Direct HTTP: Layer 2 Network SRR classification
-        let network_decision = state.srr.check(
+        let srr_result = state.srr.check(
             request.method().as_str(),
             &target.host,
             &target.path,
             None,
         );
 
-        Classification {
-            decision: network_decision,
+        let is_catch_all = srr_result.is_catch_all;
+        (Classification {
+            decision: srr_result.decision,
             source: ClassificationSource::SRR,
             operation: None,
-            matched_rule_id: None,
-        }
+            matched_rule_id: srr_result.matched_description,
+        }, is_catch_all)
     };
 
     let agent_id = gvm_headers
@@ -156,6 +165,7 @@ pub async fn proxy_handler(
 
     // ── Step 4: Enforcement with EventStatus lifecycle ──
     let mut event = build_event(&classification, &gvm_headers, &target);
+    event.default_caution = is_default_caution;
 
     // Measure engine processing time (classification was already done above)
     let engine_start = std::time::Instant::now();
@@ -479,6 +489,7 @@ fn build_event(
         nats_sequence: None,
         event_hash: None, // Computed by Ledger during WAL write
         llm_trace: None,
+        default_caution: false, // Set by caller after build_event
     }
 }
 

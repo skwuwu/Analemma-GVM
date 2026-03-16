@@ -44,6 +44,24 @@ pub struct NetworkRule {
     pub payload_field: Option<String>,
     pub payload_match: Option<Vec<String>>,
     pub max_body_bytes: usize,
+    /// True if this rule is a catch-all (method="*" + pattern="{any}").
+    /// Catch-all matches are flagged as default-to-caution for the CLI.
+    pub is_catch_all: bool,
+}
+
+/// Result of an SRR check, including metadata about which rule matched.
+///
+/// Used by the proxy to populate `matched_rule_id` and `default_caution` on events,
+/// and by the CLI to detect unregistered URLs that may need explicit rules.
+#[derive(Clone, Debug)]
+pub struct SrrCheckResult {
+    /// The enforcement decision for this request.
+    pub decision: EnforcementDecision,
+    /// Description of the matched rule (None if default-to-caution fired).
+    pub matched_description: Option<String>,
+    /// True if this request hit the catch-all rule or the built-in default
+    /// (no specific, intentional rule exists for this URL).
+    pub is_catch_all: bool,
 }
 
 /// Host matching pattern
@@ -88,6 +106,11 @@ impl NetworkSRR {
                 vec![rule_cfg.method.as_str()]
             };
 
+            // Detect catch-all rules: method="*" and pattern="{any}" (or just "{any}")
+            let is_catch_all = rule_cfg.method == "*"
+                && matches!(host_pattern, HostPattern::Any)
+                && (path_pattern == "/*" || path_pattern == "*");
+
             for method in methods {
                 rules.push(NetworkRule {
                     method: method.to_uppercase(),
@@ -98,6 +121,7 @@ impl NetworkSRR {
                     payload_field: rule_cfg.payload_field.clone(),
                     payload_match: rule_cfg.payload_match.clone(),
                     max_body_bytes: rule_cfg.max_body_bytes.unwrap_or(65536),
+                    is_catch_all,
                 });
             }
         }
@@ -116,13 +140,16 @@ impl NetworkSRR {
     /// via zero-compression, IPv4-mapped, or bracket variations.
     /// Paths are canonicalized (percent-decoded, dot-segment resolved, double
     /// slashes collapsed) to prevent bypass via path manipulation.
+    ///
+    /// Returns `SrrCheckResult` with the decision, matched rule description,
+    /// and whether this was a catch-all/default-to-caution match.
     pub fn check(
         &self,
         method: &str,
         host: &str,
         path: &str,
         body: Option<&[u8]>,
-    ) -> EnforcementDecision {
+    ) -> SrrCheckResult {
         // Normalize host: resolve IPv6 variants to canonical form so SRR rules
         // written for "localhost" or "127.0.0.1" also catch IPv6 equivalents.
         let normalized = normalize_host(host);
@@ -172,7 +199,11 @@ impl NetworkSRR {
                     if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
                         if let Some(value) = json.get(field).and_then(|v| v.as_str()) {
                             if matches.iter().any(|m| m == value) {
-                                return rule.decision.clone();
+                                return SrrCheckResult {
+                                    decision: rule.decision.clone(),
+                                    matched_description: Some(rule.description.clone()),
+                                    is_catch_all: rule.is_catch_all,
+                                };
                             }
                         }
                     }
@@ -185,11 +216,19 @@ impl NetworkSRR {
             }
 
             // URL-only rule matched
-            return rule.decision.clone();
+            return SrrCheckResult {
+                decision: rule.decision.clone(),
+                matched_description: Some(rule.description.clone()),
+                is_catch_all: rule.is_catch_all,
+            };
         }
 
-        // No match — Default-to-Caution
-        self.default_decision.clone()
+        // No match — Default-to-Caution (built-in fallback)
+        SrrCheckResult {
+            decision: self.default_decision.clone(),
+            matched_description: None,
+            is_catch_all: true,
+        }
     }
 }
 
@@ -610,10 +649,10 @@ mod tests {
         // Body is 200 bytes — exceeds max_body_bytes (100)
         let big_body = vec![b'x'; 200];
 
-        let decision = srr.check("POST", "api.bank.com", "/graphql", Some(&big_body));
+        let result = srr.check("POST", "api.bank.com", "/graphql", Some(&big_body));
 
         // Must NOT crash. Must skip the payload rule and match the URL-only rule.
-        match decision {
+        match result.decision {
             EnforcementDecision::Delay { milliseconds } => {
                 assert_eq!(milliseconds, 500, "Should fall through to URL-only rule");
             }
@@ -638,9 +677,9 @@ mod tests {
 
         // Body exceeds limit, no fallback rule → Default-to-Caution
         let big_body = vec![b'x'; 200];
-        let decision = srr.check("POST", "api.bank.com", "/graphql", Some(&big_body));
+        let result = srr.check("POST", "api.bank.com", "/graphql", Some(&big_body));
 
-        match decision {
+        match result.decision {
             EnforcementDecision::Delay { milliseconds } => {
                 assert_eq!(milliseconds, 300, "No fallback rule → Default-to-Caution");
             }
@@ -665,8 +704,8 @@ mod tests {
         let body = br#"{"operationName": "TransferFunds"}"#;
         assert!(body.len() <= 1024);
 
-        let decision = srr.check("POST", "api.bank.com", "/graphql", Some(body));
-        match decision {
+        let result = srr.check("POST", "api.bank.com", "/graphql", Some(body));
+        match result.decision {
             EnforcementDecision::Deny { reason } => {
                 assert!(reason.contains("Dangerous GraphQL"));
             }
@@ -695,10 +734,10 @@ mod tests {
 
         // 128KB body — well over 64KB limit
         let huge_body = vec![b'A'; 131072];
-        let decision = srr.check("POST", "api.bank.com", "/graphql", Some(&huge_body));
+        let result = srr.check("POST", "api.bank.com", "/graphql", Some(&huge_body));
 
         // Must return Default-to-Caution, not crash
-        match decision {
+        match result.decision {
             EnforcementDecision::Delay { milliseconds } => {
                 assert_eq!(milliseconds, 300);
             }
@@ -727,9 +766,9 @@ mod tests {
 
         // Invalid JSON — should not crash, should skip to next rule
         let bad_json = b"this is not json {{{";
-        let decision = srr.check("POST", "api.bank.com", "/graphql", Some(bad_json));
+        let result = srr.check("POST", "api.bank.com", "/graphql", Some(bad_json));
 
-        match decision {
+        match result.decision {
             EnforcementDecision::Delay { milliseconds } => {
                 assert_eq!(milliseconds, 300, "Malformed JSON should fall through to next rule");
             }
@@ -756,9 +795,9 @@ mod tests {
         "#);
 
         // No body provided — payload rule should be skipped
-        let decision = srr.check("POST", "api.bank.com", "/graphql", None);
+        let result = srr.check("POST", "api.bank.com", "/graphql", None);
 
-        match decision {
+        match result.decision {
             EnforcementDecision::Delay { milliseconds } => {
                 assert_eq!(milliseconds, 500);
             }
@@ -781,9 +820,9 @@ mod tests {
 
         // Agent lies: claims storage.read but URL is bank transfer
         // SRR doesn't care about headers — it inspects the actual URL
-        let decision = srr.check("POST", "api.bank.com", "/transfer/123", None);
+        let result = srr.check("POST", "api.bank.com", "/transfer/123", None);
 
-        match decision {
+        match result.decision {
             EnforcementDecision::Deny { reason } => {
                 assert!(reason.contains("Wire transfer"));
             }
@@ -806,9 +845,9 @@ mod tests {
         "#);
 
         // Completely unknown URL — should hit default_decision (Delay 300ms)
-        let decision = srr.check("GET", "totally-unknown.com", "/some/path", None);
+        let result = srr.check("GET", "totally-unknown.com", "/some/path", None);
 
-        match decision {
+        match result.decision {
             EnforcementDecision::Delay { milliseconds } => {
                 assert_eq!(milliseconds, 300, "Unknown URLs must get Default-to-Caution");
             }
@@ -832,8 +871,8 @@ mod tests {
         let d2 = srr.check("DELETE", "staging.database.com", "/orders", None);
         let d3 = srr.check("DELETE", "dev.database.com", "/anything", None);
 
-        for (i, decision) in [d1, d2, d3].iter().enumerate() {
-            match decision {
+        for (i, r) in [d1, d2, d3].iter().enumerate() {
+            match &r.decision {
                 EnforcementDecision::Deny { .. } => {}
                 other => panic!("Subdomain {} should be denied, got {:?}", i + 1, other),
             }
@@ -852,9 +891,9 @@ mod tests {
         "#);
 
         // GET to a POST-only rule — should NOT be denied
-        let decision = srr.check("GET", "api.bank.com", "/transfer/123", None);
+        let result = srr.check("GET", "api.bank.com", "/transfer/123", None);
 
-        match decision {
+        match result.decision {
             EnforcementDecision::Deny { .. } => {
                 panic!("GET should not match a POST-only deny rule");
             }
@@ -874,8 +913,8 @@ mod tests {
         "#);
 
         for method in &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"] {
-            let decision = srr.check(method, "evil.com", "/anything", None);
-            match decision {
+            let result = srr.check(method, "evil.com", "/anything", None);
+            match result.decision {
                 EnforcementDecision::Deny { .. } => {}
                 other => panic!("{} should be denied for evil.com, got {:?}", method, other),
             }
@@ -894,8 +933,8 @@ mod tests {
         "#);
 
         // Host with port — must match "api.bank.com" pattern
-        let decision = srr.check("POST", "api.bank.com:443", "/transfer/123", None);
-        match decision {
+        let result = srr.check("POST", "api.bank.com:443", "/transfer/123", None);
+        match result.decision {
             EnforcementDecision::Deny { reason } => {
                 assert!(reason.contains("Wire transfer"));
             }
@@ -912,8 +951,8 @@ mod tests {
             decision = { type = "Deny", reason = "Database deletion blocked" }
         "#);
 
-        let decision = srr.check("DELETE", "prod.database.com:5432", "/users/123", None);
-        match decision {
+        let result = srr.check("DELETE", "prod.database.com:5432", "/users/123", None);
+        match result.decision {
             EnforcementDecision::Deny { .. } => {}
             other => panic!("Host with port should match suffix pattern, got {:?}", other),
         }
@@ -931,8 +970,8 @@ mod tests {
         "#);
 
         // %2F = /, %74 = t, etc. — encoded path that resolves to /transfer/123
-        let decision = srr.check("POST", "api.bank.com", "/%74ransfer/123", None);
-        match decision {
+        let result = srr.check("POST", "api.bank.com", "/%74ransfer/123", None);
+        match result.decision {
             EnforcementDecision::Deny { .. } => {}
             other => panic!("Percent-encoded path must be decoded before matching, got: {:?}", other),
         }
@@ -947,8 +986,8 @@ mod tests {
             decision = { type = "Deny", reason = "Wire transfer blocked" }
         "#);
 
-        let decision = srr.check("POST", "api.bank.com", "//transfer/123", None);
-        match decision {
+        let result = srr.check("POST", "api.bank.com", "//transfer/123", None);
+        match result.decision {
             EnforcementDecision::Deny { .. } => {}
             other => panic!("Double slash must be collapsed, got: {:?}", other),
         }
@@ -964,8 +1003,8 @@ mod tests {
         "#);
 
         // /safe/../transfer/123 resolves to /transfer/123
-        let decision = srr.check("POST", "api.bank.com", "/safe/../transfer/123", None);
-        match decision {
+        let result = srr.check("POST", "api.bank.com", "/safe/../transfer/123", None);
+        match result.decision {
             EnforcementDecision::Deny { .. } => {}
             other => panic!("Dot-segment traversal must not bypass deny, got: {:?}", other),
         }
@@ -995,5 +1034,44 @@ mod tests {
 
         // Null byte removal
         assert_eq!(normalize_path("/a\0b").expect("null-byte path must normalize"), "/ab");
+    }
+
+    // ── Test: SrrCheckResult metadata ──
+
+    #[test]
+    fn explicit_rule_match_is_not_catch_all() {
+        let srr = srr_from_toml(r#"
+            [[rules]]
+            method = "POST"
+            pattern = "api.bank.com/transfer/{any}"
+            decision = { type = "Deny", reason = "Wire transfer blocked" }
+            description = "Block wire transfers"
+
+            [[rules]]
+            method = "*"
+            pattern = "{any}"
+            decision = { type = "Delay", milliseconds = 300 }
+            description = "Default-to-Caution"
+        "#);
+
+        // Explicit rule match
+        let r1 = srr.check("POST", "api.bank.com", "/transfer/123", None);
+        assert!(!r1.is_catch_all, "Explicit rule must not be flagged as catch-all");
+        assert_eq!(r1.matched_description.as_deref(), Some("Block wire transfers"));
+
+        // Catch-all match
+        let r2 = srr.check("GET", "unknown.com", "/any", None);
+        assert!(r2.is_catch_all, "Catch-all rule must be flagged");
+
+        // Built-in default (no rules match at all)
+        let srr_no_catchall = srr_from_toml(r#"
+            [[rules]]
+            method = "POST"
+            pattern = "api.bank.com/transfer/{any}"
+            decision = { type = "Deny", reason = "Wire transfer blocked" }
+        "#);
+        let r3 = srr_no_catchall.check("GET", "unknown.com", "/any", None);
+        assert!(r3.is_catch_all, "Built-in default must be flagged as catch-all");
+        assert!(r3.matched_description.is_none(), "Built-in default has no description");
     }
 }

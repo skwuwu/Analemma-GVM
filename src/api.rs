@@ -503,10 +503,10 @@ pub async fn check(
     let (policy_decision, matched_rule) = state.policy.evaluate(&operation);
 
     // Layer 2: Network SRR evaluation (use actual target_path for accurate matching)
-    let srr_decision = state.srr.check(&body.method, &body.target_host, &body.target_path, None);
+    let srr_result = state.srr.check(&body.method, &body.target_host, &body.target_path, None);
 
     // Combined decision
-    let decision = crate::types::max_strict(srr_decision, policy_decision);
+    let decision = crate::types::max_strict(srr_result.decision, policy_decision);
     let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
 
     let (decision_str, next_action) = match &decision {
