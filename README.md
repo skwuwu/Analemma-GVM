@@ -263,9 +263,9 @@ The goal is not to build another agent framework. The goal is to build the **ope
 | **Isolation** | Docker + K3s | Linux namespaces (no Docker required) |
 | **Policy Granularity** | Allow / Deny | Allow / Delay / RequireApproval / Deny |
 | **Forgery Detection** | Single layer (URL) | Cross-layer (semantic + network + capability) |
-| **On Deny** | Agent waits for policy change | Auto-rollback to checkpoint |
+| **On Deny** | Agent waits for policy change | Auto-rollback to checkpoint (with SDK) |
 | **Audit Integrity** | Audit trail | Merkle-verified hash chain |
-| **Deployment** | Kubernetes | Single Rust binary |
+| **Deployment** | Kubernetes | Standalone Rust proxy (no Kubernetes) |
 | **Status** | Alpha | Alpha (v0.1) |
 
 **Complementary, not competitive.** GVM can run *inside* an OpenShell sandbox for layered defense, or standalone. [Full analysis →](docs/11-competitive-analysis.md)
