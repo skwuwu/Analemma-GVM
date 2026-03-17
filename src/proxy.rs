@@ -9,9 +9,10 @@ use crate::srr::NetworkSRR;
 use crate::types::*;
 use crate::vault::Vault;
 use crate::wasm_engine::WasmEngine;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{Request, Response, StatusCode, Uri};
+use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -67,12 +68,10 @@ pub async fn proxy_handler(
         let (policy_decision, matched_rule) = state.policy.evaluate(&operation);
 
         // Also check network SRR (Deny in SRR overrides policy)
-        let srr_result = state.srr.check(
-            request.method().as_str(),
-            &target.host,
-            &target.path,
-            None,
-        );
+        let srr_result =
+            state
+                .srr
+                .check(request.method().as_str(), &target.host, &target.path, None);
 
         // Determine which layer won (max_strict picks the strictest)
         let final_decision = max_strict(srr_result.decision.clone(), policy_decision.clone());
@@ -90,28 +89,32 @@ pub async fn proxy_handler(
             matched_rule
         };
 
-        (Classification {
-            decision: final_decision,
-            source,
-            operation: Some(operation),
-            matched_rule_id: rule_id,
-        }, srr_result.is_catch_all)
+        (
+            Classification {
+                decision: final_decision,
+                source,
+                operation: Some(operation),
+                matched_rule_id: rule_id,
+            },
+            srr_result.is_catch_all,
+        )
     } else {
         // Direct HTTP: Layer 2 Network SRR classification
-        let srr_result = state.srr.check(
-            request.method().as_str(),
-            &target.host,
-            &target.path,
-            None,
-        );
+        let srr_result =
+            state
+                .srr
+                .check(request.method().as_str(), &target.host, &target.path, None);
 
         let is_catch_all = srr_result.is_catch_all;
-        (Classification {
-            decision: srr_result.decision,
-            source: ClassificationSource::SRR,
-            operation: None,
-            matched_rule_id: srr_result.matched_description,
-        }, is_catch_all)
+        (
+            Classification {
+                decision: srr_result.decision,
+                source: ClassificationSource::SRR,
+                operation: None,
+                matched_rule_id: srr_result.matched_description,
+            },
+            is_catch_all,
+        )
     };
 
     let agent_id = gvm_headers
@@ -186,7 +189,11 @@ pub async fn proxy_handler(
             }
             state.ledger.append_async(event.clone()).await;
             inject_gvm_response_headers(
-                response.headers_mut(), &event, &classification, engine_ms, 0,
+                response.headers_mut(),
+                &event,
+                &classification,
+                engine_ms,
+                0,
             );
             response
         }
@@ -233,15 +240,23 @@ pub async fn proxy_handler(
             if let Some(provider) = llm_provider {
                 if response.status().is_success() {
                     response = extract_llm_trace_from_response(
-                        response, provider, &mut event,
-                    ).await;
+                        response,
+                        provider,
+                        &mut event,
+                        state.ledger.clone(),
+                    )
+                    .await;
                 }
             }
 
             // Best-effort status update to WAL
             let _ = state.ledger.append_durable(&event).await;
             inject_gvm_response_headers(
-                response.headers_mut(), &event, &classification, engine_ms, *milliseconds,
+                response.headers_mut(),
+                &event,
+                &classification,
+                engine_ms,
+                *milliseconds,
             );
             response
         }
@@ -321,7 +336,11 @@ pub async fn proxy_handler(
             event.status = EventStatus::Confirmed;
             state.ledger.append_async(event.clone()).await;
             inject_gvm_response_headers(
-                response.headers_mut(), &event, &classification, engine_ms, 0,
+                response.headers_mut(),
+                &event,
+                &classification,
+                engine_ms,
+                0,
             );
             response
         }
@@ -352,7 +371,11 @@ pub async fn proxy_handler(
                 );
             }
             inject_gvm_response_headers(
-                response.headers_mut(), &event, &classification, engine_ms, 0,
+                response.headers_mut(),
+                &event,
+                &classification,
+                engine_ms,
+                0,
             );
             response
         }
@@ -505,7 +528,10 @@ async fn forward_request(
     // MVP default: Passthrough (no credential = forward as-is).
     // Production should use Deny to enforce Layer 3 isolation.
     let credential_policy = crate::api_keys::MissingCredentialPolicy::default();
-    if let Err(e) = state.api_keys.inject(&mut parts.headers, &target.host, &credential_policy) {
+    if let Err(e) = state
+        .api_keys
+        .inject(&mut parts.headers, &target.host, &credential_policy)
+    {
         tracing::error!(error = %e, "Failed to inject API key");
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -576,28 +602,24 @@ async fn forward_request(
             // Hyper errors can reveal internal network topology (hostnames, ports,
             // connection refused details) which aids reconnaissance attacks.
             tracing::error!(error = %e, "Upstream request failed");
-            error_response(
-                StatusCode::BAD_GATEWAY,
-                "Upstream service unavailable",
-            )
+            error_response(StatusCode::BAD_GATEWAY, "Upstream service unavailable")
         }
     }
 }
 
-/// Buffer response body to extract LLM thinking trace, then reconstruct the response.
+/// Buffer or tap response body to extract LLM thinking trace.
 /// Called only for IC-2 paths targeting known LLM providers.
 ///
-/// Supports both non-streaming (JSON) and SSE streaming (`text/event-stream`) responses.
-/// Thinking content is stored as a SHA-256 hash by default for privacy protection.
-///
-/// Safety behavior:
-/// - Only buffers when `Content-Length` is present and within a configured limit.
-/// - If size is unknown or exceeds limit, skips extraction and streams response through.
-/// - If buffering fails, returns an explicit upstream error (never silent empty success body).
+/// - Non-streaming JSON responses: bounded buffering with explicit upstream errors on collect failure.
+/// - SSE responses: passthrough streaming with bounded tap capture (no full buffering before first byte).
+const MAX_JSON_TRACE_BUFFER_BYTES: usize = 256 * 1024;
+const MAX_SSE_TRACE_CAPTURE_BYTES: usize = 1024 * 1024;
+
 async fn extract_llm_trace_from_response(
     response: Response<Body>,
     provider: &str,
     event: &mut GVMEvent,
+    ledger: Arc<Ledger>,
 ) -> Response<Body> {
     let (parts, body) = response.into_parts();
 
@@ -609,10 +631,10 @@ async fn extract_llm_trace_from_response(
         .map(llm_trace::is_sse_content_type)
         .unwrap_or(false);
 
-    // Buffer limits (256KB for JSON, 1MB for SSE).
-    // We only buffer when Content-Length is known and fits the limit.
-    // Unknown-sized/chunked responses are passed through to avoid output drops.
-    let max_buffer: usize = if is_sse { 1024 * 1024 } else { 256 * 1024 };
+    if is_sse {
+        return extract_llm_trace_from_sse_stream(parts, body, provider, event.clone(), ledger);
+    }
+
     let content_length = parts
         .headers
         .get(hyper::header::CONTENT_LENGTH)
@@ -624,7 +646,6 @@ async fn extract_llm_trace_from_response(
         None => {
             tracing::debug!(
                 provider = provider,
-                streaming = is_sse,
                 "Skipping LLM trace extraction: unknown content-length"
             );
             let body_stream = http_body_util::BodyDataStream::new(body);
@@ -632,12 +653,11 @@ async fn extract_llm_trace_from_response(
         }
     };
 
-    if known_len > max_buffer {
+    if known_len > MAX_JSON_TRACE_BUFFER_BYTES {
         tracing::debug!(
             provider = provider,
             content_length = known_len,
-            max_buffer = max_buffer,
-            streaming = is_sse,
+            max_buffer = MAX_JSON_TRACE_BUFFER_BYTES,
             "Skipping LLM trace extraction: response exceeds buffer limit"
         );
         let body_stream = http_body_util::BodyDataStream::new(body);
@@ -647,23 +667,17 @@ async fn extract_llm_trace_from_response(
     match http_body_util::BodyExt::collect(body).await {
         Ok(collected) => {
             let bytes = collected.to_bytes();
-            let trace = if is_sse {
-                llm_trace::extract_thinking_trace_from_sse(provider, &bytes)
-            } else {
-                llm_trace::extract_thinking_trace(provider, &bytes)
-            };
-            if let Some(trace) = trace {
+            if let Some(trace) = llm_trace::extract_thinking_trace(provider, &bytes) {
                 tracing::info!(
                     provider = provider,
                     model = ?trace.model,
                     has_thinking = trace.thinking.is_some(),
                     truncated = trace.truncated,
-                    streaming = is_sse,
+                    streaming = false,
                     "LLM thinking trace extracted"
                 );
                 event.llm_trace = Some(trace);
             }
-            // Reconstruct the response with the buffered body
             Response::from_parts(parts, Body::from(bytes))
         }
         Err(e) => {
@@ -674,6 +688,85 @@ async fn extract_llm_trace_from_response(
             )
         }
     }
+}
+
+fn extract_llm_trace_from_sse_stream(
+    parts: axum::http::response::Parts,
+    body: Body,
+    provider: &str,
+    event: GVMEvent,
+    ledger: Arc<Ledger>,
+) -> Response<Body> {
+    let provider_name = provider.to_string();
+    let mut upstream_stream = http_body_util::BodyDataStream::new(body);
+
+    let tapped_stream = async_stream::stream! {
+        let mut capture = Vec::with_capacity(16 * 1024);
+        let mut capture_overflow = false;
+        let mut stream_failed = false;
+
+        while let Some(next) = upstream_stream.next().await {
+            match next {
+                Ok(chunk) => {
+                    if capture.len() < MAX_SSE_TRACE_CAPTURE_BYTES {
+                        let remaining = MAX_SSE_TRACE_CAPTURE_BYTES - capture.len();
+                        let take_len = remaining.min(chunk.len());
+                        capture.extend_from_slice(&chunk[..take_len]);
+                        if take_len < chunk.len() {
+                            capture_overflow = true;
+                        }
+                    } else {
+                        capture_overflow = true;
+                    }
+
+                    yield Ok::<Bytes, axum::Error>(chunk);
+                }
+                Err(err) => {
+                    stream_failed = true;
+                    tracing::warn!(
+                        provider = provider_name.as_str(),
+                        error = %err,
+                        "Upstream SSE stream interrupted during trace tap"
+                    );
+                    yield Err(err);
+                    break;
+                }
+            }
+        }
+
+        if stream_failed {
+            return;
+        }
+
+        let mut trace = match llm_trace::extract_thinking_trace_from_sse(provider_name.as_str(), &capture) {
+            Some(trace) => trace,
+            None => return,
+        };
+
+        if capture_overflow {
+            trace.truncated = true;
+        }
+
+        tracing::info!(
+            provider = provider_name.as_str(),
+            model = ?trace.model,
+            has_thinking = trace.thinking.is_some(),
+            truncated = trace.truncated,
+            streaming = true,
+            "LLM thinking trace extracted"
+        );
+
+        let mut trace_event = event;
+        trace_event.llm_trace = Some(trace);
+
+        tokio::spawn(async move {
+            if let Err(e) = ledger.append_durable(&trace_event).await {
+                tracing::warn!(error = %e, "Failed to persist SSE LLM trace update");
+            }
+        });
+    };
+
+    Response::from_parts(parts, Body::from_stream(tapped_stream))
 }
 
 /// Parse GVM-specific headers from an SDK-routed request.
@@ -871,10 +964,7 @@ fn error_response_detailed(
 /// Returns the standard `GovernanceBlockResponse` JSON body with appropriate
 /// HTTP headers for SDK consumption. This is the contract between the proxy
 /// and all agent SDKs — every blocked request uses this format.
-fn governance_block_response(
-    status: StatusCode,
-    block: GovernanceBlockResponse,
-) -> Response<Body> {
+fn governance_block_response(status: StatusCode, block: GovernanceBlockResponse) -> Response<Body> {
     let body = serde_json::to_string(&block).unwrap_or_else(|_| {
         // Serialization of GovernanceBlockResponse should never fail,
         // but if it does, return a minimal valid JSON.
@@ -885,11 +975,14 @@ fn governance_block_response(
         .status(status)
         .header("Content-Type", "application/json")
         .header("X-GVM-Decision", &block.decision)
-        .header("X-GVM-Block-Mode", match &block.mode {
-            BlockResponseMode::Halt => "halt",
-            BlockResponseMode::SoftPivot => "soft_pivot",
-            BlockResponseMode::Rollback => "rollback",
-        });
+        .header(
+            "X-GVM-Block-Mode",
+            match &block.mode {
+                BlockResponseMode::Halt => "halt",
+                BlockResponseMode::SoftPivot => "soft_pivot",
+                BlockResponseMode::Rollback => "rollback",
+            },
+        );
 
     if !block.event_id.is_empty() {
         builder = builder.header("X-GVM-Event-Id", &block.event_id);
@@ -904,14 +997,12 @@ fn governance_block_response(
         builder = builder.header("Retry-After", secs.to_string());
     }
 
-    builder
-        .body(Body::from(body))
-        .unwrap_or_else(|_| {
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::empty())
-                .expect("fallback 500 response with empty body cannot fail")
-        })
+    builder.body(Body::from(body)).unwrap_or_else(|_| {
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::empty())
+            .expect("fallback 500 response with empty body cannot fail")
+    })
 }
 
 #[cfg(test)]
@@ -920,6 +1011,16 @@ mod tests {
     use axum::body::Bytes;
     use std::pin::Pin;
     use std::task::{Context, Poll};
+    use std::time::{Duration, Instant};
+
+    async fn make_test_ledger() -> (Arc<Ledger>, std::path::PathBuf) {
+        let wal_path =
+            std::env::temp_dir().join(format!("gvm-proxy-test-{}.wal", uuid::Uuid::new_v4()));
+        let ledger = Ledger::new(&wal_path, "", "gvm_test")
+            .await
+            .expect("ledger init should succeed");
+        (Arc::new(ledger), wal_path)
+    }
 
     fn make_event() -> GVMEvent {
         GVMEvent {
@@ -965,8 +1066,10 @@ mod tests {
             .body(Body::from(body.clone()))
             .expect("response build should succeed");
 
+        let (ledger, _wal_path) = make_test_ledger().await;
         let mut event = make_event();
-        let response = extract_llm_trace_from_response(response, "openai", &mut event).await;
+        let response =
+            extract_llm_trace_from_response(response, "openai", &mut event, ledger).await;
 
         let bytes = http_body_util::BodyExt::collect(response.into_body())
             .await
@@ -1004,8 +1107,10 @@ mod tests {
             .body(Body::from(body.clone()))
             .expect("response build should succeed");
 
+        let (ledger, _wal_path) = make_test_ledger().await;
         let mut event = make_event();
-        let response = extract_llm_trace_from_response(response, "openai", &mut event).await;
+        let response =
+            extract_llm_trace_from_response(response, "openai", &mut event, ledger).await;
 
         let bytes = http_body_util::BodyExt::collect(response.into_body())
             .await
@@ -1030,8 +1135,10 @@ mod tests {
             .body(Body::from(body.clone()))
             .expect("response build should succeed");
 
+        let (ledger, _wal_path) = make_test_ledger().await;
         let mut event = make_event();
-        let response = extract_llm_trace_from_response(response, "openai", &mut event).await;
+        let response =
+            extract_llm_trace_from_response(response, "openai", &mut event, ledger).await;
 
         let bytes = http_body_util::BodyExt::collect(response.into_body())
             .await
@@ -1071,8 +1178,10 @@ mod tests {
             .body(Body::new(FailingBody))
             .expect("response build should succeed");
 
+        let (ledger, _wal_path) = make_test_ledger().await;
         let mut event = make_event();
-        let response = extract_llm_trace_from_response(response, "openai", &mut event).await;
+        let response =
+            extract_llm_trace_from_response(response, "openai", &mut event, ledger).await;
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let bytes = http_body_util::BodyExt::collect(response.into_body())
@@ -1085,6 +1194,116 @@ mod tests {
             body.contains("Upstream response stream interrupted"),
             "must return explicit error body, got: {}",
             body
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_trace_sse_passthrough_returns_immediately() {
+        let first_event =
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}],\"model\":\"o1-preview\"}\n\n";
+        let done_event = "data: [DONE]\n\n";
+        let expected = format!("{}{}", first_event, done_event);
+
+        let slow_stream = async_stream::stream! {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(first_event.to_string()));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(done_event.to_string()));
+        };
+
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(slow_stream))
+            .expect("response build should succeed");
+
+        let (ledger, _wal_path) = make_test_ledger().await;
+        let mut event = make_event();
+
+        let start = Instant::now();
+        let response =
+            extract_llm_trace_from_response(response, "openai", &mut event, ledger).await;
+        assert!(
+            start.elapsed() < Duration::from_millis(150),
+            "SSE extraction must not block on upstream stream completion"
+        );
+
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("body collect should succeed")
+            .to_bytes();
+        assert_eq!(bytes, expected.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn llm_trace_sse_large_stream_preserves_body_and_persists_trace() {
+        let reasoning_fragment = "r".repeat(512);
+        let sse_event = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"{}\"}}}}],\"model\":\"o1-preview\"}}\n\n",
+            reasoning_fragment
+        );
+        let repetitions = (MAX_SSE_TRACE_CAPTURE_BYTES / sse_event.len()) + 128;
+
+        let mut body = sse_event.repeat(repetitions);
+        body.push_str("data: [DONE]\n\n");
+
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body.clone()))
+            .expect("response build should succeed");
+
+        let (ledger, wal_path) = make_test_ledger().await;
+        let mut event = make_event();
+        event.event_id = format!("evt-test-{}", uuid::Uuid::new_v4());
+
+        let response =
+            extract_llm_trace_from_response(response, "openai", &mut event, ledger).await;
+        assert!(
+            event.llm_trace.is_none(),
+            "SSE trace extraction should be persisted asynchronously"
+        );
+
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("body collect should succeed")
+            .to_bytes();
+        assert_eq!(bytes, body.as_bytes());
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut persisted_trace = None;
+
+        while Instant::now() < deadline {
+            let wal = tokio::fs::read_to_string(&wal_path)
+                .await
+                .unwrap_or_default();
+
+            for line in wal.lines() {
+                if !line.contains(&event.event_id) || !line.contains("\"llm_trace\"") {
+                    continue;
+                }
+
+                if let Ok(parsed) = serde_json::from_str::<GVMEvent>(line) {
+                    if let Some(trace) = parsed.llm_trace {
+                        persisted_trace = Some(trace);
+                        break;
+                    }
+                }
+            }
+
+            if persisted_trace.is_some() {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let trace = persisted_trace
+            .expect("large SSE response should persist a bounded trace update asynchronously");
+        assert_eq!(trace.provider, "openai");
+        assert!(
+            trace.truncated,
+            "bounded capture should mark large SSE trace as truncated"
         );
     }
 }

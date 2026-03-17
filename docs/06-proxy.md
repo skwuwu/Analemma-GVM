@@ -236,18 +236,25 @@ The Tower middleware stack provides three layers of runtime protection:
 
 **Source**: `src/llm_trace.rs` (379 lines, 8 unit tests)
 
-When the proxy processes an IC-2 (Delay) response from a known LLM provider, it performs **best-effort bounded extraction** of reasoning/thinking content and records it in the WAL event for governance audit.
+When the proxy processes an IC-2 (Delay) response from a known LLM provider, it performs **best-effort bounded extraction** of reasoning/thinking content for governance audit.
 
-To protect runtime stability and avoid output loss, extraction only buffers responses when size is known and within configured limits. Unknown-size or oversized responses are passed through unchanged (no trace extraction).
+Extraction behavior is transport-aware to avoid output drops:
+
+- **JSON (`application/json`)**: bounded buffering only when `Content-Length` is present and ≤ 256KB. Unknown-size or oversized JSON is passed through unchanged (no extraction).
+- **SSE (`text/event-stream`)**: passthrough streaming (no full pre-buffering), while tapping up to 1MB for best-effort extraction. On stream completion, any extracted trace is appended asynchronously as a follow-up WAL update.
 
 ### Activation Conditions
 
-Trace extraction only runs when **all four** conditions are met:
+Trace extraction baseline conditions:
 
-1. The enforcement decision is **Delay** (IC-2 path — response body is already buffered)
+1. The enforcement decision is **Delay** (IC-2 path)
 2. The target host matches a **known LLM provider** (`identify_llm_provider()`)
 3. The upstream response status is **2xx** (successful)
-4. `Content-Length` is present and within the extraction buffer limit (256KB JSON, 1MB SSE)
+
+Additional extraction gates by response type:
+
+- **JSON**: requires `Content-Length` and bounded size (≤ 256KB)
+- **SSE**: requires `Content-Type: text/event-stream`; tap capture is bounded to 1MB
 
 IC-1 (Allow) responses are forwarded without buffering. Deny/RequireApproval responses never reach upstream.
 
@@ -271,20 +278,20 @@ Agent → Proxy (IC-2 Delay) → Upstream LLM API
                   No          Yes
                   │            │
                   ▼            ▼
-                Return    check bounded buffering eligibility
+                Return      inspect content-type
                 as-is             │
-                         ├─ Not eligible (unknown/oversize): return as-is
+                         ├─ JSON: bounded buffer (≤256KB, known length)
+                         │      ├─ collect fail: explicit 502 upstream error
+                         │      └─ extract trace → event.llm_trace
                          │
-                         └─ Eligible: buffer → extract_thinking_trace(...)
-                                 │
-                                 ▼
-                             event.llm_trace = Some(trace)
-                                 │
-                                 ▼
-                             WAL append (audit record)
+                         └─ SSE: passthrough stream + bounded tap (≤1MB)
+                                └─ stream end: extract trace → async WAL update
 ```
 
-If bounded buffering fails (e.g., interrupted upstream stream), the proxy returns an explicit upstream error response instead of silently returning an empty success body.
+Failure semantics:
+
+- JSON bounded-buffer collect failure returns explicit `502 Bad Gateway` (never silent empty success body).
+- SSE upstream stream errors pass through as upstream stream errors; trace update is skipped when extraction cannot complete.
 
 ### Truncation
 

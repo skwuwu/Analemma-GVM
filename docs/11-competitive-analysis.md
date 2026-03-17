@@ -124,7 +124,7 @@ headers.remove(AUTHORIZATION);
 
 **OPA+Envoy**: No awareness of LLM response structure. Treats all HTTP responses as opaque bytes.
 
-**GVM**: When the proxy processes an IC-2 response from a known LLM provider (OpenAI, Anthropic, Gemini), it performs bounded best-effort extraction of reasoning/thinking content and records it in the WAL event. Unknown-size or oversized responses are passed through unchanged to avoid output drop/stall risks.
+**GVM**: When the proxy processes an IC-2 response from a known LLM provider (OpenAI, Anthropic, Gemini), it performs transport-aware bounded best-effort extraction of reasoning/thinking content. JSON responses are extracted only when `Content-Length` is known and ≤ 256KB; SSE responses are streamed through immediately with a bounded 1MB tap and persisted as an asynchronous WAL trace update on stream completion. This preserves output continuity while still capturing audit-relevant trace data.
 
 ```rust
 // src/llm_trace.rs:18-22 — Known LLM providers
