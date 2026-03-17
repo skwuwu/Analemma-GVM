@@ -589,6 +589,11 @@ async fn forward_request(
 ///
 /// Supports both non-streaming (JSON) and SSE streaming (`text/event-stream`) responses.
 /// Thinking content is stored as a SHA-256 hash by default for privacy protection.
+///
+/// Safety behavior:
+/// - Only buffers when `Content-Length` is present and within a configured limit.
+/// - If size is unknown or exceeds limit, skips extraction and streams response through.
+/// - If buffering fails, returns an explicit upstream error (never silent empty success body).
 async fn extract_llm_trace_from_response(
     response: Response<Body>,
     provider: &str,
@@ -604,36 +609,69 @@ async fn extract_llm_trace_from_response(
         .map(llm_trace::is_sse_content_type)
         .unwrap_or(false);
 
-    // Buffer the body (limit to 256KB for JSON, 1MB for SSE)
+    // Buffer limits (256KB for JSON, 1MB for SSE).
+    // We only buffer when Content-Length is known and fits the limit.
+    // Unknown-sized/chunked responses are passed through to avoid output drops.
     let max_buffer: usize = if is_sse { 1024 * 1024 } else { 256 * 1024 };
+    let content_length = parts
+        .headers
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok());
+
+    let known_len = match content_length {
+        Some(len) => len,
+        None => {
+            tracing::debug!(
+                provider = provider,
+                streaming = is_sse,
+                "Skipping LLM trace extraction: unknown content-length"
+            );
+            let body_stream = http_body_util::BodyDataStream::new(body);
+            return Response::from_parts(parts, Body::from_stream(body_stream));
+        }
+    };
+
+    if known_len > max_buffer {
+        tracing::debug!(
+            provider = provider,
+            content_length = known_len,
+            max_buffer = max_buffer,
+            streaming = is_sse,
+            "Skipping LLM trace extraction: response exceeds buffer limit"
+        );
+        let body_stream = http_body_util::BodyDataStream::new(body);
+        return Response::from_parts(parts, Body::from_stream(body_stream));
+    }
+
     match http_body_util::BodyExt::collect(body).await {
         Ok(collected) => {
             let bytes = collected.to_bytes();
-            if bytes.len() <= max_buffer {
-                let trace = if is_sse {
-                    llm_trace::extract_thinking_trace_from_sse(provider, &bytes)
-                } else {
-                    llm_trace::extract_thinking_trace(provider, &bytes)
-                };
-                if let Some(trace) = trace {
-                    tracing::info!(
-                        provider = provider,
-                        model = ?trace.model,
-                        has_thinking = trace.thinking.is_some(),
-                        truncated = trace.truncated,
-                        streaming = is_sse,
-                        "LLM thinking trace extracted"
-                    );
-                    event.llm_trace = Some(trace);
-                }
+            let trace = if is_sse {
+                llm_trace::extract_thinking_trace_from_sse(provider, &bytes)
+            } else {
+                llm_trace::extract_thinking_trace(provider, &bytes)
+            };
+            if let Some(trace) = trace {
+                tracing::info!(
+                    provider = provider,
+                    model = ?trace.model,
+                    has_thinking = trace.thinking.is_some(),
+                    truncated = trace.truncated,
+                    streaming = is_sse,
+                    "LLM thinking trace extracted"
+                );
+                event.llm_trace = Some(trace);
             }
             // Reconstruct the response with the buffered body
             Response::from_parts(parts, Body::from(bytes))
         }
         Err(e) => {
             tracing::warn!(error = %e, "Failed to buffer LLM response for trace extraction");
-            // Return an empty body on error — the response was already consumed
-            Response::from_parts(parts, Body::empty())
+            error_response(
+                StatusCode::BAD_GATEWAY,
+                "Upstream response stream interrupted",
+            )
         }
     }
 }
@@ -874,4 +912,179 @@ fn governance_block_response(
                 .body(Body::empty())
                 .expect("fallback 500 response with empty body cannot fail")
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Bytes;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    fn make_event() -> GVMEvent {
+        GVMEvent {
+            event_id: "evt-test-1".to_string(),
+            trace_id: "trace-test-1".to_string(),
+            parent_event_id: None,
+            agent_id: "agent-test".to_string(),
+            tenant_id: None,
+            session_id: "session-test".to_string(),
+            timestamp: chrono::Utc::now(),
+            operation: "gvm.messaging.send".to_string(),
+            resource: ResourceDescriptor::default(),
+            context: HashMap::new(),
+            transport: None,
+            decision: "Delay".to_string(),
+            decision_source: "ABAC".to_string(),
+            matched_rule_id: None,
+            enforcement_point: "proxy".to_string(),
+            status: EventStatus::Pending,
+            payload: PayloadDescriptor::default(),
+            nats_sequence: None,
+            event_hash: None,
+            llm_trace: None,
+            default_caution: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_trace_skip_when_content_length_missing_preserves_body() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "reasoning_content": "secret reasoning"
+                }
+            }],
+            "model": "o1-preview"
+        })
+        .to_string();
+
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.clone()))
+            .expect("response build should succeed");
+
+        let mut event = make_event();
+        let response = extract_llm_trace_from_response(response, "openai", &mut event).await;
+
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("body collect should succeed")
+            .to_bytes();
+
+        assert_eq!(bytes, body.as_bytes());
+        assert!(
+            event.llm_trace.is_none(),
+            "unknown length should skip extraction and preserve response"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_trace_extract_when_content_length_bounded() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "reasoning_content": "explain transfer review path"
+                }
+            }],
+            "model": "o1-preview",
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 20,
+                "total_tokens": 30
+            }
+        })
+        .to_string();
+
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .header(hyper::header::CONTENT_LENGTH, body.len().to_string())
+            .body(Body::from(body.clone()))
+            .expect("response build should succeed");
+
+        let mut event = make_event();
+        let response = extract_llm_trace_from_response(response, "openai", &mut event).await;
+
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("body collect should succeed")
+            .to_bytes();
+
+        assert_eq!(bytes, body.as_bytes());
+        let trace = event
+            .llm_trace
+            .as_ref()
+            .expect("bounded body should produce trace");
+        assert_eq!(trace.provider, "openai");
+    }
+
+    #[tokio::test]
+    async fn llm_trace_skip_when_content_length_exceeds_limit() {
+        let body = "x".repeat(300_001);
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .header(hyper::header::CONTENT_LENGTH, body.len().to_string())
+            .body(Body::from(body.clone()))
+            .expect("response build should succeed");
+
+        let mut event = make_event();
+        let response = extract_llm_trace_from_response(response, "openai", &mut event).await;
+
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("body collect should succeed")
+            .to_bytes();
+
+        assert_eq!(bytes, body.as_bytes());
+        assert!(
+            event.llm_trace.is_none(),
+            "oversized body should skip extraction and preserve response"
+        );
+    }
+
+    struct FailingBody;
+
+    impl hyper::body::Body for FailingBody {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "stream aborted",
+            ))))
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_trace_collect_error_returns_explicit_error_response() {
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .header(hyper::header::CONTENT_LENGTH, "10")
+            .body(Body::new(FailingBody))
+            .expect("response build should succeed");
+
+        let mut event = make_event();
+        let response = extract_llm_trace_from_response(response, "openai", &mut event).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("body collect should succeed")
+            .to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).expect("error body must be UTF-8 JSON");
+
+        assert!(
+            body.contains("Upstream response stream interrupted"),
+            "must return explicit error body, got: {}",
+            body
+        );
+    }
 }

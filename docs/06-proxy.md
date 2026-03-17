@@ -236,15 +236,18 @@ The Tower middleware stack provides three layers of runtime protection:
 
 **Source**: `src/llm_trace.rs` (379 lines, 8 unit tests)
 
-When the proxy processes an IC-2 (Delay) response from a known LLM provider, it buffers the response body, extracts reasoning/thinking content, and records it in the WAL event for governance audit.
+When the proxy processes an IC-2 (Delay) response from a known LLM provider, it performs **best-effort bounded extraction** of reasoning/thinking content and records it in the WAL event for governance audit.
+
+To protect runtime stability and avoid output loss, extraction only buffers responses when size is known and within configured limits. Unknown-size or oversized responses are passed through unchanged (no trace extraction).
 
 ### Activation Conditions
 
-Trace extraction only runs when **all three** conditions are met:
+Trace extraction only runs when **all four** conditions are met:
 
 1. The enforcement decision is **Delay** (IC-2 path — response body is already buffered)
 2. The target host matches a **known LLM provider** (`identify_llm_provider()`)
 3. The upstream response status is **2xx** (successful)
+4. `Content-Length` is present and within the extraction buffer limit (256KB JSON, 1MB SSE)
 
 IC-1 (Allow) responses are forwarded without buffering. Deny/RequireApproval responses never reach upstream.
 
@@ -260,28 +263,28 @@ IC-1 (Allow) responses are forwarded without buffering. Deny/RequireApproval res
 
 ```
 Agent → Proxy (IC-2 Delay) → Upstream LLM API
-                                    │
-                                    ▼ (response buffered)
-                          identify_llm_provider(host)
-                                    │
-                              ┌─────┴─────┐
-                              No          Yes
-                              │            │
-                              ▼            ▼
-                         Return       extract_thinking_trace(provider, body)
-                         as-is             │
-                                           ▼
-                                    LLMTrace {
-                                      provider, model, thinking,
-                                      truncated, usage
-                                    }
-                                           │
-                                           ▼
-                                    event.llm_trace = Some(trace)
-                                           │
-                                           ▼
-                                    WAL append (audit record)
+                     │
+                     ▼
+                 identify_llm_provider(host)
+                     │
+                  ┌─────┴─────┐
+                  No          Yes
+                  │            │
+                  ▼            ▼
+                Return    check bounded buffering eligibility
+                as-is             │
+                         ├─ Not eligible (unknown/oversize): return as-is
+                         │
+                         └─ Eligible: buffer → extract_thinking_trace(...)
+                                 │
+                                 ▼
+                             event.llm_trace = Some(trace)
+                                 │
+                                 ▼
+                             WAL append (audit record)
 ```
+
+If bounded buffering fails (e.g., interrupted upstream stream), the proxy returns an explicit upstream error response instead of silently returning an empty success body.
 
 ### Truncation
 
