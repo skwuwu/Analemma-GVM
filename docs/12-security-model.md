@@ -1,6 +1,6 @@
 # Security Model & Known Attack Surface
 
-> **Last updated**: 2026-03-16
+> **Last updated**: 2026-03-17
 
 ## Purpose
 
@@ -49,15 +49,19 @@ If an attacker has root access to the host, GVM — like any userspace process �
 
 ---
 
-### 2. Wasm Module Integrity
+### 2. Optional Wasm Runtime Integrity (Roadmap Scope)
 
-**Attack**: If the Wasm extension loading path is compromised, a malicious module could be loaded. Currently, SHA-256 hashes are logged but not verified against a whitelist.
+**Attack**: If optional Wasm decision mode is enabled and the module loading path is compromised, a malicious module could be loaded.
 
-**Preconditions**: Write access to the Wasm module directory or config file.
+**Preconditions**: Deployment explicitly enables Wasm decision mode and an attacker has write access to the Wasm module path or config.
 
-**Impact**: Arbitrary code execution within the Wasm sandbox boundary.
+**Current (v1)**: Request hot-path decisions are evaluated by the native policy engine. A Wasm loader exists, but it is not the default enforcement path.
 
-**Planned mitigation**: Cryptographic signature verification (Ed25519) with a trusted publisher key. Module whitelist in `proxy.toml` with hash pinning. Not implemented in v1 because Wasm extensions are an optional feature and the MVP does not load untrusted modules.
+**Impact (when enabled)**: Arbitrary policy logic execution within the Wasm sandbox boundary.
+
+**Roadmap mitigation**: (1) Hot-path Wasm activation with parity tests against native decisions, (2) Ed25519 signature verification + hash pinning, and (3) fail-close startup when Wasm mode is required.
+
+**Status**: Roadmap hardening item. Not active on the default runtime path.
 
 ---
 
@@ -69,19 +73,25 @@ If an attacker has root access to the host, GVM — like any userspace process �
 
 **Impact**: Complete policy bypass — no enforcement, no audit trail.
 
-**Current (v1)**: Cooperative model — SDK sets `HTTP_PROXY` via `GVMAgent.create_session()`, but enforcement depends on agent cooperation.
+**Current (v1)**:
+- Cooperative default: SDK sets `HTTP_PROXY` via `GVMAgent.create_session()`.
+- Enforced mode is available today via `gvm run --sandbox` (Linux namespace + veth + iptables redirect).
+- Docker fallback is available via `gvm run --contained`.
+- Limitation: containment is opt-in and process-scoped. Processes not launched via `gvm run` still rely on cooperative proxy routing.
 
-**Planned (v2)**: `gvm run` — mandatory interception via Linux network namespace isolation. The agent process runs in an isolated network namespace where all outbound traffic is iptables-redirected to the proxy. No direct internet access is possible:
+`gvm run --sandbox` interception path:
 
 ```
-gvm run my_agent.py
-  → unshare(CLONE_NEWNET)          # isolated network namespace
-  → veth pair: agent ns ↔ host     # controlled network bridge
-  → iptables DNAT: *:80,443 → proxy:8080
-  → iptables REJECT: everything else
+gvm run --sandbox my_agent.py
+  → unshare(CLONE_NEWNET)                 # isolated network namespace
+  → veth pair: agent ns ↔ host            # controlled network bridge
+  → HTTP_PROXY/HTTPS_PROXY set in child   # client traffic steered to proxy endpoint
+  → iptables DNAT: host-veth:proxy_port → configured proxy_addr
+  → iptables FORWARD allow: veth ↔ lo (proxy path)
+  → no blanket REJECT rule in v1 (strict transparent interception hardening is roadmap)
 ```
 
-This transitions GVM from "SDK proxy model" to "mandatory interception model" (same pattern as Envoy sidecar + iptables redirect). Cross-platform fallback: Docker `--network=container:gvm-proxy` for macOS/Windows.
+**Roadmap (v2)**: Move from opt-in containment to deployment-level mandatory interception profiles (policy-enforced launch path + identity attestation).
 
 ---
 

@@ -1,6 +1,6 @@
 # Analemma-GVM Roadmap
 
-> **Last updated**: 2026-03-16
+> **Last updated**: 2026-03-17
 
 ---
 
@@ -14,10 +14,10 @@
 - [x] `max_strict` cross-layer verification
 - [x] Merkle tree audit ledger + WAL group commit
 - [x] AES-256-GCM encrypted state cache (Vault)
-- [x] Wasm sandbox policy engine + native fallback
+- [x] Wasm runtime loader + host bridge (optional) + native fallback
 - [x] Rate limiter (token bucket, per-agent)
 - [x] Operation registry with namespace validation
-- [x] 141 adversarial tests, ~63 benchmarks, 0 failures
+- [x] 179 Rust tests (unit + integration + adversarial + boundary + stress), ~63 benchmarks, 0 failures
 
 ### SDK (Complete)
 
@@ -79,6 +79,8 @@
 - [x] `result_ptr` dealloc (memory leak fix)
 - [x] Unknown decision → Delay (Fail-Close)
 - [x] `MAX_RESPONSE_LEN` validation
+- [ ] ABAC hot-path execution via Wasm engine (current request path uses native `policy.evaluate`)
+- [ ] Ed25519 module signature verification + hash pinning + fail-close required mode
 
 **Policy Engine** (`src/policy.rs`):
 - [x] Regex pre-compile at load time
@@ -149,14 +151,13 @@
 
 ### `gvm run` — Network Namespace Enforcement
 
-- [ ] `unshare(CLONE_NEWNET | CLONE_NEWPID)`
-- [ ] `iptables REDIRECT` + `SO_ORIGINAL_DST` (transparent proxy)
-- [ ] Default deny: `OUTPUT DROP`, proxy + loopback only
-- [ ] IPv6 disable in namespace
-- [ ] PID namespace for child process cleanup
-- [ ] `CAP_NET_ADMIN` + `CAP_NET_RAW` (no `SYS_ADMIN`)
-- [ ] Docker fallback mode
-- [ ] macOS `pf` fallback (partial)
+- [x] `gvm run --sandbox` Linux-native namespace isolation (`CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET`)
+- [x] veth pair + iptables DNAT path to proxy
+- [x] seccomp-BPF sandbox profile (default + strict)
+- [x] Docker fallback mode (`gvm run --contained`)
+- [ ] Mandatory-by-default interception profile (reject non-contained launch in production)
+- [ ] Transparent proxy parity (`SO_ORIGINAL_DST`, CONNECT tunnel, IPv6 hardening)
+- [ ] macOS/Windows host-level interception fallback (currently Docker fallback only)
 
 ### Agent Identity
 

@@ -53,12 +53,12 @@ The `GVMHeaders` struct does not contain a `decision` field. Even if an attacker
 
 **Verified by**: 4 fuzzing-style tests in `tests/boundary.rs` covering 13 IPv6 attack variants.
 
-### OBS-003: Wasm engine unknown decision maps to Allow (fail-open)
+### OBS-003: Wasm engine unknown decision maps to Delay (fail-close)
 
-`WasmEngine::response_to_decision()` maps unknown decision strings to `EnforcementDecision::Allow` (line 227 of `wasm_engine.rs`). This is intentionally fail-open for forward compatibility — new decision types added to the Wasm engine will not break the proxy.
+`WasmEngine::response_to_decision()` maps unknown decision strings to `EnforcementDecision::Delay { milliseconds: 300 }` (fail-close default).
 
-**Status**: Architectural decision. If fail-close is preferred, the default branch should return `Deny` instead.
-**Verified by**: Test `wasm_invalid_decision_string_maps_to_allow`
+**Status**: Updated and aligned with fail-close policy. Unknown decision strings no longer map to Allow.
+**Verified by**: Test `wasm_invalid_decision_string_maps_to_delay`
 
 ### OBS-004: Vault key collision is by design (last-writer-wins)
 
@@ -77,7 +77,7 @@ Multiple agents writing to the same Vault key results in last-writer-wins semant
 
 | # | Boundary | Test Name | Verification |
 |---|----------|-----------|--------------|
-| 1 | Wasm↔Host | `wasm_invalid_decision_string_maps_to_allow` | Unknown decision → Allow |
+| 1 | Wasm↔Host | `wasm_invalid_decision_string_maps_to_delay` | Unknown decision → Delay(300ms) |
 | 2 | Wasm↔Host | `wasm_malformed_response_does_not_crash` | 10 garbage inputs → valid JSON |
 | 3 | Wasm↔Host | `wasm_oversized_input_handled_gracefully` | 1MB operation name → no crash |
 | 4 | Wasm↔Host | `wasm_unicode_boundary_operation_names` | Korean, null, emoji, RTL → no crash |
@@ -175,14 +175,16 @@ Batch N+1:
 
 | Test File | Count | Category |
 |-----------|-------|----------|
-| `src/` (unit tests) | 38 | Registry (4), Policy (4), SRR (10), Vault (7), WasmEngine (4), Merkle (9) |
+| `src/` (unit tests) | 79 | Registry (4), Policy (10), SRR (19), Vault (7), WasmEngine (4), Merkle (9), LLM-trace (26) |
+| `crates/gvm-engine/src/lib.rs` | 7 | Policy engine evaluation + cross-layer strictness |
+| `crates/gvm-cli/src/suggest.rs` | 6 | Path generalization helper (numeric IDs, UUIDs) |
 | `tests/hostile.rs` | 11 | Adversarial/concurrency |
 | `tests/integration.rs` | 5 | End-to-end pipeline |
 | `tests/edge_cases.rs` | 17 | Input boundaries, conflicts |
 | `tests/stress.rs` | 12 | Scale, performance |
 | `tests/boundary.rs` | 30 | Cross-boundary security (incl. 4 IPv6 SSRF) |
 | `tests/merkle.rs` | 12 | Merkle tree integrity |
-| **Total** | **125** | **All passing** |
+| **Total** | **179** | **All passing** |
 
 ---
 

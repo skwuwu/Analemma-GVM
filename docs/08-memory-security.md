@@ -241,10 +241,10 @@ The `gvm-sandbox` crate provides Linux-native process isolation using four kerne
 | User namespace | `CLONE_NEWUSER` | `namespace.rs` | Non-privileged root (UID 0 maps to host UID) |
 | PID namespace | `CLONE_NEWPID` | `namespace.rs` | Isolated process tree |
 | Mount namespace | `CLONE_NEWNS` + `pivot_root` | `mount.rs` | Read-only workspace, minimal rootfs (tmpfs 64MB) |
-| Network namespace | `CLONE_NEWNET` + veth pair | `network.rs` | Proxy-only routing via DNAT |
+| Network namespace | `CLONE_NEWNET` + veth pair | `network.rs` | Proxy-path routing via veth + DNAT (v1 opt-in path) |
 | Syscall filter | seccomp-BPF (whitelist, ~45 syscalls) | `seccomp.rs` | Default-deny; blocks ptrace, mount, bpf, unshare |
 
-**Network isolation** is the critical enforcement boundary: the agent's sole network path is a veth pair with iptables DNAT that routes all traffic to the GVM proxy. No external IP is reachable. This ensures Layer 2 (SRR) and Layer 3 (API key injection) cannot be bypassed.
+**Network isolation** is the critical enforcement boundary: the agent runs in an isolated netns with a dedicated veth pair and child-level `HTTP_PROXY`/`HTTPS_PROXY` injection, while host iptables config provides a DNAT path to the configured proxy endpoint. This gives stronger containment than cooperative mode; transparent interception parity remains roadmap work.
 
 ```
 Agent (sandbox netns)         Host netns              GVM Proxy
@@ -272,7 +272,7 @@ The architecture is extensible to Firecracker-class MicroVM isolation. This sect
 | Concurrent instances | 16K+ (PID-based subnet) | Tens to low hundreds (memory-bound) |
 | Infrastructure dependency | Linux kernel only | KVM + VMM binary + rootfs images |
 
-**Proxy connectivity invariant**: Both models can maintain the architectural guarantee that the GVM proxy is the agent's sole network gateway. In the MicroVM model, the veth+DNAT path would be replaced by a virtio-net+TAP+bridge configuration, but the enforcement semantics are identical.
+**Proxy connectivity invariant**: Both models can maintain a proxy-first connectivity model. In the MicroVM design, the veth+DNAT path would be replaced by a virtio-net+TAP+bridge configuration with equivalent governance interception goals.
 
 ### 8.7.3 Threat Model Analysis
 
@@ -281,7 +281,7 @@ GVM's threat model assumes AI agents are adversarial at the application level (p
 | Threat | namespace+seccomp | MicroVM | Assessment |
 |--------|-------------------|---------|------------|
 | Unauthorized API calls (prompt injection) | Blocked by proxy (Layer 2/3) | Blocked by proxy (Layer 2/3) | Isolation mode irrelevant |
-| Network escape attempt | Blocked (no route outside veth) | Blocked (no route outside virtio-net) | Equivalent |
+| Network escape attempt | Mitigated for proxy-directed flows (strict transparent interception hardening is roadmap) | Mitigated with equivalent proxy-first topology design | Comparable under same interception policy |
 | API key theft from environment | Blocked (Layer 3 injects post-enforcement) | Blocked (same) | Equivalent |
 | Header forgery / operation spoofing | Blocked (SRR cross-checks URL) | Blocked (same) | Equivalent |
 | Filesystem escape | Blocked (pivot_root + read-only) | Blocked (separate rootfs) | Equivalent |
@@ -300,7 +300,7 @@ GVM's threat model assumes AI agents are adversarial at the application level (p
 
 3. **Operational complexity**: MicroVM requires rootfs image management (per-interpreter), VMM lifecycle management, and KVM availability — significantly raising the deployment barrier for a governance tool that should be as lightweight as possible.
 
-4. **Current isolation is already strong**: The combination of four Linux namespaces, a 45-syscall seccomp whitelist, pivot_root filesystem isolation, and proxy-only network routing provides defense-in-depth sufficient for the AI agent governance use case. The seccomp filter itself uses Firecracker's `seccompiler` crate, demonstrating shared security heritage.
+4. **Current isolation is already strong**: The combination of four Linux namespaces, a 45-syscall seccomp whitelist, pivot_root filesystem isolation, and proxy-path routing provides meaningful defense-in-depth for the AI agent governance use case. The seccomp filter itself uses Firecracker's `seccompiler` crate, demonstrating shared security heritage.
 
 ### 8.7.5 Extensibility Path
 
