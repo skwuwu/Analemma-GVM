@@ -28,6 +28,10 @@ use std::collections::BTreeMap;
 /// Apply the seccomp-BPF filter to the current thread.
 /// Must be called just before execve() in the child process.
 pub fn apply_seccomp_filter(profile: &Option<SeccompProfile>) -> Result<()> {
+    let target_arch: seccompiler::TargetArch = std::env::consts::ARCH
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Unsupported architecture"))?;
+
     let filter = match profile {
         Some(SeccompProfile::Strict) => build_strict_filter()?,
         Some(SeccompProfile::Custom(path)) => {
@@ -36,7 +40,7 @@ pub fn apply_seccomp_filter(profile: &Option<SeccompProfile>) -> Result<()> {
                 .with_context(|| format!("Failed to read seccomp profile: {}", path.display()))?;
             let map: BpfMap = seccompiler::compile_from_json(
                 &content[..],
-                std::env::consts::ARCH.into(),
+                target_arch,
             )
             .context("Failed to compile custom seccomp profile")?;
             map.into_values()
@@ -60,7 +64,7 @@ fn build_default_filter() -> Result<seccompiler::BpfProgram> {
     // Helper to allow a syscall unconditionally
     macro_rules! allow {
         ($($syscall:expr),+ $(,)?) => {
-            $(rules.insert($syscall as i64, vec![SeccompRule::new(vec![])]);)+
+            $(rules.insert($syscall as i64, vec![]);)+
         };
     }
 
@@ -229,7 +233,7 @@ fn build_strict_filter() -> Result<seccompiler::BpfProgram> {
 
     macro_rules! allow {
         ($($syscall:expr),+ $(,)?) => {
-            $(rules.insert($syscall as i64, vec![SeccompRule::new(vec![])]);)+
+            $(rules.insert($syscall as i64, vec![]);)+
         };
     }
 

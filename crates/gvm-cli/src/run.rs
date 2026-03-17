@@ -22,12 +22,97 @@ pub async fn run_agent(
     if sandbox && contained {
         anyhow::bail!("Cannot use --sandbox and --contained together. Choose one isolation mode.");
     }
+
+    ensure_proxy_available(proxy).await?;
+
     if sandbox {
         run_sandboxed(script, agent_id, proxy, interactive).await
     } else if contained {
         run_contained(script, agent_id, proxy, image, memory, cpus, detach).await
     } else {
         run_local(script, agent_id, proxy, interactive).await
+    }
+}
+
+fn is_local_proxy_url(proxy: &str) -> bool {
+    // Check if proxy URL is a localhost/loopback address
+    // Handle IPv4 (127.0.0.1), IPv6 (::1 or [::1]), and hostnames (localhost)
+    if proxy.contains("127.0.0.1") || proxy.contains("localhost") || proxy.contains("::1") {
+        return true;
+    }
+
+    // Fallback: try parsing with url crate for other formats
+    match url::Url::parse(proxy) {
+        Ok(url) => matches!(url.host_str(), Some("127.0.0.1" | "localhost")),
+        Err(_) => false,
+    }
+}
+
+async fn proxy_healthy(proxy: &str) -> bool {
+    let health_url = format!("{}/gvm/health", proxy.trim_end_matches('/'));
+    matches!(reqwest::get(&health_url).await, Ok(resp) if resp.status().is_success())
+}
+
+fn workspace_root_for_proxy() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+}
+
+async fn ensure_proxy_available(proxy: &str) -> Result<()> {
+    if proxy_healthy(proxy).await {
+        return Ok(());
+    }
+
+    if !is_local_proxy_url(proxy) {
+        anyhow::bail!(
+            "Proxy is not reachable at {}. For non-local proxy URLs, start it manually and retry.",
+            proxy
+        );
+    }
+
+    println!(
+        "  {YELLOW}Proxy not reachable at {}. Attempting auto-start...{RESET}",
+        proxy
+    );
+
+    let workspace_root = workspace_root_for_proxy();
+    let mut child = tokio::process::Command::new("cargo")
+        .arg("run")
+        .arg("-p")
+        .arg("gvm-proxy")
+        .current_dir(workspace_root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("Failed to spawn gvm-proxy with cargo")?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+    loop {
+        if proxy_healthy(proxy).await {
+            println!("  {GREEN}Proxy auto-started successfully.{RESET}");
+            return Ok(());
+        }
+
+        if let Some(status) = child
+            .try_wait()
+            .context("Failed to poll auto-started proxy process")?
+        {
+            anyhow::bail!(
+                "Auto-started proxy exited early (status: {}). Start it manually with `cargo run -p gvm-proxy`.",
+                status
+            );
+        }
+
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "Timed out waiting for proxy startup at {}. Start it manually with `cargo run -p gvm-proxy`.",
+                proxy
+            );
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
 
@@ -229,6 +314,13 @@ async fn run_sandboxed(script: &str, agent_id: &str, proxy: &str, interactive: b
     print!("  {DIM}Running pre-flight checks...{RESET} ");
     let preflight = gvm_sandbox::preflight_check(&config);
 
+    let missing_critical = !preflight.user_namespaces
+        || !preflight.seccomp_available
+        || !preflight.net_admin_capability
+        || !preflight.ip_command_available
+        || !preflight.iptables_command_available
+        || !preflight.interpreter_found;
+
     if !preflight.issues.is_empty() {
         println!("{YELLOW}WARNINGS{RESET}");
         for issue in &preflight.issues {
@@ -236,9 +328,9 @@ async fn run_sandboxed(script: &str, agent_id: &str, proxy: &str, interactive: b
         }
 
         // Fail if critical features are missing
-        if !preflight.user_namespaces || !preflight.seccomp_available {
+        if missing_critical {
             println!();
-            println!("  {RED}Cannot proceed: kernel features required for sandbox are unavailable.{RESET}");
+            println!("  {RED}Cannot proceed: required sandbox prerequisites are unavailable.{RESET}");
             println!("  {DIM}Use --contained for Docker-based isolation instead.{RESET}");
             println!();
             return Ok(());
@@ -471,59 +563,125 @@ async fn run_contained(
         .with_context(|| format!("Cannot resolve path: {}", script))?;
     let script_dir = abs_script.parent().unwrap();
     let script_name = abs_script.file_name().unwrap().to_str().unwrap();
+    let script_ext = abs_script
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+
+    let proxy_url: url::Url = proxy
+        .parse()
+        .with_context(|| format!("Invalid proxy URL: {}", proxy))?;
+
+    let local_proxy_host = matches!(proxy_url.host_str(), Some("127.0.0.1" | "localhost"));
+    let use_host_network = local_proxy_host && cfg!(target_os = "linux");
+
+    let container_proxy = if use_host_network {
+        proxy.to_string()
+    } else if local_proxy_host {
+        let mut rewritten = proxy_url.clone();
+        rewritten
+            .set_host(Some("host.docker.internal"))
+            .context("Failed to rewrite proxy host for container networking")?;
+        rewritten.to_string()
+    } else {
+        proxy.to_string()
+    };
 
     println!("  {DIM}Agent ID:{RESET}     {CYAN}{}{RESET}", agent_id);
     println!("  {DIM}Script:{RESET}       {}", abs_script.display());
     println!("  {DIM}Image:{RESET}        {}", image);
     println!("  {DIM}Proxy:{RESET}        {}", proxy);
+    if use_host_network {
+        println!(
+            "  {DIM}Network mode:{RESET} host {DIM}(Linux localhost proxy compatibility){RESET}"
+        );
+    }
+    if local_proxy_host && !use_host_network {
+        println!(
+            "  {DIM}Proxy in container:{RESET} {}",
+            container_proxy
+        );
+    }
     println!("  {DIM}Memory:{RESET}       {}", memory);
     println!("  {DIM}CPUs:{RESET}         {}", cpus);
-    println!("  {DIM}Network:{RESET}      gvm-internal {DIM}(isolated){RESET}");
+    if use_host_network {
+        println!("  {DIM}Network:{RESET}      host {DIM}(local proxy compatibility){RESET}");
+    } else {
+        println!("  {DIM}Network:{RESET}      gvm-internal {DIM}(isolated){RESET}");
+    }
     println!();
 
-    // Ensure gvm-internal network exists
-    let net_check = tokio::process::Command::new("docker")
-        .args(["network", "inspect", "gvm-internal"])
-        .output()
-        .await?;
-
-    if !net_check.status.success() {
-        println!("  {YELLOW}Creating gvm-internal network (isolated)...{RESET}");
-        let net_create = tokio::process::Command::new("docker")
-            .args(["network", "create", "--internal", "gvm-internal"])
+    if !use_host_network {
+        // Ensure gvm-internal network exists
+        let net_check = tokio::process::Command::new("docker")
+            .args(["network", "inspect", "gvm-internal"])
             .output()
             .await?;
 
-        if !net_create.status.success() {
-            let err = String::from_utf8_lossy(&net_create.stderr);
-            println!("  {RED}Failed to create network: {}{RESET}", err.trim());
-            return Ok(());
+        if !net_check.status.success() {
+            println!("  {YELLOW}Creating gvm-internal network (isolated)...{RESET}");
+            let net_create = tokio::process::Command::new("docker")
+                .args(["network", "create", "--internal", "gvm-internal"])
+                .output()
+                .await?;
+
+            if !net_create.status.success() {
+                let err = String::from_utf8_lossy(&net_create.stderr);
+                println!("  {RED}Failed to create network: {}{RESET}", err.trim());
+                return Ok(());
+            }
+            println!("  {GREEN}Network created{RESET}");
         }
-        println!("  {GREEN}Network created{RESET}");
     }
 
     // Build docker run command
     let container_name = format!("gvm-agent-{}", agent_id);
     let mount_dir = script_dir.to_str().unwrap_or(".");
+    let container_script = format!("/home/agent/workspace/{}", script_name);
+
+    let container_cmd: Vec<String> = match script_ext {
+        "py" => vec!["python".to_string(), container_script.clone()],
+        "js" => vec!["node".to_string(), container_script.clone()],
+        "ts" => vec![
+            "npx".to_string(),
+            "ts-node".to_string(),
+            container_script.clone(),
+        ],
+        "sh" | "bash" => vec!["bash".to_string(), container_script.clone()],
+        _ => vec![container_script.clone()],
+    };
 
     let mut cmd = tokio::process::Command::new("docker");
     cmd.arg("run")
         .arg("--name").arg(&container_name)
         .arg("--rm")
-        .arg("--network").arg("gvm-internal")
         .arg("--read-only")
         .arg("--tmpfs").arg("/tmp")
         .arg("--security-opt").arg("no-new-privileges:true")
         .arg("--memory").arg(memory)
         .arg("--cpus").arg(cpus)
+        .arg("-w").arg("/home/agent/workspace")
         .arg("-e").arg(format!("GVM_AGENT_ID={}", agent_id))
-        .arg("-e").arg(format!("HTTP_PROXY={}", proxy))
-        .arg("-e").arg(format!("HTTPS_PROXY={}", proxy))
-        .arg("-e").arg(format!("http_proxy={}", proxy))
-        .arg("-e").arg(format!("https_proxy={}", proxy))
-        .arg("-v").arg(format!("{}:/home/agent/workspace:ro", mount_dir))
-        .arg(image)
-        .arg(script_name);
+        .arg("-e").arg(format!("HTTP_PROXY={}", container_proxy))
+        .arg("-e").arg(format!("HTTPS_PROXY={}", container_proxy))
+        .arg("-e").arg(format!("http_proxy={}", container_proxy))
+        .arg("-e").arg(format!("https_proxy={}", container_proxy))
+        .arg("-v").arg(format!("{}:/home/agent/workspace:ro", mount_dir));
+
+    if use_host_network {
+        cmd.arg("--network").arg("host");
+    } else {
+        cmd.arg("--network")
+            .arg("gvm-internal")
+            .arg("--add-host")
+            .arg("host.docker.internal:host-gateway");
+    }
+
+    cmd.arg(image);
+
+    for arg in &container_cmd {
+        cmd.arg(arg);
+    }
 
     if detach {
         cmd.arg("-d");
@@ -538,7 +696,11 @@ async fn run_contained(
     println!("    {GREEN}\u{2713}{RESET} Layer 1: Governance Engine (policy evaluation)");
     println!("    {GREEN}\u{2713}{RESET} Layer 2: Enforcement Proxy (request interception)");
     println!("    {GREEN}\u{2713}{RESET} Layer 3: OS Containment (network isolation)");
-    println!("      {DIM}\u{2022} Network: gvm-internal (no external access){RESET}");
+    if use_host_network {
+        println!("      {DIM}\u{2022} Network: host (shared host network namespace){RESET}");
+    } else {
+        println!("      {DIM}\u{2022} Network: gvm-internal (no external access){RESET}");
+    }
     println!("      {DIM}\u{2022} Filesystem: read-only root{RESET}");
     println!("      {DIM}\u{2022} Privileges: no-new-privileges{RESET}");
     println!("      {DIM}\u{2022} Resources: {} memory, {} CPUs{RESET}", memory, cpus);
@@ -584,4 +746,52 @@ async fn run_contained(
     println!();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_local_proxy_url_localhost() {
+        assert!(is_local_proxy_url("http://localhost:8080"));
+    }
+
+    #[test]
+    fn test_is_local_proxy_url_127_0_0_1() {
+        assert!(is_local_proxy_url("http://127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn test_is_local_proxy_url_ipv6_loopback() {
+        // IPv6 localhost can be represented as ::1
+        // (URL parser may handle [::1] bracket notation differently across versions)
+        let result = is_local_proxy_url("http://[::1]:8080");
+        assert!(result, "IPv6 loopback address [::1] should be recognized as local");
+    }
+
+    #[test]
+    fn test_is_local_proxy_url_with_trailing_slash() {
+        assert!(is_local_proxy_url("http://localhost:8080/"));
+    }
+
+    #[test]
+    fn test_is_local_proxy_url_remote_host() {
+        assert!(!is_local_proxy_url("http://proxy.example.com:8080"));
+    }
+
+    #[test]
+    fn test_is_local_proxy_url_remote_ip() {
+        assert!(!is_local_proxy_url("http://192.168.1.1:8080"));
+    }
+
+    #[test]
+    fn test_is_local_proxy_url_invalid_url() {
+        assert!(!is_local_proxy_url("not-a-valid-url"));
+    }
+
+    #[test]
+    fn test_is_local_proxy_url_no_port() {
+        assert!(is_local_proxy_url("http://localhost"));
+    }
 }

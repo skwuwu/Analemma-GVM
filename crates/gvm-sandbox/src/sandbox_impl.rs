@@ -13,7 +13,6 @@ use crate::seccomp::apply_seccomp_filter;
 use crate::{SandboxConfig, SandboxResult};
 use anyhow::{Context, Result};
 use nix::sys::wait::{waitpid, WaitStatus};
-use nix::unistd::Pid;
 
 /// Stack size for the cloned child process (2 MB).
 const CHILD_STACK_SIZE: usize = 2 * 1024 * 1024;
@@ -39,19 +38,17 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     let child_config = config.clone();
     let child_interpreter_path = interpreter_path.clone();
 
-    let child_pid = nix::sched::clone(
-        Box::new(move || {
-            // ── Child process (inside new namespaces) ──
-            child_entry(
-                child_fd,
-                &child_config,
-                &child_interpreter_path,
-            )
-        }),
-        &mut stack,
-        clone_flags,
-        Some(nix::sys::signal::SIGCHLD as i32),
-    )
+    let child_pid = unsafe {
+        nix::sched::clone(
+            Box::new(move || {
+                // ── Child process (inside new namespaces) ──
+                child_entry(child_fd, &child_config, &child_interpreter_path)
+            }),
+            &mut stack,
+            clone_flags,
+            Some(nix::sys::signal::SIGCHLD as i32),
+        )
+    }
     .context("clone() failed — ensure user namespaces are enabled")?;
 
     tracing::info!(
@@ -73,7 +70,7 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     }
 
     // 3. Signal child that setup is complete
-    signal_child_ready(parent_fd)?;
+    signal_child_ready(parent_fd, child_pid.as_raw() as u32)?;
 
     let setup_ms = start.elapsed().as_millis() as u64;
     tracing::info!(setup_ms = setup_ms, "Sandbox setup complete, waiting for agent");
@@ -114,13 +111,18 @@ fn child_entry(
     interpreter_path: &std::path::Path,
 ) -> isize {
     // Wait for parent to complete UID mapping and network setup
-    if let Err(e) = wait_for_parent(coord_fd) {
-        eprintln!("gvm-sandbox: coordination failed: {}", e);
-        return 1;
-    }
+    let network_seed = match wait_for_parent(coord_fd) {
+        Ok(seed) => seed,
+        Err(e) => {
+            eprintln!("gvm-sandbox: coordination failed: {}", e);
+            return 1;
+        }
+    };
+
+    // Use parent-provided seed so interface names/IPs match host-side setup.
+    let veth_config = VethConfig::from_pid(network_seed, config.proxy_addr);
 
     // Set up network inside the sandbox
-    let veth_config = VethConfig::from_pid(std::process::id(), config.proxy_addr);
     if let Err(e) = setup_sandbox_network(&veth_config) {
         // Network failure is non-fatal for debugging — agent just won't have connectivity
         eprintln!("gvm-sandbox: network setup failed (non-fatal): {}", e);

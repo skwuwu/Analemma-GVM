@@ -226,7 +226,7 @@ This is the conservative middle ground: unknown operations are not broken (they 
 
 The network namespace is the critical piece: `gvm run --sandbox` injects `HTTP_PROXY`/`HTTPS_PROXY` in the child and configures a veth+DNAT path to the proxy endpoint. This gives stronger containment than cooperative proxy mode, while transparent interception parity (`SO_ORIGINAL_DST`, CONNECT, IPv6 hardening) remains roadmap work.
 
-**Implementation status (2026-03)**: `gvm run --sandbox` (Linux-native) and `gvm run --contained` (Docker) are implemented. Containment is opt-in per launched process; workloads not started via `gvm run` remain in cooperative proxy mode.
+**Implementation status (2026-03)**: `gvm run --sandbox` (Linux-native) and `gvm run --contained` (Docker) are implemented. Containment is opt-in per launched process; workloads not started via `gvm run` remain in cooperative proxy mode. Sandbox launch is fail-fast gated on critical host prerequisites (`kernel.unprivileged_userns_clone=1`, `CAP_NET_ADMIN`, `ip`, `iptables`, `net.ipv4.ip_forward=1`). `gvm run` also performs proxy readiness checks before launch and auto-starts `gvm-proxy` only for localhost targets when the proxy is unavailable.
 
 ---
 

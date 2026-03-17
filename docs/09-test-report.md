@@ -1,8 +1,8 @@
 # Part 9: Test & Benchmark Report
 
-**Total: 179 Rust Tests (79 unit in src/ + 7 engine + 6 CLI + 30 boundary + 17 edge + 11 hostile + 5 integration + 12 merkle + 12 stress) — All Pass**
-**Benchmarks: 14 groups (Criterion v0.5)**
-**Last Run: 2026-03-16**
+**Total: 199 Rust Tests (85 core unit + 7 engine + 17 CLI + 30 boundary + 17 edge + 11 hostile + 5 integration + 12 merkle + 12 stress) — All Pass**
+**Benchmarks: 14 groups / 61 benchmark cases (Criterion v0.5)**
+**Last Verified: 2026-03-17 (`cargo test --workspace --all-targets`)**
 
 ---
 
@@ -24,17 +24,20 @@ src/
 ├── wasm_engine.rs      # 4 unit tests
 ├── merkle.rs           # 9 Merkle hash/proof tests
 ├── llm_trace.rs        # 26 LLM thinking trace tests
+├── proxy.rs            # 6 response-trace extraction tests
 crates/gvm-engine/
 ├── src/lib.rs          # 7 engine tests
 crates/gvm-cli/
+├── src/run.rs          # 8 proxy URL detection unit tests
 ├── src/suggest.rs      # 6 path generalization tests
+├── tests/cli_integration.rs # 3 command surface integration tests
 benches/
 ├── pipeline.rs         # 14 benchmark groups (Criterion)
 ```
 
 ---
 
-## 9.2 Test Execution Log (2026-03-16)
+## 9.2 Test Execution Log (Historical Snapshot: 2026-03-16)
 
 ```
 $ cargo test
@@ -287,6 +290,28 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 | 4 | [`generalize_empty_path`](crates/gvm-cli/src/suggest.rs) | `/`, `""` | Returns `/{any}` |
 | 5 | [`looks_like_id_detects_numbers`](crates/gvm-cli/src/suggest.rs) | `12345`, `0` vs `users`, `v1` | Digits detect as ID; alpha strings do not |
 | 6 | [`looks_like_id_detects_uuids`](crates/gvm-cli/src/suggest.rs) | Full UUID vs short hyphenated string | Full RFC-4122 detected; short strings not |
+
+### GVM-CLI run (8 tests) — [crates/gvm-cli/src/run.rs](crates/gvm-cli/src/run.rs)
+
+| # | Test | Scenario | Verification |
+|---|------|----------|--------------|
+| 1 | [`test_is_local_proxy_url_localhost`](crates/gvm-cli/src/run.rs) | `http://localhost:8080` | Returns true |
+| 2 | [`test_is_local_proxy_url_127_0_0_1`](crates/gvm-cli/src/run.rs) | `http://127.0.0.1:8080` | Returns true |
+| 3 | [`test_is_local_proxy_url_ipv6_loopback`](crates/gvm-cli/src/run.rs) | `http://[::1]:8080` | Returns true (IPv6) |
+| 4 | [`test_is_local_proxy_url_no_port`](crates/gvm-cli/src/run.rs) | `http://localhost` | Returns true (auto-default port semantics) |
+| 5 | [`test_is_local_proxy_url_with_trailing_slash`](crates/gvm-cli/src/run.rs) | `http://localhost:8080/` | Returns true |
+| 6 | [`test_is_local_proxy_url_remote_host`](crates/gvm-cli/src/run.rs) | `http://proxy.example.com:8080` | Returns false (non-local FQDN) |
+| 7 | [`test_is_local_proxy_url_remote_ip`](crates/gvm-cli/src/run.rs) | `http://192.168.1.1:8080` | Returns false (non-loopback IP) |
+| 8 | [`test_is_local_proxy_url_invalid_url`](crates/gvm-cli/src/run.rs) | `not-a-valid-url` | Returns false (parse error handling) |
+
+### GVM-CLI Integration (3 tests) — [crates/gvm-cli/tests/cli_integration.rs](crates/gvm-cli/tests/cli_integration.rs)
+
+| # | Test | Scenario | Notes |
+|---|------|----------|-------|
+| 1 | [`test_gvm_run_help_succeeds`](crates/gvm-cli/tests/cli_integration.rs) | `gvm run --help` command | Validates binary availability and help rendering |
+| 2 | [`test_gvm_events_list_basic`](crates/gvm-cli/tests/cli_integration.rs) | `gvm events list` command | Confirms command structure and exit code |
+| 3 | [`test_gvm_stats_basic`](crates/gvm-cli/tests/cli_integration.rs) | `gvm stats tokens` command | Tests stats subcommand availability |
+| *E2E* | [`test_gvm_run_local_mode_with_proxy_autostart`](crates/gvm-cli/tests/cli_integration.rs) | Full: proxy down → auto-start → agent run | Ignored by default; run with `--ignored` flag |
 
 ---
 

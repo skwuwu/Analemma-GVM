@@ -17,7 +17,7 @@
 - [x] Wasm runtime loader + host bridge (optional) + native fallback
 - [x] Rate limiter (token bucket, per-agent)
 - [x] Operation registry with namespace validation
-- [x] 179 Rust tests (unit + integration + adversarial + boundary + stress), ~63 benchmarks, 0 failures
+- [x] 199 Rust tests (core unit + integration + adversarial + boundary + stress + CLI unit & integration + engine), 61 benchmark cases across 14 groups, 0 failures
 
 ### SDK (Complete)
 
@@ -155,6 +155,8 @@
 - [x] veth pair + iptables DNAT path to proxy
 - [x] seccomp-BPF sandbox profile (default + strict)
 - [x] Docker fallback mode (`gvm run --contained`)
+- [x] Sandbox preflight gating for critical prerequisites (`CAP_NET_ADMIN`, `ip`, `iptables`, userns, seccomp)
+- [x] Local proxy auto-start for `gvm run` when localhost target is unreachable
 - [ ] Mandatory-by-default interception profile (reject non-contained launch in production)
 - [ ] Transparent proxy parity (`SO_ORIGINAL_DST`, CONNECT tunnel, IPv6 hardening)
 - [ ] macOS/Windows host-level interception fallback (currently Docker fallback only)
@@ -175,7 +177,7 @@
 
 - [ ] TLS termination + certificate management
 - [ ] HTTP CONNECT tunnel support (for HTTPS transparent proxy)
-- [ ] SSE response passthrough with thinking trace extraction
+- [x] SSE response passthrough with bounded thinking trace tap (1MB capture)
 - [ ] gRPC detection + passthrough (no inspection yet)
 - [ ] Pluggable isolation backend interface:
   - `gvm run --isolation=namespace` (default)
