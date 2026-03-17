@@ -107,15 +107,17 @@ After sandbox network setup, the agent can only reach: (1) GVM proxy via TCP on 
 
 ---
 
-### 4. ReDoS in Policy Regex
+### 4. ReDoS in Policy Regex — Non-Issue
 
 **Attack**: A crafted path pattern in `operation_registry.toml` or `srr_network.toml` could cause catastrophic backtracking in the regex engine, leading to CPU exhaustion.
 
-**Preconditions**: Attacker can influence policy configuration (admin-level access).
+**Status**: **Not applicable.** GVM uses Rust's `regex` crate (v1), which is automata-based (Thompson NFA → DFA). It guarantees O(n) linear-time matching regardless of pattern complexity — no backtracking, no catastrophic performance. This is architecturally immune to ReDoS, unlike PCRE/Python `re`/JavaScript regex engines.
 
-**Impact**: Denial of service on the proxy.
+Regex usage in GVM:
+- **ABAC policy engine** (`policy.rs`): `Operator::Regex` — pre-compiled at policy load time, `re.is_match()` at runtime
+- **SRR network rules** (`srr.rs`): `path_regex` field — pre-compiled at TOML load time, `re.is_match()` at runtime
 
-**Planned mitigation**: Use a regex engine with linear-time guarantees (Rust's `regex` crate already provides this for most patterns). Add pattern complexity validation at config load time. Low priority because policy files are admin-controlled, not agent-controlled.
+Both paths pre-compile regex at config load time (fail-fast on invalid patterns) and reuse compiled patterns at runtime — zero per-request compilation overhead. Policy files are admin-controlled, not agent-controlled, providing an additional layer of defense-in-depth.
 
 ---
 
@@ -180,6 +182,42 @@ After sandbox network setup, the agent can only reach: (1) GVM proxy via TCP on 
 **Planned mitigation (v2)**: GraphQL query parser that inspects the `query` field for mutation names, field names, and aliases. Until then, GraphQL endpoints should be treated as elevated risk — consider Deny-by-default for GraphQL endpoints with allowlisted `operationName` values only.
 
 **Why acceptable now**: Current deployments use the operationName-based rules as defense-in-depth behind ABAC policy layer. The ABAC layer evaluates semantic operation names independently of the HTTP payload, so a GraphQL alias bypass only evades Layer 2 SRR, not Layer 1 policy.
+
+---
+
+### 11. Numeric Precision in Policy Evaluation
+
+**Issue**: Policy numeric comparisons (`Gt`, `Lt`, `Gte`, `Lte`) convert all values to `f64` via `value_as_f64()`. In financial domains, floating-point rounding could cause boundary-case policy bypass (e.g., `500.000000000001` might round to `500.0`, passing a `> 500` rule check).
+
+**Impact**: Edge-case policy bypass for exact boundary values in precision-sensitive domains.
+
+**Current (v1)**: Standard IEEE 754 `f64` comparison. Sufficient for most use cases where amounts are integer cents or have limited decimal places.
+
+**Planned mitigation**: Decimal-based comparison for currency fields, or integer-cent normalization at the SDK layer. For now, operators should write rules with appropriate margins (e.g., `>= 500` instead of `> 499.99`).
+
+---
+
+### 12. WAL Recovery Memory Pressure
+
+**Issue**: `recover_from_wal()` uses `tokio::fs::read_to_string()` which loads the entire WAL file into memory. If the WAL grows to gigabytes, recovery could trigger OOM.
+
+**Planned mitigation**: Switch to `BufReader` with line-by-line streaming. This is a v1.1 item.
+
+---
+
+### 13. WAL Single File / No Rotation
+
+**Issue**: All events are appended to a single WAL file with no rotation or compaction. The file grows unbounded over time, increasing recovery time and disk usage.
+
+**Planned mitigation**: Size-based rotation with Merkle chain linking across segments. The inter-batch `prev_root` field already supports cross-segment chaining.
+
+---
+
+### 14. WAL Sequence Number Persistence
+
+**Issue**: `wal_sequence` is initialized to `AtomicU64::new(0)` on every proxy restart. This creates duplicate sequence numbers across restarts, which could confuse NATS consumers.
+
+**Status**: Acknowledged in code as TODO. Will be fixed when NATS JetStream integration is implemented (v2) — recovery will initialize from last WAL event count.
 
 ---
 

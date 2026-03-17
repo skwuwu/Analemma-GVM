@@ -526,10 +526,12 @@ Analemma-GVM does the same for AI agents. The agent can *try* to wire-transfer $
 
 | Area | Current State | Planned Fix |
 |------|--------------|-------------|
+| **Numeric Precision** | Policy numeric comparisons use `f64`. In financial domains, floating-point rounding could cause boundary-case policy bypass (e.g., `500.000000000001 > 500`). | Decimal-based comparison for currency fields, or integer-cent normalization at the SDK layer. |
+| **WAL Recovery Memory** | `recover_from_wal()` loads the entire WAL file into memory via `read_to_string()`. Large WAL files (GB+) risk OOM on recovery. | Streaming recovery with `BufReader` + line-by-line parsing. |
+| **WAL Rotation** | Single WAL file grows unbounded. No automatic rotation or compaction. | Size-based rotation with Merkle chain linking across segments. |
+| **WAL Sequence Persistence** | `wal_sequence` resets to 0 on proxy restart. Duplicate sequence numbers across restarts. | Initialize from last WAL event count during recovery (acknowledged TODO). |
 | **Vault Key** | Falls back to ephemeral random key if `GVM_VAULT_KEY` is not set. Safe for development, but encrypted state is lost on restart. | Require explicit key in production mode (`GVM_ENV=production`). Error on missing key instead of fallback. |
-| **JSON Schema Validation** | Proxy responses and checkpoint data are parsed without schema validation. Trusted-environment assumption. | Add Serde-based strict deserialization on proxy side, Pydantic/dataclass validation on SDK side. |
 | **Checkpoint Failure Mode** | Checkpoint save failures are logged as warnings but do not block execution. | Configurable strict mode: fail the operation if checkpoint cannot be saved. |
-| **Thread Safety (SDK)** | `last_gvm_response` in LangChain tools module is not thread-safe. | Wrap with `threading.Lock` or use thread-local storage. |
 | **Rate Limiter Eviction** | Bucket overflow (>10K agents) triggers 25% bulk eviction. | LRU-based eviction with per-tenant isolation. |
 
 ---

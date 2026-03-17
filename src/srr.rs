@@ -1,5 +1,6 @@
 use crate::types::EnforcementDecision;
 use anyhow::{Context, Result};
+use regex::Regex;
 use serde::Deserialize;
 use std::path::Path;
 
@@ -11,6 +12,10 @@ struct NetworkRuleConfig {
     method: String,
     pattern: String,
     decision: NetworkDecisionConfig,
+    /// Optional regex pattern for path matching (overrides path portion of `pattern`).
+    /// Compiled at load time using Rust's `regex` crate (automata-based, O(n) guaranteed).
+    /// Example: `"^/api/v[1-3]/users/.*"` matches /api/v1/users/, /api/v2/users/foo, etc.
+    path_regex: Option<String>,
     /// Optional payload field for GraphQL/gRPC defense
     payload_field: Option<String>,
     /// Payload values to match against
@@ -39,6 +44,9 @@ pub struct NetworkRule {
     pub method: String,
     pub host_pattern: HostPattern,
     pub path_pattern: String,
+    /// Pre-compiled regex for path matching (if `path_regex` was specified in config).
+    /// Uses Rust's `regex` crate which guarantees O(n) linear-time matching (no backtracking).
+    pub compiled_path_regex: Option<Regex>,
     pub decision: EnforcementDecision,
     pub description: String,
     pub payload_field: Option<String>,
@@ -100,6 +108,16 @@ impl NetworkSRR {
             let decision = parse_decision(&rule_cfg.decision)?;
             let (host_pattern, path_pattern) = parse_pattern(&rule_cfg.pattern);
 
+            // Pre-compile path regex at load time (fail-fast on invalid patterns)
+            let compiled_path_regex = match &rule_cfg.path_regex {
+                Some(pattern) => {
+                    let re = Regex::new(pattern)
+                        .with_context(|| format!("Invalid path_regex '{}' in SRR rule", pattern))?;
+                    Some(re)
+                }
+                None => None,
+            };
+
             let methods = if rule_cfg.method == "*" {
                 vec!["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
             } else {
@@ -109,13 +127,15 @@ impl NetworkSRR {
             // Detect catch-all rules: method="*" and pattern="{any}" (or just "{any}")
             let is_catch_all = rule_cfg.method == "*"
                 && matches!(host_pattern, HostPattern::Any)
-                && (path_pattern == "/*" || path_pattern == "*");
+                && (path_pattern == "/*" || path_pattern == "*")
+                && compiled_path_regex.is_none();
 
             for method in methods {
                 rules.push(NetworkRule {
                     method: method.to_uppercase(),
                     host_pattern: host_pattern.clone(),
                     path_pattern: path_pattern.clone(),
+                    compiled_path_regex: compiled_path_regex.clone(),
                     decision: decision.clone(),
                     description: rule_cfg.description.clone().unwrap_or_default(),
                     payload_field: rule_cfg.payload_field.clone(),
@@ -174,11 +194,15 @@ impl NetworkSRR {
                 continue;
             }
 
-            // Path match: check BOTH normalized and original paths.
-            // A rule that matches either form should fire — normalization must
+            // Path match: if path_regex is set, use regex; otherwise use prefix/exact match.
+            // Check BOTH normalized and original paths — normalization must
             // expand what gets caught (e.g., dot-segment traversal attempts
             // should not escape a deny rule that matched the original prefix).
-            if !match_path(&rule.path_pattern, effective_path)
+            if let Some(ref re) = rule.compiled_path_regex {
+                if !re.is_match(effective_path) && !re.is_match(path) {
+                    continue;
+                }
+            } else if !match_path(&rule.path_pattern, effective_path)
                 && !match_path(&rule.path_pattern, path)
             {
                 continue;
@@ -1050,6 +1074,130 @@ mod tests {
     }
 
     // ── Test: SrrCheckResult metadata ──
+
+    // ── Path regex tests ──
+
+    #[test]
+    fn path_regex_matches_versioned_api() {
+        let srr = srr_from_toml(r#"
+            [[rules]]
+            method = "GET"
+            pattern = "api.example.com"
+            path_regex = "^/api/v[1-3]/users/.*"
+            decision = { type = "Delay", milliseconds = 500 }
+            description = "Versioned API rate limit"
+        "#);
+
+        // v1, v2, v3 should match
+        for v in &["v1", "v2", "v3"] {
+            let path = format!("/api/{}/users/123", v);
+            let r = srr.check("GET", "api.example.com", &path, None);
+            match r.decision {
+                EnforcementDecision::Delay { milliseconds } => {
+                    assert_eq!(milliseconds, 500, "Path {} should match regex", path);
+                }
+                other => panic!("Path {} should match regex, got {:?}", path, other),
+            }
+        }
+
+        // v4 should NOT match → default-to-caution (300ms)
+        let r = srr.check("GET", "api.example.com", "/api/v4/users/123", None);
+        match r.decision {
+            EnforcementDecision::Delay { milliseconds } => {
+                assert_eq!(milliseconds, 300, "v4 should not match [1-3] regex");
+            }
+            other => panic!("v4 should get default-to-caution, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn path_regex_deny_sensitive_endpoints() {
+        let srr = srr_from_toml(r#"
+            [[rules]]
+            method = "*"
+            pattern = "{any}"
+            path_regex = "(?i)/(admin|internal|debug)(/|$)"
+            decision = { type = "Deny", reason = "Sensitive endpoint blocked" }
+            description = "Block admin/internal/debug paths"
+
+            [[rules]]
+            method = "*"
+            pattern = "{any}"
+            decision = { type = "Delay", milliseconds = 300 }
+        "#);
+
+        // Should be denied
+        for path in &["/admin", "/admin/settings", "/internal/", "/debug/pprof"] {
+            let r = srr.check("GET", "any.com", path, None);
+            assert!(
+                matches!(r.decision, EnforcementDecision::Deny { .. }),
+                "Path {} should be denied by regex", path
+            );
+        }
+
+        // Should NOT be denied (no match)
+        for path in &["/api/users", "/administrator", "/public/debug-info"] {
+            let r = srr.check("GET", "any.com", path, None);
+            assert!(
+                !matches!(r.decision, EnforcementDecision::Deny { .. }),
+                "Path {} should not be denied", path
+            );
+        }
+    }
+
+    #[test]
+    fn path_regex_combined_with_host_pattern() {
+        let srr = srr_from_toml(r#"
+            [[rules]]
+            method = "POST"
+            pattern = "{host}.database.com"
+            path_regex = "^/(drop|truncate|delete)/"
+            decision = { type = "Deny", reason = "Destructive DB operation" }
+        "#);
+
+        // Matching host + regex path → Deny
+        let r = srr.check("POST", "prod.database.com", "/drop/users", None);
+        assert!(matches!(r.decision, EnforcementDecision::Deny { .. }));
+
+        // Matching host + non-matching path → Default-to-Caution
+        let r = srr.check("POST", "prod.database.com", "/select/users", None);
+        assert!(matches!(r.decision, EnforcementDecision::Delay { .. }));
+
+        // Non-matching host → Default-to-Caution
+        let r = srr.check("POST", "other.com", "/drop/users", None);
+        assert!(matches!(r.decision, EnforcementDecision::Delay { .. }));
+    }
+
+    #[test]
+    fn path_regex_invalid_pattern_rejected_at_load() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("bad_regex.toml");
+        std::fs::write(&path, r#"
+            [[rules]]
+            method = "GET"
+            pattern = "example.com"
+            path_regex = "[invalid(regex"
+            decision = { type = "Deny", reason = "Should not load" }
+        "#).unwrap();
+
+        let result = NetworkSRR::load(&path);
+        assert!(result.is_err(), "Invalid regex must be rejected at load time");
+    }
+
+    #[test]
+    fn path_regex_with_catch_all_is_not_catch_all() {
+        let srr = srr_from_toml(r#"
+            [[rules]]
+            method = "*"
+            pattern = "{any}"
+            path_regex = "^/api/"
+            decision = { type = "Delay", milliseconds = 500 }
+            description = "API rate limit"
+        "#);
+
+        let r = srr.check("GET", "any.com", "/api/users", None);
+        assert!(!r.is_catch_all, "Regex rule with wildcard host should not be catch-all");
+    }
 
     #[test]
     fn explicit_rule_match_is_not_catch_all() {

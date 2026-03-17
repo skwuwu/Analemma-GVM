@@ -86,15 +86,21 @@
 - [x] Regex pre-compile at load time
 - [x] Unknown operator → bail (Fail-Close)
 - [x] Debug format → explicit `as_policy_str()` (`tier_as_policy_str`, `sensitivity_as_policy_str`)
+- [ ] Decimal-based numeric comparison for financial precision (current: f64, boundary-case rounding risk)
 
 **SRR** (`src/srr.rs`):
 - [x] Port number stripping in `match_host`
 - [x] Oversized body: `continue` to next rule (documented design intent)
+- [x] `path_regex` field for regex-based path matching (pre-compiled at load, O(n) guaranteed)
+- [ ] Hash Map / Trie index for O(1) host+method lookup (current: O(N) linear scan, ~300µs @ 10K rules)
+- [ ] `Cow<'a, str>` in `normalize_path` / `normalize_host` to reduce allocations on hot path
 
 **Ledger** (`src/ledger.rs`):
 - [x] Shutdown flush remaining batch
 - [x] Recovery dedup by `event_id`
 - [ ] `wal_sequence` persist across restart (currently resets to 0)
+- [ ] Streaming WAL recovery (`BufReader` line-by-line instead of `read_to_string`)
+- [ ] WAL rotation (size-based segment split with Merkle chain linking)
 
 **Rate Limiter** (`src/rate_limiter.rs`):
 - [x] Mutex poison → return false (Fail-Close)
@@ -165,6 +171,8 @@
 - [ ] Mandatory-by-default interception profile (reject non-contained launch in production)
 - [ ] Transparent proxy parity (`SO_ORIGINAL_DST`, CONNECT tunnel)
 - [ ] macOS/Windows host-level interception fallback (currently Docker fallback only)
+- [ ] Static library list for common interpreters (Python, Node) as ldd fallback
+- [ ] `mknod`-based /dev node creation as alternative to bind-mount
 
 ### Agent Identity
 
