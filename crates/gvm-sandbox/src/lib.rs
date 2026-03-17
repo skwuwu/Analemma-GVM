@@ -82,8 +82,14 @@ pub struct PreflightReport {
     pub user_namespaces: bool,
     /// Whether seccomp-BPF is supported.
     pub seccomp_available: bool,
+    /// Whether current process has CAP_NET_ADMIN (needed for veth/iptables setup).
+    pub net_admin_capability: bool,
     /// Whether IP forwarding is enabled.
     pub ip_forward: bool,
+    /// Whether the `ip` command is available.
+    pub ip_command_available: bool,
+    /// Whether the `iptables` command is available.
+    pub iptables_command_available: bool,
     /// Whether the interpreter binary exists.
     pub interpreter_found: bool,
     /// Human-readable remediation messages for failures.
@@ -141,7 +147,10 @@ pub fn preflight_check(_config: &SandboxConfig) -> PreflightReport {
     PreflightReport {
         user_namespaces: false,
         seccomp_available: false,
+        net_admin_capability: false,
         ip_forward: false,
+        ip_command_available: false,
+        iptables_command_available: false,
         interpreter_found: false,
         issues: vec![
             "Linux-native sandbox is not available on this platform.".to_string(),

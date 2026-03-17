@@ -24,6 +24,13 @@ pub fn check(config: &SandboxConfig) -> PreflightReport {
         issues.push("seccomp-BPF is not supported by this kernel.".to_string());
     }
 
+    let net_admin_capability = check_cap_net_admin();
+    if !net_admin_capability {
+        issues.push(
+            "CAP_NET_ADMIN is missing. veth and iptables setup requires elevated network capabilities.".to_string(),
+        );
+    }
+
     let ip_forward = check_ip_forward();
     if !ip_forward {
         issues.push(
@@ -31,6 +38,16 @@ pub fn check(config: &SandboxConfig) -> PreflightReport {
              sudo sysctl net.ipv4.ip_forward=1"
                 .to_string(),
         );
+    }
+
+    let ip_command_available = check_interpreter("ip");
+    if !ip_command_available {
+        issues.push("`ip` command not found in PATH (install iproute2).".to_string());
+    }
+
+    let iptables_command_available = check_interpreter("iptables");
+    if !iptables_command_available {
+        issues.push("`iptables` command not found in PATH.".to_string());
     }
 
     let interpreter_found = check_interpreter(&config.interpreter);
@@ -52,7 +69,10 @@ pub fn check(config: &SandboxConfig) -> PreflightReport {
     PreflightReport {
         user_namespaces,
         seccomp_available,
+        net_admin_capability,
         ip_forward,
+        ip_command_available,
+        iptables_command_available,
         interpreter_found,
         issues,
     }
@@ -82,6 +102,33 @@ fn check_seccomp() -> bool {
         let ret = libc::prctl(libc::PR_GET_SECCOMP);
         ret >= 0
     }
+}
+
+/// Check if current process has CAP_NET_ADMIN in effective capabilities.
+fn check_cap_net_admin() -> bool {
+    let content = match std::fs::read_to_string("/proc/self/status") {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    let cap_eff_hex = match content
+        .lines()
+        .find(|line| line.starts_with("CapEff:"))
+        .and_then(|line| line.split_whitespace().nth(1))
+    {
+        Some(v) => v,
+        None => return false,
+    };
+
+    let cap_eff = match u64::from_str_radix(cap_eff_hex, 16) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    // Linux capability index for CAP_NET_ADMIN.
+    const CAP_NET_ADMIN_BIT: u64 = 12;
+    let bit = CAP_NET_ADMIN_BIT;
+    (cap_eff & (1u64 << bit)) != 0
 }
 
 /// Check if IP forwarding is enabled.

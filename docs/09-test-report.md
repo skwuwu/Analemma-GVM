@@ -1,8 +1,8 @@
 # Part 9: Test & Benchmark Report
 
-**Total: 146 Rust Tests (54 unit + 5 engine + 30 boundary + 17 edge + 11 hostile + 5 integration + 12 merkle + 12 stress) — All Pass**
-**Benchmarks: 12 groups, 49 individual measurements (Criterion v0.5)**
-**Last Run: 2026-03-16**
+**Total: 199 Rust Tests (85 core unit + 7 engine + 17 CLI + 30 boundary + 17 edge + 11 hostile + 5 integration + 12 merkle + 12 stress) — All Pass**
+**Benchmarks: 14 groups / 61 benchmark cases (Criterion v0.5)**
+**Last Verified: 2026-03-17 (`cargo test --workspace --all-targets`)**
 
 ---
 
@@ -18,21 +18,26 @@ tests/
 ├── merkle.rs           # 12 Merkle tree integrity tests
 src/
 ├── registry.rs         # 4 unit tests
-├── policy.rs           # 4 unit tests
-├── srr.rs              # 18 unit tests (13 + 5 path normalization)
+├── policy.rs           # 10 unit tests (4 evaluation + 6 conflict detection)
+├── srr.rs              # 19 unit tests (13 + 6 path normalization)
 ├── vault.rs            # 7 unit tests
 ├── wasm_engine.rs      # 4 unit tests
 ├── merkle.rs           # 9 Merkle hash/proof tests
-├── llm_trace.rs        # 8 LLM thinking trace tests
+├── llm_trace.rs        # 26 LLM thinking trace tests
+├── proxy.rs            # 6 response-trace extraction tests
 crates/gvm-engine/
-├── src/lib.rs          # 5 engine tests
+├── src/lib.rs          # 7 engine tests
+crates/gvm-cli/
+├── src/run.rs          # 8 proxy URL detection unit tests
+├── src/suggest.rs      # 6 path generalization tests
+├── tests/cli_integration.rs # 3 command surface integration tests
 benches/
-├── pipeline.rs         # 12 benchmark groups (Criterion)
+├── pipeline.rs         # 14 benchmark groups (Criterion)
 ```
 
 ---
 
-## 9.2 Test Execution Log (2026-03-16)
+## 9.2 Test Execution Log (Historical Snapshot: 2026-03-16)
 
 ```
 $ cargo test
@@ -107,7 +112,7 @@ test srr_redirect_target_blocked ... ok
 test ssrf_private_ip_ranges_blocked_by_srr ... ok
 test ssrf_localhost_blocked_by_srr ... ok
 test wasm_all_decision_types_roundtrip ... ok
-test wasm_invalid_decision_string_maps_to_allow ... ok
+test wasm_invalid_decision_string_maps_to_delay ... ok
 test wasm_null_bytes_in_string_fields ... ok
 test wasm_malformed_response_does_not_crash ... ok
 test wasm_unicode_boundary_operation_names ... ok
@@ -197,7 +202,9 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 | 3 | [`test_invalid_core_name_rejected`](src/registry.rs) | Core op with 2 segments (`gvm.read`) | Startup fails with format error — must be 3 segments |
 | 4 | [`test_vendor_mismatch_rejected`](src/registry.rs) | `custom.acme.*` with `vendor = "other"` | Startup fails with "Vendor mismatch" |
 
-### ABAC Policy Engine (4 tests) — [src/policy.rs](src/policy.rs)
+### ABAC Policy Engine (10 tests) — [src/policy.rs](src/policy.rs)
+
+**Evaluation tests (4):**
 
 | # | Test | Scenario | Verification |
 |---|------|----------|--------------|
@@ -206,7 +213,18 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 | 3 | [`test_numeric_gt_condition`](src/policy.rs) | Rule: `context.amount > 500`, input: `amount=1000` | Numeric comparison succeeds |
 | 4 | [`test_deny_overrides_all`](src/policy.rs) | Deny (priority 1) + Allow (priority 100) on same request | Deny short-circuits, `matched_rule_id` correct |
 
-### Network SRR (18 tests) — [src/srr.rs](src/srr.rs)
+**Conflict detection tests (6):**
+
+| # | Test | Scenario | Verification |
+|---|------|----------|--------------|
+| 5 | [`test_duplicate_priority_detected`](src/policy.rs) | Two rules with same priority on same condition | `WarningKind::DuplicatePriority` emitted |
+| 6 | [`test_contradictory_decisions_detected`](src/policy.rs) | Allow + Deny on same operation pattern | `WarningKind::ContradictoryDecision` emitted |
+| 7 | [`test_ineffective_tenant_rule_detected`](src/policy.rs) | Tenant Allow overshadowed by global Deny | `WarningKind::IneffectiveRule` emitted |
+| 8 | [`test_no_conflict_for_non_overlapping_rules`](src/policy.rs) | `.read` allow + `.delete` deny | No warnings |
+| 9 | [`test_unconditional_rule_overlaps_everything`](src/policy.rs) | Unconditional Allow + specific Deny | `WarningKind::ContradictoryDecision` emitted |
+| 10 | [`test_eq_vs_startswith_overlap`](src/policy.rs) | `Eq gvm.payment.charge` + `StartsWith gvm.payment` contradictory | `WarningKind::ContradictoryDecision` emitted |
+
+### Network SRR (19 tests) — [src/srr.rs](src/srr.rs)
 
 | # | Test | Scenario | Verification |
 |---|------|----------|--------------|
@@ -249,6 +267,51 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 | 2 | [`test_native_deny`](src/wasm_engine.rs) | Rule: `resource.sensitivity == critical` | Returns Deny with reason "Critical data protected" |
 | 3 | [`test_response_to_decision`](src/wasm_engine.rs) | EvalResponse `decision="Delay", delay_ms=500` | Maps to `EnforcementDecision::Delay{milliseconds: 500}` |
 | 4 | [`test_load_missing_wasm`](src/wasm_engine.rs) | Load from `nonexistent.wasm` | Falls back to native mode, `is_wasm()=false` |
+
+### GVM-Engine (7 tests) — [crates/gvm-engine/src/lib.rs](crates/gvm-engine/src/lib.rs)
+
+| # | Test | Scenario | Verification |
+|---|------|----------|--------------|
+| 1 | [`test_allow_when_no_rules`](crates/gvm-engine/src/lib.rs) | EvalRequest with empty rules | Returns Allow |
+| 2 | [`test_deny_critical_delete`](crates/gvm-engine/src/lib.rs) | `resource.sensitivity == critical` match | Returns Deny |
+| 3 | [`test_delay_medium_send`](crates/gvm-engine/src/lib.rs) | `operation StartsWith gvm.messaging`, Delay 300ms | Returns Delay{300} |
+| 4 | [`test_json_roundtrip`](crates/gvm-engine/src/lib.rs) | EvalRequest serialize → deserialize | Round-trips correctly |
+| 5 | [`test_pascal_case_operators_accepted`](crates/gvm-engine/src/lib.rs) | PascalCase operator strings (`"StartsWith"`, `"Eq"`) | All recognized, no parse error |
+| 6 | [`test_context_attribute_matching`](crates/gvm-engine/src/lib.rs) | `context.amount > 10000` on high-value payload | Correct decision matched |
+| 7 | [`test_strictest_wins_across_layers`](crates/gvm-engine/src/lib.rs) | Allow (priority 100) + Deny (priority 1) | max_strict: Deny wins |
+
+### GVM-CLI suggest (6 tests) — [crates/gvm-cli/src/suggest.rs](crates/gvm-cli/src/suggest.rs)
+
+| # | Test | Scenario | Verification |
+|---|------|----------|--------------|
+| 1 | [`generalize_short_static_path`](crates/gvm-cli/src/suggest.rs) | `/v1/messages`, `/api/health` | Returned unchanged (no ID segments) |
+| 2 | [`generalize_path_with_numeric_id`](crates/gvm-cli/src/suggest.rs) | `/users/12345/orders`, `/transfer/99999` | Numeric segment replaced with `{any}` |
+| 3 | [`generalize_path_with_uuid`](crates/gvm-cli/src/suggest.rs) | RFC-4122 UUID in path segment | UUID segment replaced with `{any}` |
+| 4 | [`generalize_empty_path`](crates/gvm-cli/src/suggest.rs) | `/`, `""` | Returns `/{any}` |
+| 5 | [`looks_like_id_detects_numbers`](crates/gvm-cli/src/suggest.rs) | `12345`, `0` vs `users`, `v1` | Digits detect as ID; alpha strings do not |
+| 6 | [`looks_like_id_detects_uuids`](crates/gvm-cli/src/suggest.rs) | Full UUID vs short hyphenated string | Full RFC-4122 detected; short strings not |
+
+### GVM-CLI run (8 tests) — [crates/gvm-cli/src/run.rs](crates/gvm-cli/src/run.rs)
+
+| # | Test | Scenario | Verification |
+|---|------|----------|--------------|
+| 1 | [`test_is_local_proxy_url_localhost`](crates/gvm-cli/src/run.rs) | `http://localhost:8080` | Returns true |
+| 2 | [`test_is_local_proxy_url_127_0_0_1`](crates/gvm-cli/src/run.rs) | `http://127.0.0.1:8080` | Returns true |
+| 3 | [`test_is_local_proxy_url_ipv6_loopback`](crates/gvm-cli/src/run.rs) | `http://[::1]:8080` | Returns true (IPv6) |
+| 4 | [`test_is_local_proxy_url_no_port`](crates/gvm-cli/src/run.rs) | `http://localhost` | Returns true (auto-default port semantics) |
+| 5 | [`test_is_local_proxy_url_with_trailing_slash`](crates/gvm-cli/src/run.rs) | `http://localhost:8080/` | Returns true |
+| 6 | [`test_is_local_proxy_url_remote_host`](crates/gvm-cli/src/run.rs) | `http://proxy.example.com:8080` | Returns false (non-local FQDN) |
+| 7 | [`test_is_local_proxy_url_remote_ip`](crates/gvm-cli/src/run.rs) | `http://192.168.1.1:8080` | Returns false (non-loopback IP) |
+| 8 | [`test_is_local_proxy_url_invalid_url`](crates/gvm-cli/src/run.rs) | `not-a-valid-url` | Returns false (parse error handling) |
+
+### GVM-CLI Integration (3 tests) — [crates/gvm-cli/tests/cli_integration.rs](crates/gvm-cli/tests/cli_integration.rs)
+
+| # | Test | Scenario | Notes |
+|---|------|----------|-------|
+| 1 | [`test_gvm_run_help_succeeds`](crates/gvm-cli/tests/cli_integration.rs) | `gvm run --help` command | Validates binary availability and help rendering |
+| 2 | [`test_gvm_events_list_basic`](crates/gvm-cli/tests/cli_integration.rs) | `gvm events list` command | Confirms command structure and exit code |
+| 3 | [`test_gvm_stats_basic`](crates/gvm-cli/tests/cli_integration.rs) | `gvm stats tokens` command | Tests stats subcommand availability |
+| *E2E* | [`test_gvm_run_local_mode_with_proxy_autostart`](crates/gvm-cli/tests/cli_integration.rs) | Full: proxy down → auto-start → agent run | Ignored by default; run with `--ignored` flag |
 
 ---
 
@@ -323,7 +386,7 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 
 | # | Boundary | Test | Verification |
 |---|----------|------|--------------|
-| 1 | Wasm↔Host | [`wasm_invalid_decision_string_maps_to_allow`](tests/boundary.rs) | `"InvalidDecisionType"` → Allow (fail-open for forward compat) |
+| 1 | Wasm↔Host | [`wasm_invalid_decision_string_maps_to_delay`](tests/boundary.rs) | `"InvalidDecisionType"` → Delay(300ms) (fail-close default) |
 | 2 | Wasm↔Host | [`wasm_malformed_response_does_not_crash`](tests/boundary.rs) | 10 garbage JSON inputs → all return valid JSON |
 | 3 | Wasm↔Host | [`wasm_oversized_input_handled_gracefully`](tests/boundary.rs) | 1MB operation name → no crash, returns Allow |
 | 4 | Wasm↔Host | [`wasm_unicode_boundary_operation_names`](tests/boundary.rs) | Korean, null byte, max BMP, emoji, RTL override → no crash |
@@ -467,7 +530,7 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 
 ## 9.7 Running Tests & Benchmarks
 
-### All 100 Rust Tests
+### All Rust Tests
 
 ```bash
 cargo test

@@ -2,6 +2,15 @@
 
 **Governance Virtual Machine — A Security Kernel for AI Agent I/O**
 
+**Status: v0.1.0-alpha (pre-release software).**
+
+> **How is this different from NVIDIA OpenShell?**  
+> OpenShell sandboxes agents with Docker+K3s (allow/deny).  
+> GVM governs agent actions with graduated enforcement,  
+> semantic forgery detection, and checkpoint rollback —  
+> in a single binary, no container runtime required.  
+> [See comparison →](#openshell-comparison)
+
 > Smarter models do not mean safer systems.
 > Safety must be structural, not behavioral.
 
@@ -17,7 +26,7 @@ AI agents are getting better at doing things. That is exactly the problem.
 
 A model that can compose emails, query databases, and call payment APIs is one prompt injection away from doing all three without authorization. Today's safety strategy — instruction tuning, guardrails in the prompt, RLHF alignment — operates at the **behavioral** level. It asks the model to be good. But a sufficiently capable model, a jailbreak, or a simple bug can bypass behavioral constraints entirely.
 
-**Model sophistication is not control.** GPT-5 will be smarter than GPT-4. It will not be more *governed*. The gap between what an agent *can* do and what it *should* do is an infrastructure problem, not a model problem.
+**Model sophistication is not control.** The gap between what an agent *can* do and what it *should* do is an infrastructure problem, not a model problem.
 
 The industry needs action-level enforcement at the runtime layer — something that sits between the agent and the world, something the agent cannot reason its way around.
 
@@ -158,24 +167,35 @@ Any request that doesn't match a known rule gets a 300ms delay (not Allow, not D
 
 ---
 
-## Quick Start (5 minutes)
+## Quick Start
 
 ### Prerequisites
 
-- Rust 1.75+
+- Rust 1.75+ (for building from source)
 - Python 3.9+ (only if using the Python SDK or running demos)
 
-### 1. Build and start the proxy
+### Option A: Pre-built Binary (Fastest)
+
+```bash
+# Download pre-built binary
+curl -sSL https://github.com/skwuwu/Analemma-GVM/releases/latest/download/gvm-proxy-linux-x86_64 -o gvm-proxy
+chmod +x gvm-proxy && ./gvm-proxy
+```
+
+The proxy starts on `0.0.0.0:8080`. Governance is now active.
+
+### Option B: Build from Source (5 minutes after Rust build completes)
 
 ```bash
 git clone https://github.com/skwuwu/Analemma-GVM.git
 cd Analemma-GVM
-cargo run
+cargo run               # First build: 2-3 minutes (one-time)
+                       # Subsequent runs: ~100ms
 ```
 
 The proxy starts on `0.0.0.0:8080`. That's it — governance is now active.
 
-### 2. Route any agent through the proxy
+### 1. Route any agent through the proxy
 
 GVM is a **transparent HTTP proxy**. It works with any language, any framework, any agent — no SDK required. Just point your agent's HTTP traffic at the proxy:
 
@@ -209,7 +229,7 @@ Every outbound HTTP request your agent makes now passes through the GVM proxy. T
 
 Without the SDK, Layer 1 (ABAC) has no operation metadata to evaluate, so it defaults to **Default-to-Caution** (300ms delay). Layer 2 and Layer 3 work at full strength because they inspect the actual HTTP request, not agent-declared headers.
 
-### 3. (Optional) Use the Python SDK for richer governance
+### 2. (Optional) Use the Python SDK for richer governance
 
 The SDK is **not required** for enforcement — it's an enhancement. It adds Layer 1 (semantic ABAC policy) by injecting `X-GVM-*` headers that tell the proxy *what the agent thinks it's doing*. The proxy then cross-checks this against *what the agent is actually doing* (Layer 2).
 
@@ -266,7 +286,7 @@ session.post("http://api.bank.com/transfer/123", json={"amount": 50000})
 # → Denied by SRR. Agent never needed the SDK for this to work.
 ```
 
-### 4. Run the demo
+### 3. Run the demo
 
 ```bash
 pip install -e sdk/python
@@ -321,15 +341,30 @@ GVM provides two OS-level isolation modes that restrict agents to communicate on
 # Linux-native sandbox (recommended for production)
 # Uses namespaces (user, PID, mount, network), seccomp-BPF, and veth pair.
 # No Docker required. Analogous to Firecracker's MicroVM approach.
+# Requires Linux kernel support + CAP_NET_ADMIN + ip/iptables availability.
 gvm run --sandbox agent.py
 
 # Docker containment (dev/CI or non-Linux platforms)
 # Uses Docker network isolation, read-only filesystem, resource limits.
+# On Linux with localhost proxy, CLI uses host network mode for proxy reachability.
 gvm run --contained agent.py --image python:3.12-slim --memory 512m --cpus 1.0
 
 # Local mode (Layer 2 only — no OS isolation)
 gvm run agent.py
 ```
+
+`gvm run` performs a proxy health check before launching the agent process:
+
+- If `--proxy` targets localhost and the proxy is down, CLI auto-starts `gvm-proxy` using `cargo run -p gvm-proxy` from the workspace root and waits up to 25 seconds.
+- If `--proxy` targets a non-local endpoint and health check fails, launch is rejected (fail-close) and the operator must start the proxy explicitly.
+
+**Sandbox runtime prerequisites (all required):**
+
+- Linux with unprivileged user namespaces enabled (`kernel.unprivileged_userns_clone=1`)
+- Effective `CAP_NET_ADMIN` for the `gvm run` process
+- `ip` and `iptables` commands available in `PATH`
+- `net.ipv4.ip_forward=1`
+- Interpreter runtime dependencies resolvable from the sandbox rootfs (for example, Python shared libraries)
 
 **Linux-native sandbox** is the primary deployment target:
 
@@ -337,7 +372,7 @@ gvm run agent.py
 |---------|---------------------------|----------------------|
 | Isolation | User/PID/mount/network namespaces | Docker container |
 | Syscall filter | seccomp-BPF (~45 allowed) | Docker default seccomp |
-| Network | veth pair, proxy-only routing | `gvm-internal` network |
+| Network | veth pair, proxy-only routing | `gvm-internal` (default) or `host` mode on Linux when proxy target is localhost |
 | Filesystem | pivot_root, read-only workspace | `--read-only` mount |
 | Overhead | ~2ms setup, no daemon | Docker daemon required |
 | Platform | Linux only | Any Docker-supported OS |
@@ -415,7 +450,7 @@ Savings are not a fixed percentage — they depend on where in the workflow the 
 ### Run tests
 
 ```bash
-cargo test   # 146 tests
+cargo test --workspace --all-targets   # 199 tests (2026-03-17, incl. 14 CLI proxy unit tests)
 ```
 
 ---
@@ -442,19 +477,23 @@ The full technical whitepaper is in [`docs/`](docs/):
 
 ## Test Coverage
 
-146 tests across unit, integration, boundary, edge-case, hostile, stress, and Merkle suites. Zero failures.
+199 tests across core unit, integration, boundary, edge-case, hostile, stress, CLI, and Merkle suites. Zero failures.
 
-| Category | Count |
-|----------|-------|
-| Unit (SRR, Policy, Vault, Registry, Merkle, Wasm, LLM Trace) | 54 |
-| Integration (E2E) | 5 |
-| Boundary | 30 |
-| Edge Cases | 17 |
-| Hostile Environment | 11 |
-| Stress | 12 |
-| Merkle Tree | 12 |
-| Engine (gvm-engine) | 5 |
-| **Total** | **146** |
+| Category | Count | Notes |
+|----------|-------|-------|
+| Core unit (`src/lib.rs`) | 85 | SRR, Policy, Vault, Registry, Merkle, Wasm, LLM Trace, Proxy |
+| Integration (E2E) | 5 | Full workflow |
+| Boundary | 30 | Security boundaries |
+| Edge Cases | 17 | Unusual inputs |
+| Hostile Environment | 11 | Concurrency |
+| Stress | 12 | Scale |
+| Merkle Tree | 12 | Integrity proofs |
+| Engine (`gvm-engine`) | 7 | Policy engine |
+| CLI unit (`gvm-cli`) | 14 | Proxy URL detection, path generalization |
+| CLI integration | 3 | Command surface (`--help`, events, stats) |
+| **Total** | **199** | All passing |
+
+(Run `cargo test -p gvm-cli --test cli_integration -- --ignored` to include full end-to-end proxy auto-start test.)
 
 ---
 
@@ -483,7 +522,7 @@ Analemma-GVM does the same for AI agents. The agent can *try* to wire-transfer $
 
 ## Known Limitations & Planned Hardening
 
-We know where the weak points are. Transparency is part of the security posture.
+> What's implemented works. These are the edges we haven't polished yet.
 
 | Area | Current State | Planned Fix |
 |------|--------------|-------------|
@@ -492,6 +531,29 @@ We know where the weak points are. Transparency is part of the security posture.
 | **Checkpoint Failure Mode** | Checkpoint save failures are logged as warnings but do not block execution. | Configurable strict mode: fail the operation if checkpoint cannot be saved. |
 | **Thread Safety (SDK)** | `last_gvm_response` in LangChain tools module is not thread-safe. | Wrap with `threading.Lock` or use thread-local storage. |
 | **Rate Limiter Eviction** | Bucket overflow (>10K agents) triggers 25% bulk eviction. | LRU-based eviction with per-tenant isolation. |
+
+---
+
+## OpenShell Comparison
+
+| Feature | NVIDIA OpenShell | Analemma-GVM |
+|---------|------------------|-----------------|
+| **Isolation** | Docker + K3s | Linux namespaces (no Docker required) |
+| **Policy Granularity** | Allow / Deny | Allow / Delay / RequireApproval / Deny |
+| **Forgery Detection** | Single layer (URL) | Cross-layer (semantic + network + capability) |
+| **On Deny** | Agent waits for policy change | Auto-rollback to checkpoint |
+| **Audit Integrity** | Audit trail | Merkle-verified hash chain |
+| **Enforcement Tiers** | Binary | IC-1/2/3 (reversibility classification) |
+| **Deployment** | Kubernetes | Single Rust binary |
+| **Setup** | Docker Desktop + K3s | Cargo run or pre-built binary |
+| **Status** | Production (v1+) | Alpha (v0.1) |
+
+**Complementary, not competitive:**  
+GVM is not a replacement for OpenShell. OpenShell provides sandboxed execution environments. GVM provides governance logic and semantic enforcement. They can work together — GVM can run *inside* an OpenShell sandbox for layered defense, or as a standalone enforcement point. Choose based on your isolation posture:
+
+- **OpenShell**: You need strong process isolation (untrusted user code, shared hardware)
+- **GVM**: You need policy-driven enforcement (trusted processes, graduated responses, checkpoint rollback)
+- **Both**: You need defense-in-depth (OpenShell sandbox + GVM governance inside)
 
 ---
 

@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use nix::sched::CloneFlags;
+use std::os::fd::{IntoRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 
 /// Flags for creating a fully isolated sandbox.
@@ -49,7 +50,7 @@ pub fn write_uid_map(child_pid: nix::unistd::Pid) -> Result<()> {
 
 /// Create a Unix socketpair for parent-child coordination.
 /// Parent sends a byte after completing setup; child blocks until received.
-pub fn coordination_pipe() -> Result<(RawFd, RawFd)> {
+pub fn coordination_pipe() -> Result<(OwnedFd, RawFd)> {
     let (parent_fd, child_fd) = nix::sys::socket::socketpair(
         nix::sys::socket::AddressFamily::Unix,
         nix::sys::socket::SockType::Stream,
@@ -58,22 +59,38 @@ pub fn coordination_pipe() -> Result<(RawFd, RawFd)> {
     )
     .context("Failed to create coordination socketpair")?;
 
-    Ok((parent_fd.into(), child_fd.into()))
+    Ok((parent_fd, child_fd.into_raw_fd()))
 }
 
-/// Parent signals the child that setup is complete.
-pub fn signal_child_ready(parent_fd: RawFd) -> Result<()> {
-    nix::unistd::write(parent_fd, &[1u8])
-        .context("Failed to signal child")?;
-    nix::unistd::close(parent_fd).ok();
+/// Parent signals the child that setup is complete and sends a network seed.
+pub fn signal_child_ready(parent_fd: OwnedFd, network_seed: u32) -> Result<()> {
+    let payload = network_seed.to_le_bytes();
+    let mut written = 0;
+    while written < payload.len() {
+        let n = nix::unistd::write(&parent_fd, &payload[written..])
+            .context("Failed to signal child")?;
+        if n == 0 {
+            anyhow::bail!("coordination socket closed while signaling child");
+        }
+        written += n;
+    }
     Ok(())
 }
 
 /// Child waits for the parent to complete setup.
-pub fn wait_for_parent(child_fd: RawFd) -> Result<()> {
-    let mut buf = [0u8; 1];
-    nix::unistd::read(child_fd, &mut buf)
-        .context("Failed to read parent signal")?;
+pub fn wait_for_parent(child_fd: RawFd) -> Result<u32> {
+    let mut buf = [0u8; 4];
+    let mut read_total = 0;
+
+    while read_total < buf.len() {
+        let n = nix::unistd::read(child_fd, &mut buf[read_total..])
+            .context("Failed to read parent signal")?;
+        if n == 0 {
+            anyhow::bail!("coordination socket closed before setup signal");
+        }
+        read_total += n;
+    }
+
     nix::unistd::close(child_fd).ok();
-    Ok(())
+    Ok(u32::from_le_bytes(buf))
 }

@@ -46,6 +46,10 @@ let final_decision = max_strict(srr_decision.clone(), policy_decision.clone());
 
 OPA has no equivalent mechanism. If a service sends a header claiming `action: read`, OPA evaluates that claim at face value.
 
+**Implementation status (2026-03)**:
+- Layer 1 decisions in the request hot path are currently evaluated by native `PolicyEngine` (`state.policy.evaluate(...)`).
+- The Wasm runtime loader exists, but making Wasm the default hot-path evaluator is tracked as roadmap hardening.
+
 ---
 
 ### 11.3.2 IC Classification (4-State vs Binary)
@@ -120,7 +124,7 @@ headers.remove(AUTHORIZATION);
 
 **OPA+Envoy**: No awareness of LLM response structure. Treats all HTTP responses as opaque bytes.
 
-**GVM**: When the proxy processes an IC-2 response from a known LLM provider (OpenAI, Anthropic, Gemini), it extracts the reasoning/thinking content and records it in the WAL event.
+**GVM**: When the proxy processes an IC-2 response from a known LLM provider (OpenAI, Anthropic, Gemini), it performs transport-aware bounded best-effort extraction of reasoning/thinking content. JSON responses are extracted only when `Content-Length` is known and ≤ 256KB; SSE responses are streamed through immediately with a bounded 1MB tap and persisted as an asynchronous WAL trace update on stream completion. This preserves output continuity while still capturing audit-relevant trace data.
 
 ```rust
 // src/llm_trace.rs:18-22 — Known LLM providers
@@ -217,10 +221,12 @@ This is the conservative middle ground: unknown operations are not broken (they 
 | User namespace | Unprivileged container creation |
 | PID namespace | Process isolation |
 | Mount namespace | `pivot_root` to minimal read-only filesystem |
-| Network namespace | veth pair with DNAT forcing all traffic through proxy |
+| Network namespace | veth pair + DNAT proxy path (opt-in, process-scoped in v1) |
 | seccomp-BPF | ~45 allowed syscalls (default profile) |
 
-The network namespace is the critical piece: `iptables DNAT` routes all outbound traffic to the proxy's veth endpoint. The agent cannot reach the internet directly — the proxy is the only network path. Combined with Layer 3 (no API keys in agent memory), this creates defense-in-depth that Envoy alone cannot provide.
+The network namespace is the critical piece: `gvm run --sandbox` injects `HTTP_PROXY`/`HTTPS_PROXY` in the child and configures a veth+DNAT path to the proxy endpoint. This gives stronger containment than cooperative proxy mode, while transparent interception parity (`SO_ORIGINAL_DST`, CONNECT, IPv6 hardening) remains roadmap work.
+
+**Implementation status (2026-03)**: `gvm run --sandbox` (Linux-native) and `gvm run --contained` (Docker) are implemented. Containment is opt-in per launched process; workloads not started via `gvm run` remain in cooperative proxy mode. Sandbox launch is fail-fast gated on critical host prerequisites (`kernel.unprivileged_userns_clone=1`, `CAP_NET_ADMIN`, `ip`, `iptables`, `net.ipv4.ip_forward=1`). `gvm run` also performs proxy readiness checks before launch and auto-starts `gvm-proxy` only for localhost targets when the proxy is unavailable.
 
 ---
 
@@ -293,7 +299,8 @@ The SDK uses these headers to make intelligent recovery decisions (e.g., `X-GVM-
 | **Hierarchical monotonic policy** | Flat Rego namespace | Global > Tenant > Agent | **GVM only** |
 | **Payload inspection** | Custom plugins | Built-in `payload_field` matching | **GVM advantage** |
 | **Default-to-Caution** | Configurable (usually allow) | `Delay(300ms)` on unknown | **GVM only** |
-| **Agent sandboxing** | Not in scope | namespace+seccomp+veth | **GVM only** |
+| **Agent sandboxing** | Not in scope | namespace+seccomp+veth (`gvm run --sandbox`, opt-in) | **GVM only** |
+| **Wasm-isolated policy runtime** | Not in scope | Optional loader exists; default decision path remains native (roadmap to enforce) | **Roadmap** |
 | **Checkpoint/rollback** | Not in scope | Merkle-verified state restore | **GVM only** |
 | **IPv6 SSRF defense** | Literal matching | Canonical normalization | **GVM only** |
 | **Response metadata** | Allow/deny only | 7 governance headers | **GVM advantage** |
@@ -317,7 +324,7 @@ The SDK uses these headers to make intelligent recovery decisions (e.g., `X-GVM-
 - Audit must be a hard constraint, not a side effect
 - The agent should never hold API credentials
 - You need to record *why* the LLM made a decision (thinking trace)
-- You need OS-level process isolation for the agent runtime
+- You need OS-level process isolation for the agent runtime (`gvm run --sandbox` on Linux, `--contained` on Docker)
 
 **The elevator pitch**: OPA is a policy engine for microservices. GVM is a security kernel for AI agents. They solve different problems that happen to share a surface similarity (proxy + policy evaluation).
 

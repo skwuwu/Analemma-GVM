@@ -12,6 +12,7 @@ pub async fn verify_wal(wal_file: &str) -> Result<()> {
     let mut total_lines: u64 = 0;
     let mut valid_events: u64 = 0;
     let mut corrupt_lines: u64 = 0;
+    let mut merkle_batch_records: u64 = 0;
     let mut prev_timestamp: Option<chrono::DateTime<chrono::Utc>> = None;
     let mut out_of_order: u64 = 0;
     let mut events_with_hash: u64 = 0;
@@ -26,7 +27,21 @@ pub async fn verify_wal(wal_file: &str) -> Result<()> {
         }
         total_lines += 1;
 
-        match serde_json::from_str::<GVMEvent>(trimmed) {
+        let value: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => {
+                corrupt_lines += 1;
+                continue;
+            }
+        };
+
+        // Merkle batch records are valid WAL metadata, not GVMEvent rows.
+        if value.get("merkle_root").is_some() && value.get("batch_id").is_some() {
+            merkle_batch_records += 1;
+            continue;
+        }
+
+        match serde_json::from_value::<GVMEvent>(value) {
             Ok(event) => {
                 valid_events += 1;
 
@@ -60,6 +75,7 @@ pub async fn verify_wal(wal_file: &str) -> Result<()> {
     println!("{}", "-".repeat(50));
     println!("  Total lines:            {}", total_lines);
     println!("  Valid events:           {}", valid_events);
+    println!("  Merkle batch records:   {}", merkle_batch_records);
     println!("  Corrupt/unparseable:    {}", corrupt_lines);
     println!("  Timestamp out-of-order: {}", out_of_order);
     println!("  Events with hash:       {}", events_with_hash);

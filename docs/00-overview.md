@@ -67,9 +67,9 @@ When in doubt, block. The system defaults to **Delay 300ms** (Default-to-Caution
 
 No single model covers all requirements. GVM uses a **proxy + SDK hybrid**:
 
-- **Level 0 (proxy only)**: Immediate value with zero agent changes. SRR inspects URLs and payloads, API keys are injected by the proxy, all traffic is audited. This is the "Datadog pattern" — drop in a proxy, get visibility instantly.
+- **Level 0 (proxy only)**: Immediate value with zero agent changes. SRR inspects URLs and payloads, API keys are injected by the proxy, and all proxied traffic is audited. This is the "Datadog pattern" — drop in a proxy, get visibility instantly.
 - **Level 1 (+ SDK `@ic` decorator)**: Agent declares operation semantics. ABAC policy evaluates context attributes. Checkpoint/rollback on denial. Progressive adoption — the agent opts in to richer governance.
-- **Level 2 (+ `gvm run` mandatory interception)**: Network namespace isolation ensures the agent cannot bypass the proxy. Full enforcement without agent cooperation.
+- **Level 2 (+ `gvm run --sandbox`)**: Network namespace + seccomp containment for agents launched via `gvm run`. It steers child HTTP clients to a proxy path using veth+DNAT, reducing direct egress bypass risk versus cooperative mode. Optional in v1; roadmap moves toward mandatory deployment profiles.
 
 This progressive adoption path mirrors how observability tools (Datadog, New Relic) gain traction: start with infrastructure-level metrics (free), then instrument application code for traces and custom metrics (opt-in). GVM starts with network-level governance (free), then adds semantic governance (opt-in).
 
@@ -84,9 +84,9 @@ The enforcement layer determines what the system can *see*:
 
 For **governance** (deciding whether an agent *should* perform an action), semantic visibility is essential. A syscall-level monitor sees `connect(fd, 93.184.216.34:443)` + `write(fd, <TLS bytes>)` — it cannot distinguish a balance check from a wire transfer. An HTTP proxy sees `POST api.bank.com/v1/transfers {"amount": 50000, "currency": "USD"}` and can make a meaningful policy decision.
 
-Syscall-level enforcement solves a *different* problem: **containment** (preventing an agent from escaping its sandbox). This is Layer 3 territory — preventing raw socket connections, file system escapes, and process spawning. GVM's planned `gvm run` uses network namespace isolation (a syscall-level mechanism) precisely for this containment purpose.
+Syscall-level enforcement solves a *different* problem: **containment** (reducing sandbox escape and uncontrolled runtime behavior). This is Layer 3 territory — constraining namespace, filesystem, and syscall surface. GVM's `gvm run --sandbox` uses Linux namespace isolation + seccomp for this containment purpose today.
 
-**Summary**: Syscall for containment (can the agent escape?), HTTP for governance (should the agent do this?). Different layers solve different problems. GVM enforces governance at the HTTP layer where semantic context is available, and plans containment at the syscall/namespace layer where bypass prevention is guaranteed.
+**Summary**: Syscall for containment (can the agent escape?), HTTP for governance (should the agent do this?). Different layers solve different problems. GVM enforces governance at the HTTP layer where semantic context is available, and adds containment via `gvm run --sandbox` with roadmap work to make containment mandatory by deployment profile.
 
 ---
 
@@ -130,18 +130,19 @@ See [Part 8: Memory & Runtime Security](08-memory-security.md) for full analysis
 
 ---
 
-## Test Coverage: 146 Tests
+## Test Coverage: 199 Tests
 
 | Category | Count | Source |
 |----------|-------|--------|
-| Unit (SRR, Policy, Vault, Registry, Merkle, Wasm, LLM Trace) | 54 | `src/lib.rs` |
+| Core unit (SRR, Policy, Vault, Registry, Merkle, Wasm, LLM Trace, Proxy) | 85 | `src/lib.rs` |
 | Integration (E2E) | 5 | `tests/integration.rs` |
 | Boundary | 30 | `tests/boundary.rs` |
 | Edge Cases | 17 | `tests/edge_cases.rs` |
 | Hostile Environment | 11 | `tests/hostile.rs` |
 | Stress | 12 | `tests/stress.rs` |
 | Merkle Tree | 12 | `tests/merkle.rs` |
-| Engine (gvm-engine) | 5 | `crates/gvm-engine/` |
-| **Total** | **146** | |
+| Engine (gvm-engine) | 7 | `crates/gvm-engine/` |
+| CLI unit & integration (gvm-cli) | 17 | `crates/gvm-cli/` (14 unit + 3 integration) |
+| **Total** | **199** | All passing |
 
 All tests pass. Zero failures.
