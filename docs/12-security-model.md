@@ -75,21 +75,33 @@ If an attacker has root access to the host, GVM — like any userspace process �
 
 **Current (v1)**:
 - Cooperative default: SDK sets `HTTP_PROXY` via `GVMAgent.create_session()`.
-- Enforced mode is available today via `gvm run --sandbox` (Linux namespace + veth + iptables redirect).
-- Docker fallback is available via `gvm run --contained`.
+- **Enforced mode**: `gvm run --sandbox` (Linux namespace + veth + iptables OUTPUT lockdown). Proxy bypass is structurally impossible within the sandbox namespace.
+- Docker fallback: `gvm run --contained`.
 - Limitation: containment is opt-in and process-scoped. Processes not launched via `gvm run` still rely on cooperative proxy routing.
 
-`gvm run --sandbox` interception path:
+`gvm run --sandbox` interception path (implemented):
 
 ```
 gvm run --sandbox my_agent.py
-  → unshare(CLONE_NEWNET)                 # isolated network namespace
-  → veth pair: agent ns ↔ host            # controlled network bridge
-  → HTTP_PROXY/HTTPS_PROXY set in child   # client traffic steered to proxy endpoint
-  → iptables DNAT: host-veth:proxy_port → configured proxy_addr
-  → iptables FORWARD allow: veth ↔ lo (proxy path)
-  → no blanket REJECT rule in v1 (strict transparent interception hardening is roadmap)
+  → clone(CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET)
+  → veth pair: agent ns ↔ host (10.200.X.1/30 ↔ 10.200.X.2/30)
+  → HTTP_PROXY/HTTPS_PROXY set in child env
+  → Host-side:
+      iptables DNAT: host-veth:proxy_port → configured proxy_addr
+      iptables MASQUERADE: restricted to proxy port TCP only
+      iptables FORWARD: veth↔lo ACCEPT, veth→* DROP
+  → Sandbox-side (OUTPUT chain lockdown):
+      iptables OUTPUT -o lo → ACCEPT
+      iptables OUTPUT ESTABLISHED,RELATED → ACCEPT
+      iptables OUTPUT -p tcp -d host_ip --dport proxy_port → ACCEPT
+      iptables OUTPUT -p udp -d host_ip --dport 53 → ACCEPT
+      iptables OUTPUT → DROP (all else)
+  → IPv6 fully disabled (sysctl + ip6tables DROP fallback)
+  → resolv.conf aligned to host veth IP (DNS resolution via host only)
+  → seccomp-BPF: ~45 syscalls whitelisted
 ```
+
+After sandbox network setup, the agent can only reach: (1) GVM proxy via TCP on the host veth IP, (2) DNS via UDP 53 on the same host veth IP, (3) loopback. All other egress is dropped by iptables OUTPUT chain. IPv6 is disabled to prevent bypassing IPv4 firewall rules.
 
 **Roadmap (v2)**: Move from opt-in containment to deployment-level mandatory interception profiles (policy-enforced launch path + identity attestation).
 
@@ -168,6 +180,52 @@ gvm run --sandbox my_agent.py
 **Planned mitigation (v2)**: GraphQL query parser that inspects the `query` field for mutation names, field names, and aliases. Until then, GraphQL endpoints should be treated as elevated risk — consider Deny-by-default for GraphQL endpoints with allowlisted `operationName` values only.
 
 **Why acceptable now**: Current deployments use the operationName-based rules as defense-in-depth behind ABAC policy layer. The ABAC layer evaluates semantic operation names independently of the HTTP payload, so a GraphQL alias bypass only evades Layer 2 SRR, not Layer 1 policy.
+
+---
+
+## Enforcement Decision Behavior
+
+### Decision Types and Agent-Side Behavior
+
+GVM enforces governance at the HTTP proxy layer. The proxy returns standard HTTP responses to the agent — it does not control agent process lifecycle.
+
+| Decision | Proxy Behavior | HTTP Response | Agent Receives |
+|----------|---------------|---------------|----------------|
+| **Allow** | Immediate forward, async audit | Upstream response (2xx/4xx/5xx) | Normal response |
+| **Delay** | WAL write, hold N ms, then forward | Upstream response (delayed) | Normal response (slower) |
+| **Deny** | Block request, WAL write | `403 Forbidden` with error JSON | HTTP 403 error |
+| **RequireApproval** | Block request, WAL write | `403 Forbidden` with `RequireApproval` decision | HTTP 403 error |
+
+### What Happens When an Agent is Denied
+
+GVM returns an HTTP 403 response. **What the agent does next is entirely the agent's design responsibility**, not GVM's:
+
+- An agent using the Python SDK receives a `GVMDeniedError` exception, which can trigger checkpoint rollback.
+- An agent using raw HTTP receives a 403 status code and must handle it in its own error handling logic.
+- GVM does **not** kill, pause, or signal the agent process. The agent remains running and can attempt other operations.
+
+This is by design: GVM governs individual I/O operations at the proxy boundary, not agent process lifecycle. An agent that receives a Deny can retry (and be denied again), fall back to alternative logic, or crash — all of which are agent-level design decisions.
+
+### RequireApproval (IC-3) — Scope Boundary
+
+`RequireApproval` exists as a decision type in the policy engine. The proxy blocks the request and records the event in the WAL.
+
+**What GVM does NOT provide:**
+- No built-in approval UI, webhook, or notification system
+- No approval queue or pending-request store
+- No mechanism to "resume" a blocked request after human approval
+
+**Why this is correct:**
+Human-in-the-loop (HITL) approval workflows are application-layer concerns. The mechanism for collecting approval (Slack bot, admin dashboard, email, CLI prompt) varies by deployment context. GVM's role is to **enforce the block** and **record the event** — the approval workflow is built on top of GVM's audit trail, not inside it.
+
+**Practical IC-3 implementation pattern:**
+1. Agent calls an IC-3 operation → proxy returns 403 with `RequireApproval`
+2. Agent SDK catches the error and halts that workflow branch (agent design)
+3. External system (monitoring, Slack bot, dashboard) reads WAL event and notifies approver
+4. Approver updates policy (temporary Allow rule or one-time override)
+5. Agent retries → proxy now returns Allow
+
+This pattern keeps GVM focused on enforcement and audit, while approval UX is delegated to the deployment environment.
 
 ---
 

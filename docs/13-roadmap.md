@@ -153,12 +153,17 @@
 
 - [x] `gvm run --sandbox` Linux-native namespace isolation (`CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET`)
 - [x] veth pair + iptables DNAT path to proxy
+- [x] iptables OUTPUT chain lockdown (proxy TCP + DNS UDP only, all else DROP)
+- [x] IPv6 fully disabled (sysctl + ip6tables DROP fallback)
+- [x] MASQUERADE restricted to proxy port only
+- [x] FORWARD DROP for veth traffic to non-proxy destinations
+- [x] DNS alignment (resolv.conf + iptables both use host veth IP)
 - [x] seccomp-BPF sandbox profile (default + strict)
 - [x] Docker fallback mode (`gvm run --contained`)
 - [x] Sandbox preflight gating for critical prerequisites (`CAP_NET_ADMIN`, `ip`, `iptables`, userns, seccomp)
 - [x] Local proxy auto-start for `gvm run` when localhost target is unreachable
 - [ ] Mandatory-by-default interception profile (reject non-contained launch in production)
-- [ ] Transparent proxy parity (`SO_ORIGINAL_DST`, CONNECT tunnel, IPv6 hardening)
+- [ ] Transparent proxy parity (`SO_ORIGINAL_DST`, CONNECT tunnel)
 - [ ] macOS/Windows host-level interception fallback (currently Docker fallback only)
 
 ### Agent Identity
@@ -239,7 +244,7 @@
 ### Enterprise
 
 - [ ] Multi-tenant SaaS deployment mode
-- [ ] Approval UI for RequireApproval (IC-3)
+- [ ] Approval UI for RequireApproval (IC-3) — optional; HITL workflow is deployment/agent responsibility, not GVM core
 - [ ] Envoy filter mode (GVM as Envoy Wasm filter)
 - [ ] OPA policy format compatibility layer
 - [ ] Firecracker isolation backend

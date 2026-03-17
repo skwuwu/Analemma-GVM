@@ -46,7 +46,7 @@ Analemma-GVM is a transparent enforcement proxy for AI agent I/O operations. It 
 |----------|----------|----------|
 | IC-1 | Allow | Immediate pass-through, async audit |
 | IC-2 | Delay | WAL-first write, configurable delay, then forward |
-| IC-3 | RequireApproval | Blocked until human approves |
+| IC-3 | RequireApproval | Blocked (returns 403). Approval workflow is agent/deployment responsibility, not GVM's |
 | — | Deny | Unconditional block |
 
 ### Fail-Close Philosophy
@@ -69,7 +69,7 @@ No single model covers all requirements. GVM uses a **proxy + SDK hybrid**:
 
 - **Level 0 (proxy only)**: Immediate value with zero agent changes. SRR inspects URLs and payloads, API keys are injected by the proxy, and all proxied traffic is audited. This is the "Datadog pattern" — drop in a proxy, get visibility instantly.
 - **Level 1 (+ SDK `@ic` decorator)**: Agent declares operation semantics. ABAC policy evaluates context attributes. Checkpoint/rollback on denial. Progressive adoption — the agent opts in to richer governance.
-- **Level 2 (+ `gvm run --sandbox`)**: Network namespace + seccomp containment for agents launched via `gvm run`. It steers child HTTP clients to a proxy path using veth+DNAT, reducing direct egress bypass risk versus cooperative mode. Optional in v1; roadmap moves toward mandatory deployment profiles.
+- **Level 2 (+ `gvm run --sandbox`)**: Network namespace + seccomp containment for agents launched via `gvm run`. Proxy bypass is structurally impossible: iptables OUTPUT chain inside the sandbox namespace only allows TCP to the proxy port and UDP 53 (DNS) on the host veth IP — all other egress is dropped. IPv6 is fully disabled. Optional in v1; roadmap moves toward mandatory deployment profiles.
 
 This progressive adoption path mirrors how observability tools (Datadog, New Relic) gain traction: start with infrastructure-level metrics (free), then instrument application code for traces and custom metrics (opt-in). GVM starts with network-level governance (free), then adds semantic governance (opt-in).
 
