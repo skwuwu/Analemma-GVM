@@ -4,11 +4,11 @@
 
 **Status: v0.1.0-alpha (pre-release software).**
 
-> **How is this different from NVIDIA OpenShell?**  
-> OpenShell sandboxes agents with Docker+K3s (allow/deny).  
-> GVM governs agent actions with graduated enforcement,  
-> semantic forgery detection, and checkpoint rollback —  
-> in a single binary, no container runtime required.  
+> **How is this different from NVIDIA OpenShell?**
+> OpenShell sandboxes agents with Docker+K3s (allow/deny).
+> GVM governs agent actions with graduated enforcement,
+> semantic forgery detection, and checkpoint rollback(with SDK) —
+> in a single binary, no container runtime required.
 > [See comparison →](#openshell-comparison)
 
 > Smarter models do not mean safer systems.
@@ -17,6 +17,21 @@
 <p align="center">
   <img src="demo.svg" alt="Analemma-GVM Unified Finance Agent Demo" width="860">
 </p>
+
+> *The recording above is a live demo using my personal Claude API key. To try GVM without an API key or personal Agent, run `python -m gvm.mock_demo` — same proxy enforcement, pre-scripted LLM decisions.*
+
+---
+
+## Why GVM?
+
+| Approach | What it does | What it misses |
+|----------|-------------|----------------|
+| Prompt guardrails | Asks the model to behave | Bypassed by jailbreak or bugs |
+| Sandbox (Docker/K8s) | Constrains the environment | Binary allow/deny only |
+| Policy engines (OPA) | Evaluates metadata | Trusts what the agent declares |
+| **GVM** | **Governs actual HTTP actions** | **Alpha — not hardened** |
+
+Only GVM: graduated enforcement, semantic forgery detection, checkpoint rollback, Merkle-verified audit. No Docker required.
 
 ---
 
@@ -27,8 +42,6 @@ AI agents are getting better at doing things. That is exactly the problem.
 A model that can compose emails, query databases, and call payment APIs is one prompt injection away from doing all three without authorization. Today's safety strategy — instruction tuning, guardrails in the prompt, RLHF alignment — operates at the **behavioral** level. It asks the model to be good. But a sufficiently capable model, a jailbreak, or a simple bug can bypass behavioral constraints entirely.
 
 **Model sophistication is not control.** The gap between what an agent *can* do and what it *should* do is an infrastructure problem, not a model problem.
-
-The industry needs action-level enforcement at the runtime layer — something that sits between the agent and the world, something the agent cannot reason its way around.
 
 ### The Contrarian Bet
 
@@ -94,35 +107,47 @@ def steal_money(self):
 
 ---
 
-## Why This Architecture
+## Quick Start
 
-### Why a Proxy, Not a Library
+```bash
+git clone https://github.com/skwuwu/Analemma-GVM.git && cd Analemma-GVM
+cargo run                       # First build: 2-5 min (one-time). Subsequent runs: ~1s.
+pip install -e sdk/python       # Install SDK (one-time)
+gvm run my_agent.py             # Run your agent through GVM
+```
 
-Libraries run inside the agent's process. The agent can patch them, skip them, or ignore them. A proxy is an external enforcement point — the agent's traffic physically passes through it. There is no code path that bypasses the proxy.
+That's it. Your agent's code is unchanged. Every outbound HTTP request now passes through the governance proxy.
 
-### Why 3 Layers, Not 1
+```
+ Your agent                GVM Proxy (:8080)                External API
+ ┌──────────┐    HTTP      ┌──────────────────────┐  HTTPS  ┌──────────┐
+ │ Any code │────PROXY────>│ URL check + policy   │────────>│ Stripe   │
+ │ Any lang │              │ Key inject + audit   │         │ Gmail    │
+ └──────────┘              └──────────────────────┘         └──────────┘
+```
 
-A single policy engine can be fooled. If the agent declares `storage.read` but sends a wire transfer, a semantic-only policy would allow it. The 3-layer model eliminates this:
+**Try the demo** (no API key needed):
 
-| Layer | What It Checks | Why It Exists |
-|-------|---------------|---------------|
-| **Layer 1: Semantic (ABAC)** | Operation name, resource, context | Handles the happy path — SDK-declared operations |
-| **Layer 2: Network (SRR)** | Actual URL, method, payload | Catches lies — inspects what the agent *does*, not what it *says* |
-| **Layer 3: Capability Token** | API key injection | Removes the means — agent never holds credentials |
+```bash
+cargo run                       # Terminal 1
+python -m gvm.mock_demo         # Terminal 2 — mock LLM, real proxy enforcement
+```
 
-The final decision is `max_strict(Layer1, Layer2)` — the stricter ruling always wins.
+**Or run your own agent** — any language, any framework:
 
-### Why WAL-First, Not Fire-and-Forget
+```bash
+# Option A: gvm run (recommended — auto-starts proxy, sets up isolation)
+gvm run my_agent.py                 # Proxy auto-starts, HTTP_PROXY set automatically
+gvm run --sandbox my_agent.py       # + Linux namespace isolation (production)
+gvm run --contained my_agent.py     # + Docker isolation (any OS)
 
-For irreversible operations (payments, deletions, external messages), the audit record must exist *before* the action executes. If the proxy crashes mid-request, the WAL contains a `Pending` entry that is explicitly marked `Expired` on recovery — "this action may or may not have executed." No phantom records, no silent failures.
+# Option B: Manual proxy (any language)
+HTTP_PROXY=http://localhost:8080 python my_agent.py
+HTTP_PROXY=http://localhost:8080 node my_agent.js
+HTTP_PROXY=http://localhost:8080 ./my_agent
+```
 
-### Why AES-256-GCM with Zeroize
-
-Agent state contains sensitive data (balances, PII, credentials). The Vault encrypts everything at rest with AES-256-GCM. But encryption alone isn't enough — if the key persists in freed memory, a core dump or memory forensic tool can recover it. The `zeroize` crate guarantees key material is wiped on drop, using compiler barriers that prevent dead-store elimination. This is the same discipline applied in OpenSSL (`OPENSSL_cleanse`) and the Linux kernel (`memzero_explicit`). See the full [Memory & Runtime Security Report](docs/08-memory-security.md) for the 10-item security checklist covering nonce reuse, side-channel timing, OOM resistance, and more.
-
-### Why Default-to-Caution
-
-Any request that doesn't match a known rule gets a 300ms delay (not Allow, not Deny). This is the conservative middle ground: it doesn't break unknown legitimate operations, but it creates a review window and an audit trail. When in doubt, slow down.
+> Platform support, SDK usage, isolation modes, LLM provider governance, checkpoint/rollback — see [Quick Start Guide →](docs/14-quickstart.md)
 
 ---
 
@@ -142,326 +167,81 @@ Any request that doesn't match a known rule gets a 300ms delay (not Allow, not D
                      └───────────────────────┘
 ```
 
+### Why 3 Layers, Not 1
+
+A single policy engine can be fooled. If the agent declares `storage.read` but sends a wire transfer, a semantic-only policy would allow it. The 3-layer model eliminates this:
+
+| Layer | What It Checks | Why It Exists |
+|-------|---------------|---------------|
+| **Layer 1: Semantic (ABAC)** | Operation name, resource, context | Handles the happy path — SDK-declared operations |
+| **Layer 2: Network (SRR)** | Actual URL, method, payload | Catches lies — inspects what the agent *does*, not what it *says* |
+| **Layer 3: Capability Token** | API key injection | Removes the means — agent never holds credentials |
+
+The final decision is `max_strict(Layer1, Layer2)` — the stricter ruling always wins.
+
 ### IC Classification (Enforcement Decisions)
 
 | Level | Decision | Behavior |
 |-------|----------|----------|
 | IC-1 | Allow | Immediate pass-through, async audit |
 | IC-2 | Delay | WAL-first write, configurable delay, then forward |
-| IC-3 | RequireApproval | Blocked until human approves |
+| IC-3 | RequireApproval | Blocked (returns 403). Approval workflow is agent/deployment responsibility |
 | — | Deny | Unconditional block |
 
+### Components
+
+| Component | Moat | Details |
+|-----------|------|---------|
+| **ABAC Policy Engine** | Hierarchical rules (Global > Tenant > Agent), lower layers can only be stricter | [Details →](docs/02-policy.md) |
+| **Network SRR** | URL inspection independent of SDK headers, regex path matching, payload inspection | [Details →](docs/03-srr.md) |
+| **WAL-First Ledger** | Crash-safe audit: fsync before action, Merkle hash chain, NATS distribution | [Details →](docs/04-ledger.md) |
+| **Encrypted Vault** | AES-256-GCM + `zeroize` on drop, no key material in freed memory | [Details →](docs/05-vault.md) |
+| **Proxy Pipeline** | CatchPanicLayer + backpressure + 1024 connection limit, sub-μs policy eval | [Details →](docs/06-proxy.md) |
+| **Python SDK** | `@ic()` decorator, auto-checkpoint/rollback, causal tracing, LangChain adapter | [Details →](docs/07-sdk.md) |
+| **OS Isolation** | Linux namespace + seccomp-BPF (`--sandbox`), Docker fallback (`--contained`) | [Details →](docs/08-memory-security.md) |
+
+> Full technical whitepaper: [Architecture Overview →](docs/00-overview.md)
+
 ---
 
-## Components
+## Demos
 
-| Component | Role | Design Choice |
-|-----------|------|---------------|
-| **Operation Registry** | Defines the vocabulary of agent actions | Schema-validated TOML; anti-downgrade protection on `maps_to` |
-| **ABAC Policy Engine** | Evaluates operation metadata against hierarchical rules | Global > Tenant > Agent layers; lower layers can only be stricter |
-| **Network SRR** | URL-based rule matching independent of SDK headers | First-match-wins; payload inspection for GraphQL/gRPC defense |
-| **WAL-First Ledger** | Crash-safe audit log with NATS distribution | fsync before action; AtomicU64 sequence for NATS ordering |
-| **Encrypted Vault** | AES-256-GCM key-value store for agent state | `zeroize` on drop; sanitized error messages; WAL-integrated writes |
-| **Proxy Pipeline** | Central enforcement point with backpressure | CatchPanicLayer + 1MB body limit + 1024 connection limit |
-| **Python SDK** | Zero-friction agent interface | `@ic()` decorator; transparent header injection; causal tracing |
+| Demo | What it shows | API key needed? |
+|------|--------------|----------------|
+| `python -m gvm.mock_demo` | Mock LLM + real proxy enforcement | No |
+| `python -m gvm.unified_demo` | Scripted 4-step finance agent | No |
+| `python -m gvm.hostile_demo` | Adversarial security tests | No |
+| `python -m gvm.llm_demo` | Claude autonomous agent | Yes (`ANTHROPIC_API_KEY`) |
+| `python -m gvm.langchain_demo` | LangChain + Gmail integration | Yes |
+| `python -m gvm.rollback_demo` | Checkpoint/rollback + token savings | Yes |
+
+All demos require the proxy (`cargo run`). The mock demo uses pre-scripted LLM decisions — same governance pipeline, no API key.
 
 ---
 
-## Quick Start
-
-### Prerequisites
-
-- Rust 1.75+ (for building from source)
-- Python 3.9+ (only if using the Python SDK or running demos)
-
-### Option A: Pre-built Binary (Fastest)
-
-```bash
-# Download pre-built binary
-curl -sSL https://github.com/skwuwu/Analemma-GVM/releases/latest/download/gvm-proxy-linux-x86_64 -o gvm-proxy
-chmod +x gvm-proxy && ./gvm-proxy
-```
-
-The proxy starts on `0.0.0.0:8080`. Governance is now active.
-
-### Option B: Build from Source (5 minutes after Rust build completes)
-
-```bash
-git clone https://github.com/skwuwu/Analemma-GVM.git
-cd Analemma-GVM
-cargo run               # First build: 2-3 minutes (one-time)
-                       # Subsequent runs: ~100ms
-```
-
-The proxy starts on `0.0.0.0:8080`. That's it — governance is now active.
-
-### 1. Route any agent through the proxy
-
-GVM is a **transparent HTTP proxy**. It works with any language, any framework, any agent — no SDK required. Just point your agent's HTTP traffic at the proxy:
-
-```bash
-# Any language, any framework — set the proxy and go
-HTTP_PROXY=http://localhost:8080 HTTPS_PROXY=http://localhost:8080 python my_agent.py
-HTTP_PROXY=http://localhost:8080 HTTPS_PROXY=http://localhost:8080 node my_agent.js
-HTTP_PROXY=http://localhost:8080 HTTPS_PROXY=http://localhost:8080 ./my_agent
-```
-
-Every outbound HTTP request your agent makes now passes through the GVM proxy. The proxy inspects the **actual URL, method, and payload** (Layer 2: Network SRR) and enforces rules — regardless of what framework the agent uses.
-
-```
- Your agent                GVM Proxy (localhost:8080)           External API
- ┌──────────┐    HTTP      ┌──────────────────────┐    HTTPS  ┌──────────┐
- │ Any code │────PROXY────>│ Layer 2: URL check   │──────────>│ Stripe   │
- │ Any lang │              │ Layer 3: Key inject  │           │ Slack    │
- │ Any fw   │              │ WAL audit log        │           │ Gmail    │
- └──────────┘              └──────────────────────┘           └──────────┘
-```
-
-**What the proxy does without the SDK:**
-
-| Layer | What it does | SDK needed? |
-|-------|-------------|-------------|
-| **Layer 2: Network SRR** | Inspects actual URL/method/payload. Blocks `POST api.bank.com/transfer`, delays unknown endpoints 300ms. | No |
-| **Layer 3: Capability Token** | Injects API keys by hostname. Agent never holds credentials. | No |
-| **WAL Audit** | Records every request with tamper-proof Merkle hash chain. | No |
-| **Rate Limiting** | Token-bucket rate limit per agent. | No |
-| **Layer 1: Semantic ABAC** | Evaluates operation name, resource type, agent role against hierarchical policies. | **Yes** (needs `X-GVM-*` headers) |
-
-Without the SDK, Layer 1 (ABAC) has no operation metadata to evaluate, so it defaults to **Default-to-Caution** (300ms delay). Layer 2 and Layer 3 work at full strength because they inspect the actual HTTP request, not agent-declared headers.
-
-### 2. (Optional) Use the Python SDK for richer governance
-
-The SDK is **not required** for enforcement — it's an enhancement. It adds Layer 1 (semantic ABAC policy) by injecting `X-GVM-*` headers that tell the proxy *what the agent thinks it's doing*. The proxy then cross-checks this against *what the agent is actually doing* (Layer 2).
-
-```bash
-pip install -e sdk/python
-```
-
-**What the SDK adds:**
-
-| Feature | Without SDK | With SDK |
-|---------|------------|----------|
-| URL-based blocking (SRR) | Full | Full |
-| API key injection (Layer 3) | Full | Full |
-| Audit trail | URL/method only | Operation name, agent ID, trace chain |
-| ABAC policy evaluation | Skipped (Default-to-Caution) | Full (per-agent, per-tenant, per-operation) |
-| Causal tracing | No parent-child linking | Automatic trace_id + parent_event_id |
-| Rate limiting | By source IP | By agent_id |
-| Operation classification | `"unknown"` | `"gvm.messaging.send"` etc. |
-| State checkpoint/rollback | None (full restart on deny) | Auto-checkpoint + Merkle-verified rollback |
-| Token savings on deny | 0% | ~42% per blocked action |
-
-**SDK agent example (10 lines):**
-
-```python
-from gvm import GVMAgent, ic, Resource
-
-class MyAgent(GVMAgent):
-    @ic(operation="gvm.messaging.send",
-        resource=Resource(service="slack", tier="customer-facing"))
-    def notify(self, channel: str, msg: str):
-        session = self.create_session()
-        return session.post(f"http://api.slack.com/post/{channel}",
-                           json={"text": msg}).json()
-
-agent = MyAgent(agent_id="my-agent", tenant_id="my-org")
-agent.notify("#alerts", "Deploy complete")
-# → Delayed 300ms by proxy, then forwarded. Audit trail recorded.
-```
-
-The `@ic()` decorator injects `X-GVM-Operation`, `X-GVM-Agent-Id`, and other headers. `GVMAgent.create_session()` returns a `requests.Session` pre-configured to route through the proxy. The proxy sees both the semantic header *and* the actual URL, and takes the stricter decision.
-
-**Without SDK — same protection, less metadata:**
-
-```python
-import requests
-
-# Just set the proxy — any HTTP library works
-session = requests.Session()
-session.proxies = {"http": "http://localhost:8080", "https": "http://localhost:8080"}
-
-# This request goes through the proxy. Layer 2 (SRR) inspects the URL.
-# If api.bank.com/transfer is in the deny list, it's blocked.
-session.post("http://api.bank.com/transfer/123", json={"amount": 50000})
-# → Denied by SRR. Agent never needed the SDK for this to work.
-```
-
-### 3. Run the demo
-
-```bash
-pip install -e sdk/python
-python -m gvm.unified_demo
-```
-
-One scenario demonstrates every core feature — IC classification, SRR network defense, semantic forgery detection, checkpoint/rollback, token savings, and WAL-first audit:
-
-```
-[Step 1] read_inbox()        → ✓ Allow     (IC-1, no checkpoint)
-[Step 2] send_summary()      → ⏱ Delay     (IC-2, checkpoint #0 saved)
-[Step 3] wire_transfer()     → ✗ BLOCKED   (Deny, SRR catches URL)
-         ↺ Rollback to checkpoint #0
-         Agent continues from safe state
-[Step 4] summarize_results() → ✓ Allow     (IC-1, agent resumes)
-
-Token savings: 670 tokens saved per blocked action (42% reduction)
-```
-
-Additional demos for specific scenarios:
-
-```bash
-python -m gvm.langchain_demo    # LangChain + Gmail (4-step enforcement)
-python -m gvm.hostile_demo      # Adversarial security tests
-python -m gvm.rollback_demo     # Checkpoint/rollback token analysis
-```
-
-### Industry templates
-
-```bash
-# Finance (strict: payments IC-3, transfers denied)
-GVM_CONFIG=config/templates/finance/proxy.toml cargo run
-
-# SaaS (balanced: reads IC-1, sends IC-2, exports IC-3)
-GVM_CONFIG=config/templates/saas/proxy.toml cargo run
-```
-
-### Dry-run policy check (no forwarding)
-
-```bash
-curl -X POST http://localhost:8080/gvm/check \
-  -H "Content-Type: application/json" \
-  -d '{"operation": "gvm.payment.transfer", "target_host": "api.bank.com", "target_path": "/transfer/123"}'
-# → {"decision": "Deny", "engine_ms": 0.1, "dry_run": true, ...}
-```
-
-### Agent isolation (Layer 3: OS Containment)
-
-GVM provides two OS-level isolation modes that restrict agents to communicate only through the proxy:
-
-```bash
-# Linux-native sandbox (recommended for production)
-# Uses namespaces (user, PID, mount, network), seccomp-BPF, and veth pair.
-# No Docker required. Analogous to Firecracker's MicroVM approach.
-# Requires Linux kernel support + CAP_NET_ADMIN + ip/iptables availability.
-gvm run --sandbox agent.py
-
-# Docker containment (dev/CI or non-Linux platforms)
-# Uses Docker network isolation, read-only filesystem, resource limits.
-# On Linux with localhost proxy, CLI uses host network mode for proxy reachability.
-gvm run --contained agent.py --image python:3.12-slim --memory 512m --cpus 1.0
-
-# Local mode (Layer 2 only — no OS isolation)
-gvm run agent.py
-```
-
-`gvm run` performs a proxy health check before launching the agent process:
-
-- If `--proxy` targets localhost and the proxy is down, CLI auto-starts `gvm-proxy` using `cargo run -p gvm-proxy` from the workspace root and waits up to 25 seconds.
-- If `--proxy` targets a non-local endpoint and health check fails, launch is rejected (fail-close) and the operator must start the proxy explicitly.
-
-**Sandbox runtime prerequisites (all required):**
-
-- Linux with unprivileged user namespaces enabled (`kernel.unprivileged_userns_clone=1`)
-- Effective `CAP_NET_ADMIN` for the `gvm run` process
-- `ip` and `iptables` commands available in `PATH`
-- `net.ipv4.ip_forward=1`
-- Interpreter runtime dependencies resolvable from the sandbox rootfs (for example, Python shared libraries)
-
-**Linux-native sandbox** is the primary deployment target:
-
-| Feature | `--sandbox` (Linux-native) | `--contained` (Docker) |
-|---------|---------------------------|----------------------|
-| Isolation | User/PID/mount/network namespaces | Docker container |
-| Syscall filter | seccomp-BPF (~45 allowed) | Docker default seccomp |
-| Network | veth pair, proxy-only routing | `gvm-internal` (default) or `host` mode on Linux when proxy target is localhost |
-| Filesystem | pivot_root, read-only workspace | `--read-only` mount |
-| Overhead | ~2ms setup, no daemon | Docker daemon required |
-| Platform | Linux only | Any Docker-supported OS |
-
-**Why not MicroVM?** The architecture is designed to be extensible to Firecracker-class MicroVM isolation (`--microvm` mode) for multi-tenant SaaS deployments where untrusted user code requires hardware-level (KVM) isolation. However, the current namespace+seccomp approach is sufficient for AI agent governance: agents are non-privileged interpreted processes (Python/Node), not arbitrary binaries capable of kernel exploits. MicroVM would add 50x setup latency (2ms → 100ms+) and 25x memory overhead (5MB → 128MB+) with no practical security gain for this threat model. See [Part 8: Memory & Runtime Security](docs/08-memory-security.md) for the full analysis.
-
-### LLM provider governance
-
-GVM inspects LLM API calls at the proxy level — no SDK changes needed:
-
-- **Model pinning**: Only approved models allowed (e.g., `gpt-4o`, `claude-sonnet-4-20250514`)
-- **Endpoint restriction**: Only authorized API paths (e.g., `chat/completions` only, not `fine-tuning`)
-- **Provider allowlist**: Unauthorized providers (Together AI, Groq, Mistral, etc.) blocked
-- **Thinking trace audit**: IC-2/IC-3 paths extract reasoning content from LLM responses into the WAL
-
-See [`config/srr_network.toml`](config/srr_network.toml) for the full rule set.
-
-### Checkpoint/Rollback (SDK Level 2)
-
-When using the SDK, agents get **automatic state checkpointing and rollback** on denied operations — the key value-add over proxy-only (Level 0) enforcement.
-
-**How it works:**
-
-1. `@ic` decorator infers IC level from operation name
-2. Before IC-2+ operations, agent state is checkpointed to Vault (AES-256-GCM encrypted, Merkle-verified)
-3. If the operation is denied, state is rolled back to the last approved checkpoint
-4. `GVMRollbackError` provides structured context for LLM agents to choose an alternative path
-
-```python
-from gvm import GVMAgent, ic, Resource
-
-class MyAgent(GVMAgent):
-    auto_checkpoint = "ic2+"  # Checkpoint before IC-2 and IC-3 operations
-
-    @ic(operation="gvm.payment.charge",
-        resource=Resource(service="bank", tier="external", sensitivity="critical"))
-    def wire_transfer(self, to: str, amount: float):
-        session = self.create_session()
-        return session.post("http://api.bank.com/transfer/123",
-                           json={"to": to, "amount": amount}).json()
-
-agent = MyAgent(agent_id="finance-001")
-try:
-    agent.wire_transfer("account-123", 50000.00)
-except GVMRollbackError as e:
-    print(f"Blocked: {e.operation}, rolled back to checkpoint #{e.rolled_back_to}")
-    # LLM agent receives structured error and chooses alternative action
-```
-
-**SDK vs No-SDK: Rollback behavior**
-
-| Scenario | Level 0 (No SDK) | Level 2 (SDK) |
-|----------|-----------------|---------------|
-| Operation denied | Error returned, no state recovery | State rolled back to last checkpoint |
-| LLM agent recovery | Must restart entire workflow from scratch | Resumes from checkpoint with full context |
-| Token cost on deny | Re-run all prior steps (~670 tokens) | Resume cost only (~60 tokens) |
-| State integrity | Manual reconstruction | Merkle-verified restoration |
-| Developer effort | None (proxy-only) | One decorator per method (`@ic`) |
-
-**Token savings demo:**
-
-```bash
-python -m gvm.unified_demo
-```
-
-Output:
-```
-Level 0 (no SDK):   1,580 tokens (run all steps + restart from scratch on deny)
-Level 2 (SDK):        910 tokens (run all steps + resume from checkpoint on deny)
-Saved: 670 tokens (42.4% reduction)
-```
-
-Savings are not a fixed percentage — they depend on where in the workflow the deny occurs. The later the deny, the more prior steps are skipped by resuming from a checkpoint instead of restarting. In this 4-step workflow with a deny at step 3, the saving is ~42%. A longer workflow with a later deny would save proportionally more.
-
-### Run tests
-
-```bash
-cargo test --workspace --all-targets   # 199 tests (2026-03-17, incl. 14 CLI proxy unit tests)
-```
+## Roadmap: Toward an Agentic OS
+
+| Phase | Scope | Status |
+|-------|-------|--------|
+| **v0.1 — Kernel** | 3-layer enforcement, WAL ledger, encrypted vault, Python SDK, CLI | Done |
+| **v0.1.1 — Hardening** | Linux-native sandbox, LLM provider governance, thinking trace audit | Done |
+| **v0.1.2 — Rollback** | Merkle-verified checkpoints, auto-rollback, token savings, `@ic` decorator | Done |
+| **v0.2 — Multi-Agent** | Agent identity (JWT), inter-agent governance, session isolation | Planned |
+| **v0.3 — Observability** | Prometheus metrics, enforcement dashboard, cost attribution | Planned |
+| **v0.4 — Multi-Framework** | TypeScript/Go SDK, LangChain/CrewAI/AutoGen adapters | Planned |
+| **v1.0 — Agentic OS** | Agent scheduling, resource quotas, capability-based permissions, multi-tenant SaaS | Planned |
+
+The goal is not to build another agent framework. The goal is to build the **operating system layer** that makes every agent framework safe to deploy in production.
+
+> Full roadmap with implementation details: [Roadmap →](docs/13-roadmap.md)
 
 ---
 
 ## Documentation
 
-The full technical whitepaper is in [`docs/`](docs/):
-
 | Part | Title |
 |------|-------|
-| [0](docs/00-overview.md) | Architecture Overview |
+| [0](docs/00-overview.md) | Architecture Overview & Why HTTP Proxy |
 | [1](docs/01-operations.md) | Operation Namespace & Registry |
 | [2](docs/02-policy.md) | ABAC Policy Engine |
 | [3](docs/03-srr.md) | Network SRR Engine |
@@ -470,69 +250,9 @@ The full technical whitepaper is in [`docs/`](docs/):
 | [6](docs/06-proxy.md) | Proxy Pipeline |
 | [7](docs/07-sdk.md) | Python SDK |
 | [8](docs/08-memory-security.md) | Memory & Runtime Security Report |
-| [9](docs/09-test-report.md) | Test Coverage Report |
+| [9](docs/09-test-report.md) | Test Coverage Report (199 tests, 0 failures) |
 | [11](docs/11-competitive-analysis.md) | Competitive Analysis: GVM vs OPA+Envoy |
-
----
-
-## Test Coverage
-
-199 tests across core unit, integration, boundary, edge-case, hostile, stress, CLI, and Merkle suites. Zero failures.
-
-| Category | Count | Notes |
-|----------|-------|-------|
-| Core unit (`src/lib.rs`) | 85 | SRR, Policy, Vault, Registry, Merkle, Wasm, LLM Trace, Proxy |
-| Integration (E2E) | 5 | Full workflow |
-| Boundary | 30 | Security boundaries |
-| Edge Cases | 17 | Unusual inputs |
-| Hostile Environment | 11 | Concurrency |
-| Stress | 12 | Scale |
-| Merkle Tree | 12 | Integrity proofs |
-| Engine (`gvm-engine`) | 7 | Policy engine |
-| CLI unit (`gvm-cli`) | 14 | Proxy URL detection, path generalization |
-| CLI integration | 3 | Command surface (`--help`, events, stats) |
-| **Total** | **199** | All passing |
-
-(Run `cargo test -p gvm-cli --test cli_integration -- --ignored` to include full end-to-end proxy auto-start test.)
-
----
-
-## Roadmap: Toward an Agentic OS
-
-Analemma-GVM is the kernel. The vision is an **Agentic Operating System** — a complete runtime layer for governed AI agents.
-
-| Phase | Scope | Status |
-|-------|-------|--------|
-| **v0.1 — Kernel** | 3-layer enforcement, WAL ledger, encrypted vault, Python SDK, LangChain demo, CLI | Done |
-| **v0.1.1 — Hardening** | Linux-native sandbox (namespace + seccomp), LLM provider governance, thinking trace audit, model pinning | Done |
-| **v0.1.2 — Rollback** | Merkle-verified state checkpoints, auto-rollback on deny, token savings quantification, `@ic` decorator SDK | Done |
-| **v0.2 — Multi-Agent** | Agent identity management, inter-agent communication governance, session isolation | Planned |
-| **v0.3 — Approval Workflows** | Human-in-the-loop approval UI, escalation chains, SLA-based auto-expiry | Planned |
-| **v0.4 — Observability** | Real-time enforcement dashboard, anomaly detection, cost attribution per agent | Planned |
-| **v0.5 — Multi-Framework** | LangChain / CrewAI / AutoGen adapters, language-agnostic SDK (gRPC) | Planned |
-| **v1.0 — Agentic OS** | Agent scheduling, resource quotas, capability-based permissions, multi-tenant SaaS | Planned |
-
-The goal is not to build another agent framework. The goal is to build the **operating system layer** that makes every agent framework safe to deploy in production.
-
-An OS doesn't tell applications what to do. It controls what they *can* do. It doesn't inspect the source code of every program — it enforces permissions at the syscall boundary. An application can *try* to delete `/etc/passwd`; the kernel says no.
-
-Analemma-GVM does the same for AI agents. The agent can *try* to wire-transfer $50,000; the kernel says no.
-
----
-
-## Known Limitations & Planned Hardening
-
-> What's implemented works. These are the edges we haven't polished yet.
-
-| Area | Current State | Planned Fix |
-|------|--------------|-------------|
-| **Numeric Precision** | Policy numeric comparisons use `f64`. In financial domains, floating-point rounding could cause boundary-case policy bypass (e.g., `500.000000000001 > 500`). | Decimal-based comparison for currency fields, or integer-cent normalization at the SDK layer. |
-| **WAL Recovery Memory** | `recover_from_wal()` loads the entire WAL file into memory via `read_to_string()`. Large WAL files (GB+) risk OOM on recovery. | Streaming recovery with `BufReader` + line-by-line parsing. |
-| **WAL Rotation** | Single WAL file grows unbounded. No automatic rotation or compaction. | Size-based rotation with Merkle chain linking across segments. |
-| **WAL Sequence Persistence** | `wal_sequence` resets to 0 on proxy restart. Duplicate sequence numbers across restarts. | Initialize from last WAL event count during recovery (acknowledged TODO). |
-| **Vault Key** | Falls back to ephemeral random key if `GVM_VAULT_KEY` is not set. Safe for development, but encrypted state is lost on restart. | Require explicit key in production mode (`GVM_ENV=production`). Error on missing key instead of fallback. |
-| **Checkpoint Failure Mode** | Checkpoint save failures are logged as warnings but do not block execution. | Configurable strict mode: fail the operation if checkpoint cannot be saved. |
-| **Rate Limiter Eviction** | Bucket overflow (>10K agents) triggers 25% bulk eviction. | LRU-based eviction with per-tenant isolation. |
+| [12](docs/12-security-model.md) | Security Model & Known Attack Surface |
 
 ---
 
@@ -545,25 +265,32 @@ Analemma-GVM does the same for AI agents. The agent can *try* to wire-transfer $
 | **Forgery Detection** | Single layer (URL) | Cross-layer (semantic + network + capability) |
 | **On Deny** | Agent waits for policy change | Auto-rollback to checkpoint |
 | **Audit Integrity** | Audit trail | Merkle-verified hash chain |
-| **Enforcement Tiers** | Binary | IC-1/2/3 (reversibility classification) |
 | **Deployment** | Kubernetes | Single Rust binary |
-| **Setup** | Docker Desktop + K3s | Cargo run or pre-built binary |
-| **Status** | Production (v1+) | Alpha (v0.1) |
+| **Status** | Alpha | Alpha (v0.1) |
 
-**Complementary, not competitive:**  
-GVM is not a replacement for OpenShell. OpenShell provides sandboxed execution environments. GVM provides governance logic and semantic enforcement. They can work together — GVM can run *inside* an OpenShell sandbox for layered defense, or as a standalone enforcement point. Choose based on your isolation posture:
+**Complementary, not competitive.** GVM can run *inside* an OpenShell sandbox for layered defense, or standalone. [Full analysis →](docs/11-competitive-analysis.md)
 
-- **OpenShell**: You need strong process isolation (untrusted user code, shared hardware)
-- **GVM**: You need policy-driven enforcement (trusted processes, graduated responses, checkpoint rollback)
-- **Both**: You need defense-in-depth (OpenShell sandbox + GVM governance inside)
+---
+
+## Known Limitations
+
+> What's implemented works. These are the edges we haven't polished yet.
+
+| Area | Current State | Planned Fix |
+|------|--------------|-------------|
+| **Numeric Precision** | Policy comparisons use `f64` (boundary-case rounding risk in financial domains) | Decimal-based comparison |
+| **WAL Recovery** | Loads entire WAL into memory (OOM risk on GB+ files) | Streaming `BufReader` recovery |
+| **WAL Rotation** | Single file, no rotation | Size-based rotation with Merkle chain linking |
+| **WAL Sequence** | Resets to 0 on restart | Initialize from last WAL event count |
+| **Vault Key** | Ephemeral random key if `GVM_VAULT_KEY` not set (state lost on restart) | Require explicit key in production |
+
+> Full security model and known attack surface: [Security Model →](docs/12-security-model.md)
 
 ---
 
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
-
-You may use, modify, and distribute this software under the terms of the Apache 2.0 license. See the [LICENSE](LICENSE) file for the full text.
 
 ---
 

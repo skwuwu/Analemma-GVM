@@ -258,12 +258,6 @@
 - [ ] Firecracker isolation backend
 - [ ] SOC 2 / ISO 27001 audit report generation
 
-### Advanced Rollback
-
-- [ ] Saga Coordinator (IC-2 compensation actions)
-- [ ] Operation-specific rollback strategies
-- [ ] Cross-agent causal quarantine
-
 ---
 
 ## Non-Issues (Assessed and Closed)
