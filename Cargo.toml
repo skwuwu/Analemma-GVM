@@ -44,6 +44,7 @@ gvm-engine = { path = "crates/gvm-engine" }
 [dev-dependencies]
 tempfile = "3"
 criterion = { version = "0.5", features = ["async_tokio"] }
+proptest = "1"
 
 [[bench]]
 name = "pipeline"

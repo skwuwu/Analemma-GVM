@@ -2,7 +2,7 @@
 Analemma-GVM-architecture-*
 
 # Rust
-/target/
+**/target/
 **/*.rs.bk
 # Cargo.lock is tracked for reproducible builds (binary project)
 
@@ -31,6 +31,10 @@ __pycache__/
 *.dll
 *.so
 *.dylib
+
+# Fuzz
+fuzz/corpus/
+fuzz/artifacts/
 
 # Runtime data
 data/wal.log

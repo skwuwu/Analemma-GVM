@@ -7,6 +7,64 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
+// ─── Emergency WAL (Fallback Storage) ───
+
+/// Fallback local file for emergency audit logging when the primary WAL fails.
+///
+/// When the primary WAL (group commit + Merkle) encounters I/O errors,
+/// the Ledger falls back to this simple append-only file to preserve
+/// a minimal audit trail. This ensures IC-2 requests can still be
+/// processed (with degraded integrity guarantees) rather than returning
+/// 500 errors during transient disk issues.
+///
+/// Limitations vs primary WAL:
+/// - No Merkle tree integrity (no batch records)
+/// - No group commit batching (single event per write)
+/// - No fsync guarantee (best-effort durability)
+/// - Events written here must be reconciled with the primary WAL on recovery
+///
+/// Thread safety: Uses a persistent file handle behind tokio::sync::Mutex
+/// to prevent concurrent file open/close races (critical on Windows where
+/// append-mode concurrent opens can cause lost writes).
+struct EmergencyWAL {
+    file: tokio::sync::Mutex<tokio::fs::File>,
+}
+
+impl EmergencyWAL {
+    async fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await?;
+        tracing::info!(path = %path.display(), "Emergency WAL initialized");
+        Ok(Self {
+            file: tokio::sync::Mutex::new(file),
+        })
+    }
+
+    /// Best-effort append: serialize event as JSON line, write to persistent handle.
+    /// Mutex ensures serialized writes — no interleaving under concurrent load.
+    /// Returns Ok(()) on success, Err on I/O failure.
+    async fn append(&self, event: &GVMEvent) -> Result<()> {
+        let hash = compute_event_hash(event);
+        let mut stamped = event.clone();
+        stamped.event_hash = Some(hash);
+
+        let mut data = serde_json::to_vec(&stamped)?;
+        data.push(b'\n');
+
+        let mut file = self.file.lock().await;
+        file.write_all(&data).await?;
+        // Best-effort fsync — don't fail if sync fails
+        let _ = file.sync_data().await;
+        Ok(())
+    }
+}
+
 // ─── Group Commit Configuration ───
 
 /// Tuning knobs for WAL group commit batching.
@@ -271,6 +329,14 @@ async fn flush_batch_with_merkle(
 /// - Crash recovery: replay WAL, re-publish events missing from NATS
 pub struct Ledger {
     wal: WAL,
+    /// Emergency fallback WAL for when the primary WAL fails.
+    /// Provides degraded-but-auditable operation during disk issues.
+    emergency_wal: EmergencyWAL,
+    /// Tracks consecutive primary WAL failures for circuit breaker logic.
+    /// When this exceeds the threshold, the proxy should signal degraded mode.
+    primary_failures: AtomicU64,
+    /// Total events written to the emergency WAL (observable metric).
+    emergency_writes: AtomicU64,
     // NATS JetStream connection — stubbed for MVP, will be connected in production
     nats_url: String,
     stream_name: String,
@@ -299,6 +365,10 @@ impl Ledger {
     ) -> Result<Self> {
         let wal = WAL::open(wal_path, config).await?;
 
+        // Emergency WAL path: same directory, separate file
+        let emergency_path = wal_path.with_file_name("wal_emergency.log");
+        let emergency_wal = EmergencyWAL::open(&emergency_path).await?;
+
         // NATS connection will be established when available
         if !nats_url.is_empty() {
             tracing::info!(url = nats_url, stream = stream_name, "NATS configured (connection deferred)");
@@ -306,6 +376,9 @@ impl Ledger {
 
         Ok(Self {
             wal,
+            emergency_wal,
+            primary_failures: AtomicU64::new(0),
+            emergency_writes: AtomicU64::new(0),
             nats_url: nats_url.to_string(),
             stream_name: stream_name.to_string(),
             wal_sequence: AtomicU64::new(0),
@@ -313,13 +386,57 @@ impl Ledger {
     }
 
     /// IC-2/3 durable write: WAL append first, then async NATS publish.
-    /// If WAL write fails, the request must be rejected (Fail-Close).
+    ///
+    /// Fallback behavior:
+    /// - Primary WAL succeeds → normal path, reset failure counter
+    /// - Primary WAL fails → attempt emergency WAL → if emergency succeeds,
+    ///   return Ok (degraded mode) and increment failure counter
+    /// - Both fail → return Err (true Fail-Close, request must be rejected)
     pub async fn append_durable(&self, event: &GVMEvent) -> Result<()> {
         // 1. Assign monotonic WAL sequence (atomic, lock-free)
         let wal_seq = self.wal_sequence.fetch_add(1, Ordering::SeqCst);
 
         // 2. Local WAL append (group commit — batched fsync + Merkle)
-        self.wal.append(event).await?;
+        match self.wal.append(event).await {
+            Ok(()) => {
+                // Primary succeeded — reset failure counter
+                self.primary_failures.store(0, Ordering::Relaxed);
+            }
+            Err(primary_err) => {
+                // Primary WAL failed — attempt emergency fallback
+                let failures = self.primary_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::error!(
+                    error = %primary_err,
+                    consecutive_failures = failures,
+                    "Primary WAL write failed — falling back to emergency WAL"
+                );
+
+                match self.emergency_wal.append(event).await {
+                    Ok(()) => {
+                        let total = self.emergency_writes.fetch_add(1, Ordering::Relaxed) + 1;
+                        tracing::warn!(
+                            event_id = %event.event_id,
+                            emergency_total = total,
+                            "Event written to emergency WAL (degraded mode — no Merkle integrity)"
+                        );
+                        // Return Ok — request can proceed with degraded audit
+                    }
+                    Err(emergency_err) => {
+                        // Both WALs failed — true Fail-Close
+                        tracing::error!(
+                            primary_error = %primary_err,
+                            emergency_error = %emergency_err,
+                            "Both primary and emergency WAL failed — Fail-Close"
+                        );
+                        return Err(anyhow!(
+                            "All audit storage failed: primary={}, emergency={}",
+                            primary_err,
+                            emergency_err
+                        ));
+                    }
+                }
+            }
+        }
 
         // 3. Async NATS publish (background, non-blocking)
         // wal_seq is included so NATS consumers can reconstruct WAL order
@@ -343,6 +460,17 @@ impl Ledger {
         });
 
         Ok(())
+    }
+
+    /// Return the number of consecutive primary WAL failures.
+    /// Used by the circuit breaker to determine degraded state.
+    pub fn primary_failure_count(&self) -> u64 {
+        self.primary_failures.load(Ordering::Relaxed)
+    }
+
+    /// Return the total number of events written to the emergency WAL.
+    pub fn emergency_write_count(&self) -> u64 {
+        self.emergency_writes.load(Ordering::Relaxed)
     }
 
     /// IC-1 / Allow: async append with no durability guarantee.

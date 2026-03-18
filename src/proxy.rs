@@ -16,6 +16,15 @@ use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+// ─── Circuit Breaker Configuration ───
+
+/// Number of consecutive primary WAL failures before the circuit breaker opens.
+/// When open, IC-2/3 requests are rejected with 503 to prevent cascading failures.
+const CIRCUIT_BREAKER_THRESHOLD: u64 = 5;
+
+/// Retry-After header value (seconds) sent in 503 responses when the circuit breaker is open.
+const CIRCUIT_BREAKER_RETRY_SECS: u64 = 30;
+
 /// Shared application state passed to all handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -163,6 +172,50 @@ pub async fn proxy_handler(
                     ic_level: 2,
                 },
             );
+        }
+    }
+
+    // ── Step 3.5: Circuit Breaker — WAL health check ──
+    // If the primary WAL has too many consecutive failures, reject IC-2
+    // requests early with 503 + Retry-After to prevent cascading failures.
+    // IC-1 (Allow) is unaffected — it uses async append (loss tolerated).
+    // Deny and RequireApproval are NOT gated — they block the request
+    // regardless, so WAL durability is not required for safety.
+    let wal_failures = state.ledger.primary_failure_count();
+    if wal_failures >= CIRCUIT_BREAKER_THRESHOLD {
+        match &classification.decision {
+            EnforcementDecision::Delay { .. } => {
+                tracing::error!(
+                    consecutive_failures = wal_failures,
+                    "Circuit breaker OPEN — rejecting IC-2/3 request (WAL degraded)"
+                );
+                return governance_block_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    GovernanceBlockResponse {
+                        blocked: true,
+                        decision: "CircuitBreakerOpen".to_string(),
+                        event_id: String::new(),
+                        trace_id: gvm_headers
+                            .as_ref()
+                            .map(|h| h.trace_id.clone())
+                            .unwrap_or_default(),
+                        operation: gvm_headers
+                            .as_ref()
+                            .map(|h| h.operation.clone())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        reason: "Audit subsystem degraded — durable write unavailable".to_string(),
+                        mode: state.on_block.infrastructure_failure.clone(),
+                        next_action: "Retry after the audit subsystem recovers".to_string(),
+                        retry_after_secs: Some(CIRCUIT_BREAKER_RETRY_SECS),
+                        rollback_hint: None,
+                        matched_rule_id: None,
+                        ic_level: 0,
+                    },
+                );
+            }
+            _ => {
+                // IC-1 (Allow, AuditOnly, Throttle) — proceed despite WAL issues
+            }
         }
     }
 

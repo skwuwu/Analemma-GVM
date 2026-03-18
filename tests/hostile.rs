@@ -5,6 +5,9 @@
 //! 2. WAL integrity: tampered WAL entries handled gracefully on recovery
 //! 3. Rate limiter under pressure: no deadlock under concurrent load
 //! 4. Vault concurrent access: simultaneous read/write to same key
+//! 5. Property-based: max_strict determinism (proptest)
+//! 6. Bypass scenarios: HTTP case-smuggling, null bytes, unicode normalization
+//! 7. Emergency WAL fallback under primary failure
 
 use gvm_proxy::rate_limiter::RateLimiter;
 use gvm_proxy::srr::NetworkSRR;
@@ -539,14 +542,15 @@ fn srr_decision_time_is_roughly_constant() {
     );
 }
 
-// ─── Test 11: Group Commit Fail-Close — all in-flight callers receive Err ───
+// ─── Test 11: Group Commit Primary Fail — Emergency WAL Catches Events ───
 //
 // Uses Ledger::inject_write_error() to simulate I/O failure inside the batch task.
-// When injected, flush_batch is bypassed and all oneshot replies receive Err.
-// This verifies the Fail-Close guarantee: no request proceeds without a durable audit record.
+// When injected, flush_batch is bypassed. The emergency WAL should catch these events,
+// allowing requests to proceed in degraded mode rather than failing outright.
+// True Fail-Close only occurs when BOTH primary and emergency WALs fail.
 
 #[tokio::test]
-async fn group_commit_fail_close_all_callers_receive_error() {
+async fn group_commit_primary_fail_emergency_wal_catches() {
     use gvm_proxy::ledger::Ledger;
 
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
@@ -585,7 +589,7 @@ async fn group_commit_fail_close_all_callers_receive_error() {
     // Inject I/O error — simulates disk failure, permission denied, etc.
     ledger.inject_write_error(true);
 
-    // Launch 10 concurrent callers — ALL must receive Err (Fail-Close)
+    // Launch 10 concurrent callers — all should succeed via emergency WAL fallback
     let mut handles = Vec::new();
     for i in 0..10 {
         let ledger = ledger.clone();
@@ -617,18 +621,32 @@ async fn group_commit_fail_close_all_callers_receive_error() {
         }));
     }
 
-    let mut error_count = 0;
+    let mut ok_count = 0;
     for handle in handles {
-        let result = handle.await.expect("fail-close task must not panic");
-        if result.is_err() {
-            error_count += 1;
+        let result = handle.await.expect("emergency WAL fallback task must not panic");
+        if result.is_ok() {
+            ok_count += 1;
         }
     }
 
+    // Emergency WAL catches all events — degraded mode, not fail-close
     assert_eq!(
-        error_count, 10,
-        "Fail-Close: all 10 callers must receive Err, got {} errors",
-        error_count
+        ok_count, 10,
+        "Emergency WAL: all 10 callers must succeed via fallback, got {} ok",
+        ok_count
+    );
+
+    // Verify the primary failure counter tracks failures
+    assert!(
+        ledger.primary_failure_count() >= 10,
+        "Primary failure count should be >= 10, got {}",
+        ledger.primary_failure_count()
+    );
+
+    // Verify emergency WAL captured the events
+    assert_eq!(
+        ledger.emergency_write_count(), 10,
+        "Emergency write count must be 10"
     );
 
     // Disable error injection and verify recovery
@@ -656,6 +674,449 @@ async fn group_commit_fail_close_all_callers_receive_error() {
         llm_trace: None,
         default_caution: false,
     };
-    // After disabling error injection, writes should succeed again
-    ledger.append_durable(&event).await.expect("ledger must recover after error injection is disabled");
+    // After disabling error injection, writes should succeed via primary WAL again
+    ledger.append_durable(&event).await.expect("primary WAL must recover after error injection is disabled");
+}
+
+// ─── Test 12: Property-Based — max_strict is commutative, associative, idempotent ───
+
+mod proptest_max_strict {
+    use gvm_proxy::types::{max_strict, EnforcementDecision, ApprovalUrgency, AlertLevel};
+    use proptest::prelude::*;
+
+    /// Generate arbitrary EnforcementDecision values for property testing.
+    fn arb_decision() -> impl Strategy<Value = EnforcementDecision> {
+        prop_oneof![
+            Just(EnforcementDecision::Allow),
+            (1u64..=10000).prop_map(|ms| EnforcementDecision::Delay { milliseconds: ms }),
+            prop_oneof![
+                Just(ApprovalUrgency::Immediate),
+                Just(ApprovalUrgency::Standard),
+                Just(ApprovalUrgency::Low),
+            ]
+            .prop_map(|u| EnforcementDecision::RequireApproval { urgency: u }),
+            "[a-z]{1,20}".prop_map(|r| EnforcementDecision::Deny { reason: r }),
+            (1u64..=1000).prop_map(|m| EnforcementDecision::Throttle { max_per_minute: m }),
+            prop_oneof![
+                Just(AlertLevel::Info),
+                Just(AlertLevel::Warning),
+                Just(AlertLevel::Critical),
+            ]
+            .prop_map(|l| EnforcementDecision::AuditOnly { alert_level: l }),
+        ]
+    }
+
+    proptest! {
+        /// max_strict(a, b).strictness() == max(a.strictness(), b.strictness())
+        /// This is the core determinism guarantee: same inputs → same strictness level.
+        #[test]
+        fn max_strict_picks_highest_strictness(
+            a in arb_decision(),
+            b in arb_decision(),
+        ) {
+            let result = max_strict(a.clone(), b.clone());
+            let expected = std::cmp::max(a.strictness(), b.strictness());
+            prop_assert_eq!(
+                result.strictness(),
+                expected,
+                "max_strict({:?}, {:?}) = {:?}, strictness {} != expected {}",
+                a, b, result, result.strictness(), expected,
+            );
+        }
+
+        /// Commutativity at the strictness level:
+        /// max_strict(a, b).strictness() == max_strict(b, a).strictness()
+        #[test]
+        fn max_strict_commutative_strictness(
+            a in arb_decision(),
+            b in arb_decision(),
+        ) {
+            let ab = max_strict(a.clone(), b.clone());
+            let ba = max_strict(b, a);
+            prop_assert_eq!(
+                ab.strictness(),
+                ba.strictness(),
+                "Commutativity violated: ab={:?}, ba={:?}",
+                ab, ba,
+            );
+        }
+
+        /// Associativity at the strictness level:
+        /// max_strict(max_strict(a, b), c).strictness() == max_strict(a, max_strict(b, c)).strictness()
+        #[test]
+        fn max_strict_associative_strictness(
+            a in arb_decision(),
+            b in arb_decision(),
+            c in arb_decision(),
+        ) {
+            let left = max_strict(max_strict(a.clone(), b.clone()), c.clone());
+            let right = max_strict(a, max_strict(b, c));
+            prop_assert_eq!(
+                left.strictness(),
+                right.strictness(),
+                "Associativity violated: left={:?}, right={:?}",
+                left, right,
+            );
+        }
+
+        /// Idempotence: max_strict(a, a).strictness() == a.strictness()
+        #[test]
+        fn max_strict_idempotent(a in arb_decision()) {
+            let result = max_strict(a.clone(), a.clone());
+            prop_assert_eq!(
+                result.strictness(),
+                a.strictness(),
+                "Idempotence violated: max_strict(a, a)={:?}, a={:?}",
+                result, a,
+            );
+        }
+
+        /// Deny is the absorbing element: max_strict(x, Deny) is always Deny
+        #[test]
+        fn max_strict_deny_absorbs(a in arb_decision()) {
+            let deny = EnforcementDecision::Deny { reason: "test".to_string() };
+            let result = max_strict(a, deny);
+            prop_assert!(
+                matches!(result, EnforcementDecision::Deny { .. }),
+                "Deny must absorb any decision, got {:?}",
+                result,
+            );
+        }
+    }
+}
+
+// ─── Test 13: HTTP Case-Smuggling Bypass Attempt ───
+//
+// Attacker tries to bypass SRR rules by varying HTTP method/host/path casing.
+// SRR must match case-insensitively for method and host, or the rule must
+// catch all case variants.
+
+#[test]
+fn srr_case_smuggling_host_variations() {
+    let srr = srr_from_toml(
+        r#"
+        [[rules]]
+        method = "POST"
+        pattern = "api.bank.com/transfer/{any}"
+        decision = { type = "Deny", reason = "Wire transfer blocked" }
+
+        [[rules]]
+        method = "*"
+        pattern = "{any}"
+        decision = { type = "Delay", milliseconds = 300 }
+    "#,
+    );
+
+    // Attacker varies method and host casing to try to bypass the rule.
+    // SRR normalizes method to uppercase and host to lowercase before matching,
+    // so all these variants MUST be denied.
+    let bypass_attempts = vec![
+        ("POST", "API.BANK.COM", "/transfer/123"),
+        ("POST", "Api.Bank.Com", "/transfer/123"),
+        ("POST", "api.BANK.com", "/transfer/123"),
+        ("post", "api.bank.com", "/transfer/123"),
+        ("Post", "api.bank.com", "/transfer/123"),
+    ];
+
+    for (method, host, path) in &bypass_attempts {
+        let result = srr.check(method, host, path, None);
+        assert!(
+            matches!(result.decision, EnforcementDecision::Deny { .. }),
+            "Case-smuggling bypass ({} {} {}) must be denied, got {:?}",
+            method, host, path, result.decision,
+        );
+    }
+
+    // Path casing: SRR does NOT normalize path case (paths are case-sensitive
+    // in URLs per RFC 3986). These fall through to catch-all Delay, not Allow.
+    let path_case_results = vec![
+        srr.check("POST", "api.bank.com", "/Transfer/123", None),
+        srr.check("POST", "api.bank.com", "/TRANSFER/123", None),
+    ];
+    for result in &path_case_results {
+        assert!(
+            result.decision.strictness() >= EnforcementDecision::Delay { milliseconds: 0 }.strictness(),
+            "Path case variant must not bypass to Allow, got {:?}",
+            result.decision,
+        );
+    }
+}
+
+// ─── Test 14: Null Byte Injection ───
+//
+// Attacker injects null bytes to truncate path matching in C-style string processing.
+// Rust's String is not null-terminated, so this should not cause truncation,
+// but the test proves it.
+
+#[test]
+fn srr_null_byte_injection_does_not_truncate() {
+    let srr = srr_from_toml(
+        r#"
+        [[rules]]
+        method = "POST"
+        pattern = "api.bank.com/transfer/{any}"
+        decision = { type = "Deny", reason = "Wire transfer blocked" }
+
+        [[rules]]
+        method = "DELETE"
+        pattern = "api.bank.com/{any}"
+        decision = { type = "Deny", reason = "Delete blocked" }
+
+        [[rules]]
+        method = "*"
+        pattern = "{any}"
+        decision = { type = "Delay", milliseconds = 300 }
+    "#,
+    );
+
+    // Null byte before the dangerous path segment
+    let result = srr.check("POST", "api.bank.com", "/transfer/\0bypass", None);
+    // Must not panic. Deny or Delay is acceptable — must not Allow.
+    assert!(
+        result.decision.strictness() >= EnforcementDecision::Delay { milliseconds: 0 }.strictness(),
+        "Null byte must not cause Allow bypass, got {:?}",
+        result.decision
+    );
+
+    // Null byte in host
+    let result = srr.check("POST", "api.bank.com\0evil.com", "/transfer/123", None);
+    assert!(
+        result.decision.strictness() >= EnforcementDecision::Delay { milliseconds: 0 }.strictness(),
+        "Null byte in host must not cause Allow bypass, got {:?}",
+        result.decision
+    );
+
+    // Null byte as path traversal disguise
+    let result = srr.check("DELETE", "api.bank.com", "/\0/users/42", None);
+    assert!(
+        result.decision.strictness() >= EnforcementDecision::Delay { milliseconds: 0 }.strictness(),
+        "Null byte in path must not cause Allow bypass, got {:?}",
+        result.decision
+    );
+}
+
+// ─── Test 15: Unicode Normalization Bypass ───
+//
+// Attacker uses Unicode confusables or normalization forms (NFC/NFD/NFKC/NFKD)
+// to bypass pattern matching. For example, using fullwidth characters or
+// combining marks that normalize to ASCII equivalents.
+
+#[test]
+fn srr_unicode_normalization_bypass_attempt() {
+    let srr = srr_from_toml(
+        r#"
+        [[rules]]
+        method = "POST"
+        pattern = "api.bank.com/transfer/{any}"
+        decision = { type = "Deny", reason = "Wire transfer blocked" }
+
+        [[rules]]
+        method = "*"
+        pattern = "{any}"
+        decision = { type = "Delay", milliseconds = 300 }
+    "#,
+    );
+
+    // Fullwidth characters: ／ (U+FF0F) instead of / (U+002F)
+    let result = srr.check("POST", "api.bank.com", "/transfer\u{FF0F}123", None);
+    // Must not panic. This should NOT match the rule (different bytes).
+    // Catch-all Delay is the safe fallback.
+    let _s = result.decision.strictness();
+
+    // Combining dot below on 'a' in "api": a̤pi.bank.com
+    let result = srr.check("POST", "a\u{0324}pi.bank.com", "/transfer/123", None);
+    let _s = result.decision.strictness();
+
+    // Right-to-left override (U+202E) — could visually disguise URLs
+    let result = srr.check("POST", "\u{202E}moc.knab.ipa", "/transfer/123", None);
+    let _s = result.decision.strictness();
+
+    // Homoglyph: Cyrillic 'а' (U+0430) instead of Latin 'a' (U+0061)
+    let result = srr.check("POST", "\u{0430}pi.bank.com", "/transfer/123", None);
+    // This is a different hostname, so the bank rule should NOT match.
+    // Must fall through to catch-all (Delay), not be accidentally allowed.
+    assert!(
+        result.decision.strictness() >= EnforcementDecision::Delay { milliseconds: 0 }.strictness(),
+        "Homoglyph host must not bypass to Allow, got {:?}",
+        result.decision
+    );
+
+    // Percent-encoded path: /transfer/%31%32%33 instead of /transfer/123
+    let result = srr.check("POST", "api.bank.com", "/transfer/%31%32%33", None);
+    let _s = result.decision.strictness();
+}
+
+// ─── Test 16: Path Traversal Bypass Attempt ───
+
+#[test]
+fn srr_path_traversal_does_not_bypass() {
+    let srr = srr_from_toml(
+        r#"
+        [[rules]]
+        method = "POST"
+        pattern = "api.bank.com/transfer/{any}"
+        decision = { type = "Deny", reason = "Wire transfer blocked" }
+
+        [[rules]]
+        method = "*"
+        pattern = "{any}"
+        decision = { type = "Delay", milliseconds = 300 }
+    "#,
+    );
+
+    // Path traversal attempts
+    let traversal_paths = vec![
+        "/transfer/../transfer/123",
+        "/./transfer/123",
+        "/transfer/./123",
+        "/../../../transfer/123",
+        "/transfer/123/../../transfer/456",
+        "/transfer%2F123",           // encoded slash
+        "/transfer/123%00.txt",      // null byte + extension
+    ];
+
+    for path in &traversal_paths {
+        let result = srr.check("POST", "api.bank.com", path, None);
+        // Must not panic. Must not return Allow (fail-open).
+        assert!(
+            result.decision.strictness() >= EnforcementDecision::Delay { milliseconds: 0 }.strictness(),
+            "Path traversal '{}' must not bypass to Allow, got {:?}",
+            path, result.decision
+        );
+    }
+}
+
+// ─── Test 17: Emergency WAL Fallback — Primary Fails, Emergency Catches ───
+
+#[tokio::test]
+async fn emergency_wal_catches_events_when_primary_fails() {
+    use gvm_proxy::ledger::Ledger;
+
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
+    let wal_path = dir.path().join("wal.log");
+
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("ledger must initialize for emergency WAL test"),
+    );
+
+    // Inject primary WAL failure
+    ledger.inject_write_error(true);
+
+    // Write events — should succeed via emergency WAL fallback
+    for i in 0..5 {
+        let event = gvm_proxy::types::GVMEvent {
+            event_id: format!("emergency-{}", i),
+            trace_id: format!("trace-emergency-{}", i),
+            parent_event_id: None,
+            agent_id: "test-agent".to_string(),
+            tenant_id: None,
+            session_id: "session".to_string(),
+            timestamp: chrono::Utc::now(),
+            operation: "gvm.storage.write".to_string(),
+            resource: Default::default(),
+            context: Default::default(),
+            transport: None,
+            decision: "Delay".to_string(),
+            decision_source: "test".to_string(),
+            matched_rule_id: None,
+            enforcement_point: "test".to_string(),
+            status: gvm_proxy::types::EventStatus::Pending,
+            payload: Default::default(),
+            nats_sequence: None,
+            event_hash: None,
+            llm_trace: None,
+            default_caution: false,
+        };
+        // With emergency WAL, this should succeed even though primary is broken
+        ledger
+            .append_durable(&event)
+            .await
+            .expect("append must succeed via emergency WAL when primary fails");
+    }
+
+    // Verify metrics
+    assert!(
+        ledger.primary_failure_count() >= 5,
+        "Primary failure count should be at least 5, got {}",
+        ledger.primary_failure_count()
+    );
+    assert_eq!(
+        ledger.emergency_write_count(),
+        5,
+        "Emergency write count must be 5"
+    );
+
+    // Verify emergency WAL file contains the events
+    let emergency_path = dir.path().join("wal_emergency.log");
+    let content = tokio::fs::read_to_string(&emergency_path)
+        .await
+        .expect("emergency WAL file must be readable");
+    let event_lines: Vec<&str> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    assert_eq!(
+        event_lines.len(),
+        5,
+        "Emergency WAL should contain 5 events, got {}",
+        event_lines.len()
+    );
+
+    // Verify each event roundtrips to a valid GVMEvent (not just generic JSON)
+    for (i, line) in event_lines.iter().enumerate() {
+        let event: gvm_proxy::types::GVMEvent =
+            serde_json::from_str(line).expect("emergency WAL event must deserialize to GVMEvent");
+        assert_eq!(
+            event.event_id,
+            format!("emergency-{}", i),
+            "Emergency WAL event_id must match original"
+        );
+        assert_eq!(
+            event.operation, "gvm.storage.write",
+            "Emergency WAL operation must be preserved"
+        );
+        assert!(
+            event.event_hash.is_some(),
+            "Emergency WAL event must have event_hash"
+        );
+    }
+
+    // Disable error injection — primary WAL should recover
+    ledger.inject_write_error(false);
+    let event = gvm_proxy::types::GVMEvent {
+        event_id: "recovery-after-emergency".to_string(),
+        trace_id: "trace-recovery".to_string(),
+        parent_event_id: None,
+        agent_id: "test-agent".to_string(),
+        tenant_id: None,
+        session_id: "session".to_string(),
+        timestamp: chrono::Utc::now(),
+        operation: "gvm.storage.read".to_string(),
+        resource: Default::default(),
+        context: Default::default(),
+        transport: None,
+        decision: "Allow".to_string(),
+        decision_source: "test".to_string(),
+        matched_rule_id: None,
+        enforcement_point: "test".to_string(),
+        status: gvm_proxy::types::EventStatus::Confirmed,
+        payload: Default::default(),
+        nats_sequence: None,
+        event_hash: None,
+        llm_trace: None,
+        default_caution: false,
+    };
+    ledger
+        .append_durable(&event)
+        .await
+        .expect("primary WAL must recover after error injection disabled");
+
+    // Failure counter should reset to 0 after successful primary write
+    assert_eq!(
+        ledger.primary_failure_count(),
+        0,
+        "Failure counter must reset after successful primary write"
+    );
 }

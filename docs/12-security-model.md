@@ -1,6 +1,6 @@
 # Security Model & Known Attack Surface
 
-> **Last updated**: 2026-03-17
+> **Last updated**: 2026-03-18
 
 ## Purpose
 
@@ -205,7 +205,23 @@ Both paths pre-compile regex at config load time (fail-fast on invalid patterns)
 
 ---
 
-### 13. WAL Single File / No Rotation
+### 13. WAL Single Point of Failure (Mitigated)
+
+**Issue**: Prior to v0.2.1, a primary WAL I/O failure caused all IC-2/3 requests to return 500 (Fail-Close). While correct from a safety perspective, this meant a single disk hiccup could halt all agent operations.
+
+**Mitigation (v0.2.1)**: Emergency WAL fallback + Circuit Breaker.
+
+- **Emergency WAL** (`ledger.rs`): When the primary WAL (group commit + Merkle) fails, the Ledger automatically falls back to a secondary append-only log file (`wal_emergency.log`). This provides a degraded-but-auditable mode — events are still recorded, but without Merkle integrity guarantees. Only if both primary and emergency WALs fail does the true Fail-Close activate.
+
+- **Circuit Breaker** (`proxy.rs`): After 5 consecutive primary WAL failures, the proxy returns `503 Service Unavailable` with `Retry-After: 30s` for IC-2/3 requests. IC-1 (Allow) requests continue unaffected. This prevents cascading failures and gives the primary WAL time to recover.
+
+- **Observability**: `Ledger::primary_failure_count()` and `Ledger::emergency_write_count()` expose metrics for monitoring. The circuit breaker decision is logged and included in the response as `CircuitBreakerOpen`.
+
+**Remaining gap**: Emergency WAL events must be reconciled with the primary WAL on recovery. This reconciliation is not yet automated — operator must review `wal_emergency.log` after a primary WAL outage.
+
+---
+
+### 14. WAL Single File / No Rotation
 
 **Issue**: All events are appended to a single WAL file with no rotation or compaction. The file grows unbounded over time, increasing recovery time and disk usage.
 
@@ -213,7 +229,7 @@ Both paths pre-compile regex at config load time (fail-fast on invalid patterns)
 
 ---
 
-### 14. WAL Sequence Number Persistence
+### 15. WAL Sequence Number Persistence
 
 **Issue**: `wal_sequence` is initialized to `AtomicU64::new(0)` on every proxy restart. This creates duplicate sequence numbers across restarts, which could confuse NATS consumers.
 
@@ -383,6 +399,28 @@ For Kubernetes or multi-tenant environments, additionally apply:
 - **Service mesh**: Istio/Linkerd sidecar for transparent authentication
 
 Without network-level isolation, any process on the same network can send requests with arbitrary `X-GVM-Agent-Id` headers, bypassing agent identity checks.
+
+---
+
+## Adversarial Test Coverage (v0.2.1)
+
+21 tests in `tests/hostile.rs` covering:
+
+| Category | Tests | What They Prove |
+|----------|-------|----------------|
+| Concurrency stress | 3 | SRR, rate limiter, vault under 50-500 concurrent tasks |
+| WAL integrity | 3 | Tampered entries, group commit fail-close, emergency WAL fallback |
+| Policy determinism | 5 (proptest) | `max_strict` commutativity, associativity, idempotence, Deny absorption |
+| Bypass scenarios | 4 | HTTP case-smuggling, null bytes, unicode normalization, path traversal |
+| Side-channel | 1 | SRR timing variance < 10x between match/no-match |
+| Forgery | 1 | Header forgery defeated by SRR URL-based enforcement |
+| Garbage input | 1 | No panics on arbitrary method/host/path/body combinations |
+| Secret zeroing | 1 | VaultEncryption key zeroed on drop |
+| Backpressure | 1 | 500 concurrent WAL appends complete bounded |
+
+Fuzz targets (`fuzz/fuzz_targets/`):
+- `fuzz_srr`: Arbitrary method/host/path/body into SRR pattern matching
+- `fuzz_wal_parse`: Arbitrary bytes as WAL event JSON parsing
 
 ---
 

@@ -170,6 +170,12 @@ impl NetworkSRR {
         path: &str,
         body: Option<&[u8]>,
     ) -> SrrCheckResult {
+        // Normalize method: uppercase once here to match rule storage format.
+        // Rules are stored as uppercase (line 135). HTTP methods from hyper are
+        // already uppercase, but direct API callers may pass lowercase.
+        // Defense-in-depth: normalize here to prevent case-smuggling bypass.
+        let effective_method = method.to_uppercase();
+
         // Normalize host: resolve IPv6 variants to canonical form so SRR rules
         // written for "localhost" or "127.0.0.1" also catch IPv6 equivalents.
         let normalized = normalize_host(host);
@@ -184,8 +190,8 @@ impl NetworkSRR {
         let effective_path = canonical.as_deref().unwrap_or(path);
 
         for rule in &self.rules {
-            // Method match
-            if rule.method != method {
+            // Method match (both sides uppercase — case-insensitive comparison)
+            if rule.method != effective_method {
                 continue;
             }
 
