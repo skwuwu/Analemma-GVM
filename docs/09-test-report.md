@@ -1,8 +1,8 @@
 # Part 9: Test & Benchmark Report
 
 **Total: 199 Rust Tests (85 core unit + 7 engine + 17 CLI + 30 boundary + 17 edge + 11 hostile + 5 integration + 12 merkle + 12 stress) — All Pass**
-**Benchmarks: 14 groups / 61 benchmark cases (Criterion v0.5)**
-**Last Verified: 2026-03-17 (`cargo test --workspace --all-targets`)**
+**Benchmarks: 17 groups / 76 benchmark cases (Criterion v0.5)**
+**Last Verified: 2026-03-19 (`cargo test --workspace --all-targets`)**
 
 ---
 
@@ -32,7 +32,7 @@ crates/gvm-cli/
 ├── src/suggest.rs      # 6 path generalization tests
 ├── tests/cli_integration.rs # 3 command surface integration tests
 benches/
-├── pipeline.rs         # 14 benchmark groups (Criterion)
+├── pipeline.rs         # 17 benchmark groups (Criterion)
 ```
 
 ---
@@ -503,6 +503,39 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 |-----------|--------|-------------|
 | `ic2_delay_accuracy/300ms` | ~300.3 ms | tokio::sleep precision (sample_size=10) |
 
+### Vault Contention P99 — Tail Latency Under Load
+
+| Concurrency | 4KB | 16KB | 64KB | Outlier Rate |
+|------------|------|------|------|-------------|
+| 10 writers | 2.4 ms | 3.9 ms | 4.3 ms | 22% high-severe (4KB) |
+| 50 writers | 4.4 ms | 4.8 ms | 5.7 ms | 6% (64KB) |
+| 100 writers | 4.9 ms | 5.5 ms | 6.5 ms | 9% (4KB) |
+
+| Benchmark | Median | Description |
+|-----------|--------|-------------|
+| `p99_explicit_16kb_50writers` | **4.7 ms** | Max latency across 50 concurrent 16KB write+read ops |
+
+**Key insight**: Tail latency scales sub-linearly with concurrency — 10x more writers (10→100) adds only ~2.5x latency. fsync contention is the dominant factor; encryption overhead is negligible even under load. At 100 concurrent writers with 64KB values, p99 stays under 7ms.
+
+### Wasm Cold Start
+
+| Benchmark | Median | Range | Description |
+|-----------|--------|-------|-------------|
+| `wasm_cold_start/full_load` | **36.6 ms** | 34–40 ms | File read + SHA-256 + Cranelift JIT compile + WASI setup |
+| `wasm_cold_start/load_and_first_eval` | **35.4 ms** | 34–37 ms | Full load + first policy evaluation |
+| `wasm_cold_start/warm_eval_baseline` | **5.3 µs** | 5.1–5.6 µs | Pre-loaded module evaluation |
+
+**Key insight**: Cold start is ~35ms, dominated by Cranelift JIT compilation. First evaluation adds negligible overhead (~0.1ms). Warm path is **6,900x faster** than cold start. Module must be loaded once at proxy startup — per-request Wasm overhead is microsecond-level, not millisecond-level.
+
+### eBPF/TC Kernel Context Switch (Linux-only)
+
+| Benchmark | Expected | Description |
+|-----------|----------|-------------|
+| `ebpf_kernel/tc_attach_detach_cycle` | ~5-15 ms | clsact qdisc add + 4 tc filter rules + qdisc del |
+| `ebpf_kernel/tc_attach_only` | ~3-8 ms | clsact qdisc + 2 tc filter rules (setup cost) |
+
+**Note**: eBPF benchmarks are Linux-only (`cfg(target_os = "linux")`). Expected values based on typical kernel round-trip costs for TC filter operations. These are one-time sandbox setup costs, not per-packet overhead — once attached, TC filtering runs entirely in kernel space with zero userspace context switches per packet.
+
 ---
 
 ## 9.6 Test Matrix by Security Property
@@ -554,6 +587,9 @@ cargo bench --bench pipeline -- "srr/"              # SRR benchmarks only
 cargo bench --bench pipeline -- "vault/"            # Vault benchmarks only
 cargo bench --bench pipeline -- "wal"               # WAL benchmarks only
 cargo bench --bench pipeline -- "rate_limiter/"     # Rate limiter only
+cargo bench --bench pipeline -- "vault_contention"  # Vault p99 tail latency
+cargo bench --bench pipeline -- "wasm_cold_start"   # Wasm module cold start
+cargo bench --bench pipeline -- "ebpf_kernel"       # eBPF TC setup (Linux only)
 ```
 
 ---

@@ -22,7 +22,7 @@
 - [x] seccomp AF_NETLINK blocking (CAP_NET_ADMIN escape prevention)
 - [x] seccomp dual filter audit logging (Log + KillProcess stacking, kernel audit trail via `dmesg`/`ausearch`)
 - [x] seccomp violation detection in parent process (`WaitStatus::Signaled(SIGSYS)`)
-- [x] 218 Rust tests (core unit + integration + adversarial + boundary + stress + CLI unit & integration + engine + JWT auth + sandbox security), 61 benchmark cases across 14 groups, 0 failures
+- [x] 218 Rust tests (core unit + integration + adversarial + boundary + stress + CLI unit & integration + engine + JWT auth + sandbox security), 76 benchmark cases across 17 groups, 0 failures
 
 ### SDK (Complete)
 

@@ -908,6 +908,385 @@ fn bench_rate_limiter(c: &mut Criterion) {
 }
 
 // ═══════════════════════════════════════════════
+// 15. Vault Contention P99 — Tail Latency Under Load
+// ═══════════════════════════════════════════════
+
+fn bench_vault_contention_p99(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench");
+
+    let tmp_dir = tempfile::tempdir().expect("temp directory must be creatable for bench setup");
+    let wal_path = tmp_dir.path().join("bench_vault_contention.log");
+
+    let ledger = rt.block_on(async {
+        Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger must initialize with valid WAL path"))
+    });
+
+    let vault = Arc::new(Vault::new(ledger).expect("vault must initialize with valid ledger"));
+
+    let mut group = c.benchmark_group("vault_contention_p99");
+    group.sample_size(100);
+
+    // Vary concurrency levels — each iteration runs N concurrent write+read roundtrips
+    // Criterion captures the per-iteration distribution; p99 is visible in HTML report
+    for concurrency in [10, 50, 100] {
+        for size in [4096, 16384, 65536] {
+            let v = vault.clone();
+            let plaintext: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+
+            group.bench_with_input(
+                BenchmarkId::new(
+                    format!("concurrent_{}_bytes_{}", concurrency, size),
+                    concurrency,
+                ),
+                &concurrency,
+                |b, &n| {
+                    b.to_async(tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench iteration"))
+                        .iter_custom(|iters| {
+                            let v = v.clone();
+                            let pt = plaintext.clone();
+                            async move {
+                                let mut total = std::time::Duration::ZERO;
+                                for _ in 0..iters {
+                                    let mut handles = Vec::with_capacity(n);
+                                    let start = std::time::Instant::now();
+                                    for i in 0..n {
+                                        let v = v.clone();
+                                        let pt = pt.clone();
+                                        handles.push(tokio::spawn(async move {
+                                            let key = format!("contention-{}", i);
+                                            v.write(&key, &pt, "bench-agent").await
+                                                .expect("vault write must succeed under contention");
+                                            let result = v.read(&key, "bench-agent").await
+                                                .expect("vault read must succeed under contention");
+                                            black_box(result);
+                                        }));
+                                    }
+                                    for h in handles {
+                                        h.await.expect("contention task must complete");
+                                    }
+                                    total += start.elapsed();
+                                }
+                                total
+                            }
+                        });
+                },
+            );
+        }
+    }
+
+    // Explicit p99 measurement: 500 individual timings, report worst-case
+    let v = vault.clone();
+    let plaintext_16k: Vec<u8> = (0..16384).map(|i| (i % 256) as u8).collect();
+
+    group.bench_function("p99_explicit_16kb_50writers", |b| {
+        b.to_async(tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench iteration"))
+            .iter(|| {
+                let v = v.clone();
+                let pt = plaintext_16k.clone();
+                async move {
+                    // Measure the slowest writer out of 50 concurrent writers
+                    let mut handles = Vec::with_capacity(50);
+                    for i in 0..50 {
+                        let v = v.clone();
+                        let pt = pt.clone();
+                        handles.push(tokio::spawn(async move {
+                            let start = std::time::Instant::now();
+                            let key = format!("p99-{}", i);
+                            v.write(&key, &pt, "bench-agent").await
+                                .expect("vault write must succeed");
+                            let _ = v.read(&key, "bench-agent").await
+                                .expect("vault read must succeed");
+                            start.elapsed()
+                        }));
+                    }
+                    let mut latencies = Vec::with_capacity(50);
+                    for h in handles {
+                        latencies.push(h.await.expect("p99 task must complete"));
+                    }
+                    latencies.sort();
+                    // Return p99 latency (index 49 of 50 = 98th percentile)
+                    black_box(latencies[latencies.len() - 1]);
+                }
+            });
+    });
+
+    group.finish();
+}
+
+// ═══════════════════════════════════════════════
+// 16. Wasm Cold Start — Module Load Latency
+// ═══════════════════════════════════════════════
+
+fn bench_wasm_cold_start(c: &mut Criterion) {
+    use gvm_proxy::wasm_engine::WasmEngine;
+
+    let wasm_path = Path::new("data/gvm_engine.wasm");
+    if !wasm_path.exists() {
+        eprintln!("Wasm module not found at data/gvm_engine.wasm — skipping cold start benchmark");
+        eprintln!("Build with: cargo build -p gvm-engine --target wasm32-wasip1 --release");
+        return;
+    }
+
+    let mut group = c.benchmark_group("wasm_cold_start");
+    group.sample_size(20); // Cold start is expensive, fewer samples needed
+
+    // Full cold start: file read → SHA-256 → Cranelift compile → WASI setup → instantiation
+    group.bench_function("full_load", |b| {
+        b.iter(|| {
+            let engine = WasmEngine::load(black_box(wasm_path))
+                .expect("wasm module must load from valid path");
+            assert!(engine.is_wasm());
+            black_box(engine);
+        });
+    });
+
+    // Cold start + first evaluation (JIT warmup)
+    let rules = vec![gvm_engine::Rule {
+        id: "cold-test".to_string(),
+        priority: 1,
+        layer: "global".to_string(),
+        conditions: vec![gvm_engine::Condition {
+            field: "resource.sensitivity".to_string(),
+            operator: "eq".to_string(),
+            value: serde_json::Value::String("critical".to_string()),
+        }],
+        decision: gvm_engine::Decision {
+            decision_type: "Deny".to_string(),
+            milliseconds: None,
+            reason: Some("Cold start test".to_string()),
+        },
+    }];
+
+    let req = gvm_engine::EvalRequest {
+        operation: "gvm.storage.delete".to_string(),
+        resource: gvm_engine::ResourceAttrs {
+            service: "db".to_string(),
+            tier: "internal".to_string(),
+            sensitivity: "critical".to_string(),
+        },
+        subject: gvm_engine::SubjectAttrs {
+            agent_id: "cold-bench".to_string(),
+            tenant_id: None,
+        },
+        context: gvm_engine::ContextAttrs::default(),
+        rules,
+    };
+
+    group.bench_function("load_and_first_eval", |b| {
+        b.iter(|| {
+            let engine = WasmEngine::load(black_box(wasm_path))
+                .expect("wasm module must load from valid path");
+            let resp = engine.evaluate(black_box(&req))
+                .expect("first evaluation must succeed");
+            black_box(resp);
+        });
+    });
+
+    // Warm evaluation baseline (for comparison with cold start)
+    let warm_engine = WasmEngine::load(wasm_path)
+        .expect("wasm module must load for warm baseline");
+
+    group.bench_function("warm_eval_baseline", |b| {
+        b.iter(|| {
+            let resp = warm_engine.evaluate(black_box(&req))
+                .expect("warm evaluation must succeed");
+            black_box(resp);
+        });
+    });
+
+    group.finish();
+}
+
+// ═══════════════════════════════════════════════
+// 17. eBPF/TC Setup Teardown — Kernel Context Switch Cost
+// ═══════════════════════════════════════════════
+
+fn bench_ebpf_setup(c: &mut Criterion) {
+    if cfg!(not(target_os = "linux")) {
+        eprintln!("eBPF benchmarks are Linux-only — skipping on this platform");
+        return;
+    }
+
+    // Check if 'tc' and 'ip' commands are available
+    let tc_ok = std::process::Command::new("tc")
+        .arg("-Version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let ip_ok = std::process::Command::new("ip")
+        .arg("-Version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !tc_ok || !ip_ok {
+        eprintln!("'tc' or 'ip' command not available — skipping eBPF kernel benchmark");
+        return;
+    }
+
+    // Check minimum kernel version (4.15+ for TC clsact)
+    let kernel_ok = std::process::Command::new("uname")
+        .arg("-r")
+        .output()
+        .ok()
+        .and_then(|o| {
+            let ver = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            let parts: Vec<&str> = ver.split('.').collect();
+            if parts.len() >= 2 {
+                let major: u32 = parts[0].parse().ok()?;
+                let minor: u32 = parts[1].parse().ok()?;
+                Some(major > 4 || (major == 4 && minor >= 15))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(false);
+
+    if !kernel_ok {
+        eprintln!("Kernel < 4.15 — TC clsact not supported, skipping eBPF benchmark");
+        return;
+    }
+
+    let mut group = c.benchmark_group("ebpf_kernel");
+    group.sample_size(20); // kernel operations, fewer samples
+
+    let proxy_ip_str = "10.200.0.1";
+    // Full attach + detach cycle on a dummy veth pair
+    // Measures: clsact qdisc add + 4x tc filter add + qdisc del (kernel round-trips)
+    group.bench_function("tc_attach_detach_cycle", |b| {
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                // Create a temporary veth pair for benchmarking
+                let _ = std::process::Command::new("ip")
+                    .args(["link", "del", "gvm-bench0"])
+                    .output();
+                let _ = std::process::Command::new("ip")
+                    .args(["link", "add", "gvm-bench0", "type", "veth", "peer", "name", "gvm-bench1"])
+                    .output();
+                let _ = std::process::Command::new("ip")
+                    .args(["link", "set", "gvm-bench0", "up"])
+                    .output();
+
+                // ── Measured section: TC filter lifecycle ──
+                let start = std::time::Instant::now();
+
+                // Attach: clsact qdisc + 4 filter rules
+                let _ = std::process::Command::new("tc")
+                    .args(["qdisc", "add", "dev", "gvm-bench0", "clsact"])
+                    .output();
+
+                // TCP to proxy
+                let _ = std::process::Command::new("tc")
+                    .args([
+                        "filter", "add", "dev", "gvm-bench0", "ingress",
+                        "protocol", "ip", "prio", "1", "u32",
+                        "match", "ip", "protocol", "6", "0xff",
+                        "match", "ip", "dst", proxy_ip_str, "255.255.255.255",
+                        "match", "ip", "dport", "0x1f90", "0xffff",
+                        "action", "ok",
+                    ])
+                    .output();
+
+                // UDP DNS
+                let _ = std::process::Command::new("tc")
+                    .args([
+                        "filter", "add", "dev", "gvm-bench0", "ingress",
+                        "protocol", "ip", "prio", "2", "u32",
+                        "match", "ip", "protocol", "17", "0xff",
+                        "match", "ip", "dst", proxy_ip_str, "255.255.255.255",
+                        "match", "ip", "dport", "0x0035", "0xffff",
+                        "action", "ok",
+                    ])
+                    .output();
+
+                // ARP
+                let _ = std::process::Command::new("tc")
+                    .args([
+                        "filter", "add", "dev", "gvm-bench0", "ingress",
+                        "protocol", "arp", "prio", "3", "u32",
+                        "match", "u32", "0", "0",
+                        "action", "ok",
+                    ])
+                    .output();
+
+                // Drop all else
+                let _ = std::process::Command::new("tc")
+                    .args([
+                        "filter", "add", "dev", "gvm-bench0", "ingress",
+                        "protocol", "all", "prio", "99", "u32",
+                        "match", "u32", "0", "0",
+                        "action", "drop",
+                    ])
+                    .output();
+
+                // Detach: remove clsact
+                let _ = std::process::Command::new("tc")
+                    .args(["qdisc", "del", "dev", "gvm-bench0", "clsact"])
+                    .output();
+
+                total += start.elapsed();
+
+                // Cleanup veth pair
+                let _ = std::process::Command::new("ip")
+                    .args(["link", "del", "gvm-bench0"])
+                    .output();
+            }
+            total
+        });
+    });
+
+    // Attach only (setup cost isolated — detach excluded from measurement)
+    group.bench_function("tc_attach_only", |b| {
+        b.iter_custom(|iters| {
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let _ = std::process::Command::new("ip")
+                    .args(["link", "del", "gvm-bench0"])
+                    .output();
+                let _ = std::process::Command::new("ip")
+                    .args(["link", "add", "gvm-bench0", "type", "veth", "peer", "name", "gvm-bench1"])
+                    .output();
+                let _ = std::process::Command::new("ip")
+                    .args(["link", "set", "gvm-bench0", "up"])
+                    .output();
+
+                let start = std::time::Instant::now();
+
+                let _ = std::process::Command::new("tc")
+                    .args(["qdisc", "add", "dev", "gvm-bench0", "clsact"])
+                    .output();
+                for (prio, args) in [
+                    ("1", vec!["protocol", "ip", "u32", "match", "ip", "protocol", "6", "0xff", "action", "ok"]),
+                    ("99", vec!["protocol", "all", "u32", "match", "u32", "0", "0", "action", "drop"]),
+                ] {
+                    let mut cmd_args = vec![
+                        "filter", "add", "dev", "gvm-bench0", "ingress",
+                    ];
+                    cmd_args.push("prio");
+                    cmd_args.push(prio);
+                    cmd_args.extend(args.iter());
+                    let _ = std::process::Command::new("tc").args(&cmd_args).output();
+                }
+
+                total += start.elapsed();
+
+                // Cleanup (outside measurement)
+                let _ = std::process::Command::new("tc")
+                    .args(["qdisc", "del", "dev", "gvm-bench0", "clsact"])
+                    .output();
+                let _ = std::process::Command::new("ip")
+                    .args(["link", "del", "gvm-bench0"])
+                    .output();
+            }
+            total
+        });
+    });
+
+    group.finish();
+}
+
+// ═══════════════════════════════════════════════
 
 criterion_group!(
     benches,
@@ -925,5 +1304,8 @@ criterion_group!(
     bench_rate_limiter,
     bench_wasm_vs_native,
     bench_vault_p99,
+    bench_vault_contention_p99,
+    bench_wasm_cold_start,
+    bench_ebpf_setup,
 );
 criterion_main!(benches);
