@@ -4,12 +4,13 @@
 //! and seccomp application into a single launch sequence.
 
 use crate::capability::which_interpreter;
+use crate::ebpf::{self, EbpfAttachResult};
 use crate::mount::setup_mount_namespace;
 use crate::namespace::{
     coordination_pipe, sandbox_clone_flags, signal_child_ready, wait_for_parent, write_uid_map,
 };
 use crate::network::{cleanup_host_network, setup_host_network, setup_sandbox_network, VethConfig};
-use crate::seccomp::apply_seccomp_filter;
+use crate::seccomp::{apply_seccomp_filter, count_seccomp_violations};
 use crate::{SandboxConfig, SandboxResult};
 use anyhow::{Context, Result};
 use nix::sys::wait::{waitpid, WaitStatus};
@@ -69,14 +70,52 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         tracing::warn!(error = %e, "Host network setup failed — sandbox will have no network");
     }
 
+    // 2.5. Attach eBPF TC ingress filter on host-side veth (unbypassable enforcement)
+    //      This runs BEFORE signaling the child, so enforcement is active from first packet.
+    //      If eBPF is unavailable, iptables provides baseline enforcement and
+    //      seccomp AF_NETLINK blocking prevents iptables modification (defense-in-depth).
+    let ebpf_attached = if network_result.is_ok() {
+        let proxy_ip: std::net::Ipv4Addr = veth_config.host_ip.parse().unwrap_or(
+            std::net::Ipv4Addr::new(10, 200, 0, 1),
+        );
+        match ebpf::try_attach_tc_filter(
+            &veth_config.host_iface,
+            proxy_ip,
+            veth_config.proxy_addr.port(),
+        ) {
+            EbpfAttachResult::Attached { interface } => {
+                tracing::info!(
+                    interface = %interface,
+                    "eBPF TC filter ACTIVE — unbypassable proxy enforcement"
+                );
+                true
+            }
+            EbpfAttachResult::Unavailable { reason } => {
+                tracing::warn!(
+                    reason = %reason,
+                    "eBPF TC filter unavailable — using iptables with seccomp defense-in-depth"
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+
     // 3. Signal child that setup is complete
     signal_child_ready(parent_fd, child_pid.as_raw() as u32)?;
 
     let setup_ms = start.elapsed().as_millis() as u64;
     tracing::info!(setup_ms = setup_ms, "Sandbox setup complete, waiting for agent");
 
-    // 4. Wait for child to exit
-    let exit_code = match waitpid(child_pid, None) {
+    // 4. Wait for child to exit and detect seccomp violations
+    let wait_result = waitpid(child_pid, None);
+    let seccomp_violations = match &wait_result {
+        Ok(status) => count_seccomp_violations(status),
+        Err(_) => 0,
+    };
+
+    let exit_code = match wait_result {
         Ok(WaitStatus::Exited(_, code)) => code,
         Ok(WaitStatus::Signaled(_, signal, _)) => {
             tracing::warn!(signal = ?signal, "Agent killed by signal");
@@ -92,15 +131,27 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         }
     };
 
-    // 5. Clean up host-side network
+    if seccomp_violations > 0 {
+        tracing::error!(
+            violations = seccomp_violations,
+            child_pid = child_pid.as_raw(),
+            "Seccomp violations detected — agent attempted blocked syscall(s). \
+             Check 'dmesg | grep SECCOMP' or 'ausearch -m SECCOMP' for details."
+        );
+    }
+
+    // 5. Clean up host-side network (eBPF filter + iptables rules + veth pair)
     if network_result.is_ok() {
+        if ebpf_attached {
+            ebpf::detach_tc_filter(&veth_config.host_iface);
+        }
         cleanup_host_network(&veth_config);
     }
 
     Ok(SandboxResult {
         exit_code,
         setup_ms,
-        seccomp_violations: 0, // TODO: track via SECCOMP_RET_LOG
+        seccomp_violations,
     })
 }
 

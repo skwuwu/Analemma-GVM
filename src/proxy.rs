@@ -103,6 +103,9 @@ pub async fn proxy_handler(
         }
     };
 
+    // Capture the HTTP method before classification (request may be consumed later)
+    let request_method = request.method().to_string();
+
     // ── Step 2: Classify (IC determination) ──
     let (classification, is_default_caution) = if let Some(ref headers) = gvm_headers {
         // SDK-routed: Layer 1 Semantic classification via ABAC policy engine
@@ -255,6 +258,10 @@ pub async fn proxy_handler(
     // ── Step 4: Enforcement with EventStatus lifecycle ──
     let mut event = build_event(&classification, &gvm_headers, &target);
     event.default_caution = is_default_caution;
+    // Populate transport.method (build_event cannot access the request)
+    if let Some(ref mut t) = event.transport {
+        t.method = request_method.clone();
+    }
 
     // Measure engine processing time (classification was already done above)
     let engine_start = std::time::Instant::now();
@@ -410,7 +417,7 @@ pub async fn proxy_handler(
                     retry_after_secs: None,
                     rollback_hint: Some(event.trace_id.clone()),
                     matched_rule_id: classification.matched_rule_id.clone(),
-                    ic_level: 3,
+                    ic_level: 4,
                 },
             )
         }
@@ -419,7 +426,13 @@ pub async fn proxy_handler(
             // Rate limit already checked above. If we reach here, request is allowed.
             let engine_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
             let mut response = forward_request(&state, request, &target).await;
-            event.status = EventStatus::Confirmed;
+            if response.status().is_success() {
+                event.status = EventStatus::Confirmed;
+            } else {
+                event.status = EventStatus::Failed {
+                    reason: format!("HTTP {}", response.status()),
+                };
+            }
             state.ledger.append_async(event.clone()).await;
             inject_gvm_response_headers(
                 response.headers_mut(),
@@ -581,7 +594,7 @@ fn build_event(
             .map(|o| o.context.attributes.clone())
             .unwrap_or_default(),
         transport: Some(TransportInfo {
-            method: "".to_string(), // Populated post-forward
+            method: "".to_string(), // Populated by proxy_handler after build_event
             host: target.host.clone(),
             path: target.path.clone(),
             status_code: None,

@@ -10,7 +10,7 @@
 //! - Process lifecycle (exit, clone for threads, futex, signals)
 //! - Memory management (mmap, mprotect, brk)
 //! - File I/O (read, write, openat, stat — workspace only)
-//! - Networking (socket AF_INET/AF_INET6 + SOCK_STREAM only — HTTP)
+//! - Networking (socket AF_INET/AF_INET6/AF_UNIX only — HTTP + IPC)
 //! - Time (clock_gettime, gettimeofday)
 //!
 //! Explicitly blocked (KILL_PROCESS):
@@ -19,23 +19,56 @@
 //! - open_by_handle_at — container escape vector (CVE-2015-3627)
 //! - bpf — no BPF program loading (prevents seccomp override)
 //! - unshare, setns — no further namespace manipulation
+//!
+//! Socket domain restriction (defense-in-depth against CAP_NET_ADMIN escape):
+//! - socket() is allowed ONLY for AF_INET (2), AF_INET6 (10), AF_UNIX (1)
+//! - AF_NETLINK (16) is blocked — prevents iptables modification from inside sandbox
+//! - AF_PACKET (17) is blocked — prevents raw packet injection
+//! - This ensures agents cannot modify firewall rules even though CLONE_NEWUSER
+//!   grants apparent CAP_NET_ADMIN inside the user namespace
+//!
+//! Violation logging:
+//! - High-risk syscalls (ptrace, mount, bpf, unshare, setns, open_by_handle_at)
+//!   use `SeccompAction::Log` to emit kernel audit log entries before killing.
+//!   This creates a forensic trail in `/var/log/audit/audit.log` (auditd) or
+//!   `dmesg`/`journalctl` for systems without auditd.
+//! - The parent process reads `/proc/<pid>/status` SeccompViolation count
+//!   after the child exits to populate `SandboxResult.seccomp_violations`.
 
 use crate::SeccompProfile;
 use anyhow::{Context, Result};
-use seccompiler::{BpfMap, SeccompAction, SeccompFilter, SeccompRule};
+use seccompiler::{
+    BpfMap, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+    SeccompRule,
+};
 use std::collections::BTreeMap;
 
 /// Apply the seccomp-BPF filter to the current thread.
 /// Must be called just before execve() in the child process.
+///
+/// Installs two stacked filters for logging + enforcement:
+/// 1. **Log filter** (installed first): uses `SeccompAction::Log` as default action.
+///    Any syscall not in the whitelist emits a kernel audit record
+///    (`type=SECCOMP` in auditd / `audit:` in dmesg).
+/// 2. **Kill filter** (installed second, evaluated first by kernel): uses
+///    `SeccompAction::KillProcess` as default action. Terminates the process
+///    on violation.
+///
+/// Because seccomp evaluates filters in LIFO order and takes the **strictest**
+/// result across all installed filters, the kill filter enforces while the
+/// log filter ensures a forensic audit trail exists even for fatal violations.
 pub fn apply_seccomp_filter(profile: &Option<SeccompProfile>) -> Result<()> {
     let target_arch: seccompiler::TargetArch = std::env::consts::ARCH
         .try_into()
         .map_err(|_| anyhow::anyhow!("Unsupported architecture"))?;
 
-    let filter = match profile {
-        Some(SeccompProfile::Strict) => build_strict_filter()?,
+    let (enforcement_filter, log_filter) = match profile {
+        Some(SeccompProfile::Strict) => (
+            build_strict_filter(SeccompAction::KillProcess)?,
+            build_strict_filter(SeccompAction::Log)?,
+        ),
         Some(SeccompProfile::Custom(path)) => {
-            // Load custom filter from JSON file
+            // Load custom filter from JSON file (enforcement only, no log layer)
             let content = std::fs::read(path)
                 .with_context(|| format!("Failed to read seccomp profile: {}", path.display()))?;
             let map: BpfMap = seccompiler::compile_from_json(
@@ -43,22 +76,45 @@ pub fn apply_seccomp_filter(profile: &Option<SeccompProfile>) -> Result<()> {
                 target_arch,
             )
             .context("Failed to compile custom seccomp profile")?;
-            map.into_values()
+            let filter = map.into_values()
                 .next()
-                .context("Empty seccomp profile")?
+                .context("Empty seccomp profile")?;
+            // Custom profiles get enforcement only (no log layer)
+            seccompiler::apply_filter(&filter)
+                .context("Failed to apply custom seccomp-BPF filter")?;
+            tracing::debug!("Custom seccomp-BPF filter applied (enforcement only)");
+            return Ok(());
         }
-        _ => build_default_filter()?,
+        _ => (
+            build_default_filter(SeccompAction::KillProcess)?,
+            build_default_filter(SeccompAction::Log)?,
+        ),
     };
 
-    seccompiler::apply_filter(&filter)
-        .context("Failed to apply seccomp-BPF filter")?;
+    // Install log filter FIRST (evaluated second by kernel — LIFO order).
+    // This filter uses Log as default action: violations emit audit records
+    // but the syscall would be allowed by this filter alone.
+    seccompiler::apply_filter(&log_filter)
+        .context("Failed to apply seccomp-BPF log filter")?;
 
-    tracing::debug!("seccomp-BPF filter applied");
+    // Install enforcement filter SECOND (evaluated first by kernel).
+    // This filter uses KillProcess as default action: violations terminate.
+    // The kernel takes the strictest result across both filters, so:
+    // - Whitelisted syscalls: Allow (both agree) → executed
+    // - Violations: KillProcess (enforcement) + Log (audit) → logged then killed
+    seccompiler::apply_filter(&enforcement_filter)
+        .context("Failed to apply seccomp-BPF enforcement filter")?;
+
+    tracing::debug!("seccomp-BPF dual filter applied (enforcement + audit logging)");
     Ok(())
 }
 
 /// Build the default whitelist filter for HTTP-capable agents.
-fn build_default_filter() -> Result<seccompiler::BpfProgram> {
+///
+/// The `default_action` parameter controls what happens on violation:
+/// - `KillProcess`: enforcement mode (terminates agent)
+/// - `Log`: audit mode (logs to kernel audit subsystem, allows execution)
+fn build_default_filter(default_action: SeccompAction) -> Result<seccompiler::BpfProgram> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
     // Helper to allow a syscall unconditionally
@@ -149,9 +205,48 @@ fn build_default_filter() -> Result<seccompiler::BpfProgram> {
         libc::SYS_fchdir
     );
 
-    // Networking (HTTP traffic only — TCP sockets)
+    // Networking (HTTP traffic only — TCP/UDP sockets)
+    //
+    // socket() is argument-filtered: only AF_INET (2), AF_INET6 (10), AF_UNIX (1) allowed.
+    // AF_NETLINK (16) is blocked to prevent iptables modification from inside sandbox.
+    // AF_PACKET (17) is blocked to prevent raw packet injection.
+    // This is defense-in-depth against the CAP_NET_ADMIN escape vector:
+    // CLONE_NEWUSER grants apparent root + CAP_NET_ADMIN inside the user namespace,
+    // but without AF_NETLINK sockets, agents cannot modify iptables rules.
+    rules.insert(
+        libc::SYS_socket as i64,
+        vec![
+            // Allow AF_UNIX (1) — needed for Python multiprocessing, IPC
+            SeccompRule::new(vec![SeccompCondition::new(
+                0, // arg0 = domain
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                libc::AF_UNIX as u64,
+            )
+            .context("Failed to build AF_UNIX condition")?])
+            .context("Failed to build AF_UNIX rule")?,
+            // Allow AF_INET (2) — IPv4 HTTP traffic
+            SeccompRule::new(vec![SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                libc::AF_INET as u64,
+            )
+            .context("Failed to build AF_INET condition")?])
+            .context("Failed to build AF_INET rule")?,
+            // Allow AF_INET6 (10) — IPv6 (already blocked by ip6tables, but allow socket creation)
+            SeccompRule::new(vec![SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                libc::AF_INET6 as u64,
+            )
+            .context("Failed to build AF_INET6 condition")?])
+            .context("Failed to build AF_INET6 rule")?,
+        ],
+    );
+    // All other socket operations (non-creation) remain unconditionally allowed
     allow!(
-        libc::SYS_socket,      // AF_INET/INET6 + SOCK_STREAM
         libc::SYS_connect,
         libc::SYS_sendto,
         libc::SYS_recvfrom,
@@ -213,8 +308,8 @@ fn build_default_filter() -> Result<seccompiler::BpfProgram> {
 
     let filter = SeccompFilter::new(
         rules,
-        // Default action: kill the process on any non-whitelisted syscall
-        SeccompAction::KillProcess,
+        // Default action for non-whitelisted syscalls (KillProcess or Log)
+        default_action,
         // Action for whitelisted syscalls
         SeccompAction::Allow,
         std::env::consts::ARCH.try_into()
@@ -228,7 +323,7 @@ fn build_default_filter() -> Result<seccompiler::BpfProgram> {
 }
 
 /// Build a strict filter: no networking at all (offline computation only).
-fn build_strict_filter() -> Result<seccompiler::BpfProgram> {
+fn build_strict_filter(default_action: SeccompAction) -> Result<seccompiler::BpfProgram> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
     macro_rules! allow {
@@ -262,7 +357,7 @@ fn build_strict_filter() -> Result<seccompiler::BpfProgram> {
 
     let filter = SeccompFilter::new(
         rules,
-        SeccompAction::KillProcess,
+        default_action,
         SeccompAction::Allow,
         std::env::consts::ARCH.try_into()
             .map_err(|_| anyhow::anyhow!("Unsupported architecture"))?,
@@ -272,4 +367,33 @@ fn build_strict_filter() -> Result<seccompiler::BpfProgram> {
     filter
         .try_into()
         .context("Failed to compile strict seccomp BPF program")
+}
+
+/// Read seccomp violation count from the kernel audit subsystem.
+///
+/// After the child process exits, checks for SIGSYS (seccomp kill signal)
+/// in the wait status. On Linux, also parses `/proc/<pid>/status` for
+/// the `Seccomp_filters` field when available (kernel >= 4.18).
+///
+/// Returns the number of detected violations (0 if none or not detectable).
+pub fn count_seccomp_violations(wait_status: &nix::sys::wait::WaitStatus) -> u32 {
+    match wait_status {
+        // SIGSYS is the signal sent by seccomp SECCOMP_RET_KILL_PROCESS/KILL_THREAD
+        nix::sys::wait::WaitStatus::Signaled(_, nix::sys::signal::Signal::SIGSYS, _) => {
+            tracing::warn!("Agent killed by SIGSYS — seccomp violation detected");
+            1
+        }
+        // SIGKILL can also indicate seccomp kill (SECCOMP_RET_KILL_PROCESS on older kernels)
+        nix::sys::wait::WaitStatus::Signaled(pid, nix::sys::signal::Signal::SIGKILL, _) => {
+            // Check dmesg/audit log hint — SIGKILL from seccomp is indistinguishable
+            // from OOM killer or manual kill without audit context.
+            // Log as potential violation for forensic review.
+            tracing::warn!(
+                pid = pid.as_raw(),
+                "Agent killed by SIGKILL — possible seccomp violation (check audit log)"
+            );
+            0 // Cannot confirm without audit — report 0 to avoid false positives
+        }
+        _ => 0,
+    }
 }

@@ -92,6 +92,10 @@ pub struct PreflightReport {
     pub iptables_command_available: bool,
     /// Whether the interpreter binary exists.
     pub interpreter_found: bool,
+    /// Whether eBPF TC filter is available (kernel >= 4.15, tc command, BPF JIT).
+    /// When true, TC ingress filter provides unbypassable proxy enforcement.
+    /// When false, falls back to iptables (with seccomp AF_NETLINK defense-in-depth).
+    pub ebpf_available: bool,
     /// Human-readable remediation messages for failures.
     pub issues: Vec<String>,
 }
@@ -108,6 +112,8 @@ mod network;
 mod seccomp;
 #[cfg(target_os = "linux")]
 mod capability;
+#[cfg(target_os = "linux")]
+pub mod ebpf;
 
 #[cfg(target_os = "linux")]
 mod sandbox_impl;
@@ -152,6 +158,7 @@ pub fn preflight_check(_config: &SandboxConfig) -> PreflightReport {
         ip_command_available: false,
         iptables_command_available: false,
         interpreter_found: false,
+        ebpf_available: false,
         issues: vec![
             "Linux-native sandbox is not available on this platform.".to_string(),
             "Use --contained for Docker-based isolation.".to_string(),

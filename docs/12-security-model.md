@@ -1,6 +1,6 @@
 # Security Model & Known Attack Surface
 
-> **Last updated**: 2026-03-18
+> **Last updated**: 2026-03-19
 
 ## Purpose
 
@@ -75,7 +75,7 @@ If an attacker has root access to the host, GVM — like any userspace process �
 
 **Current (v1)**:
 - Cooperative default: SDK sets `HTTP_PROXY` via `GVMAgent.create_session()`.
-- **Enforced mode**: `gvm run --sandbox` (Linux namespace + veth + iptables OUTPUT lockdown). Proxy bypass is structurally impossible within the sandbox namespace.
+- **Enforced mode**: `gvm run --sandbox` (Linux namespace + veth + TC filter + iptables + seccomp). Three-layer defense-in-depth: (1) TC ingress filter on host-side veth (unbypassable), (2) iptables OUTPUT chain inside sandbox, (3) seccomp AF_NETLINK blocking prevents iptables modification.
 - Docker fallback: `gvm run --contained`.
 - Limitation: containment is opt-in and process-scoped. Processes not launched via `gvm run` still rely on cooperative proxy routing.
 
@@ -101,7 +101,25 @@ gvm run --sandbox my_agent.py
   → seccomp-BPF: ~45 syscalls whitelisted
 ```
 
-After sandbox network setup, the agent can only reach: (1) GVM proxy via TCP on the host veth IP, (2) DNS via UDP 53 on the same host veth IP, (3) loopback. All other egress is dropped by iptables OUTPUT chain. IPv6 is disabled to prevent bypassing IPv4 firewall rules.
+Defense-in-depth enforcement layers (v0.2.4):
+
+1. **TC ingress filter** (host-side veth): Kernel-level packet filtering on the host-side of the veth pair. Allows only TCP to proxy IP:port, UDP to proxy IP:53, and ARP. Runs in the host network namespace — the agent cannot modify or detach it even with `CAP_NET_ADMIN` inside its user namespace. Falls back to iptables-only on kernels < 4.15.
+
+2. **iptables OUTPUT chain** (sandbox-side): Traditional firewall rules inside the sandbox. Provides enforcement even without TC filter, but is potentially modifiable by the agent via netlink sockets (mitigated by seccomp, see below).
+
+3. **seccomp AF_NETLINK blocking**: The `socket()` syscall is argument-filtered to only allow AF_INET (2), AF_INET6 (10), and AF_UNIX (1). AF_NETLINK (16) and AF_PACKET (17) are blocked by `SECCOMP_RET_KILL_PROCESS`. This prevents agents from creating netlink sockets to modify iptables rules inside the sandbox — closing the CAP_NET_ADMIN escape vector where `CLONE_NEWUSER` grants apparent root with `CAP_NET_ADMIN` for the associated network namespace.
+
+4. **seccomp dual filter audit logging** (v0.2.5): Two seccomp-BPF filters are stacked in LIFO order — a Log filter (installed first, evaluated second) and a KillProcess filter (installed second, evaluated first). The kernel evaluates all filters and takes the strictest result (`SECCOMP_RET_KILL_PROCESS`), but the Log filter also emits a `type=SECCOMP` audit record to the kernel log (`dmesg | grep SECCOMP` or `ausearch -m SECCOMP`). This provides both enforcement AND an audit trail for blocked syscalls. The parent process detects violations via `WaitStatus::Signaled(_, SIGSYS, _)` and logs them with the child PID for correlation with kernel audit records.
+
+After sandbox network setup, the agent can only reach: (1) GVM proxy via TCP on the host veth IP, (2) DNS via UDP 53 on the same host veth IP, (3) loopback. All other egress is dropped at multiple layers. IPv6 is disabled to prevent bypassing IPv4 firewall rules.
+
+**Environment compatibility**:
+
+| Kernel | TC filter | iptables | seccomp AF_NETLINK | Enforcement |
+|--------|-----------|----------|--------------------|-------------|
+| >= 4.15 | Active | Active | Active | Triple-layer (unbypassable) |
+| 3.17 - 4.14 | Fallback | Active | Active | Dual-layer (seccomp prevents iptables escape) |
+| < 3.17 | N/A | Active | N/A | iptables only (use `--contained` Docker mode) |
 
 **Roadmap (v2)**: Move from opt-in containment to deployment-level mandatory interception profiles (policy-enforced launch path + identity attestation).
 
@@ -305,6 +323,9 @@ The following issues have been identified and **fixed** as they affect normal op
 | Policy field name typo silently ignored | Validate field names at load time; unknown fields cause load error | Fixed |
 | Import chain attack (lazy import in except block) | Move `from gvm.errors import ...` to module top-level in `decorator.py` | Fixed |
 | Checkpoint Merkle verification hardcoded `"true"` | Real content hash + chain verification; proxy computes SHA-256 of plaintext and chains with previous checkpoint | Fixed (v0.2) |
+| `transport.method` always empty in WAL events | Capture `request.method()` before classification and inject into event | Fixed (v0.2.5) |
+| Throttle path always sets `Confirmed` status | Check upstream `response.status().is_success()` before setting EventStatus | Fixed (v0.2.5) |
+| Deny `ic_level` was 3 (same as RequireApproval) | Corrected to `ic_level: 4` matching IC-4 classification | Fixed (v0.2.5) |
 
 ---
 

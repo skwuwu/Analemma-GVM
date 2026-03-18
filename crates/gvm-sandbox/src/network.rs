@@ -2,21 +2,26 @@
 //!
 //! Creates a point-to-point network between the sandbox and the host.
 //! The sandbox can ONLY reach the GVM proxy via the veth pair.
-//! All other network traffic is dropped by iptables OUTPUT rules
-//! inside the sandbox namespace.
+//!
+//! Enforcement layers (defense-in-depth):
+//! 1. **TC ingress filter** on host-side veth (when available) — unbypassable
+//!    kernel-level filtering. The agent cannot modify this even with CAP_NET_ADMIN.
+//! 2. **iptables OUTPUT rules** inside sandbox namespace — traditional firewall.
+//! 3. **seccomp AF_NETLINK blocking** — prevents the agent from creating netlink
+//!    sockets to modify iptables rules inside the sandbox.
 //!
 //! Topology:
 //! ```text
 //!   Host netns                Sandbox netns
-//!   ┌──────────┐              ┌──────────┐
-//!   │ veth-host│──────────────│ veth-sb  │
-//!   │ 10.200.  │              │ 10.200.  │
-//!   │ X.1/30   │              │ X.2/30   │
-//!   └────┬─────┘              └──────────┘
-//!        │ DNAT                  OUTPUT:
-//!        ▼                       proxy → ACCEPT
-//!   GVM Proxy (host)             DNS   → ACCEPT (host_ip:53)
-//!                                lo    → ACCEPT
+//!   ┌──────────────────┐      ┌──────────┐
+//!   │ veth-host        │──────│ veth-sb  │
+//!   │  ↓ TC ingress    │      │ 10.200.  │
+//!   │  ↓ eBPF filter   │      │ X.2/30   │
+//!   │ 10.200.X.1/30    │      └──────────┘
+//!   └────┬─────────────┘        OUTPUT:
+//!        │ DNAT                  proxy → ACCEPT
+//!        ▼                       DNS   → ACCEPT
+//!   GVM Proxy (host)             lo    → ACCEPT
 //!                                *     → DROP
 //! ```
 //!
@@ -24,10 +29,11 @@
 //! to support multiple concurrent sandboxes.
 //!
 //! Security properties:
-//! - No direct internet access from sandbox (OUTPUT DROP default)
+//! - No direct internet access from sandbox (TC filter + OUTPUT DROP)
 //! - IPv6 fully disabled (prevents IPv6 bypass)
 //! - DNS queries routed through host veth IP only
 //! - MASQUERADE restricted to proxy port traffic only
+//! - AF_NETLINK sockets blocked by seccomp (cannot modify iptables)
 
 use anyhow::{Context, Result};
 use std::net::SocketAddr;

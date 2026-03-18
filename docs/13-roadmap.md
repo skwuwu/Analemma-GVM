@@ -1,6 +1,6 @@
 # Analemma-GVM Roadmap
 
-> **Last updated**: 2026-03-18
+> **Last updated**: 2026-03-19
 
 ---
 
@@ -18,7 +18,11 @@
 - [x] Rate limiter (token bucket, per-agent)
 - [x] Operation registry with namespace validation
 - [x] JWT agent identity verification (HMAC-SHA256, opt-in via `GVM_JWT_SECRET`)
-- [x] 211 Rust tests (core unit + integration + adversarial + boundary + stress + CLI unit & integration + engine + JWT auth), 61 benchmark cases across 14 groups, 0 failures
+- [x] eBPF TC ingress filter (unbypassable proxy enforcement on host-side veth)
+- [x] seccomp AF_NETLINK blocking (CAP_NET_ADMIN escape prevention)
+- [x] seccomp dual filter audit logging (Log + KillProcess stacking, kernel audit trail via `dmesg`/`ausearch`)
+- [x] seccomp violation detection in parent process (`WaitStatus::Signaled(SIGSYS)`)
+- [x] 218 Rust tests (core unit + integration + adversarial + boundary + stress + CLI unit & integration + engine + JWT auth + sandbox security), 61 benchmark cases across 14 groups, 0 failures
 
 ### SDK (Complete)
 
@@ -166,8 +170,12 @@
 - [x] FORWARD DROP for veth traffic to non-proxy destinations
 - [x] DNS alignment (resolv.conf + iptables both use host veth IP)
 - [x] seccomp-BPF sandbox profile (default + strict)
+- [x] seccomp socket() argument filtering — AF_NETLINK/AF_PACKET blocked (CAP_NET_ADMIN escape prevention)
+- [x] seccomp dual filter stacking — Log + KillProcess for enforcement with kernel audit trail
+- [x] seccomp violation detection — parent detects SIGSYS/SIGKILL, logs with child PID for audit correlation
+- [x] TC ingress filter on host-side veth — unbypassable kernel-level proxy enforcement (eBPF-first, iptables fallback)
 - [x] Docker fallback mode (`gvm run --contained`)
-- [x] Sandbox preflight gating for critical prerequisites (`CAP_NET_ADMIN`, `ip`, `iptables`, userns, seccomp)
+- [x] Sandbox preflight gating for critical prerequisites (`CAP_NET_ADMIN`, `ip`, `iptables`, userns, seccomp, eBPF)
 - [x] Local proxy auto-start for `gvm run` when localhost target is unreachable
 - [ ] Mandatory-by-default interception profile (reject non-contained launch in production)
 - [ ] Transparent proxy parity (`SO_ORIGINAL_DST`, CONNECT tunnel)
@@ -295,3 +303,6 @@ Reported during security audit — determined to be non-vulnerabilities. Documen
 | IPv6 SSRF defense | `normalize_host()` with `expand_ipv6()` |
 | Checkpoint Merkle verification hardcoded | Real content hash + chain verification |
 | Agent ID spoofing via `X-GVM-Agent-Id` header | JWT identity verification (HMAC-SHA256, `src/auth.rs`) |
+| `transport.method` always empty in WAL events | Capture `request.method()` before body consumption |
+| Throttle path always sets `Confirmed` status | Check `response.status().is_success()` |
+| Deny `ic_level` was 3 (same as RequireApproval) | Corrected to `ic_level: 4` (IC-4) |

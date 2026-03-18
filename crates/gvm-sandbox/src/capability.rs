@@ -66,6 +66,15 @@ pub fn check(config: &SandboxConfig) -> PreflightReport {
         );
     }
 
+    let ebpf_available = crate::ebpf::check_ebpf_support().is_ok();
+    if !ebpf_available {
+        issues.push(
+            "eBPF TC filter unavailable — falling back to iptables \
+             (seccomp AF_NETLINK blocking provides defense-in-depth)."
+                .to_string(),
+        );
+    }
+
     PreflightReport {
         user_namespaces,
         seccomp_available,
@@ -74,6 +83,7 @@ pub fn check(config: &SandboxConfig) -> PreflightReport {
         ip_command_available,
         iptables_command_available,
         interpreter_found,
+        ebpf_available,
         issues,
     }
 }
