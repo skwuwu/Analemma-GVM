@@ -625,6 +625,7 @@ milliseconds = 300
         on_block: gvm_proxy::config::OnBlockConfig::default(),
         http_client,
         host_overrides: std::collections::HashMap::new(),
+        jwt_config: None,
     };
 
     let app = Router::new()

@@ -1,6 +1,6 @@
 # Analemma-GVM Roadmap
 
-> **Last updated**: 2026-03-17
+> **Last updated**: 2026-03-18
 
 ---
 
@@ -17,7 +17,8 @@
 - [x] Wasm runtime loader + host bridge (optional) + native fallback
 - [x] Rate limiter (token bucket, per-agent)
 - [x] Operation registry with namespace validation
-- [x] 199 Rust tests (core unit + integration + adversarial + boundary + stress + CLI unit & integration + engine), 61 benchmark cases across 14 groups, 0 failures
+- [x] JWT agent identity verification (HMAC-SHA256, opt-in via `GVM_JWT_SECRET`)
+- [x] 211 Rust tests (core unit + integration + adversarial + boundary + stress + CLI unit & integration + engine + JWT auth), 61 benchmark cases across 14 groups, 0 failures
 
 ### SDK (Complete)
 
@@ -52,8 +53,8 @@
 
 - [x] LLM provider allowlist in SRR templates
 - [x] Model allowlist via `payload_field` matching
-- [ ] asciinema demo recording
-- [ ] README restructure (Before/After diagram + condensed output)
+- [x] asciinema demo recording (`demo.cast`)
+- [x] README restructure (Before/After diagram + condensed output)
 
 ### Docs
 
@@ -136,7 +137,7 @@
 
 ### Security
 
-- [ ] Vault API authentication (agent_id prefix scoping)
+- [x] Vault API authentication (JWT-verified agent_id on vault endpoints)
 - [x] Checkpoint Merkle tree verification (O(log N) proof, same tree as WAL)
 - [x] Timing side-channel: documented as "not constant-time but practically non-exploitable"
 
@@ -148,8 +149,8 @@
 
 ### Config Templates
 
-- [ ] LLM provider SRR templates (OpenAI, Anthropic, Gemini)
-- [ ] Industry templates (finance, healthcare, SaaS)
+- [x] LLM provider SRR templates (OpenAI, Anthropic — in finance/saas templates)
+- [x] Industry templates (finance, healthcare, SaaS)
 
 ---
 
@@ -174,11 +175,14 @@
 - [ ] Static library list for common interpreters (Python, Node) as ldd fallback
 - [ ] `mknod`-based /dev node creation as alternative to bind-mount
 
-### Agent Identity
+### Agent Identity (Complete — v0.2.3)
 
-- [ ] JWT issued by `gvm run`, verified by proxy middleware
-- [ ] `agent_id` / `tenant_id` from JWT claims (not self-declared)
-- [ ] Token expiration + refresh
+- [x] JWT issued via `POST /gvm/auth/token`, verified by proxy middleware (HMAC-SHA256)
+- [x] `agent_id` / `tenant_id` from JWT claims (not self-declared headers)
+- [x] Token expiration + configurable TTL (`token_ttl_secs`, default 3600s, 5s leeway)
+- [x] Backward-compatible: opt-in via `GVM_JWT_SECRET` env var; header-based identity continues when disabled
+- [x] Secret management: `ZeroizeOnDrop`, hex-encoded, minimum 32-byte key
+- [x] 17 unit tests (roundtrip, expiration, tampering, wrong secret, malformed tokens, input validation)
 
 ### Distributed Backend
 
@@ -219,7 +223,7 @@
 ### Observability
 
 - [ ] Prometheus metrics endpoint (`/gvm/metrics`)
-- [ ] WAL verification CLI (`gvm events verify`)
+- [x] WAL verification CLI (`gvm audit verify` in `crates/gvm-cli/src/audit.rs`)
 - [ ] Dashboard template (Grafana)
 
 ---
@@ -271,7 +275,7 @@ Reported during security audit — determined to be non-vulnerabilities. Documen
 - SRR body size bypass (Default-to-Caution fallback catches unmatched requests)
 - Vault `list_keys()` cross-agent (no API endpoint exposes this)
 - SDK credential header pass-through (proxy strips at Layer 3)
-- Rate limiter agent ID spoofing (same root cause as unauthenticated proxy access)
+- Rate limiter agent ID spoofing (mitigated by JWT identity verification in v0.2.3)
 
 ---
 
@@ -290,3 +294,4 @@ Reported during security audit — determined to be non-vulnerabilities. Documen
 | Import chain attack | Top-level imports in `decorator.py` |
 | IPv6 SSRF defense | `normalize_host()` with `expand_ipv6()` |
 | Checkpoint Merkle verification hardcoded | Real content hash + chain verification |
+| Agent ID spoofing via `X-GVM-Agent-Id` header | JWT identity verification (HMAC-SHA256, `src/auth.rs`) |

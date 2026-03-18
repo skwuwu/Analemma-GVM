@@ -159,11 +159,17 @@ Both paths pre-compile regex at config load time (fail-fast on invalid patterns)
 
 ---
 
-### 8. Agent Identity
+### 8. Agent Identity (Partially Mitigated)
 
-**Current (v1)**: Self-declared `X-GVM-Agent-Id` header. Spoofable on shared networks.
+**v1 (default)**: Self-declared `X-GVM-Agent-Id` header. Spoofable on shared networks.
 
-**Planned (v2)**: JWT issued by `gvm run` at agent startup, verified by proxy middleware. The agent cannot forge identity without the signing key. Multi-tenant deployments will require JWT or mTLS.
+**v1.1 (opt-in)**: JWT-based identity verification via `POST /gvm/auth/token`. When `GVM_JWT_SECRET` env var is set (hex-encoded, min 32 bytes HMAC-SHA256 key):
+- Proxy issues JWTs with `agent_id`, `tenant_id`, `scope` claims
+- `Authorization: Bearer <token>` is verified; claims override self-declared headers
+- Rate limiter uses verified `agent_id` (spoofing prevented)
+- Backward-compatible: without JWT configured, header-based identity continues
+
+**Remaining limitation**: Token issuance endpoint (`POST /gvm/auth/token`) is unauthenticated in v1. Acceptable for single-host deployment where `gvm run` and proxy are co-located. Multi-tenant deployments should add mTLS for issuance.
 
 ### 9. IPv4-Mapped IPv6 Bypass (Fixed)
 
@@ -402,9 +408,9 @@ Without network-level isolation, any process on the same network can send reques
 
 ---
 
-## Adversarial Test Coverage (v0.2.1)
+## Adversarial Test Coverage (v0.2.3)
 
-21 tests in `tests/hostile.rs` covering:
+28 tests in `tests/hostile.rs` + 17 JWT unit tests in `src/auth.rs` covering:
 
 | Category | Tests | What They Prove |
 |----------|-------|----------------|
@@ -413,10 +419,15 @@ Without network-level isolation, any process on the same network can send reques
 | Policy determinism | 5 (proptest) | `max_strict` commutativity, associativity, idempotence, Deny absorption |
 | Bypass scenarios | 4 | HTTP case-smuggling, null bytes, unicode normalization, path traversal |
 | Side-channel | 1 | SRR timing variance < 10x between match/no-match |
-| Forgery | 1 | Header forgery defeated by SRR URL-based enforcement |
+| Forgery | 2 | Header forgery defeated by SRR; upstream X-GVM-* header stripping |
 | Garbage input | 1 | No panics on arbitrary method/host/path/body combinations |
 | Secret zeroing | 1 | VaultEncryption key zeroed on drop |
 | Backpressure | 1 | 500 concurrent WAL appends complete bounded |
+| Agent spoofing | 1 | Rate limiter bucket isolation under spoofed agent IDs |
+| Config poisoning | 3 | Malformed TOML rejected; catch-all Deny blocks all traffic |
+| ABAC bypass | 1 | Attribute omission bypass documented; SRR defense-in-depth verified |
+| Resource exhaustion | 2 | Rate limiter MAX_BUCKETS overflow + eviction; limits enforced post-cleanup |
+| JWT auth | 17 | Issue/verify roundtrip, expiration, signature tampering, wrong secret, malformed tokens, secret zeroing |
 
 Fuzz targets (`fuzz/fuzz_targets/`):
 - `fuzz_srr`: Arbitrary method/host/path/body into SRR pattern matching

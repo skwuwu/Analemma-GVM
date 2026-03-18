@@ -1,5 +1,6 @@
 use gvm_proxy::api;
 use gvm_proxy::api_keys::APIKeyStore;
+use gvm_proxy::auth;
 use gvm_proxy::config::ProxyConfig;
 use gvm_proxy::ledger::Ledger;
 use gvm_proxy::policy::PolicyEngine;
@@ -167,6 +168,47 @@ async fn main() {
         }
     }
 
+    // 9.7. Initialize JWT authentication (optional)
+    let jwt_secret_env = config
+        .jwt
+        .as_ref()
+        .map(|j| j.secret_env.as_str())
+        .unwrap_or("GVM_JWT_SECRET");
+    let jwt_ttl = config
+        .jwt
+        .as_ref()
+        .map(|j| j.token_ttl_secs)
+        .unwrap_or(3600);
+
+    let jwt_config = match auth::JwtConfig::from_env(jwt_secret_env, jwt_ttl) {
+        Ok(Some(c)) => {
+            tracing::info!(
+                ttl_secs = c.token_ttl_secs,
+                "JWT authentication ACTIVE — agent identity will be cryptographically verified"
+            );
+            Some(Arc::new(c))
+        }
+        Ok(None) => {
+            tracing::info!(
+                "JWT authentication DISABLED (no {} env var). \
+                 Agent identity uses self-declared X-GVM-Agent-Id headers.",
+                jwt_secret_env
+            );
+            None
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Invalid JWT secret — cannot start");
+            eprintln!();
+            eprintln!("  ERROR: JWT secret is configured but invalid.");
+            eprintln!("  {}", e);
+            eprintln!();
+            eprintln!("  Fix: export {}=<64+ hex chars>", jwt_secret_env);
+            eprintln!("  Or remove [jwt] section from proxy.toml to disable JWT.");
+            eprintln!();
+            std::process::exit(1);
+        }
+    };
+
     // 10. Compose shared state
     let state = AppState {
         srr: Arc::new(srr),
@@ -181,6 +223,7 @@ async fn main() {
         on_block: config.enforcement.on_block.clone(),
         http_client,
         host_overrides,
+        jwt_config,
     };
 
     // 11. Build axum router with security layers
@@ -192,6 +235,7 @@ async fn main() {
         .route("/gvm/health", axum::routing::get(api::health))
         .route("/gvm/info", axum::routing::get(api::info))
         .route("/gvm/check", axum::routing::post(api::check))
+        .route("/gvm/auth/token", axum::routing::post(api::auth_token))
         .route(
             "/gvm/vault/:key",
             axum::routing::put(api::vault_write)

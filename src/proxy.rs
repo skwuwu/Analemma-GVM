@@ -1,4 +1,5 @@
 use crate::api_keys::APIKeyStore;
+use crate::auth;
 use crate::config::OnBlockConfig;
 use crate::ledger::Ledger;
 use crate::llm_trace;
@@ -50,6 +51,8 @@ pub struct AppState {
     /// Dev-only: remap external hostnames to local addresses for forwarding.
     /// SRR matching uses the original host; only forwarding is redirected.
     pub host_overrides: HashMap<String, String>,
+    /// JWT authentication config (None = disabled, header-based identity).
+    pub jwt_config: Option<Arc<auth::JwtConfig>>,
 }
 
 /// Main proxy handler — all requests route here via axum fallback.
@@ -58,8 +61,38 @@ pub async fn proxy_handler(
     State(state): State<AppState>,
     request: Request<Body>,
 ) -> Response<Body> {
+    // ── Step 0: Verify JWT identity (if configured) ──
+    let verified_identity = if let Some(ref jwt) = state.jwt_config {
+        match auth::extract_bearer_token(request.headers()) {
+            Some(token) => match auth::verify_token(jwt, token) {
+                Ok(identity) => {
+                    tracing::debug!(
+                        agent = %identity.agent_id,
+                        token_id = %identity.token_id,
+                        "JWT identity verified"
+                    );
+                    Some(identity)
+                }
+                Err(e) => {
+                    tracing::warn!("JWT verification failed — rejecting request");
+                    tracing::debug!(error = %e, "JWT verification error detail");
+                    return error_response(
+                        StatusCode::UNAUTHORIZED,
+                        "Invalid or expired authentication token",
+                    );
+                }
+            },
+            None => {
+                tracing::warn!("No JWT token provided — using unverified X-GVM-Agent-Id header");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // ── Step 1: Parse request ──
-    let gvm_headers = parse_gvm_headers(&request);
+    let gvm_headers = parse_gvm_headers(&request, verified_identity.as_ref());
     let target = match extract_target(&request) {
         Some(t) => t,
         None => {
@@ -823,13 +856,23 @@ fn extract_llm_trace_from_sse_stream(
 }
 
 /// Parse GVM-specific headers from an SDK-routed request.
-fn parse_gvm_headers(request: &Request<Body>) -> Option<GVMHeaders> {
-    let agent_id = request
-        .headers()
-        .get("X-GVM-Agent-Id")?
-        .to_str()
-        .ok()?
-        .to_string();
+/// When a verified JWT identity is provided, it overrides the self-declared
+/// X-GVM-Agent-Id and X-GVM-Tenant-Id headers for spoofing prevention.
+fn parse_gvm_headers(
+    request: &Request<Body>,
+    verified: Option<&auth::VerifiedIdentity>,
+) -> Option<GVMHeaders> {
+    // If JWT-verified identity exists, use it; otherwise fall back to header
+    let agent_id = if let Some(v) = verified {
+        v.agent_id.clone()
+    } else {
+        request
+            .headers()
+            .get("X-GVM-Agent-Id")?
+            .to_str()
+            .ok()?
+            .to_string()
+    };
 
     let operation = request
         .headers()
@@ -877,11 +920,15 @@ fn parse_gvm_headers(request: &Request<Body>) -> Option<GVMHeaders> {
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
-    let tenant_id = request
-        .headers()
-        .get("X-GVM-Tenant-Id")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
+    let tenant_id = if let Some(v) = verified {
+        v.tenant_id.clone()
+    } else {
+        request
+            .headers()
+            .get("X-GVM-Tenant-Id")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+    };
 
     let rate_limit = request
         .headers()

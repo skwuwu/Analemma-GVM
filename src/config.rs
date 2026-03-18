@@ -16,6 +16,34 @@ pub struct ProxyConfig {
     pub operations: OperationsConfig,
     pub secrets: SecretsConfig,
     pub dev: Option<DevConfig>,
+    /// JWT authentication configuration (optional).
+    /// When configured, agents authenticate via Bearer tokens.
+    pub jwt: Option<JwtAuthConfig>,
+}
+
+/// JWT authentication configuration.
+///
+/// ```toml
+/// [jwt]
+/// secret_env = "GVM_JWT_SECRET"
+/// token_ttl_secs = 3600
+/// ```
+#[derive(Deserialize, Clone, Debug)]
+pub struct JwtAuthConfig {
+    /// Environment variable name holding the hex-encoded HMAC secret (min 32 bytes).
+    #[serde(default = "default_jwt_secret_env")]
+    pub secret_env: String,
+    /// Token time-to-live in seconds (default: 3600 = 1 hour).
+    #[serde(default = "default_jwt_ttl")]
+    pub token_ttl_secs: u64,
+}
+
+fn default_jwt_secret_env() -> String {
+    "GVM_JWT_SECRET".to_string()
+}
+
+fn default_jwt_ttl() -> u64 {
+    3600
 }
 
 /// Dev-only configuration. Ignored when GVM_ENV=production.
@@ -173,6 +201,7 @@ impl Default for ProxyConfig {
                 key_env: "GVM_SECRETS_KEY".to_string(),
             },
             dev: None,
+            jwt: None,
         }
     }
 }

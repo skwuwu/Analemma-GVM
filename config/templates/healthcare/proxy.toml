@@ -1,0 +1,42 @@
+# GVM Proxy — Healthcare Template
+# HIPAA-aligned enforcement for EHR/EMR and patient data operations.
+# PHI access is always delayed (audit window). Exports and deletions denied.
+
+[server]
+listen = "0.0.0.0:8080"
+
+[enforcement]
+default_decision = { type = "Delay", milliseconds = 500 }
+ic1_async_ledger = false   # synchronous ledger — every access must be audited before response
+ic1_loss_threshold = 0.0   # zero tolerance for audit loss
+
+# Healthcare: strict block modes — all decisions halt immediately (HIPAA requires full audit trail)
+[enforcement.on_block]
+deny = "halt"
+require_approval = "halt"
+throttle = "halt"
+infrastructure_failure = "halt"
+
+[nats]
+url = "nats://127.0.0.1:4222"
+stream = "gvm-audit-healthcare"
+max_age_days = 2555   # 7 years — HIPAA requires 6-year retention minimum
+
+[redis]
+url = "redis://127.0.0.1:6379"
+
+[srr]
+network_file = "config/templates/healthcare/srr_network.toml"
+semantic_file = "config/srr_semantic.toml"
+hot_reload = true
+
+[policies]
+directory = "config/templates/healthcare/policies/"
+hot_reload = true
+
+[operations]
+registry_file = "config/templates/healthcare/operation_registry.toml"
+
+[secrets]
+file = "config/secrets.toml"
+key_env = "GVM_SECRETS_KEY"

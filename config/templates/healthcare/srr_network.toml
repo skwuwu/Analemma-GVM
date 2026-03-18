@@ -1,0 +1,148 @@
+# Network SRR rules — Healthcare template
+# HIPAA-aligned: PHI endpoints delayed, data export denied, strict LLM control.
+# All patient data access creates an audit trail via the delay window.
+
+# ── EHR/EMR Systems ──
+
+[[rules]]
+method = "POST"
+pattern = "{host}.epic.com/api/FHIR/{any}"
+decision = { type = "Delay", milliseconds = 500 }
+description = "Epic FHIR API — delay for audit (PHI access)"
+
+[[rules]]
+method = "GET"
+pattern = "{host}.epic.com/api/FHIR/{any}"
+decision = { type = "Delay", milliseconds = 500 }
+description = "Epic FHIR read — delay for audit (PHI access)"
+
+[[rules]]
+method = "POST"
+pattern = "fhir.cerner.com/{any}"
+decision = { type = "Delay", milliseconds = 500 }
+description = "Cerner FHIR API — delay for audit (PHI access)"
+
+[[rules]]
+method = "GET"
+pattern = "fhir.cerner.com/{any}"
+decision = { type = "Delay", milliseconds = 500 }
+description = "Cerner FHIR read — delay for audit (PHI access)"
+
+# ── Patient Data Export (Deny) ──
+
+[[rules]]
+method = "POST"
+pattern = "{any}/Patient/$export"
+decision = { type = "Deny", reason = "Bulk patient data export requires offline authorization (HIPAA)" }
+description = "Block FHIR bulk export"
+
+[[rules]]
+method = "POST"
+pattern = "{any}/Group/{id}/$export"
+decision = { type = "Deny", reason = "Group bulk export requires offline authorization (HIPAA)" }
+description = "Block FHIR group bulk export"
+
+# ── Data Deletion (Deny) ──
+
+[[rules]]
+method = "DELETE"
+pattern = "{any}"
+decision = { type = "Deny", reason = "Record deletion is prohibited — healthcare records must be retained per HIPAA" }
+description = "Block all DELETE requests (record retention)"
+
+# ── External Data Transfer (Deny) ──
+
+[[rules]]
+method = "POST"
+pattern = "{any}.s3.amazonaws.com/{any}"
+decision = { type = "Deny", reason = "Direct S3 upload denied — use approved data pipeline" }
+description = "Block direct S3 uploads (data exfiltration risk)"
+
+[[rules]]
+method = "PUT"
+pattern = "{any}.s3.amazonaws.com/{any}"
+decision = { type = "Deny", reason = "Direct S3 upload denied — use approved data pipeline" }
+description = "Block direct S3 PUTs (data exfiltration risk)"
+
+[[rules]]
+method = "POST"
+pattern = "storage.googleapis.com/{any}"
+decision = { type = "Deny", reason = "Direct GCS upload denied — use approved data pipeline" }
+description = "Block direct GCS uploads"
+
+# ── LLM Provider Control (Healthcare: strict model pinning, no PHI in prompts) ──
+
+[[rules]]
+method = "POST"
+pattern = "api.openai.com/v1/chat/completions"
+payload_field = "model"
+payload_match = ["gpt-4o"]
+max_body_bytes = 32768
+decision = { type = "Delay", milliseconds = 500 }
+description = "Only gpt-4o approved for healthcare (reduced body limit for PHI minimization)"
+
+[[rules]]
+method = "POST"
+pattern = "api.openai.com/v1/{any}"
+decision = { type = "Deny", reason = "Only gpt-4o chat/completions is authorized for healthcare" }
+description = "Block all other OpenAI endpoints and models"
+
+[[rules]]
+method = "POST"
+pattern = "api.anthropic.com/v1/messages"
+payload_field = "model"
+payload_match = ["claude-sonnet-4-20250514"]
+max_body_bytes = 32768
+decision = { type = "Delay", milliseconds = 500 }
+description = "Only Claude Sonnet 4 approved for healthcare (reduced body limit)"
+
+[[rules]]
+method = "POST"
+pattern = "api.anthropic.com/v1/{any}"
+decision = { type = "Deny", reason = "Only Claude Sonnet 4 messages endpoint is authorized" }
+description = "Block all other Anthropic endpoints and models"
+
+# Block all unauthorized LLM providers
+[[rules]]
+method = "POST"
+pattern = "api.together.ai/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider — not HIPAA BAA covered" }
+
+[[rules]]
+method = "POST"
+pattern = "api.groq.com/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider — not HIPAA BAA covered" }
+
+[[rules]]
+method = "POST"
+pattern = "generativelanguage.googleapis.com/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider — not HIPAA BAA covered" }
+
+[[rules]]
+method = "POST"
+pattern = "api.cohere.ai/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider — not HIPAA BAA covered" }
+
+[[rules]]
+method = "POST"
+pattern = "api.mistral.ai/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider — not HIPAA BAA covered" }
+
+[[rules]]
+method = "POST"
+pattern = "api.replicate.com/{any}"
+decision = { type = "Deny", reason = "Unauthorized LLM provider — not HIPAA BAA covered" }
+
+# ── General Rules ──
+
+[[rules]]
+method = "GET"
+pattern = "{any}"
+decision = { type = "Delay", milliseconds = 500 }
+description = "All reads delayed for audit (PHI may be in any response)"
+
+[[rules]]
+method = "*"
+pattern = "{any}"
+decision = { type = "Delay", milliseconds = 500 }
+description = "Default: 500ms delay for audit trail (Fail-Close)"

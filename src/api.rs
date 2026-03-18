@@ -1,8 +1,9 @@
+use crate::auth;
 use crate::merkle;
 use crate::proxy::AppState;
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::{Response, StatusCode};
+use axum::http::{HeaderMap, Response, StatusCode};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -241,6 +242,55 @@ impl CheckpointRegistry {
     }
 }
 
+// ─── Vault Identity Resolution ───
+
+/// Resolve the effective agent_id for vault operations.
+///
+/// When JWT is configured:
+/// - If a valid Bearer token is present, use the JWT-verified agent_id (ignoring self-declared).
+/// - If a Bearer token is present but invalid, reject with 401.
+/// - If no Bearer token is present, fall back to the declared agent_id with a warning.
+///
+/// When JWT is not configured: use the declared agent_id as-is.
+fn resolve_vault_agent_id(
+    jwt_config: &Option<Arc<auth::JwtConfig>>,
+    headers: &HeaderMap,
+    declared_agent_id: &str,
+) -> Result<String, Response<Body>> {
+    if let Some(ref jwt) = jwt_config {
+        match auth::extract_bearer_token(headers) {
+            Some(token) => match auth::verify_token(jwt, token) {
+                Ok(identity) => {
+                    if identity.agent_id != declared_agent_id {
+                        tracing::warn!(
+                            declared = declared_agent_id,
+                            verified = %identity.agent_id,
+                            "Vault request: JWT agent_id differs from declared — using verified identity"
+                        );
+                    }
+                    Ok(identity.agent_id)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Vault request: JWT verification failed");
+                    Err(json_response(
+                        StatusCode::UNAUTHORIZED,
+                        &serde_json::json!({"error": "Invalid or expired authentication token"}),
+                    ))
+                }
+            },
+            None => {
+                tracing::warn!(
+                    agent = declared_agent_id,
+                    "Vault request: No JWT token — using unverified agent_id"
+                );
+                Ok(declared_agent_id.to_string())
+            }
+        }
+    } else {
+        Ok(declared_agent_id.to_string())
+    }
+}
+
 // ─── Vault REST API ───
 
 #[derive(Deserialize)]
@@ -277,8 +327,10 @@ fn validate_vault_identifier(id: &str, field_name: &str) -> Result<(), Response<
 ///
 /// Security: keys are scoped by agent_id prefix to enforce namespace isolation.
 /// Agent "agent-001" can only write to keys prefixed with "agent-001:".
+/// When JWT is configured, the agent_id is cryptographically verified from the Bearer token.
 pub async fn vault_write(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(key): Path<String>,
     Json(body): Json<VaultWriteRequest>,
 ) -> Response<Body> {
@@ -290,17 +342,23 @@ pub async fn vault_write(
         return resp;
     }
 
+    // Resolve effective agent_id: JWT-verified takes precedence over self-declared
+    let agent_id = match resolve_vault_agent_id(&state.jwt_config, &headers, &body.agent_id) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
     // Namespace isolation: scope key by agent_id to prevent cross-agent access
-    let scoped_key = format!("{}:{}", body.agent_id, key);
+    let scoped_key = format!("{}:{}", agent_id, key);
 
     match state
         .vault
-        .write(&scoped_key, body.value.as_bytes(), &body.agent_id)
+        .write(&scoped_key, body.value.as_bytes(), &agent_id)
         .await
     {
         Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"status": "ok", "key": key})),
         Err(e) => {
-            tracing::error!(key = %key, agent = %body.agent_id, error = %e, "Vault write failed");
+            tracing::error!(key = %key, agent = %agent_id, error = %e, "Vault write failed");
             json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &serde_json::json!({"error": "Internal vault error"}),
@@ -312,21 +370,30 @@ pub async fn vault_write(
 /// GET /gvm/vault/:key?agent_id=xxx — Read and decrypt value from vault
 ///
 /// Security: reads are scoped by agent_id prefix (namespace isolation).
+/// When JWT is configured, the agent_id is cryptographically verified from the Bearer token.
 pub async fn vault_read(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(key): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response<Body> {
-    let agent_id = params.get("agent_id").map(|s| s.as_str()).unwrap_or("unknown");
-    if let Err(resp) = validate_vault_identifier(agent_id, "agent_id") {
+    let declared_agent_id = params.get("agent_id").map(|s| s.as_str()).unwrap_or("unknown");
+    if let Err(resp) = validate_vault_identifier(declared_agent_id, "agent_id") {
         return resp;
     }
     if let Err(resp) = validate_vault_identifier(&key, "key") {
         return resp;
     }
+
+    // Resolve effective agent_id: JWT-verified takes precedence over query param
+    let agent_id = match resolve_vault_agent_id(&state.jwt_config, &headers, declared_agent_id) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
     let scoped_key = format!("{}:{}", agent_id, key);
 
-    match state.vault.read(&scoped_key, agent_id).await {
+    match state.vault.read(&scoped_key, &agent_id).await {
         Ok(Some(bytes)) => {
             let value = String::from_utf8_lossy(&bytes).to_string();
             json_response(
@@ -351,21 +418,30 @@ pub async fn vault_read(
 /// DELETE /gvm/vault/:key?agent_id=xxx — Delete key from vault
 ///
 /// Security: deletes are scoped by agent_id prefix (namespace isolation).
+/// When JWT is configured, the agent_id is cryptographically verified from the Bearer token.
 pub async fn vault_delete(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(key): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response<Body> {
-    let agent_id = params.get("agent_id").map(|s| s.as_str()).unwrap_or("unknown");
-    if let Err(resp) = validate_vault_identifier(agent_id, "agent_id") {
+    let declared_agent_id = params.get("agent_id").map(|s| s.as_str()).unwrap_or("unknown");
+    if let Err(resp) = validate_vault_identifier(declared_agent_id, "agent_id") {
         return resp;
     }
     if let Err(resp) = validate_vault_identifier(&key, "key") {
         return resp;
     }
+
+    // Resolve effective agent_id: JWT-verified takes precedence over query param
+    let agent_id = match resolve_vault_agent_id(&state.jwt_config, &headers, declared_agent_id) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+
     let scoped_key = format!("{}:{}", agent_id, key);
 
-    match state.vault.delete(&scoped_key, agent_id).await {
+    match state.vault.delete(&scoped_key, &agent_id).await {
         Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"status": "deleted", "key": key})),
         Err(e) => {
             tracing::error!(key = %key, agent = %agent_id, error = %e, "Vault delete failed");
@@ -624,6 +700,78 @@ pub async fn check(
     }
 
     json_response(StatusCode::OK, &resp)
+}
+
+// ─── JWT Token Issuance ───
+
+#[derive(Deserialize)]
+pub struct TokenRequest {
+    pub agent_id: String,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default = "default_scope")]
+    pub scope: String,
+}
+
+fn default_scope() -> String {
+    "proxy".to_string()
+}
+
+/// POST /gvm/auth/token — Issue a JWT for agent authentication.
+///
+/// Returns a signed Bearer token that the proxy verifies on subsequent requests.
+/// When JWT is not configured (no GVM_JWT_SECRET), returns 503.
+pub async fn auth_token(
+    State(state): State<AppState>,
+    Json(body): Json<TokenRequest>,
+) -> Response<Body> {
+    let jwt_config = match &state.jwt_config {
+        Some(c) => c,
+        None => {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &serde_json::json!({
+                    "error": "JWT authentication not configured",
+                    "hint": "Set GVM_JWT_SECRET environment variable (hex-encoded, min 32 bytes)"
+                }),
+            );
+        }
+    };
+
+    // Validate agent_id
+    if let Err(resp) = validate_vault_identifier(&body.agent_id, "agent_id") {
+        return resp;
+    }
+    if body.agent_id.len() > 128 {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({"error": "agent_id exceeds maximum length (128)"}),
+        );
+    }
+
+    // Validate scope
+    if body.scope != "proxy" {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({"error": "Invalid scope. Supported: proxy"}),
+        );
+    }
+
+    match crate::auth::issue_token_response(
+        jwt_config,
+        &body.agent_id,
+        body.tenant_id.as_deref(),
+        &body.scope,
+    ) {
+        Ok(resp) => json_response(StatusCode::OK, &serde_json::json!(resp)),
+        Err(e) => {
+            tracing::error!(error = %e, "Token issuance failed");
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({"error": "Token issuance failed"}),
+            )
+        }
+    }
 }
 
 // ─── Health / Admin Endpoints ───

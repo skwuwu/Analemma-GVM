@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod api_keys;
+pub mod auth;
 pub mod config;
 pub mod ledger;
 pub mod llm_trace;

@@ -1,0 +1,91 @@
+# Healthcare Global Policy — HIPAA-aligned, strict by default.
+# PHI access delayed, data export requires approval, deletion denied.
+# All operations audited. No silent Allow for any write operation.
+
+[[rules]]
+id = "healthcare-phi-export-deny"
+priority = 1
+layer = "Global"
+description = "Patient data export is denied (HIPAA: bulk PHI transfer requires offline authorization)"
+decision = { type = "Deny", reason = "PHI bulk export requires offline authorization per HIPAA policy" }
+[[rules.conditions]]
+field = "operation"
+operator = "Eq"
+value = "gvm.data.export"
+
+[[rules]]
+id = "healthcare-record-delete-deny"
+priority = 2
+layer = "Global"
+description = "Healthcare record deletion is prohibited (retention requirement)"
+decision = { type = "Deny", reason = "Healthcare record deletion is prohibited — 6-year HIPAA retention" }
+[[rules.conditions]]
+field = "operation"
+operator = "Eq"
+value = "gvm.storage.delete"
+
+[[rules]]
+id = "healthcare-identity-modify-approval"
+priority = 3
+layer = "Global"
+description = "Account/permission changes require approval (access control audit)"
+decision = { type = "RequireApproval", urgency = "Immediate" }
+[[rules.conditions]]
+field = "operation"
+operator = "Eq"
+value = "gvm.identity.modify"
+
+[[rules]]
+id = "healthcare-messaging-approval"
+priority = 4
+layer = "Global"
+description = "External messaging requires approval (PHI leak prevention)"
+decision = { type = "RequireApproval", urgency = "Immediate" }
+[[rules.conditions]]
+field = "operation"
+operator = "Eq"
+value = "gvm.messaging.send"
+[[rules.conditions]]
+field = "resource.sensitivity"
+operator = "In"
+value = "Critical,High"
+
+[[rules]]
+id = "healthcare-messaging-standard"
+priority = 5
+layer = "Global"
+description = "Standard messaging delayed for audit"
+decision = { type = "Delay", milliseconds = 500 }
+[[rules.conditions]]
+field = "operation"
+operator = "Eq"
+value = "gvm.messaging.send"
+
+[[rules]]
+id = "healthcare-write-delay"
+priority = 10
+layer = "Global"
+description = "All write operations delayed for audit trail"
+decision = { type = "Delay", milliseconds = 500 }
+[[rules.conditions]]
+field = "operation"
+operator = "Eq"
+value = "gvm.storage.write"
+
+[[rules]]
+id = "healthcare-read-delay"
+priority = 20
+layer = "Global"
+description = "Read operations delayed for PHI access audit (HIPAA requires access logging)"
+decision = { type = "Delay", milliseconds = 500 }
+[[rules.conditions]]
+field = "operation"
+operator = "EndsWith"
+value = ".read"
+
+[[rules]]
+id = "healthcare-fallback"
+priority = 999
+layer = "Global"
+description = "Default: delay 500ms (Fail-Close, all access audited)"
+decision = { type = "Delay", milliseconds = 500 }
