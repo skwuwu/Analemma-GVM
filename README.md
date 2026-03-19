@@ -7,12 +7,11 @@
 > **How is this different from NVIDIA OpenShell?**
 > OpenShell sandboxes agents with Docker+K3s (allow/deny).
 > GVM governs agent actions with graduated enforcement,
-> semantic forgery detection, and checkpoint rollback(with SDK) —
+> semantic forgery detection, optional syscall/network containment, and checkpoint rollback (with SDK) —
 > in a single binary, no container runtime required.
 > [See comparison →](#openshell-comparison)
 
-> Smarter models do not mean safer systems.
-> Safety must be structural, not behavioral.
+> better models do not mean safer systems.
 
 <p align="center">
   <img src="demo.svg" alt="Analemma-GVM Unified Finance Agent Demo" width="860">
@@ -29,27 +28,25 @@
 | Prompt guardrails | Asks the model to behave | Bypassed by jailbreak or bugs |
 | Sandbox (Docker/K8s) | Constrains the environment | Binary allow/deny only |
 | Policy engines (OPA) | Evaluates metadata | Trusts what the agent declares |
-| **GVM** | **Governs actual HTTP actions** | **Alpha — not hardened** |
+| **GVM** | **Governs actual HTTP actions + optional kernel containment** | **Alpha — not hardened** |
 
-Only GVM: graduated enforcement, semantic forgery detection, checkpoint rollback, Merkle-verified audit. No Docker required.
+Only GVM: graduated enforcement, semantic forgery detection, checkpoint rollback, Merkle-verified audit, and optional OS-level containment. No Docker required.
 
 ---
 
-## The Problem
+## The Problem: Agency without Enforcement
+As AI agents gain the ability to execute complex workflows—integrating with databases, payment APIs, and sensitive internal tools—the surface area for catastrophic failure expands.
 
-AI agents are getting better at doing things. That is exactly the problem.
+Current safety strategies (RLHF, instruction tuning, and prompt-level guardrails) focus on behavioral alignment. They attempt to "persuade" the model to remain benign. However, behavioral constraints are inherently fragile; they can be bypassed by sophisticated prompt injections, model hallucinations, or simple logic bugs.
 
-A model that can compose emails, query databases, and call payment APIs is one prompt injection away from doing all three without authorization. Today's safety strategy — instruction tuning, guardrails in the prompt, RLHF alignment — operates at the **behavioral** level. It asks the model to be good. But a sufficiently capable model, a jailbreak, or a simple bug can bypass behavioral constraints entirely.
+Model sophistication is not a substitute for deterministic control. We believe agent security is fundamentally an infrastructure challenge, not a linguistic one.
 
-**Model sophistication is not control.** The gap between what an agent *can* do and what it *should* do is an infrastructure problem, not a model problem.
+---
 
-### The Contrarian Bet
+## The Architectural Shift
+Traditional AI security focuses on "LLM WAFs"—analyzing natural language to intercept malicious intent. This approach is limited by the inherent ambiguity of language. In contrast, Analemma-GVM operates at the execution layer.
 
-Most AI security companies focus on prompt defense — a WAF for LLMs. We believe that approach is fundamentally limited. Language is ambiguous, but **syscalls are precise**. You cannot reliably determine intent from a prompt, but you *can* determine exactly what HTTP endpoint an agent is calling, with what payload, and whether it has authorization.
-
-**We don't correct what agents *say*. We control what agents *do*.**
-
-This is the same insight that separates OS-level security from application-level security. Anti-virus scans files; the kernel enforces permissions. We are building the kernel.
+While intent is difficult to parse, syscalls and network egress are precise. Instead of filtering what an agent says, we enforce what an agent does. By shifting the security boundary from the application layer to the runtime environment, we provide a deterministic sandbox that remains robust even if the model itself is compromised.
 
 ---
 
@@ -57,17 +54,17 @@ This is the same insight that separates OS-level security from application-level
 
 Analemma-GVM is built on a single thesis:
 
-**Security must be enforced at the infrastructure level, not the application level.**
+**Controlling nondeterministic systems requires deterministic enforcement.**
 
-The agent's code is unchanged. The agent doesn't know it's being governed. Every outbound HTTP request passes through a transparent proxy that classifies the operation, evaluates policy, and decides — in real time — whether to allow, delay, block, or escalate.
+The agent's code is unchanged. The agent doesn't know it's being governed. In default mode, every outbound HTTP request passes through a transparent proxy that classifies the operation, evaluates policy, and decides — in real time — whether to allow, delay, block, or escalate. In sandbox mode (`gvm run --sandbox`), GVM additionally applies seccomp syscall filtering and proxy-only network containment at the OS boundary.
 
 The agent cannot bypass this. Not because it's told not to, but because the architecture makes bypass structurally impossible:
 
 - The agent has no API keys (Layer 3 injects them post-enforcement)
 - The agent's declared operation is cross-checked against the actual URL (Layer 2 catches lies)
 - If the proxy is down, the agent has no network path to external APIs (Fail-Close)
+- In sandbox mode, blocked syscalls and non-proxy egress are denied at the kernel boundary
 
-This is not a wrapper. This is a **kernel**.
 
 ---
 
@@ -118,6 +115,8 @@ gvm run my_agent.py             # Run your agent through GVM
 
 That's it. Your agent's code is unchanged. Every outbound HTTP request now passes through the governance proxy.
 
+`gvm run` enforces governance at the HTTP layer. Add `--sandbox` to enable syscall and network controls (seccomp + namespace networking) at the OS layer.
+
 ```
  Your agent                GVM Proxy (:8080)                External API
  ┌──────────┐    HTTP      ┌──────────────────────┐  HTTPS  ┌──────────┐
@@ -137,8 +136,8 @@ python -m gvm.mock_demo         # Terminal 2 — mock LLM, real proxy enforcemen
 
 ```bash
 # Option A: gvm run (recommended — auto-starts proxy, sets up isolation)
-gvm run my_agent.py                 # Proxy auto-starts, HTTP_PROXY set automatically
-gvm run --sandbox my_agent.py       # + Linux namespace isolation (production)
+gvm run my_agent.py                 # Proxy auto-starts, HTTP_PROXY set automatically (HTTP governance)
+gvm run --sandbox my_agent.py       # + Linux namespace + seccomp + proxy-only egress (kernel enforcement)
 gvm run --contained my_agent.py     # + Docker isolation (any OS)
 
 # Option B: Manual proxy (any language)
@@ -178,6 +177,8 @@ A single policy engine can be fooled. If the agent declares `storage.read` but s
 | **Layer 3: Capability Token** | API key injection | Removes the means — agent never holds credentials |
 
 The final decision is `max_strict(Layer1, Layer2)` — the stricter ruling always wins.
+
+Note: this 3-layer decision pipeline is distinct from runtime containment modes (`--sandbox` / `--contained`), which add OS-level isolation and syscall/network restrictions.
 
 ### IC Classification (Enforcement Decisions)
 
@@ -294,4 +295,3 @@ Licensed under the [Apache License, Version 2.0](LICENSE).
 
 ---
 
-*Analemma: the figure-eight path traced by the sun across a year. A pattern of constraint that enables predictability. That's what governance is — not a cage, but a shape that makes the system legible.*
