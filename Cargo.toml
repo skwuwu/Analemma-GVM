@@ -10,6 +10,16 @@ description = "Analemma Governance Virtual Machine — AI agent enforcement prox
 license = "Apache-2.0"
 repository = "https://github.com/skwuwu/Analemma-GVM"
 
+# cargo-binstall: download pre-built binaries instead of compiling from source.
+# Install cargo-binstall: cargo install cargo-binstall
+# Then: cargo binstall gvm-proxy
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/gvm-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "gvm-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
 [dependencies]
 gvm-types = { path = "crates/gvm-types" }
 tokio = { version = "1", features = ["full"] }

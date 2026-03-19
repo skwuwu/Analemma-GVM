@@ -9,41 +9,107 @@
 GVM Vault is an encrypted key-value store for agent runtime state (checkpoints, conversation history, intermediate results). It is **NOT** a secrets manager — API credentials are handled separately by `APIKeyStore` (`src/api_keys.rs`).
 
 **What Vault does:**
-- AES-256-GCM encryption at rest
+- AES-256-GCM encryption at rest (via pluggable `KeyProvider` trait)
+- Pluggable storage backend (via `VaultBackend` trait)
 - Automatic nonce generation (no reuse)
 - Key zeroing on drop (`zeroize`)
 - WAL-first write for crash recovery metadata
 
 **What Vault does NOT do:**
-- Key rotation
-- Envelope encryption
-- KDF (key derivation function) — key is used directly from env var
-- HSM/KMS integration
+- Key rotation (planned v2.0)
+- Envelope encryption (planned with KMS integration)
+- KDF (key derivation function) — key is used directly from env var (planned: Argon2id)
 - Access control between agents
 
 **Production deployments should:**
-- Use KMS (AWS KMS, GCP KMS) for master key management
-- Use Redis with TLS for persistent backend (planned)
+- Implement `KeyProvider` for KMS (AWS KMS, GCP KMS)
+- Implement `VaultBackend` for Redis with TLS or DynamoDB
 - Restrict Vault API to localhost or mTLS-authenticated agents
 
 **Design principle**: Agents never handle raw encryption. The proxy encrypts/decrypts transparently. Key material is zeroed on drop to prevent memory remanence attacks.
 
 ---
 
-## 5.2 Encryption Layer (AES-256-GCM)
+## 5.2 Trait Architecture
 
-### Key Management
+### KeyProvider
 
 ```rust
-struct VaultEncryption {
+pub trait KeyProvider: Send + Sync {
+    fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>>;
+    fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>>;
+}
+```
+
+Separates cryptographic operations from storage. Implementations:
+
+| Implementation | Description | Status |
+|---------------|-------------|--------|
+| `LocalKeyProvider` | AES-256-GCM with local key material | MVP (implemented) |
+| AWS KMS | Envelope encryption via KMS Encrypt/Decrypt API | Planned (v2.0) |
+| GCP KMS | Same pattern, Google Cloud API | Planned (v2.0) |
+
+### VaultBackend
+
+```rust
+pub trait VaultBackend: Send + Sync {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
+    async fn put(&self, key: &str, value: Vec<u8>) -> Result<()>;
+    async fn delete(&self, key: &str) -> Result<()>;
+    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>>;
+    async fn len(&self) -> Result<usize>;
+    async fn contains_key(&self, key: &str) -> Result<bool>;
+}
+```
+
+Separates storage from encryption. All values stored are already encrypted by KeyProvider. Implementations:
+
+| Implementation | Persistence | Status |
+|---------------|-------------|--------|
+| `InMemoryBackend` | None (lost on restart) | MVP (implemented) |
+| Redis with TLS | Durable, TTL support | Planned (v2.0) |
+| DynamoDB | Serverless durable | Planned (v2.0) |
+
+### Vault Struct
+
+```rust
+pub struct Vault<B: VaultBackend = InMemoryBackend> {
+    backend: B,
+    key_provider: Box<dyn KeyProvider>,
+    ledger: Arc<Ledger>,
+}
+```
+
+The default type parameter `InMemoryBackend` means existing code using `Vault` (without type params) continues to work unchanged. Custom backends use `Vault::with_backends()`:
+
+```rust
+// MVP (default): local encryption + in-memory storage
+let vault = Vault::new(ledger)?;
+
+// Production: KMS encryption + Redis storage
+let vault = Vault::with_backends(
+    Box::new(AwsKmsKeyProvider::new(kms_key_id)),
+    RedisBackend::new(redis_url),
+    ledger,
+);
+```
+
+---
+
+## 5.3 Encryption Layer (AES-256-GCM)
+
+### Key Management (LocalKeyProvider)
+
+```rust
+pub struct LocalKeyProvider {
     key: [u8; 32],  // AES-256 key
 }
 ```
 
 **Key source** (priority order):
 1. `GVM_VAULT_KEY` environment variable (64 hex chars → 32 bytes)
-2. Deterministic dev key (development only, logged as warning)
-3. Production: AWS KMS / HashiCorp Vault (planned)
+2. Random ephemeral key (development only, logged as warning)
+3. Production: KMS via `KeyProvider` trait implementation
 
 ### Encrypt
 
@@ -83,12 +149,12 @@ fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
 
 ---
 
-## 5.3 Memory Security (Secret Zeroing)
+## 5.4 Memory Security (Secret Zeroing)
 
 ### Drop Implementation
 
 ```rust
-impl Drop for VaultEncryption {
+impl Drop for LocalKeyProvider {
     fn drop(&mut self) {
         self.key.zeroize();  // Zero 32 bytes of key material
     }
@@ -97,7 +163,7 @@ impl Drop for VaultEncryption {
 
 The `zeroize` crate guarantees that the compiler will not optimize away the zeroing operation (unlike `memset` which can be eliminated by dead-store elimination). This ensures:
 
-- Key material does not persist in freed memory after `VaultEncryption` is dropped
+- Key material does not persist in freed memory after `LocalKeyProvider` is dropped
 - Core dumps do not contain encryption keys
 - Memory page reuse by other processes cannot recover key material
 
@@ -121,14 +187,15 @@ The intermediate `Vec<u8>` from hex decoding is zeroed on **all code paths** (su
 
 ---
 
-## 5.4 Vault Operations
+## 5.5 Vault Operations
 
 ### Write (WAL-First)
 
 ```
-1. Encrypt plaintext → ciphertext
-2. WAL append (encrypted value, fsync)  ← Fail-Close: reject on WAL failure
-3. Store in HashMap
+1. Validate size limits (value ≤ 1MB, key count ≤ 10K)
+2. Encrypt plaintext via KeyProvider → ciphertext
+3. WAL append (encrypted value, fsync)  ← Fail-Close: reject on WAL failure
+4. Store in backend via VaultBackend.put()
 ```
 
 The WAL records the **encrypted** value, not plaintext. Even if the WAL file is compromised, stored values remain encrypted.
@@ -136,9 +203,9 @@ The WAL records the **encrypted** value, not plaintext. Even if the WAL file is 
 ### Read (Async Audit)
 
 ```
-1. Read ciphertext from HashMap
+1. Read ciphertext from backend via VaultBackend.get()
 2. Async audit log (key name only, no value)  ← IC-1, loss tolerated
-3. Decrypt ciphertext → return plaintext
+3. Decrypt ciphertext via KeyProvider → return plaintext
 ```
 
 Read audit events do **not** include the decrypted value — only the key name and agent identity. This prevents audit log compromise from leaking secrets.
@@ -147,24 +214,45 @@ Read audit events do **not** include the decrypted value — only the key name a
 
 ```
 1. WAL append (delete event, fsync)
-2. Remove from HashMap
+2. Remove from backend via VaultBackend.delete()
 ```
 
 ---
 
-## 5.5 Concurrent Access
+## 5.6 Concurrent Access
 
-The Vault uses `tokio::sync::RwLock<HashMap>`:
+With `InMemoryBackend`, the Vault uses `tokio::sync::RwLock<HashMap>`:
 
 - **Reads**: Multiple concurrent reads allowed (no blocking)
 - **Writes**: Exclusive lock (serialized)
 - **Concurrent writes to same key**: Last-writer-wins. Both writes succeed in WAL, HashMap takes the final value.
 
-**TOCTOU note**: Under concurrent writes to the same key, both are recorded in the WAL (full audit trail), but the in-memory HashMap reflects only the last write. This is acceptable for the MVP; production would use Redis with atomic operations.
+**TOCTOU note**: Under concurrent writes to the same key, both are recorded in the WAL (full audit trail), but the in-memory backend reflects only the last write. This is acceptable for the MVP; production backends (Redis) should use atomic operations.
 
 ---
 
-## 5.6 Test Coverage
+## 5.7 Persistence Requirements
+
+The MVP `InMemoryBackend` loses all data on process restart. For persistent state across restarts, implement `VaultBackend` with a durable store:
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| **Redis with TLS** | Fast, TTL support, pub/sub for invalidation | Operational overhead, separate process |
+| **File-based (sled/rocksdb)** | No external dependency, embedded | No built-in TTL, compaction management |
+| **DynamoDB** | Serverless, auto-scaling | Network latency, AWS-only |
+| **WAL recovery** | No new dependency | WAL stores metadata (hash+size), not full encrypted values |
+
+**Key constraint**: WAL currently records only metadata (content hash + size) for vault writes, not the full encrypted value. Full WAL-based recovery would require storing the encrypted ciphertext in the WAL — a design change with WAL size implications.
+
+**Recommended production path**: Redis with TLS as `VaultBackend` implementation. This provides:
+- Persistence across restarts
+- TTL-based key expiration
+- Atomic operations (no TOCTOU)
+- TLS encryption in transit (complementing Vault's at-rest encryption)
+
+---
+
+## 5.8 Test Coverage
 
 ### Unit Tests (src/vault.rs)
 
@@ -177,17 +265,19 @@ The Vault uses `tokio::sync::RwLock<HashMap>`:
 | `test_wrong_key_returns_integrity_error` | Wrong key → "integrity error", no AES internals leaked |
 | `test_empty_plaintext_roundtrip` | Empty string encrypts/decrypts correctly |
 | `test_nonce_reuse_not_possible` | 100 encryptions → 100 unique nonces |
+| `test_in_memory_backend_crud` | InMemoryBackend get/put/delete/len/contains_key roundtrip |
+| `test_in_memory_backend_list_keys` | Prefix-scoped key listing with multiple agents |
 
 ### Integration Tests (tests/hostile.rs)
 
 | Test | Assertion |
 |------|-----------|
 | `vault_concurrent_writes_to_same_key` | 50 concurrent writes → no deadlock, value exists |
-| `vault_key_is_zeroed_on_drop` | VaultEncryption drop completes without crash, zeroize contract verified |
+| `vault_key_is_zeroed_on_drop` | LocalKeyProvider drop completes without crash, zeroize contract verified |
 
 ---
 
-## 5.7 Security Implications
+## 5.9 Security Implications
 
 | Threat | Mitigation | Verification |
 |--------|-----------|--------------|

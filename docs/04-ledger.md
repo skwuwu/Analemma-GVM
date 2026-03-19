@@ -52,42 +52,70 @@ The Ledger provides crash-safe event recording with a WAL-first (Write-Ahead Log
 
 ---
 
-## 4.4 WAL (Write-Ahead Log)
+## 4.4 WAL (Write-Ahead Log) with Group Commit + Merkle Tree
 
 ### Structure
 
-The WAL is a newline-delimited JSON file (`data/wal.log`):
+The WAL is a newline-delimited JSON file (`data/wal.log`) containing interleaved event records and Merkle batch records:
 
 ```json
-{"event_id":"evt-001","trace_id":"tr-abc","operation":"gvm.payment.refund","status":"Pending",...}
-{"event_id":"evt-001","trace_id":"tr-abc","operation":"gvm.payment.refund","status":"Confirmed",...}
+{"event_id":"evt-001","trace_id":"tr-abc","operation":"gvm.payment.refund","status":"Pending","event_hash":"a1b2..."}
+{"event_id":"evt-002","trace_id":"tr-abc","operation":"gvm.messaging.send","status":"Pending","event_hash":"c3d4..."}
+{"batch_id":0,"merkle_root":"e5f6...","prev_batch_root":null,"event_count":2,"timestamp":"..."}
 ```
 
-Each event may appear multiple times as its status transitions (Pending → Confirmed/Failed/Expired).
+Events within a batch form a Merkle tree (intra-batch integrity). Batches are chained via `prev_batch_root` (inter-batch integrity).
 
-### Implementation
+### Group Commit Architecture
+
+```
+Caller A ─┐
+Caller B ──┤ mpsc channel (4096) → batch_loop → collect(try_recv drain) →
+Caller C ──┘                         write_all(events + batch_record) → fsync(1x)
+```
+
+Event hashing and JSON serialization happen in **caller threads** (parallel). The batch loop collects all queued events via non-blocking `try_recv()` drain, then writes the entire batch + Merkle batch record in a single `write_all + fsync`.
 
 ```rust
 struct WAL {
-    file: tokio::sync::Mutex<tokio::fs::File>,
-    path: PathBuf,
+    tx: tokio::sync::mpsc::Sender<GroupCommitRequest>,
+    _batch_task: tokio::task::JoinHandle<()>,
 }
 
 async fn append(&self, event: &GVMEvent) -> Result<()> {
-    let mut json = serde_json::to_vec(event)?;
-    json.push(b'\n');
+    let hash = compute_event_hash(event);
+    let mut stamped = event.clone();
+    stamped.event_hash = Some(hash.clone());
+    let data = serde_json::to_vec(&stamped)?;
 
-    let mut file = self.file.lock().await;
-    file.write_all(&json).await?;
-    file.sync_data().await?; // fsync — crash safe
-    Ok(())
+    let (reply_tx, reply_rx) = oneshot::channel();
+    self.tx.send(GroupCommitRequest { data, event_hash: hash, reply: reply_tx }).await?;
+    reply_rx.await?
 }
 ```
 
 **Key properties**:
-- `tokio::sync::Mutex` ensures serial WAL writes (no interleaving)
-- `sync_data()` calls fsync — data survives process/OS crash
-- Append-only — no in-place mutations, no corruption risk from partial writes
+- **One fsync per batch** — amortized across all events in the batch (not per-event)
+- **Non-blocking drain** — `try_recv()` collects all queued events without timer overhead
+- **Bounded backpressure** — channel capacity 4096, max batch size 128
+- **Caller-parallel serialization** — event hash + JSON computed before channel send
+- **Emergency WAL fallback** — if primary WAL fails, events go to `wal_emergency.log` (degraded mode, no Merkle)
+
+### Global Merkle Chain Design
+
+**All agents share a single WAL and a single Merkle chain.** This is a deliberate architectural choice:
+
+| Property | Global chain (current) | Per-agent chains (rejected) |
+|----------|----------------------|---------------------------|
+| Cross-agent ordering | Cryptographically guaranteed | Impossible (timestamp-only, forgeable) |
+| Collusion detection | "A denied → B retries same URL" provable | Requires timestamp merge (not tamper-proof) |
+| Verification | Single `verify_wal()` pass | N passes + cross-chain reconciliation |
+| WAL file management | 1 file | N files (one per agent) |
+| Serialization point | Batch-level (group commit) | None (but N separate fsyncs) |
+
+**Why global doesn't bottleneck**: The serialization point is the batch, not the event. At 100 agents × 10 ops/sec = 1,000 events/sec, with batch drain collecting ~10 events per batch, that's ~100 fsyncs/sec — trivial for any modern disk. Sharding becomes relevant only at ~100K events/sec, at which point NATS JetStream provides cross-shard ordering.
+
+**Scaling path**: v1.x global WAL → v2.x NATS JetStream handles ordering → v3.x proxy sharding by agent_id hash (if needed).
 
 ---
 
@@ -96,6 +124,9 @@ async fn append(&self, event: &GVMEvent) -> Result<()> {
 ```rust
 pub struct Ledger {
     wal: WAL,
+    emergency_wal: EmergencyWAL,
+    primary_failures: AtomicU64,
+    emergency_writes: AtomicU64,
     nats_url: String,
     stream_name: String,
     wal_sequence: AtomicU64,  // Monotonic counter
@@ -108,7 +139,7 @@ pub struct Ledger {
 
 ```rust
 let wal_seq = self.wal_sequence.fetch_add(1, Ordering::SeqCst);
-self.wal.append(event).await?;
+self.wal.append(event).await?;  // group commit: batched fsync + Merkle
 // NATS publish includes wal_seq as header
 ```
 
@@ -116,6 +147,7 @@ self.wal.append(event).await?;
 - Lock-free (`AtomicU64`) — zero performance impact
 - Monotonic — strictly increasing, no gaps within a process lifetime
 - SeqCst ordering — visible to all threads immediately
+- **Known limitation**: Resets to 0 on restart (v1.1 fix: initialize from WAL event count)
 
 ---
 
@@ -186,11 +218,12 @@ pub async fn recover_from_wal(&self) -> Result<RecoveryReport> {
 
 ## 4.9 Security Implications
 
-- **Fail-Close**: WAL write failure → request rejected. No action without audit record.
-- **Tamper Resilience**: Corrupted entries are skipped; recovery continues with valid data.
+- **Fail-Close**: WAL write failure → request rejected. No action without audit record. Both primary and emergency WAL must fail before Fail-Close triggers.
+- **Tamper Detection**: Per-event SHA-256 hashes + Merkle batch roots. `verify_wal()` detects both event content tampering and batch chain breaks.
 - **No Phantom Records**: Expired status explicitly marks uncertain execution state.
+- **Cross-Agent Ordering**: Global Merkle chain provides cryptographic proof of event ordering across all agents. This enables collusion detection: "Agent A was denied at batch N, Agent B attempted the same URL at batch N+1" is provable, not just timestamp-correlated.
 - **Ordering Guarantee**: AtomicU64 sequence allows NATS consumers to reconstruct exact WAL order.
-- **Backpressure**: WAL mutex serializes writes, preventing unbounded concurrent disk I/O.
+- **Backpressure**: Bounded channel (4096) + max batch size (128) prevent unbounded resource consumption.
 
 ---
 

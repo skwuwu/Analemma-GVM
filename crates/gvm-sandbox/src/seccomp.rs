@@ -117,93 +117,8 @@ pub fn apply_seccomp_filter(profile: &Option<SeccompProfile>) -> Result<()> {
 fn build_default_filter(default_action: SeccompAction) -> Result<seccompiler::BpfProgram> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
-    // Helper to allow a syscall unconditionally
-    macro_rules! allow {
-        ($($syscall:expr),+ $(,)?) => {
-            $(rules.insert($syscall as i64, vec![]);)+
-        };
-    }
-
-    // Process lifecycle
-    allow!(
-        libc::SYS_exit,
-        libc::SYS_exit_group,
-        libc::SYS_wait4,
-        libc::SYS_waitid,
-        libc::SYS_futex,
-        libc::SYS_nanosleep,
-        libc::SYS_clock_nanosleep,
-        libc::SYS_sched_yield,
-        libc::SYS_sched_getaffinity,
-        libc::SYS_getpid,
-        libc::SYS_gettid,
-        libc::SYS_getppid,
-        libc::SYS_set_tid_address,
-        libc::SYS_set_robust_list,
-        libc::SYS_get_robust_list,
-        libc::SYS_rt_sigaction,
-        libc::SYS_rt_sigprocmask,
-        libc::SYS_rt_sigreturn,
-        libc::SYS_sigaltstack,
-        libc::SYS_tgkill,
-        libc::SYS_clone,    // Threads only (CLONE_THREAD)
-        libc::SYS_clone3,
-        libc::SYS_execve    // For the initial exec
-    );
-
-    // Memory management
-    allow!(
-        libc::SYS_mmap,
-        libc::SYS_mprotect,
-        libc::SYS_munmap,
-        libc::SYS_brk,
-        libc::SYS_mremap,
-        libc::SYS_madvise,
-        libc::SYS_membarrier
-    );
-
-    // File I/O
-    allow!(
-        libc::SYS_read,
-        libc::SYS_write,
-        libc::SYS_close,
-        libc::SYS_fstat,
-        libc::SYS_stat,
-        libc::SYS_lstat,
-        libc::SYS_lseek,
-        libc::SYS_openat,
-        libc::SYS_fcntl,
-        libc::SYS_dup,
-        libc::SYS_dup2,
-        libc::SYS_dup3,
-        libc::SYS_pipe,
-        libc::SYS_pipe2,
-        libc::SYS_readv,
-        libc::SYS_writev,
-        libc::SYS_pread64,
-        libc::SYS_pwrite64,
-        libc::SYS_access,
-        libc::SYS_faccessat,
-        libc::SYS_faccessat2,
-        libc::SYS_getcwd,
-        libc::SYS_readlink,
-        libc::SYS_readlinkat,
-        libc::SYS_newfstatat,
-        libc::SYS_statx,
-        libc::SYS_getdents,
-        libc::SYS_getdents64,
-        libc::SYS_ftruncate,
-        libc::SYS_rename,
-        libc::SYS_renameat,
-        libc::SYS_renameat2,
-        libc::SYS_unlink,
-        libc::SYS_unlinkat,
-        libc::SYS_mkdir,
-        libc::SYS_mkdirat,
-        libc::SYS_rmdir,
-        libc::SYS_chdir,
-        libc::SYS_fchdir
-    );
+    // Shared base syscalls (process lifecycle, memory, file I/O, polling, time, identity, misc)
+    insert_base_syscalls(&mut rules);
 
     // Networking (HTTP traffic only — TCP/UDP sockets)
     //
@@ -245,6 +160,14 @@ fn build_default_filter(default_action: SeccompAction) -> Result<seccompiler::Bp
             .context("Failed to build AF_INET6 rule")?,
         ],
     );
+
+    // Helper to allow a syscall unconditionally
+    macro_rules! allow {
+        ($($syscall:expr),+ $(,)?) => {
+            $(rules.insert($syscall as i64, vec![]);)+
+        };
+    }
+
     // All other socket operations (non-creation) remain unconditionally allowed
     allow!(
         libc::SYS_connect,
@@ -263,49 +186,6 @@ fn build_default_filter(default_action: SeccompAction) -> Result<seccompiler::Bp
         libc::SYS_accept4
     );
 
-    // Polling / event loop
-    allow!(
-        libc::SYS_poll,
-        libc::SYS_ppoll,
-        libc::SYS_epoll_create,
-        libc::SYS_epoll_create1,
-        libc::SYS_epoll_ctl,
-        libc::SYS_epoll_wait,
-        libc::SYS_epoll_pwait,
-        libc::SYS_select,
-        libc::SYS_pselect6,
-        libc::SYS_eventfd,
-        libc::SYS_eventfd2
-    );
-
-    // Time
-    allow!(
-        libc::SYS_clock_gettime,
-        libc::SYS_clock_getres,
-        libc::SYS_gettimeofday
-    );
-
-    // Identity (read-only)
-    allow!(
-        libc::SYS_getuid,
-        libc::SYS_getgid,
-        libc::SYS_geteuid,
-        libc::SYS_getegid,
-        libc::SYS_getgroups
-    );
-
-    // Misc required by Python/Node runtimes
-    allow!(
-        libc::SYS_getrandom,
-        libc::SYS_arch_prctl,
-        libc::SYS_prctl,
-        libc::SYS_ioctl,      // FIONREAD, TIOCGWINSZ
-        libc::SYS_uname,
-        libc::SYS_sysinfo,
-        libc::SYS_prlimit64,
-        libc::SYS_rseq
-    );
-
     let filter = SeccompFilter::new(
         rules,
         // Default action for non-whitelisted syscalls (KillProcess or Log)
@@ -322,38 +202,84 @@ fn build_default_filter(default_action: SeccompAction) -> Result<seccompiler::Bp
         .context("Failed to compile seccomp BPF program")
 }
 
-/// Build a strict filter: no networking at all (offline computation only).
-fn build_strict_filter(default_action: SeccompAction) -> Result<seccompiler::BpfProgram> {
-    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
-
+/// Insert the base (non-networking) syscall whitelist shared by all filter profiles.
+/// This covers process lifecycle, memory, file I/O, polling, time, identity, and runtime support.
+fn insert_base_syscalls(rules: &mut BTreeMap<i64, Vec<SeccompRule>>) {
     macro_rules! allow {
         ($($syscall:expr),+ $(,)?) => {
             $(rules.insert($syscall as i64, vec![]);)+
         };
     }
 
-    // Same as default but WITHOUT networking syscalls
+    // Process lifecycle
     allow!(
-        libc::SYS_exit, libc::SYS_exit_group, libc::SYS_wait4, libc::SYS_futex,
-        libc::SYS_nanosleep, libc::SYS_clock_nanosleep, libc::SYS_sched_yield,
-        libc::SYS_getpid, libc::SYS_gettid, libc::SYS_set_tid_address,
-        libc::SYS_set_robust_list, libc::SYS_rt_sigaction, libc::SYS_rt_sigprocmask,
-        libc::SYS_rt_sigreturn, libc::SYS_sigaltstack, libc::SYS_tgkill,
-        libc::SYS_clone, libc::SYS_clone3, libc::SYS_execve,
+        libc::SYS_exit, libc::SYS_exit_group, libc::SYS_wait4, libc::SYS_waitid,
+        libc::SYS_futex, libc::SYS_nanosleep, libc::SYS_clock_nanosleep,
+        libc::SYS_sched_yield, libc::SYS_sched_getaffinity,
+        libc::SYS_getpid, libc::SYS_gettid, libc::SYS_getppid,
+        libc::SYS_set_tid_address, libc::SYS_set_robust_list, libc::SYS_get_robust_list,
+        libc::SYS_rt_sigaction, libc::SYS_rt_sigprocmask, libc::SYS_rt_sigreturn,
+        libc::SYS_sigaltstack, libc::SYS_tgkill,
+        libc::SYS_clone, libc::SYS_clone3, libc::SYS_execve
+    );
+
+    // Memory management
+    allow!(
         libc::SYS_mmap, libc::SYS_mprotect, libc::SYS_munmap, libc::SYS_brk,
-        libc::SYS_mremap, libc::SYS_madvise,
+        libc::SYS_mremap, libc::SYS_madvise, libc::SYS_membarrier
+    );
+
+    // File I/O
+    allow!(
         libc::SYS_read, libc::SYS_write, libc::SYS_close, libc::SYS_fstat,
         libc::SYS_stat, libc::SYS_lstat, libc::SYS_lseek, libc::SYS_openat,
         libc::SYS_fcntl, libc::SYS_dup, libc::SYS_dup2, libc::SYS_dup3,
-        libc::SYS_pipe2, libc::SYS_readv, libc::SYS_writev,
-        libc::SYS_pread64, libc::SYS_pwrite64, libc::SYS_access, libc::SYS_faccessat,
+        libc::SYS_pipe, libc::SYS_pipe2,
+        libc::SYS_readv, libc::SYS_writev, libc::SYS_pread64, libc::SYS_pwrite64,
+        libc::SYS_access, libc::SYS_faccessat, libc::SYS_faccessat2,
         libc::SYS_getcwd, libc::SYS_readlink, libc::SYS_readlinkat,
-        libc::SYS_newfstatat, libc::SYS_getdents64, libc::SYS_chdir,
-        libc::SYS_clock_gettime, libc::SYS_clock_getres, libc::SYS_gettimeofday,
-        libc::SYS_getuid, libc::SYS_getgid, libc::SYS_geteuid, libc::SYS_getegid,
-        libc::SYS_getrandom, libc::SYS_arch_prctl, libc::SYS_prctl,
-        libc::SYS_ioctl, libc::SYS_uname, libc::SYS_prlimit64, libc::SYS_rseq
+        libc::SYS_newfstatat, libc::SYS_statx,
+        libc::SYS_getdents, libc::SYS_getdents64,
+        libc::SYS_ftruncate, libc::SYS_rename, libc::SYS_renameat, libc::SYS_renameat2,
+        libc::SYS_unlink, libc::SYS_unlinkat,
+        libc::SYS_mkdir, libc::SYS_mkdirat, libc::SYS_rmdir,
+        libc::SYS_chdir, libc::SYS_fchdir
     );
+
+    // Polling / event loop
+    allow!(
+        libc::SYS_poll, libc::SYS_ppoll,
+        libc::SYS_epoll_create, libc::SYS_epoll_create1, libc::SYS_epoll_ctl,
+        libc::SYS_epoll_wait, libc::SYS_epoll_pwait,
+        libc::SYS_select, libc::SYS_pselect6,
+        libc::SYS_eventfd, libc::SYS_eventfd2
+    );
+
+    // Time
+    allow!(
+        libc::SYS_clock_gettime, libc::SYS_clock_getres, libc::SYS_gettimeofday
+    );
+
+    // Identity (read-only)
+    allow!(
+        libc::SYS_getuid, libc::SYS_getgid, libc::SYS_geteuid, libc::SYS_getegid,
+        libc::SYS_getgroups
+    );
+
+    // Misc required by Python/Node runtimes
+    allow!(
+        libc::SYS_getrandom, libc::SYS_arch_prctl, libc::SYS_prctl,
+        libc::SYS_ioctl, libc::SYS_uname, libc::SYS_sysinfo,
+        libc::SYS_prlimit64, libc::SYS_rseq
+    );
+}
+
+/// Build a strict filter: no networking at all (offline computation only).
+fn build_strict_filter(default_action: SeccompAction) -> Result<seccompiler::BpfProgram> {
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+
+    // Strict profile uses the shared base syscalls (no networking)
+    insert_base_syscalls(&mut rules);
 
     let filter = SeccompFilter::new(
         rules,

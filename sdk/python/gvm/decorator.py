@@ -1,14 +1,45 @@
-"""@ic decorator — semantic operation declaration for GVM proxy (PART 7.1)."""
+"""@ic decorator — semantic operation declaration for GVM proxy.
+
+Works on standalone functions, class methods, and GVMAgent methods:
+
+    # Standalone (no inheritance required)
+    @ic(operation="gvm.messaging.send")
+    def send_email(to, subject, body):
+        session = gvm_session()
+        return session.post(...).json()
+
+    # GVMAgent method (full features: checkpoint, state, rollback)
+    class MyAgent(GVMAgent):
+        @ic(operation="gvm.messaging.send")
+        def send_email(self, to, subject, body):
+            session = self.create_session()
+            ...
+
+    # Stackable with LangChain @tool
+    @tool
+    @ic(operation="gvm.messaging.send")
+    def send_email(to: str, subject: str, body: str):
+        \"\"\"Send an email via Gmail.\"\"\"
+        ...
+"""
 
 import functools
 import json
 import re
 import uuid
+import warnings
 import threading
 from typing import Optional
 
 from gvm.errors import GVMDeniedError, GVMApprovalRequiredError, GVMRollbackError
 from gvm.resource import Resource
+from gvm.session import (
+    set_pending_headers,
+    has_pending_headers,
+    get_and_clear_pending_headers,
+    get_agent_id,
+    get_tenant_id,
+)
 
 # Operation names must match: alphanumeric, dots, hyphens, underscores only.
 # Prevents header injection via newlines or special characters in operation names.
@@ -39,27 +70,6 @@ def _set_current_event_id(event_id: str):
     _trace_context.current_event_id = event_id
 
 
-# Thread-local GVM header setter — each GVMAgent instance registers its own
-# setter on the thread where it operates, avoiding global state races.
-_gvm_context = threading.local()
-
-
-def _register_header_setter(setter):
-    """Register a per-thread header setter (called by GVMAgent.__init__)."""
-    _gvm_context.header_setter = setter
-
-
-def _set_gvm_headers(headers: dict):
-    """Inject GVM headers into the outgoing HTTP request context.
-
-    This is called by the @ic wrapper before the decorated function executes.
-    The GVMAgent registers a per-thread setter to configure the proxy-aware HTTP session.
-    """
-    setter = getattr(_gvm_context, "header_setter", None)
-    if setter is not None:
-        setter(headers)
-
-
 def _infer_ic_level(operation: str) -> int:
     """Infer IC level from operation name for auto-checkpoint decisions.
 
@@ -78,6 +88,15 @@ def _infer_ic_level(operation: str) -> int:
     return 2
 
 
+def _is_gvm_agent(obj) -> bool:
+    """Duck-type check for GVMAgent instance (avoids circular import)."""
+    return (
+        hasattr(obj, "_agent_id")
+        and hasattr(obj, "_checkpoint_mgr")
+        and hasattr(obj, "_session_id")
+    )
+
+
 def ic(
     operation: str = None,
     rate_limit: int = None,
@@ -85,32 +104,44 @@ def ic(
     checkpoint: bool = None,
     **context_kwargs,
 ):
-    """Declare a method as a GVM-controlled operation.
+    """Declare a function or method as a GVM-controlled operation.
+
+    Works on standalone functions and class methods (with or without GVMAgent).
+    Preserves function signature for compatibility with LangChain @tool and
+    other decorator-based frameworks.
 
     Args:
         operation: Operation name (e.g. "gvm.messaging.send").
                    If omitted, auto-generated as "custom.auto.{func_name}".
         rate_limit: Max invocations per minute (optional).
         resource: Target resource descriptor (optional).
-        checkpoint: If True, save a checkpoint before this operation.
+        checkpoint: If True, save a checkpoint before this operation (GVMAgent only).
                     If None, defer to agent's auto_checkpoint setting.
         **context_kwargs: Additional ABAC context attributes (e.g. amount=None).
 
     Usage:
+        # Standalone function (no inheritance)
         @ic(operation="gvm.messaging.send",
-            resource=Resource(service="slack", tier="customer-facing"),
-            rate_limit=100)
-        def send_alert(self, channel, message):
-            ...
+            resource=Resource(service="slack", tier="customer-facing"))
+        def send_alert(channel, message):
+            session = gvm_session()
+            return session.post(...).json()
 
-        # With explicit checkpoint (rollback if denied)
+        # GVMAgent method (checkpoint + rollback support)
         @ic(operation="gvm.payment.charge", checkpoint=True)
         def charge_card(self, amount):
             ...
 
         # Minimal version (operation auto-inferred)
         @ic()
-        def send_email(self):
+        def send_email(to, subject, body):
+            ...
+
+        # Stackable with LangChain @tool
+        @tool
+        @ic(operation="gvm.messaging.send")
+        def send_email(to: str, subject: str, body: str):
+            \"\"\"Send an email via Gmail.\"\"\"
             ...
     """
 
@@ -119,8 +150,6 @@ def ic(
         op = operation or f"custom.auto.{func.__name__}"
 
         # Validate operation name to prevent header injection attacks.
-        # Operation names are passed as HTTP headers (X-GVM-Operation);
-        # characters like \r\n could break the HTTP protocol.
         if not _OPERATION_PATTERN.match(op):
             raise ValueError(
                 f"Invalid operation name: {op!r}. "
@@ -137,12 +166,27 @@ def ic(
         func._gvm_ic_level = ic_level
 
         @functools.wraps(func)
-        def wrapper(self, *args, **kwargs):
+        def wrapper(*args, **kwargs):
+            # Detect GVMAgent instance (method call on agent subclass)
+            agent = None
+            if args and _is_gvm_agent(args[0]):
+                agent = args[0]
+
             event_id = str(uuid.uuid4())
             parent_event_id = get_current_event_id()
 
+            # Build GVM headers — source identity from agent or module config
+            if agent:
+                agent_id = agent._agent_id
+                tenant_id = getattr(agent, "_tenant_id", None)
+                session_id = getattr(agent, "_session_id", None)
+            else:
+                agent_id = get_agent_id()
+                tenant_id = get_tenant_id()
+                session_id = None
+
             headers = {
-                "X-GVM-Agent-Id": getattr(self, "_agent_id", "unknown"),
+                "X-GVM-Agent-Id": agent_id,
                 "X-GVM-Trace-Id": get_trace_id(),
                 "X-GVM-Parent-Event-Id": parent_event_id or "",
                 "X-GVM-Event-Id": event_id,
@@ -152,66 +196,72 @@ def ic(
                 "X-GVM-Rate-Limit": str(rate_limit) if rate_limit else "",
             }
 
-            # Add tenant/session if available on the agent
-            tenant_id = getattr(self, "_tenant_id", None)
             if tenant_id:
                 headers["X-GVM-Tenant-Id"] = tenant_id
-            session_id = getattr(self, "_session_id", None)
             if session_id:
                 headers["X-GVM-Session-Id"] = session_id
 
-            # Inject headers into the HTTP context
-            _set_gvm_headers(headers)
+            # Store headers for gvm_session() / create_session() consumption
+            set_pending_headers(headers)
 
             # Set current event for child operations
             prev_event_id = get_current_event_id()
             _set_current_event_id(event_id)
 
-            # Determine if checkpoint is needed
+            # Checkpoint logic (GVMAgent only)
             should_checkpoint = checkpoint
-            if should_checkpoint is None:
-                checkpoint_mgr = getattr(self, "_checkpoint_mgr", None)
-                if checkpoint_mgr is not None:
-                    should_checkpoint = getattr(
-                        self, "_should_auto_checkpoint", lambda _: False
-                    )(ic_level)
-                else:
-                    should_checkpoint = False
-
-            # Save checkpoint before execution
             checkpoint_step = None
-            if should_checkpoint:
-                checkpoint_mgr = getattr(self, "_checkpoint_mgr", None)
-                get_state = getattr(self, "_get_checkpointable_state", None)
-                if checkpoint_mgr and get_state:
-                    state_snapshot = get_state()
-                    checkpoint_step = checkpoint_mgr.save(state_snapshot)
+
+            if agent:
+                if should_checkpoint is None:
+                    should_auto = getattr(agent, "_should_auto_checkpoint", None)
+                    should_checkpoint = should_auto(ic_level) if should_auto else False
+                if should_checkpoint:
+                    mgr = getattr(agent, "_checkpoint_mgr", None)
+                    get_state = getattr(agent, "_get_checkpointable_state", None)
+                    if mgr and get_state:
+                        checkpoint_step = mgr.save(get_state())
+            else:
+                should_checkpoint = False
 
             try:
-                result = func(self, *args, **kwargs)
+                result = func(*args, **kwargs)
+
+                # Warn if headers were not consumed by a GVM-aware session.
+                # This means the developer used requests.post() directly,
+                # bypassing Layer 2 (ABAC) policy enforcement.
+                if has_pending_headers():
+                    warnings.warn(
+                        f"[GVM] @ic('{op}'): GVM headers were not consumed. "
+                        f"HTTP requests inside @ic-decorated functions should use "
+                        f"gvm_session() or self.create_session() to ensure "
+                        f"Layer 2 (ABAC) policy enforcement. "
+                        f"Direct requests.get/post() calls bypass semantic governance.",
+                        stacklevel=2,
+                    )
+                    get_and_clear_pending_headers()
+
                 return result
 
             except Exception as e:
-                # Check if this is a GVM denial that should trigger rollback
-                if should_checkpoint and checkpoint_step is not None and isinstance(
-                    e, (GVMDeniedError, GVMApprovalRequiredError)
+                # Rollback on denial (GVMAgent only)
+                if (
+                    agent
+                    and should_checkpoint
+                    and checkpoint_step is not None
+                    and isinstance(e, (GVMDeniedError, GVMApprovalRequiredError))
                 ):
-                    checkpoint_mgr = getattr(self, "_checkpoint_mgr", None)
-                    restore_fn = getattr(self, "_restore_from_state", None)
-                    if checkpoint_mgr and restore_fn:
-                        # Find the last approved step to roll back to
-                        restore_step = checkpoint_mgr.last_approved_step
+                    mgr = getattr(agent, "_checkpoint_mgr", None)
+                    restore_fn = getattr(agent, "_restore_from_state", None)
+                    if mgr and restore_fn:
+                        restore_step = mgr.last_approved_step
                         if restore_step >= 0:
                             try:
-                                restored = checkpoint_mgr.restore(restore_step)
-                                restore_fn(restored)
+                                restore_fn(mgr.restore(restore_step))
                             except Exception:
                                 pass  # Rollback best-effort
 
-                        # Inject rollback context into conversation history
-                        # so the LLM knows why it was rolled back and can
-                        # choose an alternative approach on the next turn.
-                        history = getattr(self, "_conversation_history", None)
+                        history = getattr(agent, "_conversation_history", None)
                         if history is not None:
                             history.append({
                                 "role": "system",
@@ -235,6 +285,9 @@ def ic(
             finally:
                 # Restore parent event context
                 _set_current_event_id(prev_event_id)
+                # Clean up any unconsumed headers silently on exception path
+                if has_pending_headers():
+                    get_and_clear_pending_headers()
 
         return wrapper
 

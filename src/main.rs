@@ -30,10 +30,22 @@ async fn main() {
     tracing::info!("Analemma GVM Proxy v0.1.0 starting...");
 
     // 1. Load configuration (tries GVM_CONFIG env, CWD, home dir, then defaults)
-    let config = ProxyConfig::load_or_default();
+    let mut config = ProxyConfig::load_or_default();
 
-    // 2. Load Operation Registry (Fail-Close: invalid registry → abort with guidance)
+    // 2. First-run detection: if config files are missing, offer interactive setup.
+    //    After setup, reload config so template proxy.toml settings take effect.
+    let registry_path_str = config.operations.registry_file.clone();
+    let srr_path_str = config.srr.network_file.clone();
+    if !Path::new(&registry_path_str).exists() && !Path::new(&srr_path_str).exists() {
+        if offer_first_run_setup() {
+            // Template applied — reload config to pick up template's proxy.toml
+            config = ProxyConfig::load_or_default();
+        }
+    }
     let registry_path = Path::new(&config.operations.registry_file);
+    let srr_path = Path::new(&config.srr.network_file);
+
+    // 3. Load Operation Registry (Fail-Close: invalid registry → abort with guidance)
     let registry = match OperationRegistry::load(registry_path) {
         Ok(r) => {
             tracing::info!("Operation registry loaded and validated");
@@ -59,8 +71,7 @@ async fn main() {
         }
     };
 
-    // 3. Load Network SRR rules (Fail-Close: invalid SRR → abort with guidance)
-    let srr_path = Path::new(&config.srr.network_file);
+    // 4. Load Network SRR rules (Fail-Close: invalid SRR → abort with guidance)
     let srr = match NetworkSRR::load(srr_path) {
         Ok(s) => {
             tracing::info!("Network SRR rules loaded");
@@ -209,7 +220,10 @@ async fn main() {
         }
     };
 
-    // 10. Compose shared state
+    // 10. Print startup policy summary
+    print_startup_summary(&srr, &policy, &registry, &api_keys);
+
+    // 11. Compose shared state
     let state = AppState {
         srr: Arc::new(srr),
         policy: Arc::new(policy),
@@ -271,4 +285,206 @@ async fn main() {
     tracing::info!(address = %config.server.listen, "GVM Proxy listening");
 
     axum::serve(listener, app).await.expect("Server error");
+}
+
+/// Print a human-readable startup summary of loaded governance rules.
+/// Helps operators verify that the correct policies are active before
+/// traffic starts flowing through the proxy.
+fn print_startup_summary(
+    srr: &gvm_proxy::srr::NetworkSRR,
+    policy: &gvm_proxy::policy::PolicyEngine,
+    registry: &gvm_proxy::registry::OperationRegistry,
+    api_keys: &gvm_proxy::api_keys::APIKeyStore,
+) {
+    let srr_info = srr.summary();
+    let (global_rules, tenant_count, agent_count) = policy.summary();
+
+    eprintln!();
+    eprintln!("  \x1b[1m\x1b[36m╔══════════════════════════════════════════╗\x1b[0m");
+    eprintln!("  \x1b[1m\x1b[36m║\x1b[0m   Analemma GVM — Governance Summary     \x1b[1m\x1b[36m║\x1b[0m");
+    eprintln!("  \x1b[1m\x1b[36m╚══════════════════════════════════════════╝\x1b[0m");
+    eprintln!();
+
+    // Layer 2: SRR (Network rules)
+    eprintln!("  \x1b[1mLayer 2 — Network SRR\x1b[0m");
+    eprintln!("    Rules loaded:     {}", srr_info.total_rules);
+    eprintln!(
+        "    \x1b[31mDeny:  {}\x1b[0m   \x1b[33mDelay: {}\x1b[0m   \x1b[32mAllow: {}\x1b[0m",
+        srr_info.deny_rules, srr_info.delay_rules, srr_info.allow_rules
+    );
+    eprintln!("    Default (no match): \x1b[33m{}\x1b[0m", srr_info.default_decision);
+
+    if !srr_info.sample_denies.is_empty() {
+        eprintln!("    Blocked endpoints:");
+        for deny in &srr_info.sample_denies {
+            eprintln!("      \x1b[31m✗\x1b[0m {}", deny);
+        }
+    }
+    eprintln!();
+
+    // Layer 1: ABAC (Policy engine)
+    eprintln!("  \x1b[1mLayer 1 — ABAC Policy\x1b[0m  \x1b[2m(requires SDK)\x1b[0m");
+    eprintln!(
+        "    Global rules: {}   Tenants: {}   Agent policies: {}",
+        global_rules, tenant_count, agent_count
+    );
+    if global_rules == 0 && tenant_count == 0 && agent_count == 0 {
+        eprintln!("    \x1b[2mNo ABAC policies loaded — SRR-only mode\x1b[0m");
+    }
+    eprintln!();
+
+    // Operations registry
+    eprintln!("  \x1b[1mOperation Registry\x1b[0m");
+    eprintln!(
+        "    Core: {}   Custom: {}",
+        registry.core_count(),
+        registry.custom_count()
+    );
+    eprintln!();
+
+    // Layer 3: API key isolation
+    eprintln!("  \x1b[1mLayer 3 — API Key Isolation\x1b[0m");
+    if api_keys.is_empty() {
+        eprintln!("    \x1b[33m⚠ No API keys configured — passthrough mode\x1b[0m");
+        eprintln!("    \x1b[2mAgents can call APIs directly without credential isolation.\x1b[0m");
+        eprintln!("    \x1b[2mRun: gvm init --industry saas\x1b[0m");
+    } else {
+        eprintln!("    \x1b[32m✓ Active\x1b[0m — credentials injected post-enforcement");
+    }
+    eprintln!();
+
+    // How decisions work
+    eprintln!("  \x1b[2m┌─────────────────────────────────────────────┐\x1b[0m");
+    eprintln!("  \x1b[2m│  Request flow:                              │\x1b[0m");
+    eprintln!("  \x1b[2m│  Agent → [SRR check] → [ABAC check*] →     │\x1b[0m");
+    eprintln!("  \x1b[2m│         [API key inject] → Upstream         │\x1b[0m");
+    eprintln!("  \x1b[2m│  * ABAC only with SDK (X-GVM-Agent-Id)      │\x1b[0m");
+    eprintln!("  \x1b[2m│  Unknown URLs → Delay(300ms) + audit trail  │\x1b[0m");
+    eprintln!("  \x1b[2m└─────────────────────────────────────────────┘\x1b[0m");
+    eprintln!();
+}
+
+/// Detect first-run (no config files present) and offer interactive setup.
+/// Reads from stdin — only prompts when running in a terminal (not piped/CI).
+/// Returns true if template files were successfully applied.
+fn offer_first_run_setup() -> bool {
+    use std::io::{self, BufRead, Write};
+
+    // Skip prompt in non-interactive environments (CI, piped input, tests)
+    if !atty_is_terminal() {
+        return false;
+    }
+
+    eprintln!();
+    eprintln!("  \x1b[1m\x1b[33m⚡ First Run Detected\x1b[0m");
+    eprintln!();
+    eprintln!("  No governance rules found. GVM needs a ruleset to enforce policies.");
+    eprintln!("  Choose an industry template to get started:");
+    eprintln!();
+    eprintln!("    \x1b[1m1\x1b[0m  \x1b[36mfinance\x1b[0m  — Wire transfers blocked, payments need IC-3 approval");
+    eprintln!("    \x1b[1m2\x1b[0m  \x1b[36msaas\x1b[0m     — Default-to-Caution, balanced security for SaaS agents");
+    eprintln!("    \x1b[1m3\x1b[0m  Skip     — Exit and configure manually");
+    eprintln!();
+    eprint!("  Select [1/2/3]: ");
+    io::stderr().flush().ok();
+
+    let stdin = io::stdin();
+    let mut line = String::new();
+    if stdin.lock().read_line(&mut line).is_err() {
+        return false;
+    }
+
+    let industry = match line.trim() {
+        "1" | "finance" => "finance",
+        "2" | "saas" => "saas",
+        _ => {
+            eprintln!();
+            eprintln!("  Skipped. To set up later:");
+            eprintln!("    \x1b[36mgvm init --industry saas\x1b[0m");
+            eprintln!();
+            return false;
+        }
+    };
+
+    // Find template directory relative to the executable or CWD
+    let template_candidates = [
+        format!("config/templates/{}", industry),
+        // If running from target/release or target/debug, look up
+        format!("../../config/templates/{}", industry),
+    ];
+
+    let template_dir = template_candidates
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .cloned();
+
+    let Some(template_dir) = template_dir else {
+        eprintln!();
+        eprintln!("  \x1b[31mTemplate directory not found.\x1b[0m");
+        eprintln!("  Run from repo root, or use: \x1b[36mgvm init --industry {}\x1b[0m", industry);
+        eprintln!();
+        return false;
+    };
+
+    let config_dir = Path::new("config");
+    let template_path = Path::new(&template_dir);
+
+    // Create config directory
+    if let Err(e) = std::fs::create_dir_all(config_dir.join("policies")) {
+        eprintln!("  \x1b[31mFailed to create config directory: {}\x1b[0m", e);
+        return false;
+    }
+
+    // Copy template files
+    let files_to_copy = [
+        "proxy.toml",
+        "srr_network.toml",
+        "operation_registry.toml",
+        "policies/global.toml",
+    ];
+
+    let mut copied = 0;
+    for file in &files_to_copy {
+        let src = template_path.join(file);
+        let dst = config_dir.join(file);
+        if src.exists() {
+            if let Err(e) = std::fs::copy(&src, &dst) {
+                eprintln!("  \x1b[31mFailed to copy {}: {}\x1b[0m", file, e);
+                continue;
+            }
+            eprintln!("  \x1b[32m✓\x1b[0m {}", file);
+            copied += 1;
+        }
+    }
+
+    // Create empty secrets.toml if missing
+    let secrets_path = config_dir.join("secrets.toml");
+    if !secrets_path.exists() {
+        let _ = std::fs::write(
+            &secrets_path,
+            "# API credentials — add your keys here\n# See secrets.toml.example for format\n",
+        );
+        eprintln!("  \x1b[32m✓\x1b[0m secrets.toml \x1b[2m(empty — add API keys later)\x1b[0m");
+        copied += 1;
+    }
+
+    eprintln!();
+    if copied > 0 {
+        eprintln!(
+            "  \x1b[1m\x1b[32m{} template applied ({} files)\x1b[0m",
+            industry, copied
+        );
+        eprintln!("  Starting proxy with {} configuration...", industry);
+        eprintln!();
+        true
+    } else {
+        eprintln!("  \x1b[33mNo files copied. Check template directory.\x1b[0m");
+        std::process::exit(1);
+    }
+}
+
+/// Check if stderr is a terminal (for interactive prompt detection).
+/// Returns false in CI, piped environments, or when running as a service.
+fn atty_is_terminal() -> bool {
+    std::io::IsTerminal::is_terminal(&std::io::stderr())
 }

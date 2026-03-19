@@ -1,12 +1,17 @@
-"""GVMAgent base class — proxy-aware agent with state management (PART 7)."""
+"""GVMAgent base class — proxy-aware agent with state management.
+
+Use GVMAgent when you need advanced features (checkpoint, state, rollback).
+For simple governance without inheritance, use @ic + gvm_session() directly.
+"""
 
 import os
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-import gvm.decorator as decorator
 from gvm.checkpoint import CheckpointManager
+from gvm.decorator import set_trace_id
+from gvm.session import gvm_session, configure as _configure_session
 from gvm.state import AgentState
 
 # Maximum conversation history turns to include in a checkpoint.
@@ -16,14 +21,26 @@ MAX_HISTORY_TURNS = 50
 
 
 class GVMAgent:
-    """Base class for GVM-controlled agents.
+    """Base class for GVM-controlled agents with full lifecycle management.
 
-    Handles:
-    - Automatic proxy configuration (all HTTP goes through GVM proxy)
-    - Agent identity (agent_id, tenant_id, session_id)
-    - State binding (VaultField -> Vault)
-    - Trace context initialization
-    - Checkpoint/rollback (auto or manual via @ic(checkpoint=True))
+    Provides checkpoint/rollback, state management, and trace context on top
+    of the core @ic + gvm_session() primitives.
+
+    For simple governance without inheritance, use standalone mode instead:
+
+        from gvm import ic, gvm_session, configure
+        configure(agent_id="my-agent")
+
+        @ic(operation="gvm.messaging.send")
+        def send_email(to, subject, body):
+            session = gvm_session()
+            return session.post(...).json()
+
+    GVMAgent is for when you need:
+        - auto_checkpoint: automatic state snapshots before risky operations
+        - AgentState + VaultField: encrypted sensitive state management
+        - Conversation history tracking for LLM agents
+        - Automatic rollback on denied operations
 
     Checkpoint modes (set via class attribute or constructor):
         auto_checkpoint = None      # disabled (default)
@@ -78,36 +95,41 @@ class GVMAgent:
         # Conversation history for LLM agents
         self._conversation_history = []
 
-        # Current GVM headers for the next outgoing request
-        self._pending_headers = {}
-
         # Bind state if declared
         if self.state is not None:
             self.state._bind(self)
 
-        # Register per-thread header setter so @ic decorator can inject headers
-        decorator._register_header_setter(self._apply_gvm_headers)
+        # Configure the session module with this agent's identity so that
+        # @ic can pick up agent_id/tenant_id when building headers.
+        # (When @ic detects a GVMAgent instance, it reads directly from self,
+        #  so this is mainly for gvm_session() proxy URL.)
+        _configure_session(
+            agent_id=self._agent_id,
+            tenant_id=self._tenant_id,
+            proxy_url=self._proxy_url,
+        )
 
         # Initialize trace context for this agent session
-        decorator.set_trace_id(str(uuid.uuid4()))
+        set_trace_id(str(uuid.uuid4()))
 
-    def _apply_gvm_headers(self, headers: dict):
-        """Store GVM headers to be injected into the next HTTP request.
+    def create_session(self):
+        """Create a requests.Session pre-configured to route through the GVM proxy.
 
-        The proxy configuration (env HTTP_PROXY / requests session) ensures
-        all HTTP traffic goes through the GVM proxy, which reads these headers.
+        Delegates to gvm_session() with this agent's proxy URL.
+        Headers set by @ic are automatically injected.
+
+        Usage:
+            session = agent.create_session()
+            session.get("https://api.example.com/data")
+            # -> routed through GVM proxy with governance headers
+
+        Requires: pip install requests
         """
-        self._pending_headers = headers
+        return gvm_session(proxy_url=self._proxy_url)
 
     def get_proxy_url(self) -> str:
         """Return the configured GVM proxy URL."""
         return self._proxy_url
-
-    def get_pending_headers(self) -> dict:
-        """Return and clear pending GVM headers for the next request."""
-        headers = self._pending_headers
-        self._pending_headers = {}
-        return headers
 
     def _get_checkpointable_state(self) -> dict:
         """Collect agent state for checkpoint serialization.
@@ -203,43 +225,3 @@ class GVMAgent:
         if self.auto_checkpoint == "ic3" and ic_level >= 3:
             return True
         return False
-
-    def create_session(self):
-        """Create a requests.Session pre-configured to route through the GVM proxy.
-
-        Usage:
-            session = agent.create_session()
-            session.get("https://api.example.com/data")
-            # -> routed through GVM proxy with headers
-
-        Requires: pip install requests
-        """
-        try:
-            import requests
-        except ImportError:
-            raise ImportError(
-                "requests library required for create_session(). Install: pip install requests"
-            )
-
-        session = requests.Session()
-        session.proxies = {
-            "http": self._proxy_url,
-            "https": self._proxy_url,
-        }
-
-        # Hook to inject GVM headers into every request
-        original_prepare = session.prepare_request
-
-        def prepare_with_gvm(request):
-            prepared = original_prepare(request)
-            headers = self.get_pending_headers()
-            for key, value in headers.items():
-                if value:  # Skip empty values
-                    prepared.headers[key] = value
-            # Set target host for the proxy
-            if "Host" in prepared.headers:
-                prepared.headers["X-GVM-Target-Host"] = prepared.headers["Host"]
-            return prepared
-
-        session.prepare_request = prepare_with_gvm
-        return session

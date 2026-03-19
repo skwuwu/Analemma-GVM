@@ -2,6 +2,23 @@
 
 Provides a GVMAgent subclass with @ic-decorated methods for Gmail and Bank
 operations, plus LangChain @tool wrappers that delegate to the agent.
+
+Preferred pattern for new code — stack @tool and @ic directly:
+
+    from langchain_core.tools import tool
+    from gvm import ic, gvm_session
+
+    @tool
+    @ic(operation="gvm.messaging.send")
+    def send_email(to: str, subject: str, body: str):
+        \"\"\"Send an email via Gmail.\"\"\"
+        session = gvm_session()
+        return session.post("http://gmail.googleapis.com/...", json={...}).json()
+
+    tools = [send_email]  # standard LangChain tool list, no extra wrapper
+
+The gvm_tool() wrapper below is kept for backward compatibility and for
+GVMAgent method-based patterns where error-to-string conversion is needed.
 """
 
 import json

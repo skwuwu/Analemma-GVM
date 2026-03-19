@@ -1,0 +1,152 @@
+# Build and publish pre-built binaries on tag push.
+# Creates GitHub Release with binaries for Linux (x86_64, aarch64), macOS (x86_64, aarch64), Windows (x86_64).
+#
+# Usage:
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# Users can then install via:
+#   cargo binstall gvm-proxy    (if cargo-binstall installed)
+#   gh release download v0.1.0  (manual download)
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            binary_ext: ""
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            binary_ext: ""
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            binary_ext: ""
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            binary_ext: ""
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            binary_ext: ".exe"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (Linux cross-compilation)
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build gvm-proxy
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} -p gvm-proxy
+          else
+            cargo build --release --target ${{ matrix.target }} -p gvm-proxy
+          fi
+        shell: bash
+
+      - name: Build gvm-cli
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} -p gvm-cli
+          else
+            cargo build --release --target ${{ matrix.target }} -p gvm-cli
+          fi
+        shell: bash
+
+      - name: Package binaries
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          ARCHIVE_DIR="gvm-${TAG}-${{ matrix.target }}"
+          mkdir -p "${ARCHIVE_DIR}"
+
+          # Copy binaries
+          cp "target/${{ matrix.target }}/release/gvm-proxy${{ matrix.binary_ext }}" "${ARCHIVE_DIR}/"
+          cp "target/${{ matrix.target }}/release/gvm${{ matrix.binary_ext }}" "${ARCHIVE_DIR}/" 2>/dev/null || \
+          cp "target/${{ matrix.target }}/release/gvm-cli${{ matrix.binary_ext }}" "${ARCHIVE_DIR}/" 2>/dev/null || true
+
+          # Include default config for quick start
+          cp -r config "${ARCHIVE_DIR}/config"
+          cp README.md "${ARCHIVE_DIR}/"
+          cp LICENSE "${ARCHIVE_DIR}/" 2>/dev/null || true
+
+          # Archive
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            7z a "${ARCHIVE_DIR}.zip" "${ARCHIVE_DIR}"
+            echo "ASSET=${ARCHIVE_DIR}.zip" >> $GITHUB_ENV
+          else
+            tar czf "${ARCHIVE_DIR}.tar.gz" "${ARCHIVE_DIR}"
+            echo "ASSET=${ARCHIVE_DIR}.tar.gz" >> $GITHUB_ENV
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/**/*
+          body: |
+            ## Installation
+
+            ### Quick install (recommended)
+            ```bash
+            # If you have cargo-binstall:
+            cargo binstall gvm-proxy
+
+            # Or download and extract:
+            # Linux x86_64
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/gvm-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz
+            tar xzf gvm-*.tar.gz
+            sudo mv gvm-*/gvm-proxy gvm-*/gvm /usr/local/bin/
+
+            # macOS (Apple Silicon)
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/gvm-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz
+            tar xzf gvm-*.tar.gz
+            sudo mv gvm-*/gvm-proxy gvm-*/gvm /usr/local/bin/
+            ```
+
+            ### From source
+            ```bash
+            cargo install --git https://github.com/${{ github.repository }} gvm-proxy
+            cargo install --git https://github.com/${{ github.repository }} gvm-cli
+            ```

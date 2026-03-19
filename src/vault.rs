@@ -10,6 +10,62 @@ use zeroize::Zeroize;
 
 // ─── Vault: Encrypted State Store (PART 5.4) ───
 
+// ─── Trait Abstractions ───
+
+/// Abstraction for encryption key management.
+///
+/// Separates cryptographic operations from the Vault storage layer,
+/// enabling pluggable key management backends:
+/// - `LocalKeyProvider`: AES-256-GCM with local key material (MVP)
+/// - AWS KMS: Envelope encryption via KMS API (production)
+/// - GCP KMS / HashiCorp Vault: Same pattern, different API
+///
+/// All implementations must be Send + Sync for use in async contexts.
+/// Encrypt/decrypt are synchronous — KMS implementations should use
+/// blocking client or spawn_blocking to avoid holding locks across await.
+pub trait KeyProvider: Send + Sync {
+    /// Encrypt plaintext. Output format is implementation-defined.
+    /// LocalKeyProvider: nonce(12) || ciphertext || tag(16)
+    /// KMS: envelope-encrypted blob with wrapped data key
+    fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>>;
+
+    /// Decrypt ciphertext produced by encrypt().
+    /// Must return generic error on failure (no cryptographic detail leakage).
+    fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>>;
+}
+
+/// Abstraction for vault storage backend.
+///
+/// Separates storage from encryption, enabling pluggable persistence:
+/// - `InMemoryBackend`: HashMap (MVP, no persistence across restarts)
+/// - Redis with TLS: Durable storage with TTL support (production)
+/// - DynamoDB: Serverless durable storage (alternative)
+///
+/// All values stored are already encrypted by KeyProvider.
+/// Backend implementations must NOT perform additional encryption.
+#[allow(async_fn_in_trait)]
+pub trait VaultBackend: Send + Sync {
+    /// Retrieve an encrypted value by key. Returns None if key does not exist.
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
+
+    /// Store an encrypted value. Overwrites existing key.
+    async fn put(&self, key: &str, value: Vec<u8>) -> Result<()>;
+
+    /// Remove a key. No-op if key does not exist.
+    async fn delete(&self, key: &str) -> Result<()>;
+
+    /// List all keys matching a prefix.
+    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>>;
+
+    /// Return the total number of keys in the backend.
+    async fn len(&self) -> Result<usize>;
+
+    /// Check if key exists without retrieving value.
+    async fn contains_key(&self, key: &str) -> Result<bool>;
+}
+
+// ─── Local Key Provider (AES-256-GCM) ───
+
 /// AES-256-GCM encryption layer for Vault data at rest.
 ///
 /// Memory Security (Secret Zeroing):
@@ -18,29 +74,29 @@ use zeroize::Zeroize;
 /// - Prevents key/plaintext from persisting in freed memory (memory remanence)
 /// - Core dump or /proc/mem scan cannot recover zeroed secrets
 ///
-/// In production, the key should come from AWS KMS / HashiCorp Vault.
+/// In production, replace with a KMS-backed KeyProvider.
 /// MVP uses GVM_VAULT_KEY environment variable.
-struct VaultEncryption {
+pub struct LocalKeyProvider {
     key: [u8; 32],
 }
 
 /// Drop implementation that zeros the key material before deallocation.
 /// This prevents encryption keys from persisting in freed heap/stack memory
 /// after process exit, core dump, or memory page reuse.
-impl Drop for VaultEncryption {
+impl Drop for LocalKeyProvider {
     fn drop(&mut self) {
         self.key.zeroize();
     }
 }
 
-impl VaultEncryption {
-    fn new(key: [u8; 32]) -> Self {
+impl LocalKeyProvider {
+    pub fn new(key: [u8; 32]) -> Self {
         Self { key }
     }
 
     /// Load encryption key from environment variable.
-    /// Falls back to a deterministic dev key if not set (development only).
-    fn from_env(env_var: &str) -> Result<Self> {
+    /// Falls back to a random ephemeral key if not set (development only).
+    pub fn from_env(env_var: &str) -> Result<Self> {
         match std::env::var(env_var) {
             Ok(hex_key) => {
                 let mut bytes = hex::decode(&hex_key)
@@ -73,7 +129,9 @@ impl VaultEncryption {
             }
         }
     }
+}
 
+impl KeyProvider for LocalKeyProvider {
     /// Encrypt plaintext using AES-256-GCM.
     /// Output format: nonce(12 bytes) || ciphertext || tag(16 bytes)
     fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
@@ -125,7 +183,71 @@ impl VaultEncryption {
     }
 }
 
-/// Maximum number of keys in the in-memory vault store.
+// ─── In-Memory Backend ───
+
+/// In-memory vault storage backend (MVP).
+///
+/// All data is lost on process restart. Suitable for development and testing.
+/// Production deployments should use RedisBackend or similar durable backend.
+pub struct InMemoryBackend {
+    store: RwLock<HashMap<String, Vec<u8>>>,
+}
+
+impl InMemoryBackend {
+    pub fn new() -> Self {
+        Self {
+            store: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+impl Default for InMemoryBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VaultBackend for InMemoryBackend {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let store = self.store.read().await;
+        Ok(store.get(key).cloned())
+    }
+
+    async fn put(&self, key: &str, value: Vec<u8>) -> Result<()> {
+        let mut store = self.store.write().await;
+        store.insert(key.to_string(), value);
+        Ok(())
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        let mut store = self.store.write().await;
+        store.remove(key);
+        Ok(())
+    }
+
+    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>> {
+        let store = self.store.read().await;
+        Ok(store
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect())
+    }
+
+    async fn len(&self) -> Result<usize> {
+        let store = self.store.read().await;
+        Ok(store.len())
+    }
+
+    async fn contains_key(&self, key: &str) -> Result<bool> {
+        let store = self.store.read().await;
+        Ok(store.contains_key(key))
+    }
+}
+
+// ─── Vault ───
+
+/// Maximum number of keys in the vault store.
 /// Prevents unbounded memory growth from agent writes.
 const MAX_VAULT_KEYS: usize = 10_000;
 
@@ -136,43 +258,64 @@ const MAX_VALUE_BYTES: usize = 1024 * 1024;
 /// Vault: encrypted agent state cache.
 ///
 /// Stores agent checkpoints, conversation history, and intermediate
-/// state with AES-256-GCM encryption. This is a runtime state store,
+/// state with encryption. This is a runtime state store,
 /// not a secrets manager. API credentials are handled separately
 /// by [`APIKeyStore`](crate::api_keys::APIKeyStore).
 ///
 /// Design (PART 5.4):
-/// - All values encrypted with AES-256-GCM before storage
-/// - Automatic nonce generation (no reuse)
-/// - Key zeroing on drop (zeroize) prevents memory remanence
+/// - All values encrypted via KeyProvider before storage
+/// - Storage delegated to VaultBackend (in-memory, Redis, etc.)
 /// - WAL-first write: encrypted value recorded in WAL before store write
 /// - Read operations are logged asynchronously (value not included in audit)
-/// - MVP: in-memory HashMap (Redis with TLS planned for production)
 ///
-/// What Vault does NOT do (and should not be expected to do):
-/// - Key rotation, envelope encryption, or KDF
-/// - HSM/KMS integration (production deployments should use external KMS)
-/// - Access control between agents (single-tenant per proxy instance)
+/// Trait abstractions enable pluggable backends:
+/// - `KeyProvider`: Local AES-256-GCM (MVP) → AWS KMS / GCP KMS (production)
+/// - `VaultBackend`: In-memory HashMap (MVP) → Redis with TLS (production)
 ///
 /// Memory bounds:
 /// - Max keys: 10,000 (rejects writes when full)
 /// - Max value size: 1 MB per value
 /// - Total worst case: ~10 GB (10K keys × 1 MB), but typical values are small
-pub struct Vault {
-    /// In-memory store (MVP replacement for Redis)
-    store: RwLock<HashMap<String, Vec<u8>>>,
-    encryption: VaultEncryption,
+pub struct Vault<B: VaultBackend = InMemoryBackend> {
+    backend: B,
+    key_provider: Box<dyn KeyProvider>,
     ledger: Arc<Ledger>,
 }
 
-impl Vault {
-    /// Create a new Vault with encryption and ledger integration.
+impl Vault<InMemoryBackend> {
+    /// Create a new Vault with default local implementations.
+    /// Uses LocalKeyProvider (AES-256-GCM) and InMemoryBackend.
     pub fn new(ledger: Arc<Ledger>) -> Result<Self> {
-        let encryption = VaultEncryption::from_env("GVM_VAULT_KEY")?;
+        let key_provider = LocalKeyProvider::from_env("GVM_VAULT_KEY")?;
         Ok(Self {
-            store: RwLock::new(HashMap::new()),
-            encryption,
+            backend: InMemoryBackend::new(),
+            key_provider: Box::new(key_provider),
             ledger,
         })
+    }
+}
+
+impl<B: VaultBackend> Vault<B> {
+    /// Create a Vault with custom key provider and storage backend.
+    ///
+    /// Use this for production deployments with KMS and durable storage:
+    /// ```ignore
+    /// let vault = Vault::with_backends(
+    ///     Box::new(AwsKmsKeyProvider::new(kms_key_id)),
+    ///     RedisBackend::new(redis_url),
+    ///     ledger,
+    /// );
+    /// ```
+    pub fn with_backends(
+        key_provider: Box<dyn KeyProvider>,
+        backend: B,
+        ledger: Arc<Ledger>,
+    ) -> Self {
+        Self {
+            backend,
+            key_provider,
+            ledger,
+        }
     }
 
     /// Write an encrypted value to the vault.
@@ -188,26 +331,24 @@ impl Vault {
         }
 
         // 1. Enforce key count limit (allow overwrites of existing keys)
-        {
-            let store = self.store.read().await;
-            if store.len() >= MAX_VAULT_KEYS && !store.contains_key(key) {
-                return Err(anyhow!(
-                    "Vault key limit reached ({} keys). Delete unused keys before adding new ones.",
-                    MAX_VAULT_KEYS
-                ));
-            }
+        let key_count = self.backend.len().await?;
+        let key_exists = self.backend.contains_key(key).await?;
+        if key_count >= MAX_VAULT_KEYS && !key_exists {
+            return Err(anyhow!(
+                "Vault key limit reached ({} keys). Delete unused keys before adding new ones.",
+                MAX_VAULT_KEYS
+            ));
         }
 
         // 2. Encrypt
-        let ciphertext = self.encryption.encrypt(plaintext)?;
+        let ciphertext = self.key_provider.encrypt(plaintext)?;
 
         // 3. WAL-first: record encrypted value for recovery
         let event = build_vault_event(key, agent_id, "vault_write", Some(&ciphertext));
         self.ledger.append_durable(&event).await?;
 
         // 4. Store encrypted value
-        let mut store = self.store.write().await;
-        store.insert(key.to_string(), ciphertext);
+        self.backend.put(key, ciphertext).await?;
 
         tracing::debug!(key = key, agent = agent_id, "Vault write completed");
         Ok(())
@@ -216,15 +357,14 @@ impl Vault {
     /// Read and decrypt a value from the vault.
     /// Audit log records the read event (without the value).
     pub async fn read(&self, key: &str, agent_id: &str) -> Result<Option<Vec<u8>>> {
-        let store = self.store.read().await;
-        let ciphertext = store.get(key).cloned();
+        let ciphertext = self.backend.get(key).await?;
 
         // Async audit log (read event does not include value)
         let event = build_vault_event(key, agent_id, "vault_read", None);
         self.ledger.append_async(event).await;
 
         match ciphertext {
-            Some(ct) => Ok(Some(self.encryption.decrypt(&ct)?)),
+            Some(ct) => Ok(Some(self.key_provider.decrypt(&ct)?)),
             None => Ok(None),
         }
     }
@@ -234,8 +374,7 @@ impl Vault {
         let event = build_vault_event(key, agent_id, "vault_delete", None);
         self.ledger.append_durable(&event).await?;
 
-        let mut store = self.store.write().await;
-        store.remove(key);
+        self.backend.delete(key).await?;
 
         tracing::debug!(key = key, agent = agent_id, "Vault delete completed");
         Ok(())
@@ -244,12 +383,7 @@ impl Vault {
     /// List all keys visible to an agent (prefix-scoped).
     /// Audit-logged for consistency with other vault operations.
     pub async fn list_keys(&self, prefix: &str, agent_id: &str) -> Vec<String> {
-        let store = self.store.read().await;
-        let keys: Vec<String> = store
-            .keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
-            .collect();
+        let keys = self.backend.list_keys(prefix).await.unwrap_or_default();
 
         // Async audit log for key enumeration (consistent with read/write/delete)
         let event = build_vault_event(prefix, agent_id, "vault_list_keys", None);
@@ -262,8 +396,8 @@ impl Vault {
 /// Build a GVMEvent for vault operations.
 ///
 /// NOTE: WAL records metadata only (hash + size), not the encrypted value.
-/// State recovery from WAL is NOT possible in MVP (in-memory store).
-/// Redis integration (P2) will enable durable state with WAL-based recovery.
+/// State recovery from WAL is NOT possible with InMemoryBackend.
+/// Durable backends (Redis, file-based) enable state persistence independently.
 fn build_vault_event(
     key: &str,
     agent_id: &str,
@@ -321,7 +455,7 @@ mod tests {
 
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
-        let enc = VaultEncryption::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
+        let enc = LocalKeyProvider::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
         let plaintext = b"sensitive agent state data";
 
         let ciphertext = enc.encrypt(plaintext).expect("AES-256-GCM encryption must succeed");
@@ -334,7 +468,7 @@ mod tests {
 
     #[test]
     fn test_different_nonces_produce_different_ciphertext() {
-        let enc = VaultEncryption::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
+        let enc = LocalKeyProvider::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
         let plaintext = b"same data";
 
         let ct1 = enc.encrypt(plaintext).expect("AES-256-GCM encryption must succeed");
@@ -349,7 +483,7 @@ mod tests {
 
     #[test]
     fn test_tampered_ciphertext_fails() {
-        let enc = VaultEncryption::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
+        let enc = LocalKeyProvider::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
         let plaintext = b"tamper test";
 
         let mut ciphertext = enc.encrypt(plaintext).expect("AES-256-GCM encryption must succeed");
@@ -365,7 +499,7 @@ mod tests {
 
     #[test]
     fn test_truncated_ciphertext_returns_integrity_error() {
-        let enc = VaultEncryption::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
+        let enc = LocalKeyProvider::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
 
         // Less than 12 bytes (nonce size) — must fail with integrity error
         let short_data = vec![0u8; 5];
@@ -379,8 +513,8 @@ mod tests {
 
     #[test]
     fn test_wrong_key_returns_integrity_error() {
-        let enc1 = VaultEncryption::new([1u8; 32]);
-        let enc2 = VaultEncryption::new([2u8; 32]);
+        let enc1 = LocalKeyProvider::new([1u8; 32]);
+        let enc2 = LocalKeyProvider::new([2u8; 32]);
 
         let plaintext = b"encrypted with key 1";
         let ciphertext = enc1.encrypt(plaintext).expect("enc1 encryption must succeed");
@@ -401,7 +535,7 @@ mod tests {
 
     #[test]
     fn test_empty_plaintext_roundtrip() {
-        let enc = VaultEncryption::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
+        let enc = LocalKeyProvider::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
 
         // Empty plaintext — edge case, must work
         let ciphertext = enc.encrypt(b"").expect("AES-256-GCM encryption of empty plaintext must succeed");
@@ -411,7 +545,7 @@ mod tests {
 
     #[test]
     fn test_nonce_reuse_not_possible() {
-        let enc = VaultEncryption::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
+        let enc = LocalKeyProvider::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
 
         // Encrypt same plaintext 100 times — all nonces must be unique
         let plaintext = b"nonce reuse test";
@@ -430,5 +564,55 @@ mod tests {
                 "Nonce reuse detected! This is a critical AES-GCM vulnerability."
             );
         }
+    }
+
+    // ── Backend Trait Tests ──
+
+    #[tokio::test]
+    async fn test_in_memory_backend_crud() {
+        let backend = InMemoryBackend::new();
+
+        // Initially empty
+        assert_eq!(backend.len().await.unwrap(), 0);
+        assert!(!backend.contains_key("key1").await.unwrap());
+        assert!(backend.get("key1").await.unwrap().is_none());
+
+        // Put and get
+        backend.put("key1", vec![1, 2, 3]).await.unwrap();
+        assert_eq!(backend.len().await.unwrap(), 1);
+        assert!(backend.contains_key("key1").await.unwrap());
+        assert_eq!(backend.get("key1").await.unwrap(), Some(vec![1, 2, 3]));
+
+        // Overwrite
+        backend.put("key1", vec![4, 5, 6]).await.unwrap();
+        assert_eq!(backend.len().await.unwrap(), 1);
+        assert_eq!(backend.get("key1").await.unwrap(), Some(vec![4, 5, 6]));
+
+        // Delete
+        backend.delete("key1").await.unwrap();
+        assert_eq!(backend.len().await.unwrap(), 0);
+        assert!(backend.get("key1").await.unwrap().is_none());
+
+        // Delete non-existent key (no-op)
+        backend.delete("nonexistent").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_backend_list_keys() {
+        let backend = InMemoryBackend::new();
+
+        backend.put("agent-1:checkpoint:0", vec![1]).await.unwrap();
+        backend.put("agent-1:checkpoint:1", vec![2]).await.unwrap();
+        backend.put("agent-2:checkpoint:0", vec![3]).await.unwrap();
+
+        let mut keys = backend.list_keys("agent-1:").await.unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["agent-1:checkpoint:0", "agent-1:checkpoint:1"]);
+
+        let keys = backend.list_keys("agent-2:").await.unwrap();
+        assert_eq!(keys, vec!["agent-2:checkpoint:0"]);
+
+        let keys = backend.list_keys("nonexistent:").await.unwrap();
+        assert!(keys.is_empty());
     }
 }

@@ -269,6 +269,24 @@ pub struct Target {
     pub query: Option<String>,
 }
 
+impl Target {
+    /// Strip port from host: "api.bank.com:443" → "api.bank.com".
+    /// IPv6 bracket form (e.g. "[::1]:8080") is returned as-is (port handled by normalize_host).
+    pub fn host_without_port(&self) -> &str {
+        strip_port(&self.host)
+    }
+}
+
+/// Strip port suffix from a host string: "api.bank.com:443" → "api.bank.com".
+/// IPv6 bracket form (e.g. "[::1]:8080") is returned as-is.
+pub fn strip_port(host: &str) -> &str {
+    if host.starts_with('[') {
+        host
+    } else {
+        host.split(':').next().unwrap_or(host)
+    }
+}
+
 /// WAL batch record written after each group commit flush.
 /// Contains the Merkle root of all events in the batch and a chain
 /// pointer to the previous batch's root (inter-batch integrity).

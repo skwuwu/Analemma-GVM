@@ -120,6 +120,9 @@
 - [x] Dev key → random ephemeral key
 - [x] `list_keys` audit log
 - [x] Error sanitization (no internal details in API responses; upstream errors sanitized)
+- [x] `KeyProvider` trait abstraction (pluggable encryption: local AES-256-GCM → KMS)
+- [x] `VaultBackend` trait abstraction (pluggable storage: in-memory → Redis/DynamoDB)
+- [x] `Vault<B: VaultBackend = InMemoryBackend>` generic with backward-compatible default
 
 **API** (`src/api.rs`):
 - [x] `/gvm/check` includes `target_path` field
@@ -211,7 +214,9 @@
 
 ### Vault Hardening
 
-- [ ] KMS integration (AWS KMS, GCP KMS)
+- [x] `KeyProvider` + `VaultBackend` trait abstraction (foundation for all items below)
+- [ ] KMS integration via `KeyProvider` impl (AWS KMS, GCP KMS)
+- [ ] Redis `VaultBackend` impl (persistent state across restarts)
 - [ ] Key rotation support
 - [ ] KDF (Argon2id) for env-var derived keys
 
@@ -255,11 +260,17 @@
 - [ ] gRPC method-level policy (protobuf descriptor loading)
 - [ ] SMTP inspection (for direct email agents)
 
-### Multi-Agent
+### Multi-Agent Governance
 
-- [ ] Agent-to-agent communication governance
-- [ ] Trust delegation (agent A grants agent B limited capability)
-- [ ] Shared audit trail across agent cluster
+**Architectural advantage**: GVM's global Merkle chain (single WAL, all agents) provides cryptographic ordering across agents — a property that per-agent chains cannot offer. This enables collusion detection and cross-agent forensics that are structurally impossible in systems with isolated per-agent audit trails.
+
+**Why global chain scales**: The WAL's group commit batch loop ([`ledger.rs`](../src/ledger.rs)) serializes at the batch level, not the event level. Event hashing and JSON serialization happen in caller threads (parallel). The `try_recv()` non-blocking drain collects all queued events into a single `write_all + fsync`. At 1,000 agents × 10 ops/sec, batch overhead is negligible. Sharding becomes relevant only at ~100K events/sec (v3.0+), at which point NATS JetStream provides cross-shard ordering.
+
+- [ ] Cross-agent collusion detection: "Agent A denied → Agent B attempts same URL within N seconds" pattern matching on the global chain, with cryptographic proof of event ordering (Merkle inter-batch chain, not timestamps)
+- [ ] Agent-to-agent communication governance (inter-agent HTTP routed through proxy)
+- [ ] Trust delegation (agent A grants agent B limited capability via scoped JWT)
+- [ ] Cross-agent trace correlation (`trace_id` linking across agent boundaries)
+- [ ] `gvm events cross-agent --pattern collusion` CLI command for forensic queries
 
 ### Enterprise
 

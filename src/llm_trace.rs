@@ -17,7 +17,7 @@
 //! (`thinking_hash` field) to prevent leaking internal LLM reasoning into
 //! the audit trail. Raw thinking storage requires explicit opt-in.
 
-use gvm_types::{LLMTrace, LLMUsage};
+use gvm_types::{strip_port, LLMTrace, LLMUsage};
 use sha2::{Digest, Sha256};
 
 /// Maximum thinking content size stored in WAL (2KB).
@@ -37,8 +37,7 @@ const LLM_PROVIDERS: &[(&str, &str)] = &[
 /// Check if a host is a known LLM provider.
 /// Returns the provider name if matched.
 pub fn identify_llm_provider(host: &str) -> Option<&'static str> {
-    // Strip port if present
-    let host_only = host.split(':').next().unwrap_or(host);
+    let host_only = strip_port(host);
     LLM_PROVIDERS
         .iter()
         .find(|(h, _)| *h == host_only)

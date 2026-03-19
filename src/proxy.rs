@@ -55,6 +55,17 @@ pub struct AppState {
     pub jwt_config: Option<Arc<auth::JwtConfig>>,
 }
 
+/// Derive event status from upstream HTTP response.
+fn event_status_from_response(response: &Response<Body>) -> EventStatus {
+    if response.status().is_success() {
+        EventStatus::Confirmed
+    } else {
+        EventStatus::Failed {
+            reason: format!("HTTP {}", response.status()),
+        }
+    }
+}
+
 /// Main proxy handler — all requests route here via axum fallback.
 /// Implements the 3-layer security pipeline (PART 5.2).
 pub async fn proxy_handler(
@@ -272,14 +283,7 @@ pub async fn proxy_handler(
             let engine_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
             let mut response = forward_request(&state, request, &target).await;
 
-            // Set status based on upstream response (same as IC-2 path)
-            if response.status().is_success() {
-                event.status = EventStatus::Confirmed;
-            } else {
-                event.status = EventStatus::Failed {
-                    reason: format!("HTTP {}", response.status()),
-                };
-            }
+            event.status = event_status_from_response(&response);
             state.ledger.append_async(event.clone()).await;
             inject_gvm_response_headers(
                 response.headers_mut(),
@@ -320,14 +324,7 @@ pub async fn proxy_handler(
             let llm_provider = llm_trace::identify_llm_provider(&target.host);
             let mut response = forward_request(&state, request, &target).await;
 
-            // Update event status based on upstream response
-            if response.status().is_success() {
-                event.status = EventStatus::Confirmed;
-            } else {
-                event.status = EventStatus::Failed {
-                    reason: format!("HTTP {}", response.status()),
-                };
-            }
+            event.status = event_status_from_response(&response);
 
             // Extract LLM thinking trace if this is a known LLM provider response
             if let Some(provider) = llm_provider {
@@ -426,13 +423,7 @@ pub async fn proxy_handler(
             // Rate limit already checked above. If we reach here, request is allowed.
             let engine_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
             let mut response = forward_request(&state, request, &target).await;
-            if response.status().is_success() {
-                event.status = EventStatus::Confirmed;
-            } else {
-                event.status = EventStatus::Failed {
-                    reason: format!("HTTP {}", response.status()),
-                };
-            }
+            event.status = event_status_from_response(&response);
             state.ledger.append_async(event.clone()).await;
             inject_gvm_response_headers(
                 response.headers_mut(),
@@ -454,13 +445,7 @@ pub async fn proxy_handler(
             let engine_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
             let mut response = forward_request(&state, request, &target).await;
 
-            event.status = if response.status().is_success() {
-                EventStatus::Confirmed
-            } else {
-                EventStatus::Failed {
-                    reason: format!("HTTP {}", response.status()),
-                }
-            };
+            event.status = event_status_from_response(&response);
             let _ = state.ledger.append_durable(&event).await;
 
             if matches!(alert_level, AlertLevel::Critical) {
@@ -647,7 +632,7 @@ async fn forward_request(
         .get(&target.host)
         .unwrap_or(&target.host);
     let forward_scheme = {
-        let h = forward_host.split(':').next().unwrap_or(forward_host);
+        let h = gvm_types::strip_port(forward_host);
         if h == "localhost" || h == "127.0.0.1" {
             "http"
         } else {
@@ -979,8 +964,7 @@ fn extract_target(request: &Request<Body>) -> Option<Target> {
     // Select scheme based on target host.
     // Note: IPv6 loopback ([::1]) is not handled here for MVP.
     // Production should use a proper scheme negotiation (e.g. X-GVM-Target-Scheme header).
-    let host_without_port = host.split(':').next().unwrap_or(&host);
-    let scheme = if host_without_port == "localhost" || host_without_port == "127.0.0.1" {
+    let scheme = if gvm_types::strip_port(&host) == "localhost" || gvm_types::strip_port(&host) == "127.0.0.1" {
         "http".to_string()
     } else {
         "https".to_string()

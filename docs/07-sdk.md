@@ -6,9 +6,9 @@
 
 ## 7.1 Overview
 
-The Python SDK provides a zero-friction interface for AI agents to operate under GVM governance. Agents inherit from `GVMAgent`, declare operations with the `@ic()` decorator, and use `AgentState` with `VaultField` for encrypted persistence. All HTTP traffic is automatically routed through the GVM proxy.
+The Python SDK provides a zero-friction interface for AI agents to operate under GVM governance. **No inheritance required** — add `@ic()` decorator to functions and use `gvm_session()` for HTTP requests. For advanced features (checkpoint, rollback, encrypted state), optionally extend `GVMAgent`.
 
-**Design principle**: Agent code is unchanged. The SDK injects governance metadata into HTTP requests transparently. The agent developer declares *what* they're doing (`@ic(operation=...)`); the proxy decides *whether* to allow it.
+**Design principle**: Minimum code change for maximum governance. Adding GVM to an existing agent is `import` + `@ic` + `gvm_session()`. No class restructuring, no framework lock-in.
 
 ---
 
@@ -16,14 +16,15 @@ The Python SDK provides a zero-friction interface for AI agents to operate under
 
 ```
 sdk/python/gvm/
-├── __init__.py         # Public API exports
-├── agent.py            # GVMAgent base class
-├── decorator.py        # @ic() decorator
+├── __init__.py         # Public API: ic, gvm_session, configure, GVMAgent, ...
+├── session.py          # Standalone session: configure(), gvm_session()
+├── decorator.py        # @ic() decorator (works on functions and methods)
+├── agent.py            # GVMAgent base class (optional, for checkpoint/rollback)
 ├── state.py            # AgentState + VaultField
 ├── resource.py         # Resource descriptor
 ├── errors.py           # GVM error hierarchy
 ├── checkpoint.py       # CheckpointManager (Merkle-verified state)
-├── langchain_tools.py  # LangChain adapter with rollback handling
+├── langchain_tools.py  # LangChain adapter + @tool stacking docs
 ├── unified_demo.py     # Unified finance demo (all features in one scenario)
 ├── demo.py             # Enforcement demo
 ├── rollback_demo.py    # Rollback + token savings demo
@@ -34,39 +35,75 @@ sdk/python/gvm/
 
 ## 7.3 `@ic()` Decorator
 
-The `@ic()` decorator declares a method as a GVM-controlled operation. It injects governance headers into the HTTP context before the method executes.
+The `@ic()` decorator declares a function or method as a GVM-controlled operation. It injects governance headers into the HTTP context before the function executes. Works on standalone functions, class methods, and `GVMAgent` methods.
 
-### Usage
+### Standalone Usage (recommended for most cases)
 
 ```python
-from gvm import ic, Resource
+from gvm import ic, gvm_session, configure, Resource
 
-class FinanceAgent(GVMAgent):
-    @ic(
-        operation="gvm.payment.refund",
-        resource=Resource(service="stripe", tier="external", sensitivity="critical"),
-        rate_limit=10,
-        amount=None,  # Context attribute for ABAC
-    )
-    def process_refund(self, customer_id: str, amount: float):
-        # HTTP calls within this method go through the proxy
-        # with X-GVM-Operation: gvm.payment.refund
-        ...
+configure(agent_id="my-agent")  # or set GVM_AGENT_ID env var
+
+@ic(
+    operation="gvm.payment.refund",
+    resource=Resource(service="stripe", tier="external", sensitivity="critical"),
+    rate_limit=10,
+)
+def process_refund(customer_id: str, amount: float):
+    session = gvm_session()
+    return session.post("http://api.stripe.com/refund", json={...}).json()
+```
+
+### Non-GVMAgent Class Method
+
+```python
+class MyCrewAIAgent(CrewAIBase):  # keeps existing inheritance
+    @ic(operation="gvm.search.web")
+    def search(self, query):
+        session = gvm_session()
+        return session.get(f"http://api.search.com/?q={query}").json()
+```
+
+### LangChain @tool Stacking
+
+```python
+from langchain_core.tools import tool
+from gvm import ic, gvm_session
+
+@tool
+@ic(operation="gvm.messaging.send")
+def send_email(to: str, subject: str, body: str):
+    """Send an email via Gmail."""
+    session = gvm_session()
+    return session.post("http://gmail.googleapis.com/...", json={...}).json()
+
+tools = [send_email]  # standard LangChain tool list, no wrapper needed
 ```
 
 ### Minimal Usage
 
 ```python
 @ic()  # Auto-generates operation name: "custom.auto.send_email"
-def send_email(self):
+def send_email(to, subject, body):
     ...
 ```
+
+### Safety: Unconsumed Header Warning
+
+If an `@ic`-decorated function makes HTTP requests without using `gvm_session()` or `self.create_session()`, the SDK emits a warning:
+
+```
+[GVM] @ic('gvm.messaging.send'): GVM headers were not consumed.
+Use gvm_session() or self.create_session() to ensure Layer 2 (ABAC) policy enforcement.
+```
+
+This catches the common mistake of using `requests.post()` directly, which bypasses semantic governance (Layer 1) while still passing through the proxy (Layer 2/3 via `HTTP_PROXY`).
 
 ### Injected Headers
 
 | Header | Value |
 |--------|-------|
-| `X-GVM-Agent-Id` | `self._agent_id` |
+| `X-GVM-Agent-Id` | Agent ID (from `GVMAgent` or `configure()`) |
 | `X-GVM-Trace-Id` | Thread-local trace UUID |
 | `X-GVM-Event-Id` | Unique per invocation |
 | `X-GVM-Parent-Event-Id` | Previous event in causal chain |
@@ -106,11 +143,34 @@ This creates an auditable causal chain: `evt-1 → evt-2`, visible in the ledger
 
 ---
 
-## 7.4 `GVMAgent` Base Class
+## 7.4 Standalone Session: `configure()` + `gvm_session()`
+
+For most use cases, you don't need `GVMAgent`. Configure once, then use `gvm_session()` inside `@ic`-decorated functions:
+
+```python
+from gvm import configure, gvm_session
+
+# One-time setup (or use env vars: GVM_AGENT_ID, GVM_PROXY_URL)
+configure(agent_id="my-agent", tenant_id="acme", proxy_url="http://localhost:8080")
+
+# Inside any @ic function:
+session = gvm_session()  # returns requests.Session routed through GVM proxy
+session.get("https://api.example.com/data")  # GVM headers auto-injected
+```
+
+`gvm_session()` creates a `requests.Session` that:
+- Routes all traffic through the GVM proxy
+- Auto-injects pending `@ic` headers into each outgoing request
+- Clears headers after consumption (one-shot per `@ic` invocation)
+
+## 7.5 `GVMAgent` Base Class (Optional)
+
+Use `GVMAgent` only when you need auto-checkpoint, encrypted state (`VaultField`), or rollback. For basic governance, standalone `@ic` + `gvm_session()` is sufficient.
 
 ```python
 class GVMAgent:
     state: Optional[AgentState] = None
+    auto_checkpoint: Optional[str] = None  # None, "ic2+", "ic3", "all"
 
     def __init__(
         self,
@@ -123,27 +183,21 @@ class GVMAgent:
 
 ### Key Responsibilities
 
-1. **Proxy Configuration**: All HTTP traffic routes through `self._proxy_url`
-2. **Identity**: Agent ID, tenant ID, session ID for ABAC policy lookup
-3. **State Binding**: Connects `AgentState` VaultFields to the Vault API
-4. **Header Injection**: Registers callback for `@ic()` to inject GVM headers
+1. **Auto-Checkpoint**: Saves agent state before risky operations (IC-2+)
+2. **Encrypted State**: `VaultField` values stored with AES-256-GCM via Vault API
+3. **Rollback**: Restores agent state to last approved checkpoint on Deny
+4. **Session**: `create_session()` delegates to `gvm_session()` with the agent's proxy URL
 
 ### Session Creation
 
 ```python
-session = agent.create_session()
+session = agent.create_session()  # equivalent to gvm_session(proxy_url=agent.proxy_url)
 session.get("https://api.example.com/data")
-# → Routed through GVM proxy with X-GVM-* headers
 ```
-
-The `create_session()` method returns a `requests.Session` pre-configured with:
-- Proxy settings (`http_proxy`, `https_proxy` → GVM proxy URL)
-- Header injection hook (GVM headers added to every request)
-- Target host extraction (for SRR evaluation)
 
 ---
 
-## 7.5 `AgentState` and `VaultField`
+## 7.6 `AgentState` and `VaultField`
 
 ### Declaration
 
@@ -179,7 +233,7 @@ agent.state.balance = 100  # Write (in-memory; Vault sync via API)
 
 ---
 
-## 7.6 `Resource` Descriptor
+## 7.7 `Resource` Descriptor
 
 ```python
 resource = Resource(
@@ -194,7 +248,7 @@ Resources are serialized as JSON in `X-GVM-Resource` header and used by the ABAC
 
 ---
 
-## 7.7 Error Hierarchy
+## 7.8 Error Hierarchy
 
 ```
 GVMError
@@ -216,7 +270,7 @@ except GVMRateLimitError:
 
 ---
 
-## 7.8 Demo Scripts
+## 7.9 Demo Scripts
 
 ### Unified Finance Demo (`unified_demo.py`) — Primary Demo
 
@@ -265,7 +319,7 @@ Demonstrates the full IC classification pipeline:
 
 ---
 
-## 7.9 Checkpoint/Rollback
+## 7.10 Checkpoint/Rollback
 
 The SDK provides automatic state checkpoint and rollback for IC-2+ operations. This is the primary value-add over proxy-only (Level 0) enforcement.
 
@@ -336,7 +390,7 @@ Run the demo: `python -m gvm.unified_demo`
 
 ---
 
-## 7.10 Security Guarantees
+## 7.11 Security Guarantees
 
 | Property | Mechanism |
 |----------|-----------|

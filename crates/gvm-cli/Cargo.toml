@@ -4,6 +4,17 @@ version = "0.1.0"
 edition = "2021"
 description = "CLI tool for the Analemma Governance Virtual Machine"
 license = "Apache-2.0"
+repository = "https://github.com/skwuwu/Analemma-GVM"
+
+# cargo-binstall: download pre-built binaries instead of compiling from source.
+# Install cargo-binstall: cargo install cargo-binstall
+# Then: cargo binstall gvm-cli
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/gvm-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "gvm-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
 
 [[bin]]
 name = "gvm"

@@ -1,4 +1,5 @@
 use crate::types::EnforcementDecision;
+use gvm_types::strip_port;
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::Deserialize;
@@ -94,6 +95,17 @@ pub struct NetworkSRR {
     default_decision: EnforcementDecision,
 }
 
+/// Summary of loaded SRR rules for startup banner display.
+pub struct SrrSummary {
+    pub total_rules: usize,
+    pub deny_rules: usize,
+    pub delay_rules: usize,
+    pub allow_rules: usize,
+    pub default_decision: String,
+    /// Up to 3 representative deny rules for display
+    pub sample_denies: Vec<String>,
+}
+
 impl NetworkSRR {
     /// Load network SRR rules from a TOML file.
     pub fn load(path: &Path) -> Result<Self> {
@@ -152,6 +164,53 @@ impl NetworkSRR {
             rules,
             default_decision: EnforcementDecision::Delay { milliseconds: 300 },
         })
+    }
+
+    /// Produce a summary of loaded rules for the startup banner.
+    pub fn summary(&self) -> SrrSummary {
+        let mut deny = 0;
+        let mut delay = 0;
+        let mut allow = 0;
+        let mut sample_denies = Vec::new();
+
+        for rule in &self.rules {
+            match &rule.decision {
+                EnforcementDecision::Deny { .. } => {
+                    deny += 1;
+                    if sample_denies.len() < 3 && !rule.is_catch_all {
+                        let host = match &rule.host_pattern {
+                            HostPattern::Exact(h) => h.clone(),
+                            HostPattern::Suffix(s) => format!("*{}", s),
+                            HostPattern::Any => "*".to_string(),
+                        };
+                        sample_denies.push(format!(
+                            "{} {}{}",
+                            rule.method, host, rule.path_pattern
+                        ));
+                    }
+                }
+                EnforcementDecision::Delay { .. }
+                | EnforcementDecision::Throttle { .. } => delay += 1,
+                EnforcementDecision::Allow => allow += 1,
+                _ => {}
+            }
+        }
+
+        let default_desc = match &self.default_decision {
+            EnforcementDecision::Delay { milliseconds } => format!("Delay({}ms)", milliseconds),
+            EnforcementDecision::Deny { reason } => format!("Deny({})", reason),
+            EnforcementDecision::Allow => "Allow".to_string(),
+            other => format!("{:?}", other),
+        };
+
+        SrrSummary {
+            total_rules: self.rules.len(),
+            deny_rules: deny,
+            delay_rules: delay,
+            allow_rules: allow,
+            default_decision: default_desc,
+            sample_denies,
+        }
     }
 
     /// Check a request against network SRR rules.
@@ -300,14 +359,7 @@ fn parse_pattern(pattern: &str) -> (HostPattern, String) {
 /// Caller must pass a pre-lowercased host (done once in `check()` for O(1) cost).
 /// Patterns are lowercased at compile time in `parse_pattern()`.
 fn match_host(pattern: &HostPattern, host: &str) -> bool {
-    // Strip port if present: "api.bank.com:443" → "api.bank.com"
-    // For IPv6 with port like "[::1]:8080", the brackets are already handled
-    // by normalize_host, so we only need to handle simple host:port here.
-    let host_without_port = if host.starts_with('[') {
-        host // IPv6 bracket form — port stripping handled by normalize_host
-    } else {
-        host.split(':').next().unwrap_or(host)
-    };
+    let host_without_port = strip_port(host);
 
     match pattern {
         HostPattern::Exact(expected) => host_without_port == expected.as_str(),

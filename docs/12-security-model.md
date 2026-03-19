@@ -442,7 +442,7 @@ Without network-level isolation, any process on the same network can send reques
 | Side-channel | 1 | SRR timing variance < 10x between match/no-match |
 | Forgery | 2 | Header forgery defeated by SRR; upstream X-GVM-* header stripping |
 | Garbage input | 1 | No panics on arbitrary method/host/path/body combinations |
-| Secret zeroing | 1 | VaultEncryption key zeroed on drop |
+| Secret zeroing | 1 | LocalKeyProvider key zeroed on drop |
 | Backpressure | 1 | 500 concurrent WAL appends complete bounded |
 | Agent spoofing | 1 | Rate limiter bucket isolation under spoofed agent IDs |
 | Config poisoning | 3 | Malformed TOML rejected; catch-all Deny blocks all traffic |

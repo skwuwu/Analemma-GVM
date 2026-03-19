@@ -19,18 +19,18 @@ The GVM proxy is a security kernel — it sits between untrusted AI agents and e
 
 ### 8.2.1 Secret Zeroing (Key Material)
 
-**Threat**: Encryption keys persisting in freed memory after `VaultEncryption` is dropped. An attacker with memory access (core dump, cold boot, memory forensics) could recover AES-256 key material.
+**Threat**: Encryption keys persisting in freed memory after `LocalKeyProvider` is dropped. An attacker with memory access (core dump, cold boot, memory forensics) could recover AES-256 key material.
 
 **Mitigation**: The `zeroize` crate with `Drop` implementation.
 
 ```rust
 use zeroize::Zeroize;
 
-struct VaultEncryption {
+pub struct LocalKeyProvider {
     key: [u8; 32],
 }
 
-impl Drop for VaultEncryption {
+impl Drop for LocalKeyProvider {
     fn drop(&mut self) {
         self.key.zeroize(); // Guaranteed not optimized away
     }
@@ -43,9 +43,9 @@ impl Drop for VaultEncryption {
 
 | Location | What is zeroed | When |
 |----------|---------------|------|
-| `VaultEncryption::drop()` | `key: [u8; 32]` | Struct dropped |
-| `VaultEncryption::from_env()` | Intermediate `Vec<u8>` from hex decode | After copy to `[u8; 32]` |
-| `VaultEncryption::from_env()` (error path) | Intermediate `Vec<u8>` | On validation failure |
+| `LocalKeyProvider::drop()` | `key: [u8; 32]` | Struct dropped |
+| `LocalKeyProvider::from_env()` | Intermediate `Vec<u8>` from hex decode | After copy to `[u8; 32]` |
+| `LocalKeyProvider::from_env()` (error path) | Intermediate `Vec<u8>` | On validation failure |
 
 **Verification**: `vault_key_is_zeroed_on_drop` test — creates a Vault, performs encrypt/decrypt, drops it, verifies no crash. Full memory verification requires external tooling (valgrind, bytehound).
 

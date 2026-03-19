@@ -243,6 +243,14 @@ impl PolicyEngine {
     /// Evaluate an operation against all policy layers.
     /// Returns the strictest applicable enforcement decision.
     ///
+    /// Summary counts for the startup banner.
+    pub fn summary(&self) -> (usize, usize, usize) {
+        let global = self.global_rules.len();
+        let tenants = self.tenant_rules.len();
+        let agents = self.agent_rules.len();
+        (global, tenants, agents)
+    }
+
     /// Algorithm (PART 3.4):
     /// 1. Evaluate Global rules (Deny → immediate return)
     /// 2. Evaluate Tenant rules (can only be stricter than Global)
