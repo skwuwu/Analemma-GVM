@@ -5,7 +5,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY src/ src/
 COPY benches/ benches/
-RUN cargo build --release -p gvm-proxy -p gvm
+RUN cargo build --release -p gvm-proxy -p gvm-cli
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
