@@ -76,9 +76,12 @@ GVM works in two tiers. **Tier 1 requires zero code changes** — set `HTTP_PROX
 | **Semantic policy (ABAC)** | — | ✓ |
 | **Cross-layer forgery detection** | — | ✓ (`max_strict(Layer1, Layer2)`) |
 | **Per-agent rate limiting** | — (all unauthenticated traffic shares one bucket) | ✓ |
+| **OS isolation (syscall + network)** | `--sandbox` flag² | `--sandbox` flag² |
 | **Checkpoint/rollback** | — | ✓ |
 
 > ¹ SRR payload inspection rules (`payload_field` / `payload_match`) are parsed and loaded but currently inactive — the proxy passes `body = None` to SRR in both tiers. Host/method/path rules work fully. Payload inspection is planned for a future release.
+>
+> ² OS isolation is independent of SDK usage. `--sandbox` (Linux only) applies to the **agent process**: user/PID/mount/net namespace isolation, seccomp-BPF syscall whitelist (~45 allowed, `ptrace`/`bpf`/`mount` killed), and TC ingress filter on the host veth (kernel-level, unbypassable even with CAP_NET_ADMIN inside the namespace). The proxy process itself is not sandboxed. Without `--sandbox`, the agent could bypass governance by making direct HTTPS connections.
 
 **Tier 1 alone** blocks known-bad URLs by host/method/path, injects credentials, and logs everything with WAL — that's already more than most agent deployments have. **Tier 2** adds the cross-layer forgery detection that catches a lying agent. Start with the proxy, add the SDK when you need deeper control.
 
@@ -235,11 +238,13 @@ HTTP_PROXY=http://localhost:8080 ./my_agent
 
 | Mode | Security boundary | Best for | Requires |
 |------|-------------------|----------|----------|
-| `gvm run` | HTTP proxy (cooperative) | Development, testing, any OS | Nothing extra |
-| `--sandbox` | Proxy + namespace + seccomp (structural) | **Production on Linux** | `kernel.unprivileged_userns_clone=1` |
+| `gvm run` | HTTP proxy only (cooperative) | Development, testing, any OS | Nothing extra |
+| `--sandbox` | Proxy + Linux namespaces + seccomp-BPF + TC veth filter (structural) | **Production on Linux** | `kernel.unprivileged_userns_clone=1`, kernel ≥ 4.15 |
 | `--contained` | Proxy + Docker (structural) | Production on macOS/Windows | Docker daemon |
 
-**Without `--sandbox`/`--contained`**: the proxy is cooperative — it governs traffic that goes through it, but the agent could bypass it by making direct HTTPS calls. **With isolation**: bypass is structurally impossible — the agent's only network path is through the proxy.
+**Without `--sandbox`/`--contained`**: the proxy governs traffic that passes through it, but an agent could bypass governance by making direct HTTPS connections.
+
+**With `--sandbox`**: the agent process runs in isolated Linux namespaces (user/PID/mount/net). Its only network path is through the proxy veth pair. A TC ingress filter on the host-side veth runs in the kernel and cannot be removed even if the agent gains apparent `CAP_NET_ADMIN` inside the user namespace. Seccomp-BPF (dual-layer: log + kill) blocks dangerous syscalls (`ptrace`, `bpf`, `mount`, `unshare`, namespace escape vectors) — violations terminate the process immediately. The proxy process itself is not sandboxed.
 
 ### Policy Discovery (`--interactive`)
 
