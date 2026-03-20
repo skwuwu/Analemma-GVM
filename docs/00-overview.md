@@ -67,11 +67,9 @@ When in doubt, block. The system defaults to **Delay 300ms** (Default-to-Caution
 
 No single model covers all requirements. GVM uses a **proxy + SDK hybrid**:
 
-- **Level 0 (proxy only)**: Immediate value with zero agent changes. SRR inspects URLs and payloads, API keys are injected by the proxy, and all proxied traffic is audited. This is the "Datadog pattern" — drop in a proxy, get visibility instantly.
-- **Level 1 (+ SDK `@ic` decorator)**: Agent declares operation semantics. ABAC policy evaluates context attributes. Checkpoint/rollback on denial. Progressive adoption — the agent opts in to richer governance.
+- **Level 0 (proxy only)**: Zero agent changes. SRR inspects URLs and payloads, API keys are injected by the proxy, all proxied traffic is audited.
+- **Level 1 (+ SDK `@ic` decorator)**: Agent declares operation semantics. ABAC policy evaluates context attributes. Checkpoint/rollback on denial.
 - **Level 2 (+ `gvm run --sandbox`)**: Network namespace + seccomp containment for agents launched via `gvm run`. Proxy bypass is structurally impossible: iptables OUTPUT chain inside the sandbox namespace only allows TCP to the proxy port and UDP 53 (DNS) on the host veth IP — all other egress is dropped. IPv6 is fully disabled. Optional in v1; roadmap moves toward mandatory deployment profiles.
-
-This progressive adoption path mirrors how observability tools (Datadog, New Relic) gain traction: start with infrastructure-level metrics (free), then instrument application code for traces and custom metrics (opt-in). GVM starts with network-level governance (free), then adds semantic governance (opt-in).
 
 ### Why HTTP Layer, Not Syscall Layer
 
@@ -87,6 +85,22 @@ For **governance** (deciding whether an agent *should* perform an action), seman
 Syscall-level enforcement solves a *different* problem: **containment** (reducing sandbox escape and uncontrolled runtime behavior). This is Layer 3 territory — constraining namespace, filesystem, and syscall surface. GVM's `gvm run --sandbox` uses Linux namespace isolation + seccomp for this containment purpose today.
 
 **Summary**: Syscall for containment (can the agent escape?), HTTP for governance (should the agent do this?). Different layers solve different problems. GVM enforces governance at the HTTP layer where semantic context is available, and adds containment via `gvm run --sandbox` with roadmap work to make containment mandatory by deployment profile.
+
+### Semantic Security Depth
+
+GVM's governance operates at two semantic levels. A third level (content semantics) exists but is explicitly **out of scope** — it requires ML-based analysis, which contradicts GVM's deterministic design principle.
+
+| Level | Name | What It Sees | GVM Coverage |
+|-------|------|-------------|-------------|
+| 1 | **Structural Semantics** | HTTP method, host, URL path, top-level JSON payload fields | **Covered** — SRR (Layer 2) inspects transport-layer data |
+| 2 | **Declarative Semantics** | Operation name, resource attributes, ABAC context (declared by SDK) | **Covered** — ABAC (Layer 1) evaluates declared attributes |
+| 3 | **Content Semantics** | Natural language meaning of payload text (e.g., "transfer all funds to offshore account") | **Not covered** — requires ML/NLP classification |
+
+**Level 1 (Structural)**: SRR matches HTTP method + host pattern + path pattern. For single-endpoint APIs (GraphQL, gRPC), SRR additionally inspects a **single top-level JSON string field** via `payload_field` / `payload_match` — exact case-sensitive string equality only. No nested field access, no numeric comparison, no regex on payload values. See [SRR Payload Inspection Scope](03-srr.md#36-payload-inspection-graphqlgrpc-defense) for precise specification.
+
+**Level 2 (Declarative)**: ABAC evaluates SDK-declared attributes (`X-GVM-Operation`, `X-GVM-Resource`, `X-GVM-Context`). This provides richer semantic context than structural inspection but depends on agent cooperation via the SDK. Attribute omission is a known bypass vector — mitigated by `max_strict(Layer1, Layer2)` combining both layers.
+
+**Level 3 (Content — Not Covered)**: GVM cannot determine whether the text content of a payload is harmful. For example, `POST api.bank.com/messages` with body `{"text": "transfer all funds to account X"}` passes SRR (the URL is a messaging endpoint) and ABAC (the operation is `gvm.messaging.send`). The *meaning* of the message text is invisible to deterministic pattern matching. Deployments requiring content-level governance should use an LLM WAF (Lakera, Prompt Armor, etc.) upstream of GVM. GVM and LLM WAFs are complementary: GVM governs what agents *do*, LLM WAFs analyze what agents *say*.
 
 ---
 
@@ -132,19 +146,19 @@ See [Part 8: Memory & Runtime Security](08-memory-security.md) for full analysis
 
 ---
 
-## Test Coverage: 199 Tests
+## Test Coverage: 250 Tests
 
 | Category | Count | Source |
 |----------|-------|--------|
-| Core unit (SRR, Policy, Vault, Registry, Merkle, Wasm, LLM Trace, Proxy) | 85 | `src/lib.rs` |
+| Core unit (SRR, Policy, Vault, Registry, Merkle, Wasm, LLM Trace, Proxy, Auth) | 120 | `src/lib.rs` |
 | Integration (E2E) | 5 | `tests/integration.rs` |
-| Boundary | 30 | `tests/boundary.rs` |
+| Boundary | 32 | `tests/boundary.rs` |
 | Edge Cases | 17 | `tests/edge_cases.rs` |
-| Hostile Environment | 11 | `tests/hostile.rs` |
+| Hostile Environment | 28 | `tests/hostile.rs` |
 | Stress | 12 | `tests/stress.rs` |
 | Merkle Tree | 12 | `tests/merkle.rs` |
 | Engine (gvm-engine) | 7 | `crates/gvm-engine/` |
 | CLI unit & integration (gvm-cli) | 17 | `crates/gvm-cli/` (14 unit + 3 integration) |
-| **Total** | **199** | All passing |
+| **Total** | **250** | All passing |
 
 All tests pass. Zero failures.

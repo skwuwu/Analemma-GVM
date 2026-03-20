@@ -139,6 +139,40 @@ async fn main() {
         }
     }
 
+    // 7.5. Record config file hashes in Merkle chain (tamper detection)
+    {
+        let policy_dir = Path::new(&config.policies.directory);
+
+        let mut all_config_files: Vec<(String, std::path::PathBuf)> = vec![
+            ("srr_network".to_string(), srr_path.to_path_buf()),
+            ("operation_registry".to_string(), registry_path.to_path_buf()),
+        ];
+
+        if policy_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(policy_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map_or(false, |ext| ext == "toml") {
+                        let label = format!(
+                            "policy/{}",
+                            path.file_name().unwrap_or_default().to_string_lossy()
+                        );
+                        all_config_files.push((label, path));
+                    }
+                }
+            }
+        }
+
+        let config_refs: Vec<(&str, &Path)> = all_config_files
+            .iter()
+            .map(|(label, path)| (label.as_str(), path.as_path()))
+            .collect();
+
+        if let Err(e) = ledger.record_config_load(&config_refs).await {
+            tracing::warn!(error = %e, "Failed to record config hashes in WAL — continuing without config integrity record");
+        }
+    }
+
     // 8. Initialize Vault (encrypted state store)
     let vault = Vault::new(ledger.clone()).expect("Failed to initialize vault");
     tracing::info!("Vault initialized");

@@ -287,25 +287,57 @@ The SDK uses these headers to make intelligent recovery decisions (e.g., `X-GVM-
 
 ## 11.4 Summary Comparison Table
 
+### Tier 1: Why GVM Exists — OPA+Envoy Cannot Replicate These
+
+These capabilities are architecturally unique to AI agent governance. Building them on top of OPA+Envoy would amount to rebuilding GVM.
+
+| Capability | OPA+Envoy | GVM | Why It Can't Be Replicated |
+|-----------|-----------|-----|---------------------------|
+| **Cross-layer lie detection** | None | `max_strict(ABAC, SRR)` | Requires two independent classification engines with semantic merge — no Envoy filter or Rego package provides this |
+| **LLM thinking trace extraction** | None | OpenAI/Anthropic/Gemini | Requires protocol-aware response parsing for multiple LLM providers — fundamentally outside Envoy's scope |
+| **Checkpoint/rollback** | Not in scope | Merkle-verified state restore | Requires deep SDK integration with agent state management — a proxy cannot provide this alone |
+
+### Tier 2: Significant Engineering Effort on OPA+Envoy
+
+These are achievable with Envoy custom filters + OPA extensions + additional infrastructure, but the integration cost is high — each requires solving problems that OPA+Envoy were not designed for.
+
+| Capability | OPA+Envoy | GVM | What It Would Take |
+|-----------|-----------|-----|-------------------|
+| **Graduated enforcement (IC-2/IC-3)** | Binary allow/deny | Allow/Delay/RequireApproval/Deny | Custom Envoy filter with timer + approval queue + state machine |
+| **Fail-close audit** | Best-effort logs | WAL fsync before forward | Separate WAL system + Envoy filter that blocks until WAL confirms |
+| **API key isolation** | Service holds keys | Proxy injects post-enforcement | Custom Envoy filter + secrets manager integration + header stripping logic |
+| **Hierarchical monotonic policy** | Flat Rego namespace | Global > Tenant > Agent | Rego convention + custom validation tooling (no structural guarantee) |
+| **Agent sandboxing** | Not in scope | namespace+seccomp+veth | Separate process manager + network namespace tooling |
+
+### Tier 3: Additional Benefits — Also Achievable with OPA+Envoy
+
+These are genuine advantages but can be replicated with moderate effort using existing OPA+Envoy primitives.
+
 | Capability | OPA+Envoy | GVM | Gap |
 |-----------|-----------|-----|-----|
-| Metadata-based policy | Rego rules | ABAC engine | Equivalent |
-| URL/method matching | Envoy route rules | SRR engine | Equivalent |
-| **Cross-layer lie detection** | None | `max_strict(ABAC, SRR)` | **GVM only** |
-| **Graduated enforcement (IC-2/IC-3)** | Binary allow/deny | Allow/Delay/RequireApproval/Deny | **GVM only** |
-| **Fail-close audit** | Best-effort logs | WAL fsync before forward | **GVM only** |
-| **API key isolation** | Service holds keys | Proxy injects post-enforcement | **GVM only** |
-| **LLM thinking trace** | None | OpenAI/Anthropic/Gemini extraction | **GVM only** |
-| **Hierarchical monotonic policy** | Flat Rego namespace | Global > Tenant > Agent | **GVM only** |
-| **Payload inspection** | Custom plugins | Built-in `payload_field` matching | **GVM advantage** |
-| **Default-to-Caution** | Configurable (usually allow) | `Delay(300ms)` on unknown | **GVM only** |
-| **Agent sandboxing** | Not in scope | namespace+seccomp+veth (`gvm run --sandbox`, opt-in) | **GVM only** |
-| **Wasm-isolated policy runtime** | Not in scope | Optional loader exists; default decision path remains native (roadmap to enforce) | **Roadmap** |
-| **Checkpoint/rollback** | Not in scope | Merkle-verified state restore | **GVM only** |
-| **IPv6 SSRF defense** | Literal matching | Canonical normalization | **GVM only** |
-| **Response metadata** | Allow/deny only | 7 governance headers | **GVM advantage** |
-| Community & maturity | Production-grade, CNCF | Pre-release, single-team | **OPA advantage** |
-| General-purpose flexibility | Any policy domain | AI agent governance only | **OPA advantage** |
+| **Payload inspection** | Custom plugins | Built-in `payload_field` matching | **GVM advantage** (built-in vs plugin) |
+| **Default-to-Caution** | Configurable (usually allow) | `Delay(300ms)` on unknown | **GVM advantage** (default posture) |
+| **IPv6 SSRF defense** | Literal matching | Canonical normalization | **GVM advantage** (built-in normalization) |
+| **Response metadata** | Allow/deny only | 7 governance headers | **GVM advantage** (structured feedback) |
+
+### Shared Capabilities
+
+| Capability | OPA+Envoy | GVM |
+|-----------|-----------|-----|
+| Metadata-based policy | Rego rules | ABAC engine |
+| URL/method matching | Envoy route rules | SRR engine |
+
+### OPA+Envoy Advantages
+
+OPA+Envoy has substantial strengths that GVM cannot match at its current stage:
+
+| Advantage | Details |
+|-----------|---------|
+| **Community & maturity** | CNCF graduated project, years of production use at scale (Netflix, Goldman Sachs, Pinterest). Battle-tested failure modes, extensive documentation, large contributor base. GVM is pre-release with a single developer. |
+| **Rego language expressiveness** | Rego is a purpose-built policy language with first-class support for partial evaluation, comprehensions, and complex data joins. GVM's TOML-based rules are simpler but far less expressive for complex policy logic. |
+| **Ecosystem integration** | Native Kubernetes admission controller, Terraform provider, Kafka authorizer, SQL row filtering, CI/CD pipeline gates. OPA is a general-purpose policy engine that plugs into dozens of systems. GVM is purpose-built for AI agent HTTP governance only. |
+| **Operational tooling** | `opa test`, `opa bench`, `opa fmt`, VS Code extension, Styra DAS for enterprise management. GVM's tooling is minimal (CLI + basic dry-run). |
+| **General-purpose flexibility** | OPA handles IAM, RBAC, data filtering, admission control, and any domain expressible in Rego. GVM is intentionally narrow — it governs AI agent I/O and nothing else. |
 
 ---
 

@@ -4,6 +4,88 @@
 
 ---
 
+## 2026-03-20: Test Coverage Gap Fill (5 Integration Tests)
+
+### What Changed
+
+Added 5 new integration tests to fill identified coverage gaps:
+
+1. **E2E proxy forwarding** (`e2e_proxy_forwards_to_upstream_and_strips_response_headers`): Spawns a real mock HTTP upstream, builds full AppState with `host_overrides`, verifies end-to-end request forwarding, API key injection, and X-GVM-* response header stripping.
+
+2. **GovernanceBlockResponse fields** (`governance_block_response_contains_all_required_fields`): Sends a Deny-triggering request, verifies the 403 JSON body contains all SDK-contract fields (blocked, decision, event_id, trace_id, operation, reason, mode, next_action, ic_level).
+
+3. **SDK↔Proxy header contract** (`sdk_proxy_header_contract_resource_and_context_json`): Sends SDK-format JSON in X-GVM-Resource and X-GVM-Context headers, verifies ABAC policy evaluates `resource.sensitivity` correctly (Critical→Deny, Medium→Allow), and malformed JSON doesn't crash the proxy.
+
+4. **Policy conflict Regex edge case** (`policy_conflict_regex_vs_startswith_overlap_is_documented_false_negative`): Documents that `values_could_overlap()` returns `false` for Regex vs StartsWith (known heuristic false negative), but `max_strict` still enforces correctly via priority ordering.
+
+5. **Emergency WAL recovery** (`emergency_wal_to_primary_recovery_path`): Tests primary WAL failure → emergency fallback → primary recovery flow. Verifies emergency events have `event_hash` but no `MerkleBatchRecord`, and primary failure counter tracks correctly.
+
+### Why
+
+Test coverage analysis identified these as the highest-priority gaps: no test verified actual HTTP forwarding, no test checked the SDK-facing JSON error contract, and the emergency WAL recovery path was untested.
+
+### Affected Files
+
+- `tests/integration.rs` — 5 new tests (Tests 8-12)
+- `docs/09-test-report.md` — test count 252 → 257, integration tests 7 → 12
+- `docs/14-implementation-log.md` — this entry
+
+### Risk Assessment
+
+Low. Tests only — no production code changes. All 257 tests pass.
+
+---
+
+## 2026-03-20: Config File Hash Recording in Merkle Chain
+
+### What Changed
+
+Added `record_config_load()` to `Ledger` that records SHA-256 hashes of all loaded config files (SRR, policy, registry) as a `gvm.system.config_load` event in the WAL Merkle chain at proxy startup.
+
+### Why
+
+Policy file tampering between proxy restarts was undetectable. An attacker modifying `global.toml` to weaken rules would leave no trace in the audit trail. By recording config hashes in the same Merkle chain as enforcement events, hash mismatches across restarts become visible to auditors.
+
+### Affected Files
+
+- `src/ledger.rs` — new `record_config_load()` method
+- `src/main.rs` — step 7.5: collect config paths and call `record_config_load()` after WAL recovery
+- `tests/integration.rs` — 2 new tests (hash correctness + missing file graceful degradation)
+- `docs/04-ledger.md` — new Section 4.8 (Config File Hash Recording)
+- `docs/12-security-model.md` — new Section 6.1 (Config File Tamper Detection)
+- `docs/09-test-report.md` — test count 250 → 252
+
+### Risk Assessment
+
+Low. Non-fatal on failure (proxy logs warning, continues startup). Reuses existing `append_durable()` path — no new WAL format or recovery logic changes. Known limitation: hot-reload re-recording deferred to P3.
+
+---
+
+## 2026-03-20: Security Documentation Reframing (Timing + Fuzzing)
+
+### What Changed
+
+- Reframed timing side-channel analysis from "measured < 10x variance" to "rate limiter prevents statistical attacks; end-to-end timing difference is inherent to all proxy architectures"
+- Elevated fuzzing CI pipeline from Medium → High priority (SRR regex + JSON payload parsing are direct adversarial input surfaces)
+- Lowered constant-time SRR from Medium → Low priority (rate limiter already mitigates; end-to-end timing is architecturally inherent)
+
+### Why
+
+Previous framing implied GVM was pursuing constant-time matching but falling short. The honest framing is: (1) the engine-level 35 ns variance is unobservable, (2) the end-to-end difference (Deny=fast, Allow=slow) exists in every proxy and is not a vulnerability, (3) rate limiting makes statistical exploitation impractical. This reframing presents an intentional design decision rather than an unfinished mitigation.
+
+Fuzzing priority raised because SRR regex matching and JSON payload parsing are the primary adversarial input surfaces — exactly the code paths where crafted agent payloads land.
+
+### Affected Files
+
+- `docs/08-memory-security.md` — Section 8.4.1 rewritten, checklist row 7 updated, Future Hardening table reordered
+- `docs/12-security-model.md` — Section 1 (Timing Side Channel) rewritten
+
+### Risk Assessment
+
+Documentation-only. No code changes.
+
+---
+
 ## 2026-03-19: Vault Trait Abstraction (KeyProvider + VaultBackend)
 
 ### Motivation

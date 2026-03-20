@@ -96,13 +96,29 @@ decision = { type = "Deny", reason = "Dangerous GraphQL operation" }
 
 **Inspection flow**:
 
-1. Check `body.len() > max_body_bytes` → skip rule, return Default-to-Caution (OOM defense)
-2. Parse body as JSON → on failure, skip rule (continue to next)
-3. Extract `payload_field` value → check against `payload_match` list
-4. Match → return rule decision
-5. No match → continue to next rule
+1. Check `body.len() > max_body_bytes` → skip this rule, continue to next rule
+2. Parse body as JSON → on failure, skip this rule (continue to next)
+3. Extract `payload_field` as a **top-level JSON key** → if missing or not a string, skip rule
+4. Compare extracted string value against `payload_match` list using **exact case-sensitive equality**
+5. Match → return rule decision
+6. No match → continue to next rule
 
-**OOM Protection**: Bodies exceeding `max_body_bytes` (default 65536) are **never parsed**. The rule is skipped and Default-to-Caution is returned. This prevents adversarial payloads from causing memory exhaustion.
+**Payload inspection scope and limitations**:
+
+| Capability | Supported | Example |
+|-----------|-----------|---------|
+| Top-level string field match | Yes | `{"operationName": "TransferFunds"}` → matches `"TransferFunds"` |
+| Case-sensitive exact equality | Yes | `"transferfunds"` does NOT match `"TransferFunds"` |
+| Multiple match values | Yes | `payload_match = ["TransferFunds", "DeleteAccount"]` |
+| Nested field access | **No** | `{"data": {"operationName": "X"}}` → field not found, rule skipped |
+| Numeric field comparison | **No** | `{"amount": 50000}` → `as_str()` returns None, rule skipped |
+| Boolean/null field values | **No** | Non-string JSON values are ignored |
+| Regex on payload values | **No** | Match is literal string equality only |
+| Array field values | **No** | `{"ops": ["Transfer"]}` → not a string, rule skipped |
+
+When a payload rule is skipped (body too large, JSON parse failure, field missing, field not a string, no match), evaluation **continues to the next rule** — it does not immediately return Default-to-Caution. This allows URL-only fallback rules for the same endpoint to still match. Default-to-Caution only applies if no rule matches at all.
+
+**OOM Protection**: Bodies exceeding `max_body_bytes` (default 65536) are **never parsed**. The rule is skipped and evaluation continues to subsequent rules. This prevents adversarial payloads from causing memory exhaustion.
 
 ---
 

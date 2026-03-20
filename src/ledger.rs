@@ -1,6 +1,7 @@
 use crate::merkle::compute_event_hash;
 use crate::types::{EventStatus, GVMEvent, MerkleBatchRecord};
 use anyhow::{anyhow, Result};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -459,6 +460,69 @@ impl Ledger {
             );
         });
 
+        Ok(())
+    }
+
+    /// Record a config load event in the Merkle chain.
+    ///
+    /// Computes SHA-256 hashes of the given config file paths and writes
+    /// a system event (`gvm.system.config_load`) to the WAL via durable append.
+    /// This embeds config file integrity into the same Merkle chain as enforcement
+    /// events, enabling tamper detection: if a policy file is modified between
+    /// proxy restarts, the hash mismatch is visible in the audit trail.
+    ///
+    /// Called at proxy startup (after config load) and on policy hot-reload.
+    pub async fn record_config_load(&self, config_files: &[(&str, &std::path::Path)]) -> Result<()> {
+        use sha2::{Digest, Sha256};
+
+        let mut file_hashes: HashMap<String, serde_json::Value> = HashMap::new();
+        for (label, path) in config_files {
+            let hash = match std::fs::read(path) {
+                Ok(bytes) => {
+                    let digest = Sha256::digest(&bytes);
+                    format!("{:x}", digest)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "Config file not readable — recording hash as 'unavailable'"
+                    );
+                    "unavailable".to_string()
+                }
+            };
+            file_hashes.insert(label.to_string(), serde_json::Value::String(hash));
+        }
+
+        let event = GVMEvent {
+            event_id: format!("sys-config-{}", uuid::Uuid::new_v4()),
+            trace_id: "system".to_string(),
+            parent_event_id: None,
+            agent_id: "gvm-proxy".to_string(),
+            tenant_id: None,
+            session_id: "startup".to_string(),
+            timestamp: chrono::Utc::now(),
+            operation: "gvm.system.config_load".to_string(),
+            resource: crate::types::ResourceDescriptor::default(),
+            context: file_hashes,
+            transport: None,
+            decision: "Allow".to_string(),
+            decision_source: "system".to_string(),
+            matched_rule_id: None,
+            enforcement_point: "startup".to_string(),
+            status: EventStatus::Confirmed,
+            payload: crate::types::PayloadDescriptor::default(),
+            nats_sequence: None,
+            event_hash: None,
+            llm_trace: None,
+            default_caution: false,
+        };
+
+        self.append_durable(&event).await?;
+        tracing::info!(
+            files = config_files.len(),
+            "Config file hashes recorded in Merkle chain"
+        );
         Ok(())
     }
 

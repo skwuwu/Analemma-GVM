@@ -15,7 +15,7 @@ This document catalogues known adversarial attack vectors for transparency. Each
 | In scope (v1) | Out of scope (v1) |
 |---|---|
 | Agent makes unintended API calls due to prompt injection | Attacker has root access to the proxy host |
-| Agent tries to exfiltrate data via HTTP to unknown hosts | Attacker modifies proxy binary or config at rest |
+| Agent tries to exfiltrate data via HTTP to unknown hosts | Attacker modifies proxy binary at rest |
 | Agent escalates privilege by crafting high-IC operations | Nation-state level side-channel exploitation |
 | Misconfigured policy allows overly broad access | Physical access to hardware |
 
@@ -25,7 +25,7 @@ This document catalogues known adversarial attack vectors for transparency. Each
 
 GVM assumes the underlying host OS and filesystem are secure. This is consistent with every infrastructure tool that runs as a userspace process (Envoy, OPA, Nginx, HAProxy).
 
-- **Disk integrity**: WAL and config file protection is handled by OS-level file permissions (`0600`) and disk encryption. GVM detects tampering via Merkle chain but does not prevent filesystem writes.
+- **Disk integrity**: WAL and config file protection is handled by OS-level file permissions (`0600`) and disk encryption. GVM detects tampering via Merkle chain but does not prevent filesystem writes. Config file tampering between restarts is detectable via SHA-256 hashes recorded in the Merkle chain at each startup (see Section 6.1).
 
 - **Secret management**: GVM Vault encrypts agent state at rest. Master key management should use KMS/HSM in production. GVM is not a secrets manager.
 
@@ -41,11 +41,19 @@ If an attacker has root access to the host, GVM — like any userspace process �
 
 **Attack**: An adversary measures response latency to infer the enforcement decision type.
 
-**Actual engine latency** (from benchmarks): Allow ~28 ns, Deny ~63 ns. The difference is ~35 ns — indistinguishable from network jitter (typically 0.1-10 ms). End-to-end response times (3-12 ms in demos) are dominated by upstream I/O and safety delays, not engine processing. The only timing signal distinguishable at the network level is the intentional IC-2 Delay (300+ ms), which is by design visible to the agent as enforcement feedback.
+**Two distinct timing signals exist**:
 
-**Practical risk**: Extremely low. The 35 ns engine-level difference is 3-5 orders of magnitude below network noise. An agent would need thousands of measurements with sub-microsecond precision to extract a signal — and the governance layer controls the agent's ability to run such measurement programs.
+1. **Engine-level** (SRR/ABAC evaluation): Allow ~28 ns, Deny ~63 ns. The ~35 ns difference is 3-5 orders of magnitude below network jitter (0.1-10 ms) — practically unobservable.
 
-**Status**: Not constant-time. Practically non-exploitable in the current threat model due to rate limiting and sub-100 ns decision variance. Full constant-time padding is a v2 consideration.
+2. **End-to-end** (response time): Deny returns immediate 403 (~3 ms). Allow/Delay forwards to upstream (~50-500 ms). This difference is **architecturally inherent to every proxy-based enforcement system** (Envoy, OPA, Nginx). A blocked request is always faster than a forwarded one because no upstream call is made. This is not a GVM-specific vulnerability.
+
+**Why timing attacks are impractical**:
+
+- **Rate limiter prevents statistical sampling**: Timing attacks require thousands of repeated measurements. Per-agent rate limiting (Throttle) caps request volume, preventing sample accumulation. Rate limit violations (429) are logged as auditable events — the attack attempt is self-documenting.
+- **The signal is redundant**: Deny decisions are explicitly communicated via HTTP 403 and `X-GVM-Decision: Deny` headers. Timing reveals nothing the response doesn't already state.
+- **Constant-time padding conflicts with design**: IC-2 Delay (300+ ms) is an intentionally visible timing signal for enforcement feedback.
+
+**Status**: Not constant-time by design. Timing attack is impractical due to rate limiting. Constant-time SRR matching is a low-priority future consideration, not a v2 target.
 
 ---
 
@@ -162,6 +170,20 @@ Both paths pre-compile regex at config load time (fail-fast on invalid patterns)
 **Impact**: Audit log integrity compromised silently until next write.
 
 **Planned mitigation**: Background periodic WAL integrity scan (verify Merkle chain from genesis). WAL file permissions should be restricted (`0600`). Not implemented in v1 because the MVP runs locally where disk tampering is outside the threat model.
+
+---
+
+### 6.1 Config File Tamper Detection (Implemented)
+
+**Attack**: An attacker modifies policy files (SRR rules, ABAC policies, operation registry) on disk between proxy restarts, weakening governance without leaving an obvious trace.
+
+**Mitigation (v1)**: At startup, the proxy records SHA-256 hashes of all loaded config files as a `gvm.system.config_load` event in the Merkle chain via `append_durable()`. The hashes are stored in the event's `context` field as `label → hex digest` pairs.
+
+**Detection**: An auditor compares `gvm.system.config_load` events across restarts. A hash mismatch indicates the config file was modified between runs. Because the event is in the Merkle chain, the hash record itself is tamper-proof — an attacker cannot retroactively alter the recorded hash without breaking the chain.
+
+**Scope**: Detects file modification after the fact. Does not prevent loading a tampered config (the proxy still starts with whatever files are on disk). Real-time prevention requires file integrity monitoring (e.g., IMA/EVM, AIDE) at the OS level.
+
+**Known limitation**: Policy hot-reload (P3 roadmap) will need to re-record hashes on each reload event. Not yet implemented.
 
 ---
 
@@ -406,7 +428,35 @@ decision = { type = "Delay", milliseconds = 300 }
 
 The proxy parses the request body as JSON and checks the specified field against the match list. This ensures SRR can enforce governance on GraphQL mutations, gRPC methods, and any JSON-RPC style API — not just REST endpoints with distinct URLs.
 
+**Payload inspection scope**: SRR payload inspection is limited to **top-level JSON string fields with exact case-sensitive equality matching**. Specifically:
+- Only top-level keys are accessed (`json.get(field)`) — no nested field paths (e.g., `data.operationName` is not supported)
+- Only string values are matched (`v.as_str()`) — numeric, boolean, null, array, and object values are ignored (the rule is skipped)
+- Matching is literal string equality — no regex, no substring, no case-insensitive comparison
+- When a payload rule is skipped (field missing, wrong type, no match, parse failure, body too large), evaluation **continues to the next rule**, not to Default-to-Caution
+
+This scope is sufficient for GraphQL `operationName` and gRPC method fields, which are always top-level strings. For APIs that encode operation identity in nested fields or numeric values, use ABAC (Layer 1) rules via the SDK instead.
+
 **Body size limit**: Each rule has a configurable `max_body_bytes` (default 64 KB). Bodies exceeding this limit skip payload inspection but continue to subsequent rules, where URL-only rules or the Default-to-Caution fallback (Delay 300 ms) apply.
+
+---
+
+### Cross-Layer Forgery Threat Taxonomy
+
+GVM's cross-layer architecture (`max_strict(ABAC, SRR)`) is designed to catch agents that misrepresent their actions. The following taxonomy classifies known forgery attack patterns and maps each to GVM's defense mechanism.
+
+**Architecture prerequisite**: ABAC (Layer 1) and SRR (Layer 2) have **completely independent input sources**. ABAC evaluates only SDK-declared headers (`X-GVM-Operation`, `X-GVM-Resource`, `X-GVM-Context`). SRR evaluates only transport-layer data (HTTP method, host, URL path, request body). An attacker cannot influence both layers with a single manipulation — fooling Layer 1 does not affect Layer 2, and vice versa.
+
+| Attack Type | Description | Layer 1 (ABAC) Sees | Layer 2 (SRR) Sees | GVM Defense |
+|------------|-------------|---------------------|-------------------|-------------|
+| **Operation Downgrade** | Agent declares `gvm.storage.read` (IC-1) but sends `POST api.bank.com/transfer` | `storage.read` → Allow | `POST /transfer` → Deny | `max_strict(Allow, Deny)` = **Deny** |
+| **Resource Spoofing** | Agent declares `resource.service=internal-api` but targets `api.stripe.com/charges` | Resource matches low-risk policy → Allow | Host `api.stripe.com` matches payment rule → Delay/Deny | Stricter SRR decision wins |
+| **Context Manipulation** | Agent declares `context.amount=10` but sends `{"amount": 50000}` in body | `amount=10` passes `< 500` threshold → Allow | SRR does not inspect numeric body fields (scope limitation) | **Partial defense** — ABAC is fooled, SRR catches only if URL matches a Deny rule. Mitigation: write SRR URL rules for all high-value endpoints |
+| **Attribute Omission** | Agent omits `context.amount` entirely to bypass amount-threshold rules | No matching ABAC rule fires → Allow | SRR evaluates URL independently → depends on URL rules | **Partial defense** — documented in Deployment Guide above. Write complementary ABAC rules that deny operations missing required attributes |
+| **Header Injection** | Agent injects `X-GVM-Decision: Allow` to bypass enforcement | `GVMHeaders` struct has no `decision` field — header is ignored | SRR does not read GVM headers | Non-issue — proxy strips and ignores injected decision headers |
+
+**Key security property**: For operation downgrade and resource spoofing (the most common forgery patterns), `max_strict()` provides complete defense because the attacker cannot simultaneously control both the declared semantics (ABAC input) and the actual transport target (SRR input).
+
+**Known gap**: Context manipulation and attribute omission are partially defended. When the agent lies about *values* within a legitimate operation (correct URL, correct operation name, falsified context), SRR has limited visibility because its payload inspection only covers top-level string fields with exact matching. Defense requires complementary SRR URL rules for high-value endpoints and ABAC rules that enforce mandatory attributes.
 
 ---
 
@@ -431,7 +481,7 @@ Without network-level isolation, any process on the same network can send reques
 
 ## Adversarial Test Coverage (v0.2.3)
 
-28 tests in `tests/hostile.rs` + 17 JWT unit tests in `src/auth.rs` covering:
+28 tests in `tests/hostile.rs` + 21 JWT/auth unit tests in `src/auth.rs` covering:
 
 | Category | Tests | What They Prove |
 |----------|-------|----------------|
@@ -446,6 +496,7 @@ Without network-level isolation, any process on the same network can send reques
 | Backpressure | 1 | 500 concurrent WAL appends complete bounded |
 | Agent spoofing | 1 | Rate limiter bucket isolation under spoofed agent IDs |
 | Config poisoning | 3 | Malformed TOML rejected; catch-all Deny blocks all traffic |
+| Config integrity | 2 | Config file SHA-256 hashes recorded in Merkle chain; missing files → `"unavailable"` |
 | ABAC bypass | 1 | Attribute omission bypass documented; SRR defense-in-depth verified |
 | Resource exhaustion | 2 | Rate limiter MAX_BUCKETS overflow + eviction; limits enforced post-cleanup |
 | JWT auth | 17 | Issue/verify roundtrip, expiration, signature tampering, wrong secret, malformed tokens, secret zeroing |

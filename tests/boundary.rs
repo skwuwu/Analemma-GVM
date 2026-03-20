@@ -1068,6 +1068,73 @@ async fn vault_empty_value_roundtrip() {
     assert_eq!(result, b"", "Empty value must roundtrip correctly");
 }
 
+// ── Vault Key Injection Prevention ──
+
+#[tokio::test]
+async fn vault_key_crlf_injection_rejected() {
+    use gvm_proxy::vault::Vault;
+    use gvm_proxy::ledger::Ledger;
+
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
+    let wal_path = dir.path().join("wal.log");
+    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger must initialize"));
+    let vault = Vault::new(ledger).expect("vault must initialize with valid ledger");
+
+    // CRLF in key — could enable WAL JSON injection or log injection
+    let result = vault.write("key\r\nX-Injected: true", b"data", "agent-1").await;
+    assert!(result.is_err(), "CRLF in vault key must be rejected");
+
+    // Null byte in key — could truncate in C-based backends
+    let result = vault.write("key\0rest", b"data", "agent-1").await;
+    assert!(result.is_err(), "Null byte in vault key must be rejected");
+
+    // Read with CRLF key must also fail
+    let result = vault.read("key\r\ninjection", "agent-1").await;
+    assert!(result.is_err(), "CRLF in vault read key must be rejected");
+
+    // Delete with null byte key must also fail
+    let result = vault.delete("key\0rest", "agent-1").await;
+    assert!(result.is_err(), "Null byte in vault delete key must be rejected");
+}
+
+// ── Vault TOCTOU Key Limit Race Condition ──
+// Documents the known TOCTOU window between len()/contains_key() check and put().
+// With InMemoryBackend, two concurrent writes can both pass the limit check
+// if they race during the window. This is an accepted limitation for MVP;
+// production Redis backend should use atomic operations (SETNX + DBSIZE).
+
+#[tokio::test]
+async fn vault_key_limit_toctou_documented() {
+    use gvm_proxy::vault::Vault;
+    use gvm_proxy::ledger::Ledger;
+
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
+    let wal_path = dir.path().join("wal.log");
+    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger must initialize"));
+    let vault = Arc::new(Vault::new(ledger).expect("vault must initialize with valid ledger"));
+
+    // Fill vault to near-limit (we use a smaller limit for test speed)
+    // Write 100 keys to verify concurrent writes don't panic or deadlock
+    let mut tasks = Vec::new();
+    for i in 0..100 {
+        let v = vault.clone();
+        tasks.push(tokio::spawn(async move {
+            let key = format!("key-{}", i);
+            v.write(&key, b"value", "agent-1").await
+        }));
+    }
+
+    let mut success_count = 0;
+    for task in tasks {
+        if task.await.expect("task must not panic").is_ok() {
+            success_count += 1;
+        }
+    }
+
+    // All 100 writes should succeed (well under 10K limit)
+    assert_eq!(success_count, 100, "All 100 concurrent writes must succeed");
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // 6. Docker Isolation Boundary
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -255,6 +255,30 @@ const MAX_VAULT_KEYS: usize = 10_000;
 /// Prevents a single write from consuming excessive memory.
 const MAX_VALUE_BYTES: usize = 1024 * 1024;
 
+/// Maximum vault key length (256 bytes).
+const MAX_KEY_LEN: usize = 256;
+
+/// Validate vault key: reject control characters (CRLF, null byte, tabs)
+/// and enforce length limit. Prevents WAL JSON injection and log injection.
+fn validate_vault_key(key: &str) -> Result<()> {
+    if key.is_empty() {
+        return Err(anyhow!("Vault key must not be empty"));
+    }
+    if key.len() > MAX_KEY_LEN {
+        return Err(anyhow!(
+            "Vault key length {} exceeds maximum {} bytes",
+            key.len(),
+            MAX_KEY_LEN
+        ));
+    }
+    if key.bytes().any(|b| b < 0x20 || b == 0x7F) {
+        return Err(anyhow!(
+            "Vault key contains control characters (CRLF, null byte, etc.)"
+        ));
+    }
+    Ok(())
+}
+
 /// Vault: encrypted agent state cache.
 ///
 /// Stores agent checkpoints, conversation history, and intermediate
@@ -321,7 +345,10 @@ impl<B: VaultBackend> Vault<B> {
     /// Write an encrypted value to the vault.
     /// WAL records the encrypted value for crash recovery.
     pub async fn write(&self, key: &str, plaintext: &[u8], agent_id: &str) -> Result<()> {
-        // 0. Enforce value size limit before encryption (fail fast)
+        // 0a. Validate key (reject control characters, enforce length limit)
+        validate_vault_key(key)?;
+
+        // 0b. Enforce value size limit before encryption (fail fast)
         if plaintext.len() > MAX_VALUE_BYTES {
             return Err(anyhow!(
                 "Value size {} bytes exceeds maximum {} bytes",
@@ -357,6 +384,7 @@ impl<B: VaultBackend> Vault<B> {
     /// Read and decrypt a value from the vault.
     /// Audit log records the read event (without the value).
     pub async fn read(&self, key: &str, agent_id: &str) -> Result<Option<Vec<u8>>> {
+        validate_vault_key(key)?;
         let ciphertext = self.backend.get(key).await?;
 
         // Async audit log (read event does not include value)
@@ -371,6 +399,7 @@ impl<B: VaultBackend> Vault<B> {
 
     /// Delete a key from the vault.
     pub async fn delete(&self, key: &str, agent_id: &str) -> Result<()> {
+        validate_vault_key(key)?;
         let event = build_vault_event(key, agent_id, "vault_delete", None);
         self.ledger.append_durable(&event).await?;
 
@@ -614,5 +643,57 @@ mod tests {
 
         let keys = backend.list_keys("nonexistent:").await.unwrap();
         assert!(keys.is_empty());
+    }
+
+    // ── Key Validation Tests ──
+
+    #[test]
+    fn test_vault_key_crlf_rejected() {
+        // CRLF in vault key could enable WAL JSON injection or log injection
+        let err = validate_vault_key("key\r\ninjection").unwrap_err();
+        assert!(
+            err.to_string().contains("control characters"),
+            "CRLF key must be rejected with control character error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_vault_key_null_byte_rejected() {
+        // Null byte could truncate key in C-based backends (Redis) or WAL
+        let err = validate_vault_key("key\0truncated").unwrap_err();
+        assert!(
+            err.to_string().contains("control characters"),
+            "Null byte key must be rejected, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_vault_key_tab_rejected() {
+        let err = validate_vault_key("key\tvalue").unwrap_err();
+        assert!(err.to_string().contains("control characters"));
+    }
+
+    #[test]
+    fn test_vault_key_empty_rejected() {
+        let err = validate_vault_key("").unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn test_vault_key_oversized_rejected() {
+        let long_key = "k".repeat(MAX_KEY_LEN + 1);
+        let err = validate_vault_key(&long_key).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn test_vault_key_valid_characters_accepted() {
+        // Normal keys with colons, hyphens, dots, slashes are valid
+        assert!(validate_vault_key("agent-1:checkpoint:0").is_ok());
+        assert!(validate_vault_key("tenant/agent/state.v1").is_ok());
+        assert!(validate_vault_key("a").is_ok());
+        assert!(validate_vault_key(&"k".repeat(MAX_KEY_LEN)).is_ok());
     }
 }

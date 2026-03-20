@@ -1,8 +1,8 @@
 # Part 9: Test & Benchmark Report
 
-**Total: 199 Rust Tests (85 core unit + 7 engine + 17 CLI + 30 boundary + 17 edge + 11 hostile + 5 integration + 12 merkle + 12 stress) — All Pass**
+**Total: 257 Rust Tests (120 core unit + 7 engine + 17 CLI + 32 boundary + 17 edge + 28 hostile + 12 integration + 12 merkle + 12 stress) — All Pass**
 **Benchmarks: 17 groups / 76 benchmark cases (Criterion v0.5)**
-**Last Verified: 2026-03-19 (`cargo test --workspace --all-targets`)**
+**Last Verified: 2026-03-20 (`cargo test --workspace --all-targets`)**
 
 ---
 
@@ -10,20 +10,21 @@
 
 ```
 tests/
-├── hostile.rs          # 11 adversarial/concurrency tests
-├── integration.rs      # 5 end-to-end pipeline tests
+├── hostile.rs          # 28 adversarial/concurrency tests
+├── integration.rs      # 12 end-to-end pipeline tests (5 enforcement + 2 config integrity + 5 coverage gap)
 ├── edge_cases.rs       # 17 edge case tests
 ├── stress.rs           # 12 stress/performance tests
-├── boundary.rs         # 30 cross-boundary security tests
+├── boundary.rs         # 32 cross-boundary security tests
 ├── merkle.rs           # 12 Merkle tree integrity tests
 src/
 ├── registry.rs         # 4 unit tests
 ├── policy.rs           # 10 unit tests (4 evaluation + 6 conflict detection)
-├── srr.rs              # 19 unit tests (13 + 6 path normalization)
-├── vault.rs            # 7 unit tests
+├── srr.rs              # 24 unit tests (13 + 6 path normalization + 5 path_regex)
+├── vault.rs            # 15 unit tests (7 crypto + 2 backend + 6 key validation)
 ├── wasm_engine.rs      # 4 unit tests
 ├── merkle.rs           # 9 Merkle hash/proof tests
 ├── llm_trace.rs        # 26 LLM thinking trace tests
+├── auth.rs             # 21 JWT authentication tests
 ├── proxy.rs            # 6 response-trace extraction tests
 crates/gvm-engine/
 ├── src/lib.rs          # 7 engine tests
@@ -163,13 +164,20 @@ test srr_decision_time_is_roughly_constant ... ok
 test ledger_concurrent_spawns_stay_bounded ... ok
 test result: ok. 11 passed; 0 failed; 0 ignored; finished in 0.04s
 
-running 5 tests                               (tests/integration.rs)
+running 12 tests                              (tests/integration.rs)
 test api_key_injection_bearer_and_apikey_types ... ok
 test policy_hierarchy_global_tenant_agent_strictness ... ok
 test event_status_transitions_pending_to_confirmed_and_failed ... ok
 test wal_nats_sequence_ordering_and_crash_recovery ... ok
 test sdk_headers_to_proxy_classification_end_to_end ... ok
-test result: ok. 5 passed; 0 failed; 0 ignored; finished in 0.41s
+test config_file_hashes_recorded_in_merkle_chain ... ok
+test config_hash_records_unavailable_for_missing_files ... ok
+test e2e_proxy_forwards_to_upstream_and_strips_response_headers ... ok
+test governance_block_response_contains_all_required_fields ... ok
+test sdk_proxy_header_contract_resource_and_context_json ... ok
+test policy_conflict_regex_vs_startswith_overlap_is_documented_false_negative ... ok
+test emergency_wal_to_primary_recovery_path ... ok
+test result: ok. 12 passed; 0 failed; 0 ignored; finished in 0.42s
 
 running 12 tests                              (tests/stress.rs)
 test rate_limiter_exact_enforcement ... ok
@@ -187,7 +195,9 @@ test vault_10k_encrypt_decrypt_no_leak ... ok
 test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 ```
 
-**Total: 100 passed, 0 failed. Wall time: ~7.5s**
+**Total (historical snapshot, pre-auth/vault-trait additions): 100 passed, 0 failed. Wall time: ~7.5s**
+
+> **Current total (2026-03-19)**: 226 gvm-proxy tests + 24 workspace crate tests = 250 total. Run `cargo test --workspace` to verify.
 
 ---
 
@@ -317,7 +327,7 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 
 ## 9.4 Integration Tests — Detailed Scenarios
 
-### Hostile Environment (11 tests) — [tests/hostile.rs](tests/hostile.rs)
+### Hostile Environment (28 tests) — [tests/hostile.rs](tests/hostile.rs)
 
 | # | Test | Scenario | Verification |
 |---|------|----------|--------------|
@@ -333,7 +343,7 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 | 10 | [`srr_decision_time_is_roughly_constant`](tests/hostile.rs) | 10K deny iterations vs 10K allow iterations | Timing ratio < 10x (side-channel resistance) |
 | 11 | [`group_commit_fail_close_all_callers_receive_error`](tests/hostile.rs) | Inject I/O error → 10 concurrent appends | All 10 callers receive Err (Fail-Close guarantee) |
 
-### End-to-End Pipeline (5 tests) — [tests/integration.rs](tests/integration.rs)
+### End-to-End Pipeline (12 tests) — [tests/integration.rs](tests/integration.rs)
 
 | # | Test | Scenario | Verification |
 |---|------|----------|--------------|
@@ -342,6 +352,13 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 | 3 | [`event_status_transitions_pending_to_confirmed_and_failed`](tests/integration.rs) | Create Pending → update to Confirmed/Failed | Status field transitions correctly |
 | 4 | [`wal_nats_sequence_ordering_and_crash_recovery`](tests/integration.rs) | 50 concurrent WAL writes + recovery | WAL ordering preserved, Pending → Expired on crash |
 | 5 | [`api_key_injection_bearer_and_apikey_types`](tests/integration.rs) | APIKeyStore inject Bearer + ApiKey | Headers `Authorization: Bearer sk-xxx` and `X-Api-Key: key123` |
+| 6 | [`config_file_hashes_recorded_in_merkle_chain`](tests/integration.rs) | Config files → WAL system event | SHA-256 hashes correct, event_hash present (Merkle) |
+| 7 | [`config_hash_records_unavailable_for_missing_files`](tests/integration.rs) | Missing config file | Hash recorded as `"unavailable"`, no error |
+| 8 | [`e2e_proxy_forwards_to_upstream_and_strips_response_headers`](tests/integration.rs) | Real mock upstream → proxy forward → response | Upstream receives request, X-GVM-* response headers stripped, API key injected, non-GVM headers preserved |
+| 9 | [`governance_block_response_contains_all_required_fields`](tests/integration.rs) | Deny-triggering request → 403 JSON | Response contains all GovernanceBlockResponse fields (blocked, decision, event_id, trace_id, operation, reason, mode, next_action, ic_level) |
+| 10 | [`sdk_proxy_header_contract_resource_and_context_json`](tests/integration.rs) | SDK JSON in X-GVM-Resource/Context headers | ABAC evaluates resource.sensitivity correctly (Critical→Deny, Medium→Allow), malformed JSON doesn't crash |
+| 11 | [`policy_conflict_regex_vs_startswith_overlap_is_documented_false_negative`](tests/integration.rs) | Regex vs StartsWith overlap detection | Documents heuristic false negative, verifies max_strict still enforces correctly via priority |
+| 12 | [`emergency_wal_to_primary_recovery_path`](tests/integration.rs) | Primary WAL fail → emergency fallback → recovery | Emergency WAL has event_hash but no MerkleBatchRecord, primary failure counter tracks correctly |
 
 ### Edge Cases (17 tests) — [tests/edge_cases.rs](tests/edge_cases.rs)
 
@@ -382,7 +399,7 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 | 11 | [`rate_limiter_exact_enforcement`](tests/stress.rs) | 5 agents × 200 requests, limit 100/min | Exactly 100 allowed + 100 denied per agent |
 | 12 | [`rate_limiter_window_boundary_no_double_count`](tests/stress.rs) | 100 requests → sleep 1.1s → 100 more | Refill timing correct, no double-counting |
 
-### Boundary/Security Tests (26 tests) — [tests/boundary.rs](tests/boundary.rs)
+### Boundary/Security Tests (32 tests) — [tests/boundary.rs](tests/boundary.rs)
 
 | # | Boundary | Test | Verification |
 |---|----------|------|--------------|
@@ -574,7 +591,7 @@ cargo test
 ```bash
 cargo test --test boundary    # 26 boundary/security tests
 cargo test --test hostile      # 11 adversarial tests
-cargo test --test integration  # 5 E2E pipeline tests
+cargo test --test integration  # 7 E2E pipeline tests
 cargo test --test edge_cases   # 17 edge case tests
 cargo test --test stress       # 12 stress/scale tests
 ```

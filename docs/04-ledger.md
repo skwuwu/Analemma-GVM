@@ -207,16 +207,59 @@ pub async fn recover_from_wal(&self) -> Result<RecoveryReport> {
 
 ---
 
-## 4.8 Test Coverage
+## 4.8 Config File Hash Recording
+
+At proxy startup, the Ledger records SHA-256 hashes of all loaded configuration files as a system event in the Merkle chain. This enables tamper detection: if a policy file is modified between proxy restarts, the hash mismatch is visible in the audit trail.
+
+### Mechanism
+
+```rust
+ledger.record_config_load(&[
+    ("srr:srr_network.toml", &srr_path),
+    ("registry:operation_registry.toml", &registry_path),
+    ("policy:global.toml", &policy_path),
+]).await?;
+```
+
+This creates a `GVMEvent` with:
+- `operation`: `gvm.system.config_load`
+- `agent_id`: `gvm-proxy`
+- `status`: `Confirmed`
+- `context`: map of `label → SHA-256 hex digest` for each config file
+
+The event enters the Merkle chain via `append_durable()`, so it has an `event_hash` and participates in batch Merkle roots — identical integrity guarantees as enforcement events.
+
+### Tamper Detection Flow
+
+```
+Restart N:   config_load event → context: { "policy:global.toml": "a1b2c3..." }
+                                                    ↓
+             (attacker modifies global.toml on disk)
+                                                    ↓
+Restart N+1: config_load event → context: { "policy:global.toml": "d4e5f6..." }
+
+Auditor: compare context fields across config_load events → hash mismatch detected
+```
+
+### Graceful Degradation
+
+- If a config file is unreadable (permissions, deleted), its hash is recorded as `"unavailable"` with a warning log. The proxy continues startup.
+- Config hash recording failure is non-fatal — the proxy logs a warning and continues. This prevents a secondary failure (e.g., WAL disk full) from blocking startup of a proxy that has valid config.
+
+---
+
+## 4.9 Test Coverage
 
 | Test | Source | Assertion |
 |------|--------|-----------|
 | `wal_tampered_entry_does_not_crash_recovery` | `tests/hostile.rs` | Corrupted JSON between valid entries → recovery succeeds, finds 2 Pending events |
 | `ledger_concurrent_spawns_stay_bounded` | `tests/hostile.rs` | 500 concurrent durable appends complete < 10s, WAL has exactly 500 entries |
+| `config_file_hashes_recorded_in_merkle_chain` | `tests/integration.rs` | Config files → WAL event with correct SHA-256 hashes + event_hash (Merkle membership) |
+| `config_hash_records_unavailable_for_missing_files` | `tests/integration.rs` | Missing config file → hash recorded as `"unavailable"`, no error |
 
 ---
 
-## 4.9 Security Implications
+## 4.10 Security Implications
 
 - **Fail-Close**: WAL write failure → request rejected. No action without audit record. Both primary and emergency WAL must fail before Fail-Close triggers.
 - **Tamper Detection**: Per-event SHA-256 hashes + Merkle batch roots. `verify_wal()` detects both event content tampering and batch chain breaks.
@@ -224,6 +267,7 @@ pub async fn recover_from_wal(&self) -> Result<RecoveryReport> {
 - **Cross-Agent Ordering**: Global Merkle chain provides cryptographic proof of event ordering across all agents. This enables collusion detection: "Agent A was denied at batch N, Agent B attempted the same URL at batch N+1" is provable, not just timestamp-correlated.
 - **Ordering Guarantee**: AtomicU64 sequence allows NATS consumers to reconstruct exact WAL order.
 - **Backpressure**: Bounded channel (4096) + max batch size (128) prevent unbounded resource consumption.
+- **Config Integrity**: SHA-256 hashes of policy files are recorded in the Merkle chain at startup. Policy file tampering between restarts is detectable by comparing `gvm.system.config_load` events across restarts.
 
 ---
 

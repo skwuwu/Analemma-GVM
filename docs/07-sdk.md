@@ -6,9 +6,9 @@
 
 ## 7.1 Overview
 
-The Python SDK provides a zero-friction interface for AI agents to operate under GVM governance. **No inheritance required** — add `@ic()` decorator to functions and use `gvm_session()` for HTTP requests. For advanced features (checkpoint, rollback, encrypted state), optionally extend `GVMAgent`.
+The Python SDK provides an interface for AI agents to operate under GVM governance. **No inheritance required** — add `@ic()` decorator to functions and use `gvm_session()` for HTTP requests. For advanced features (checkpoint, rollback, encrypted state), optionally extend `GVMAgent`.
 
-**Design principle**: Minimum code change for maximum governance. Adding GVM to an existing agent is `import` + `@ic` + `gvm_session()`. No class restructuring, no framework lock-in.
+**Design principle**: Adding GVM to an existing agent requires `import` + `@ic` + `gvm_session()`. No class restructuring, no framework lock-in.
 
 ---
 

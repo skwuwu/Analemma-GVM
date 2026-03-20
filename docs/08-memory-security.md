@@ -178,15 +178,21 @@ match serde_json::from_str::<GVMEvent>(line) {
 
 **Threat**: An attacker measures response latency to determine whether their request was Denied (fast — no forwarding) vs Allowed (slow — upstream round-trip). This could be used to probe which URLs are blocked.
 
-**Current status**: The SRR uses linear rule matching (O(n) where n = number of rules). Measurement shows:
+**Analysis**: There are two distinct timing signals:
 
-| Metric | Deny Path | Allow Path | Ratio |
-|--------|-----------|------------|-------|
-| 10,000 iterations | ~Xms | ~Yms | < 10x |
+1. **SRR engine-level timing**: Policy evaluation takes ~28-63 ns regardless of decision. The variance (~35 ns) is 3-5 orders of magnitude below network jitter (0.1-10 ms). This is practically unobservable.
 
-The ratio is within an order of magnitude, making timing-based inference impractical for most attackers. True constant-time matching would require padding all code paths and fixed-time response delays — a potential future enhancement.
+2. **End-to-end response timing**: Deny returns an immediate 403 (~3 ms). Allow/Delay forwards to upstream and waits for a response (~50-500 ms). This difference is architecturally inherent to **every proxy-based enforcement system** — Envoy, OPA, Nginx all exhibit the same behavior. A blocked request is always faster than a forwarded request, because the proxy does not make an upstream call.
 
-**Verification**: `srr_decision_time_is_roughly_constant` — 10,000 iterations each for Deny and Default-to-Caution paths, asserts ratio < 10x.
+**Why this is not a practical concern**:
+
+- **Rate limiter eliminates statistical attacks**: Timing attacks require thousands of repeated measurements to extract a signal. The per-agent rate limiter (Throttle) caps request volume, preventing an agent from accumulating enough samples. Exceeding the limit triggers 429 responses that are themselves recorded in the audit trail — the attack attempt becomes a detectable event.
+- **The timing signal is redundant**: The Deny decision is already explicitly communicated to the agent via the HTTP 403 status code and `X-GVM-Decision: Deny` response header. An agent learns nothing from timing that it doesn't already know from the response.
+- **Constant-time padding would mask intentional enforcement signals**: IC-2 Delay (300+ ms) is a deliberately visible timing signal designed to give the agent feedback. Padding all responses to a fixed time would conflict with this design intent.
+
+**Status**: Not constant-time by design. Timing attack is impractical due to rate limiting, and the end-to-end timing difference is an inherent property of proxy architecture, not a GVM-specific vulnerability. Constant-time SRR matching is a low-priority consideration for future hardening.
+
+**Verification**: `srr_decision_time_is_roughly_constant` — 10,000 iterations each for Deny and Default-to-Caution paths, asserts SRR engine-level ratio < 10x.
 
 ---
 
@@ -200,7 +206,7 @@ The ratio is within an order of magnitude, making timing-based inference impract
 | 4 | Panic kills proxy | `CatchPanicLayer` in tower stack | Done | `srr_garbage_input_does_not_panic` |
 | 5 | Connection exhaustion | `ConcurrencyLimitLayer(1024)` | Done | `rate_limiter_100_concurrent_checks` |
 | 6 | WAL corruption | JSON parse skip, recovery continues | Done | `wal_tampered_entry_does_not_crash_recovery` |
-| 7 | Side-channel timing | Measured < 10x variance | Done | `srr_decision_time_is_roughly_constant` |
+| 7 | Side-channel timing | Rate limiter blocks statistical attacks; end-to-end difference is inherent to proxy architecture | Done | `srr_decision_time_is_roughly_constant` |
 | 8 | Decryption error leak | Generic error, internal log only | Done | `test_wrong_key_returns_integrity_error` |
 | 9 | Task leak / backpressure | Bounded WAL mutex, stub NATS | Done | `ledger_concurrent_spawns_stay_bounded` |
 | 10 | Intermediate key exposure | `bytes.zeroize()` on all paths | Done | Code review |
@@ -342,9 +348,9 @@ The proxy layer (`proxy.rs`) and all enforcement logic (SRR, ABAC, WAL, Vault) r
 | Bounded NATS channels | High | Replace `tokio::spawn` with bounded `mpsc` channel for NATS publish |
 | Key rotation support | High | Automatic re-encryption of vault data on key change |
 | mlock for key pages | Medium | Pin key memory pages to prevent swap-to-disk |
-| Constant-time SRR | Medium | Pad all code paths to fixed execution time |
+| Fuzzing CI pipeline | High | Continuous fuzzing with `cargo-fuzz` or AFL — SRR regex matching and JSON payload parsing process adversarial external input directly, making fuzzing high-value for discovering edge cases |
+| Constant-time SRR | Low | Pad all code paths to fixed execution time — low priority because rate limiter already prevents statistical timing attacks and end-to-end timing difference is inherent to proxy architecture |
 | Memory allocator hardening | Low | Use `jemalloc` with security features or custom allocator |
-| Fuzzing CI pipeline | Medium | Continuous fuzzing with `cargo-fuzz` or AFL |
 | MicroVM isolation mode | Low | Firecracker/KVM `--microvm` flag for multi-tenant SaaS (see 8.7) |
 
 ---

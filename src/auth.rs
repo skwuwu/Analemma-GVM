@@ -170,6 +170,12 @@ pub fn verify_token(config: &JwtConfig, token: &str) -> Result<VerifiedIdentity>
         return Err(anyhow!("Token expired"));
     }
 
+    // Reject tokens issued in the future (clock skew defense).
+    // Allows EXPIRY_LEEWAY_SECS tolerance for minor clock drift.
+    if claims.iat > now + EXPIRY_LEEWAY_SECS {
+        return Err(anyhow!("Token issued in the future"));
+    }
+
     // Check issuer
     if claims.iss != "gvm-proxy" {
         return Err(anyhow!("Invalid token issuer"));
@@ -223,6 +229,26 @@ fn decode_jwt(secret: &JwtSecret, token: &str) -> Result<Claims> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err(anyhow!("Malformed token"));
+    }
+
+    // Validate header algorithm before signature verification.
+    // Defense against alg:none attack (CVE-2015-9235): reject any token
+    // that does not declare HS256. Even though we always verify with HMAC,
+    // explicit validation prevents future regressions if decode logic changes.
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .map_err(|_| anyhow!("Invalid token encoding"))?;
+    let header_str = std::str::from_utf8(&header_bytes)
+        .map_err(|_| anyhow!("Invalid token header encoding"))?;
+    let header_json: serde_json::Value = serde_json::from_str(header_str)
+        .map_err(|_| anyhow!("Invalid token header"))?;
+    match header_json.get("alg").and_then(|v| v.as_str()) {
+        Some("HS256") => {}
+        Some(alg) => {
+            tracing::warn!(algorithm = alg, "JWT with unexpected algorithm rejected");
+            return Err(anyhow!("Unsupported token algorithm"));
+        }
+        None => return Err(anyhow!("Missing token algorithm")),
     }
 
     let signing_input = format!("{}.{}", parts[0], parts[1]);
@@ -468,5 +494,147 @@ mod tests {
         let result = JwtConfig::from_env("GVM_TEST_JWT_SECRET_NONEXISTENT_12345", 3600)
             .expect("missing env var must return Ok(None)");
         assert!(result.is_none());
+    }
+
+    // ── CVE-2015-9235: JWT alg:none Attack ──
+
+    #[test]
+    fn alg_none_attack_rejected() {
+        // CVE-2015-9235: attacker crafts token with {"alg":"none"} header
+        // to bypass signature verification. Must be rejected explicitly.
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let config = test_config(3600);
+
+        // Craft a token with alg:none header
+        let header = r#"{"alg":"none","typ":"JWT"}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+
+        let payload = serde_json::json!({
+            "sub": "attacker",
+            "scope": "proxy",
+            "iat": now_unix(),
+            "exp": now_unix() + 3600,
+            "jti": "fake-id",
+            "iss": "gvm-proxy"
+        });
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+
+        // Empty signature (alg:none means no signature)
+        let token = format!("{}.{}.", header_b64, payload_b64);
+
+        let result = verify_token(&config, &token);
+        assert!(result.is_err(), "alg:none token must be rejected");
+        assert!(
+            result.unwrap_err().to_string().contains("algorithm"),
+            "Error must mention algorithm"
+        );
+    }
+
+    #[test]
+    fn alg_rs256_confusion_rejected() {
+        // Algorithm confusion attack: HS256 key used as RS256 public key.
+        // Must reject any algorithm that is not HS256.
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let config = test_config(3600);
+
+        let header = r#"{"alg":"RS256","typ":"JWT"}"#;
+        let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(b"{}");
+        let token = format!("{}.{}.fake-sig", header_b64, payload_b64);
+
+        let result = verify_token(&config, &token);
+        assert!(result.is_err(), "RS256 token must be rejected");
+        assert!(
+            result.unwrap_err().to_string().contains("algorithm"),
+            "Error must mention algorithm"
+        );
+    }
+
+    // ── JWT Wrong Issuer ──
+
+    #[test]
+    fn wrong_issuer_rejected() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let config = test_config(3600);
+
+        // Issue a valid token, then forge one with wrong issuer
+        let now = now_unix();
+        let claims = Claims {
+            sub: "agent-001".to_string(),
+            tid: None,
+            scope: "proxy".to_string(),
+            iat: now,
+            exp: now + 3600,
+            jti: uuid::Uuid::new_v4().to_string(),
+            iss: "evil-proxy".to_string(), // Wrong issuer
+        };
+
+        let token = encode_jwt(&config.secret, &claims)
+            .expect("encoding must succeed");
+
+        let result = verify_token(&config, &token);
+        assert!(result.is_err(), "Wrong issuer must be rejected");
+        assert!(
+            result.unwrap_err().to_string().contains("issuer"),
+            "Error must mention issuer"
+        );
+    }
+
+    // ── JWT Future Timestamp ──
+
+    #[test]
+    fn future_iat_rejected() {
+        let config = test_config(3600);
+
+        // Forge a token with iat far in the future (clock manipulation attack)
+        let future_time = now_unix() + 3600; // 1 hour in the future
+        let claims = Claims {
+            sub: "agent-001".to_string(),
+            tid: None,
+            scope: "proxy".to_string(),
+            iat: future_time,
+            exp: future_time + 3600,
+            jti: uuid::Uuid::new_v4().to_string(),
+            iss: "gvm-proxy".to_string(),
+        };
+
+        let token = encode_jwt(&config.secret, &claims)
+            .expect("encoding must succeed");
+
+        let result = verify_token(&config, &token);
+        assert!(result.is_err(), "Future iat must be rejected");
+        assert!(
+            result.unwrap_err().to_string().contains("future"),
+            "Error must mention future"
+        );
+    }
+
+    #[test]
+    fn slight_clock_skew_iat_accepted() {
+        // iat slightly in the future (within EXPIRY_LEEWAY_SECS) should be accepted
+        let config = test_config(3600);
+
+        let now = now_unix();
+        let claims = Claims {
+            sub: "agent-001".to_string(),
+            tid: None,
+            scope: "proxy".to_string(),
+            iat: now + EXPIRY_LEEWAY_SECS - 1, // Within leeway
+            exp: now + 3600,
+            jti: uuid::Uuid::new_v4().to_string(),
+            iss: "gvm-proxy".to_string(),
+        };
+
+        let token = encode_jwt(&config.secret, &claims)
+            .expect("encoding must succeed");
+
+        let result = verify_token(&config, &token);
+        assert!(result.is_ok(), "Slight clock skew within leeway must be accepted");
     }
 }

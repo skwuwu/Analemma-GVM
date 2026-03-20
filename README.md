@@ -31,7 +31,7 @@
 | Policy engines (OPA) | Evaluates metadata | Trusts what the agent declares |
 | **GVM** | **Governs actual HTTP actions** | **Alpha — not hardened yet** |
 
-Only GVM: graduated enforcement, semantic forgery detection, checkpoint rollback, Merkle based audit log.
+Only GVM: graduated enforcement, semantic forgery detection, checkpoint rollback, Merkle-chained audit for write operations (IC-2+).
 
 ---
 
@@ -58,19 +58,19 @@ We chose deterministic infrastructure control over ML-based classification. That
 | **Lightweight** | Single Rust binary, no GPU, sub-μs policy eval | No ML model to load or run |
 | **Zero dependencies** | No K8s, no Docker, no sidecar | HTTP proxy is the only moving part |
 | **Structurally unbypassable** | Agent has no keys, no direct network path | Enforcement is architectural, not cooperative |
-| **Tamper-proof audit** | Global Merkle hash chain, WAL-first fsync | Deterministic events have deterministic hashes; single chain enables cross-agent collusion detection |
+| **Tamper-proof audit** | Merkle hash chain for IC-2+ events (Delay/Deny/RequireApproval), async NATS for IC-1 (Allow) | IC-2+ events are WAL-first + Merkle chained; IC-1 events are fire-and-forget (loss tolerated < 0.1%) |
 | **Clean rollback** | Checkpoint = Merkle leaf, state restore is cryptographically verified | Deterministic state transitions are reversible |
 
 These are not five separate features. They are five consequences of one architectural choice: **govern actions at the infrastructure boundary, not at the language boundary.**
 
-GVM works in two tiers. **Tier 1 requires zero code changes** — set `HTTP_PROXY` and every outbound HTTP request passes through the governance proxy. **Tier 2 adds the SDK** for deeper control. This is a progressive adoption path, not a hidden dependency:
+GVM works in two tiers. **Tier 1 requires zero code changes** — set `HTTP_PROXY` and every outbound HTTP request passes through the governance proxy. **Tier 2 adds the SDK** for deeper control:
 
 | | Tier 1: Proxy only | Tier 2: + SDK (`@ic()` decorator) |
 |---|---|---|
 | **Code changes** | None | Add `@ic()` decorator to functions |
 | **URL/method policy (SRR)** | ✓ | ✓ |
 | **API key injection** | ✓ | ✓ |
-| **Merkle audit log** | ✓ (agent="unknown") | ✓ (per-agent, per-operation) |
+| **Merkle audit (IC-2+)** | ✓ (agent="unknown") | ✓ (per-agent, per-operation) |
 | **Default-to-Caution** | ✓ (Delay 300ms on unknown URLs) | ✓ |
 | **Semantic policy (ABAC)** | — | ✓ |
 | **Cross-layer forgery detection** | — | ✓ (`max_strict(Layer1, Layer2)`) |
@@ -399,7 +399,7 @@ class MyAgent(GVMAgent):
 |-----------|------|---------|
 | **ABAC Policy Engine** | Hierarchical rules (Global > Tenant > Agent), lower layers can only be stricter | [Details →](docs/02-policy.md) |
 | **Network SRR** | URL inspection independent of SDK headers, regex path matching, payload inspection | [Details →](docs/03-srr.md) |
-| **WAL-First Ledger** | Crash-safe audit: fsync before action, global Merkle chain (cross-agent ordering + collusion detection), NATS distribution | [Details →](docs/04-ledger.md) |
+| **WAL-First Ledger** | Crash-safe audit: fsync before action for IC-2+ events, global Merkle chain (cross-agent ordering + collusion detection), async NATS for IC-1 | [Details →](docs/04-ledger.md) |
 | **Encrypted Vault** | AES-256-GCM + `zeroize` on drop, no key material in freed memory | [Details →](docs/05-vault.md) |
 | **Proxy Pipeline** | CatchPanicLayer + backpressure + 1024 connection limit, sub-μs policy eval | [Details →](docs/06-proxy.md) |
 | **Python SDK** | `@ic()` + `gvm_session()` (no inheritance needed), optional `GVMAgent` for checkpoint/rollback, LangChain `@tool` stackable | [Details →](docs/07-sdk.md) |
@@ -461,7 +461,44 @@ GVM is lightweight because it uses deterministic pattern matching (URL, method, 
 
 **Honest trade-offs**: OpenShell's K8s isolation is more mature and operationally proven. GVM's namespace isolation is lighter but less battle-tested. Choose OpenShell if you already run K8s and want production-grade container isolation. Choose GVM if you need graduated enforcement, forgery detection, or want to avoid K8s complexity.
 
-**Complementary, not competitive.** GVM can run *inside* an OpenShell sandbox for layered defense, or standalone. [Full analysis →](docs/11-competitive-analysis.md)
+**Complementary, not competitive.** GVM can run *inside* an OpenShell sandbox for layered defense, or standalone.
+
+---
+
+## OPA+Envoy vs GVM
+
+> OPA is a policy engine for microservices. GVM is a security kernel for AI agents.
+> They solve different problems that happen to share a surface similarity.
+
+**The core divergence**: OPA+Envoy assumes honest services — your engineers write the code, your CI deploys it, requests follow known API contracts. GVM assumes adversarial agents — an LLM generates actions at runtime, headers may be forged, and the agent may be prompt-injected.
+
+### What only GVM can do
+
+These capabilities require architectural primitives that OPA+Envoy does not have. Building them on top of OPA would amount to rebuilding GVM.
+
+| Capability | Why OPA Can't | GVM |
+|-----------|---------------|-----|
+| **Cross-layer lie detection** | No second classification engine to cross-check | `max_strict(ABAC, SRR)` catches forged headers |
+| **LLM thinking trace** | No awareness of LLM response structure | Extracts reasoning from OpenAI/Anthropic/Gemini |
+| **Checkpoint/rollback** | Proxy cannot manage agent state | Merkle-verified state restore on denial |
+
+### What requires significant effort on OPA+Envoy
+
+Achievable with custom Envoy filters + OPA extensions + additional systems, but the integration cost is high.
+
+| Capability | What it would take on OPA | GVM |
+|-----------|--------------------------|-----|
+| Graduated enforcement | Custom filter + timer + approval queue | Built-in IC-2 Delay / IC-3 RequireApproval |
+| Fail-close audit | Separate WAL + blocking Envoy filter | WAL fsync before every IC-2+ forward |
+| API key isolation | Custom filter + secrets manager | Proxy injects post-enforcement, agent never holds keys |
+
+### When to use what
+
+**Use OPA+Envoy when** you govern service-to-service communication between trusted microservices, need a general-purpose policy engine (K8s admission, IAM, data filtering), or require production maturity and CNCF ecosystem integration.
+
+**Use GVM when** the client is an AI agent that generates actions at runtime, you cannot trust self-reported metadata (prompt injection risk), you need graduated enforcement beyond binary allow/deny, or the agent should never hold API credentials.
+
+**Honest assessment of OPA's advantages**: OPA has years of production use at scale (Netflix, Goldman Sachs, Pinterest), Rego's expressiveness far exceeds GVM's TOML-based rules, and the CNCF ecosystem integration (K8s admission, Terraform, Kafka) is mature. These are real strengths that matter in production. GVM is pre-release alpha software from a single developer. [Full competitive analysis →](docs/11-competitive-analysis.md)
 
 ---
 
@@ -499,7 +536,7 @@ Until WAL hardening ships, the Merkle chain is cryptographically sound but opera
 | [6](docs/06-proxy.md) | Proxy Pipeline |
 | [7](docs/07-sdk.md) | Python SDK |
 | [8](docs/08-memory-security.md) | Memory & Runtime Security Report |
-| [9](docs/09-test-report.md) | Test Coverage Report (218 tests, 0 failures) |
+| [9](docs/09-test-report.md) | Test Coverage Report (252 tests, 0 failures) |
 | [11](docs/11-competitive-analysis.md) | Competitive Analysis: GVM vs OPA+Envoy |
 | [12](docs/12-security-model.md) | Security Model & Known Attack Surface |
 
