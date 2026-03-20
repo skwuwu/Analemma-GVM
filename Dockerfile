@@ -4,8 +4,6 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY src/ src/
-COPY benches/ benches/
-COPY tests/ tests/
 RUN cargo build --release -p gvm-proxy
 
 # Stage 2: Runtime
