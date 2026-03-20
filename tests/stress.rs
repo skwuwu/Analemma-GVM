@@ -448,11 +448,16 @@ alert_level = "Info"
 
 /// Vault encrypt/decrypt 10,000 times without memory leak.
 /// Each write goes through WAL (fsync), so we use a count that fits within CI time limits.
+/// Uses batch_window=0 to avoid Windows timer resolution penalty (15.6ms) on sequential writes.
 #[tokio::test]
 async fn vault_10k_encrypt_decrypt_no_leak() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger with valid path must initialize"));
+    let config = gvm_proxy::ledger::GroupCommitConfig {
+        batch_window: std::time::Duration::ZERO,
+        ..Default::default()
+    };
+    let ledger = Arc::new(Ledger::with_config(&wal_path, "", "", config).await.expect("ledger with valid path must initialize"));
     let vault = Vault::new(ledger).expect("vault with valid ledger must initialize");
 
     let plaintext = b"test secret value for stress test";

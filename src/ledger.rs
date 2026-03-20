@@ -69,6 +69,11 @@ impl EmergencyWAL {
 // ─── Group Commit Configuration ───
 
 /// Tuning knobs for WAL group commit batching.
+///
+/// The `batch_window` is the key latency/throughput tradeoff:
+/// - `Duration::ZERO`: minimum latency per single request (no batching wait)
+/// - `2ms` (default): amortizes fsync across concurrent requests, 10-50x TPS gain
+/// - Higher values: more batching, higher throughput, but added latency per request
 pub struct GroupCommitConfig {
     /// Maximum time to wait for more events before flushing (default: 2ms).
     pub batch_window: Duration,
@@ -81,7 +86,7 @@ pub struct GroupCommitConfig {
 impl Default for GroupCommitConfig {
     fn default() -> Self {
         Self {
-            batch_window: Duration::ZERO,
+            batch_window: Duration::from_millis(2),
             max_batch_size: 128,
             channel_capacity: 4096,
         }

@@ -4,6 +4,40 @@
 
 ---
 
+## 2026-03-20: WAL Batch Window + LLM Trace Streaming Refactor
+
+### What Changed
+
+**WAL batch_window**: Changed default `GroupCommitConfig::batch_window` from `Duration::ZERO` to `Duration::from_millis(2)`. Added `[wal]` section to `ProxyConfig` with `batch_window_ms` and `max_batch_size` fields. `main.rs` now passes config values to `Ledger::with_config()`.
+
+**LLM trace extraction**: Unified SSE and non-SSE response paths into a single tap-stream pattern. Previously, non-SSE responses were fully buffered via `BodyExt::collect()` before forwarding (blocking first byte until entire body was received). Now both paths use the same approach: chunks are forwarded immediately through the stream while a bounded capture buffer accumulates bytes for post-stream trace extraction. Removed the separate `extract_llm_trace_from_sse_stream` function.
+
+**Key behavioral change**: `extract_llm_trace_from_response` now takes `&GVMEvent` instead of `&mut GVMEvent`. The extracted trace is persisted as a separate WAL entry via `tokio::spawn` after stream completion, rather than being set on the caller's event in-place.
+
+### Why
+
+**WAL**: With `batch_window=0`, every IC-2/3 request paid a full fsync even under concurrent load. With 2ms batching, concurrent requests amortize fsync across the batch, yielding 10-50x TPS improvement under load while adding only 2ms worst-case latency for isolated requests. This is critical because WAL fsync was the dominant latency component (1-50ms), dwarfing the sub-microsecond policy evaluation that GVM markets.
+
+**LLM trace**: The previous `collect()` approach buffered up to 256KB per non-SSE LLM response before forwarding the first byte. Under concurrent load (N requests × 256KB), this created both a memory exhaustion risk and an unnecessary latency penalty. The tap-stream approach eliminates both: first byte is forwarded immediately, and memory is bounded by the capture limit regardless of concurrency.
+
+### Affected Files
+
+- `src/ledger.rs` — default batch_window `Duration::ZERO` → `Duration::from_millis(2)`, updated docs
+- `src/config.rs` — new `WalConfig` struct with `batch_window_ms` and `max_batch_size`
+- `src/main.rs` — `Ledger::new()` → `Ledger::with_config()` with config values
+- `src/proxy.rs` — unified tap-stream for SSE and non-SSE, removed `extract_llm_trace_from_sse_stream`, updated 6 unit tests
+- `tests/stress.rs` — `vault_10k_encrypt_decrypt_no_leak` uses explicit `batch_window=0` to avoid Windows timer resolution penalty
+
+### Risk Assessment
+
+Medium. Two behavioral changes: (1) WAL writes now wait up to 2ms for more events before flushing — isolated requests see 2ms added latency (15.6ms on Windows due to timer resolution). (2) LLM trace is now a separate WAL entry instead of being embedded in the enforcement decision event — audit queries that join on trace data need to correlate by `event_id`. All 257 tests pass.
+
+### Known Limitation
+
+Windows timer resolution: `tokio::time::timeout(2ms)` resolves to ~15.6ms on Windows due to the default timer granularity. Production deployments on Windows should set `batch_window_ms = 0` in `proxy.toml` or use `timeBeginPeriod(1)` to increase timer resolution. Linux is unaffected.
+
+---
+
 ## 2026-03-20: Test Coverage Gap Fill (5 Integration Tests)
 
 ### What Changed

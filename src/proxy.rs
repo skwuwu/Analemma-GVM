@@ -326,13 +326,15 @@ pub async fn proxy_handler(
 
             event.status = event_status_from_response(&response);
 
-            // Extract LLM thinking trace if this is a known LLM provider response
+            // Extract LLM thinking trace if this is a known LLM provider response.
+            // Trace extraction is deferred to stream completion via tap-stream;
+            // the trace is persisted as a separate WAL entry by tokio::spawn.
             if let Some(provider) = llm_provider {
                 if response.status().is_success() {
                     response = extract_llm_trace_from_response(
                         response,
                         provider,
-                        &mut event,
+                        &event,
                         state.ledger.clone(),
                     )
                     .await;
@@ -694,15 +696,22 @@ async fn forward_request(
 /// Buffer or tap response body to extract LLM thinking trace.
 /// Called only for IC-2 paths targeting known LLM providers.
 ///
-/// - Non-streaming JSON responses: bounded buffering with explicit upstream errors on collect failure.
-/// - SSE responses: passthrough streaming with bounded tap capture (no full buffering before first byte).
-const MAX_JSON_TRACE_BUFFER_BYTES: usize = 256 * 1024;
+/// Both SSE and non-SSE responses use the same tap-stream pattern:
+/// chunks are forwarded immediately (no full buffering before first byte),
+/// while a bounded capture accumulates bytes for post-stream trace extraction.
+/// This prevents memory exhaustion under concurrent load (N requests × buffer_size)
+/// and eliminates the latency penalty of full buffering before forwarding.
+const MAX_JSON_TRACE_CAPTURE_BYTES: usize = 256 * 1024;
 const MAX_SSE_TRACE_CAPTURE_BYTES: usize = 1024 * 1024;
 
+/// Trace extraction is deferred to stream completion. The extracted trace
+/// is persisted as a separate WAL entry via `tokio::spawn`, so the caller's
+/// `event` is not modified in-place. The caller should still persist the
+/// original event (without llm_trace) for the enforcement decision record.
 async fn extract_llm_trace_from_response(
     response: Response<Body>,
     provider: &str,
-    event: &mut GVMEvent,
+    event: &GVMEvent,
     ledger: Arc<Ledger>,
 ) -> Response<Body> {
     let (parts, body) = response.into_parts();
@@ -715,73 +724,16 @@ async fn extract_llm_trace_from_response(
         .map(llm_trace::is_sse_content_type)
         .unwrap_or(false);
 
-    if is_sse {
-        return extract_llm_trace_from_sse_stream(parts, body, provider, event.clone(), ledger);
-    }
-
-    let content_length = parts
-        .headers
-        .get(hyper::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<usize>().ok());
-
-    let known_len = match content_length {
-        Some(len) => len,
-        None => {
-            tracing::debug!(
-                provider = provider,
-                "Skipping LLM trace extraction: unknown content-length"
-            );
-            let body_stream = http_body_util::BodyDataStream::new(body);
-            return Response::from_parts(parts, Body::from_stream(body_stream));
-        }
+    let capture_limit = if is_sse {
+        MAX_SSE_TRACE_CAPTURE_BYTES
+    } else {
+        MAX_JSON_TRACE_CAPTURE_BYTES
     };
 
-    if known_len > MAX_JSON_TRACE_BUFFER_BYTES {
-        tracing::debug!(
-            provider = provider,
-            content_length = known_len,
-            max_buffer = MAX_JSON_TRACE_BUFFER_BYTES,
-            "Skipping LLM trace extraction: response exceeds buffer limit"
-        );
-        let body_stream = http_body_util::BodyDataStream::new(body);
-        return Response::from_parts(parts, Body::from_stream(body_stream));
-    }
-
-    match http_body_util::BodyExt::collect(body).await {
-        Ok(collected) => {
-            let bytes = collected.to_bytes();
-            if let Some(trace) = llm_trace::extract_thinking_trace(provider, &bytes) {
-                tracing::info!(
-                    provider = provider,
-                    model = ?trace.model,
-                    has_thinking = trace.thinking.is_some(),
-                    truncated = trace.truncated,
-                    streaming = false,
-                    "LLM thinking trace extracted"
-                );
-                event.llm_trace = Some(trace);
-            }
-            Response::from_parts(parts, Body::from(bytes))
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to buffer LLM response for trace extraction");
-            error_response(
-                StatusCode::BAD_GATEWAY,
-                "Upstream response stream interrupted",
-            )
-        }
-    }
-}
-
-fn extract_llm_trace_from_sse_stream(
-    parts: axum::http::response::Parts,
-    body: Body,
-    provider: &str,
-    event: GVMEvent,
-    ledger: Arc<Ledger>,
-) -> Response<Body> {
+    // Unified tap-stream: forward chunks immediately, capture bounded bytes
+    // for post-stream trace extraction. Same pattern for SSE and JSON responses.
     let provider_name = provider.to_string();
+    let trace_event = event.clone();
     let mut upstream_stream = http_body_util::BodyDataStream::new(body);
 
     let tapped_stream = async_stream::stream! {
@@ -792,8 +744,8 @@ fn extract_llm_trace_from_sse_stream(
         while let Some(next) = upstream_stream.next().await {
             match next {
                 Ok(chunk) => {
-                    if capture.len() < MAX_SSE_TRACE_CAPTURE_BYTES {
-                        let remaining = MAX_SSE_TRACE_CAPTURE_BYTES - capture.len();
+                    if capture.len() < capture_limit {
+                        let remaining = capture_limit - capture.len();
                         let take_len = remaining.min(chunk.len());
                         capture.extend_from_slice(&chunk[..take_len]);
                         if take_len < chunk.len() {
@@ -810,7 +762,7 @@ fn extract_llm_trace_from_sse_stream(
                     tracing::warn!(
                         provider = provider_name.as_str(),
                         error = %err,
-                        "Upstream SSE stream interrupted during trace tap"
+                        "Upstream stream interrupted during trace tap"
                     );
                     yield Err(err);
                     break;
@@ -822,9 +774,17 @@ fn extract_llm_trace_from_sse_stream(
             return;
         }
 
-        let mut trace = match llm_trace::extract_thinking_trace_from_sse(provider_name.as_str(), &capture) {
-            Some(trace) => trace,
-            None => return,
+        // Extract trace from captured bytes after stream completes
+        let mut trace = if is_sse {
+            match llm_trace::extract_thinking_trace_from_sse(provider_name.as_str(), &capture) {
+                Some(trace) => trace,
+                None => return,
+            }
+        } else {
+            match llm_trace::extract_thinking_trace(provider_name.as_str(), &capture) {
+                Some(trace) => trace,
+                None => return,
+            }
         };
 
         if capture_overflow {
@@ -836,22 +796,25 @@ fn extract_llm_trace_from_sse_stream(
             model = ?trace.model,
             has_thinking = trace.thinking.is_some(),
             truncated = trace.truncated,
-            streaming = true,
+            streaming = is_sse,
             "LLM thinking trace extracted"
         );
 
-        let mut trace_event = event;
+        let mut trace_event = trace_event;
         trace_event.llm_trace = Some(trace);
 
         tokio::spawn(async move {
             if let Err(e) = ledger.append_durable(&trace_event).await {
-                tracing::warn!(error = %e, "Failed to persist SSE LLM trace update");
+                tracing::warn!(error = %e, "Failed to persist LLM trace update");
             }
         });
     };
 
     Response::from_parts(parts, Body::from_stream(tapped_stream))
 }
+
+// extract_llm_trace_from_sse_stream removed: unified into extract_llm_trace_from_response
+// using the same tap-stream pattern for both SSE and non-SSE responses.
 
 /// Parse GVM-specific headers from an SDK-routed request.
 /// When a verified JWT identity is provided, it overrides the self-declared
@@ -1106,8 +1069,6 @@ fn governance_block_response(status: StatusCode, block: GovernanceBlockResponse)
 mod tests {
     use super::*;
     use axum::body::Bytes;
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
     use std::time::{Duration, Instant};
 
     async fn make_test_ledger() -> (Arc<Ledger>, std::path::PathBuf) {
@@ -1164,20 +1125,17 @@ mod tests {
             .expect("response build should succeed");
 
         let (ledger, _wal_path) = make_test_ledger().await;
-        let mut event = make_event();
+        let event = make_event();
         let response =
-            extract_llm_trace_from_response(response, "openai", &mut event, ledger).await;
+            extract_llm_trace_from_response(response, "openai", &event, ledger).await;
 
         let bytes = http_body_util::BodyExt::collect(response.into_body())
             .await
             .expect("body collect should succeed")
             .to_bytes();
 
+        // Body must be preserved regardless of trace extraction
         assert_eq!(bytes, body.as_bytes());
-        assert!(
-            event.llm_trace.is_none(),
-            "unknown length should skip extraction and preserve response"
-        );
     }
 
     #[tokio::test]
@@ -1200,25 +1158,52 @@ mod tests {
         let response = Response::builder()
             .status(StatusCode::OK)
             .header(hyper::header::CONTENT_TYPE, "application/json")
-            .header(hyper::header::CONTENT_LENGTH, body.len().to_string())
             .body(Body::from(body.clone()))
             .expect("response build should succeed");
 
-        let (ledger, _wal_path) = make_test_ledger().await;
+        let (ledger, wal_path) = make_test_ledger().await;
         let mut event = make_event();
-        let response =
-            extract_llm_trace_from_response(response, "openai", &mut event, ledger).await;
+        event.event_id = format!("evt-json-trace-{}", uuid::Uuid::new_v4());
 
+        let response =
+            extract_llm_trace_from_response(response, "openai", &event, ledger).await;
+
+        // Body must be forwarded immediately via tap-stream
         let bytes = http_body_util::BodyExt::collect(response.into_body())
             .await
             .expect("body collect should succeed")
             .to_bytes();
-
         assert_eq!(bytes, body.as_bytes());
-        let trace = event
-            .llm_trace
-            .as_ref()
-            .expect("bounded body should produce trace");
+
+        // Trace is persisted asynchronously to WAL after stream completes
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut persisted_trace = None;
+
+        while Instant::now() < deadline {
+            let wal = tokio::fs::read_to_string(&wal_path)
+                .await
+                .unwrap_or_default();
+
+            for line in wal.lines() {
+                if !line.contains(&event.event_id) || !line.contains("\"llm_trace\"") {
+                    continue;
+                }
+                if let Ok(parsed) = serde_json::from_str::<GVMEvent>(line) {
+                    if let Some(trace) = parsed.llm_trace {
+                        persisted_trace = Some(trace);
+                        break;
+                    }
+                }
+            }
+
+            if persisted_trace.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let trace = persisted_trace
+            .expect("bounded JSON body should produce trace persisted to WAL");
         assert_eq!(trace.provider, "openai");
     }
 
@@ -1228,69 +1213,52 @@ mod tests {
         let response = Response::builder()
             .status(StatusCode::OK)
             .header(hyper::header::CONTENT_TYPE, "application/json")
-            .header(hyper::header::CONTENT_LENGTH, body.len().to_string())
             .body(Body::from(body.clone()))
             .expect("response build should succeed");
 
         let (ledger, _wal_path) = make_test_ledger().await;
-        let mut event = make_event();
+        let event = make_event();
         let response =
-            extract_llm_trace_from_response(response, "openai", &mut event, ledger).await;
+            extract_llm_trace_from_response(response, "openai", &event, ledger).await;
 
+        // Body must be preserved (streamed through) even if oversized
         let bytes = http_body_util::BodyExt::collect(response.into_body())
             .await
             .expect("body collect should succeed")
             .to_bytes();
 
         assert_eq!(bytes, body.as_bytes());
-        assert!(
-            event.llm_trace.is_none(),
-            "oversized body should skip extraction and preserve response"
-        );
-    }
-
-    struct FailingBody;
-
-    impl hyper::body::Body for FailingBody {
-        type Data = Bytes;
-        type Error = std::io::Error;
-
-        fn poll_frame(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
-            Poll::Ready(Some(Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionReset,
-                "stream aborted",
-            ))))
-        }
     }
 
     #[tokio::test]
     async fn llm_trace_collect_error_returns_explicit_error_response() {
+        // With tap-stream, upstream errors propagate through the stream
+        // rather than returning a 502 response. The stream yields Err.
+        let failing_stream = async_stream::stream! {
+            yield Err::<Bytes, std::io::Error>(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "stream aborted",
+            ));
+        };
+
         let response = Response::builder()
             .status(StatusCode::OK)
             .header(hyper::header::CONTENT_TYPE, "application/json")
-            .header(hyper::header::CONTENT_LENGTH, "10")
-            .body(Body::new(FailingBody))
+            .body(Body::from_stream(failing_stream))
             .expect("response build should succeed");
 
         let (ledger, _wal_path) = make_test_ledger().await;
-        let mut event = make_event();
+        let event = make_event();
         let response =
-            extract_llm_trace_from_response(response, "openai", &mut event, ledger).await;
+            extract_llm_trace_from_response(response, "openai", &event, ledger).await;
 
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        let bytes = http_body_util::BodyExt::collect(response.into_body())
-            .await
-            .expect("body collect should succeed")
-            .to_bytes();
-        let body = String::from_utf8(bytes.to_vec()).expect("error body must be UTF-8 JSON");
-
+        // The response status is preserved (200 OK from upstream headers).
+        // The body stream itself will yield the error when consumed.
+        assert_eq!(response.status(), StatusCode::OK);
+        let result = http_body_util::BodyExt::collect(response.into_body()).await;
         assert!(
-            body.contains("Upstream response stream interrupted"),
-            "must return explicit error body, got: {}",
-            body
+            result.is_err(),
+            "stream error must propagate to the consumer"
         );
     }
 
@@ -1315,14 +1283,14 @@ mod tests {
             .expect("response build should succeed");
 
         let (ledger, _wal_path) = make_test_ledger().await;
-        let mut event = make_event();
+        let event = make_event();
 
         let start = Instant::now();
         let response =
-            extract_llm_trace_from_response(response, "openai", &mut event, ledger).await;
+            extract_llm_trace_from_response(response, "openai", &event, ledger).await;
         assert!(
             start.elapsed() < Duration::from_millis(150),
-            "SSE extraction must not block on upstream stream completion"
+            "tap-stream extraction must not block on upstream stream completion"
         );
 
         let bytes = http_body_util::BodyExt::collect(response.into_body())
@@ -1355,11 +1323,7 @@ mod tests {
         event.event_id = format!("evt-test-{}", uuid::Uuid::new_v4());
 
         let response =
-            extract_llm_trace_from_response(response, "openai", &mut event, ledger).await;
-        assert!(
-            event.llm_trace.is_none(),
-            "SSE trace extraction should be persisted asynchronously"
-        );
+            extract_llm_trace_from_response(response, "openai", &event, ledger).await;
 
         let bytes = http_body_util::BodyExt::collect(response.into_body())
             .await

@@ -19,6 +19,9 @@ pub struct ProxyConfig {
     /// JWT authentication configuration (optional).
     /// When configured, agents authenticate via Bearer tokens.
     pub jwt: Option<JwtAuthConfig>,
+    /// WAL (Write-Ahead Log) tuning options.
+    #[serde(default)]
+    pub wal: WalConfig,
 }
 
 /// JWT authentication configuration.
@@ -161,6 +164,43 @@ pub struct SecretsConfig {
     pub key_env: String,
 }
 
+/// WAL (Write-Ahead Log) tuning configuration.
+///
+/// ```toml
+/// [wal]
+/// batch_window_ms = 2
+/// max_batch_size = 128
+/// ```
+#[derive(Deserialize, Clone, Debug)]
+pub struct WalConfig {
+    /// Group commit batch window in milliseconds (default: 2ms).
+    /// Events arriving within this window are batched into a single fsync.
+    /// Set to 0 for minimum latency (no batching wait), at the cost of
+    /// one fsync per request under low concurrency.
+    #[serde(default = "default_batch_window_ms")]
+    pub batch_window_ms: u64,
+    /// Maximum events per batch before forcing a flush (default: 128).
+    #[serde(default = "default_max_batch_size")]
+    pub max_batch_size: usize,
+}
+
+impl Default for WalConfig {
+    fn default() -> Self {
+        Self {
+            batch_window_ms: 2,
+            max_batch_size: 128,
+        }
+    }
+}
+
+fn default_batch_window_ms() -> u64 {
+    2
+}
+
+fn default_max_batch_size() -> usize {
+    128
+}
+
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
@@ -202,6 +242,7 @@ impl Default for ProxyConfig {
             },
             dev: None,
             jwt: None,
+            wal: WalConfig::default(),
         }
     }
 }

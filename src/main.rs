@@ -115,10 +115,16 @@ async fn main() {
     }
 
     // 6. Initialize Ledger (WAL + NATS stub)
-    let ledger = Ledger::new(
+    let wal_config = gvm_proxy::ledger::GroupCommitConfig {
+        batch_window: std::time::Duration::from_millis(config.wal.batch_window_ms),
+        max_batch_size: config.wal.max_batch_size,
+        ..Default::default()
+    };
+    let ledger = Ledger::with_config(
         Path::new("data/wal.log"),
         &config.nats.url,
         &config.nats.stream,
+        wal_config,
     )
     .await
     .expect("Failed to initialize ledger");

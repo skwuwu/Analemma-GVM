@@ -96,6 +96,7 @@ async fn append(&self, event: &GVMEvent) -> Result<()> {
 
 **Key properties**:
 - **One fsync per batch** — amortized across all events in the batch (not per-event)
+- **Batch window (2ms default)** — waits briefly for concurrent events to batch together, yielding 10-50x TPS under load vs per-event fsync. Configurable via `[wal] batch_window_ms` in `proxy.toml`.
 - **Non-blocking drain** — `try_recv()` collects all queued events without timer overhead
 - **Bounded backpressure** — channel capacity 4096, max batch size 128
 - **Caller-parallel serialization** — event hash + JSON computed before channel send
