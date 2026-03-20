@@ -68,16 +68,19 @@ GVM works in two tiers. **Tier 1 requires zero code changes** — set `HTTP_PROX
 | | Tier 1: Proxy only | Tier 2: + SDK (`@ic()` decorator) |
 |---|---|---|
 | **Code changes** | None | Add `@ic()` decorator to functions |
-| **URL/method policy (SRR)** | ✓ | ✓ |
+| **SRR: host / method / path rules** | ✓ | ✓ |
+| **SRR: payload field inspection** | — (body not buffered)¹ | — (body not buffered)¹ |
 | **API key injection** | ✓ | ✓ |
 | **Merkle audit (IC-2+)** | ✓ (agent="unknown") | ✓ (per-agent, per-operation) |
 | **Default-to-Caution** | ✓ (Delay 300ms on unknown URLs) | ✓ |
 | **Semantic policy (ABAC)** | — | ✓ |
 | **Cross-layer forgery detection** | — | ✓ (`max_strict(Layer1, Layer2)`) |
-| **Per-agent rate limiting** | — (shared bucket) | ✓ |
+| **Per-agent rate limiting** | — (all unauthenticated traffic shares one bucket) | ✓ |
 | **Checkpoint/rollback** | — | ✓ |
 
-**Tier 1 alone** blocks known-bad URLs, injects credentials, and logs everything — that's already more than most agent deployments have. **Tier 2** adds the cross-layer forgery detection that catches a lying agent. Start with the proxy, add the SDK when you need deeper control.
+> ¹ SRR payload inspection rules (`payload_field` / `payload_match`) are parsed and loaded but currently inactive — the proxy passes `body = None` to SRR in both tiers. Host/method/path rules work fully. Payload inspection is planned for a future release.
+
+**Tier 1 alone** blocks known-bad URLs by host/method/path, injects credentials, and logs everything with WAL — that's already more than most agent deployments have. **Tier 2** adds the cross-layer forgery detection that catches a lying agent. Start with the proxy, add the SDK when you need deeper control.
 
 The agent cannot bypass this. Not because it's told not to, but because the architecture makes bypass structurally impossible:
 
@@ -351,7 +354,7 @@ A single policy engine can be fooled. If the agent declares `storage.read` but s
 | Layer | What It Checks | Why It Exists | Requires SDK? |
 |-------|---------------|---------------|---------------|
 | **Layer 1: Semantic (ABAC)** | Operation name, resource, context | Catches semantic policy violations | Yes (`@ic()`) |
-| **Layer 2: Network (SRR)** | Actual URL, method, payload | Catches lies — inspects what the agent *does* | **No** |
+| **Layer 2: Network (SRR)** | Actual URL, method, path (host/method/path rules active; payload inspection not yet active¹) | Catches lies — inspects what the agent *does* | **No** |
 | **Layer 3: Capability Token** | API key injection | Removes the means — agent never holds credentials | **No** |
 
 **Without SDK**: Layer 2 + Layer 3 provide URL-based enforcement and credential isolation.
