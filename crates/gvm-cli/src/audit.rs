@@ -1,6 +1,33 @@
 use anyhow::{Context, Result};
 use gvm_types::GVMEvent;
+use sha2::{Digest, Sha256};
 use std::io::BufRead;
+
+/// Recompute the expected event_hash from event fields.
+/// Must match compute_event_hash in src/merkle.rs exactly.
+fn recompute_event_hash(event: &GVMEvent) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(event.event_id.as_bytes());
+    hasher.update(b"|");
+    hasher.update(event.trace_id.as_bytes());
+    hasher.update(b"|");
+    hasher.update(event.agent_id.as_bytes());
+    hasher.update(b"|");
+    hasher.update(event.operation.as_bytes());
+    hasher.update(b"|");
+    hasher.update(event.decision.as_bytes());
+    hasher.update(b"|");
+    hasher.update(event.decision_source.as_bytes());
+    hasher.update(b"|");
+    hasher.update(format!("{:?}", event.status).as_bytes());
+    hasher.update(b"|");
+    hasher.update(event.enforcement_point.as_bytes());
+    hasher.update(b"|");
+    hasher.update(event.timestamp.to_rfc3339().as_bytes());
+    hasher.update(b"|");
+    hasher.update(event.payload.content_hash.as_bytes());
+    hex::encode(hasher.finalize())
+}
 
 /// Verify WAL integrity: check for parseable events, monotonic timestamps,
 /// and hash chain continuity.
@@ -18,6 +45,7 @@ pub async fn verify_wal(wal_file: &str) -> Result<()> {
     let mut events_with_hash: u64 = 0;
     let mut events_without_hash: u64 = 0;
     let mut pending_events: u64 = 0;
+    let mut hash_mismatches: u64 = 0;
 
     for line in reader.lines() {
         let line = line?;
@@ -53,9 +81,13 @@ pub async fn verify_wal(wal_file: &str) -> Result<()> {
                 }
                 prev_timestamp = Some(event.timestamp);
 
-                // Check event hash presence
-                if event.event_hash.is_some() {
+                // Check event hash presence and integrity
+                if let Some(stored_hash) = &event.event_hash {
                     events_with_hash += 1;
+                    let computed = recompute_event_hash(&event);
+                    if *stored_hash != computed {
+                        hash_mismatches += 1;
+                    }
                 } else {
                     events_without_hash += 1;
                 }
@@ -80,6 +112,7 @@ pub async fn verify_wal(wal_file: &str) -> Result<()> {
     println!("  Timestamp out-of-order: {}", out_of_order);
     println!("  Events with hash:       {}", events_with_hash);
     println!("  Events without hash:    {}", events_without_hash);
+    println!("  Hash mismatches:        {}", hash_mismatches);
     println!("  Stuck Pending events:   {}", pending_events);
     println!();
 
@@ -92,7 +125,13 @@ pub async fn verify_wal(wal_file: &str) -> Result<()> {
     if pending_events > 0 {
         println!("  WARNING: {} events in Pending state (possible phantom records from crash).", pending_events);
     }
-    if corrupt_lines == 0 && out_of_order == 0 && pending_events == 0 {
+    if hash_mismatches > 0 {
+        println!(
+            "  TAMPER DETECTED: {} event(s) have invalid hashes. WAL integrity compromised.",
+            hash_mismatches
+        );
+    }
+    if corrupt_lines == 0 && out_of_order == 0 && pending_events == 0 && hash_mismatches == 0 {
         println!("  OK: WAL integrity verified. No issues found.");
     }
 

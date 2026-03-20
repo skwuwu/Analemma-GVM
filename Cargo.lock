@@ -1153,9 +1153,11 @@ dependencies = [
  "clap",
  "gvm-sandbox",
  "gvm-types",
+ "hex",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "url",
 ]
