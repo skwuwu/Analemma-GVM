@@ -131,6 +131,8 @@ def gvm_session(proxy_url: str = None):
             "Install: pip install requests"
         )
 
+    from gvm.errors import GVMError
+
     proxy = proxy_url or get_proxy_url()
     session = requests.Session()
     session.proxies = {"http": proxy, "https": proxy}
@@ -146,4 +148,19 @@ def gvm_session(proxy_url: str = None):
         return prepared
 
     session.prepare_request = prepare_with_gvm
+
+    def _enforce_response(resp, *args, **kwargs):
+        """Raise a GVMError subclass on governance block responses (403, 429)."""
+        if resp.status_code in (403, 429):
+            # Only raise for GVM governance blocks (check header or JSON body)
+            decision_header = resp.headers.get("X-GVM-Decision", "")
+            if decision_header or resp.headers.get("Content-Type", "").startswith("application/json"):
+                try:
+                    body = resp.json()
+                    if body.get("blocked") or decision_header:
+                        raise GVMError.from_response(body, status_code=resp.status_code)
+                except (ValueError, KeyError):
+                    pass
+
+    session.hooks["response"].append(_enforce_response)
     return session
