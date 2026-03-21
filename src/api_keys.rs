@@ -110,15 +110,17 @@ impl APIKeyStore {
 
         // Strip all agent-supplied auth headers before injecting proxy credentials.
         // This prevents agents from bypassing Layer 3 by smuggling their own credentials.
-        // Covers: Authorization (Bearer/Basic), Cookie (session tokens),
-        // X-API-Key and ApiKey (common API key headers).
+        // Covers standard and common non-standard auth headers.
         headers.remove(axum::http::header::AUTHORIZATION);
         headers.remove(axum::http::header::COOKIE);
-        if let Ok(k) = HeaderName::from_bytes(b"x-api-key") {
-            headers.remove(k);
-        }
-        if let Ok(k) = HeaderName::from_bytes(b"apikey") {
-            headers.remove(k);
+        headers.remove(axum::http::header::PROXY_AUTHORIZATION);
+        for name in &[
+            "x-api-key", "apikey", "x-auth-token", "x-api-token",
+            "x-signature", "x-hmac", "x-credentials",
+        ] {
+            if let Ok(k) = HeaderName::from_bytes(name.as_bytes()) {
+                headers.remove(k);
+            }
         }
 
         match cred {

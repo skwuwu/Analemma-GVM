@@ -37,25 +37,25 @@ use crate::types::{GVMEvent, MerkleBatchRecord};
 /// `decision_source` / `enforcement_point` prevent attribution falsification.
 pub fn compute_event_hash(event: &GVMEvent) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(event.event_id.as_bytes());
-    hasher.update(b"|");
-    hasher.update(event.trace_id.as_bytes());
-    hasher.update(b"|");
-    hasher.update(event.agent_id.as_bytes());
-    hasher.update(b"|");
-    hasher.update(event.operation.as_bytes());
-    hasher.update(b"|");
-    hasher.update(event.decision.as_bytes());
-    hasher.update(b"|");
-    hasher.update(event.decision_source.as_bytes());
-    hasher.update(b"|");
-    hasher.update(format!("{:?}", event.status).as_bytes());
-    hasher.update(b"|");
-    hasher.update(event.enforcement_point.as_bytes());
-    hasher.update(b"|");
-    hasher.update(event.timestamp.to_rfc3339().as_bytes());
-    hasher.update(b"|");
-    hasher.update(event.payload.content_hash.as_bytes());
+    // Domain separation prefix prevents cross-context hash collisions
+    hasher.update(b"gvm-event-v1:");
+    // Length-prefixed fields prevent delimiter-based collision attacks
+    // (e.g. event_id="a|b" + trace_id="c" vs event_id="a" + trace_id="b|c")
+    for field in &[
+        event.event_id.as_str(),
+        event.trace_id.as_str(),
+        event.agent_id.as_str(),
+        event.operation.as_str(),
+        event.decision.as_str(),
+        event.decision_source.as_str(),
+        &format!("{:?}", event.status),
+        event.enforcement_point.as_str(),
+        &event.timestamp.to_rfc3339(),
+        event.payload.content_hash.as_str(),
+    ] {
+        hasher.update((field.len() as u32).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
     hex::encode(hasher.finalize())
 }
 
@@ -89,6 +89,8 @@ pub fn compute_merkle_root(leaf_hashes: &[String]) -> anyhow::Result<String> {
 
         for chunk in current_level.chunks(2) {
             let mut hasher = Sha256::new();
+            // Domain separation for internal nodes vs leaf hashes
+            hasher.update(b"gvm-node-v1:");
             hasher.update(chunk[0]);
             if chunk.len() == 2 {
                 hasher.update(chunk[1]);
@@ -152,6 +154,7 @@ pub fn generate_merkle_proof(leaf_hashes: &[String], index: usize) -> anyhow::Re
         let mut next_level = Vec::with_capacity(current_level.len() / 2);
         for chunk in current_level.chunks(2) {
             let mut hasher = Sha256::new();
+            hasher.update(b"gvm-node-v1:");
             hasher.update(chunk[0]);
             hasher.update(chunk[1]);
             let hash: [u8; 32] = hasher.finalize().into();
@@ -189,6 +192,7 @@ pub fn verify_merkle_proof(leaf_hash: &str, proof: &[(String, bool)], expected_r
         };
 
         let mut hasher = Sha256::new();
+        hasher.update(b"gvm-node-v1:");
         if *is_right {
             // sibling is on the right: H(current || sibling)
             hasher.update(current);
@@ -338,18 +342,29 @@ mod tests {
         assert_eq!(root, leaf, "single leaf should be its own root");
     }
 
+    /// Helper: compute internal node hash with domain separation (matches production code)
+    fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"gvm-node-v1:");
+        hasher.update(left);
+        hasher.update(right);
+        hasher.finalize().into()
+    }
+
+    fn decode_hash(hex_str: &str) -> [u8; 32] {
+        let bytes = hex::decode(hex_str).expect("test hash must be valid hex");
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        arr
+    }
+
     #[test]
     fn merkle_two_leaves() {
         let a = hash_str("event_1");
         let b = hash_str("event_2");
         let root = compute_merkle_root(&[a.clone(), b.clone()]).unwrap();
 
-        // Manual: H(a || b)
-        let mut hasher = Sha256::new();
-        hasher.update(hex::decode(&a).expect("test hash 'a' must be valid hex"));
-        hasher.update(hex::decode(&b).expect("test hash 'b' must be valid hex"));
-        let expected = hex::encode(hasher.finalize());
-
+        let expected = hex::encode(node_hash(&decode_hash(&a), &decode_hash(&b)));
         assert_eq!(root, expected);
     }
 
@@ -360,22 +375,9 @@ mod tests {
         let c = hash_str("event_3");
         let root = compute_merkle_root(&[a.clone(), b.clone(), c.clone()]).unwrap();
 
-        // Manual: H(H(a,b), H(c,c))
-        let mut h_ab = Sha256::new();
-        h_ab.update(hex::decode(&a).expect("test hash 'a' must be valid hex"));
-        h_ab.update(hex::decode(&b).expect("test hash 'b' must be valid hex"));
-        let hab: [u8; 32] = h_ab.finalize().into();
-
-        let mut h_cc = Sha256::new();
-        h_cc.update(hex::decode(&c).expect("test hash 'c' must be valid hex"));
-        h_cc.update(hex::decode(&c).expect("test hash 'c' must be valid hex"));
-        let hcc: [u8; 32] = h_cc.finalize().into();
-
-        let mut h_root = Sha256::new();
-        h_root.update(hab);
-        h_root.update(hcc);
-        let expected = hex::encode(h_root.finalize());
-
+        let hab = node_hash(&decode_hash(&a), &decode_hash(&b));
+        let hcc = node_hash(&decode_hash(&c), &decode_hash(&c));
+        let expected = hex::encode(node_hash(&hab, &hcc));
         assert_eq!(root, expected);
     }
 
@@ -384,22 +386,9 @@ mod tests {
         let leaves: Vec<String> = (0..4).map(|i| hash_str(&format!("event_{}", i))).collect();
         let root = compute_merkle_root(&leaves).unwrap();
 
-        // Manually compute balanced tree
-        let mut h01 = Sha256::new();
-        h01.update(hex::decode(&leaves[0]).expect("test leaf hash must be valid hex"));
-        h01.update(hex::decode(&leaves[1]).expect("test leaf hash must be valid hex"));
-        let n01: [u8; 32] = h01.finalize().into();
-
-        let mut h23 = Sha256::new();
-        h23.update(hex::decode(&leaves[2]).expect("test leaf hash must be valid hex"));
-        h23.update(hex::decode(&leaves[3]).expect("test leaf hash must be valid hex"));
-        let n23: [u8; 32] = h23.finalize().into();
-
-        let mut h_root = Sha256::new();
-        h_root.update(n01);
-        h_root.update(n23);
-        let expected = hex::encode(h_root.finalize());
-
+        let n01 = node_hash(&decode_hash(&leaves[0]), &decode_hash(&leaves[1]));
+        let n23 = node_hash(&decode_hash(&leaves[2]), &decode_hash(&leaves[3]));
+        let expected = hex::encode(node_hash(&n01, &n23));
         assert_eq!(root, expected);
     }
 

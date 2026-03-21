@@ -925,13 +925,12 @@ fn extract_target(request: &Request<Body>) -> Option<Target> {
     let query = request.uri().query().map(String::from);
 
     // Select scheme based on target host.
-    // Note: IPv6 loopback ([::1]) is not handled here for MVP.
-    // Production should use a proper scheme negotiation (e.g. X-GVM-Target-Scheme header).
-    let scheme = if gvm_types::strip_port(&host) == "localhost" || gvm_types::strip_port(&host) == "127.0.0.1" {
-        "http".to_string()
-    } else {
-        "https".to_string()
-    };
+    let stripped = gvm_types::strip_port(&host);
+    let is_local = stripped == "localhost"
+        || stripped == "127.0.0.1"
+        || stripped == "[::1]"
+        || stripped == "::1";
+    let scheme = if is_local { "http".to_string() } else { "https".to_string() };
 
     Some(Target {
         scheme,

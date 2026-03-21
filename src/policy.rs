@@ -545,6 +545,13 @@ fn compile_rule(cfg: &PolicyRuleConfig) -> Result<PolicyRule> {
 
         let compiled_regex = if matches!(operator, Operator::Regex) {
             let pattern = value_as_str(&c.value);
+            const MAX_REGEX_LEN: usize = 10_000;
+            if pattern.len() > MAX_REGEX_LEN {
+                anyhow::bail!(
+                    "Regex pattern too long in rule {}: {} > {} bytes",
+                    cfg.id, pattern.len(), MAX_REGEX_LEN
+                );
+            }
             Some(regex::Regex::new(&pattern)
                 .with_context(|| format!("Invalid regex in rule {}: {}", cfg.id, pattern))?)
         } else {

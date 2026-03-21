@@ -174,11 +174,23 @@ impl WasmEngine {
             .context("Wasm module missing 'memory' export")?;
 
         // 1. Allocate input buffer in Wasm
+        if input_bytes.len() > u32::MAX as usize {
+            return Err(anyhow::anyhow!(
+                "Input exceeds maximum Wasm buffer size ({} bytes)", input_bytes.len()
+            ));
+        }
         let input_len = input_bytes.len() as u32;
         let input_ptr = alloc_fn.call(&mut rt.store, input_len)
             .context("engine_alloc failed")?;
 
-        // 2. Copy input JSON into Wasm memory
+        // 2. Validate pointer is within Wasm memory bounds, then copy
+        let mem_size = memory.data_size(&rt.store);
+        if (input_ptr as usize).saturating_add(input_bytes.len()) > mem_size {
+            return Err(anyhow::anyhow!(
+                "engine_alloc returned out-of-bounds pointer {} (memory size: {})",
+                input_ptr, mem_size
+            ));
+        }
         memory.write(&mut rt.store, input_ptr as usize, input_bytes)
             .context("Failed to write input to Wasm memory")?;
 
@@ -187,6 +199,11 @@ impl WasmEngine {
             .context("engine_evaluate failed")?;
 
         // 4. Read length prefix (4 bytes, little-endian u32)
+        if (result_ptr as usize).saturating_add(4) > mem_size {
+            return Err(anyhow::anyhow!(
+                "engine_evaluate returned out-of-bounds result pointer {}", result_ptr
+            ));
+        }
         let mut len_buf = [0u8; 4];
         memory.read(&mut rt.store, result_ptr as usize, &mut len_buf)
             .context("Failed to read result length from Wasm memory")?;

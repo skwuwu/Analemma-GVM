@@ -4,6 +4,37 @@
 
 ---
 
+## 2026-03-21: Security Audit — 8 Patches
+
+### What Changed
+
+1. **CRITICAL — IPv6 expand array OOB** (`srr.rs:673`): Added bounds check for `right.len() > max_segments` before subtraction. Malformed IPv6 with excessive segments after `::` caused integer underflow → out-of-bounds array write.
+
+2. **HIGH — Merkle domain separation** (`merkle.rs`): Added `gvm-event-v1:` prefix to event hashes with length-prefixed fields (replaces `|` delimiter). Added `gvm-node-v1:` prefix to internal node hashes. Prevents cross-context hash collisions and delimiter-based second preimage attacks. Updated `compute_merkle_root`, `generate_merkle_proof`, `verify_merkle_proof`, and all test vectors.
+
+3. **HIGH — Wasm pointer safety** (`wasm_engine.rs`): Added `u32::MAX` overflow check before `len as u32` cast. Added explicit memory bounds validation for both `input_ptr` and `result_ptr` before read/write operations.
+
+4. **MEDIUM — Auth header stripping** (`api_keys.rs`): Extended stripped headers from 4 to 10: added `Proxy-Authorization`, `X-Auth-Token`, `X-Api-Token`, `X-Signature`, `X-HMAC`, `X-Credentials`. Prevents agents from smuggling alternative auth headers past Layer 3.
+
+5. **MEDIUM — Regex pattern length limit** (`srr.rs`, `policy.rs`): Added 10,000-byte limit on `path_regex` and policy regex patterns. Prevents DFA memory explosion during compilation from malicious config.
+
+6. **MEDIUM — agent_id length validation** (`api.rs`): Added 128-byte length check to `validate_vault_identifier()`. Previously only `/gvm/auth/token` enforced length; vault endpoints did not.
+
+7. **LOW — IPv6 loopback scheme** (`proxy.rs`): Added `[::1]` and `::1` to local host detection for HTTP scheme selection.
+
+8. **LOW — IPv4-mapped IPv6 parsing** (`srr.rs:581`): Replaced `unwrap_or(0)` with explicit `None` return for missing colon. Prevents potential panic on malformed IPv4-mapped addresses.
+
+### Risk Assessment
+
+- Merkle hash change is **backwards-incompatible**: existing WAL files will fail verification against new hashes. This is acceptable for pre-release (v0.x). Production deployments would need a migration tool.
+- All 233 tests pass (120 core + 32 CLI + 17 gvm-cli + 28 gvm-engine + 12 sandbox + 12 types + 12 benches).
+
+### Affected Files
+
+`src/srr.rs`, `src/merkle.rs`, `src/wasm_engine.rs`, `src/api_keys.rs`, `src/policy.rs`, `src/api.rs`, `src/proxy.rs`
+
+---
+
 ## 2026-03-20: WAL Batch Window + LLM Trace Streaming Refactor
 
 ### What Changed

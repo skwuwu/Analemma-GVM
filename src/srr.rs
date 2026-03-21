@@ -123,6 +123,13 @@ impl NetworkSRR {
             // Pre-compile path regex at load time (fail-fast on invalid patterns)
             let compiled_path_regex = match &rule_cfg.path_regex {
                 Some(pattern) => {
+                    const MAX_REGEX_LEN: usize = 10_000;
+                    if pattern.len() > MAX_REGEX_LEN {
+                        anyhow::bail!(
+                            "path_regex too long in SRR rule: {} > {} bytes",
+                            pattern.len(), MAX_REGEX_LEN
+                        );
+                    }
                     let re = Regex::new(pattern)
                         .with_context(|| format!("Invalid path_regex '{}' in SRR rule", pattern))?;
                     Some(re)
@@ -578,7 +585,10 @@ fn extract_ipv4_mapped(addr: &str) -> Option<String> {
     // Check if the original has dotted-decimal notation (::ffff:1.2.3.4)
     if let Some(dot_pos) = addr.rfind('.') {
         // Find the IPv4 part after the last colon before the dotted section
-        let colon_before_v4 = addr[..dot_pos].rfind(':').unwrap_or(0);
+        let colon_before_v4 = match addr[..dot_pos].rfind(':') {
+            Some(pos) => pos,
+            None => return None, // No colon before dot — not a valid IPv4-mapped IPv6
+        };
         let v4_str = &addr[colon_before_v4 + 1..];
         if v4_str.contains('.') {
             return Some(v4_str.to_string());
@@ -670,6 +680,10 @@ fn expand_ipv6(addr: &str) -> [u16; 8] {
                 }
             }
 
+            // Guard: malformed IPv6 with too many segments after `::`
+            if right.len() > max_segments || left.len() + right.len() > max_segments {
+                return result; // Invalid — return all zeros
+            }
             let right_start = max_segments - right.len();
             for (i, seg) in right.iter().enumerate() {
                 if !seg.is_empty() {

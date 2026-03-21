@@ -308,16 +308,22 @@ pub struct VaultReadResponse {
 /// Validate that an identifier does not contain the namespace separator `:`,
 /// preventing namespace traversal attacks (e.g., agent_id="admin:foo" + key="bar" → "admin:foo:bar").
 fn validate_vault_identifier(id: &str, field_name: &str) -> Result<(), Response<Body>> {
-    if id.contains(':') {
-        return Err(json_response(
-            StatusCode::BAD_REQUEST,
-            &serde_json::json!({"error": format!("invalid {}: must not contain ':'", field_name)}),
-        ));
-    }
     if id.is_empty() {
         return Err(json_response(
             StatusCode::BAD_REQUEST,
             &serde_json::json!({"error": format!("{} must not be empty", field_name)}),
+        ));
+    }
+    if id.len() > 128 {
+        return Err(json_response(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({"error": format!("{} exceeds maximum length (128)", field_name)}),
+        ));
+    }
+    if id.contains(':') {
+        return Err(json_response(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({"error": format!("invalid {}: must not contain ':'", field_name)}),
         ));
     }
     Ok(())
