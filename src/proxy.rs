@@ -29,7 +29,7 @@ const CIRCUIT_BREAKER_RETRY_SECS: u64 = 30;
 /// Shared application state passed to all handlers
 #[derive(Clone)]
 pub struct AppState {
-    pub srr: Arc<NetworkSRR>,
+    pub srr: Arc<std::sync::RwLock<NetworkSRR>>,
     pub policy: Arc<PolicyEngine>,
     pub registry: Arc<OperationRegistry>,
     pub api_keys: Arc<APIKeyStore>,
@@ -57,6 +57,8 @@ pub struct AppState {
     pub intent_store: Arc<crate::intent_store::IntentStore>,
     /// Shadow Mode configuration.
     pub shadow_config: crate::intent_store::ShadowConfig,
+    /// SRR config file path (for hot-reload).
+    pub srr_config_path: String,
 }
 
 /// Derive event status from upstream HTTP response.
@@ -128,10 +130,12 @@ pub async fn proxy_handler(
         let (policy_decision, matched_rule) = state.policy.evaluate(&operation);
 
         // Also check network SRR (Deny in SRR overrides policy)
-        let srr_result =
-            state
-                .srr
-                .check(request.method().as_str(), &target.host, &target.path, None);
+        let srr = state.srr.read().unwrap_or_else(|e| {
+            tracing::error!("SRR lock poisoned — using poisoned state (fail-closed)");
+            e.into_inner()
+        });
+        let srr_result = srr.check(request.method().as_str(), &target.host, &target.path, None);
+        drop(srr);
 
         // Determine which layer won (max_strict picks the strictest)
         let final_decision = max_strict(srr_result.decision.clone(), policy_decision.clone());
@@ -160,10 +164,12 @@ pub async fn proxy_handler(
         )
     } else {
         // Direct HTTP: Layer 2 Network SRR classification
-        let srr_result =
-            state
-                .srr
-                .check(request.method().as_str(), &target.host, &target.path, None);
+        let srr = state.srr.read().unwrap_or_else(|e| {
+            tracing::error!("SRR lock poisoned — using poisoned state");
+            e.into_inner()
+        });
+        let srr_result = srr.check(request.method().as_str(), &target.host, &target.path, None);
+        drop(srr);
 
         let is_catch_all = srr_result.is_catch_all;
         (

@@ -601,7 +601,7 @@ milliseconds = 300
     let wal_path = dir.path().join("wal.log");
 
     // Build components
-    let srr = Arc::new(NetworkSRR::load(&srr_path).expect("valid SRR config must parse"));
+    let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).expect("valid SRR config must parse")));
     let policy = Arc::new(PolicyEngine::load(&policy_dir).expect("valid policy files must parse"));
     let registry = Arc::new(OperationRegistry::load(&registry_path).expect("valid registry config must parse"));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("valid secrets config must parse"));
@@ -627,6 +627,7 @@ milliseconds = 300
         host_overrides: std::collections::HashMap::new(),
         jwt_config: None,
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
+        srr_config_path: String::new(),
         shadow_config: gvm_proxy::intent_store::ShadowConfig::default(),
     };
 
@@ -974,7 +975,7 @@ token = "sk_test_proxy_injected_key"
 
     let wal_path = dir.path().join("wal.log");
 
-    let srr = Arc::new(NetworkSRR::load(&srr_path).expect("valid SRR config must parse"));
+    let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).expect("valid SRR config must parse")));
     let policy = Arc::new(PolicyEngine::load(&policy_dir).expect("valid policy must parse"));
     let registry = Arc::new(OperationRegistry::load(&registry_path).expect("valid registry must parse"));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("valid secrets must parse"));
@@ -1007,6 +1008,7 @@ token = "sk_test_proxy_injected_key"
         host_overrides,
         jwt_config: None,
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
+        srr_config_path: String::new(),
         shadow_config: gvm_proxy::intent_store::ShadowConfig::default(),
     };
 
@@ -1127,7 +1129,7 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
 
     let wal_path = dir.path().join("wal.log");
 
-    let srr = Arc::new(NetworkSRR::load(&srr_path).expect("valid SRR config must parse"));
+    let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).expect("valid SRR config must parse")));
     let policy = Arc::new(PolicyEngine::load(&policy_dir).expect("valid policy must parse"));
     let registry = Arc::new(OperationRegistry::load(&registry_path).expect("valid registry must parse"));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("valid secrets must parse"));
@@ -1153,6 +1155,7 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
         host_overrides: std::collections::HashMap::new(),
         jwt_config: None,
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
+        srr_config_path: String::new(),
         shadow_config: gvm_proxy::intent_store::ShadowConfig::default(),
     };
 
@@ -1294,7 +1297,7 @@ type = "Allow"
 
     let wal_path = dir.path().join("wal.log");
 
-    let srr = Arc::new(NetworkSRR::load(&srr_path).expect("valid SRR config must parse"));
+    let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).expect("valid SRR config must parse")));
     let policy = Arc::new(PolicyEngine::load(&policy_dir).expect("valid policy must parse"));
     let registry = Arc::new(OperationRegistry::load(&registry_path).expect("valid registry must parse"));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("valid secrets must parse"));
@@ -1320,6 +1323,7 @@ type = "Allow"
         host_overrides: std::collections::HashMap::new(),
         jwt_config: None,
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
+        srr_config_path: String::new(),
         shadow_config: gvm_proxy::intent_store::ShadowConfig::default(),
     };
 

@@ -227,6 +227,11 @@ impl NetworkSRR {
     /// Paths are canonicalized (percent-decoded, dot-segment resolved, double
     /// slashes collapsed) to prevent bypass via path manipulation.
     ///
+    /// Number of loaded rules (for info/reload reporting).
+    pub fn rule_count(&self) -> usize {
+        self.rules.len()
+    }
+
     /// Returns `SrrCheckResult` with the decision, matched rule description,
     /// and whether this was a catch-all/default-to-caution match.
     pub fn check(

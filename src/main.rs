@@ -265,7 +265,7 @@ async fn main() {
 
     // 11. Compose shared state
     let state = AppState {
-        srr: Arc::new(srr),
+        srr: Arc::new(std::sync::RwLock::new(srr)),
         policy: Arc::new(policy),
         registry: Arc::new(registry),
         api_keys: Arc::new(api_keys),
@@ -281,6 +281,7 @@ async fn main() {
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(
             config.shadow.intent_ttl_secs,
         )),
+        srr_config_path: config.srr.network_file.clone(),
         shadow_config: {
             // GVM_SHADOW_MODE env var overrides config (MCP server sets this)
             let mut sc = config.shadow.clone();
@@ -304,6 +305,7 @@ async fn main() {
         .route("/gvm/info", axum::routing::get(api::info))
         .route("/gvm/check", axum::routing::post(api::check))
         .route("/gvm/intent", axum::routing::post(api::register_intent))
+        .route("/gvm/reload", axum::routing::post(api::reload_srr))
         .route("/gvm/auth/token", axum::routing::post(api::auth_token))
         .route(
             "/gvm/vault/:key",

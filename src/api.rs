@@ -668,7 +668,12 @@ pub async fn check(
     let (policy_decision, matched_rule) = state.policy.evaluate(&operation);
 
     // Layer 2: Network SRR evaluation (use actual target_path for accurate matching)
-    let srr_result = state.srr.check(&body.method, &body.target_host, &body.target_path, None);
+    let srr = state.srr.read().unwrap_or_else(|e| {
+        tracing::error!("SRR lock poisoned in /gvm/check");
+        e.into_inner()
+    });
+    let srr_result = srr.check(&body.method, &body.target_host, &body.target_path, None);
+    drop(srr);
 
     // Combined decision
     let decision = crate::types::max_strict(srr_result.decision, policy_decision);
@@ -812,6 +817,56 @@ pub async fn register_intent(
                 "error": e,
             }),
         ),
+    }
+}
+
+// ─── SRR Hot-Reload ───
+
+/// POST /gvm/reload — Reload SRR rules from config file without restarting.
+///
+/// Atomically swaps the SRR rule set. If parsing fails, the existing rules
+/// are preserved and an error is returned. The proxy never goes down.
+pub async fn reload_srr(State(state): State<AppState>) -> Response<Body> {
+    use crate::srr::NetworkSRR;
+    use std::path::Path;
+
+    let path = Path::new(&state.srr_config_path);
+    match NetworkSRR::load(path) {
+        Ok(new_srr) => {
+            let rule_count = new_srr.rule_count();
+            // Atomic swap: acquire write lock, replace, release
+            match state.srr.write() {
+                Ok(mut srr) => {
+                    *srr = new_srr;
+                    tracing::info!(rules = rule_count, "SRR rules hot-reloaded");
+                    json_response(
+                        StatusCode::OK,
+                        &serde_json::json!({
+                            "reloaded": true,
+                            "rules": rule_count,
+                        }),
+                    )
+                }
+                Err(_) => {
+                    tracing::error!("SRR write lock poisoned during reload");
+                    json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &serde_json::json!({"error": "SRR lock poisoned"}),
+                    )
+                }
+            }
+        }
+        Err(e) => {
+            // Parse failed — keep existing rules (fail-safe)
+            tracing::error!(error = %e, "SRR reload failed — keeping existing rules");
+            json_response(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({
+                    "reloaded": false,
+                    "error": format!("Parse failed: {}. Existing rules preserved.", e),
+                }),
+            )
+        }
     }
 }
 
