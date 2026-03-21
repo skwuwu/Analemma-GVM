@@ -675,9 +675,20 @@ pub async fn check(
     let srr_result = srr.check(&body.method, &body.target_host, &body.target_path, None);
     drop(srr);
 
-    // Combined decision
-    let decision = crate::types::max_strict(srr_result.decision, policy_decision);
+    // Combined decision (max_strict picks the strictest)
+    let srr_decision = srr_result.decision;
+    let combined = crate::types::max_strict(srr_decision.clone(), policy_decision.clone());
     let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // Use SRR decision for the primary response (MCP/Tier-1 perspective).
+    // ABAC is only meaningful when SDK provides operation context.
+    let decision = if body.operation == "unknown" || body.operation == "test" {
+        // No meaningful operation → SRR-only decision
+        srr_decision.clone()
+    } else {
+        // Operation provided → full cross-layer decision
+        combined.clone()
+    };
 
     let (decision_str, next_action) = match &decision {
         crate::types::EnforcementDecision::Allow => ("Allow".to_string(), None),
@@ -698,11 +709,12 @@ pub async fn check(
 
     let mut resp = serde_json::json!({
         "decision": decision_str,
+        "srr_decision": format!("{:?}", srr_decision),
         "engine_ms": (elapsed * 10.0).round() / 10.0,
         "operation": body.operation,
         "method": body.method,
         "target_host": body.target_host,
-        "matched_rule": matched_rule,
+        "matched_rule": srr_result.matched_description,
         "dry_run": true,
     });
 
