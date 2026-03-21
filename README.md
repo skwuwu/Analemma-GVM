@@ -427,8 +427,22 @@ class MyAgent(GVMAgent):
 |------|--------------|----------|
 | `python -m gvm.mock_demo` | **Start here.** Full proxy enforcement, mock LLM | No |
 | `python -m gvm.llm_demo` | Claude autonomous agent, live governance | Yes |
+| [**OpenClaw / MCP**](https://github.com/skwuwu/analemma-gvm-openclaw) | MCP server for OpenClaw, Claude Desktop, Cursor | No (proxy only) |
 
 > More: `unified_demo` (scripted finance), `hostile_demo` (adversarial), `langchain_demo` (LangChain+Gmail), `rollback_demo` (checkpoint/rollback). All require `cargo run`.
+
+### MCP Integration (OpenClaw, Claude Desktop, Cursor)
+
+GVM is available as an MCP server — no SDK, no code changes. Install one skill and your agent is governed:
+
+```bash
+cargo binstall gvm-proxy
+git clone https://github.com/skwuwu/analemma-gvm-openclaw.git ~/.openclaw/skills/gvm-governance
+```
+
+The MCP server auto-launches the proxy with Shadow Mode. Agent calls `gvm_fetch`/`gvm_read`/`gvm_write` for governed API access — intent declaration, policy check, and execution in one tool call.
+
+See the [MCP integration repo →](https://github.com/skwuwu/analemma-gvm-openclaw) for full docs, preset rulesets, and conversational demos.
 
 ---
 
