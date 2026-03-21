@@ -285,6 +285,10 @@ pub async fn proxy_handler(
     // ── Step 3: Rate Limit check ──
     if let EnforcementDecision::Throttle { max_per_minute } = &classification.decision {
         if !state.rate_limiter.check(agent_id, *max_per_minute) {
+            // Release claimed intent — rate limit is not a WAL event
+            if let Some(ref claim) = shadow_claim {
+                state.intent_store.release(claim.claim_id);
+            }
             let operation_name = gvm_headers
                 .as_ref()
                 .map(|h| h.operation.as_str())
@@ -325,6 +329,10 @@ pub async fn proxy_handler(
     if wal_failures >= CIRCUIT_BREAKER_THRESHOLD {
         match &classification.decision {
             EnforcementDecision::Delay { .. } => {
+                // Release claimed intent — WAL unavailable, no audit possible
+                if let Some(ref claim) = shadow_claim {
+                    state.intent_store.release(claim.claim_id);
+                }
                 tracing::error!(
                     consecutive_failures = wal_failures,
                     "Circuit breaker OPEN — rejecting IC-2/3 request (WAL degraded)"
@@ -463,6 +471,11 @@ pub async fn proxy_handler(
             event.status = EventStatus::Pending;
             if let Err(e) = state.ledger.append_durable(&event).await {
                 tracing::error!(error = %e, "WAL write failed for IC-3 event");
+                if let Some(ref claim) = shadow_claim {
+                    state.intent_store.release(claim.claim_id);
+                }
+            } else if let Some(ref claim) = shadow_claim {
+                state.intent_store.confirm(claim.claim_id);
             }
 
             tracing::warn!(
@@ -537,6 +550,9 @@ pub async fn proxy_handler(
             let mut response = forward_request(&state, request, &target).await;
             event.status = event_status_from_response(&response);
             state.ledger.append_async(event.clone()).await;
+            if let Some(ref claim) = shadow_claim {
+                state.intent_store.confirm(claim.claim_id);
+            }
             inject_gvm_response_headers(
                 response.headers_mut(),
                 &event,
@@ -552,6 +568,9 @@ pub async fn proxy_handler(
             event.status = EventStatus::Pending;
             if let Err(e) = state.ledger.append_durable(&event).await {
                 tracing::error!(error = %e, "WAL write failed for AuditOnly event");
+                if let Some(ref claim) = shadow_claim {
+                    state.intent_store.release(claim.claim_id);
+                }
             }
 
             let engine_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
@@ -559,6 +578,10 @@ pub async fn proxy_handler(
 
             event.status = event_status_from_response(&response);
             let _ = state.ledger.append_durable(&event).await;
+            // Confirm after second WAL write (best-effort status update)
+            if let Some(ref claim) = shadow_claim {
+                state.intent_store.confirm(claim.claim_id);
+            }
 
             if matches!(alert_level, AlertLevel::Critical) {
                 tracing::warn!(
