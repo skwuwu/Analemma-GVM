@@ -239,12 +239,16 @@ HTTP_PROXY=http://localhost:8080 ./my_agent
 | Mode | Security boundary | Best for | Requires |
 |------|-------------------|----------|----------|
 | `gvm run` | HTTP proxy only (cooperative) | Development, testing, any OS | Nothing extra |
+| `gvm run` + Shadow Mode | Proxy + MCP intent verification | MCP agents (OpenClaw, Claude Desktop) | `[shadow] mode = "strict"` in proxy.toml |
 | `--sandbox` | Proxy + Linux namespaces + seccomp-BPF + TC veth filter (structural) | **Production on Linux** | `kernel.unprivileged_userns_clone=1`, kernel ≥ 4.15 |
+| `--sandbox` + Shadow Mode | **Full dual-lock** — kernel isolation + intent verification | **Maximum security** | Linux + Shadow config |
 | `--contained` | Proxy + Docker (structural) | Production on macOS/Windows | Docker daemon |
 
-**Without `--sandbox`/`--contained`**: the proxy governs traffic that passes through it, but an agent could bypass governance by making direct HTTPS connections.
+**Shadow Mode** (`[shadow]` in proxy.toml or `GVM_SHADOW_MODE=strict` env var): the proxy rejects any HTTP request that lacks a prior MCP intent declaration. This makes governance mandatory for MCP agents without requiring OS-level isolation. Works on any OS.
 
-**With `--sandbox`**: the agent process runs in isolated Linux namespaces (user/PID/mount/net). Its only network path is through the proxy veth pair. A TC ingress filter on the host-side veth runs in the kernel and cannot be removed even if the agent gains apparent `CAP_NET_ADMIN` inside the user namespace. Seccomp-BPF (dual-layer: log + kill) blocks dangerous syscalls (`ptrace`, `bpf`, `mount`, `unshare`, namespace escape vectors) — violations terminate the process immediately. The proxy process itself is not sandboxed.
+**`--sandbox`**: the agent process runs in isolated Linux namespaces (user/PID/mount/net). Its only network path is through the proxy veth pair. A TC ingress filter on the host-side veth runs in the kernel and cannot be removed even if the agent gains apparent `CAP_NET_ADMIN` inside the user namespace. Seccomp-BPF (dual-layer: log + kill) blocks dangerous syscalls (`ptrace`, `bpf`, `mount`, `unshare`, namespace escape vectors) — violations terminate the process immediately.
+
+**Shadow + `--sandbox`** (recommended for production): two independent enforcement layers. Shadow Mode ensures every request has declared intent (proxy-level). `--sandbox` ensures the agent cannot bypass the proxy (kernel-level). Even if one layer fails, the other catches it.
 
 ### Policy Discovery (`--interactive`)
 
