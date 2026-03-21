@@ -503,6 +503,11 @@ fn offer_first_run_setup() -> bool {
         let src = template_path.join(file);
         let dst = config_dir.join(file);
         if src.exists() {
+            // Never overwrite existing config — prevents accidental policy downgrade
+            if dst.exists() {
+                eprintln!("  \x1b[33m⊘\x1b[0m {} (exists, skipped)", file);
+                continue;
+            }
             if let Err(e) = std::fs::copy(&src, &dst) {
                 eprintln!("  \x1b[31mFailed to copy {}: {}\x1b[0m", file, e);
                 continue;

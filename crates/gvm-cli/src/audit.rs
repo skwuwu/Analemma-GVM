@@ -5,27 +5,25 @@ use std::io::BufRead;
 
 /// Recompute the expected event_hash from event fields.
 /// Must match compute_event_hash in src/merkle.rs exactly.
+/// Uses domain separation prefix + length-prefixed fields (no pipe delimiters).
 fn recompute_event_hash(event: &GVMEvent) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(event.event_id.as_bytes());
-    hasher.update(b"|");
-    hasher.update(event.trace_id.as_bytes());
-    hasher.update(b"|");
-    hasher.update(event.agent_id.as_bytes());
-    hasher.update(b"|");
-    hasher.update(event.operation.as_bytes());
-    hasher.update(b"|");
-    hasher.update(event.decision.as_bytes());
-    hasher.update(b"|");
-    hasher.update(event.decision_source.as_bytes());
-    hasher.update(b"|");
-    hasher.update(format!("{:?}", event.status).as_bytes());
-    hasher.update(b"|");
-    hasher.update(event.enforcement_point.as_bytes());
-    hasher.update(b"|");
-    hasher.update(event.timestamp.to_rfc3339().as_bytes());
-    hasher.update(b"|");
-    hasher.update(event.payload.content_hash.as_bytes());
+    hasher.update(b"gvm-event-v1:");
+    for field in &[
+        event.event_id.as_str(),
+        event.trace_id.as_str(),
+        event.agent_id.as_str(),
+        event.operation.as_str(),
+        event.decision.as_str(),
+        event.decision_source.as_str(),
+        &format!("{:?}", event.status),
+        event.enforcement_point.as_str(),
+        &event.timestamp.to_rfc3339(),
+        event.payload.content_hash.as_str(),
+    ] {
+        hasher.update((field.len() as u32).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
     hex::encode(hasher.finalize())
 }
 

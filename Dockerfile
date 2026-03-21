@@ -13,9 +13,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=builder /app/target/release/gvm-proxy /usr/local/bin/gvm-proxy
 COPY --from=builder /app/target/release/gvm /usr/local/bin/gvm
 COPY config/ /app/config/
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data && \
+    useradd -r -u 10001 -d /app -s /usr/sbin/nologin gvmproxy && \
+    chown -R gvmproxy:gvmproxy /app
 WORKDIR /app
 
+USER gvmproxy
 ENV GVM_CONFIG=/app/config/proxy.toml
 EXPOSE 8080
 

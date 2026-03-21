@@ -295,7 +295,17 @@ impl IntentStore {
         match matched {
             Some(intent_id) => {
                 let claim_id = self.next_claim_id.fetch_add(1, Ordering::Relaxed);
-                let intent = store.intents.get_mut(&intent_id).unwrap();
+                let intent = match store.intents.get_mut(&intent_id) {
+                    Some(i) => i,
+                    None => {
+                        // Intent was removed between candidate search and claim — race lost
+                        tracing::warn!(intent_id, "Intent disappeared during claim — returning unverified");
+                        return ClaimResult {
+                            verified: false, claim_id: 0,
+                            operation: None, agent_id: None,
+                        };
+                    }
+                };
                 let operation = intent.operation.clone();
                 let agent_id = intent.agent_id.clone();
 
@@ -343,7 +353,10 @@ impl IntentStore {
             .map(|(id, _)| *id);
 
         if let Some(id) = intent_id {
-            let intent = store.intents.remove(&id).unwrap();
+            let Some(intent) = store.intents.remove(&id) else {
+                tracing::warn!(claim_id, "Intent already removed during confirm — idempotent");
+                return;
+            };
             // Clean up index
             let key = make_key(&intent.method, &intent.host, &intent.path_prefix);
             if let Some(ids) = store.index.get_mut(&key) {

@@ -134,6 +134,19 @@ def gvm_session(proxy_url: str = None):
     from gvm.errors import GVMError
 
     proxy = proxy_url or get_proxy_url()
+
+    # Validate proxy URL: must be http:// to localhost-like address
+    from urllib.parse import urlparse
+    parsed = urlparse(proxy)
+    if parsed.scheme not in ("http", "https"):
+        raise GVMError(f"Invalid proxy scheme: {parsed.scheme} (expected http/https)")
+    if parsed.hostname not in ("localhost", "127.0.0.1", "::1", None):
+        import logging
+        logging.getLogger("gvm.session").warning(
+            "GVM proxy URL points to non-localhost: %s — ensure this is intentional",
+            proxy,
+        )
+
     session = requests.Session()
     session.proxies = {"http": proxy, "https": proxy}
 
