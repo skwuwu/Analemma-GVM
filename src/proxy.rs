@@ -193,18 +193,20 @@ pub async fn proxy_handler(
         "Request classified"
     );
 
-    // ── Step 2.5: Shadow Mode — intent verification + ABAC re-evaluation ──
-    // If shadow mode is enabled, check that the agent declared intent via MCP
-    // before this request. If verified, re-evaluate ABAC with the declared
-    // operation and apply max_strict — closing the gap where MCP requests
-    // would otherwise skip Layer 1 (ABAC) entirely.
-    if state.shadow_config.mode != crate::intent_store::ShadowMode::Disabled {
-        let verify = state.intent_store.verify(&request_method, &target.host, &target.path, Some(agent_id));
+    // ── Step 2.5: Shadow Mode — 2-phase intent verification ──
+    //
+    // Phase 1: claim() — mark intent as Claimed (not deleted)
+    // Phase 2: after WAL write → confirm() (delete) or release() (restore)
+    //
+    // Invariant: intent deletion occurs ONLY on confirm().
+    // This ensures: no decision without audit, no audit without decision.
+    let shadow_claim = if state.shadow_config.mode != crate::intent_store::ShadowMode::Disabled {
+        let claim = state.intent_store.claim(&request_method, &target.host, &target.path, Some(agent_id));
 
-        if verify.verified {
-            // Intent matched — re-evaluate ABAC with the declared operation
-            if let Some(ref operation_name) = verify.operation {
-                let shadow_agent_id = verify.agent_id.as_deref().unwrap_or(agent_id);
+        if claim.verified {
+            // ABAC re-evaluation with declared operation from intent
+            if let Some(ref operation_name) = claim.operation {
+                let shadow_agent_id = claim.agent_id.as_deref().unwrap_or(agent_id);
                 let shadow_op = OperationMetadata {
                     operation: operation_name.clone(),
                     resource: ResourceDescriptor::default(),
@@ -220,7 +222,6 @@ pub async fn proxy_handler(
                 };
                 let (abac_decision, abac_rule) = state.policy.evaluate(&shadow_op);
 
-                // Cross-layer: max_strict(current SRR decision, ABAC from intent)
                 let combined = max_strict(classification.decision.clone(), abac_decision.clone());
                 if combined.strictness() > classification.decision.strictness() {
                     tracing::warn!(
@@ -228,7 +229,7 @@ pub async fn proxy_handler(
                         abac_decision = ?abac_decision,
                         srr_decision = ?classification.decision,
                         combined = ?combined,
-                        "Shadow ABAC re-evaluation: intent operation triggered stricter decision"
+                        "Shadow ABAC re-evaluation upgraded decision"
                     );
                     classification = Classification {
                         decision: combined,
@@ -239,8 +240,8 @@ pub async fn proxy_handler(
                     is_default_caution = false;
                 }
             }
+            Some(claim) // Pass to WAL write for confirm/release
         } else {
-            // No matching intent — apply shadow policy
             match state.shadow_config.mode {
                 crate::intent_store::ShadowMode::Strict => {
                     tracing::warn!(
@@ -248,7 +249,7 @@ pub async fn proxy_handler(
                         host = %target.host,
                         path = %target.path,
                         agent = %agent_id,
-                        "Shadow STRICT: no intent declared — DENY"
+                        "Shadow STRICT: no intent — DENY"
                     );
                     return error_response(
                         StatusCode::FORBIDDEN,
@@ -259,29 +260,27 @@ pub async fn proxy_handler(
                 crate::intent_store::ShadowMode::Cautious => {
                     let delay = state.shadow_config.cautious_delay_ms;
                     tracing::warn!(
-                        method = %request_method,
-                        host = %target.host,
-                        path = %target.path,
-                        agent = %agent_id,
+                        method = %request_method, host = %target.host,
+                        path = %target.path, agent = %agent_id,
                         delay_ms = delay,
-                        "Shadow CAUTIOUS: no intent declared — delaying {}ms",
-                        delay
+                        "Shadow CAUTIOUS: no intent — delaying {}ms", delay
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 }
                 crate::intent_store::ShadowMode::Permissive => {
                     tracing::warn!(
-                        method = %request_method,
-                        host = %target.host,
-                        path = %target.path,
-                        agent = %agent_id,
-                        "Shadow PERMISSIVE: no intent declared — allowing with warning"
+                        method = %request_method, host = %target.host,
+                        path = %target.path, agent = %agent_id,
+                        "Shadow PERMISSIVE: no intent — allowing with warning"
                     );
                 }
                 crate::intent_store::ShadowMode::Disabled => unreachable!(),
             }
+            None
         }
-    }
+    } else {
+        None
+    };
 
     // ── Step 3: Rate Limit check ──
     if let EnforcementDecision::Throttle { max_per_minute } = &classification.decision {
@@ -379,6 +378,10 @@ pub async fn proxy_handler(
 
             event.status = event_status_from_response(&response);
             state.ledger.append_async(event.clone()).await;
+            // Allow uses async WAL (loss tolerated) — confirm intent immediately
+            if let Some(ref claim) = shadow_claim {
+                state.intent_store.confirm(claim.claim_id);
+            }
             inject_gvm_response_headers(
                 response.headers_mut(),
                 &event,
@@ -394,6 +397,10 @@ pub async fn proxy_handler(
             event.status = EventStatus::Pending;
             if let Err(e) = state.ledger.append_durable(&event).await {
                 tracing::error!(error = %e, "WAL write failed — rejecting request (Fail-Close)");
+                // Release claimed intent — WAL failed, intent must be restorable
+                if let Some(ref claim) = shadow_claim {
+                    state.intent_store.release(claim.claim_id);
+                }
                 return governance_block_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     GovernanceBlockResponse {
@@ -437,6 +444,10 @@ pub async fn proxy_handler(
 
             // Best-effort status update to WAL
             let _ = state.ledger.append_durable(&event).await;
+            // Phase 2a: WAL succeeded → confirm intent deletion
+            if let Some(ref claim) = shadow_claim {
+                state.intent_store.confirm(claim.claim_id);
+            }
             inject_gvm_response_headers(
                 response.headers_mut(),
                 &event,
@@ -488,6 +499,11 @@ pub async fn proxy_handler(
             };
             if let Err(e) = state.ledger.append_durable(&event).await {
                 tracing::error!(error = %e, "WAL write failed for Deny event");
+                if let Some(ref claim) = shadow_claim {
+                    state.intent_store.release(claim.claim_id);
+                }
+            } else if let Some(ref claim) = shadow_claim {
+                state.intent_store.confirm(claim.claim_id);
             }
 
             tracing::warn!(
