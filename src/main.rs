@@ -281,7 +281,17 @@ async fn main() {
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(
             config.shadow.intent_ttl_secs,
         )),
-        shadow_config: config.shadow.clone(),
+        shadow_config: {
+            // GVM_SHADOW_MODE env var overrides config (MCP server sets this)
+            let mut sc = config.shadow.clone();
+            if let Some(mode) = gvm_proxy::intent_store::ShadowMode::from_env() {
+                if mode != sc.mode {
+                    tracing::info!(mode = ?mode, "Shadow mode overridden by GVM_SHADOW_MODE env var");
+                    sc.mode = mode;
+                }
+            }
+            sc
+        },
     };
 
     // 11. Build axum router with security layers

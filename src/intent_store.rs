@@ -29,7 +29,22 @@ pub enum ShadowMode {
 
 impl Default for ShadowMode {
     fn default() -> Self {
+        // Default to Disabled for backward compatibility.
+        // MCP server sets GVM_SHADOW_MODE=strict to activate.
         ShadowMode::Disabled
+    }
+}
+
+impl ShadowMode {
+    /// Parse from environment variable (used by proxy startup).
+    pub fn from_env() -> Option<Self> {
+        match std::env::var("GVM_SHADOW_MODE").ok()?.to_lowercase().as_str() {
+            "strict" => Some(ShadowMode::Strict),
+            "cautious" => Some(ShadowMode::Cautious),
+            "permissive" => Some(ShadowMode::Permissive),
+            "disabled" => Some(ShadowMode::Disabled),
+            _ => None,
+        }
     }
 }
 
