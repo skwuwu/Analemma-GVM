@@ -53,6 +53,10 @@ pub struct AppState {
     pub host_overrides: HashMap<String, String>,
     /// JWT authentication config (None = disabled, header-based identity).
     pub jwt_config: Option<Arc<auth::JwtConfig>>,
+    /// Shadow Mode: intent verification store.
+    pub intent_store: Arc<crate::intent_store::IntentStore>,
+    /// Shadow Mode configuration.
+    pub shadow_config: crate::intent_store::ShadowConfig,
 }
 
 /// Derive event status from upstream HTTP response.
@@ -188,6 +192,57 @@ pub async fn proxy_handler(
         rule = ?classification.matched_rule_id,
         "Request classified"
     );
+
+    // ── Step 2.5: Shadow Mode — intent verification ──
+    // If shadow mode is enabled, check that the agent declared intent via MCP
+    // before this request. Undeclared requests are handled per shadow policy.
+    if state.shadow_config.mode != crate::intent_store::ShadowMode::Disabled {
+        let verify = state.intent_store.verify(&request_method, &target.host, &target.path);
+
+        if !verify.verified {
+            match state.shadow_config.mode {
+                crate::intent_store::ShadowMode::Strict => {
+                    tracing::warn!(
+                        method = %request_method,
+                        host = %target.host,
+                        path = %target.path,
+                        agent = %agent_id,
+                        "Shadow STRICT: no intent declared — DENY"
+                    );
+                    return error_response(
+                        StatusCode::FORBIDDEN,
+                        "Shadow verification failed: no intent declared for this request. \
+                         Call gvm_declare_intent before making API requests.",
+                    );
+                }
+                crate::intent_store::ShadowMode::Cautious => {
+                    let delay = state.shadow_config.cautious_delay_ms;
+                    tracing::warn!(
+                        method = %request_method,
+                        host = %target.host,
+                        path = %target.path,
+                        agent = %agent_id,
+                        delay_ms = delay,
+                        "Shadow CAUTIOUS: no intent declared — delaying {}ms",
+                        delay
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    // Continue to normal processing after delay
+                }
+                crate::intent_store::ShadowMode::Permissive => {
+                    tracing::warn!(
+                        method = %request_method,
+                        host = %target.host,
+                        path = %target.path,
+                        agent = %agent_id,
+                        "Shadow PERMISSIVE: no intent declared — allowing with warning"
+                    );
+                    // Continue to normal processing
+                }
+                crate::intent_store::ShadowMode::Disabled => unreachable!(),
+            }
+        }
+    }
 
     // ── Step 3: Rate Limit check ──
     if let EnforcementDecision::Throttle { max_per_minute } = &classification.decision {

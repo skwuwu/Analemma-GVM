@@ -626,6 +626,8 @@ milliseconds = 300
         http_client,
         host_overrides: std::collections::HashMap::new(),
         jwt_config: None,
+        intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
+        shadow_config: gvm_proxy::intent_store::ShadowConfig::default(),
     };
 
     let app = Router::new()
@@ -1004,6 +1006,8 @@ token = "sk_test_proxy_injected_key"
         http_client,
         host_overrides,
         jwt_config: None,
+        intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
+        shadow_config: gvm_proxy::intent_store::ShadowConfig::default(),
     };
 
     let app = Router::new()
@@ -1148,6 +1152,8 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
         http_client,
         host_overrides: std::collections::HashMap::new(),
         jwt_config: None,
+        intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
+        shadow_config: gvm_proxy::intent_store::ShadowConfig::default(),
     };
 
     let app = Router::new()
@@ -1313,6 +1319,8 @@ type = "Allow"
         http_client,
         host_overrides: std::collections::HashMap::new(),
         jwt_config: None,
+        intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
+        shadow_config: gvm_proxy::intent_store::ShadowConfig::default(),
     };
 
     let app = Router::new()

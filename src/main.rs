@@ -278,6 +278,10 @@ async fn main() {
         http_client,
         host_overrides,
         jwt_config,
+        intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(
+            config.shadow.intent_ttl_secs,
+        )),
+        shadow_config: config.shadow.clone(),
     };
 
     // 11. Build axum router with security layers
@@ -289,6 +293,7 @@ async fn main() {
         .route("/gvm/health", axum::routing::get(api::health))
         .route("/gvm/info", axum::routing::get(api::info))
         .route("/gvm/check", axum::routing::post(api::check))
+        .route("/gvm/intent", axum::routing::post(api::register_intent))
         .route("/gvm/auth/token", axum::routing::post(api::auth_token))
         .route(
             "/gvm/vault/:key",

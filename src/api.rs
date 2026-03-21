@@ -780,6 +780,41 @@ pub async fn auth_token(
     }
 }
 
+// ─── Shadow Mode: Intent Registration ───
+
+/// POST /gvm/intent — Register an intent for shadow verification.
+///
+/// MCP tools call this before the agent makes an outbound HTTP request.
+/// The proxy checks the intent store during request processing.
+pub async fn register_intent(
+    State(state): State<AppState>,
+    Json(body): Json<crate::intent_store::IntentRequest>,
+) -> Response<Body> {
+    match state.intent_store.register(&body) {
+        Ok(id) => json_response(
+            StatusCode::CREATED,
+            &serde_json::json!({
+                "registered": true,
+                "intent_id": id,
+                "method": body.method,
+                "host": body.host,
+                "path": body.path,
+                "operation": body.operation,
+                "ttl_secs": body.ttl_secs.unwrap_or(
+                    state.shadow_config.intent_ttl_secs
+                ),
+                "shadow_mode": format!("{:?}", state.shadow_config.mode),
+            }),
+        ),
+        Err(e) => json_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            &serde_json::json!({
+                "error": e,
+            }),
+        ),
+    }
+}
+
 // ─── Health / Admin Endpoints ───
 
 /// GET /gvm/health — Liveness check
@@ -811,6 +846,10 @@ pub async fn info(State(state): State<AppState>) -> Response<Body> {
             "registry": {
                 "core_operations": state.registry.core_count(),
                 "custom_operations": state.registry.custom_count(),
+            },
+            "shadow": {
+                "mode": format!("{:?}", state.shadow_config.mode),
+                "active_intents": state.intent_store.stats().1,
             },
         }),
     )

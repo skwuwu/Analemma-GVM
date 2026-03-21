@@ -22,6 +22,9 @@ pub struct ProxyConfig {
     /// WAL (Write-Ahead Log) tuning options.
     #[serde(default)]
     pub wal: WalConfig,
+    /// Shadow verification mode — requires MCP intent declaration before outbound requests.
+    #[serde(default)]
+    pub shadow: crate::intent_store::ShadowConfig,
 }
 
 /// JWT authentication configuration.
@@ -243,6 +246,7 @@ impl Default for ProxyConfig {
             dev: None,
             jwt: None,
             wal: WalConfig::default(),
+            shadow: crate::intent_store::ShadowConfig::default(),
         }
     }
 }
