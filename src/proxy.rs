@@ -199,7 +199,7 @@ pub async fn proxy_handler(
     // operation and apply max_strict — closing the gap where MCP requests
     // would otherwise skip Layer 1 (ABAC) entirely.
     if state.shadow_config.mode != crate::intent_store::ShadowMode::Disabled {
-        let verify = state.intent_store.verify(&request_method, &target.host, &target.path);
+        let verify = state.intent_store.verify(&request_method, &target.host, &target.path, Some(agent_id));
 
         if verify.verified {
             // Intent matched — re-evaluate ABAC with the declared operation

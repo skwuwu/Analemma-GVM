@@ -191,7 +191,8 @@ impl IntentStore {
 
     /// Check if a request has a matching, non-expired intent.
     /// Consumes the intent on match (one-time use).
-    pub fn verify(&self, method: &str, host: &str, path: &str) -> VerifyResult {
+    /// Validates agent_id if provided — prevents intent spoofing across agents.
+    pub fn verify(&self, method: &str, host: &str, path: &str, request_agent_id: Option<&str>) -> VerifyResult {
         let mut intents = match self.intents.lock() {
             Ok(i) => i,
             Err(_) => {
@@ -205,10 +206,27 @@ impl IntentStore {
             }
         };
 
-        // Find matching intent (newest first for performance)
+        // Find matching intent (newest first for performance).
+        // If request_agent_id is provided, also validate agent ownership.
         let match_idx = intents
             .iter()
-            .rposition(|i| i.matches(method, host, path));
+            .rposition(|i| {
+                if !i.matches(method, host, path) {
+                    return false;
+                }
+                // Cross-check: if caller provides agent_id, it must match
+                if let Some(req_id) = request_agent_id {
+                    if req_id != "unknown" && !i.agent_id.eq_ignore_ascii_case(req_id) {
+                        tracing::warn!(
+                            intent_agent = %i.agent_id,
+                            request_agent = %req_id,
+                            "Intent agent_id mismatch — possible spoofing"
+                        );
+                        return false;
+                    }
+                }
+                true
+            });
 
         match match_idx {
             Some(idx) => {
@@ -271,7 +289,7 @@ mod tests {
         };
         store.register(&req).unwrap();
 
-        let result = store.verify("GET", "api.stripe.com", "/v1/charges");
+        let result = store.verify("GET", "api.stripe.com", "/v1/charges", Some("test"));
         assert!(result.verified);
         assert_eq!(result.operation.as_deref(), Some("stripe.read"));
     }
@@ -289,11 +307,11 @@ mod tests {
         };
         store.register(&req).unwrap();
 
-        let r1 = store.verify("GET", "api.stripe.com", "/v1/charges");
+        let r1 = store.verify("GET", "api.stripe.com", "/v1/charges", Some("test"));
         assert!(r1.verified);
 
         // Second verify should fail — intent consumed
-        let r2 = store.verify("GET", "api.stripe.com", "/v1/charges");
+        let r2 = store.verify("GET", "api.stripe.com", "/v1/charges", Some("test"));
         assert!(!r2.verified);
     }
 
@@ -311,7 +329,7 @@ mod tests {
         store.register(&req).unwrap();
 
         // Wrong method
-        let r = store.verify("POST", "api.stripe.com", "/v1/charges");
+        let r = store.verify("POST", "api.stripe.com", "/v1/charges", Some("test"));
         assert!(!r.verified);
     }
 
@@ -329,7 +347,7 @@ mod tests {
         store.register(&req).unwrap();
 
         std::thread::sleep(Duration::from_millis(10));
-        let r = store.verify("GET", "api.stripe.com", "/v1/charges");
+        let r = store.verify("GET", "api.stripe.com", "/v1/charges", Some("test"));
         assert!(!r.verified);
     }
 
@@ -346,16 +364,54 @@ mod tests {
         };
         store.register(&req).unwrap();
 
-        let r = store.verify("GET", "api.stripe.com", "/v1/charges");
+        let r = store.verify("GET", "api.stripe.com", "/v1/charges", Some("test"));
+        assert!(r.verified);
+    }
+
+    #[test]
+    fn agent_id_spoofing_blocked() {
+        let store = IntentStore::new(30);
+        let req = IntentRequest {
+            method: "GET".into(),
+            host: "api.stripe.com".into(),
+            path: "/v1/charges".into(),
+            operation: "stripe.read".into(),
+            agent_id: "agent-a".into(),
+            ttl_secs: None,
+        };
+        store.register(&req).unwrap();
+
+        // Different agent trying to consume agent-a's intent → rejected
+        let r = store.verify("GET", "api.stripe.com", "/v1/charges", Some("agent-b"));
+        assert!(!r.verified, "should reject intent registered by different agent");
+
+        // Correct agent can still consume it
+        let r = store.verify("GET", "api.stripe.com", "/v1/charges", Some("agent-a"));
+        assert!(r.verified);
+    }
+
+    #[test]
+    fn unknown_agent_can_verify() {
+        let store = IntentStore::new(30);
+        let req = IntentRequest {
+            method: "GET".into(),
+            host: "api.stripe.com".into(),
+            path: "/v1/charges".into(),
+            operation: "stripe.read".into(),
+            agent_id: "test".into(),
+            ttl_secs: None,
+        };
+        store.register(&req).unwrap();
+
+        // "unknown" agent_id skips cross-check (backward compat)
+        let r = store.verify("GET", "api.stripe.com", "/v1/charges", Some("unknown"));
         assert!(r.verified);
     }
 
     #[test]
     fn mutex_poison_fail_closed() {
-        // IntentStore returns unverified on lock failure (fail-closed)
         let store = IntentStore::new(30);
-        // Can't easily poison from test, but verify the default behavior
-        let r = store.verify("GET", "nonexistent.com", "/");
+        let r = store.verify("GET", "nonexistent.com", "/", None);
         assert!(!r.verified);
     }
 }
