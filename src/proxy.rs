@@ -122,7 +122,7 @@ pub async fn proxy_handler(
     let request_method = request.method().to_string();
 
     // ── Step 2: Classify (IC determination) ──
-    let (classification, is_default_caution) = if let Some(ref headers) = gvm_headers {
+    let (mut classification, mut is_default_caution) = if let Some(ref headers) = gvm_headers {
         // SDK-routed: Layer 1 Semantic classification via ABAC policy engine
         let operation = build_operation_metadata(headers, &target);
         let (policy_decision, matched_rule) = state.policy.evaluate(&operation);
@@ -193,13 +193,54 @@ pub async fn proxy_handler(
         "Request classified"
     );
 
-    // ── Step 2.5: Shadow Mode — intent verification ──
+    // ── Step 2.5: Shadow Mode — intent verification + ABAC re-evaluation ──
     // If shadow mode is enabled, check that the agent declared intent via MCP
-    // before this request. Undeclared requests are handled per shadow policy.
+    // before this request. If verified, re-evaluate ABAC with the declared
+    // operation and apply max_strict — closing the gap where MCP requests
+    // would otherwise skip Layer 1 (ABAC) entirely.
     if state.shadow_config.mode != crate::intent_store::ShadowMode::Disabled {
         let verify = state.intent_store.verify(&request_method, &target.host, &target.path);
 
-        if !verify.verified {
+        if verify.verified {
+            // Intent matched — re-evaluate ABAC with the declared operation
+            if let Some(ref operation_name) = verify.operation {
+                let shadow_agent_id = verify.agent_id.as_deref().unwrap_or(agent_id);
+                let shadow_op = OperationMetadata {
+                    operation: operation_name.clone(),
+                    resource: ResourceDescriptor::default(),
+                    subject: SubjectDescriptor {
+                        agent_id: shadow_agent_id.to_string(),
+                        tenant_id: None,
+                        session_id: shadow_agent_id.to_string(),
+                    },
+                    context: OperationContext {
+                        attributes: Default::default(),
+                    },
+                    payload: PayloadDescriptor::default(),
+                };
+                let (abac_decision, abac_rule) = state.policy.evaluate(&shadow_op);
+
+                // Cross-layer: max_strict(current SRR decision, ABAC from intent)
+                let combined = max_strict(classification.decision.clone(), abac_decision.clone());
+                if combined.strictness() > classification.decision.strictness() {
+                    tracing::warn!(
+                        operation = %operation_name,
+                        abac_decision = ?abac_decision,
+                        srr_decision = ?classification.decision,
+                        combined = ?combined,
+                        "Shadow ABAC re-evaluation: intent operation triggered stricter decision"
+                    );
+                    classification = Classification {
+                        decision: combined,
+                        source: ClassificationSource::ABAC,
+                        operation: Some(shadow_op),
+                        matched_rule_id: abac_rule,
+                    };
+                    is_default_caution = false;
+                }
+            }
+        } else {
+            // No matching intent — apply shadow policy
             match state.shadow_config.mode {
                 crate::intent_store::ShadowMode::Strict => {
                     tracing::warn!(
@@ -227,7 +268,6 @@ pub async fn proxy_handler(
                         delay
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                    // Continue to normal processing after delay
                 }
                 crate::intent_store::ShadowMode::Permissive => {
                     tracing::warn!(
@@ -237,7 +277,6 @@ pub async fn proxy_handler(
                         agent = %agent_id,
                         "Shadow PERMISSIVE: no intent declared — allowing with warning"
                     );
-                    // Continue to normal processing
                 }
                 crate::intent_store::ShadowMode::Disabled => unreachable!(),
             }
