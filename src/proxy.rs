@@ -1538,11 +1538,14 @@ async fn handle_connect_inner(state: AppState, request: Request<hyper::body::Inc
     let host = target.split(':').next().unwrap_or(&target);
     let port = target.split(':').nth(1).and_then(|p| p.parse::<u16>().ok()).unwrap_or(443);
 
-    // Domain-level SRR policy check (drop guard before any .await)
+    // Domain-level policy: CONNECT only cares "is this domain allowed?"
+    // If ANY rule exists for this host (regardless of method/path), Allow the tunnel.
+    // If only Deny rules exist, Deny the tunnel.
+    // If no rules at all, Default-to-Caution (Delay 300ms).
     let (srr_result_decision, srr_result_matched, srr_result_catch_all) = {
         let srr = state.srr.read().unwrap_or_else(|e| e.into_inner());
-        let r = srr.check("CONNECT", host, "/", None);
-        (r.decision.clone(), r.matched_description.clone(), r.is_catch_all)
+        let (decision, matched, catch_all) = srr.check_domain(host);
+        (decision, matched, catch_all)
     };
 
     let decision = &srr_result_decision;

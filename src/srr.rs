@@ -232,8 +232,50 @@ impl NetworkSRR {
         self.rules.len()
     }
 
-    /// Returns `SrrCheckResult` with the decision, matched rule description,
-    /// and whether this was a catch-all/default-to-caution match.
+
+    /// Domain-level check for CONNECT tunnels.
+    /// If any non-catch-all rule exists for this host, Allow the tunnel.
+    /// If only Deny rules exist, Deny. Otherwise Default-to-Caution.
+    pub fn check_domain(&self, host: &str) -> (EnforcementDecision, Option<String>, bool) {
+        let effective_host = host.to_lowercase();
+        let mut has_allow = false;
+        let mut has_any = false;
+        let mut deny_reason = None;
+        let mut matched: Option<String> = None;
+
+        for rule in &self.rules {
+            if rule.is_catch_all || !match_host(&rule.host_pattern, &effective_host) {
+                continue;
+            }
+            has_any = true;
+            match &rule.decision {
+                EnforcementDecision::Deny { reason } => {
+                    deny_reason = Some(reason.clone());
+                    matched = Some(rule.description.clone());
+                }
+                EnforcementDecision::Allow => {
+                    has_allow = true;
+                    matched = Some(rule.description.clone());
+                }
+                _ => {
+                    has_allow = true;
+                    if matched.is_none() { matched = Some(rule.description.clone()); }
+                }
+            }
+        }
+
+        if !has_any {
+            return (self.default_decision.clone(), None, true);
+        }
+        if has_allow {
+            (EnforcementDecision::Allow, matched, false)
+        } else if let Some(r) = deny_reason {
+            (EnforcementDecision::Deny { reason: r }, matched, false)
+        } else {
+            (self.default_decision.clone(), matched, true)
+        }
+    }
+
     pub fn check(
         &self,
         method: &str,
