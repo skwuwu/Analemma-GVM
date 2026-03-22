@@ -63,6 +63,23 @@ pub fn setup_mount_namespace(
     )
     .ok(); // Best-effort remount
 
+    // /workspace/output — writable, persists to host.
+    // Agent writes results here (code, reports, artifacts).
+    // Rest of /workspace stays read-only.
+    let host_output = workspace_dir.join("output");
+    std::fs::create_dir_all(&host_output).ok();
+    let sandbox_output = new_root.join("workspace/output");
+    std::fs::create_dir_all(&sandbox_output).ok();
+    mount(
+        Some(&host_output),
+        &sandbox_output,
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
+    )
+    .context("Failed to bind-mount /workspace/output (writable)")?;
+    tracing::debug!("Writable output directory mounted at /workspace/output");
+
     // Mount tmpfs for /tmp (writable scratch space)
     mount(
         Some("tmpfs"),
