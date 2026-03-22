@@ -1052,6 +1052,68 @@ if should_run 22; then
 fi
 
 # ═══════════════════════════════════════════════════════════════════
+# TEST 23: Session Persistence (token refresh across policy checks)
+# ═══════════════════════════════════════════════════════════════════
+
+if should_run 23; then
+    header "23: Session Persistence (Auth Flow)"
+
+    # Simulate an agent workflow:
+    #   1. Login → get token (Allow, POST to auth endpoint)
+    #   2. Use token for reads (Allow)
+    #   3. Refresh token (Allow — must not be blocked)
+    #   4. Use refreshed token for write (Delay)
+    #   5. Attempt destructive action (Deny)
+    # Verifies GVM doesn't break multi-step auth flows.
+
+    # Step 1: Auth endpoint (unknown domain → Default-to-Caution, not Deny)
+    AUTH=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
+        -H "Content-Type: application/json" \
+        -d '{"method":"POST","target_host":"auth.example.com","target_path":"/oauth/token","operation":"test"}' \
+        | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('decision','?'))" 2>/dev/null)
+    echo -e "  Login (POST /oauth/token): $AUTH"
+
+    # Auth should NOT be Deny — Default-to-Caution (Delay) is acceptable
+    if echo "$AUTH" | grep -qv "Deny"; then
+        pass "23a: auth login not denied ($AUTH)"
+    else
+        fail "23a: auth login DENIED — would break agent workflow"
+    fi
+
+    # Step 2: Read with token (GitHub issues → Allow)
+    READ=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
+        -H "Content-Type: application/json" \
+        -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' \
+        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+    [ "$READ" = "Allow" ] && pass "23b: read with token ($READ)" || fail "23b: read failed ($READ)"
+
+    # Step 3: Token refresh (same auth endpoint → should still not Deny)
+    REFRESH=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
+        -H "Content-Type: application/json" \
+        -d '{"method":"POST","target_host":"auth.example.com","target_path":"/oauth/token","operation":"test"}' \
+        | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('decision','?'))" 2>/dev/null)
+    if echo "$REFRESH" | grep -qv "Deny"; then
+        pass "23c: token refresh not denied ($REFRESH)"
+    else
+        fail "23c: token refresh DENIED — agent session permanently broken"
+    fi
+
+    # Step 4: Write after refresh (GitHub create issue → Delay)
+    WRITE=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
+        -H "Content-Type: application/json" \
+        -d '{"method":"POST","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' \
+        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+    echo "$WRITE" | grep -q "Delay" && pass "23d: write after refresh ($WRITE)" || fail "23d: write failed ($WRITE)"
+
+    # Step 5: Destructive action (Deny — policy still enforced after auth flow)
+    DELETE=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
+        -H "Content-Type: application/json" \
+        -d '{"method":"DELETE","target_host":"api.github.com","target_path":"/repos/t/t/git/refs/heads/main","operation":"test"}' \
+        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+    [ "$DELETE" = "Deny" ] && pass "23e: destructive action still denied after auth ($DELETE)" || fail "23e: expected Deny, got $DELETE"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
 # SUMMARY
 # ═══════════════════════════════════════════════════════════════════
 

@@ -507,6 +507,36 @@ Fuzz targets (`fuzz/fuzz_targets/`):
 
 ---
 
+### Non-Standard TLS Implementations (Known Limitation)
+
+**Limitation**: The uprobe targets `SSL_write_ex` in the system's `libssl.so` (OpenSSL). Some runtimes use alternative TLS implementations:
+
+| Runtime | TLS Library | Uprobe Coverage |
+|---------|------------|-----------------|
+| Python (requests, urllib3) | System libssl.so (dynamic) | Covered |
+| Node.js | OpenSSL (static linked) | Covered (symbol in binary) |
+| Go | crypto/tls (custom, no libssl) | Partial (symbol search) |
+| Rust (reqwest) | rustls or native-tls | Detected but not yet integrated |
+| BoringSSL | Custom libssl fork | Not covered |
+
+**Impact**: Agents using BoringSSL or custom TLS stacks bypass uprobe plaintext capture. They are still governed by the proxy CONNECT tunnel (domain-level enforcement) and iptables (network isolation).
+
+**Mitigation**: Document in README: "Agents using non-OpenSSL TLS (BoringSSL, custom stacks) are protected at L4 (proxy CONNECT) only, not L7 (uprobe path inspection)."
+
+---
+
+### Low-and-Slow Data Exfiltration (Planned v0.3)
+
+**Attack**: An agent exfiltrates data by sending 1KB per request across 1,000 requests to an allowed endpoint, staying under any per-request size threshold. Each individual request appears normal.
+
+**Impact**: SRR evaluates each request independently. Without cumulative tracking, the aggregate exfiltration is invisible to policy enforcement.
+
+**Planned mitigation (v0.3)**: Anomaly detection layer that tracks per-agent cumulative data volume, request frequency, and destination diversity over sliding windows. Flags unusual patterns (e.g., 500 POST requests to the same endpoint in 10 minutes) for review or automatic throttling.
+
+**Current defense**: WAL records all events. Post-hoc forensic analysis via `gvm audit list` can detect the pattern. Real-time prevention requires the anomaly detection layer.
+
+---
+
 ### Multi-PID Uprobe (Planned v0.3)
 
 **Limitation**: The current TLS uprobe attaches to a single PID (the sandbox child process). If the agent spawns sub-processes (e.g., Node.js agent calls a Python MCP tool), the child processes load separate libssl.so instances. Their SSL_write_ex calls are not captured.
