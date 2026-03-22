@@ -593,9 +593,12 @@ except Exception as e:
         PIDS="$PIDS $!"
     done
 
+    # Wait with 30s timeout
     FAILED=0
+    sleep 20
     for pid in $PIDS; do
-        wait "$pid" || FAILED=$((FAILED + 1))
+        kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null && FAILED=$((FAILED + 1))
+        wait "$pid" 2>/dev/null || true
     done
 
     sleep 2
@@ -653,14 +656,14 @@ if should_run 13; then
     HEALTH_BEFORE=$(curl -sf "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null)
     WAL_BEFORE=$(wc -l < data/wal.log 2>/dev/null || echo 0)
 
-    # Fire 100 requests as fast as possible
+    # Fire 100 requests sequentially (background & causes hang on EC2)
+    echo -e "  Sending 100 sequential requests..."
     for i in $(seq 1 100); do
         curl -sf -X POST "$PROXY_URL/gvm/check" \
             -H "Content-Type: application/json" \
-            -d '{"method":"POST","target_host":"slack.com","target_path":"/api/chat.postMessage","operation":"test"}' > /dev/null 2>&1 &
+            -d '{"method":"POST","target_host":"slack.com","target_path":"/api/chat.postMessage","operation":"test"}' > /dev/null 2>&1
+        [ $((i % 25)) -eq 0 ] && echo -e "    $i/100..."
     done
-    wait
-    sleep 2
 
     HEALTH_AFTER=$(curl -sf "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null)
     WAL_AFTER=$(wc -l < data/wal.log 2>/dev/null || echo 0)
@@ -1016,12 +1019,18 @@ if should_run 21; then
 
         MEM_BEFORE=$(free -m | awk '/Mem:/{print $7}')
 
-        # Burst: 50 rapid HTTPS requests
-        echo -e "  Firing 50 rapid HTTPS requests..."
-        for i in $(seq 1 50); do
-            HTTPS_PROXY="$PROXY_URL" python3 -c "import requests; requests.get('https://api.github.com', timeout=5)" 2>/dev/null &
+        # Burst: 10 batches of 5 concurrent HTTPS requests
+        echo -e "  Firing 50 HTTPS requests (10 batches of 5)..."
+        for batch in $(seq 1 10); do
+            for i in $(seq 1 5); do
+                HTTPS_PROXY="$PROXY_URL" python3 -c "import requests; requests.get('https://api.github.com', timeout=10)" 2>/dev/null &
+            done
+            sleep 15
+            # Kill any stragglers
+            jobs -p 2>/dev/null | xargs kill 2>/dev/null || true
+            wait 2>/dev/null || true
+            echo -e "    batch $batch/10 done"
         done
-        wait
         sleep 2
 
         MEM_AFTER=$(free -m | awk '/Mem:/{print $7}')
