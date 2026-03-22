@@ -10,9 +10,7 @@
 name: Docker Publish
 
 on:
-  push:
-    branches: [master]
-    tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: read
