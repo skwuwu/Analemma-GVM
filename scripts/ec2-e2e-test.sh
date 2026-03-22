@@ -1853,7 +1853,7 @@ if should_run 33; then
     else
         # 33a: gvm run -- curl (simple binary through proxy)
         echo -e "  Testing: gvm run -- curl https://api.github.com"
-        GVM_RUN_OUTPUT=$("$GVM_BIN" run -- curl -sf https://api.github.com -o /dev/null -w "%{http_code}" 2>&1 || echo "")
+        GVM_RUN_OUTPUT=$("$GVM_BIN" run -- curl -sf https://api.github.com -o /dev/null -w "%{http_code}" 2>/dev/null || echo "")
         echo -e "  Output (last 3 lines):"
         echo "$GVM_RUN_OUTPUT" | tail -3 | while read -r line; do echo -e "    $line"; done
 
@@ -1868,7 +1868,7 @@ if should_run 33; then
         GVM_PY_OUTPUT=$("$GVM_BIN" run -- python3 -c "
 import requests
 r = requests.get('https://api.github.com/repos/skwuwu/Analemma-GVM', timeout=10)
-print(f'STATUS:{r.status_code}:REPO:{r.json().get(\"name\",\"?\")}')" 2>&1 || echo "")
+print(f'STATUS:{r.status_code}:REPO:{r.json().get(\"name\",\"?\")}')" 2>/dev/null || echo "")
         echo -e "  Output (last 3 lines):"
         echo "$GVM_PY_OUTPUT" | tail -3 | while read -r line; do echo -e "    $line"; done
 
@@ -1923,7 +1923,7 @@ if should_run 34; then
         GH_RESULT=$("$GVM_BIN" run -- python3 -c "
 import requests
 r = requests.get('https://api.github.com/repos/skwuwu/Analemma-GVM', timeout=10)
-print(f'{r.status_code}:{r.json().get(\"name\",\"?\")}')" 2>&1 | grep "^200:Analemma-GVM" || echo "FAIL")
+print(f'{r.status_code}:{r.json().get(\"name\",\"?\")}')" 2>/dev/null | grep "^200:" || echo "FAIL")
         [ -n "$GH_RESULT" ] && pass "34a: GitHub API via gvm run ($GH_RESULT)" || fail "34a: GitHub via gvm run"
 
         # 34b: GitHub MCP Server via gvm run (child spawns npx → Node.js → HTTPS)

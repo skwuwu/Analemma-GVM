@@ -75,25 +75,27 @@ async fn run_binary_local(
     let binary = &command[0];
     let args = &command[1..];
 
-    println!();
-    println!("{BOLD}Analemma GVM \u{2014} Binary Mode (Layer 2){RESET}");
-    println!("{DIM}All outbound HTTP/HTTPS routed through GVM proxy.{RESET}");
-    println!();
-    println!("  {DIM}Agent ID:{RESET}     {CYAN}{}{RESET}", agent_id);
-    println!("  {DIM}Command:{RESET}      {} {}", binary, args.join(" "));
-    println!("  {DIM}Proxy:{RESET}        {}", proxy);
-    println!();
+    // All GVM banner/status output goes to stderr to keep stdout clean
+    // for the child process output (piping, JSON parsing, etc.)
+    eprintln!();
+    eprintln!("{BOLD}Analemma GVM \u{2014} Binary Mode (Layer 2){RESET}");
+    eprintln!("{DIM}All outbound HTTP/HTTPS routed through GVM proxy.{RESET}");
+    eprintln!();
+    eprintln!("  {DIM}Agent ID:{RESET}     {CYAN}{}{RESET}", agent_id);
+    eprintln!("  {DIM}Command:{RESET}      {} {}", binary, args.join(" "));
+    eprintln!("  {DIM}Proxy:{RESET}        {}", proxy);
+    eprintln!();
 
-    println!("  {BOLD}Security layers active:{RESET}");
-    println!("    {GREEN}\u{2713}{RESET} Layer 2: Enforcement Proxy (HTTPS_PROXY)");
-    println!("    {DIM}\u{25cb}{RESET} Layer 3: OS Containment {DIM}(add --sandbox for kernel isolation){RESET}");
-    println!();
+    eprintln!("  {BOLD}Security layers active:{RESET}");
+    eprintln!("    {GREEN}\u{2713}{RESET} Layer 2: Enforcement Proxy (HTTPS_PROXY)");
+    eprintln!("    {DIM}\u{25cb}{RESET} Layer 3: OS Containment {DIM}(add --sandbox for kernel isolation){RESET}");
+    eprintln!();
 
     let wal_path = "data/wal.log";
     let wal_start_len = std::fs::metadata(wal_path).map(|m| m.len()).unwrap_or(0);
 
-    println!("  {DIM}--- Output below ---{RESET}");
-    println!();
+    eprintln!("  {DIM}--- Output below ---{RESET}");
+    eprintln!();
 
     let status = tokio::process::Command::new(binary)
         .args(args)
@@ -109,16 +111,16 @@ async fn run_binary_local(
         .await
         .with_context(|| format!("Failed to execute: {}", binary))?;
 
-    println!();
+    eprintln!();
     if status.success() {
-        println!("  {GREEN}Process completed successfully{RESET}");
+        eprintln!("  {GREEN}Process completed successfully{RESET}");
     } else {
-        println!(
+        eprintln!(
             "  {YELLOW}Process exited with code: {}{RESET}",
             status.code().unwrap_or(-1)
         );
     }
-    println!();
+    eprintln!();
 
     print_wal_audit(wal_path, wal_start_len, agent_id);
 
@@ -144,14 +146,14 @@ async fn run_binary_sandboxed(
     let binary = &command[0];
     let args = &command[1..];
 
-    println!();
-    println!("{BOLD}Analemma GVM \u{2014} Binary Sandbox Mode (Layer 2 + 3){RESET}");
-    println!("{DIM}Kernel isolation: namespace + seccomp + veth + uprobe.{RESET}");
-    println!();
-    println!("  {DIM}Agent ID:{RESET}     {CYAN}{}{RESET}", agent_id);
-    println!("  {DIM}Command:{RESET}      {} {}", binary, args.join(" "));
-    println!("  {DIM}Proxy:{RESET}        {}", proxy);
-    println!();
+    eprintln!();
+    eprintln!("{BOLD}Analemma GVM \u{2014} Binary Sandbox Mode (Layer 2 + 3){RESET}");
+    eprintln!("{DIM}Kernel isolation: namespace + seccomp + veth + uprobe.{RESET}");
+    eprintln!();
+    eprintln!("  {DIM}Agent ID:{RESET}     {CYAN}{}{RESET}", agent_id);
+    eprintln!("  {DIM}Command:{RESET}      {} {}", binary, args.join(" "));
+    eprintln!("  {DIM}Proxy:{RESET}        {}", proxy);
+    eprintln!();
 
     // Resolve binary path
     let binary_path =
@@ -178,39 +180,39 @@ async fn run_binary_sandboxed(
         proxy_url: Some(proxy.to_string()),
     };
 
-    println!("  {BOLD}Security layers active:{RESET}");
-    println!("    {GREEN}\u{2713}{RESET} Layer 2: Enforcement Proxy");
-    println!("    {GREEN}\u{2713}{RESET} Layer 3: OS Containment");
-    println!("      {DIM}\u{2022} PID namespace: isolated process tree{RESET}");
-    println!("      {DIM}\u{2022} Mount namespace: minimal rootfs{RESET}");
-    println!("      {DIM}\u{2022} Network namespace: veth pair, proxy-only routing{RESET}");
-    println!("      {DIM}\u{2022} Seccomp-BPF: syscall whitelist{RESET}");
-    println!("      {DIM}\u{2022} eBPF uprobe: TLS plaintext inspection{RESET}");
-    println!();
-    println!("  {DIM}--- Output below ---{RESET}");
-    println!();
+    eprintln!("  {BOLD}Security layers active:{RESET}");
+    eprintln!("    {GREEN}\u{2713}{RESET} Layer 2: Enforcement Proxy");
+    eprintln!("    {GREEN}\u{2713}{RESET} Layer 3: OS Containment");
+    eprintln!("      {DIM}\u{2022} PID namespace: isolated process tree{RESET}");
+    eprintln!("      {DIM}\u{2022} Mount namespace: minimal rootfs{RESET}");
+    eprintln!("      {DIM}\u{2022} Network namespace: veth pair, proxy-only routing{RESET}");
+    eprintln!("      {DIM}\u{2022} Seccomp-BPF: syscall whitelist{RESET}");
+    eprintln!("      {DIM}\u{2022} eBPF uprobe: TLS plaintext inspection{RESET}");
+    eprintln!();
+    eprintln!("  {DIM}--- Output below ---{RESET}");
+    eprintln!();
 
     let result = gvm_sandbox::launch_sandboxed(config);
 
-    println!();
+    eprintln!();
     match result {
         Ok(sr) => {
             if sr.exit_code == 0 {
-                println!("  {GREEN}Process completed successfully{RESET}");
+                eprintln!("  {GREEN}Process completed successfully{RESET}");
             } else {
-                println!(
+                eprintln!(
                     "  {YELLOW}Process exited with code: {}{RESET}",
                     sr.exit_code
                 );
             }
-            println!("  {DIM}Sandbox setup: {}ms{RESET}", sr.setup_ms);
+            eprintln!("  {DIM}Sandbox setup: {}ms{RESET}", sr.setup_ms);
         }
         Err(e) => {
-            println!("  {RED}Sandbox execution failed: {}{RESET}", e);
-            println!("  {DIM}Try without --sandbox, or use --contained for Docker.{RESET}");
+            eprintln!("  {RED}Sandbox execution failed: {}{RESET}", e);
+            eprintln!("  {DIM}Try without --sandbox, or use --contained for Docker.{RESET}");
         }
     }
-    println!();
+    eprintln!();
     Ok(())
 }
 
