@@ -116,9 +116,11 @@ pub fn setup_mount_namespace(
     nix::unistd::pivot_root(&new_root, &old_root)
         .context("pivot_root failed")?;
 
-    // Change to new root
-    nix::unistd::chdir("/")
-        .context("chdir to / failed")?;
+    // Set CWD to /workspace/output — agent writes here by default.
+    // Source files are at /workspace (read-only, accessible via ../src etc).
+    nix::unistd::chdir("/workspace/output")
+        .or_else(|_| nix::unistd::chdir("/"))
+        .context("chdir failed")?;
 
     // Unmount old root (lazy to handle busy mounts)
     nix::mount::umount2("/old_root", nix::mount::MntFlags::MNT_DETACH)
