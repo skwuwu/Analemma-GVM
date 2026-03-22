@@ -122,7 +122,17 @@ async fn run_binary_local(
     }
     eprintln!();
 
-    print_wal_audit(wal_path, wal_start_len, agent_id);
+    // WAL audit goes to stderr in binary mode to keep stdout clean for piping
+    // Use `gvm events list` for detailed audit inspection
+    let events_count = std::fs::metadata(wal_path)
+        .map(|m| m.len().saturating_sub(wal_start_len))
+        .unwrap_or(0);
+    if events_count > 0 {
+        eprintln!(
+            "  {DIM}WAL: {} new bytes recorded. Run: gvm events list{RESET}",
+            events_count
+        );
+    }
 
     if interactive {
         crate::suggest::suggest_rules_interactive(
