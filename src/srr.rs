@@ -1,5 +1,6 @@
 use crate::types::EnforcementDecision;
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use gvm_types::strip_port;
 use regex::Regex;
 use serde::Deserialize;
@@ -343,7 +344,31 @@ impl NetworkSRR {
                         continue;
                     }
 
-                    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
+                    // Try JSON parsing first (normal case)
+                    let json_result = serde_json::from_slice::<serde_json::Value>(body_bytes);
+
+                    // If JSON parse fails, try Base64-decoding the body first
+                    let decoded_json = if json_result.is_err() {
+                        base64::engine::general_purpose::STANDARD
+                            .decode(
+                                body_bytes
+                                    .iter()
+                                    .copied()
+                                    .filter(|b| !b.is_ascii_whitespace())
+                                    .collect::<Vec<u8>>(),
+                            )
+                            .ok()
+                            .and_then(|decoded| {
+                                serde_json::from_slice::<serde_json::Value>(&decoded).ok()
+                            })
+                    } else {
+                        None
+                    };
+
+                    let json_val = json_result.ok().or(decoded_json);
+
+                    if let Some(json) = json_val {
+                        // Check the target field value
                         if let Some(value) = json.get(field).and_then(|v| v.as_str()) {
                             if matches.iter().any(|m| m == value) {
                                 return SrrCheckResult {
@@ -351,6 +376,24 @@ impl NetworkSRR {
                                     matched_description: Some(rule.description.clone()),
                                     is_catch_all: rule.is_catch_all,
                                 };
+                            }
+                        }
+
+                        // Also check if any string field value is Base64-encoded
+                        // and contains a match when decoded
+                        if let Some(value) = json.get(field).and_then(|v| v.as_str()) {
+                            if let Ok(decoded) =
+                                base64::engine::general_purpose::STANDARD.decode(value)
+                            {
+                                if let Ok(decoded_str) = std::str::from_utf8(&decoded) {
+                                    if matches.iter().any(|m| decoded_str.contains(m.as_str())) {
+                                        return SrrCheckResult {
+                                            decision: rule.decision.clone(),
+                                            matched_description: Some(rule.description.clone()),
+                                            is_catch_all: rule.is_catch_all,
+                                        };
+                                    }
+                                }
                             }
                         }
                     }
@@ -935,6 +978,88 @@ mod tests {
                 );
             }
             other => panic!("Expected Delay (fallthrough), got {:?}", other),
+        }
+    }
+
+    // ── Test 4b: Base64-encoded body — entire body is Base64 ──
+
+    #[test]
+    fn base64_encoded_body_detected() {
+        let srr = srr_from_toml(
+            r#"
+            [[rules]]
+            method = "POST"
+            pattern = "api.bank.com/graphql"
+            payload_field = "operationName"
+            payload_match = ["TransferFunds"]
+            max_body_bytes = 65536
+            decision = { type = "Deny", reason = "Dangerous GraphQL via Base64" }
+        "#,
+        );
+
+        // Base64 of: {"operationName":"TransferFunds","amount":5000}
+        let b64_body = b"eyJvcGVyYXRpb25OYW1lIjoiVHJhbnNmZXJGdW5kcyIsImFtb3VudCI6NTAwMH0=";
+        let result = srr.check("POST", "api.bank.com", "/graphql", Some(b64_body));
+
+        match result.decision {
+            EnforcementDecision::Deny { .. } => {} // expected
+            other => panic!("Base64 body should be decoded and matched, got {:?}", other),
+        }
+    }
+
+    // ── Test 4c: Base64-encoded field value — field value is Base64 ──
+
+    #[test]
+    fn base64_encoded_field_value_detected() {
+        let srr = srr_from_toml(
+            r#"
+            [[rules]]
+            method = "POST"
+            pattern = "api.external.com/webhook"
+            payload_field = "data"
+            payload_match = ["ghp_"]
+            max_body_bytes = 65536
+            decision = { type = "Deny", reason = "API key exfiltration blocked" }
+        "#,
+        );
+
+        // JSON body where "data" field contains Base64-encoded API key
+        // Base64 of: ghp_abc123secrettoken
+        let body = br#"{"data":"Z2hwX2FiYzEyM3NlY3JldHRva2Vu","target":"attacker.com"}"#;
+        let result = srr.check("POST", "api.external.com", "/webhook", Some(body));
+
+        match result.decision {
+            EnforcementDecision::Deny { .. } => {} // expected: decoded "ghp_abc123secrettoken" contains "ghp_"
+            other => panic!(
+                "Base64 field value should be decoded and pattern-matched, got {:?}",
+                other
+            ),
+        }
+    }
+
+    // ── Test 4d: Non-Base64 body still works normally ──
+
+    #[test]
+    fn non_base64_body_works_normally() {
+        let srr = srr_from_toml(
+            r#"
+            [[rules]]
+            method = "POST"
+            pattern = "api.bank.com/graphql"
+            payload_field = "operationName"
+            payload_match = ["TransferFunds"]
+            max_body_bytes = 65536
+            decision = { type = "Deny", reason = "Dangerous GraphQL" }
+        "#,
+        );
+
+        // Normal JSON (not Base64)
+        let body = br#"{"operationName":"TransferFunds","amount":5000}"#;
+        let result = srr.check("POST", "api.bank.com", "/graphql", Some(body));
+
+        match result.decision {
+            EnforcementDecision::Deny { .. } => {} // expected
+            other => panic!("Normal JSON should still match, got {:?}", other),
         }
     }
 
