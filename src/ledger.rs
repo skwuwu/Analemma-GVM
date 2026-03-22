@@ -119,6 +119,7 @@ struct GroupCommitRequest {
 /// Merkle structure:
 /// - Intra-batch: events form a binary Merkle tree, root stored in MerkleBatchRecord
 /// - Inter-batch: each batch references the previous batch's root (chain)
+#[allow(clippy::upper_case_acronyms)]
 struct WAL {
     /// Sender for submitting write requests to the batch task.
     tx: tokio::sync::mpsc::Sender<GroupCommitRequest>,
@@ -206,9 +207,9 @@ async fn batch_loop(
                 // Channel closed — all senders dropped, shutdown.
                 // Flush any remaining events that arrived before channel close.
                 if !batch.is_empty() {
-                    let result = flush_batch_with_merkle(
-                        &mut file, &batch, batch_id, &prev_batch_root,
-                    ).await;
+                    let result =
+                        flush_batch_with_merkle(&mut file, &batch, batch_id, &prev_batch_root)
+                            .await;
                     for req in batch.drain(..) {
                         let notify = match &result {
                             Ok(_) => Ok(()),
@@ -254,13 +255,7 @@ async fn batch_loop(
         let result = if inject_error.load(Ordering::Relaxed) {
             Err(anyhow!("WAL I/O error (injected for testing)"))
         } else {
-            flush_batch_with_merkle(
-                &mut file,
-                &batch,
-                batch_id,
-                &prev_batch_root,
-            )
-            .await
+            flush_batch_with_merkle(&mut file, &batch, batch_id, &prev_batch_root).await
         };
 
         // Update batch chain state on success
@@ -359,7 +354,13 @@ pub struct Ledger {
 impl Ledger {
     /// Initialize the ledger with WAL and NATS configuration.
     pub async fn new(wal_path: &Path, nats_url: &str, stream_name: &str) -> Result<Self> {
-        Self::with_config(wal_path, nats_url, stream_name, GroupCommitConfig::default()).await
+        Self::with_config(
+            wal_path,
+            nats_url,
+            stream_name,
+            GroupCommitConfig::default(),
+        )
+        .await
     }
 
     /// Initialize the ledger with explicit group commit configuration.
@@ -377,7 +378,11 @@ impl Ledger {
 
         // NATS connection will be established when available
         if !nats_url.is_empty() {
-            tracing::info!(url = nats_url, stream = stream_name, "NATS configured (connection deferred)");
+            tracing::info!(
+                url = nats_url,
+                stream = stream_name,
+                "NATS configured (connection deferred)"
+            );
         }
 
         Ok(Self {
@@ -477,7 +482,10 @@ impl Ledger {
     /// proxy restarts, the hash mismatch is visible in the audit trail.
     ///
     /// Called at proxy startup (after config load) and on policy hot-reload.
-    pub async fn record_config_load(&self, config_files: &[(&str, &std::path::Path)]) -> Result<()> {
+    pub async fn record_config_load(
+        &self,
+        config_files: &[(&str, &std::path::Path)],
+    ) -> Result<()> {
         use sha2::{Digest, Sha256};
 
         let mut file_hashes: HashMap<String, serde_json::Value> = HashMap::new();

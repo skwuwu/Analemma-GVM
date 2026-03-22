@@ -16,11 +16,7 @@ struct CautionTarget {
 /// Called after the agent run when `--interactive` is set. Reads new WAL entries,
 /// identifies unique (method, host, path) combos that triggered default-to-caution,
 /// and prompts the operator to add explicit SRR rules.
-pub fn suggest_rules_interactive(
-    wal_path: &str,
-    start_offset: u64,
-    srr_file: &str,
-) {
+pub fn suggest_rules_interactive(wal_path: &str, start_offset: u64, srr_file: &str) {
     let content = match std::fs::read_to_string(wal_path) {
         Ok(c) => c,
         Err(_) => return,
@@ -72,7 +68,11 @@ pub fn suggest_rules_interactive(
         }
 
         let target = CautionTarget {
-            method: if method.is_empty() { "POST".to_string() } else { method.to_uppercase() },
+            method: if method.is_empty() {
+                "POST".to_string()
+            } else {
+                method.to_uppercase()
+            },
             host: host.to_string(),
             path_pattern: generalize_path(path),
         };
@@ -85,15 +85,11 @@ pub fn suggest_rules_interactive(
     }
 
     println!();
-    println!(
-        "  {BOLD}SRR Rule Suggestions{RESET} {DIM}(Default-to-Caution detected){RESET}"
-    );
+    println!("  {BOLD}SRR Rule Suggestions{RESET} {DIM}(Default-to-Caution detected){RESET}");
     println!(
         "  {DIM}The following URLs had no explicit SRR rule and fell back to 300ms delay.{RESET}"
     );
-    println!(
-        "  {DIM}Add explicit rules to make governance intent clear.{RESET}"
-    );
+    println!("  {DIM}Add explicit rules to make governance intent clear.{RESET}");
     println!();
 
     let stdin = io::stdin();
@@ -110,18 +106,10 @@ pub fn suggest_rules_interactive(
             if *count > 1 { "s" } else { "" },
         );
         println!();
-        println!(
-            "    {CYAN}[a]{RESET} Allow     {DIM}(IC-1: instant, no delay){RESET}"
-        );
-        println!(
-            "    {CYAN}[d]{RESET} Delay     {DIM}(IC-2: 300ms safety delay + audit){RESET}"
-        );
-        println!(
-            "    {CYAN}[n]{RESET} Deny      {DIM}(IC-3: block completely){RESET}"
-        );
-        println!(
-            "    {CYAN}[s]{RESET} Skip      {DIM}(leave as Default-to-Caution){RESET}"
-        );
+        println!("    {CYAN}[a]{RESET} Allow     {DIM}(IC-1: instant, no delay){RESET}");
+        println!("    {CYAN}[d]{RESET} Delay     {DIM}(IC-2: 300ms safety delay + audit){RESET}");
+        println!("    {CYAN}[n]{RESET} Deny      {DIM}(IC-3: block completely){RESET}");
+        println!("    {CYAN}[s]{RESET} Skip      {DIM}(leave as Default-to-Caution){RESET}");
         println!();
         print!("    {BOLD}Choice [a/d/n/s]:{RESET} ");
         io::stdout().flush().unwrap_or(());
@@ -139,10 +127,7 @@ pub fn suggest_rules_interactive(
             ),
             "d" | "delay" => (
                 r#"{ type = "Delay", milliseconds = 300 }"#.to_string(),
-                format!(
-                    "{} {} — monitored with 300ms delay",
-                    target.method, pattern
-                ),
+                format!("{} {} — monitored with 300ms delay", target.method, pattern),
             ),
             "n" | "deny" => (
                 format!(
@@ -182,17 +167,11 @@ description = "{description}"
         match append_rule_to_file(srr_file, &rule_toml) {
             Ok(()) => {
                 rules_added += 1;
-                println!(
-                    "    {GREEN}\u{2713} Rule added to {}{RESET}",
-                    srr_file
-                );
+                println!("    {GREEN}\u{2713} Rule added to {}{RESET}", srr_file);
                 println!();
             }
             Err(e) => {
-                println!(
-                    "    {RED}\u{2717} Failed to write rule: {}{RESET}",
-                    e
-                );
+                println!("    {RED}\u{2717} Failed to write rule: {}{RESET}", e);
                 println!();
             }
         }
@@ -277,10 +256,7 @@ fn looks_like_id(segment: &str) -> bool {
 fn append_rule_to_file(path: &str, rule_toml: &str) -> io::Result<()> {
     use std::fs::OpenOptions;
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
 
     file.write_all(rule_toml.as_bytes())?;
     Ok(())
@@ -299,10 +275,7 @@ mod tests {
     #[test]
     fn generalize_path_with_numeric_id() {
         assert_eq!(generalize_path("/users/12345/orders"), "/users/{any}");
-        assert_eq!(
-            generalize_path("/transfer/99999"),
-            "/transfer/{any}"
-        );
+        assert_eq!(generalize_path("/transfer/99999"), "/transfer/{any}");
     }
 
     #[test]

@@ -71,14 +71,9 @@ pub fn apply_seccomp_filter(profile: &Option<SeccompProfile>) -> Result<()> {
             // Load custom filter from JSON file (enforcement only, no log layer)
             let content = std::fs::read(path)
                 .with_context(|| format!("Failed to read seccomp profile: {}", path.display()))?;
-            let map: BpfMap = seccompiler::compile_from_json(
-                &content[..],
-                target_arch,
-            )
-            .context("Failed to compile custom seccomp profile")?;
-            let filter = map.into_values()
-                .next()
-                .context("Empty seccomp profile")?;
+            let map: BpfMap = seccompiler::compile_from_json(&content[..], target_arch)
+                .context("Failed to compile custom seccomp profile")?;
+            let filter = map.into_values().next().context("Empty seccomp profile")?;
             // Custom profiles get enforcement only (no log layer)
             seccompiler::apply_filter(&filter)
                 .context("Failed to apply custom seccomp-BPF filter")?;
@@ -94,8 +89,7 @@ pub fn apply_seccomp_filter(profile: &Option<SeccompProfile>) -> Result<()> {
     // Install log filter FIRST (evaluated second by kernel — LIFO order).
     // This filter uses Log as default action: violations emit audit records
     // but the syscall would be allowed by this filter alone.
-    seccompiler::apply_filter(&log_filter)
-        .context("Failed to apply seccomp-BPF log filter")?;
+    seccompiler::apply_filter(&log_filter).context("Failed to apply seccomp-BPF log filter")?;
 
     // Install enforcement filter SECOND (evaluated first by kernel).
     // This filter uses KillProcess as default action: violations terminate.
@@ -192,7 +186,8 @@ fn build_default_filter(default_action: SeccompAction) -> Result<seccompiler::Bp
         default_action,
         // Action for whitelisted syscalls
         SeccompAction::Allow,
-        std::env::consts::ARCH.try_into()
+        std::env::consts::ARCH
+            .try_into()
             .map_err(|_| anyhow::anyhow!("Unsupported architecture"))?,
     )
     .context("Failed to build seccomp filter")?;
@@ -213,64 +208,126 @@ fn insert_base_syscalls(rules: &mut BTreeMap<i64, Vec<SeccompRule>>) {
 
     // Process lifecycle
     allow!(
-        libc::SYS_exit, libc::SYS_exit_group, libc::SYS_wait4, libc::SYS_waitid,
-        libc::SYS_futex, libc::SYS_nanosleep, libc::SYS_clock_nanosleep,
-        libc::SYS_sched_yield, libc::SYS_sched_getaffinity,
-        libc::SYS_getpid, libc::SYS_gettid, libc::SYS_getppid,
-        libc::SYS_set_tid_address, libc::SYS_set_robust_list, libc::SYS_get_robust_list,
-        libc::SYS_rt_sigaction, libc::SYS_rt_sigprocmask, libc::SYS_rt_sigreturn,
-        libc::SYS_sigaltstack, libc::SYS_tgkill,
-        libc::SYS_clone, libc::SYS_clone3, libc::SYS_execve
+        libc::SYS_exit,
+        libc::SYS_exit_group,
+        libc::SYS_wait4,
+        libc::SYS_waitid,
+        libc::SYS_futex,
+        libc::SYS_nanosleep,
+        libc::SYS_clock_nanosleep,
+        libc::SYS_sched_yield,
+        libc::SYS_sched_getaffinity,
+        libc::SYS_getpid,
+        libc::SYS_gettid,
+        libc::SYS_getppid,
+        libc::SYS_set_tid_address,
+        libc::SYS_set_robust_list,
+        libc::SYS_get_robust_list,
+        libc::SYS_rt_sigaction,
+        libc::SYS_rt_sigprocmask,
+        libc::SYS_rt_sigreturn,
+        libc::SYS_sigaltstack,
+        libc::SYS_tgkill,
+        libc::SYS_clone,
+        libc::SYS_clone3,
+        libc::SYS_execve
     );
 
     // Memory management
     allow!(
-        libc::SYS_mmap, libc::SYS_mprotect, libc::SYS_munmap, libc::SYS_brk,
-        libc::SYS_mremap, libc::SYS_madvise, libc::SYS_membarrier
+        libc::SYS_mmap,
+        libc::SYS_mprotect,
+        libc::SYS_munmap,
+        libc::SYS_brk,
+        libc::SYS_mremap,
+        libc::SYS_madvise,
+        libc::SYS_membarrier
     );
 
     // File I/O
     allow!(
-        libc::SYS_read, libc::SYS_write, libc::SYS_close, libc::SYS_fstat,
-        libc::SYS_stat, libc::SYS_lstat, libc::SYS_lseek, libc::SYS_openat,
-        libc::SYS_fcntl, libc::SYS_dup, libc::SYS_dup2, libc::SYS_dup3,
-        libc::SYS_pipe, libc::SYS_pipe2,
-        libc::SYS_readv, libc::SYS_writev, libc::SYS_pread64, libc::SYS_pwrite64,
-        libc::SYS_access, libc::SYS_faccessat, libc::SYS_faccessat2,
-        libc::SYS_getcwd, libc::SYS_readlink, libc::SYS_readlinkat,
-        libc::SYS_newfstatat, libc::SYS_statx,
-        libc::SYS_getdents, libc::SYS_getdents64,
-        libc::SYS_ftruncate, libc::SYS_rename, libc::SYS_renameat, libc::SYS_renameat2,
-        libc::SYS_unlink, libc::SYS_unlinkat,
-        libc::SYS_mkdir, libc::SYS_mkdirat, libc::SYS_rmdir,
-        libc::SYS_chdir, libc::SYS_fchdir
+        libc::SYS_read,
+        libc::SYS_write,
+        libc::SYS_close,
+        libc::SYS_fstat,
+        libc::SYS_stat,
+        libc::SYS_lstat,
+        libc::SYS_lseek,
+        libc::SYS_openat,
+        libc::SYS_fcntl,
+        libc::SYS_dup,
+        libc::SYS_dup2,
+        libc::SYS_dup3,
+        libc::SYS_pipe,
+        libc::SYS_pipe2,
+        libc::SYS_readv,
+        libc::SYS_writev,
+        libc::SYS_pread64,
+        libc::SYS_pwrite64,
+        libc::SYS_access,
+        libc::SYS_faccessat,
+        libc::SYS_faccessat2,
+        libc::SYS_getcwd,
+        libc::SYS_readlink,
+        libc::SYS_readlinkat,
+        libc::SYS_newfstatat,
+        libc::SYS_statx,
+        libc::SYS_getdents,
+        libc::SYS_getdents64,
+        libc::SYS_ftruncate,
+        libc::SYS_rename,
+        libc::SYS_renameat,
+        libc::SYS_renameat2,
+        libc::SYS_unlink,
+        libc::SYS_unlinkat,
+        libc::SYS_mkdir,
+        libc::SYS_mkdirat,
+        libc::SYS_rmdir,
+        libc::SYS_chdir,
+        libc::SYS_fchdir
     );
 
     // Polling / event loop
     allow!(
-        libc::SYS_poll, libc::SYS_ppoll,
-        libc::SYS_epoll_create, libc::SYS_epoll_create1, libc::SYS_epoll_ctl,
-        libc::SYS_epoll_wait, libc::SYS_epoll_pwait,
-        libc::SYS_select, libc::SYS_pselect6,
-        libc::SYS_eventfd, libc::SYS_eventfd2
+        libc::SYS_poll,
+        libc::SYS_ppoll,
+        libc::SYS_epoll_create,
+        libc::SYS_epoll_create1,
+        libc::SYS_epoll_ctl,
+        libc::SYS_epoll_wait,
+        libc::SYS_epoll_pwait,
+        libc::SYS_select,
+        libc::SYS_pselect6,
+        libc::SYS_eventfd,
+        libc::SYS_eventfd2
     );
 
     // Time
     allow!(
-        libc::SYS_clock_gettime, libc::SYS_clock_getres, libc::SYS_gettimeofday
+        libc::SYS_clock_gettime,
+        libc::SYS_clock_getres,
+        libc::SYS_gettimeofday
     );
 
     // Identity (read-only)
     allow!(
-        libc::SYS_getuid, libc::SYS_getgid, libc::SYS_geteuid, libc::SYS_getegid,
+        libc::SYS_getuid,
+        libc::SYS_getgid,
+        libc::SYS_geteuid,
+        libc::SYS_getegid,
         libc::SYS_getgroups
     );
 
     // Misc required by Python/Node runtimes
     allow!(
-        libc::SYS_getrandom, libc::SYS_arch_prctl, libc::SYS_prctl,
-        libc::SYS_ioctl, libc::SYS_uname, libc::SYS_sysinfo,
-        libc::SYS_prlimit64, libc::SYS_rseq
+        libc::SYS_getrandom,
+        libc::SYS_arch_prctl,
+        libc::SYS_prctl,
+        libc::SYS_ioctl,
+        libc::SYS_uname,
+        libc::SYS_sysinfo,
+        libc::SYS_prlimit64,
+        libc::SYS_rseq
     );
 }
 
@@ -285,7 +342,8 @@ fn build_strict_filter(default_action: SeccompAction) -> Result<seccompiler::Bpf
         rules,
         default_action,
         SeccompAction::Allow,
-        std::env::consts::ARCH.try_into()
+        std::env::consts::ARCH
+            .try_into()
             .map_err(|_| anyhow::anyhow!("Unsupported architecture"))?,
     )
     .context("Failed to build strict seccomp filter")?;

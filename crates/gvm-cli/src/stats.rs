@@ -20,10 +20,11 @@ pub async fn show_token_stats(
     last: &str,
     wal_file: Option<&str>,
 ) -> Result<()> {
-    let all_events = match events::load_events(wal_file, "gvm stats --tokens --wal-file data/wal.log")? {
-        Some(e) => e,
-        None => return Ok(()),
-    };
+    let all_events =
+        match events::load_events(wal_file, "gvm stats --tokens --wal-file data/wal.log")? {
+            Some(e) => e,
+            None => return Ok(()),
+        };
 
     let duration_secs = parse_duration(last)?;
     let cutoff = chrono::Utc::now() - chrono::Duration::seconds(duration_secs);
@@ -118,10 +119,7 @@ pub async fn show_token_stats(
 /// Show rollback savings estimate.
 /// Counts denied events that targeted LLM providers — these represent
 /// tokens that would have been consumed without governance.
-pub async fn show_rollback_savings(
-    last: &str,
-    wal_file: Option<&str>,
-) -> Result<()> {
+pub async fn show_rollback_savings(last: &str, wal_file: Option<&str>) -> Result<()> {
     let all_events = match events::load_events(
         wal_file,
         "gvm stats --rollback-savings --wal-file data/wal.log",

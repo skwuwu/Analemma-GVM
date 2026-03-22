@@ -130,9 +130,7 @@ pub fn evaluate(req: &EvalRequest) -> EvalResponse {
     let layer_order = ["global", "tenant", "agent"];
 
     for layer in &layer_order {
-        let layer_rules: Vec<&Rule> = req.rules.iter()
-            .filter(|r| r.layer == *layer)
-            .collect();
+        let layer_rules: Vec<&Rule> = req.rules.iter().filter(|r| r.layer == *layer).collect();
 
         // Sort by priority (ascending = higher priority first)
         let mut sorted = layer_rules;
@@ -224,13 +222,31 @@ fn decision_strictness(decision_type: &str) -> u8 {
 /// This mirrors the host-side policy engine's `resolve_field()` behavior.
 fn build_field_map(req: &EvalRequest) -> HashMap<String, serde_json::Value> {
     let mut m = HashMap::new();
-    m.insert("operation".to_string(), serde_json::Value::String(req.operation.clone()));
-    m.insert("resource.service".to_string(), serde_json::Value::String(req.resource.service.clone()));
-    m.insert("resource.tier".to_string(), serde_json::Value::String(req.resource.tier.clone()));
-    m.insert("resource.sensitivity".to_string(), serde_json::Value::String(req.resource.sensitivity.clone()));
-    m.insert("subject.agent_id".to_string(), serde_json::Value::String(req.subject.agent_id.clone()));
+    m.insert(
+        "operation".to_string(),
+        serde_json::Value::String(req.operation.clone()),
+    );
+    m.insert(
+        "resource.service".to_string(),
+        serde_json::Value::String(req.resource.service.clone()),
+    );
+    m.insert(
+        "resource.tier".to_string(),
+        serde_json::Value::String(req.resource.tier.clone()),
+    );
+    m.insert(
+        "resource.sensitivity".to_string(),
+        serde_json::Value::String(req.resource.sensitivity.clone()),
+    );
+    m.insert(
+        "subject.agent_id".to_string(),
+        serde_json::Value::String(req.subject.agent_id.clone()),
+    );
     if let Some(ref tid) = req.subject.tenant_id {
-        m.insert("subject.tenant_id".to_string(), serde_json::Value::String(tid.clone()));
+        m.insert(
+            "subject.tenant_id".to_string(),
+            serde_json::Value::String(tid.clone()),
+        );
     }
     // Flatten context attributes with "context." prefix
     for (key, value) in &req.context.attributes {
@@ -308,9 +324,17 @@ fn condition_matches(cond: &Condition, fields: &HashMap<String, serde_json::Valu
     }
 }
 
-fn compare_numeric(a: &serde_json::Value, b: &serde_json::Value, cmp: fn(f64, f64) -> bool) -> bool {
-    let av = a.as_f64().or_else(|| a.as_str().and_then(|s| s.parse().ok()));
-    let bv = b.as_f64().or_else(|| b.as_str().and_then(|s| s.parse().ok()));
+fn compare_numeric(
+    a: &serde_json::Value,
+    b: &serde_json::Value,
+    cmp: fn(f64, f64) -> bool,
+) -> bool {
+    let av = a
+        .as_f64()
+        .or_else(|| a.as_str().and_then(|s| s.parse().ok()));
+    let bv = b
+        .as_f64()
+        .or_else(|| b.as_str().and_then(|s| s.parse().ok()));
     match (av, bv) {
         (Some(a), Some(b)) => cmp(a, b),
         _ => false,
@@ -327,14 +351,16 @@ mod wasm_ffi {
     /// Allocate memory for the host to write input.
     #[no_mangle]
     pub extern "C" fn engine_alloc(size: u32) -> *mut u8 {
-        let layout = Layout::from_size_align(size as usize, 1).expect("layout with align=1 is always valid for non-zero size");
+        let layout = Layout::from_size_align(size as usize, 1)
+            .expect("layout with align=1 is always valid for non-zero size");
         unsafe { alloc(layout) }
     }
 
     /// Free memory.
     #[no_mangle]
     pub extern "C" fn engine_dealloc(ptr: *mut u8, size: u32) {
-        let layout = Layout::from_size_align(size as usize, 1).expect("layout with align=1 is always valid for non-zero size");
+        let layout = Layout::from_size_align(size as usize, 1)
+            .expect("layout with align=1 is always valid for non-zero size");
         unsafe { dealloc(ptr, layout) }
     }
 
@@ -357,12 +383,17 @@ mod wasm_ffi {
                 let error_output = r#"{"error":"invalid UTF-8 input"}"#;
                 let error_bytes = error_output.as_bytes();
                 let total = 4 + error_bytes.len();
-                let layout = Layout::from_size_align(total, 1).expect("error response layout with align=1 cannot fail");
+                let layout = Layout::from_size_align(total, 1)
+                    .expect("error response layout with align=1 cannot fail");
                 let err_ptr = unsafe { alloc(layout) };
                 let len_bytes = (error_bytes.len() as u32).to_le_bytes();
                 unsafe {
                     std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), err_ptr, 4);
-                    std::ptr::copy_nonoverlapping(error_bytes.as_ptr(), err_ptr.add(4), error_bytes.len());
+                    std::ptr::copy_nonoverlapping(
+                        error_bytes.as_ptr(),
+                        err_ptr.add(4),
+                        error_bytes.len(),
+                    );
                 }
                 return err_ptr;
             }
@@ -372,14 +403,19 @@ mod wasm_ffi {
         let output_bytes = output.as_bytes();
         let total_len = 4 + output_bytes.len();
 
-        let layout = Layout::from_size_align(total_len, 1).expect("response layout with align=1 cannot fail");
+        let layout = Layout::from_size_align(total_len, 1)
+            .expect("response layout with align=1 cannot fail");
         let result_ptr = unsafe { alloc(layout) };
 
         // Write length prefix (little-endian u32)
         let len_bytes = (output_bytes.len() as u32).to_le_bytes();
         unsafe {
             std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), result_ptr, 4);
-            std::ptr::copy_nonoverlapping(output_bytes.as_ptr(), result_ptr.add(4), output_bytes.len());
+            std::ptr::copy_nonoverlapping(
+                output_bytes.as_ptr(),
+                result_ptr.add(4),
+                output_bytes.len(),
+            );
         }
 
         result_ptr
@@ -416,8 +452,10 @@ mod tests {
 
     #[test]
     fn test_deny_critical_delete() {
-        let req = make_request("gvm.storage.delete", "critical", vec![
-            Rule {
+        let req = make_request(
+            "gvm.storage.delete",
+            "critical",
+            vec![Rule {
                 id: "deny-critical-delete".to_string(),
                 priority: 1,
                 layer: "global".to_string(),
@@ -438,8 +476,8 @@ mod tests {
                     milliseconds: None,
                     reason: Some("Critical data deletion forbidden".to_string()),
                 },
-            },
-        ]);
+            }],
+        );
         let resp = evaluate(&req);
         assert_eq!(resp.decision, "Deny");
         assert_eq!(resp.matched_rule.as_deref(), Some("deny-critical-delete"));
@@ -447,25 +485,25 @@ mod tests {
 
     #[test]
     fn test_delay_medium_send() {
-        let req = make_request("gvm.messaging.send", "medium", vec![
-            Rule {
+        let req = make_request(
+            "gvm.messaging.send",
+            "medium",
+            vec![Rule {
                 id: "delay-send".to_string(),
                 priority: 10,
                 layer: "global".to_string(),
-                conditions: vec![
-                    Condition {
-                        field: "operation".to_string(),
-                        operator: "starts_with".to_string(),
-                        value: serde_json::Value::String("gvm.messaging.send".to_string()),
-                    },
-                ],
+                conditions: vec![Condition {
+                    field: "operation".to_string(),
+                    operator: "starts_with".to_string(),
+                    value: serde_json::Value::String("gvm.messaging.send".to_string()),
+                }],
                 decision: Decision {
                     decision_type: "Delay".to_string(),
                     milliseconds: Some(300),
                     reason: None,
                 },
-            },
-        ]);
+            }],
+        );
         let resp = evaluate(&req);
         assert_eq!(resp.decision, "Delay");
         assert_eq!(resp.delay_ms, Some(300));
@@ -480,7 +518,8 @@ mod tests {
             "rules": []
         }"#;
         let output = evaluate_json(input);
-        let resp: EvalResponse = serde_json::from_str(&output).expect("evaluate_json must return valid JSON");
+        let resp: EvalResponse =
+            serde_json::from_str(&output).expect("evaluate_json must return valid JSON");
         assert_eq!(resp.decision, "Allow");
         assert_eq!(resp.engine_version, "0.1.0-wasm");
     }
@@ -489,20 +528,22 @@ mod tests {
     fn test_pascal_case_operators_accepted() {
         // Host policy.rs sends PascalCase operators ("Eq", "StartsWith").
         // Wasm engine must accept them via case normalization.
-        let req = make_request("gvm.messaging.send", "medium", vec![
-            Rule {
+        let req = make_request(
+            "gvm.messaging.send",
+            "medium",
+            vec![Rule {
                 id: "pascal-delay".to_string(),
                 priority: 10,
                 layer: "global".to_string(),
                 conditions: vec![
                     Condition {
                         field: "operation".to_string(),
-                        operator: "StartsWith".to_string(),  // PascalCase
+                        operator: "StartsWith".to_string(), // PascalCase
                         value: serde_json::Value::String("gvm.messaging".to_string()),
                     },
                     Condition {
                         field: "resource.sensitivity".to_string(),
-                        operator: "Eq".to_string(),  // PascalCase
+                        operator: "Eq".to_string(), // PascalCase
                         value: serde_json::Value::String("medium".to_string()),
                     },
                 ],
@@ -511,8 +552,8 @@ mod tests {
                     milliseconds: Some(300),
                     reason: None,
                 },
-            },
-        ]);
+            }],
+        );
         let resp = evaluate(&req);
         assert_eq!(resp.decision, "Delay");
         assert_eq!(resp.matched_rule.as_deref(), Some("pascal-delay"));
@@ -521,8 +562,10 @@ mod tests {
     #[test]
     fn test_context_attribute_matching() {
         let mut ctx = ContextAttrs::default();
-        ctx.attributes.insert("amount".to_string(), serde_json::json!(1500));
-        ctx.attributes.insert("currency".to_string(), serde_json::json!("USD"));
+        ctx.attributes
+            .insert("amount".to_string(), serde_json::json!(1500));
+        ctx.attributes
+            .insert("currency".to_string(), serde_json::json!("USD"));
 
         let req = EvalRequest {
             operation: "gvm.payment.charge".to_string(),

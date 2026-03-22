@@ -26,37 +26,58 @@ async fn event_status_transitions_pending_to_confirmed_and_failed() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
 
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger with valid WAL path must initialize"));
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("ledger with valid WAL path must initialize"),
+    );
 
     // ── Phase 1: Write a Pending event (IC-2 Delay scenario) ──
     let mut event_delay = make_test_event("evt-delay-001", "gvm.messaging.send");
     event_delay.status = EventStatus::Pending;
-    ledger.append_durable(&event_delay).await.expect("appending valid event to empty WAL must succeed");
+    ledger
+        .append_durable(&event_delay)
+        .await
+        .expect("appending valid event to empty WAL must succeed");
 
     // Simulate: upstream returned 200 → update to Confirmed
     event_delay.status = EventStatus::Confirmed;
-    ledger.append_durable(&event_delay).await.expect("appending confirmed status update must succeed");
+    ledger
+        .append_durable(&event_delay)
+        .await
+        .expect("appending confirmed status update must succeed");
 
     // ── Phase 2: Write another Pending event that fails ──
     let mut event_fail = make_test_event("evt-fail-001", "gvm.payment.refund");
     event_fail.status = EventStatus::Pending;
-    ledger.append_durable(&event_fail).await.expect("appending pending refund event must succeed");
+    ledger
+        .append_durable(&event_fail)
+        .await
+        .expect("appending pending refund event must succeed");
 
     // Simulate: upstream returned 500 → update to Failed
     event_fail.status = EventStatus::Failed {
         reason: "HTTP 500".to_string(),
     };
-    ledger.append_durable(&event_fail).await.expect("appending failed status update must succeed");
+    ledger
+        .append_durable(&event_fail)
+        .await
+        .expect("appending failed status update must succeed");
 
     // ── Phase 3: Write a Pending event that will "crash" ──
     let mut event_crash = make_test_event("evt-crash-001", "gvm.storage.write");
     event_crash.status = EventStatus::Pending;
-    ledger.append_durable(&event_crash).await.expect("appending crash-scenario pending event must succeed");
+    ledger
+        .append_durable(&event_crash)
+        .await
+        .expect("appending crash-scenario pending event must succeed");
 
     // Don't update — simulate proxy crash with Pending in WAL
 
     // ── Phase 4: Verify WAL contents ──
-    let wal_content = tokio::fs::read_to_string(&wal_path).await.expect("WAL file must be readable after writes");
+    let wal_content = tokio::fs::read_to_string(&wal_path)
+        .await
+        .expect("WAL file must be readable after writes");
     let entries: Vec<GVMEvent> = wal_content
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
@@ -86,8 +107,13 @@ async fn event_status_transitions_pending_to_confirmed_and_failed() {
 
     // ── Phase 5: Crash recovery → Pending becomes Expired ──
     // Create a NEW ledger on the same WAL file (simulates restart)
-    let ledger2 = Ledger::new(&wal_path, "", "").await.expect("ledger must initialize from existing WAL file");
-    let report = ledger2.recover_from_wal().await.expect("WAL crash recovery must complete successfully");
+    let ledger2 = Ledger::new(&wal_path, "", "")
+        .await
+        .expect("ledger must initialize from existing WAL file");
+    let report = ledger2
+        .recover_from_wal()
+        .await
+        .expect("WAL crash recovery must complete successfully");
 
     // Only the un-resolved Pending entries should be found
     // evt-delay-001 has both Pending and Confirmed → last status is Confirmed (skip)
@@ -105,7 +131,9 @@ async fn event_status_transitions_pending_to_confirmed_and_failed() {
     );
 
     // Verify the Expired entry was appended to WAL
-    let wal_after = tokio::fs::read_to_string(&wal_path).await.expect("WAL file must be readable after recovery");
+    let wal_after = tokio::fs::read_to_string(&wal_path)
+        .await
+        .expect("WAL file must be readable after recovery");
     let expired_count = wal_after
         .lines()
         .filter_map(|l| serde_json::from_str::<GVMEvent>(l).ok())
@@ -139,11 +167,11 @@ async fn wal_nats_sequence_ordering_and_crash_recovery() {
     for i in 0..50 {
         let ledger = ledger.clone();
         handles.push(tokio::spawn(async move {
-            let event = make_test_event(
-                &format!("nats-evt-{:03}", i),
-                "gvm.storage.write",
-            );
-            ledger.append_durable(&event).await.expect("concurrent WAL append must succeed");
+            let event = make_test_event(&format!("nats-evt-{:03}", i), "gvm.storage.write");
+            ledger
+                .append_durable(&event)
+                .await
+                .expect("concurrent WAL append must succeed");
         }));
     }
 
@@ -152,7 +180,9 @@ async fn wal_nats_sequence_ordering_and_crash_recovery() {
     }
 
     // ── Phase 2: Verify WAL has all 50 entries ──
-    let wal_content = tokio::fs::read_to_string(&wal_path).await.expect("WAL file must be readable after concurrent writes");
+    let wal_content = tokio::fs::read_to_string(&wal_path)
+        .await
+        .expect("WAL file must be readable after concurrent writes");
     let entries: Vec<GVMEvent> = wal_content
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
@@ -167,13 +197,19 @@ async fn wal_nats_sequence_ordering_and_crash_recovery() {
 
     // ── Phase 3: Simulate crash — add some Pending events ──
     let pending_event = make_test_event("nats-pending-crash", "gvm.payment.refund");
-    ledger.append_durable(&pending_event).await.expect("appending crash-scenario pending event must succeed");
+    ledger
+        .append_durable(&pending_event)
+        .await
+        .expect("appending crash-scenario pending event must succeed");
 
     // ── Phase 4: Crash recovery on new ledger instance ──
     let ledger2 = Ledger::new(&wal_path, "nats://stub:4222", "gvm-stream")
         .await
         .expect("ledger must initialize from existing WAL for recovery");
-    let report = ledger2.recover_from_wal().await.expect("WAL crash recovery must complete successfully");
+    let report = ledger2
+        .recover_from_wal()
+        .await
+        .expect("WAL crash recovery must complete successfully");
 
     // All 51 events are Pending (default in make_test_event) → all should be found
     assert!(
@@ -300,7 +336,8 @@ reason = "Agent restricted-bot is fully blocked"
     )
     .expect("writing agent-restricted-bot policy config must succeed");
 
-    let engine = PolicyEngine::load(&policy_dir).expect("valid policy files must parse successfully");
+    let engine =
+        PolicyEngine::load(&policy_dir).expect("valid policy files must parse successfully");
 
     // ── Scenario A: Agent without tenant — only Global rules apply ──
     let op_read = make_policy_operation("gvm.storage.read", None, "normal-agent");
@@ -310,7 +347,10 @@ reason = "Agent restricted-bot is fully blocked"
         "Global: read should be Allow, got {:?}",
         decision
     );
-    assert_eq!(rule_id.expect("global read must match a rule"), "global-allow-read");
+    assert_eq!(
+        rule_id.expect("global read must match a rule"),
+        "global-allow-read"
+    );
 
     let op_write = make_policy_operation("gvm.storage.write", None, "normal-agent");
     let (decision, _) = engine.evaluate(&op_write);
@@ -321,8 +361,7 @@ reason = "Agent restricted-bot is fully blocked"
     );
 
     // ── Scenario B: Agent in tenant "acme" — Tenant rules escalate ──
-    let op_read_acme =
-        make_policy_operation("gvm.storage.read", Some("acme"), "normal-agent");
+    let op_read_acme = make_policy_operation("gvm.storage.read", Some("acme"), "normal-agent");
     let (decision, rule_id) = engine.evaluate(&op_read_acme);
     // Tenant says Delay 100ms for reads, Global says Allow
     // Delay (strictness 3) > Allow (strictness 0) → Delay wins
@@ -331,10 +370,12 @@ reason = "Agent restricted-bot is fully blocked"
         "Acme tenant: read should be Delay (stricter than global Allow), got {:?}",
         decision
     );
-    assert_eq!(rule_id.expect("acme read must match a tenant rule"), "acme-delay-read");
+    assert_eq!(
+        rule_id.expect("acme read must match a tenant rule"),
+        "acme-delay-read"
+    );
 
-    let op_write_acme =
-        make_policy_operation("gvm.storage.write", Some("acme"), "normal-agent");
+    let op_write_acme = make_policy_operation("gvm.storage.write", Some("acme"), "normal-agent");
     let (decision, rule_id) = engine.evaluate(&op_write_acme);
     // Tenant says RequireApproval for writes, Global says Delay
     // RequireApproval (strictness 4) > Delay (strictness 3) → RequireApproval wins
@@ -343,11 +384,13 @@ reason = "Agent restricted-bot is fully blocked"
         "Acme tenant: write should be RequireApproval (stricter than Delay), got {:?}",
         decision
     );
-    assert_eq!(rule_id.expect("acme write must match a tenant rule"), "acme-approve-write");
+    assert_eq!(
+        rule_id.expect("acme write must match a tenant rule"),
+        "acme-approve-write"
+    );
 
     // ── Scenario C: Global Deny cannot be weakened by Tenant ──
-    let op_delete_acme =
-        make_policy_operation("gvm.storage.delete", Some("acme"), "normal-agent");
+    let op_delete_acme = make_policy_operation("gvm.storage.delete", Some("acme"), "normal-agent");
     let (decision, rule_id) = engine.evaluate(&op_delete_acme);
     // Global Deny short-circuits — tenant rules never evaluated
     assert!(
@@ -355,7 +398,10 @@ reason = "Agent restricted-bot is fully blocked"
         "Global Deny must not be weakened by tenant: got {:?}",
         decision
     );
-    assert_eq!(rule_id.expect("global deny must match a rule"), "global-deny-delete");
+    assert_eq!(
+        rule_id.expect("global deny must match a rule"),
+        "global-deny-delete"
+    );
 
     // ── Scenario D: Agent-level Deny overrides everything ──
     let op_read_restricted =
@@ -367,7 +413,10 @@ reason = "Agent restricted-bot is fully blocked"
         "Agent-level Deny must override all: got {:?}",
         decision
     );
-    assert_eq!(rule_id.expect("agent-level deny must match a rule"), "restricted-deny-all");
+    assert_eq!(
+        rule_id.expect("agent-level deny must match a rule"),
+        "restricted-deny-all"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -400,20 +449,24 @@ expires_at = "2027-01-01T00:00:00Z"
     )
     .expect("writing secrets config must succeed");
 
-    let store = APIKeyStore::load(&secrets_path).expect("valid secrets file must parse successfully");
+    let store =
+        APIKeyStore::load(&secrets_path).expect("valid secrets file must parse successfully");
 
     let passthrough = gvm_proxy::api_keys::MissingCredentialPolicy::Passthrough;
 
     // ── Test Bearer injection (Stripe) ──
     {
         let mut headers = axum::http::HeaderMap::new();
-        store.inject(&mut headers, "api.stripe.com", &passthrough).expect("Stripe credential injection must succeed");
+        store
+            .inject(&mut headers, "api.stripe.com", &passthrough)
+            .expect("Stripe credential injection must succeed");
 
         let auth = headers
             .get("authorization")
             .expect("Authorization header must be set for Stripe");
         assert_eq!(
-            auth.to_str().expect("authorization header must be valid UTF-8"),
+            auth.to_str()
+                .expect("authorization header must be valid UTF-8"),
             "Bearer sk_test_stripe_secret_key_123"
         );
     }
@@ -421,12 +474,19 @@ expires_at = "2027-01-01T00:00:00Z"
     // ── Test ApiKey injection (SendGrid) ──
     {
         let mut headers = axum::http::HeaderMap::new();
-        store.inject(&mut headers, "api.sendgrid.com", &passthrough).expect("SendGrid credential injection must succeed");
+        store
+            .inject(&mut headers, "api.sendgrid.com", &passthrough)
+            .expect("SendGrid credential injection must succeed");
 
         let api_key = headers
             .get("x-api-key")
             .expect("x-api-key header must be set for SendGrid");
-        assert_eq!(api_key.to_str().expect("x-api-key header must be valid UTF-8"), "SG.sendgrid_api_key_456");
+        assert_eq!(
+            api_key
+                .to_str()
+                .expect("x-api-key header must be valid UTF-8"),
+            "SG.sendgrid_api_key_456"
+        );
 
         // Authorization should NOT be set (ApiKey type uses custom header)
         assert!(
@@ -438,13 +498,16 @@ expires_at = "2027-01-01T00:00:00Z"
     // ── Test OAuth2 injection (GitHub) ──
     {
         let mut headers = axum::http::HeaderMap::new();
-        store.inject(&mut headers, "api.github.com", &passthrough).expect("GitHub OAuth2 credential injection must succeed");
+        store
+            .inject(&mut headers, "api.github.com", &passthrough)
+            .expect("GitHub OAuth2 credential injection must succeed");
 
         let auth = headers
             .get("authorization")
             .expect("Authorization header must be set for GitHub OAuth2");
         assert_eq!(
-            auth.to_str().expect("authorization header must be valid UTF-8"),
+            auth.to_str()
+                .expect("authorization header must be valid UTF-8"),
             "Bearer gho_github_oauth_token_789"
         );
     }
@@ -452,7 +515,9 @@ expires_at = "2027-01-01T00:00:00Z"
     // ── Test unknown host — passthrough mode (no injection, no error) ──
     {
         let mut headers = axum::http::HeaderMap::new();
-        store.inject(&mut headers, "unknown.example.com", &passthrough).expect("passthrough mode must not error on unknown host");
+        store
+            .inject(&mut headers, "unknown.example.com", &passthrough)
+            .expect("passthrough mode must not error on unknown host");
 
         assert!(
             headers.is_empty(),
@@ -478,11 +543,16 @@ expires_at = "2027-01-01T00:00:00Z"
             axum::http::header::AUTHORIZATION,
             axum::http::HeaderValue::from_static("Bearer agent-smuggled-token"),
         );
-        store.inject(&mut headers, "api.stripe.com", &passthrough).expect("Stripe injection must overwrite agent-supplied header");
+        store
+            .inject(&mut headers, "api.stripe.com", &passthrough)
+            .expect("Stripe injection must overwrite agent-supplied header");
 
-        let auth = headers.get("authorization").expect("authorization header must exist after injection");
+        let auth = headers
+            .get("authorization")
+            .expect("authorization header must exist after injection");
         assert_eq!(
-            auth.to_str().expect("authorization header must be valid UTF-8"),
+            auth.to_str()
+                .expect("authorization header must be valid UTF-8"),
             "Bearer sk_test_stripe_secret_key_123",
             "Proxy credential must replace agent-supplied Authorization header"
         );
@@ -595,18 +665,29 @@ milliseconds = 300
 
     // Empty secrets
     let secrets_path = dir.path().join("secrets.toml");
-    std::fs::write(&secrets_path, "[credentials]\n").expect("writing empty secrets config must succeed");
+    std::fs::write(&secrets_path, "[credentials]\n")
+        .expect("writing empty secrets config must succeed");
 
     // WAL
     let wal_path = dir.path().join("wal.log");
 
     // Build components
-    let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).expect("valid SRR config must parse")));
+    let srr = Arc::new(std::sync::RwLock::new(
+        NetworkSRR::load(&srr_path).expect("valid SRR config must parse"),
+    ));
     let policy = Arc::new(PolicyEngine::load(&policy_dir).expect("valid policy files must parse"));
-    let registry = Arc::new(OperationRegistry::load(&registry_path).expect("valid registry config must parse"));
-    let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("valid secrets config must parse"));
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger must initialize for end-to-end test"));
-    let vault = Arc::new(Vault::new(ledger.clone()).expect("vault must initialize with valid ledger"));
+    let registry = Arc::new(
+        OperationRegistry::load(&registry_path).expect("valid registry config must parse"),
+    );
+    let api_keys =
+        Arc::new(APIKeyStore::load(&secrets_path).expect("valid secrets config must parse"));
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("ledger must initialize for end-to-end test"),
+    );
+    let vault =
+        Arc::new(Vault::new(ledger.clone()).expect("vault must initialize with valid ledger"));
     let rate_limiter = Arc::new(RateLimiter::new());
     let http_client =
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
@@ -631,9 +712,7 @@ milliseconds = 300
         shadow_config: gvm_proxy::intent_store::ShadowConfig::default(),
     };
 
-    let app = Router::new()
-        .fallback(proxy_handler)
-        .with_state(state);
+    let app = Router::new().fallback(proxy_handler).with_state(state);
 
     // ── Scenario A: Header Forgery — agent lies about operation ──
     // SDK sends: operation=gvm.storage.read (Allow)
@@ -651,7 +730,11 @@ milliseconds = 300
         .body(Body::empty())
         .expect("valid HTTP request must build");
 
-    let response = app.clone().oneshot(request).await.expect("proxy must handle forged header request");
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("proxy must handle forged header request");
     assert_eq!(
         response.status(),
         StatusCode::FORBIDDEN,
@@ -685,7 +768,11 @@ milliseconds = 300
         .body(Body::empty())
         .expect("valid HTTP request must build");
 
-    let response = app.clone().oneshot(request).await.expect("proxy must handle payment request");
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("proxy must handle payment request");
     assert_eq!(
         response.status(),
         StatusCode::FORBIDDEN,
@@ -720,7 +807,11 @@ milliseconds = 300
         .body(Body::empty())
         .expect("valid HTTP request must build");
 
-    let response = app.clone().oneshot(request).await.expect("proxy must handle safe read request");
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("proxy must handle safe read request");
     // Should NOT be 403 (not denied). Likely 502 because no real upstream.
     assert_ne!(
         response.status(),
@@ -738,7 +829,11 @@ milliseconds = 300
         .body(Body::empty())
         .expect("valid HTTP request must build");
 
-    let response = app.clone().oneshot(request).await.expect("proxy must handle direct HTTP request");
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("proxy must handle direct HTTP request");
     assert_eq!(
         response.status(),
         StatusCode::FORBIDDEN,
@@ -749,7 +844,9 @@ milliseconds = 300
     // Give async tasks a moment to flush
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let wal_content = tokio::fs::read_to_string(&wal_path).await.expect("WAL file must be readable after enforcement tests");
+    let wal_content = tokio::fs::read_to_string(&wal_path)
+        .await
+        .expect("WAL file must be readable after enforcement tests");
     let wal_entries: Vec<GVMEvent> = wal_content
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
@@ -763,9 +860,7 @@ milliseconds = 300
     );
 
     // Verify at least one event has the malicious-agent header forgery recorded
-    let forgery_event = wal_entries
-        .iter()
-        .find(|e| e.agent_id == "malicious-agent");
+    let forgery_event = wal_entries.iter().find(|e| e.agent_id == "malicious-agent");
     assert!(
         forgery_event.is_some(),
         "WAL must record the header forgery attempt"
@@ -796,7 +891,9 @@ async fn config_file_hashes_recorded_in_merkle_chain() {
     let expected_srr_hash = format!("{:x}", Sha256::digest(srr_content));
 
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "").await.expect("ledger must initialize"),
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("ledger must initialize"),
     );
 
     // Record config load
@@ -818,7 +915,11 @@ async fn config_file_hashes_recorded_in_merkle_chain() {
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect();
 
-    assert_eq!(entries.len(), 1, "WAL should have exactly 1 config_load event");
+    assert_eq!(
+        entries.len(),
+        1,
+        "WAL should have exactly 1 config_load event"
+    );
 
     let event = &entries[0];
     assert_eq!(event.operation, "gvm.system.config_load");
@@ -827,15 +928,25 @@ async fn config_file_hashes_recorded_in_merkle_chain() {
     assert!(matches!(event.status, EventStatus::Confirmed));
 
     // Verify SHA-256 hashes in context field
-    let policy_hash = event.context.get("policy:global.toml")
+    let policy_hash = event
+        .context
+        .get("policy:global.toml")
         .and_then(|v| v.as_str())
         .expect("policy hash must be present in context");
-    assert_eq!(policy_hash, expected_policy_hash, "policy file hash must match SHA-256");
+    assert_eq!(
+        policy_hash, expected_policy_hash,
+        "policy file hash must match SHA-256"
+    );
 
-    let srr_hash = event.context.get("srr:srr.toml")
+    let srr_hash = event
+        .context
+        .get("srr:srr.toml")
         .and_then(|v| v.as_str())
         .expect("SRR hash must be present in context");
-    assert_eq!(srr_hash, expected_srr_hash, "SRR file hash must match SHA-256");
+    assert_eq!(
+        srr_hash, expected_srr_hash,
+        "SRR file hash must match SHA-256"
+    );
 
     // Verify event entered Merkle chain (has event_hash)
     assert!(
@@ -854,14 +965,15 @@ async fn config_hash_records_unavailable_for_missing_files() {
     let wal_path = dir.path().join("wal.log");
 
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "").await.expect("ledger must initialize"),
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("ledger must initialize"),
     );
 
     // Reference a file that does not exist
     let missing_path = dir.path().join("nonexistent.toml");
-    let config_files: Vec<(&str, &std::path::Path)> = vec![
-        ("policy:missing.toml", missing_path.as_path()),
-    ];
+    let config_files: Vec<(&str, &std::path::Path)> =
+        vec![("policy:missing.toml", missing_path.as_path())];
     ledger
         .record_config_load(&config_files)
         .await
@@ -876,10 +988,15 @@ async fn config_hash_records_unavailable_for_missing_files() {
         .collect();
 
     assert_eq!(entries.len(), 1);
-    let hash = entries[0].context.get("policy:missing.toml")
+    let hash = entries[0]
+        .context
+        .get("policy:missing.toml")
         .and_then(|v| v.as_str())
         .expect("missing file hash must still be recorded");
-    assert_eq!(hash, "unavailable", "unreadable config file must be recorded as 'unavailable'");
+    assert_eq!(
+        hash, "unavailable",
+        "unreadable config file must be recorded as 'unavailable'"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -898,7 +1015,9 @@ async fn e2e_proxy_forwards_to_upstream_and_strips_response_headers() {
     let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("binding upstream mock server must succeed");
-    let upstream_addr = upstream.local_addr().expect("upstream must have an address");
+    let upstream_addr = upstream
+        .local_addr()
+        .expect("upstream must have an address");
 
     // Upstream handler: echoes back request info + injects malicious X-GVM-* headers
     let upstream_app = axum::Router::new().fallback(|req: Request<Body>| async move {
@@ -906,7 +1025,10 @@ async fn e2e_proxy_forwards_to_upstream_and_strips_response_headers() {
         let has_gvm_agent = req.headers().get("X-GVM-Agent-Id").is_some();
         let has_gvm_op = req.headers().get("X-GVM-Operation").is_some();
         // Check if API key was injected
-        let has_auth = req.headers().get("Authorization").map(|v| v.to_str().unwrap_or("").to_string());
+        let has_auth = req
+            .headers()
+            .get("Authorization")
+            .map(|v| v.to_str().unwrap_or("").to_string());
 
         let body = serde_json::json!({
             "upstream_received": true,
@@ -943,7 +1065,8 @@ method = "*"
 pattern = "{any}"
 decision = { type = "Delay", milliseconds = 10 }
 "#,
-    ).expect("writing SRR config must succeed");
+    )
+    .expect("writing SRR config must succeed");
 
     let registry_path = dir.path().join("registry.toml");
     std::fs::write(&registry_path, "").expect("writing empty registry must succeed");
@@ -961,7 +1084,8 @@ description = "Allow everything"
 [rules.decision]
 type = "Allow"
 "#,
-    ).expect("writing global policy must succeed");
+    )
+    .expect("writing global policy must succeed");
 
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(
@@ -971,15 +1095,23 @@ type = "Allow"
 type = "Bearer"
 token = "sk_test_proxy_injected_key"
 "#,
-    ).expect("writing secrets config must succeed");
+    )
+    .expect("writing secrets config must succeed");
 
     let wal_path = dir.path().join("wal.log");
 
-    let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).expect("valid SRR config must parse")));
+    let srr = Arc::new(std::sync::RwLock::new(
+        NetworkSRR::load(&srr_path).expect("valid SRR config must parse"),
+    ));
     let policy = Arc::new(PolicyEngine::load(&policy_dir).expect("valid policy must parse"));
-    let registry = Arc::new(OperationRegistry::load(&registry_path).expect("valid registry must parse"));
+    let registry =
+        Arc::new(OperationRegistry::load(&registry_path).expect("valid registry must parse"));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("valid secrets must parse"));
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger must init"));
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("ledger must init"),
+    );
     let vault = Arc::new(Vault::new(ledger.clone()).expect("vault must init"));
     let rate_limiter = Arc::new(RateLimiter::new());
     let http_client =
@@ -1029,7 +1161,10 @@ token = "sk_test_proxy_injected_key"
         .body(Body::from(r#"{"key":"value"}"#))
         .expect("request must build");
 
-    let response = app.oneshot(request).await.expect("proxy must handle request");
+    let response = app
+        .oneshot(request)
+        .await
+        .expect("proxy must handle request");
 
     // ── Step 4: Verify response ──
     // Should NOT be 403 — policy allows + SRR delays, upstream reachable
@@ -1040,23 +1175,29 @@ token = "sk_test_proxy_injected_key"
     );
 
     // Proxy should inject its own X-GVM-Decision header (not the fake one from upstream)
-    let decision = response.headers().get("X-GVM-Decision")
+    let decision = response
+        .headers()
+        .get("X-GVM-Decision")
         .and_then(|v| v.to_str().ok());
     assert!(
         decision.is_some(),
         "Response must have X-GVM-Decision header from proxy"
     );
     assert_ne!(
-        decision.unwrap(), "Allow-Fake",
+        decision.unwrap(),
+        "Allow-Fake",
         "Upstream's fake X-GVM-Decision must be stripped, not forwarded"
     );
 
     // Upstream's fake X-GVM-Event-Id must be stripped
-    let event_id = response.headers().get("X-GVM-Event-Id")
+    let event_id = response
+        .headers()
+        .get("X-GVM-Event-Id")
         .and_then(|v| v.to_str().ok());
     assert!(event_id.is_some(), "Proxy must inject X-GVM-Event-Id");
     assert_ne!(
-        event_id.unwrap(), "upstream-injected-fake",
+        event_id.unwrap(),
+        "upstream-injected-fake",
         "Upstream's fake X-GVM-Event-Id must be stripped"
     );
 
@@ -1070,11 +1211,14 @@ token = "sk_test_proxy_injected_key"
     let body_bytes = axum::body::to_bytes(response.into_body(), 65536)
         .await
         .expect("response body must be readable");
-    let body: serde_json::Value = serde_json::from_slice(&body_bytes)
-        .expect("upstream JSON must be parseable");
+    let body: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("upstream JSON must be parseable");
 
     // Upstream must have received the request
-    assert_eq!(body["upstream_received"], true, "Upstream must have received the request");
+    assert_eq!(
+        body["upstream_received"], true,
+        "Upstream must have received the request"
+    );
     assert_eq!(body["method"], "POST");
     assert_eq!(body["path"], "/v1/data");
 
@@ -1115,25 +1259,34 @@ method = "POST"
 pattern = "api.bank.com/transfer/{any}"
 decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
 "#,
-    ).expect("writing SRR config must succeed");
+    )
+    .expect("writing SRR config must succeed");
 
     let registry_path = dir.path().join("registry.toml");
     std::fs::write(&registry_path, "").expect("writing empty registry must succeed");
 
     let policy_dir = dir.path().join("policies");
     std::fs::create_dir_all(&policy_dir).expect("creating policy dir must succeed");
-    std::fs::write(policy_dir.join("global.toml"), "rules = []\n").expect("writing empty policy must succeed");
+    std::fs::write(policy_dir.join("global.toml"), "rules = []\n")
+        .expect("writing empty policy must succeed");
 
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(&secrets_path, "[credentials]\n").expect("writing empty secrets must succeed");
 
     let wal_path = dir.path().join("wal.log");
 
-    let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).expect("valid SRR config must parse")));
+    let srr = Arc::new(std::sync::RwLock::new(
+        NetworkSRR::load(&srr_path).expect("valid SRR config must parse"),
+    ));
     let policy = Arc::new(PolicyEngine::load(&policy_dir).expect("valid policy must parse"));
-    let registry = Arc::new(OperationRegistry::load(&registry_path).expect("valid registry must parse"));
+    let registry =
+        Arc::new(OperationRegistry::load(&registry_path).expect("valid registry must parse"));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("valid secrets must parse"));
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger must init"));
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("ledger must init"),
+    );
     let vault = Arc::new(Vault::new(ledger.clone()).expect("vault must init"));
     let rate_limiter = Arc::new(RateLimiter::new());
     let http_client =
@@ -1175,8 +1328,15 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
         .body(Body::empty())
         .expect("request must build");
 
-    let response = app.oneshot(request).await.expect("proxy must handle blocked request");
-    assert_eq!(response.status(), StatusCode::FORBIDDEN, "Denied request must return 403");
+    let response = app
+        .oneshot(request)
+        .await
+        .expect("proxy must handle blocked request");
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "Denied request must return 403"
+    );
 
     // Verify response headers
     assert!(
@@ -1196,8 +1356,8 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
     let body_bytes = axum::body::to_bytes(response.into_body(), 65536)
         .await
         .expect("response body must be readable");
-    let body: serde_json::Value = serde_json::from_slice(&body_bytes)
-        .expect("block response must be valid JSON");
+    let body: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("block response must be valid JSON");
 
     // Verify all GovernanceBlockResponse contract fields
     assert_eq!(body["blocked"], true, "blocked field must be true");
@@ -1259,7 +1419,8 @@ method = "*"
 pattern = "{any}"
 decision = { type = "Allow" }
 "#,
-    ).expect("writing SRR config must succeed");
+    )
+    .expect("writing SRR config must succeed");
 
     let registry_path = dir.path().join("registry.toml");
     std::fs::write(&registry_path, "").expect("writing empty registry must succeed");
@@ -1290,18 +1451,26 @@ description = "Allow everything else"
 [rules.decision]
 type = "Allow"
 "#,
-    ).expect("writing policy must succeed");
+    )
+    .expect("writing policy must succeed");
 
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(&secrets_path, "[credentials]\n").expect("writing empty secrets must succeed");
 
     let wal_path = dir.path().join("wal.log");
 
-    let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).expect("valid SRR config must parse")));
+    let srr = Arc::new(std::sync::RwLock::new(
+        NetworkSRR::load(&srr_path).expect("valid SRR config must parse"),
+    ));
     let policy = Arc::new(PolicyEngine::load(&policy_dir).expect("valid policy must parse"));
-    let registry = Arc::new(OperationRegistry::load(&registry_path).expect("valid registry must parse"));
+    let registry =
+        Arc::new(OperationRegistry::load(&registry_path).expect("valid registry must parse"));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("valid secrets must parse"));
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger must init"));
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("ledger must init"),
+    );
     let vault = Arc::new(Vault::new(ledger.clone()).expect("vault must init"));
     let rate_limiter = Arc::new(RateLimiter::new());
     let http_client =
@@ -1359,7 +1528,11 @@ type = "Allow"
         .body(Body::empty())
         .expect("request must build");
 
-    let response = app.clone().oneshot(request).await.expect("proxy must handle SDK-formatted request");
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("proxy must handle SDK-formatted request");
 
     // Policy should deny based on resource.sensitivity == "Critical"
     assert_eq!(
@@ -1388,7 +1561,11 @@ type = "Allow"
         .body(Body::empty())
         .expect("request must build");
 
-    let response = app.clone().oneshot(request).await.expect("proxy must handle medium-sensitivity request");
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("proxy must handle medium-sensitivity request");
 
     // Should NOT be denied — Medium sensitivity is allowed
     assert_ne!(
@@ -1411,7 +1588,10 @@ type = "Allow"
         .body(Body::empty())
         .expect("request must build");
 
-    let response = app.oneshot(request).await.expect("proxy must not crash on malformed SDK headers");
+    let response = app
+        .oneshot(request)
+        .await
+        .expect("proxy must not crash on malformed SDK headers");
     // Should not be 500 (internal error) — graceful degradation
     assert_ne!(
         response.status(),
@@ -1459,10 +1639,11 @@ value = "gvm.payment"
 [rules.decision]
 type = "Allow"
 "#,
-    ).expect("writing policy config must succeed");
+    )
+    .expect("writing policy config must succeed");
 
-    let engine = PolicyEngine::load(policy_dir.path())
-        .expect("policy with regex and startswith must load");
+    let engine =
+        PolicyEngine::load(policy_dir.path()).expect("policy with regex and startswith must load");
 
     // Access rules through the engine to call validate_conflicts
     // PolicyEngine::load already calls validate_conflicts internally and logs warnings.
@@ -1513,12 +1694,17 @@ async fn emergency_wal_to_primary_recovery_path() {
     let wal_path = dir.path().join("wal.log");
 
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "").await.expect("ledger must init"),
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("ledger must init"),
     );
 
     // Phase 1: Write normally to primary WAL
     let event1 = make_test_event("normal-001", "gvm.storage.read");
-    ledger.append_durable(&event1).await.expect("normal WAL write must succeed");
+    ledger
+        .append_durable(&event1)
+        .await
+        .expect("normal WAL write must succeed");
     assert_eq!(ledger.primary_failure_count(), 0, "no failures yet");
     assert_eq!(ledger.emergency_write_count(), 0, "no emergency writes yet");
 
@@ -1526,7 +1712,10 @@ async fn emergency_wal_to_primary_recovery_path() {
     ledger.inject_write_error(true);
 
     let event2 = make_test_event("emergency-001", "gvm.payment.charge");
-    ledger.append_durable(&event2).await.expect("emergency WAL fallback must succeed");
+    ledger
+        .append_durable(&event2)
+        .await
+        .expect("emergency WAL fallback must succeed");
 
     assert!(
         ledger.primary_failure_count() > 0,
@@ -1541,11 +1730,15 @@ async fn emergency_wal_to_primary_recovery_path() {
     ledger.inject_write_error(false);
 
     let event3 = make_test_event("recovered-001", "gvm.storage.write");
-    ledger.append_durable(&event3).await.expect("primary WAL must accept writes after recovery");
+    ledger
+        .append_durable(&event3)
+        .await
+        .expect("primary WAL must accept writes after recovery");
 
     // Primary failure counter should reset to 0 after successful write
     assert_eq!(
-        ledger.primary_failure_count(), 0,
+        ledger.primary_failure_count(),
+        0,
         "primary failure counter must reset after successful write"
     );
 
@@ -1558,7 +1751,10 @@ async fn emergency_wal_to_primary_recovery_path() {
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect();
 
-    let primary_ids: Vec<&str> = primary_entries.iter().map(|e| e.event_id.as_str()).collect();
+    let primary_ids: Vec<&str> = primary_entries
+        .iter()
+        .map(|e| e.event_id.as_str())
+        .collect();
     assert!(
         primary_ids.contains(&"normal-001"),
         "primary WAL must contain pre-failure event"
@@ -1582,7 +1778,10 @@ async fn emergency_wal_to_primary_recovery_path() {
         .filter_map(|line| serde_json::from_str(line).ok())
         .collect();
 
-    let emergency_ids: Vec<&str> = emergency_entries.iter().map(|e| e.event_id.as_str()).collect();
+    let emergency_ids: Vec<&str> = emergency_entries
+        .iter()
+        .map(|e| e.event_id.as_str())
+        .collect();
     assert!(
         emergency_ids.contains(&"emergency-001"),
         "emergency WAL must contain the fallback event"
@@ -1593,8 +1792,8 @@ async fn emergency_wal_to_primary_recovery_path() {
     // There is no MerkleBatchRecord in the emergency WAL file, so inter-event
     // chain integrity is not guaranteed. Emergency events also require manual
     // reconciliation into the primary WAL — this is a known limitation.
-    let emergency_raw = std::fs::read_to_string(&emergency_path)
-        .expect("emergency WAL must be readable as string");
+    let emergency_raw =
+        std::fs::read_to_string(&emergency_path).expect("emergency WAL must be readable as string");
     let has_batch_record = emergency_raw
         .lines()
         .any(|line| line.contains("batch_id") && line.contains("merkle_root"));

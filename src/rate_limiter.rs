@@ -61,6 +61,12 @@ impl TokenBucket {
     }
 }
 
+impl Default for RateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RateLimiter {
     pub fn new() -> Self {
         Self {
@@ -82,9 +88,11 @@ impl RateLimiter {
 
         // Periodic cleanup of stale buckets to prevent unbounded memory growth.
         // Also triggers immediately if bucket count exceeds MAX_BUCKETS (DoS defense).
-        let count = self.check_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let count = self
+            .check_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let force_cleanup = buckets.len() >= MAX_BUCKETS;
-        if force_cleanup || (count % CLEANUP_INTERVAL == 0 && count > 0) {
+        if force_cleanup || (count.is_multiple_of(CLEANUP_INTERVAL) && count > 0) {
             if force_cleanup {
                 tracing::warn!(
                     buckets = buckets.len(),
@@ -96,7 +104,11 @@ impl RateLimiter {
             buckets.retain(|_, b| b.last_access.elapsed() < BUCKET_IDLE_TTL);
             let evicted = before - buckets.len();
             if evicted > 0 {
-                tracing::debug!(evicted = evicted, remaining = buckets.len(), "Evicted stale rate limit buckets");
+                tracing::debug!(
+                    evicted = evicted,
+                    remaining = buckets.len(),
+                    "Evicted stale rate limit buckets"
+                );
             }
             // If still at capacity after TTL eviction, evict oldest entries
             if buckets.len() >= MAX_BUCKETS {

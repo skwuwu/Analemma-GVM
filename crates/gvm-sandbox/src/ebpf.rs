@@ -68,12 +68,12 @@ impl Drop for EbpfGuard {
 /// Check if the current system supports eBPF TC filters.
 pub fn check_ebpf_support() -> Result<(), String> {
     // 1. Check kernel version
-    let (major, minor) = kernel_version().map_err(|e| format!("Cannot read kernel version: {}", e))?;
+    let (major, minor) =
+        kernel_version().map_err(|e| format!("Cannot read kernel version: {}", e))?;
     if major < MIN_KERNEL_MAJOR || (major == MIN_KERNEL_MAJOR && minor < MIN_KERNEL_MINOR) {
         return Err(format!(
             "Kernel {}.{} < {}.{} (TC clsact requires >= {}.{})",
-            major, minor, MIN_KERNEL_MAJOR, MIN_KERNEL_MINOR,
-            MIN_KERNEL_MAJOR, MIN_KERNEL_MINOR
+            major, minor, MIN_KERNEL_MAJOR, MIN_KERNEL_MINOR, MIN_KERNEL_MAJOR, MIN_KERNEL_MINOR
         ));
     }
 
@@ -102,11 +102,7 @@ pub fn check_ebpf_support() -> Result<(), String> {
 /// that matches the logic of gvm_tc_filter.bpf.c.
 ///
 /// Returns an EbpfGuard that removes the filter on drop.
-pub fn attach_tc_filter(
-    interface: &str,
-    proxy_ip: Ipv4Addr,
-    proxy_port: u16,
-) -> Result<EbpfGuard> {
+pub fn attach_tc_filter(interface: &str, proxy_ip: Ipv4Addr, proxy_port: u16) -> Result<EbpfGuard> {
     // 1. Add clsact qdisc (multi-attach qdisc for ingress/egress classification)
     let output = Command::new("tc")
         .args(["qdisc", "add", "dev", interface, "clsact"])
@@ -149,41 +145,77 @@ pub fn attach_tc_filter(
     //   Match destination IP at offset 16 of IP header
     //   Match destination port at offset 2 of TCP header (offset 22 from IP start)
     run_tc(&[
-        "filter", "add", "dev", interface, "ingress",
-        "protocol", "ip", "prio", "1",
+        "filter",
+        "add",
+        "dev",
+        interface,
+        "ingress",
+        "protocol",
+        "ip",
+        "prio",
+        "1",
         "u32",
-        "match", "ip", "protocol", "6", "0xff",           // TCP
-        "match", "ip", "dst", &format!("{}", proxy_ip), "255.255.255.255",
-        "match", "ip", "dport", &port_hex.to_string(), "0xffff",
-        "action", "ok",
+        "match",
+        "ip",
+        "protocol",
+        "6",
+        "0xff", // TCP
+        "match",
+        "ip",
+        "dst",
+        &format!("{}", proxy_ip),
+        "255.255.255.255",
+        "match",
+        "ip",
+        "dport",
+        &port_hex.to_string(),
+        "0xffff",
+        "action",
+        "ok",
     ])?;
 
     // Priority 2: Allow UDP (protocol 17) to proxy IP:53 (DNS)
     run_tc(&[
-        "filter", "add", "dev", interface, "ingress",
-        "protocol", "ip", "prio", "2",
+        "filter",
+        "add",
+        "dev",
+        interface,
+        "ingress",
+        "protocol",
+        "ip",
+        "prio",
+        "2",
         "u32",
-        "match", "ip", "protocol", "17", "0xff",          // UDP
-        "match", "ip", "dst", &format!("{}", proxy_ip), "255.255.255.255",
-        "match", "ip", "dport", dns_port_hex, "0xffff",
-        "action", "ok",
+        "match",
+        "ip",
+        "protocol",
+        "17",
+        "0xff", // UDP
+        "match",
+        "ip",
+        "dst",
+        &format!("{}", proxy_ip),
+        "255.255.255.255",
+        "match",
+        "ip",
+        "dport",
+        dns_port_hex,
+        "0xffff",
+        "action",
+        "ok",
     ])?;
 
     // Priority 3: Allow ARP (EtherType 0x0806) — needed for L2 resolution
     run_tc(&[
-        "filter", "add", "dev", interface, "ingress",
-        "protocol", "arp", "prio", "3",
-        "u32",
-        "match", "u32", "0", "0",  // match any ARP packet
+        "filter", "add", "dev", interface, "ingress", "protocol", "arp", "prio", "3", "u32",
+        "match", "u32", "0", "0", // match any ARP packet
         "action", "ok",
     ])?;
 
     // Priority 99: Drop everything else (catch-all)
     run_tc(&[
-        "filter", "add", "dev", interface, "ingress",
-        "protocol", "all", "prio", "99",
-        "u32",
-        "match", "u32", "0", "0",  // match everything
+        "filter", "add", "dev", interface, "ingress", "protocol", "all", "prio", "99", "u32",
+        "match", "u32", "0", "0", // match everything
         "action", "drop",
     ])?;
 
@@ -230,10 +262,7 @@ pub fn detach_tc_filter(interface: &str) {
         .args(["qdisc", "del", "dev", interface, "clsact"])
         .output();
 
-    tracing::debug!(
-        interface = interface,
-        "TC ingress filter detached"
-    );
+    tracing::debug!(interface = interface, "TC ingress filter detached");
 }
 
 /// Parse kernel version from uname.

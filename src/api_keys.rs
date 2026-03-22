@@ -115,8 +115,13 @@ impl APIKeyStore {
         headers.remove(axum::http::header::COOKIE);
         headers.remove(axum::http::header::PROXY_AUTHORIZATION);
         for name in &[
-            "x-api-key", "apikey", "x-auth-token", "x-api-token",
-            "x-signature", "x-hmac", "x-credentials",
+            "x-api-key",
+            "apikey",
+            "x-auth-token",
+            "x-api-token",
+            "x-signature",
+            "x-hmac",
+            "x-credentials",
         ] {
             if let Ok(k) = HeaderName::from_bytes(name.as_bytes()) {
                 headers.remove(k);

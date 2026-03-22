@@ -25,7 +25,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Shadow verification mode — controls what happens to unverified requests.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ShadowMode {
     /// Unverified requests are denied (production recommended).
@@ -35,19 +35,18 @@ pub enum ShadowMode {
     /// Unverified requests are allowed + audit warning (onboarding).
     Permissive,
     /// Shadow verification disabled — proxy behaves as before.
+    #[default]
     Disabled,
-}
-
-impl Default for ShadowMode {
-    fn default() -> Self {
-        ShadowMode::Disabled
-    }
 }
 
 impl ShadowMode {
     /// Parse from environment variable (used by proxy startup).
     pub fn from_env() -> Option<Self> {
-        match std::env::var("GVM_SHADOW_MODE").ok()?.to_lowercase().as_str() {
+        match std::env::var("GVM_SHADOW_MODE")
+            .ok()?
+            .to_lowercase()
+            .as_str()
+        {
             "strict" => Some(ShadowMode::Strict),
             "cautious" => Some(ShadowMode::Cautious),
             "permissive" => Some(ShadowMode::Permissive),
@@ -78,8 +77,12 @@ impl Default for ShadowConfig {
     }
 }
 
-fn default_intent_ttl_secs() -> u64 { 30 }
-fn default_cautious_delay_ms() -> u64 { 5000 }
+fn default_intent_ttl_secs() -> u64 {
+    30
+}
+fn default_cautious_delay_ms() -> u64 {
+    5000
+}
 
 // ── Intent State Machine ─────────────────────────────────────────────────────
 
@@ -169,7 +172,9 @@ pub struct IntentRequest {
     pub ttl_secs: Option<u64>,
 }
 
-fn default_agent() -> String { "mcp-agent".to_string() }
+fn default_agent() -> String {
+    "mcp-agent".to_string()
+}
 
 // ── Intent Store ─────────────────────────────────────────────────────────────
 
@@ -200,9 +205,10 @@ impl IntentStore {
 
     /// Register a new intent (Active state).
     pub fn register(&self, req: &IntentRequest) -> Result<u64, String> {
-        let mut store = self.inner.lock().map_err(|_| {
-            "Intent store lock poisoned — fail-closed".to_string()
-        })?;
+        let mut store = self
+            .inner
+            .lock()
+            .map_err(|_| "Intent store lock poisoned — fail-closed".to_string())?;
 
         // Cleanup: expired Active intents + timed-out Claims → release
         self.cleanup_inner(&mut store);
@@ -214,7 +220,8 @@ impl IntentStore {
             ));
         }
 
-        let ttl = req.ttl_secs
+        let ttl = req
+            .ttl_secs
             .map(|s| Duration::from_secs(s.min(300)))
             .unwrap_or(self.default_ttl);
 
@@ -264,14 +271,18 @@ impl IntentStore {
             Err(_) => {
                 tracing::error!("Intent store lock poisoned — fail-closed");
                 return ClaimResult {
-                    verified: false, claim_id: 0,
-                    operation: None, agent_id: None,
+                    verified: false,
+                    claim_id: 0,
+                    operation: None,
+                    agent_id: None,
                 };
             }
         };
 
         // Search for matching Active intent (newest first by intent_id)
-        let mut candidates: Vec<_> = store.intents.values()
+        let mut candidates: Vec<_> = store
+            .intents
+            .values()
             .filter(|i| {
                 if !i.matches(method, host, path) {
                     return false;
@@ -299,10 +310,15 @@ impl IntentStore {
                     Some(i) => i,
                     None => {
                         // Intent was removed between candidate search and claim — race lost
-                        tracing::warn!(intent_id, "Intent disappeared during claim — returning unverified");
+                        tracing::warn!(
+                            intent_id,
+                            "Intent disappeared during claim — returning unverified"
+                        );
                         return ClaimResult {
-                            verified: false, claim_id: 0,
-                            operation: None, agent_id: None,
+                            verified: false,
+                            claim_id: 0,
+                            operation: None,
+                            agent_id: None,
                         };
                     }
                 };
@@ -333,8 +349,10 @@ impl IntentStore {
             None => {
                 tracing::warn!(method, host, path, "No matching intent — UNVERIFIED");
                 ClaimResult {
-                    verified: false, claim_id: 0,
-                    operation: None, agent_id: None,
+                    verified: false,
+                    claim_id: 0,
+                    operation: None,
+                    agent_id: None,
                 }
             }
         }
@@ -354,7 +372,10 @@ impl IntentStore {
 
         if let Some(id) = intent_id {
             let Some(intent) = store.intents.remove(&id) else {
-                tracing::warn!(claim_id, "Intent already removed during confirm — idempotent");
+                tracing::warn!(
+                    claim_id,
+                    "Intent already removed during confirm — idempotent"
+                );
                 return;
             };
             // Clean up index
@@ -365,7 +386,11 @@ impl IntentStore {
                     store.index.remove(&key);
                 }
             }
-            tracing::debug!(intent_id = id, claim_id, "Intent confirmed (WAL durable, deleted)");
+            tracing::debug!(
+                intent_id = id,
+                claim_id,
+                "Intent confirmed (WAL durable, deleted)"
+            );
         }
     }
 
@@ -393,7 +418,13 @@ impl IntentStore {
     }
 
     /// Legacy verify() — claims and immediately confirms (for non-transactional paths).
-    pub fn verify(&self, method: &str, host: &str, path: &str, request_agent_id: Option<&str>) -> VerifyResult {
+    pub fn verify(
+        &self,
+        method: &str,
+        host: &str,
+        path: &str,
+        request_agent_id: Option<&str>,
+    ) -> VerifyResult {
         let claim = self.claim(method, host, path, request_agent_id);
         if claim.verified {
             self.confirm(claim.claim_id);
@@ -459,15 +490,27 @@ mod tests {
 
     fn req(method: &str, host: &str, path: &str, op: &str, agent: &str) -> IntentRequest {
         IntentRequest {
-            method: method.into(), host: host.into(), path: path.into(),
-            operation: op.into(), agent_id: agent.into(), ttl_secs: None,
+            method: method.into(),
+            host: host.into(),
+            path: path.into(),
+            operation: op.into(),
+            agent_id: agent.into(),
+            ttl_secs: None,
         }
     }
 
     #[test]
     fn register_and_claim_confirm() {
         let store = IntentStore::new(30);
-        store.register(&req("GET", "api.stripe.com", "/v1/charges", "stripe.read", "test")).unwrap();
+        store
+            .register(&req(
+                "GET",
+                "api.stripe.com",
+                "/v1/charges",
+                "stripe.read",
+                "test",
+            ))
+            .unwrap();
 
         let claim = store.claim("GET", "api.stripe.com", "/v1/charges", Some("test"));
         assert!(claim.verified);
@@ -475,7 +518,10 @@ mod tests {
 
         // Intent is Claimed — second claim should fail
         let claim2 = store.claim("GET", "api.stripe.com", "/v1/charges", Some("test"));
-        assert!(!claim2.verified, "claimed intent should not be claimable again");
+        assert!(
+            !claim2.verified,
+            "claimed intent should not be claimable again"
+        );
 
         // Confirm deletes the intent
         store.confirm(claim.claim_id);
@@ -485,7 +531,15 @@ mod tests {
     #[test]
     fn claim_release_restores_intent() {
         let store = IntentStore::new(30);
-        store.register(&req("GET", "api.stripe.com", "/v1/charges", "stripe.read", "test")).unwrap();
+        store
+            .register(&req(
+                "GET",
+                "api.stripe.com",
+                "/v1/charges",
+                "stripe.read",
+                "test",
+            ))
+            .unwrap();
 
         // Claim
         let claim = store.claim("GET", "api.stripe.com", "/v1/charges", Some("test"));
@@ -507,7 +561,15 @@ mod tests {
     #[test]
     fn legacy_verify_still_works() {
         let store = IntentStore::new(30);
-        store.register(&req("GET", "api.stripe.com", "/v1/charges", "stripe.read", "test")).unwrap();
+        store
+            .register(&req(
+                "GET",
+                "api.stripe.com",
+                "/v1/charges",
+                "stripe.read",
+                "test",
+            ))
+            .unwrap();
 
         let r = store.verify("GET", "api.stripe.com", "/v1/charges", Some("test"));
         assert!(r.verified);
@@ -520,7 +582,15 @@ mod tests {
     #[test]
     fn agent_id_spoofing_blocked() {
         let store = IntentStore::new(30);
-        store.register(&req("GET", "api.stripe.com", "/v1/charges", "stripe.read", "agent-a")).unwrap();
+        store
+            .register(&req(
+                "GET",
+                "api.stripe.com",
+                "/v1/charges",
+                "stripe.read",
+                "agent-a",
+            ))
+            .unwrap();
 
         let r = store.claim("GET", "api.stripe.com", "/v1/charges", Some("agent-b"));
         assert!(!r.verified, "should reject intent from different agent");
@@ -533,7 +603,15 @@ mod tests {
     #[test]
     fn expired_intent_not_claimable() {
         let store = IntentStore::new(0); // 0s TTL
-        store.register(&req("GET", "api.stripe.com", "/v1/charges", "stripe.read", "test")).unwrap();
+        store
+            .register(&req(
+                "GET",
+                "api.stripe.com",
+                "/v1/charges",
+                "stripe.read",
+                "test",
+            ))
+            .unwrap();
         std::thread::sleep(Duration::from_millis(10));
 
         let r = store.claim("GET", "api.stripe.com", "/v1/charges", Some("test"));
@@ -543,7 +621,15 @@ mod tests {
     #[test]
     fn case_insensitive_matching() {
         let store = IntentStore::new(30);
-        store.register(&req("get", "API.Stripe.COM", "/v1/charges", "stripe.read", "test")).unwrap();
+        store
+            .register(&req(
+                "get",
+                "API.Stripe.COM",
+                "/v1/charges",
+                "stripe.read",
+                "test",
+            ))
+            .unwrap();
 
         let r = store.claim("GET", "api.stripe.com", "/v1/charges", Some("test"));
         assert!(r.verified);
@@ -553,18 +639,31 @@ mod tests {
     #[test]
     fn claim_id_differs_from_intent_id() {
         let store = IntentStore::new(30);
-        let intent_id = store.register(&req("GET", "a.com", "/x", "op", "t")).unwrap();
+        let intent_id = store
+            .register(&req("GET", "a.com", "/x", "op", "t"))
+            .unwrap();
 
         let claim = store.claim("GET", "a.com", "/x", Some("t"));
         assert!(claim.verified);
-        assert_ne!(claim.claim_id, intent_id, "claim_id and intent_id must be distinct");
+        assert_ne!(
+            claim.claim_id, intent_id,
+            "claim_id and intent_id must be distinct"
+        );
         store.confirm(claim.claim_id);
     }
 
     #[test]
     fn unknown_agent_can_claim() {
         let store = IntentStore::new(30);
-        store.register(&req("GET", "api.stripe.com", "/v1/charges", "stripe.read", "test")).unwrap();
+        store
+            .register(&req(
+                "GET",
+                "api.stripe.com",
+                "/v1/charges",
+                "stripe.read",
+                "test",
+            ))
+            .unwrap();
 
         let r = store.claim("GET", "api.stripe.com", "/v1/charges", Some("unknown"));
         assert!(r.verified);

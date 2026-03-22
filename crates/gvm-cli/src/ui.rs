@@ -24,13 +24,14 @@ pub fn print_check_result(
     next_action: Option<&str>,
 ) {
     println!();
-    println!(
-        "{BOLD}Analemma-GVM — Dry-Run Policy Check{RESET}"
-    );
+    println!("{BOLD}Analemma-GVM — Dry-Run Policy Check{RESET}");
     println!("{}", "\u{2501}".repeat(WIDTH));
     println!();
     println!("  {DIM}Operation:{RESET}    {BOLD}{}{RESET}", operation);
-    println!("  {DIM}Resource:{RESET}     {} (tier={}, sensitivity={})", service, tier, sensitivity);
+    println!(
+        "  {DIM}Resource:{RESET}     {} (tier={}, sensitivity={})",
+        service, tier, sensitivity
+    );
     println!("  {DIM}Target:{RESET}       {} {}", method, host);
     println!();
 
@@ -56,9 +57,7 @@ pub fn print_check_result(
 
     println!();
     println!("{}", "\u{2501}".repeat(WIDTH));
-    println!(
-        "  {DIM}This was a dry-run. No API calls were made. No events were recorded.{RESET}"
-    );
+    println!("  {DIM}This was a dry-run. No API calls were made. No events were recorded.{RESET}");
     println!("{}", "\u{2501}".repeat(WIDTH));
     println!();
 }

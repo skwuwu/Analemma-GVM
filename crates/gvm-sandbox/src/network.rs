@@ -81,22 +81,32 @@ impl VethConfig {
 pub fn setup_host_network(config: &VethConfig) -> Result<()> {
     // 1. Create veth pair
     run_ip(&[
-        "link", "add", &config.host_iface,
-        "type", "veth",
-        "peer", "name", &config.sandbox_iface,
+        "link",
+        "add",
+        &config.host_iface,
+        "type",
+        "veth",
+        "peer",
+        "name",
+        &config.sandbox_iface,
     ])?;
 
     // 2. Move sandbox end into child's network namespace
     run_ip(&[
-        "link", "set", &config.sandbox_iface,
-        "netns", &config.child_pid.to_string(),
+        "link",
+        "set",
+        &config.sandbox_iface,
+        "netns",
+        &config.child_pid.to_string(),
     ])?;
 
     // 3. Configure host-side interface
     run_ip(&[
-        "addr", "add",
+        "addr",
+        "add",
         &format!("{}/{}", config.host_ip, config.cidr),
-        "dev", &config.host_iface,
+        "dev",
+        &config.host_iface,
     ])?;
     run_ip(&["link", "set", &config.host_iface, "up"])?;
 
@@ -110,43 +120,64 @@ pub fn setup_host_network(config: &VethConfig) -> Result<()> {
     // 5. DNAT: traffic from sandbox to proxy port → actual proxy address
     let proxy_port = config.proxy_addr.port();
     run_iptables(&[
-        "-t", "nat", "-A", "PREROUTING",
-        "-i", &config.host_iface,
-        "-p", "tcp", "--dport", &proxy_port.to_string(),
-        "-j", "DNAT",
-        "--to-destination", &config.proxy_addr.to_string(),
+        "-t",
+        "nat",
+        "-A",
+        "PREROUTING",
+        "-i",
+        &config.host_iface,
+        "-p",
+        "tcp",
+        "--dport",
+        &proxy_port.to_string(),
+        "-j",
+        "DNAT",
+        "--to-destination",
+        &config.proxy_addr.to_string(),
     ])?;
 
     // 6. MASQUERADE restricted to proxy port traffic only (not all traffic)
     run_iptables(&[
-        "-t", "nat", "-A", "POSTROUTING",
-        "-s", &format!("{}/{}", config.sandbox_ip, config.cidr),
-        "-p", "tcp", "--dport", &proxy_port.to_string(),
-        "-j", "MASQUERADE",
+        "-t",
+        "nat",
+        "-A",
+        "POSTROUTING",
+        "-s",
+        &format!("{}/{}", config.sandbox_ip, config.cidr),
+        "-p",
+        "tcp",
+        "--dport",
+        &proxy_port.to_string(),
+        "-j",
+        "MASQUERADE",
     ])?;
 
     // 7. Allow forwarding between veth and loopback (proxy is on host)
     run_iptables(&[
-        "-A", "FORWARD",
-        "-i", &config.host_iface,
-        "-o", "lo",
-        "-j", "ACCEPT",
+        "-A",
+        "FORWARD",
+        "-i",
+        &config.host_iface,
+        "-o",
+        "lo",
+        "-j",
+        "ACCEPT",
     ])?;
     run_iptables(&[
-        "-A", "FORWARD",
-        "-i", "lo",
-        "-o", &config.host_iface,
-        "-j", "ACCEPT",
+        "-A",
+        "FORWARD",
+        "-i",
+        "lo",
+        "-o",
+        &config.host_iface,
+        "-j",
+        "ACCEPT",
     ])?;
 
     // 8. Explicit DROP for veth traffic to any other destination
     // This prevents proxy bypass via direct socket connections that
     // would otherwise be routed through the default gateway.
-    run_iptables(&[
-        "-A", "FORWARD",
-        "-i", &config.host_iface,
-        "-j", "DROP",
-    ])?;
+    run_iptables(&["-A", "FORWARD", "-i", &config.host_iface, "-j", "DROP"])?;
 
     tracing::debug!(
         host_iface = %config.host_iface,
@@ -173,17 +204,16 @@ pub fn setup_sandbox_network(config: &VethConfig) -> Result<()> {
 
     // 2. Configure sandbox-side interface
     run_ip(&[
-        "addr", "add",
+        "addr",
+        "add",
         &format!("{}/{}", config.sandbox_ip, config.cidr),
-        "dev", &config.sandbox_iface,
+        "dev",
+        &config.sandbox_iface,
     ])?;
     run_ip(&["link", "set", &config.sandbox_iface, "up"])?;
 
     // 3. Default route via host side
-    run_ip(&[
-        "route", "add", "default",
-        "via", &config.host_ip,
-    ])?;
+    run_ip(&["route", "add", "default", "via", &config.host_ip])?;
 
     // ── Firewall lockdown inside sandbox namespace ──
 
@@ -194,37 +224,50 @@ pub fn setup_sandbox_network(config: &VethConfig) -> Result<()> {
     let proxy_port = config.proxy_addr.port().to_string();
 
     // Allow loopback traffic
-    run_iptables(&[
-        "-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT",
-    ])?;
+    run_iptables(&["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"])?;
 
     // Allow established/related connections (return traffic)
     run_iptables(&[
-        "-A", "OUTPUT", "-m", "state",
-        "--state", "ESTABLISHED,RELATED",
-        "-j", "ACCEPT",
+        "-A",
+        "OUTPUT",
+        "-m",
+        "state",
+        "--state",
+        "ESTABLISHED,RELATED",
+        "-j",
+        "ACCEPT",
     ])?;
 
     // Allow TCP to proxy port on host IP only
     run_iptables(&[
-        "-A", "OUTPUT",
-        "-p", "tcp", "-d", &config.host_ip,
-        "--dport", &proxy_port,
-        "-j", "ACCEPT",
+        "-A",
+        "OUTPUT",
+        "-p",
+        "tcp",
+        "-d",
+        &config.host_ip,
+        "--dport",
+        &proxy_port,
+        "-j",
+        "ACCEPT",
     ])?;
 
     // Allow UDP DNS to host IP only (resolv.conf must point to host_ip)
     run_iptables(&[
-        "-A", "OUTPUT",
-        "-p", "udp", "-d", &config.host_ip,
-        "--dport", "53",
-        "-j", "ACCEPT",
+        "-A",
+        "OUTPUT",
+        "-p",
+        "udp",
+        "-d",
+        &config.host_ip,
+        "--dport",
+        "53",
+        "-j",
+        "ACCEPT",
     ])?;
 
     // DROP everything else — this is the core proxy bypass prevention
-    run_iptables(&[
-        "-A", "OUTPUT", "-j", "DROP",
-    ])?;
+    run_iptables(&["-A", "OUTPUT", "-j", "DROP"])?;
 
     tracing::debug!(
         sandbox_ip = %config.sandbox_ip,
@@ -252,8 +295,7 @@ fn disable_ipv6() {
 /// Write a sysctl value.
 fn run_sysctl(key: &str, value: &str) -> Result<()> {
     let path = format!("/proc/sys/{}", key.replace('.', "/"));
-    std::fs::write(&path, value)
-        .with_context(|| format!("Failed to set sysctl {}", key))?;
+    std::fs::write(&path, value).with_context(|| format!("Failed to set sysctl {}", key))?;
     Ok(())
 }
 
@@ -263,43 +305,67 @@ pub fn cleanup_host_network(config: &VethConfig) {
 
     // Remove iptables rules (best-effort, reverse order)
     // FORWARD DROP for veth
-    run_iptables(&[
-        "-D", "FORWARD",
-        "-i", &config.host_iface,
-        "-j", "DROP",
-    ])
-    .ok();
+    run_iptables(&["-D", "FORWARD", "-i", &config.host_iface, "-j", "DROP"]).ok();
 
     // FORWARD lo→veth
     run_iptables(&[
-        "-D", "FORWARD",
-        "-i", "lo", "-o", &config.host_iface, "-j", "ACCEPT",
+        "-D",
+        "FORWARD",
+        "-i",
+        "lo",
+        "-o",
+        &config.host_iface,
+        "-j",
+        "ACCEPT",
     ])
     .ok();
 
     // FORWARD veth→lo
     run_iptables(&[
-        "-D", "FORWARD",
-        "-i", &config.host_iface, "-o", "lo", "-j", "ACCEPT",
+        "-D",
+        "FORWARD",
+        "-i",
+        &config.host_iface,
+        "-o",
+        "lo",
+        "-j",
+        "ACCEPT",
     ])
     .ok();
 
     // MASQUERADE (now port-restricted)
     run_iptables(&[
-        "-t", "nat", "-D", "POSTROUTING",
-        "-s", &format!("{}/{}", config.sandbox_ip, config.cidr),
-        "-p", "tcp", "--dport", &proxy_port.to_string(),
-        "-j", "MASQUERADE",
+        "-t",
+        "nat",
+        "-D",
+        "POSTROUTING",
+        "-s",
+        &format!("{}/{}", config.sandbox_ip, config.cidr),
+        "-p",
+        "tcp",
+        "--dport",
+        &proxy_port.to_string(),
+        "-j",
+        "MASQUERADE",
     ])
     .ok();
 
     // DNAT
     run_iptables(&[
-        "-t", "nat", "-D", "PREROUTING",
-        "-i", &config.host_iface,
-        "-p", "tcp", "--dport", &proxy_port.to_string(),
-        "-j", "DNAT",
-        "--to-destination", &config.proxy_addr.to_string(),
+        "-t",
+        "nat",
+        "-D",
+        "PREROUTING",
+        "-i",
+        &config.host_iface,
+        "-p",
+        "tcp",
+        "--dport",
+        &proxy_port.to_string(),
+        "-j",
+        "DNAT",
+        "--to-destination",
+        &config.proxy_addr.to_string(),
     ])
     .ok();
 

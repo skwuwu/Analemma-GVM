@@ -252,10 +252,7 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await?;
             }
-            EventsAction::Trace {
-                trace_id,
-                wal_file,
-            } => {
+            EventsAction::Trace { trace_id, wal_file } => {
                 events::trace_events(&trace_id, wal_file.as_deref()).await?;
             }
         },
@@ -282,11 +279,18 @@ async fn main() -> anyhow::Result<()> {
             }
         },
 
-        Commands::Init { industry, config_dir } => {
+        Commands::Init {
+            industry,
+            config_dir,
+        } => {
             init::run_init(&industry, &config_dir)?;
         }
 
-        Commands::Demo { scenario, proxy, mock_port } => {
+        Commands::Demo {
+            scenario,
+            proxy,
+            mock_port,
+        } => {
             demo::run_demo(&proxy, mock_port, scenario.as_deref()).await?;
         }
 
@@ -302,7 +306,19 @@ async fn main() -> anyhow::Result<()> {
             cpus,
             detach,
         } => {
-            run::run_agent(&script, &agent_id, &proxy, &image, &memory, &cpus, detach, contained, sandbox, interactive).await?;
+            run::run_agent(
+                &script,
+                &agent_id,
+                &proxy,
+                &image,
+                &memory,
+                &cpus,
+                detach,
+                contained,
+                sandbox,
+                interactive,
+            )
+            .await?;
         }
 
         Commands::Check {
@@ -314,8 +330,16 @@ async fn main() -> anyhow::Result<()> {
             method,
             proxy,
         } => {
-            check::run_check(&operation, &service, &tier, &sensitivity, &host, &method, &proxy)
-                .await?;
+            check::run_check(
+                &operation,
+                &service,
+                &tier,
+                &sensitivity,
+                &host,
+                &method,
+                &proxy,
+            )
+            .await?;
         }
     }
 

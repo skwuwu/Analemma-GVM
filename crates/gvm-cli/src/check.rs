@@ -1,5 +1,5 @@
-use anyhow::{Context, Result};
 use crate::ui;
+use anyhow::{Context, Result};
 use std::time::Instant;
 
 /// Dry-run policy check: sends a preflight request to the proxy's check endpoint.
@@ -39,9 +39,10 @@ pub async fn run_check(
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.unwrap_or_default();
 
-    let decision = body["decision"]
-        .as_str()
-        .unwrap_or(if status.is_success() { "Allow" } else { "Deny" });
+    let decision =
+        body["decision"]
+            .as_str()
+            .unwrap_or(if status.is_success() { "Allow" } else { "Deny" });
     let event_id = body["event_id"].as_str();
     let next_action = body["next_action"].as_str();
 

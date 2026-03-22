@@ -176,9 +176,7 @@ fn find_symbol_offset(path: &Path, symbol: &str) -> Result<u64> {
 /// Find Go TLS write symbol offset.
 fn find_go_tls_symbol(path: &Path) -> Result<u64> {
     // Go binaries have unstripped symbols by default
-    let output = std::process::Command::new("nm")
-        .arg(path)
-        .output()?;
+    let output = std::process::Command::new("nm").arg(path).output()?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -240,8 +238,10 @@ pub fn parse_http_from_plaintext(data: &[u8]) -> Option<ParsedHttpRequest> {
     let path = parts[1].to_string();
 
     // Validate it looks like HTTP
-    if !["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "CONNECT"]
-        .contains(&method.as_str())
+    if ![
+        "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "CONNECT",
+    ]
+    .contains(&method.as_str())
     {
         return None;
     }
@@ -411,19 +411,15 @@ impl TlsProbeController {
             self.library.ssl_write_offset,
         );
 
-        std::fs::write(
-            "/sys/kernel/debug/tracing/uprobe_events",
-            &uprobe_def,
-        )
-        .with_context(|| "Failed to write uprobe_events (need root or CAP_BPF)")?;
+        std::fs::write("/sys/kernel/debug/tracing/uprobe_events", &uprobe_def)
+            .with_context(|| "Failed to write uprobe_events (need root or CAP_BPF)")?;
 
         // Enable the uprobe event
         let enable_path = format!(
             "/sys/kernel/debug/tracing/events/uprobes/gvm_ssl_write_{}/enable",
             self.pid,
         );
-        std::fs::write(&enable_path, "1")
-            .with_context(|| "Failed to enable uprobe event")?;
+        std::fs::write(&enable_path, "1").with_context(|| "Failed to enable uprobe event")?;
 
         // Filter to our PID only
         let filter_path = format!(
@@ -474,8 +470,7 @@ impl TlsProbeController {
         let trace_pipe = "/sys/kernel/debug/tracing/trace_pipe".to_string();
         let filter = format!("gvm_ssl_write_{}", self.pid);
 
-        let file = std::fs::File::open(&trace_pipe)
-            .context("Failed to open trace_pipe")?;
+        let file = std::fs::File::open(&trace_pipe).context("Failed to open trace_pipe")?;
 
         use std::io::{BufRead, BufReader};
         let reader = BufReader::new(file);
@@ -638,11 +633,15 @@ fn parse_trace_line_http(line: &str) -> Option<String> {
 /// Legacy: parse buf address and len from hex fetchargs (for /proc/pid/mem reading).
 #[allow(dead_code)]
 fn parse_trace_line(line: &str) -> Option<(u64, u32)> {
-    let buf_addr = line.split("buf=0x").nth(1)
+    let buf_addr = line
+        .split("buf=0x")
+        .nth(1)
         .and_then(|s| s.split_whitespace().next())
         .and_then(|s| u64::from_str_radix(s, 16).ok())?;
 
-    let buf_len = line.split("len=").nth(1)
+    let buf_len = line
+        .split("len=")
+        .nth(1)
         .and_then(|s| s.split_whitespace().next())
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(4096);
@@ -664,21 +663,19 @@ pub fn start_tls_probe_thread(
 ) -> Result<std::thread::JoinHandle<()>> {
     let handle = std::thread::Builder::new()
         .name(format!("gvm-tls-probe-{}", pid))
-        .spawn(move || {
-            match TlsProbeController::new(pid) {
-                Ok(mut controller) => {
-                    controller.set_policy_check(policy_check);
-                    controller.set_audit_only(audit_only);
-                    if let Err(e) = controller.run_event_loop() {
-                        tracing::error!(pid, error = %e, "TLS probe event loop failed");
-                    }
+        .spawn(move || match TlsProbeController::new(pid) {
+            Ok(mut controller) => {
+                controller.set_policy_check(policy_check);
+                controller.set_audit_only(audit_only);
+                if let Err(e) = controller.run_event_loop() {
+                    tracing::error!(pid, error = %e, "TLS probe event loop failed");
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        pid, error = %e,
-                        "TLS probe initialization failed — HTTPS will use domain-level policy only"
-                    );
-                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    pid, error = %e,
+                    "TLS probe initialization failed — HTTPS will use domain-level policy only"
+                );
             }
         })
         .context("Failed to spawn TLS probe thread")?;
@@ -726,7 +723,10 @@ mod tests {
     fn parse_maps_line() {
         let line = "7f8a12345000-7f8a12400000 r-xp 00000000 08:01 12345  /usr/lib/x86_64-linux-gnu/libssl.so.3";
         let path = extract_path_from_maps_line(line).unwrap();
-        assert_eq!(path.to_str().unwrap(), "/usr/lib/x86_64-linux-gnu/libssl.so.3");
+        assert_eq!(
+            path.to_str().unwrap(),
+            "/usr/lib/x86_64-linux-gnu/libssl.so.3"
+        );
     }
 
     #[test]
@@ -763,12 +763,20 @@ mod tests {
     fn policy_decision_deny() {
         let check: PolicyCheckFn = Box::new(|method, _host, path| {
             if method == "POST" && path.contains("transfers") {
-                PolicyDecision::Deny { reason: "wire transfer blocked".into() }
+                PolicyDecision::Deny {
+                    reason: "wire transfer blocked".into(),
+                }
             } else {
                 PolicyDecision::Allow
             }
         });
-        assert!(matches!(check("GET", "stripe.com", "/v1/charges"), PolicyDecision::Allow));
-        assert!(matches!(check("POST", "stripe.com", "/v1/transfers"), PolicyDecision::Deny { .. }));
+        assert!(matches!(
+            check("GET", "stripe.com", "/v1/charges"),
+            PolicyDecision::Allow
+        ));
+        assert!(matches!(
+            check("POST", "stripe.com", "/v1/transfers"),
+            PolicyDecision::Deny { .. }
+        ));
     }
 }

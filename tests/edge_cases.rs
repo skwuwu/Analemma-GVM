@@ -112,7 +112,10 @@ decision = { type = "Delay", milliseconds = 300 }
         EnforcementDecision::Delay { milliseconds } => {
             assert_eq!(milliseconds, 300);
         }
-        other => panic!("Binary body should cause graceful fallthrough, got: {:?}", other),
+        other => panic!(
+            "Binary body should cause graceful fallthrough, got: {:?}",
+            other
+        ),
     }
 }
 
@@ -134,7 +137,12 @@ decision = { type = "Delay", milliseconds = 300 }
     );
 
     // Path with null byte injection attempt
-    let d = srr.check("POST", "api.bank.com", "/transfer/\0../../../etc/passwd", None);
+    let d = srr.check(
+        "POST",
+        "api.bank.com",
+        "/transfer/\0../../../etc/passwd",
+        None,
+    );
 
     // The path starts with /transfer/ so it should still be caught by the deny rule
     assert!(
@@ -351,7 +359,10 @@ reason = "Tenant suspended"
         "Tenant Deny must override Global Allow, got: {:?}",
         decision
     );
-    assert_eq!(rule_id.expect("tenant deny rule must match"), "tenant-deny-all");
+    assert_eq!(
+        rule_id.expect("tenant deny rule must match"),
+        "tenant-deny-all"
+    );
 }
 
 /// SRR says Allow, Policy says Deny — max_strict should pick Deny.
@@ -470,9 +481,16 @@ fn edge_nonexistent_policy_directory() {
     let policy_dir = dir.path().join("does-not-exist");
 
     // Should not panic — returns empty engine
-    let engine = PolicyEngine::load(&policy_dir).expect("nonexistent policy directory must return empty engine");
+    let engine = PolicyEngine::load(&policy_dir)
+        .expect("nonexistent policy directory must return empty engine");
 
-    let op = make_operation("gvm.storage.read", Sensitivity::Low, ResourceTier::Internal, None, "agent");
+    let op = make_operation(
+        "gvm.storage.read",
+        Sensitivity::Low,
+        ResourceTier::Internal,
+        None,
+        "agent",
+    );
     let (decision, _) = engine.evaluate(&op);
 
     assert!(matches!(decision, EnforcementDecision::Allow));
@@ -487,7 +505,11 @@ fn edge_nonexistent_policy_directory() {
 async fn edge_concurrent_status_update_no_crash() {
     let dir = tempfile::tempdir().expect("temp directory creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger initialization must succeed"));
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("ledger initialization must succeed"),
+    );
 
     // Write the same event_id from 10 concurrent tasks
     let mut handles = Vec::new();
@@ -520,10 +542,13 @@ async fn edge_concurrent_status_update_no_crash() {
                 payload: PayloadDescriptor::default(),
                 nats_sequence: None,
                 event_hash: None,
-        llm_trace: None,
-        default_caution: false,
+                llm_trace: None,
+                default_caution: false,
             };
-            ledger.append_durable(&event).await.expect("concurrent WAL append must succeed");
+            ledger
+                .append_durable(&event)
+                .await
+                .expect("concurrent WAL append must succeed");
         }));
     }
 
@@ -532,7 +557,9 @@ async fn edge_concurrent_status_update_no_crash() {
     }
 
     // WAL should have 10 event entries (exclude MerkleBatchRecord lines)
-    let content = tokio::fs::read_to_string(&wal_path).await.expect("WAL file must be readable after writes");
+    let content = tokio::fs::read_to_string(&wal_path)
+        .await
+        .expect("WAL file must be readable after writes");
     let event_count = content
         .lines()
         .filter(|line| !line.contains("\"merkle_root\""))
@@ -574,12 +601,22 @@ async fn edge_recovery_no_pending_events() {
                 "payload": { "content_hash": "", "size_bytes": 0, "flagged_patterns": [] },
                 "nats_sequence": null
             });
-            writeln!(file, "{}", serde_json::to_string(&event).expect("event JSON serialization must succeed")).expect("writing event to WAL file must succeed");
+            writeln!(
+                file,
+                "{}",
+                serde_json::to_string(&event).expect("event JSON serialization must succeed")
+            )
+            .expect("writing event to WAL file must succeed");
         }
     }
 
-    let ledger = Ledger::new(&wal_path, "", "").await.expect("ledger must initialize from pre-written WAL");
-    let report = ledger.recover_from_wal().await.expect("WAL recovery must succeed with confirmed-only events");
+    let ledger = Ledger::new(&wal_path, "", "")
+        .await
+        .expect("ledger must initialize from pre-written WAL");
+    let report = ledger
+        .recover_from_wal()
+        .await
+        .expect("WAL recovery must succeed with confirmed-only events");
 
     assert_eq!(report.pending_found, 0, "No Pending events should be found");
     assert_eq!(report.expired_marked, 0, "No events should be expired");

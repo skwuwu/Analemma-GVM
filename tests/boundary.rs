@@ -69,7 +69,8 @@ fn wasm_malformed_response_does_not_crash() {
         assert!(
             serde_json::from_str::<serde_json::Value>(&output).is_ok(),
             "evaluate_json must return valid JSON even for garbage input: {:?}, got: {}",
-            input, output
+            input,
+            output
         );
     }
 }
@@ -101,9 +102,13 @@ fn wasm_oversized_input_handled_gracefully() {
 
     // JSON roundtrip with huge input
     let json = serde_json::to_string(&req).expect("valid EvalRequest must serialize to JSON");
-    assert!(json.len() > 1_000_000, "JSON must contain the huge operation name");
+    assert!(
+        json.len() > 1_000_000,
+        "JSON must contain the huge operation name"
+    );
     let output = gvm_engine::evaluate_json(&json);
-    let parsed: gvm_engine::EvalResponse = serde_json::from_str(&output).expect("engine output must be valid EvalResponse JSON");
+    let parsed: gvm_engine::EvalResponse =
+        serde_json::from_str(&output).expect("engine output must be valid EvalResponse JSON");
     assert_eq!(parsed.decision, "Allow");
 }
 
@@ -112,14 +117,14 @@ fn wasm_oversized_input_handled_gracefully() {
 #[test]
 fn wasm_unicode_boundary_operation_names() {
     let unicode_operations = vec![
-        "gvm.메시지.전송",                    // Korean
-        "gvm.messaging.\u{0000}send",         // null byte
-        "gvm.messaging.send\u{FFFF}",         // max BMP char
-        "gvm.messaging.send\u{10FFFF}",       // max Unicode code point
-        "gvm.messaging.\u{200B}send",         // zero-width space
-        "gvm.messaging.\u{202E}dnes",         // right-to-left override
-        "gvm.\u{D7FF}.send",                  // boundary below surrogates
-        "\u{1F4A9}.\u{1F525}.\u{2764}",       // emoji operation names
+        "gvm.메시지.전송",              // Korean
+        "gvm.messaging.\u{0000}send",   // null byte
+        "gvm.messaging.send\u{FFFF}",   // max BMP char
+        "gvm.messaging.send\u{10FFFF}", // max Unicode code point
+        "gvm.messaging.\u{200B}send",   // zero-width space
+        "gvm.messaging.\u{202E}dnes",   // right-to-left override
+        "gvm.\u{D7FF}.send",            // boundary below surrogates
+        "\u{1F4A9}.\u{1F525}.\u{2764}", // emoji operation names
     ];
 
     for op in &unicode_operations {
@@ -140,7 +145,11 @@ fn wasm_unicode_boundary_operation_names() {
 
         // Must not panic
         let resp = gvm_engine::evaluate(&req);
-        assert_eq!(resp.decision, "Allow", "Unicode operation name must not crash: {:?}", op);
+        assert_eq!(
+            resp.decision, "Allow",
+            "Unicode operation name must not crash: {:?}",
+            op
+        );
     }
 }
 
@@ -180,7 +189,10 @@ fn wasm_null_bytes_in_string_fields() {
     // Must not panic — null bytes in strings are valid in Rust
     let resp = gvm_engine::evaluate(&req);
     // The condition should actually match since the null bytes are identical
-    assert_eq!(resp.decision, "Deny", "Null bytes in matching strings should still match");
+    assert_eq!(
+        resp.decision, "Deny",
+        "Null bytes in matching strings should still match"
+    );
 }
 
 // ── 1.6 Wasm engine: all decision types roundtrip correctly ──
@@ -213,9 +225,15 @@ fn wasm_all_decision_types_roundtrip() {
         // Verify correct mapping
         match decision_type {
             &"Allow" => assert!(matches!(decision, EnforcementDecision::Allow)),
-            &"Delay" => assert!(matches!(decision, EnforcementDecision::Delay { milliseconds: 500 })),
+            &"Delay" => assert!(matches!(
+                decision,
+                EnforcementDecision::Delay { milliseconds: 500 }
+            )),
             &"Deny" => assert!(matches!(decision, EnforcementDecision::Deny { .. })),
-            &"RequireApproval" => assert!(matches!(decision, EnforcementDecision::RequireApproval { .. })),
+            &"RequireApproval" => assert!(matches!(
+                decision,
+                EnforcementDecision::RequireApproval { .. }
+            )),
             &"AuditOnly" => assert!(matches!(decision, EnforcementDecision::AuditOnly { .. })),
             &"Throttle" => assert!(matches!(decision, EnforcementDecision::Throttle { .. })),
             _ => unreachable!(),
@@ -264,7 +282,9 @@ async fn wasm_concurrent_native_evaluations_no_corruption() {
                 },
             };
 
-            let resp = engine.evaluate(&req).expect("concurrent evaluation must not fail");
+            let resp = engine
+                .evaluate(&req)
+                .expect("concurrent evaluation must not fail");
             (i, resp.decision.clone())
         }));
     }
@@ -274,7 +294,11 @@ async fn wasm_concurrent_native_evaluations_no_corruption() {
         if i % 3 == 0 {
             assert_eq!(decision, "Deny", "Agent {} with rules should be Denied", i);
         } else {
-            assert_eq!(decision, "Allow", "Agent {} with no rules should be Allowed", i);
+            assert_eq!(
+                decision, "Allow",
+                "Agent {} with no rules should be Allowed",
+                i
+            );
         }
     }
 }
@@ -324,10 +348,24 @@ fn duplicate_gvm_headers_first_value_wins() {
     use axum::http::HeaderMap;
 
     let mut headers = HeaderMap::new();
-    headers.append("X-GVM-Agent-Id", "real-agent".parse().expect("static header value must parse"));
-    headers.append("X-GVM-Agent-Id", "injected-agent".parse().expect("static header value must parse"));
+    headers.append(
+        "X-GVM-Agent-Id",
+        "real-agent"
+            .parse()
+            .expect("static header value must parse"),
+    );
+    headers.append(
+        "X-GVM-Agent-Id",
+        "injected-agent"
+            .parse()
+            .expect("static header value must parse"),
+    );
 
-    let value = headers.get("X-GVM-Agent-Id").expect("appended header must exist").to_str().expect("ASCII header value must convert to str");
+    let value = headers
+        .get("X-GVM-Agent-Id")
+        .expect("appended header must exist")
+        .to_str()
+        .expect("ASCII header value must convert to str");
     assert_eq!(
         value, "real-agent",
         "First header value must win (axum .get() returns first)"
@@ -365,19 +403,67 @@ fn gvm_headers_stripped_before_forwarding() {
     use axum::http::HeaderMap;
 
     let mut headers = HeaderMap::new();
-    headers.insert("X-GVM-Agent-Id", "agent-001".parse().expect("static header value must parse"));
-    headers.insert("X-GVM-Trace-Id", "trace-001".parse().expect("static header value must parse"));
-    headers.insert("X-GVM-Event-Id", "event-001".parse().expect("static header value must parse"));
-    headers.insert("X-GVM-Operation", "gvm.test.read".parse().expect("static header value must parse"));
-    headers.insert("X-GVM-Target-Host", "api.example.com".parse().expect("static header value must parse"));
-    headers.insert("X-GVM-Session-Id", "session-001".parse().expect("static header value must parse"));
-    headers.insert("X-GVM-Tenant-Id", "tenant-001".parse().expect("static header value must parse"));
-    headers.insert("X-GVM-Rate-Limit", "100".parse().expect("static header value must parse"));
-    headers.insert("X-GVM-Context", "{}".parse().expect("static header value must parse"));
-    headers.insert("X-GVM-Resource", "{}".parse().expect("static header value must parse"));
+    headers.insert(
+        "X-GVM-Agent-Id",
+        "agent-001".parse().expect("static header value must parse"),
+    );
+    headers.insert(
+        "X-GVM-Trace-Id",
+        "trace-001".parse().expect("static header value must parse"),
+    );
+    headers.insert(
+        "X-GVM-Event-Id",
+        "event-001".parse().expect("static header value must parse"),
+    );
+    headers.insert(
+        "X-GVM-Operation",
+        "gvm.test.read"
+            .parse()
+            .expect("static header value must parse"),
+    );
+    headers.insert(
+        "X-GVM-Target-Host",
+        "api.example.com"
+            .parse()
+            .expect("static header value must parse"),
+    );
+    headers.insert(
+        "X-GVM-Session-Id",
+        "session-001"
+            .parse()
+            .expect("static header value must parse"),
+    );
+    headers.insert(
+        "X-GVM-Tenant-Id",
+        "tenant-001"
+            .parse()
+            .expect("static header value must parse"),
+    );
+    headers.insert(
+        "X-GVM-Rate-Limit",
+        "100".parse().expect("static header value must parse"),
+    );
+    headers.insert(
+        "X-GVM-Context",
+        "{}".parse().expect("static header value must parse"),
+    );
+    headers.insert(
+        "X-GVM-Resource",
+        "{}".parse().expect("static header value must parse"),
+    );
     // Non-GVM headers should survive
-    headers.insert("Authorization", "Bearer token123".parse().expect("static header value must parse"));
-    headers.insert("Content-Type", "application/json".parse().expect("static header value must parse"));
+    headers.insert(
+        "Authorization",
+        "Bearer token123"
+            .parse()
+            .expect("static header value must parse"),
+    );
+    headers.insert(
+        "Content-Type",
+        "application/json"
+            .parse()
+            .expect("static header value must parse"),
+    );
 
     // Simulate what remove_gvm_headers does
     let gvm_prefixes = [
@@ -399,14 +485,32 @@ fn gvm_headers_stripped_before_forwarding() {
     }
 
     // All GVM headers must be gone
-    assert!(headers.get("X-GVM-Agent-Id").is_none(), "Agent-Id must be removed");
-    assert!(headers.get("X-GVM-Trace-Id").is_none(), "Trace-Id must be removed");
-    assert!(headers.get("X-GVM-Operation").is_none(), "Operation must be removed");
-    assert!(headers.get("X-GVM-Target-Host").is_none(), "Target-Host must be removed");
+    assert!(
+        headers.get("X-GVM-Agent-Id").is_none(),
+        "Agent-Id must be removed"
+    );
+    assert!(
+        headers.get("X-GVM-Trace-Id").is_none(),
+        "Trace-Id must be removed"
+    );
+    assert!(
+        headers.get("X-GVM-Operation").is_none(),
+        "Operation must be removed"
+    );
+    assert!(
+        headers.get("X-GVM-Target-Host").is_none(),
+        "Target-Host must be removed"
+    );
 
     // Non-GVM headers must survive
-    assert!(headers.get("Authorization").is_some(), "Auth header must survive");
-    assert!(headers.get("Content-Type").is_some(), "Content-Type must survive");
+    assert!(
+        headers.get("Authorization").is_some(),
+        "Auth header must survive"
+    );
+    assert!(
+        headers.get("Content-Type").is_some(),
+        "Content-Type must survive"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -437,7 +541,9 @@ fn ssrf_localhost_blocked_by_srr() {
     );
 
     // SSRF attempt via localhost
-    let d1 = srr.check("GET", "localhost", "/admin/secrets", None).decision;
+    let d1 = srr
+        .check("GET", "localhost", "/admin/secrets", None)
+        .decision;
     assert!(
         matches!(d1, EnforcementDecision::Deny { .. }),
         "SSRF via localhost must be denied, got {:?}",
@@ -445,7 +551,9 @@ fn ssrf_localhost_blocked_by_srr() {
     );
 
     // SSRF attempt via 127.0.0.1
-    let d2 = srr.check("POST", "127.0.0.1", "/internal-api", None).decision;
+    let d2 = srr
+        .check("POST", "127.0.0.1", "/internal-api", None)
+        .decision;
     assert!(
         matches!(d2, EnforcementDecision::Deny { .. }),
         "SSRF via 127.0.0.1 must be denied, got {:?}",
@@ -477,21 +585,32 @@ fn ssrf_cloud_metadata_blocked_by_srr() {
     );
 
     // AWS metadata
-    let d1 = srr.check("GET", "169.254.169.254", "/latest/meta-data/", None).decision;
+    let d1 = srr
+        .check("GET", "169.254.169.254", "/latest/meta-data/", None)
+        .decision;
     assert!(
         matches!(d1, EnforcementDecision::Deny { .. }),
         "SSRF via AWS metadata must be denied"
     );
 
     // AWS IMDSv2 token endpoint
-    let d2 = srr.check("PUT", "169.254.169.254", "/latest/api/token", None).decision;
+    let d2 = srr
+        .check("PUT", "169.254.169.254", "/latest/api/token", None)
+        .decision;
     assert!(
         matches!(d2, EnforcementDecision::Deny { .. }),
         "SSRF via AWS IMDSv2 must be denied"
     );
 
     // GCP metadata
-    let d3 = srr.check("GET", "metadata.google.internal", "/computeMetadata/v1/", None).decision;
+    let d3 = srr
+        .check(
+            "GET",
+            "metadata.google.internal",
+            "/computeMetadata/v1/",
+            None,
+        )
+        .decision;
     assert!(
         matches!(d3, EnforcementDecision::Deny { .. }),
         "SSRF via GCP metadata must be denied"
@@ -659,7 +778,9 @@ fn ssrf_ipv6_cloud_metadata_blocked() {
     );
 
     // AWS IPv6 metadata endpoint
-    let d1 = srr.check("GET", "[fd00:ec2::254]", "/latest/meta-data", None).decision;
+    let d1 = srr
+        .check("GET", "[fd00:ec2::254]", "/latest/meta-data", None)
+        .decision;
     assert!(
         matches!(d1, EnforcementDecision::Deny { .. }),
         "AWS IPv6 metadata must be denied, got {:?}",
@@ -667,7 +788,9 @@ fn ssrf_ipv6_cloud_metadata_blocked() {
     );
 
     // IPv4-mapped metadata
-    let d2 = srr.check("GET", "[::ffff:169.254.169.254]", "/latest/meta-data", None).decision;
+    let d2 = srr
+        .check("GET", "[::ffff:169.254.169.254]", "/latest/meta-data", None)
+        .decision;
     assert!(
         matches!(d2, EnforcementDecision::Deny { .. }),
         "IPv4-mapped metadata must be denied, got {:?}",
@@ -697,14 +820,18 @@ fn ssrf_ipv6_private_ranges_mapped_blocked() {
     );
 
     // IPv4-mapped private IPs
-    let d1 = srr.check("GET", "[::ffff:10.0.0.1]", "/internal", None).decision;
+    let d1 = srr
+        .check("GET", "[::ffff:10.0.0.1]", "/internal", None)
+        .decision;
     assert!(
         matches!(d1, EnforcementDecision::Deny { .. }),
         "IPv4-mapped 10.0.0.1 must be denied, got {:?}",
         d1
     );
 
-    let d2 = srr.check("GET", "[::ffff:192.168.1.1]", "/admin", None).decision;
+    let d2 = srr
+        .check("GET", "[::ffff:192.168.1.1]", "/admin", None)
+        .decision;
     assert!(
         matches!(d2, EnforcementDecision::Deny { .. }),
         "IPv4-mapped 192.168.1.1 must be denied, got {:?}",
@@ -730,16 +857,28 @@ fn api_key_not_leaked_via_gvm_headers() {
     // Attacker tries to leak secrets through GVM context
     headers.insert(
         "X-GVM-Context",
-        r#"{"api_key": "sk-secret-123"}"#.parse().expect("static header value must parse"),
+        r#"{"api_key": "sk-secret-123"}"#
+            .parse()
+            .expect("static header value must parse"),
     );
-    headers.insert("X-GVM-Agent-Id", "attacker".parse().expect("static header value must parse"));
+    headers.insert(
+        "X-GVM-Agent-Id",
+        "attacker".parse().expect("static header value must parse"),
+    );
 
     // Simulate remove_gvm_headers
     let gvm_prefixes = [
-        "x-gvm-agent-id", "x-gvm-trace-id", "x-gvm-parent-event-id",
-        "x-gvm-event-id", "x-gvm-operation", "x-gvm-resource",
-        "x-gvm-context", "x-gvm-session-id", "x-gvm-tenant-id",
-        "x-gvm-rate-limit", "x-gvm-target-host",
+        "x-gvm-agent-id",
+        "x-gvm-trace-id",
+        "x-gvm-parent-event-id",
+        "x-gvm-event-id",
+        "x-gvm-operation",
+        "x-gvm-resource",
+        "x-gvm-context",
+        "x-gvm-session-id",
+        "x-gvm-tenant-id",
+        "x-gvm-rate-limit",
+        "x-gvm-target-host",
     ];
     for prefix in &gvm_prefixes {
         headers.remove(*prefix);
@@ -770,7 +909,9 @@ fn srr_redirect_target_blocked() {
     "#,
     );
 
-    let decision = srr.check("GET", "httpbin.org", "/redirect/10", None).decision;
+    let decision = srr
+        .check("GET", "httpbin.org", "/redirect/10", None)
+        .decision;
     assert!(
         matches!(decision, EnforcementDecision::Deny { .. }),
         "Known redirect endpoint must be blocked"
@@ -849,19 +990,30 @@ async fn nats_empty_url_wal_only_mode() {
     let wal_path = dir.path().join("wal.log");
 
     // Empty NATS URL = WAL-only mode
-    let ledger = Ledger::new(&wal_path, "", "").await.expect("WAL-only ledger must initialize without NATS");
+    let ledger = Ledger::new(&wal_path, "", "")
+        .await
+        .expect("WAL-only ledger must initialize without NATS");
 
     // Durable writes should work without NATS
     let event = make_test_event("wal-only-1");
-    ledger.append_durable(&event).await.expect("durable write must succeed in WAL-only mode");
+    ledger
+        .append_durable(&event)
+        .await
+        .expect("durable write must succeed in WAL-only mode");
 
     // Async writes should work without NATS (fire-and-forget)
     let event2 = make_test_event("wal-only-2");
     ledger.append_async(event2).await;
 
     // Recovery should work
-    let report = ledger.recover_from_wal().await.expect("WAL recovery must succeed");
-    assert_eq!(report.pending_found, 1, "One durable event should be Pending");
+    let report = ledger
+        .recover_from_wal()
+        .await
+        .expect("WAL recovery must succeed");
+    assert_eq!(
+        report.pending_found, 1,
+        "One durable event should be Pending"
+    );
 }
 
 // ── 4.3 WAL sequence monotonicity under concurrent load ──
@@ -873,14 +1025,21 @@ async fn nats_wal_sequence_monotonic() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
 
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("WAL-only ledger must initialize"));
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("WAL-only ledger must initialize"),
+    );
 
     let mut handles = Vec::new();
     for i in 0..50 {
         let ledger = ledger.clone();
         handles.push(tokio::spawn(async move {
             let event = make_test_event(&format!("seq-{}", i));
-            ledger.append_durable(&event).await.expect("concurrent durable write must succeed");
+            ledger
+                .append_durable(&event)
+                .await
+                .expect("concurrent durable write must succeed");
         }));
     }
 
@@ -889,7 +1048,9 @@ async fn nats_wal_sequence_monotonic() {
     }
 
     // Read WAL and verify all 50 events present (filter out MerkleBatchRecord lines)
-    let content = tokio::fs::read_to_string(&wal_path).await.expect("WAL file must be readable after writes");
+    let content = tokio::fs::read_to_string(&wal_path)
+        .await
+        .expect("WAL file must be readable after writes");
     let event_count = content
         .lines()
         .filter(|line| !line.contains("\"merkle_root\""))
@@ -901,7 +1062,10 @@ async fn nats_wal_sequence_monotonic() {
         .lines()
         .filter(|line| line.contains("\"merkle_root\""))
         .count();
-    assert!(batch_count > 0, "WAL must contain at least one Merkle batch record");
+    assert!(
+        batch_count > 0,
+        "WAL must contain at least one Merkle batch record"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -917,14 +1081,25 @@ async fn vault_large_value_roundtrip() {
 
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("WAL-only ledger must initialize"));
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("WAL-only ledger must initialize"),
+    );
     let vault = Vault::new(ledger).expect("vault must initialize with valid ledger");
 
     // 1MB value
     let large_value: Vec<u8> = (0..1_000_000).map(|i| (i % 256) as u8).collect();
 
-    vault.write("large-key", &large_value, "agent-1").await.expect("1MB value write must succeed");
-    let result = vault.read("large-key", "agent-1").await.expect("vault read must not error").expect("written key must exist");
+    vault
+        .write("large-key", &large_value, "agent-1")
+        .await
+        .expect("1MB value write must succeed");
+    let result = vault
+        .read("large-key", "agent-1")
+        .await
+        .expect("vault read must not error")
+        .expect("written key must exist");
 
     assert_eq!(
         result.len(),
@@ -943,17 +1118,30 @@ async fn vault_key_collision_between_agents() {
 
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("WAL-only ledger must initialize"));
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("WAL-only ledger must initialize"),
+    );
     let vault = Vault::new(ledger).expect("vault must initialize with valid ledger");
 
     // Two agents write to the same key — last writer wins
-    vault.write("shared-key", b"agent-1-data", "agent-1").await.expect("first agent write must succeed");
-    vault.write("shared-key", b"agent-2-data", "agent-2").await.expect("second agent write must succeed");
+    vault
+        .write("shared-key", b"agent-1-data", "agent-1")
+        .await
+        .expect("first agent write must succeed");
+    vault
+        .write("shared-key", b"agent-2-data", "agent-2")
+        .await
+        .expect("second agent write must succeed");
 
-    let result = vault.read("shared-key", "agent-1").await.expect("vault read must not error").expect("shared key must exist");
+    let result = vault
+        .read("shared-key", "agent-1")
+        .await
+        .expect("vault read must not error")
+        .expect("shared key must exist");
     assert_eq!(
-        result,
-        b"agent-2-data",
+        result, b"agent-2-data",
         "Last write wins — agent-2 data should be returned"
     );
 }
@@ -967,14 +1155,24 @@ async fn vault_tampered_ciphertext_detected() {
 
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("WAL-only ledger must initialize"));
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("WAL-only ledger must initialize"),
+    );
     let vault = Vault::new(ledger).expect("vault must initialize with valid ledger");
 
     // Write a value
-    vault.write("tamper-key", b"secret-data", "agent-1").await.expect("vault write must succeed");
+    vault
+        .write("tamper-key", b"secret-data", "agent-1")
+        .await
+        .expect("vault write must succeed");
 
     // Read succeeds before tampering
-    let result = vault.read("tamper-key", "agent-1").await.expect("vault read must not error");
+    let result = vault
+        .read("tamper-key", "agent-1")
+        .await
+        .expect("vault read must not error");
     assert!(result.is_some(), "Read should succeed before tampering");
     assert_eq!(result.expect("written key must exist"), b"secret-data");
 }
@@ -988,11 +1186,18 @@ async fn vault_concurrent_read_write_same_key() {
 
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("WAL-only ledger must initialize"));
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("WAL-only ledger must initialize"),
+    );
     let vault = Arc::new(Vault::new(ledger).expect("vault must initialize with valid ledger"));
 
     // Write initial value
-    vault.write("rw-key", b"initial", "agent-1").await.expect("initial vault write must succeed");
+    vault
+        .write("rw-key", b"initial", "agent-1")
+        .await
+        .expect("initial vault write must succeed");
 
     // 20 concurrent reads + 20 concurrent writes
     let mut handles = Vec::new();
@@ -1001,7 +1206,10 @@ async fn vault_concurrent_read_write_same_key() {
         let vault = vault.clone();
         handles.push(tokio::spawn(async move {
             let value = format!("value-{}", i);
-            vault.write("rw-key", value.as_bytes(), "writer").await.expect("concurrent vault write must succeed");
+            vault
+                .write("rw-key", value.as_bytes(), "writer")
+                .await
+                .expect("concurrent vault write must succeed");
             "write"
         }));
     }
@@ -1009,8 +1217,14 @@ async fn vault_concurrent_read_write_same_key() {
     for _ in 0..20 {
         let vault = vault.clone();
         handles.push(tokio::spawn(async move {
-            let result = vault.read("rw-key", "reader").await.expect("concurrent vault read must not error");
-            assert!(result.is_some(), "Read during concurrent writes must not fail");
+            let result = vault
+                .read("rw-key", "reader")
+                .await
+                .expect("concurrent vault read must not error");
+            assert!(
+                result.is_some(),
+                "Read during concurrent writes must not fail"
+            );
             "read"
         }));
     }
@@ -1038,15 +1252,33 @@ async fn vault_delete_then_read_returns_none() {
 
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("WAL-only ledger must initialize"));
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("WAL-only ledger must initialize"),
+    );
     let vault = Vault::new(ledger).expect("vault must initialize with valid ledger");
 
-    vault.write("delete-key", b"data", "agent-1").await.expect("vault write must succeed");
-    assert!(vault.read("delete-key", "agent-1").await.expect("vault read must not error").is_some());
+    vault
+        .write("delete-key", b"data", "agent-1")
+        .await
+        .expect("vault write must succeed");
+    assert!(vault
+        .read("delete-key", "agent-1")
+        .await
+        .expect("vault read must not error")
+        .is_some());
 
-    vault.delete("delete-key", "agent-1").await.expect("vault delete must succeed");
+    vault
+        .delete("delete-key", "agent-1")
+        .await
+        .expect("vault delete must succeed");
     assert!(
-        vault.read("delete-key", "agent-1").await.expect("vault read after delete must not error").is_none(),
+        vault
+            .read("delete-key", "agent-1")
+            .await
+            .expect("vault read after delete must not error")
+            .is_none(),
         "Deleted key must return None"
     );
 }
@@ -1060,11 +1292,22 @@ async fn vault_empty_value_roundtrip() {
 
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("WAL-only ledger must initialize"));
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("WAL-only ledger must initialize"),
+    );
     let vault = Vault::new(ledger).expect("vault must initialize with valid ledger");
 
-    vault.write("empty-key", b"", "agent-1").await.expect("empty value write must succeed");
-    let result = vault.read("empty-key", "agent-1").await.expect("vault read must not error").expect("written empty key must exist");
+    vault
+        .write("empty-key", b"", "agent-1")
+        .await
+        .expect("empty value write must succeed");
+    let result = vault
+        .read("empty-key", "agent-1")
+        .await
+        .expect("vault read must not error")
+        .expect("written empty key must exist");
     assert_eq!(result, b"", "Empty value must roundtrip correctly");
 }
 
@@ -1072,16 +1315,22 @@ async fn vault_empty_value_roundtrip() {
 
 #[tokio::test]
 async fn vault_key_crlf_injection_rejected() {
-    use gvm_proxy::vault::Vault;
     use gvm_proxy::ledger::Ledger;
+    use gvm_proxy::vault::Vault;
 
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger must initialize"));
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("ledger must initialize"),
+    );
     let vault = Vault::new(ledger).expect("vault must initialize with valid ledger");
 
     // CRLF in key — could enable WAL JSON injection or log injection
-    let result = vault.write("key\r\nX-Injected: true", b"data", "agent-1").await;
+    let result = vault
+        .write("key\r\nX-Injected: true", b"data", "agent-1")
+        .await;
     assert!(result.is_err(), "CRLF in vault key must be rejected");
 
     // Null byte in key — could truncate in C-based backends
@@ -1094,7 +1343,10 @@ async fn vault_key_crlf_injection_rejected() {
 
     // Delete with null byte key must also fail
     let result = vault.delete("key\0rest", "agent-1").await;
-    assert!(result.is_err(), "Null byte in vault delete key must be rejected");
+    assert!(
+        result.is_err(),
+        "Null byte in vault delete key must be rejected"
+    );
 }
 
 // ── Vault TOCTOU Key Limit Race Condition ──
@@ -1105,12 +1357,16 @@ async fn vault_key_crlf_injection_rejected() {
 
 #[tokio::test]
 async fn vault_key_limit_toctou_documented() {
-    use gvm_proxy::vault::Vault;
     use gvm_proxy::ledger::Ledger;
+    use gvm_proxy::vault::Vault;
 
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger must initialize"));
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("ledger must initialize"),
+    );
     let vault = Arc::new(Vault::new(ledger).expect("vault must initialize with valid ledger"));
 
     // Fill vault to near-limit (we use a smaller limit for test speed)

@@ -118,17 +118,17 @@ pub struct PreflightReport {
 // ── Platform-specific implementation ──
 
 #[cfg(target_os = "linux")]
-mod namespace;
+mod capability;
+#[cfg(target_os = "linux")]
+pub mod ebpf;
 #[cfg(target_os = "linux")]
 mod mount;
+#[cfg(target_os = "linux")]
+mod namespace;
 #[cfg(target_os = "linux")]
 mod network;
 #[cfg(target_os = "linux")]
 mod seccomp;
-#[cfg(target_os = "linux")]
-mod capability;
-#[cfg(target_os = "linux")]
-pub mod ebpf;
 #[cfg(target_os = "linux")]
 pub mod tls_probe;
 

@@ -22,8 +22,8 @@
 //! Single-event verification: O(log N) proof path within the batch.
 //! Batch chain verification: O(B) where B = number of batches.
 
-use sha2::{Digest, Sha256};
 use crate::types::{GVMEvent, MerkleBatchRecord};
+use sha2::{Digest, Sha256};
 
 // ─── Event Hash Computation ───
 
@@ -74,7 +74,8 @@ pub fn compute_merkle_root(leaf_hashes: &[String]) -> anyhow::Result<String> {
     let mut current_level: Vec<[u8; 32]> = leaf_hashes
         .iter()
         .map(|h| {
-            let bytes = hex::decode(h).map_err(|e| anyhow::anyhow!("invalid hex in leaf hash: {}", e))?;
+            let bytes =
+                hex::decode(h).map_err(|e| anyhow::anyhow!("invalid hex in leaf hash: {}", e))?;
             if bytes.len() != 32 {
                 anyhow::bail!("leaf hash must be 32 bytes, got {}", bytes.len());
             }
@@ -85,7 +86,7 @@ pub fn compute_merkle_root(leaf_hashes: &[String]) -> anyhow::Result<String> {
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     while current_level.len() > 1 {
-        let mut next_level = Vec::with_capacity((current_level.len() + 1) / 2);
+        let mut next_level = Vec::with_capacity(current_level.len().div_ceil(2));
 
         for chunk in current_level.chunks(2) {
             let mut hasher = Sha256::new();
@@ -112,15 +113,23 @@ pub fn compute_merkle_root(leaf_hashes: &[String]) -> anyhow::Result<String> {
 /// Returns a list of (sibling_hash, is_right) pairs, from leaf to root.
 ///
 /// Returns an error if the index is out of bounds or leaf hashes contain invalid hex.
-pub fn generate_merkle_proof(leaf_hashes: &[String], index: usize) -> anyhow::Result<Vec<(String, bool)>> {
+pub fn generate_merkle_proof(
+    leaf_hashes: &[String],
+    index: usize,
+) -> anyhow::Result<Vec<(String, bool)>> {
     if index >= leaf_hashes.len() {
-        anyhow::bail!("merkle proof index {} out of bounds (len {})", index, leaf_hashes.len());
+        anyhow::bail!(
+            "merkle proof index {} out of bounds (len {})",
+            index,
+            leaf_hashes.len()
+        );
     }
 
     let mut current_level: Vec<[u8; 32]> = leaf_hashes
         .iter()
         .map(|h| {
-            let bytes = hex::decode(h).map_err(|e| anyhow::anyhow!("invalid hex in leaf hash: {}", e))?;
+            let bytes =
+                hex::decode(h).map_err(|e| anyhow::anyhow!("invalid hex in leaf hash: {}", e))?;
             if bytes.len() != 32 {
                 anyhow::bail!("leaf hash must be 32 bytes, got {}", bytes.len());
             }
@@ -146,8 +155,12 @@ pub fn generate_merkle_proof(leaf_hashes: &[String], index: usize) -> anyhow::Re
             current_level.push(last);
         }
 
-        let sibling_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
-        let is_right = idx % 2 == 0; // sibling is on the right
+        let sibling_idx = if idx.is_multiple_of(2) {
+            idx + 1
+        } else {
+            idx - 1
+        };
+        let is_right = idx.is_multiple_of(2); // sibling is on the right
         proof.push((hex::encode(current_level[sibling_idx]), is_right));
 
         // Build next level
@@ -173,7 +186,9 @@ pub fn verify_merkle_proof(leaf_hash: &str, proof: &[(String, bool)], expected_r
     let mut current = match hex::decode(leaf_hash) {
         Ok(bytes) => {
             let mut arr = [0u8; 32];
-            if bytes.len() != 32 { return false; }
+            if bytes.len() != 32 {
+                return false;
+            }
             arr.copy_from_slice(&bytes);
             arr
         }
@@ -184,7 +199,9 @@ pub fn verify_merkle_proof(leaf_hash: &str, proof: &[(String, bool)], expected_r
         let sibling = match hex::decode(sibling_hex) {
             Ok(bytes) => {
                 let mut arr = [0u8; 32];
-                if bytes.len() != 32 { return false; }
+                if bytes.len() != 32 {
+                    return false;
+                }
                 arr.copy_from_slice(&bytes);
                 arr
             }

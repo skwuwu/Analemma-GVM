@@ -121,7 +121,10 @@ async fn rate_limiter_100_concurrent_checks_no_deadlock() {
     let mut allowed = 0;
     let mut denied = 0;
     for handle in handles {
-        if handle.await.expect("rate limiter check task must not panic") {
+        if handle
+            .await
+            .expect("rate limiter check task must not panic")
+        {
             allowed += 1;
         } else {
             denied += 1;
@@ -189,10 +192,16 @@ async fn wal_tampered_entry_does_not_crash_recovery() {
             },
             "nats_sequence": null
         });
-        writeln!(file, "{}", serde_json::to_string(&valid).expect("valid WAL entry must serialize to JSON")).expect("writing valid WAL entry must succeed");
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&valid).expect("valid WAL entry must serialize to JSON")
+        )
+        .expect("writing valid WAL entry must succeed");
 
         // Corrupted entry — invalid JSON
-        writeln!(file, "{{CORRUPTED_DATA_TAMPERE{{{{D}}}}").expect("writing corrupted WAL entry must succeed");
+        writeln!(file, "{{CORRUPTED_DATA_TAMPERE{{{{D}}}}")
+            .expect("writing corrupted WAL entry must succeed");
 
         // Another valid entry
         let valid2 = {
@@ -200,12 +209,22 @@ async fn wal_tampered_entry_does_not_crash_recovery() {
             v["event_id"] = serde_json::json!("evt-002");
             v
         };
-        writeln!(file, "{}", serde_json::to_string(&valid2).expect("second WAL entry must serialize to JSON")).expect("writing second WAL entry must succeed");
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&valid2).expect("second WAL entry must serialize to JSON")
+        )
+        .expect("writing second WAL entry must succeed");
     }
 
     // Recovery must not crash even with corrupted entries
-    let ledger = Ledger::new(&wal_path, "", "").await.expect("ledger must initialize with tampered WAL");
-    let report = ledger.recover_from_wal().await.expect("WAL recovery must handle corrupted entries gracefully");
+    let ledger = Ledger::new(&wal_path, "", "")
+        .await
+        .expect("ledger must initialize with tampered WAL");
+    let report = ledger
+        .recover_from_wal()
+        .await
+        .expect("WAL recovery must handle corrupted entries gracefully");
 
     // Both valid Pending entries should be processed (corrupted entry skipped)
     assert_eq!(
@@ -228,7 +247,11 @@ async fn vault_concurrent_writes_to_same_key() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
 
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger must initialize for vault test"));
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("ledger must initialize for vault test"),
+    );
     let vault = Arc::new(Vault::new(ledger).expect("vault must initialize with valid ledger"));
 
     let start = Instant::now();
@@ -260,13 +283,14 @@ async fn vault_concurrent_writes_to_same_key() {
     );
 
     // Read the final value — it should be one of the written values (last-write-wins)
-    let result = vault.read("shared-key", "reader").await.expect("vault read after concurrent writes must succeed");
-    assert!(
-        result.is_some(),
-        "Key must exist after concurrent writes"
-    );
+    let result = vault
+        .read("shared-key", "reader")
+        .await
+        .expect("vault read after concurrent writes must succeed");
+    assert!(result.is_some(), "Key must exist after concurrent writes");
 
-    let value = String::from_utf8(result.expect("key must exist after concurrent writes")).expect("vault value must be valid UTF-8");
+    let value = String::from_utf8(result.expect("key must exist after concurrent writes"))
+        .expect("vault value must be valid UTF-8");
     assert!(
         value.starts_with("value-"),
         "Value must be one of the written values, got: {}",
@@ -377,10 +401,10 @@ fn srr_garbage_input_does_not_panic() {
         b"",
         b"\0\0\0\0",
         b"\xff\xff\xff\xff\xff",
-        &[0u8; 65537],          // exactly over default max_body_bytes
+        &[0u8; 65537], // exactly over default max_body_bytes
         b"{\"operationName\": \"\x00\x01\x02\"}",
         b"{{{{{{{{{{{{{{",
-        b"\x89PNG\r\n\x1a\n",   // PNG header — not JSON
+        b"\x89PNG\r\n\x1a\n", // PNG header — not JSON
     ];
 
     for body in &garbage_bodies {
@@ -400,20 +424,30 @@ fn vault_key_is_zeroed_on_drop() {
         //
         // For a true memory scan, use: valgrind --tool=memcheck or bytehound.
         // Here we test the compile-time contract: VaultEncryption implements Drop with zeroize.
-        use gvm_proxy::vault::Vault;
         use gvm_proxy::ledger::Ledger;
+        use gvm_proxy::vault::Vault;
 
         let dir = tempfile::tempdir().expect("temp dir creation must succeed");
         let wal_path = dir.path().join("wal.log");
 
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime creation must succeed");
         rt.block_on(async {
-            let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger must initialize for key zeroing test"));
+            let ledger = Arc::new(
+                Ledger::new(&wal_path, "", "")
+                    .await
+                    .expect("ledger must initialize for key zeroing test"),
+            );
             let vault = Vault::new(ledger).expect("vault must initialize with valid ledger");
 
             // Write and read — proves encryption works
-            vault.write("test-key", b"secret-data", "agent-1").await.expect("vault write must succeed before drop");
-            let data = vault.read("test-key", "agent-1").await.expect("vault read must succeed before drop");
+            vault
+                .write("test-key", b"secret-data", "agent-1")
+                .await
+                .expect("vault write must succeed before drop");
+            let data = vault
+                .read("test-key", "agent-1")
+                .await
+                .expect("vault read must succeed before drop");
             assert_eq!(data.expect("written key must be readable"), b"secret-data");
 
             // vault is dropped here — ZeroizeOnDrop zeros the key
@@ -434,7 +468,11 @@ async fn ledger_concurrent_spawns_stay_bounded() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
 
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger must initialize for backpressure test"));
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("ledger must initialize for backpressure test"),
+    );
     let start = Instant::now();
 
     // Simulate 500 rapid-fire durable appends
@@ -463,10 +501,13 @@ async fn ledger_concurrent_spawns_stay_bounded() {
                 payload: Default::default(),
                 nats_sequence: None,
                 event_hash: None,
-        llm_trace: None,
-        default_caution: false,
+                llm_trace: None,
+                default_caution: false,
             };
-            ledger.append_durable(&event).await.expect("durable append must succeed under load");
+            ledger
+                .append_durable(&event)
+                .await
+                .expect("durable append must succeed under load");
         }));
     }
 
@@ -483,7 +524,9 @@ async fn ledger_concurrent_spawns_stay_bounded() {
     );
 
     // Verify WAL file has all event entries (exclude MerkleBatchRecord lines)
-    let wal_content = tokio::fs::read_to_string(&wal_path).await.expect("WAL file must be readable after all appends");
+    let wal_content = tokio::fs::read_to_string(&wal_path)
+        .await
+        .expect("WAL file must be readable after all appends");
     let event_count = wal_content
         .lines()
         .filter(|line| !line.contains("\"merkle_root\""))
@@ -539,7 +582,9 @@ fn srr_decision_time_is_roughly_constant() {
     assert!(
         ratio < 10.0,
         "SRR timing variance too high: deny={:?}, allow={:?}, ratio={:.1}x",
-        deny_time, allow_time, ratio
+        deny_time,
+        allow_time,
+        ratio
     );
 }
 
@@ -557,7 +602,11 @@ async fn group_commit_primary_fail_emergency_wal_catches() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
 
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger must initialize for fail-close test"));
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("ledger must initialize for fail-close test"),
+    );
 
     // Verify normal operation works first
     {
@@ -581,10 +630,13 @@ async fn group_commit_primary_fail_emergency_wal_catches() {
             payload: Default::default(),
             nats_sequence: None,
             event_hash: None,
-        llm_trace: None,
-        default_caution: false,
+            llm_trace: None,
+            default_caution: false,
         };
-        ledger.append_durable(&event).await.expect("initial append must succeed before error injection");
+        ledger
+            .append_durable(&event)
+            .await
+            .expect("initial append must succeed before error injection");
     }
 
     // Inject I/O error — simulates disk failure, permission denied, etc.
@@ -615,8 +667,8 @@ async fn group_commit_primary_fail_emergency_wal_catches() {
                 payload: Default::default(),
                 nats_sequence: None,
                 event_hash: None,
-        llm_trace: None,
-        default_caution: false,
+                llm_trace: None,
+                default_caution: false,
             };
             ledger.append_durable(&event).await
         }));
@@ -624,7 +676,9 @@ async fn group_commit_primary_fail_emergency_wal_catches() {
 
     let mut ok_count = 0;
     for handle in handles {
-        let result = handle.await.expect("emergency WAL fallback task must not panic");
+        let result = handle
+            .await
+            .expect("emergency WAL fallback task must not panic");
         if result.is_ok() {
             ok_count += 1;
         }
@@ -646,7 +700,8 @@ async fn group_commit_primary_fail_emergency_wal_catches() {
 
     // Verify emergency WAL captured the events
     assert_eq!(
-        ledger.emergency_write_count(), 10,
+        ledger.emergency_write_count(),
+        10,
         "Emergency write count must be 10"
     );
 
@@ -676,13 +731,16 @@ async fn group_commit_primary_fail_emergency_wal_catches() {
         default_caution: false,
     };
     // After disabling error injection, writes should succeed via primary WAL again
-    ledger.append_durable(&event).await.expect("primary WAL must recover after error injection is disabled");
+    ledger
+        .append_durable(&event)
+        .await
+        .expect("primary WAL must recover after error injection is disabled");
 }
 
 // ─── Test 12: Property-Based — max_strict is commutative, associative, idempotent ───
 
 mod proptest_max_strict {
-    use gvm_proxy::types::{max_strict, EnforcementDecision, ApprovalUrgency, AlertLevel};
+    use gvm_proxy::types::{max_strict, AlertLevel, ApprovalUrgency, EnforcementDecision};
     use proptest::prelude::*;
 
     /// Generate arbitrary EnforcementDecision values for property testing.
@@ -824,7 +882,10 @@ fn srr_case_smuggling_host_variations() {
         assert!(
             matches!(result.decision, EnforcementDecision::Deny { .. }),
             "Case-smuggling bypass ({} {} {}) must be denied, got {:?}",
-            method, host, path, result.decision,
+            method,
+            host,
+            path,
+            result.decision,
         );
     }
 
@@ -836,7 +897,8 @@ fn srr_case_smuggling_host_variations() {
     ];
     for result in &path_case_results {
         assert!(
-            result.decision.strictness() >= EnforcementDecision::Delay { milliseconds: 0 }.strictness(),
+            result.decision.strictness()
+                >= EnforcementDecision::Delay { milliseconds: 0 }.strictness(),
             "Path case variant must not bypass to Allow, got {:?}",
             result.decision,
         );
@@ -972,17 +1034,19 @@ fn srr_path_traversal_does_not_bypass() {
         "/transfer/./123",
         "/../../../transfer/123",
         "/transfer/123/../../transfer/456",
-        "/transfer%2F123",           // encoded slash
-        "/transfer/123%00.txt",      // null byte + extension
+        "/transfer%2F123",      // encoded slash
+        "/transfer/123%00.txt", // null byte + extension
     ];
 
     for path in &traversal_paths {
         let result = srr.check("POST", "api.bank.com", path, None);
         // Must not panic. Must not return Allow (fail-open).
         assert!(
-            result.decision.strictness() >= EnforcementDecision::Delay { milliseconds: 0 }.strictness(),
+            result.decision.strictness()
+                >= EnforcementDecision::Delay { milliseconds: 0 }.strictness(),
             "Path traversal '{}' must not bypass to Allow, got {:?}",
-            path, result.decision
+            path,
+            result.decision
         );
     }
 }
@@ -1054,10 +1118,7 @@ async fn emergency_wal_catches_events_when_primary_fails() {
     let content = tokio::fs::read_to_string(&emergency_path)
         .await
         .expect("emergency WAL file must be readable");
-    let event_lines: Vec<&str> = content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .collect();
+    let event_lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
     assert_eq!(
         event_lines.len(),
         5,
@@ -1217,10 +1278,7 @@ fn config_poisoning_policy_malformed_toml_rejected() {
     std::fs::write(&global_path, "[[rules]]\nid = broken\n{{{{").expect("write");
 
     let result = PolicyEngine::load(&policy_dir);
-    assert!(
-        result.is_err(),
-        "Malformed policy TOML must fail to load"
-    );
+    assert!(result.is_err(), "Malformed policy TOML must fail to load");
 }
 
 #[test]
@@ -1248,7 +1306,10 @@ fn config_srr_catch_all_deny_blocks_everything() {
         assert!(
             matches!(result.decision, EnforcementDecision::Deny { .. }),
             "Catch-all Deny must block {} {} {}, got {:?}",
-            method, host, path, result.decision,
+            method,
+            host,
+            path,
+            result.decision,
         );
     }
 }

@@ -1,5 +1,5 @@
-use anyhow::{Context, Result};
 use crate::ui::{BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
+use anyhow::{Context, Result};
 
 /// Demo profile metadata for display purposes.
 struct DemoProfile {
@@ -75,7 +75,10 @@ async fn run_single_demo(proxy_url: &str, name: &str) -> Result<()> {
 
     // Resolve script path relative to the project root
     let script_path = resolve_script_path(profile.script)?;
-    println!("  {DIM}Launching LLM agent:{RESET} {CYAN}{}{RESET}", profile.script);
+    println!(
+        "  {DIM}Launching LLM agent:{RESET} {CYAN}{}{RESET}",
+        profile.script
+    );
     println!("  {DIM}This demo uses Claude API to autonomously call tools.{RESET}");
     println!("  {DIM}GVM proxy enforces governance on every tool call.{RESET}");
     println!();
@@ -89,8 +92,10 @@ async fn run_single_demo(proxy_url: &str, name: &str) -> Result<()> {
     if status.success() {
         println!("  {GREEN}Demo completed successfully{RESET}");
     } else {
-        println!("  {YELLOW}Demo exited with code: {}{RESET}",
-            status.code().unwrap_or(-1));
+        println!(
+            "  {YELLOW}Demo exited with code: {}{RESET}",
+            status.code().unwrap_or(-1)
+        );
     }
     println!();
 
@@ -143,7 +148,12 @@ async fn run_all_demos(proxy_url: &str) -> Result<()> {
         let profile = build_profile(name);
         let script_path = resolve_script_path(profile.script)?;
 
-        println!("{BOLD}\u{2501}\u{2501}\u{2501} [{}/{}] {} \u{2501}\u{2501}\u{2501}{RESET}", i + 1, demos.len(), profile.title);
+        println!(
+            "{BOLD}\u{2501}\u{2501}\u{2501} [{}/{}] {} \u{2501}\u{2501}\u{2501}{RESET}",
+            i + 1,
+            demos.len(),
+            profile.title
+        );
         println!("{DIM}{}{RESET}", profile.description);
         println!();
 
@@ -156,8 +166,11 @@ async fn run_all_demos(proxy_url: &str) -> Result<()> {
         } else {
             failed += 1;
             println!();
-            println!("  {RED}\u{2717} {} failed (exit code: {}){RESET}",
-                profile.title, status.code().unwrap_or(-1));
+            println!(
+                "  {RED}\u{2717} {} failed (exit code: {}){RESET}",
+                profile.title,
+                status.code().unwrap_or(-1)
+            );
         }
         println!();
     }
@@ -165,7 +178,12 @@ async fn run_all_demos(proxy_url: &str) -> Result<()> {
     // Summary
     println!("{BOLD}\u{2501}\u{2501}\u{2501} Summary \u{2501}\u{2501}\u{2501}{RESET}");
     println!();
-    println!("  {GREEN}{} passed{RESET}  {RED}{} failed{RESET}  (out of {} demos)", passed, failed, demos.len());
+    println!(
+        "  {GREEN}{} passed{RESET}  {RED}{} failed{RESET}  (out of {} demos)",
+        passed,
+        failed,
+        demos.len()
+    );
     println!();
 
     Ok(())
@@ -189,7 +207,9 @@ async fn launch_agent_script(
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
 
-    let status = cmd.status().await
+    let status = cmd
+        .status()
+        .await
         .with_context(|| format!("Failed to execute: python {}", script_path.display()))?;
 
     Ok(status)
@@ -245,7 +265,8 @@ fn build_profile(name: &str) -> DemoProfile {
     match name {
         "finance" => DemoProfile {
             title: "Finance Agent \u{2014} Incident Simulation",
-            description: "A refund processing agent goes rogue and attempts unauthorized transfers.",
+            description:
+                "A refund processing agent goes rogue and attempts unauthorized transfers.",
             script: "examples/agents/finance_agent.py",
             narrative: &[
                 "1. Agent processes a legitimate refund lookup (normal)",
@@ -256,7 +277,8 @@ fn build_profile(name: &str) -> DemoProfile {
         },
         "assistant" => DemoProfile {
             title: "Email Assistant \u{2014} Inbox Destruction Attempt",
-            description: "An email management agent oversteps its bounds and tries destructive actions.",
+            description:
+                "An email management agent oversteps its bounds and tries destructive actions.",
             script: "examples/agents/email_assistant.py",
             narrative: &[
                 "1. Agent reads the inbox to summarize recent messages (normal)",
@@ -267,7 +289,8 @@ fn build_profile(name: &str) -> DemoProfile {
         },
         "devops" => DemoProfile {
             title: "DevOps Agent \u{2014} Destructive Command Attempt",
-            description: "A deployment agent with API access tries dangerous infrastructure operations.",
+            description:
+                "A deployment agent with API access tries dangerous infrastructure operations.",
             script: "examples/agents/devops_agent.py",
             narrative: &[
                 "1. Agent checks deployment status via API (normal)",
@@ -278,7 +301,8 @@ fn build_profile(name: &str) -> DemoProfile {
         },
         "data" => DemoProfile {
             title: "Data Analytics Agent \u{2014} Secret Exfiltration Attempt",
-            description: "An analytics agent tries to read and exfiltrate sensitive configuration files.",
+            description:
+                "An analytics agent tries to read and exfiltrate sensitive configuration files.",
             script: "examples/agents/data_exfil_agent.py",
             narrative: &[
                 "1. Agent queries public analytics data (normal)",

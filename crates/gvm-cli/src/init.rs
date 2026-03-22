@@ -1,16 +1,12 @@
-use anyhow::{Context, Result};
 use crate::ui::{BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 /// Known industry templates (shipped with the repo)
 const INDUSTRIES: &[&str] = &["finance", "saas"];
 
 /// Template files to copy from template directory into config/
-const TEMPLATE_FILES: &[&str] = &[
-    "proxy.toml",
-    "srr_network.toml",
-    "policies/global.toml",
-];
+const TEMPLATE_FILES: &[&str] = &["proxy.toml", "srr_network.toml", "policies/global.toml"];
 
 /// Run `gvm init` — apply an industry template over the existing config.
 pub fn run_init(industry: &str, config_dir: &str) -> Result<()> {
@@ -67,8 +63,7 @@ pub fn run_init(industry: &str, config_dir: &str) -> Result<()> {
             println!("  {GREEN}\u{2713}{RESET}  {}", file);
         }
 
-        std::fs::copy(&src, &dst)
-            .with_context(|| format!("Failed to copy {}", file))?;
+        std::fs::copy(&src, &dst).with_context(|| format!("Failed to copy {}", file))?;
         copied += 1;
     }
 
@@ -89,13 +84,16 @@ pub fn run_init(industry: &str, config_dir: &str) -> Result<()> {
         std::fs::copy(&registry_src, &registry_dst)?;
         copied += 1;
     } else if !registry_dst.exists() {
-        println!("  {DIM}skip{RESET}  operation_registry.toml {DIM}(using default from repo){RESET}");
+        println!(
+            "  {DIM}skip{RESET}  operation_registry.toml {DIM}(using default from repo){RESET}"
+        );
     }
 
     // Ensure secrets.toml exists (don't overwrite — user's credentials)
     let secrets_dst = config_path.join("secrets.toml");
     if !secrets_dst.exists() {
-        let secrets_example = template_dir.parent()
+        let secrets_example = template_dir
+            .parent()
             .and_then(|p| p.parent())
             .map(|root| root.join("secrets.toml.example"));
 
@@ -109,10 +107,13 @@ pub fn run_init(industry: &str, config_dir: &str) -> Result<()> {
 
         if !secrets_dst.exists() {
             // Create minimal empty secrets
-            std::fs::write(&secrets_dst,
-                "# API credentials — see secrets.toml.example for format\n"
+            std::fs::write(
+                &secrets_dst,
+                "# API credentials — see secrets.toml.example for format\n",
             )?;
-            println!("  {GREEN}\u{2713}{RESET}  secrets.toml {DIM}(empty — add API keys later){RESET}");
+            println!(
+                "  {GREEN}\u{2713}{RESET}  secrets.toml {DIM}(empty — add API keys later){RESET}"
+            );
             copied += 1;
         }
     } else {
@@ -145,7 +146,10 @@ pub fn run_init(industry: &str, config_dir: &str) -> Result<()> {
 
     println!();
     println!("  {BOLD}Next steps:{RESET}");
-    println!("    1. Add API keys:    {CYAN}edit {}/secrets.toml{RESET}", config_dir);
+    println!(
+        "    1. Add API keys:    {CYAN}edit {}/secrets.toml{RESET}",
+        config_dir
+    );
     println!("    2. Start proxy:     {CYAN}cargo run{RESET}");
     println!("    3. Point agent:     {CYAN}HTTP_PROXY=http://localhost:8080{RESET}");
     println!();
@@ -171,6 +175,7 @@ fn find_template_dir(industry: &str) -> Result<PathBuf> {
         "Template directory not found for industry '{}'. \
          Expected config/templates/{}/. \
          Make sure you're running from the Analemma-GVM repo root.",
-        industry, industry
+        industry,
+        industry
     )
 }

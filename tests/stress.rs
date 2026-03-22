@@ -289,7 +289,8 @@ type = "Allow"
 "#,
     );
 
-    std::fs::write(policy_dir.join("global.toml"), &rules_toml).expect("policy TOML must write to temp file");
+    std::fs::write(policy_dir.join("global.toml"), &rules_toml)
+        .expect("policy TOML must write to temp file");
 
     let start = Instant::now();
     let engine = PolicyEngine::load(&policy_dir).expect("valid policy directory must load");
@@ -302,13 +303,28 @@ type = "Allow"
     );
 
     // Verify specific rule matches
-    let op = make_operation("gvm.test.op500", Sensitivity::Low, ResourceTier::Internal, None, "agent");
+    let op = make_operation(
+        "gvm.test.op500",
+        Sensitivity::Low,
+        ResourceTier::Internal,
+        None,
+        "agent",
+    );
     let (decision, rule_id) = engine.evaluate(&op);
     assert!(matches!(decision, EnforcementDecision::Deny { .. }));
-    assert_eq!(rule_id.expect("matching rule must return its ID"), "rule-500");
+    assert_eq!(
+        rule_id.expect("matching rule must return its ID"),
+        "rule-500"
+    );
 
     // Verify unmatched operation falls through to catch-all
-    let op = make_operation("gvm.unknown.action", Sensitivity::Low, ResourceTier::Internal, None, "agent");
+    let op = make_operation(
+        "gvm.unknown.action",
+        Sensitivity::Low,
+        ResourceTier::Internal,
+        None,
+        "agent",
+    );
     let (decision, _) = engine.evaluate(&op);
     assert!(matches!(decision, EnforcementDecision::Allow));
 
@@ -317,7 +333,13 @@ type = "Allow"
     let iterations = 1_000;
     for _ in 0..iterations {
         // Worst case: falls through all 999 rules to catch-all
-        let op = make_operation("gvm.nomatch.ever", Sensitivity::Low, ResourceTier::Internal, None, "agent");
+        let op = make_operation(
+            "gvm.nomatch.ever",
+            Sensitivity::Low,
+            ResourceTier::Internal,
+            None,
+            "agent",
+        );
         let _ = engine.evaluate(&op);
     }
     let eval_time = start.elapsed();
@@ -382,7 +404,8 @@ type = "Delay"
 milliseconds = 300
 "#,
         );
-        std::fs::write(policy_dir.join(format!("tenant-t{}.toml", t)), &content).expect("tenant policy TOML must write to temp file");
+        std::fs::write(policy_dir.join(format!("tenant-t{}.toml", t)), &content)
+            .expect("tenant policy TOML must write to temp file");
     }
 
     // Generate 1,000 agent configs (10 per tenant)
@@ -399,7 +422,8 @@ type = "AuditOnly"
 alert_level = "Info"
 "#,
         );
-        std::fs::write(policy_dir.join(format!("agent-a{}.toml", a)), &content).expect("agent policy TOML must write to temp file");
+        std::fs::write(policy_dir.join(format!("agent-a{}.toml", a)), &content)
+            .expect("agent policy TOML must write to temp file");
     }
 
     let start = Instant::now();
@@ -457,7 +481,11 @@ async fn vault_10k_encrypt_decrypt_no_leak() {
         batch_window: std::time::Duration::ZERO,
         ..Default::default()
     };
-    let ledger = Arc::new(Ledger::with_config(&wal_path, "", "", config).await.expect("ledger with valid path must initialize"));
+    let ledger = Arc::new(
+        Ledger::with_config(&wal_path, "", "", config)
+            .await
+            .expect("ledger with valid path must initialize"),
+    );
     let vault = Vault::new(ledger).expect("vault with valid ledger must initialize");
 
     let plaintext = b"test secret value for stress test";
@@ -465,9 +493,18 @@ async fn vault_10k_encrypt_decrypt_no_leak() {
     let start = Instant::now();
     for i in 0..10_000 {
         let key = format!("key-{}", i % 100); // Reuse 100 keys
-        vault.write(&key, plaintext, "stress-agent").await.expect("vault write must succeed for valid key");
-        let result = vault.read(&key, "stress-agent").await.expect("vault read must succeed for existing key");
-        assert_eq!(result.expect("vault read must return data for existing key"), plaintext);
+        vault
+            .write(&key, plaintext, "stress-agent")
+            .await
+            .expect("vault write must succeed for valid key");
+        let result = vault
+            .read(&key, "stress-agent")
+            .await
+            .expect("vault read must succeed for existing key");
+        assert_eq!(
+            result.expect("vault read must return data for existing key"),
+            plaintext
+        );
     }
     let elapsed = start.elapsed();
 
@@ -484,7 +521,11 @@ async fn vault_10k_encrypt_decrypt_no_leak() {
 async fn vault_1mb_value_roundtrip() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger with valid path must initialize"));
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("ledger with valid path must initialize"),
+    );
     let vault = Vault::new(ledger).expect("vault with valid ledger must initialize");
 
     // 1MB plaintext
@@ -494,8 +535,15 @@ async fn vault_1mb_value_roundtrip() {
         .write("big-key", &plaintext, "agent")
         .await
         .expect("vault must handle 1MB write");
-    let result = vault.read("big-key", "agent").await.expect("vault must handle 1MB read");
-    assert_eq!(result.expect("vault must return 1MB value after write"), plaintext, "1MB roundtrip must be exact");
+    let result = vault
+        .read("big-key", "agent")
+        .await
+        .expect("vault must handle 1MB read");
+    assert_eq!(
+        result.expect("vault must return 1MB value after write"),
+        plaintext,
+        "1MB roundtrip must be exact"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════

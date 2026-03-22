@@ -26,8 +26,7 @@ pub fn setup_mount_namespace(
     let new_root = PathBuf::from("/tmp/gvm-sandbox-root");
 
     // Create staging root as tmpfs
-    std::fs::create_dir_all(&new_root)
-        .context("Failed to create sandbox root")?;
+    std::fs::create_dir_all(&new_root).context("Failed to create sandbox root")?;
     mount(
         Some("tmpfs"),
         &new_root,
@@ -38,7 +37,17 @@ pub fn setup_mount_namespace(
     .context("Failed to mount tmpfs for sandbox root")?;
 
     // Create directory structure
-    let dirs = ["workspace", "tmp", "proc", "dev", "usr", "lib", "lib64", "etc", "bin"];
+    let dirs = [
+        "workspace",
+        "tmp",
+        "proc",
+        "dev",
+        "usr",
+        "lib",
+        "lib64",
+        "etc",
+        "bin",
+    ];
     for dir in &dirs {
         std::fs::create_dir_all(new_root.join(dir))?;
     }
@@ -113,8 +122,7 @@ pub fn setup_mount_namespace(
     let old_root = new_root.join("old_root");
     std::fs::create_dir_all(&old_root)?;
 
-    nix::unistd::pivot_root(&new_root, &old_root)
-        .context("pivot_root failed")?;
+    nix::unistd::pivot_root(&new_root, &old_root).context("pivot_root failed")?;
 
     // Set CWD to /workspace/output — agent writes here by default.
     // Source files are at /workspace (read-only, accessible via ../src etc).
@@ -137,8 +145,7 @@ fn create_dev_nodes(new_root: &Path) -> Result<()> {
     for dev in &devices {
         let target = new_root.join("dev").join(dev);
         // Create empty file as mount point
-        std::fs::write(&target, "")
-            .with_context(|| format!("Failed to create /dev/{}", dev))?;
+        std::fs::write(&target, "").with_context(|| format!("Failed to create /dev/{}", dev))?;
         mount(
             Some(&PathBuf::from(format!("/dev/{}", dev))),
             &target,
@@ -158,8 +165,7 @@ fn bind_mount_interpreter(new_root: &Path, interpreter_path: &Path) -> Result<()
         .file_name()
         .context("Invalid interpreter path")?;
     let target_bin = new_root.join("bin").join(interpreter_name);
-    std::fs::write(&target_bin, "")
-        .context("Failed to create interpreter mount point")?;
+    std::fs::write(&target_bin, "").context("Failed to create interpreter mount point")?;
     mount(
         Some(interpreter_path),
         &target_bin,
@@ -236,9 +242,7 @@ fn bind_mount_library(new_root: &Path, lib_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let relative = lib_path
-        .strip_prefix("/")
-        .unwrap_or(lib_path);
+    let relative = lib_path.strip_prefix("/").unwrap_or(lib_path);
     let target = new_root.join(relative);
 
     // Create parent directories
@@ -274,16 +278,10 @@ fn create_minimal_etc(new_root: &Path, dns_server: &str) -> Result<()> {
     )?;
 
     // /etc/group
-    std::fs::write(
-        new_root.join("etc/group"),
-        "agent:x:0:\n",
-    )?;
+    std::fs::write(new_root.join("etc/group"), "agent:x:0:\n")?;
 
     // /etc/hosts — only localhost (no IPv6 since it's disabled in sandbox)
-    std::fs::write(
-        new_root.join("etc/hosts"),
-        "127.0.0.1 localhost\n",
-    )?;
+    std::fs::write(new_root.join("etc/hosts"), "127.0.0.1 localhost\n")?;
 
     // /etc/resolv.conf — DNS via host veth IP (matches OUTPUT iptables rule)
     std::fs::write(

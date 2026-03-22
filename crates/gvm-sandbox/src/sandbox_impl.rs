@@ -75,9 +75,10 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     //      If eBPF is unavailable, iptables provides baseline enforcement and
     //      seccomp AF_NETLINK blocking prevents iptables modification (defense-in-depth).
     let ebpf_attached = if network_result.is_ok() {
-        let proxy_ip: std::net::Ipv4Addr = veth_config.host_ip.parse().unwrap_or(
-            std::net::Ipv4Addr::new(10, 200, 0, 1),
-        );
+        let proxy_ip: std::net::Ipv4Addr = veth_config
+            .host_ip
+            .parse()
+            .unwrap_or(std::net::Ipv4Addr::new(10, 200, 0, 1));
         match ebpf::try_attach_tc_filter(
             &veth_config.host_iface,
             proxy_ip,
@@ -106,7 +107,10 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     signal_child_ready(parent_fd, child_pid.as_raw() as u32)?;
 
     let setup_ms = start.elapsed().as_millis() as u64;
-    tracing::info!(setup_ms = setup_ms, "Sandbox setup complete, waiting for agent");
+    tracing::info!(
+        setup_ms = setup_ms,
+        "Sandbox setup complete, waiting for agent"
+    );
 
     // 3.5. Start TLS probe (uprobe on SSL_write_ex for HTTPS L7 inspection)
     // Captures plaintext before encryption — enables path/method-level HTTPS enforcement.
@@ -221,7 +225,11 @@ fn child_entry(
 
     // Set up mount namespace (pivot_root)
     // DNS server must match the OUTPUT iptables rule (host veth IP)
-    if let Err(e) = setup_mount_namespace(&config.workspace_dir, interpreter_path, &veth_config.host_ip) {
+    if let Err(e) = setup_mount_namespace(
+        &config.workspace_dir,
+        interpreter_path,
+        &veth_config.host_ip,
+    ) {
         eprintln!("gvm-sandbox: mount namespace setup failed: {}", e);
         return 1;
     }
@@ -233,7 +241,11 @@ fn child_entry(
     }
 
     // Prepare environment variables
-    let proxy_url = format!("http://{}:{}", veth_config.host_ip, config.proxy_addr.port());
+    let proxy_url = format!(
+        "http://{}:{}",
+        veth_config.host_ip,
+        config.proxy_addr.port()
+    );
 
     // Build exec arguments
     let interpreter_name = interpreter_path

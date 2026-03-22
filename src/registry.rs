@@ -187,12 +187,9 @@ impl OperationRegistry {
     }
 
     /// Look up an operation by name. Checks custom first, then core.
-    pub fn lookup(&self, name: &str) -> Option<OperationInfo> {
+    pub fn lookup(&self, name: &str) -> Option<OperationInfo<'_>> {
         if let Some(custom) = self.custom_ops.get(name) {
-            let mapped_core = custom
-                .maps_to
-                .as_ref()
-                .and_then(|m| self.core_ops.get(m));
+            let mapped_core = custom.maps_to.as_ref().and_then(|m| self.core_ops.get(m));
             return Some(OperationInfo {
                 name: &custom.name,
                 default_ic: custom.default_ic,
@@ -218,12 +215,7 @@ impl OperationRegistry {
     /// For core operations, returns the operation name itself.
     pub fn effective_core_operation(&self, name: &str) -> Option<String> {
         if let Some(custom) = self.custom_ops.get(name) {
-            return Some(
-                custom
-                    .maps_to
-                    .clone()
-                    .unwrap_or_else(|| name.to_string()),
-            );
+            return Some(custom.maps_to.clone().unwrap_or_else(|| name.to_string()));
         }
         if self.core_ops.contains_key(name) {
             return Some(name.to_string());
@@ -259,7 +251,8 @@ mod tests {
 
     fn write_temp_toml(content: &str) -> NamedTempFile {
         let mut f = NamedTempFile::new().expect("temp file creation must succeed");
-        f.write_all(content.as_bytes()).expect("writing TOML to temp file must succeed");
+        f.write_all(content.as_bytes())
+            .expect("writing TOML to temp file must succeed");
         f
     }
 

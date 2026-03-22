@@ -1,3 +1,6 @@
+use axum::body::Body;
+use axum::http::{Request, Response, StatusCode};
+use axum::Router;
 use gvm_proxy::api;
 use gvm_proxy::api_keys::APIKeyStore;
 use gvm_proxy::auth;
@@ -10,9 +13,6 @@ use gvm_proxy::registry::OperationRegistry;
 use gvm_proxy::srr::NetworkSRR;
 use gvm_proxy::vault::Vault;
 use gvm_proxy::wasm_engine::WasmEngine;
-use axum::body::Body;
-use axum::http::{Request, Response, StatusCode};
-use axum::Router;
 use std::path::Path;
 use std::sync::Arc;
 use tower::ServiceBuilder;
@@ -39,11 +39,12 @@ async fn main() {
     //    After setup, reload config so template proxy.toml settings take effect.
     let registry_path_str = config.operations.registry_file.clone();
     let srr_path_str = config.srr.network_file.clone();
-    if !Path::new(&registry_path_str).exists() && !Path::new(&srr_path_str).exists() {
-        if offer_first_run_setup() {
-            // Template applied — reload config to pick up template's proxy.toml
-            config = ProxyConfig::load_or_default();
-        }
+    if !Path::new(&registry_path_str).exists()
+        && !Path::new(&srr_path_str).exists()
+        && offer_first_run_setup()
+    {
+        // Template applied — reload config to pick up template's proxy.toml
+        config = ProxyConfig::load_or_default();
     }
     let registry_path = Path::new(&config.operations.registry_file);
     let srr_path = Path::new(&config.srr.network_file);
@@ -104,8 +105,8 @@ async fn main() {
     tracing::info!("ABAC policy engine loaded");
 
     // 5. Load API key store (graceful: missing file → empty store with warning)
-    let api_keys = APIKeyStore::load(Path::new(&config.secrets.file))
-        .expect("Failed to load API key store");
+    let api_keys =
+        APIKeyStore::load(Path::new(&config.secrets.file)).expect("Failed to load API key store");
     if api_keys.is_empty() {
         tracing::warn!(
             "No API keys configured. Running in passthrough mode. \
@@ -154,14 +155,17 @@ async fn main() {
 
         let mut all_config_files: Vec<(String, std::path::PathBuf)> = vec![
             ("srr_network".to_string(), srr_path.to_path_buf()),
-            ("operation_registry".to_string(), registry_path.to_path_buf()),
+            (
+                "operation_registry".to_string(),
+                registry_path.to_path_buf(),
+            ),
         ];
 
         if policy_dir.exists() {
             if let Ok(entries) = std::fs::read_dir(policy_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.extension().map_or(false, |ext| ext == "toml") {
+                    if path.extension().is_some_and(|ext| ext == "toml") {
                         let label = format!(
                             "policy/{}",
                             path.file_name().unwrap_or_default().to_string_lossy()
@@ -355,7 +359,10 @@ async fn main() {
     loop {
         let (stream, _addr) = match listener.accept().await {
             Ok(conn) => conn,
-            Err(e) => { tracing::error!(error = %e, "Accept failed"); continue; }
+            Err(e) => {
+                tracing::error!(error = %e, "Accept failed");
+                continue;
+            }
         };
         let app = app_for_connect.clone();
         let cs = state_for_connect.clone();
@@ -418,7 +425,9 @@ fn print_startup_summary(
 
     eprintln!();
     eprintln!("  \x1b[1m\x1b[36m╔══════════════════════════════════════════╗\x1b[0m");
-    eprintln!("  \x1b[1m\x1b[36m║\x1b[0m   Analemma GVM — Governance Summary     \x1b[1m\x1b[36m║\x1b[0m");
+    eprintln!(
+        "  \x1b[1m\x1b[36m║\x1b[0m   Analemma GVM — Governance Summary     \x1b[1m\x1b[36m║\x1b[0m"
+    );
     eprintln!("  \x1b[1m\x1b[36m╚══════════════════════════════════════════╝\x1b[0m");
     eprintln!();
 
@@ -429,7 +438,10 @@ fn print_startup_summary(
         "    \x1b[31mDeny:  {}\x1b[0m   \x1b[33mDelay: {}\x1b[0m   \x1b[32mAllow: {}\x1b[0m",
         srr_info.deny_rules, srr_info.delay_rules, srr_info.allow_rules
     );
-    eprintln!("    Default (no match): \x1b[33m{}\x1b[0m", srr_info.default_decision);
+    eprintln!(
+        "    Default (no match): \x1b[33m{}\x1b[0m",
+        srr_info.default_decision
+    );
 
     if !srr_info.sample_denies.is_empty() {
         eprintln!("    Blocked endpoints:");
@@ -538,7 +550,10 @@ fn offer_first_run_setup() -> bool {
     let Some(template_dir) = template_dir else {
         eprintln!();
         eprintln!("  \x1b[31mTemplate directory not found.\x1b[0m");
-        eprintln!("  Run from repo root, or use: \x1b[36mgvm init --industry {}\x1b[0m", industry);
+        eprintln!(
+            "  Run from repo root, or use: \x1b[36mgvm init --industry {}\x1b[0m",
+            industry
+        );
         eprintln!();
         return false;
     };

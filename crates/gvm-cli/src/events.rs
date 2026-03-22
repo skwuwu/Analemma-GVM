@@ -122,15 +122,15 @@ pub async fn list_events(
 
 /// Show causal chain for a trace ID.
 pub async fn trace_events(trace_id: &str, wal_file: Option<&str>) -> Result<()> {
-    let events = match load_events(wal_file, "gvm events trace --trace-id xxx --wal-file data/wal.log")? {
+    let events = match load_events(
+        wal_file,
+        "gvm events trace --trace-id xxx --wal-file data/wal.log",
+    )? {
         Some(e) => e,
         None => return Ok(()),
     };
 
-    let mut traced: Vec<&GVMEvent> = events
-        .iter()
-        .filter(|e| e.trace_id == trace_id)
-        .collect();
+    let mut traced: Vec<&GVMEvent> = events.iter().filter(|e| e.trace_id == trace_id).collect();
 
     if traced.is_empty() {
         println!("No events found for trace_id: {}", trace_id);
@@ -189,9 +189,18 @@ fn format_llm_trace_detail(event: &GVMEvent) -> String {
 
             // Token usage
             if let Some(ref usage) = trace.usage {
-                let prompt = usage.prompt_tokens.map(|t| t.to_string()).unwrap_or_else(|| "?".into());
-                let completion = usage.completion_tokens.map(|t| t.to_string()).unwrap_or_else(|| "?".into());
-                let total = usage.computed_total().map(|t| t.to_string()).unwrap_or_else(|| "?".into());
+                let prompt = usage
+                    .prompt_tokens
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "?".into());
+                let completion = usage
+                    .completion_tokens
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "?".into());
+                let total = usage
+                    .computed_total()
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "?".into());
                 parts.push(format!("tokens:{}/{}/{}", prompt, completion, total));
             }
 

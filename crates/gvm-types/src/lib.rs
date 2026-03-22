@@ -329,12 +329,11 @@ impl LLMUsage {
     /// Return total_tokens if available, otherwise compute from prompt + completion.
     /// Normalizes vendor differences (e.g., Anthropic omits total_tokens).
     pub fn computed_total(&self) -> Option<u64> {
-        self.total_tokens.or_else(|| {
-            match (self.prompt_tokens, self.completion_tokens) {
+        self.total_tokens
+            .or_else(|| match (self.prompt_tokens, self.completion_tokens) {
                 (Some(p), Some(c)) => Some(p + c),
                 _ => None,
-            }
-        })
+            })
     }
 }
 

@@ -207,7 +207,10 @@ pub async fn proxy_handler(
     // Invariant: intent deletion occurs ONLY on confirm().
     // This ensures: no decision without audit, no audit without decision.
     let shadow_claim = if state.shadow_config.mode != crate::intent_store::ShadowMode::Disabled {
-        let claim = state.intent_store.claim(&request_method, &target.host, &target.path, Some(agent_id));
+        let claim =
+            state
+                .intent_store
+                .claim(&request_method, &target.host, &target.path, Some(agent_id));
 
         if claim.verified {
             // ABAC re-evaluation with declared operation from intent
@@ -651,7 +654,7 @@ fn inject_gvm_response_headers(
 }
 
 /// Build OperationMetadata from SDK headers for ABAC policy evaluation.
-fn build_operation_metadata(headers: &GVMHeaders, target: &Target) -> OperationMetadata {
+fn build_operation_metadata(headers: &GVMHeaders, _target: &Target) -> OperationMetadata {
     OperationMetadata {
         operation: headers.operation.clone(),
         resource: headers.resource.clone().unwrap_or_default(),
@@ -1069,7 +1072,11 @@ fn extract_target(request: &Request<Body>) -> Option<Target> {
         || stripped == "127.0.0.1"
         || stripped == "[::1]"
         || stripped == "::1";
-    let scheme = if is_local { "http".to_string() } else { "https".to_string() };
+    let scheme = if is_local {
+        "http".to_string()
+    } else {
+        "https".to_string()
+    };
 
     Some(Target {
         scheme,
@@ -1264,8 +1271,7 @@ mod tests {
 
         let (ledger, _wal_path) = make_test_ledger().await;
         let event = make_event();
-        let response =
-            extract_llm_trace_from_response(response, "openai", &event, ledger).await;
+        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
 
         let bytes = http_body_util::BodyExt::collect(response.into_body())
             .await
@@ -1303,8 +1309,7 @@ mod tests {
         let mut event = make_event();
         event.event_id = format!("evt-json-trace-{}", uuid::Uuid::new_v4());
 
-        let response =
-            extract_llm_trace_from_response(response, "openai", &event, ledger).await;
+        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
 
         // Body must be forwarded immediately via tap-stream
         let bytes = http_body_util::BodyExt::collect(response.into_body())
@@ -1340,8 +1345,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
 
-        let trace = persisted_trace
-            .expect("bounded JSON body should produce trace persisted to WAL");
+        let trace =
+            persisted_trace.expect("bounded JSON body should produce trace persisted to WAL");
         assert_eq!(trace.provider, "openai");
     }
 
@@ -1356,8 +1361,7 @@ mod tests {
 
         let (ledger, _wal_path) = make_test_ledger().await;
         let event = make_event();
-        let response =
-            extract_llm_trace_from_response(response, "openai", &event, ledger).await;
+        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
 
         // Body must be preserved (streamed through) even if oversized
         let bytes = http_body_util::BodyExt::collect(response.into_body())
@@ -1387,8 +1391,7 @@ mod tests {
 
         let (ledger, _wal_path) = make_test_ledger().await;
         let event = make_event();
-        let response =
-            extract_llm_trace_from_response(response, "openai", &event, ledger).await;
+        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
 
         // The response status is preserved (200 OK from upstream headers).
         // The body stream itself will yield the error when consumed.
@@ -1424,8 +1427,7 @@ mod tests {
         let event = make_event();
 
         let start = Instant::now();
-        let response =
-            extract_llm_trace_from_response(response, "openai", &event, ledger).await;
+        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
         assert!(
             start.elapsed() < Duration::from_millis(150),
             "tap-stream extraction must not block on upstream stream completion"
@@ -1460,8 +1462,7 @@ mod tests {
         let mut event = make_event();
         event.event_id = format!("evt-test-{}", uuid::Uuid::new_v4());
 
-        let response =
-            extract_llm_trace_from_response(response, "openai", &event, ledger).await;
+        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
 
         let bytes = http_body_util::BodyExt::collect(response.into_body())
             .await
@@ -1521,14 +1522,21 @@ pub async fn handle_connect(
     Ok(result)
 }
 
-async fn handle_connect_inner(state: AppState, request: Request<hyper::body::Incoming>) -> Response<Body> {
+async fn handle_connect_inner(
+    state: AppState,
+    request: Request<hyper::body::Incoming>,
+) -> Response<Body> {
     // Extract target host:port from CONNECT request URI
-    let target = request.uri().authority()
+    let target = request
+        .uri()
+        .authority()
         .map(|a| a.to_string())
-        .or_else(|| request.uri().host().map(|h| {
-            let port = request.uri().port_u16().unwrap_or(443);
-            format!("{}:{}", h, port)
-        }))
+        .or_else(|| {
+            request.uri().host().map(|h| {
+                let port = request.uri().port_u16().unwrap_or(443);
+                format!("{}:{}", h, port)
+            })
+        })
         .unwrap_or_default();
 
     if target.is_empty() {
@@ -1536,7 +1544,11 @@ async fn handle_connect_inner(state: AppState, request: Request<hyper::body::Inc
     }
 
     let host = target.split(':').next().unwrap_or(&target);
-    let port = target.split(':').nth(1).and_then(|p| p.parse::<u16>().ok()).unwrap_or(443);
+    let port = target
+        .split(':')
+        .nth(1)
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(443);
 
     // Domain-level policy: CONNECT only cares "is this domain allowed?"
     // If ANY rule exists for this host (regardless of method/path), Allow the tunnel.
@@ -1563,15 +1575,12 @@ async fn handle_connect_inner(state: AppState, request: Request<hyper::body::Inc
     if state.shadow_config.mode != crate::intent_store::ShadowMode::Disabled {
         let claim = state.intent_store.claim("CONNECT", host, "/", None);
         if !claim.verified {
-            match state.shadow_config.mode {
-                crate::intent_store::ShadowMode::Strict => {
-                    tracing::warn!(host = %host, "Shadow STRICT: CONNECT without intent — DENY");
-                    return error_response(
-                        StatusCode::FORBIDDEN,
-                        "Shadow verification failed for CONNECT tunnel",
-                    );
-                }
-                _ => {} // Cautious/Permissive: allow CONNECT but log
+            if state.shadow_config.mode == crate::intent_store::ShadowMode::Strict {
+                tracing::warn!(host = %host, "Shadow STRICT: CONNECT without intent — DENY");
+                return error_response(
+                    StatusCode::FORBIDDEN,
+                    "Shadow verification failed for CONNECT tunnel",
+                );
             }
         } else {
             // Confirm immediately for CONNECT (no WAL for tunneled content)
@@ -1592,7 +1601,9 @@ async fn handle_connect_inner(state: AppState, request: Request<hyper::body::Inc
                 operation: format!("connect:{}", host),
                 decision: "Deny".to_string(),
                 decision_source: "SRR".to_string(),
-                status: EventStatus::Failed { reason: reason.clone() },
+                status: EventStatus::Failed {
+                    reason: reason.clone(),
+                },
                 enforcement_point: "proxy".to_string(),
                 timestamp: chrono::Utc::now(),
                 payload: PayloadDescriptor::default(),
@@ -1615,7 +1626,10 @@ async fn handle_connect_inner(state: AppState, request: Request<hyper::body::Inc
             };
             state.ledger.append_async(event).await;
 
-            return error_response(StatusCode::FORBIDDEN, &format!("CONNECT denied: {}", reason));
+            return error_response(
+                StatusCode::FORBIDDEN,
+                &format!("CONNECT denied: {}", reason),
+            );
         }
         _ => {
             // Allow, Delay, etc. — proceed with tunnel
@@ -1659,27 +1673,24 @@ async fn handle_connect_inner(state: AppState, request: Request<hyper::body::Inc
     // Respond with 200 Connection Established, then upgrade to raw TCP
     tokio::task::spawn(async move {
         match hyper::upgrade::on(request).await {
-            Ok(upgraded) => {
-                match tokio::net::TcpStream::connect(&target_addr).await {
-                    Ok(upstream) => {
-                        let (mut client_read, mut client_write) =
-                            tokio::io::split(hyper_util::rt::TokioIo::new(upgraded));
-                        let (mut upstream_read, mut upstream_write) =
-                            tokio::io::split(upstream);
+            Ok(upgraded) => match tokio::net::TcpStream::connect(&target_addr).await {
+                Ok(upstream) => {
+                    let (mut client_read, mut client_write) =
+                        tokio::io::split(hyper_util::rt::TokioIo::new(upgraded));
+                    let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
 
-                        let c2s = tokio::io::copy(&mut client_read, &mut upstream_write);
-                        let s2c = tokio::io::copy(&mut upstream_read, &mut client_write);
+                    let c2s = tokio::io::copy(&mut client_read, &mut upstream_write);
+                    let s2c = tokio::io::copy(&mut upstream_read, &mut client_write);
 
-                        tokio::select! {
-                            r = c2s => { if let Err(e) = r { tracing::debug!(error = %e, "CONNECT client→upstream ended"); } }
-                            r = s2c => { if let Err(e) = r { tracing::debug!(error = %e, "CONNECT upstream→client ended"); } }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(target = %target_addr, error = %e, "CONNECT: failed to connect to upstream");
+                    tokio::select! {
+                        r = c2s => { if let Err(e) = r { tracing::debug!(error = %e, "CONNECT client→upstream ended"); } }
+                        r = s2c => { if let Err(e) = r { tracing::debug!(error = %e, "CONNECT upstream→client ended"); } }
                     }
                 }
-            }
+                Err(e) => {
+                    tracing::error!(target = %target_addr, error = %e, "CONNECT: failed to connect to upstream");
+                }
+            },
             Err(e) => {
                 tracing::error!(error = %e, "CONNECT: upgrade failed");
             }

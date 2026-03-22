@@ -17,6 +17,7 @@ use wasmtime_wasi::WasiCtxBuilder;
 /// Governance engine mode — Wasm sandbox or native fallback.
 enum EngineMode {
     /// Production: policy logic runs inside Wasmtime sandbox.
+    #[allow(dead_code)]
     Wasm {
         engine: wasmtime::Engine,
         module: wasmtime::Module,
@@ -78,11 +79,10 @@ impl WasmEngine {
         let mut config = wasmtime::Config::new();
         config.cranelift_opt_level(wasmtime::OptLevel::Speed);
 
-        let engine = wasmtime::Engine::new(&config)
-            .context("Failed to create Wasmtime engine")?;
+        let engine = wasmtime::Engine::new(&config).context("Failed to create Wasmtime engine")?;
 
-        let module = wasmtime::Module::new(&engine, &wasm_bytes)
-            .context("Failed to compile Wasm module")?;
+        let module =
+            wasmtime::Module::new(&engine, &wasm_bytes).context("Failed to compile Wasm module")?;
 
         // Create WASI preview1 context (minimal: no filesystem, no network, no env)
         // The governance engine only uses std::alloc which requires WASI shims.
@@ -94,15 +94,19 @@ impl WasmEngine {
         wasmtime_wasi::preview1::add_to_linker_sync(&mut linker, |ctx| ctx)
             .context("Failed to add WASI preview1 to linker")?;
 
-        let instance = linker.instantiate(&mut store, &module)
+        let instance = linker
+            .instantiate(&mut store, &module)
             .context("Failed to instantiate Wasm module")?;
 
         // Verify required exports exist
-        let _ = instance.get_func(&mut store, "engine_alloc")
+        let _ = instance
+            .get_func(&mut store, "engine_alloc")
             .context("Wasm module missing 'engine_alloc' export")?;
-        let _ = instance.get_func(&mut store, "engine_dealloc")
+        let _ = instance
+            .get_func(&mut store, "engine_dealloc")
             .context("Wasm module missing 'engine_dealloc' export")?;
-        let _ = instance.get_func(&mut store, "engine_evaluate")
+        let _ = instance
+            .get_func(&mut store, "engine_evaluate")
             .context("Wasm module missing 'engine_evaluate' export")?;
 
         tracing::info!("Wasm governance engine loaded and verified");
@@ -130,12 +134,8 @@ impl WasmEngine {
     /// In native mode: calls gvm_engine::evaluate() directly.
     pub fn evaluate(&self, req: &gvm_engine::EvalRequest) -> Result<gvm_engine::EvalResponse> {
         match &self.mode {
-            EngineMode::Wasm { runtime, .. } => {
-                self.evaluate_wasm(runtime, req)
-            }
-            EngineMode::Native => {
-                Ok(gvm_engine::evaluate(req))
-            }
+            EngineMode::Wasm { runtime, .. } => self.evaluate_wasm(runtime, req),
+            EngineMode::Native => Ok(gvm_engine::evaluate(req)),
         }
     }
 
@@ -152,35 +152,42 @@ impl WasmEngine {
         runtime: &Mutex<WasmRuntime>,
         req: &gvm_engine::EvalRequest,
     ) -> Result<gvm_engine::EvalResponse> {
-        let input_json = serde_json::to_string(req)
-            .context("Failed to serialize EvalRequest")?;
+        let input_json = serde_json::to_string(req).context("Failed to serialize EvalRequest")?;
         let input_bytes = input_json.as_bytes();
 
-        let mut rt = runtime.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let mut rt = runtime
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
 
         // Copy instance handle (it's a lightweight Copy type)
         let instance = rt.instance;
 
         // Get exported functions
-        let alloc_fn = instance.get_typed_func::<u32, u32>(&mut rt.store, "engine_alloc")
+        let alloc_fn = instance
+            .get_typed_func::<u32, u32>(&mut rt.store, "engine_alloc")
             .context("Failed to get engine_alloc")?;
-        let dealloc_fn = instance.get_typed_func::<(u32, u32), ()>(&mut rt.store, "engine_dealloc")
+        let dealloc_fn = instance
+            .get_typed_func::<(u32, u32), ()>(&mut rt.store, "engine_dealloc")
             .context("Failed to get engine_dealloc")?;
-        let evaluate_fn = instance.get_typed_func::<(u32, u32), u32>(&mut rt.store, "engine_evaluate")
+        let evaluate_fn = instance
+            .get_typed_func::<(u32, u32), u32>(&mut rt.store, "engine_evaluate")
             .context("Failed to get engine_evaluate")?;
 
         // Get Wasm memory
-        let memory = instance.get_memory(&mut rt.store, "memory")
+        let memory = instance
+            .get_memory(&mut rt.store, "memory")
             .context("Wasm module missing 'memory' export")?;
 
         // 1. Allocate input buffer in Wasm
         if input_bytes.len() > u32::MAX as usize {
             return Err(anyhow::anyhow!(
-                "Input exceeds maximum Wasm buffer size ({} bytes)", input_bytes.len()
+                "Input exceeds maximum Wasm buffer size ({} bytes)",
+                input_bytes.len()
             ));
         }
         let input_len = input_bytes.len() as u32;
-        let input_ptr = alloc_fn.call(&mut rt.store, input_len)
+        let input_ptr = alloc_fn
+            .call(&mut rt.store, input_len)
             .context("engine_alloc failed")?;
 
         // 2. Validate pointer is within Wasm memory bounds, then copy
@@ -188,24 +195,29 @@ impl WasmEngine {
         if (input_ptr as usize).saturating_add(input_bytes.len()) > mem_size {
             return Err(anyhow::anyhow!(
                 "engine_alloc returned out-of-bounds pointer {} (memory size: {})",
-                input_ptr, mem_size
+                input_ptr,
+                mem_size
             ));
         }
-        memory.write(&mut rt.store, input_ptr as usize, input_bytes)
+        memory
+            .write(&mut rt.store, input_ptr as usize, input_bytes)
             .context("Failed to write input to Wasm memory")?;
 
         // 3. Call engine_evaluate
-        let result_ptr = evaluate_fn.call(&mut rt.store, (input_ptr, input_len))
+        let result_ptr = evaluate_fn
+            .call(&mut rt.store, (input_ptr, input_len))
             .context("engine_evaluate failed")?;
 
         // 4. Read length prefix (4 bytes, little-endian u32)
         if (result_ptr as usize).saturating_add(4) > mem_size {
             return Err(anyhow::anyhow!(
-                "engine_evaluate returned out-of-bounds result pointer {}", result_ptr
+                "engine_evaluate returned out-of-bounds result pointer {}",
+                result_ptr
             ));
         }
         let mut len_buf = [0u8; 4];
-        memory.read(&mut rt.store, result_ptr as usize, &mut len_buf)
+        memory
+            .read(&mut rt.store, result_ptr as usize, &mut len_buf)
             .context("Failed to read result length from Wasm memory")?;
         let result_len = u32::from_le_bytes(len_buf) as usize;
 
@@ -214,13 +226,15 @@ impl WasmEngine {
         if result_len > MAX_RESPONSE_LEN {
             return Err(anyhow::anyhow!(
                 "Wasm response too large: {} bytes (max {})",
-                result_len, MAX_RESPONSE_LEN
+                result_len,
+                MAX_RESPONSE_LEN
             ));
         }
 
         // 5. Read response JSON
         let mut result_buf = vec![0u8; result_len];
-        memory.read(&mut rt.store, (result_ptr as usize) + 4, &mut result_buf)
+        memory
+            .read(&mut rt.store, (result_ptr as usize) + 4, &mut result_buf)
             .context("Failed to read result data from Wasm memory")?;
 
         // 6. Deallocate both input and output buffers
@@ -233,8 +247,8 @@ impl WasmEngine {
         }
 
         // 7. Parse response
-        let result_str = std::str::from_utf8(&result_buf)
-            .context("Wasm response is not valid UTF-8")?;
+        let result_str =
+            std::str::from_utf8(&result_buf).context("Wasm response is not valid UTF-8")?;
 
         let response: gvm_engine::EvalResponse = serde_json::from_str(result_str)
             .with_context(|| format!("Failed to parse Wasm response: {}", result_str))?;
@@ -248,14 +262,19 @@ impl WasmEngine {
     }
 
     /// Convert a gvm_engine::EvalResponse to the proxy's EnforcementDecision.
-    pub fn response_to_decision(resp: &gvm_engine::EvalResponse) -> (EnforcementDecision, Option<String>) {
+    pub fn response_to_decision(
+        resp: &gvm_engine::EvalResponse,
+    ) -> (EnforcementDecision, Option<String>) {
         let decision = match resp.decision.as_str() {
             "Allow" => EnforcementDecision::Allow,
             "Delay" => EnforcementDecision::Delay {
                 milliseconds: resp.delay_ms.unwrap_or(300),
             },
             "Deny" => EnforcementDecision::Deny {
-                reason: resp.reason.clone().unwrap_or_else(|| "Denied by Wasm engine".to_string()),
+                reason: resp
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "Denied by Wasm engine".to_string()),
             },
             "RequireApproval" => EnforcementDecision::RequireApproval {
                 urgency: ApprovalUrgency::Standard,
@@ -263,9 +282,7 @@ impl WasmEngine {
             "AuditOnly" => EnforcementDecision::AuditOnly {
                 alert_level: AlertLevel::Info,
             },
-            "Throttle" => EnforcementDecision::Throttle {
-                max_per_minute: 60,
-            },
+            "Throttle" => EnforcementDecision::Throttle { max_per_minute: 60 },
             other => {
                 tracing::warn!(
                     decision = %other,
@@ -321,7 +338,7 @@ fn sensitivity_to_str(sensitivity: &Sensitivity) -> &'static str {
 }
 
 fn compute_sha256(data: &[u8]) -> String {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(data);
     hex::encode(hasher.finalize())
@@ -352,7 +369,9 @@ mod tests {
             rules: vec![],
         };
 
-        let resp = engine.evaluate(&req).expect("native engine evaluation must succeed");
+        let resp = engine
+            .evaluate(&req)
+            .expect("native engine evaluation must succeed");
         assert_eq!(resp.decision, "Allow");
     }
 
@@ -389,7 +408,9 @@ mod tests {
             }],
         };
 
-        let resp = engine.evaluate(&req).expect("native engine evaluation must succeed");
+        let resp = engine
+            .evaluate(&req)
+            .expect("native engine evaluation must succeed");
         assert_eq!(resp.decision, "Deny");
         assert_eq!(resp.reason.as_deref(), Some("Critical data protected"));
     }
@@ -406,13 +427,17 @@ mod tests {
         };
 
         let (decision, rule_id) = WasmEngine::response_to_decision(&resp);
-        assert!(matches!(decision, EnforcementDecision::Delay { milliseconds: 500 }));
+        assert!(matches!(
+            decision,
+            EnforcementDecision::Delay { milliseconds: 500 }
+        ));
         assert_eq!(rule_id.as_deref(), Some("delay-rule"));
     }
 
     #[test]
     fn test_load_missing_wasm() {
-        let engine = WasmEngine::load(Path::new("nonexistent.wasm")).expect("missing wasm falls back to native mode");
+        let engine = WasmEngine::load(Path::new("nonexistent.wasm"))
+            .expect("missing wasm falls back to native mode");
         assert!(!engine.is_wasm());
     }
 }

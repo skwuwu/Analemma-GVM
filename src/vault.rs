@@ -44,6 +44,7 @@ pub trait KeyProvider: Send + Sync {
 /// All values stored are already encrypted by KeyProvider.
 /// Backend implementations must NOT perform additional encryption.
 #[allow(async_fn_in_trait)]
+#[allow(clippy::len_without_is_empty)]
 pub trait VaultBackend: Send + Sync {
     /// Retrieve an encrypted value by key. Returns None if key does not exist.
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
@@ -151,8 +152,8 @@ impl KeyProvider for LocalKeyProvider {
     /// 1. Data tampering (authentication tag mismatch)
     /// 2. Wrong key (key rotation without data migration)
     /// 3. Storage corruption
-    /// All cases are security events — details logged internally,
-    /// generic error returned to caller (no cryptographic information leakage).
+    ///    All cases are security events — details logged internally,
+    ///    generic error returned to caller (no cryptographic information leakage).
     fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
         if data.len() < 12 {
             tracing::error!(
@@ -161,25 +162,22 @@ impl KeyProvider for LocalKeyProvider {
             );
             return Err(anyhow!("Vault integrity error: data corrupted or tampered"));
         }
-        let cipher = Aes256Gcm::new_from_slice(&self.key)
-            .map_err(|e| {
-                tracing::error!(error = %e, "Vault cipher initialization failed");
-                anyhow!("Vault internal error")
-            })?;
+        let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|e| {
+            tracing::error!(error = %e, "Vault cipher initialization failed");
+            anyhow!("Vault internal error")
+        })?;
         let (nonce_bytes, ciphertext) = data.split_at(12);
         let nonce = Nonce::from_slice(nonce_bytes);
-        cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|_| {
-                // Do NOT expose raw AES-GCM error details (could aid cryptanalysis).
-                // Log the event for operator review, return generic error to caller.
-                tracing::error!(
-                    "Vault decryption failed: authentication tag mismatch. \
+        cipher.decrypt(nonce, ciphertext).map_err(|_| {
+            // Do NOT expose raw AES-GCM error details (could aid cryptanalysis).
+            // Log the event for operator review, return generic error to caller.
+            tracing::error!(
+                "Vault decryption failed: authentication tag mismatch. \
                      Possible causes: data tampering, key rotation, or storage corruption. \
                      Operator review required."
-                );
-                anyhow!("Vault integrity error: decryption failed")
-            })
+            );
+            anyhow!("Vault integrity error: decryption failed")
+        })
     }
 }
 
@@ -484,38 +482,54 @@ mod tests {
 
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
-        let enc = LocalKeyProvider::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
+        let enc = LocalKeyProvider::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT")
+            .expect("ephemeral key generation must succeed");
         let plaintext = b"sensitive agent state data";
 
-        let ciphertext = enc.encrypt(plaintext).expect("AES-256-GCM encryption must succeed");
+        let ciphertext = enc
+            .encrypt(plaintext)
+            .expect("AES-256-GCM encryption must succeed");
         assert_ne!(&ciphertext, plaintext);
         assert!(ciphertext.len() > plaintext.len()); // nonce + tag overhead
 
-        let decrypted = enc.decrypt(&ciphertext).expect("decryption of valid ciphertext must succeed");
+        let decrypted = enc
+            .decrypt(&ciphertext)
+            .expect("decryption of valid ciphertext must succeed");
         assert_eq!(&decrypted, plaintext);
     }
 
     #[test]
     fn test_different_nonces_produce_different_ciphertext() {
-        let enc = LocalKeyProvider::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
+        let enc = LocalKeyProvider::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT")
+            .expect("ephemeral key generation must succeed");
         let plaintext = b"same data";
 
-        let ct1 = enc.encrypt(plaintext).expect("AES-256-GCM encryption must succeed");
-        let ct2 = enc.encrypt(plaintext).expect("AES-256-GCM encryption must succeed");
+        let ct1 = enc
+            .encrypt(plaintext)
+            .expect("AES-256-GCM encryption must succeed");
+        let ct2 = enc
+            .encrypt(plaintext)
+            .expect("AES-256-GCM encryption must succeed");
 
         // Same plaintext should produce different ciphertext (random nonce)
         assert_ne!(ct1, ct2);
 
         // But both should decrypt to the same plaintext
-        assert_eq!(enc.decrypt(&ct1).expect("ct1 decryption"), enc.decrypt(&ct2).expect("ct2 decryption"));
+        assert_eq!(
+            enc.decrypt(&ct1).expect("ct1 decryption"),
+            enc.decrypt(&ct2).expect("ct2 decryption")
+        );
     }
 
     #[test]
     fn test_tampered_ciphertext_fails() {
-        let enc = LocalKeyProvider::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
+        let enc = LocalKeyProvider::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT")
+            .expect("ephemeral key generation must succeed");
         let plaintext = b"tamper test";
 
-        let mut ciphertext = enc.encrypt(plaintext).expect("AES-256-GCM encryption must succeed");
+        let mut ciphertext = enc
+            .encrypt(plaintext)
+            .expect("AES-256-GCM encryption must succeed");
         // Flip a bit in the ciphertext body (after nonce)
         if ciphertext.len() > 13 {
             ciphertext[13] ^= 0xFF;
@@ -528,7 +542,8 @@ mod tests {
 
     #[test]
     fn test_truncated_ciphertext_returns_integrity_error() {
-        let enc = LocalKeyProvider::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
+        let enc = LocalKeyProvider::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT")
+            .expect("ephemeral key generation must succeed");
 
         // Less than 12 bytes (nonce size) — must fail with integrity error
         let short_data = vec![0u8; 5];
@@ -546,7 +561,9 @@ mod tests {
         let enc2 = LocalKeyProvider::new([2u8; 32]);
 
         let plaintext = b"encrypted with key 1";
-        let ciphertext = enc1.encrypt(plaintext).expect("enc1 encryption must succeed");
+        let ciphertext = enc1
+            .encrypt(plaintext)
+            .expect("enc1 encryption must succeed");
 
         // Decrypt with wrong key — must fail with integrity error, not leak details
         let err = enc2.decrypt(&ciphertext).unwrap_err();
@@ -564,23 +581,31 @@ mod tests {
 
     #[test]
     fn test_empty_plaintext_roundtrip() {
-        let enc = LocalKeyProvider::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
+        let enc = LocalKeyProvider::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT")
+            .expect("ephemeral key generation must succeed");
 
         // Empty plaintext — edge case, must work
-        let ciphertext = enc.encrypt(b"").expect("AES-256-GCM encryption of empty plaintext must succeed");
-        let decrypted = enc.decrypt(&ciphertext).expect("decryption of valid ciphertext must succeed");
+        let ciphertext = enc
+            .encrypt(b"")
+            .expect("AES-256-GCM encryption of empty plaintext must succeed");
+        let decrypted = enc
+            .decrypt(&ciphertext)
+            .expect("decryption of valid ciphertext must succeed");
         assert_eq!(decrypted, b"");
     }
 
     #[test]
     fn test_nonce_reuse_not_possible() {
-        let enc = LocalKeyProvider::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT").expect("ephemeral key generation must succeed");
+        let enc = LocalKeyProvider::from_env("GVM_VAULT_KEY_TEST_NONEXISTENT")
+            .expect("ephemeral key generation must succeed");
 
         // Encrypt same plaintext 100 times — all nonces must be unique
         let plaintext = b"nonce reuse test";
         let nonces: Vec<Vec<u8>> = (0..100)
             .map(|_| {
-                let ct = enc.encrypt(plaintext).expect("AES-256-GCM encryption must succeed");
+                let ct = enc
+                    .encrypt(plaintext)
+                    .expect("AES-256-GCM encryption must succeed");
                 ct[..12].to_vec() // Extract 12-byte nonce
             })
             .collect();

@@ -6,16 +6,17 @@
 //! 3. Agent script is executed through the governance pipeline
 //! 4. Audit trail is recorded
 
-use std::process::Command;
-use std::time::Duration;
-use std::thread;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 /// Create a minimal test script for agent execution.
 fn create_test_script() -> PathBuf {
     let script_path = PathBuf::from("/tmp/gvm_test_noop.py");
-    let content = "#!/usr/bin/env python3\nimport sys\nprint('Test agent ran successfully')\nsys.exit(0)\n";
+    let content =
+        "#!/usr/bin/env python3\nimport sys\nprint('Test agent ran successfully')\nsys.exit(0)\n";
     fs::write(&script_path, content).expect("Failed to write test script");
     script_path
 }
@@ -34,10 +35,7 @@ fn is_proxy_ready(_proxy_url: &str) -> bool {
 
 /// Kill any existing gvm-proxy processes to ensure clean test state.
 fn kill_existing_proxy() {
-    let _ = Command::new("pkill")
-        .arg("-f")
-        .arg("gvm-proxy")
-        .output();
+    let _ = Command::new("pkill").arg("-f").arg("gvm-proxy").output();
     thread::sleep(Duration::from_millis(500));
 }
 
@@ -46,7 +44,10 @@ fn kill_existing_proxy() {
 fn test_gvm_run_local_mode_with_proxy_autostart() {
     // Precondition: no proxy running
     kill_existing_proxy();
-    assert!(!is_proxy_ready("http://127.0.0.1:8080"), "Proxy should be down at test start");
+    assert!(
+        !is_proxy_ready("http://127.0.0.1:8080"),
+        "Proxy should be down at test start"
+    );
 
     let agent_id = "test-agent-local";
     let script = create_test_script();
@@ -73,7 +74,10 @@ fn test_gvm_run_local_mode_with_proxy_autostart() {
 
     // Assertions
     // 1. Command should succeed (auto-start worked + agent executed)
-    assert!(output.status.success(), "gvm run should succeed with proxy auto-start");
+    assert!(
+        output.status.success(),
+        "gvm run should succeed with proxy auto-start"
+    );
 
     // 2. Output should contain auto-start message
     assert!(
@@ -115,10 +119,7 @@ fn test_gvm_run_help_succeeds() {
         .output()
         .expect("Failed to execute gvm run --help");
 
-    assert!(
-        output.status.success(),
-        "gvm run --help should succeed"
-    );
+    assert!(output.status.success(), "gvm run --help should succeed");
 
     let output_str = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -141,10 +142,7 @@ fn test_gvm_events_list_basic() {
         .expect("Failed to execute gvm events list");
 
     // Command should succeed (even if WAL is empty)
-    assert!(
-        output.status.success(),
-        "gvm events list should succeed"
-    );
+    assert!(output.status.success(), "gvm events list should succeed");
 }
 
 #[test]
@@ -161,8 +159,5 @@ fn test_gvm_stats_basic() {
         .expect("Failed to execute gvm stats tokens");
 
     // Command should succeed (even if no events recorded)
-    assert!(
-        output.status.success(),
-        "gvm stats tokens should succeed"
-    );
+    assert!(output.status.success(), "gvm stats tokens should succeed");
 }

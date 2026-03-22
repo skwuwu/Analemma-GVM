@@ -115,13 +115,22 @@ pub async fn verify_wal(wal_file: &str) -> Result<()> {
     println!();
 
     if corrupt_lines > 0 {
-        println!("  WARNING: {} corrupt entries found. These will be skipped during recovery.", corrupt_lines);
+        println!(
+            "  WARNING: {} corrupt entries found. These will be skipped during recovery.",
+            corrupt_lines
+        );
     }
     if out_of_order > 0 {
-        println!("  WARNING: {} out-of-order timestamps detected. May indicate concurrent write issues.", out_of_order);
+        println!(
+            "  WARNING: {} out-of-order timestamps detected. May indicate concurrent write issues.",
+            out_of_order
+        );
     }
     if pending_events > 0 {
-        println!("  WARNING: {} events in Pending state (possible phantom records from crash).", pending_events);
+        println!(
+            "  WARNING: {} events in Pending state (possible phantom records from crash).",
+            pending_events
+        );
     }
     if hash_mismatches > 0 {
         println!(
@@ -137,11 +146,7 @@ pub async fn verify_wal(wal_file: &str) -> Result<()> {
 }
 
 /// Export events from WAL as JSON, optionally filtered by time window.
-pub async fn export_events(
-    since: &str,
-    wal_file: &str,
-    format: &str,
-) -> Result<()> {
+pub async fn export_events(since: &str, wal_file: &str, format: &str) -> Result<()> {
     let duration_secs = parse_duration(since)?;
     let cutoff = chrono::Utc::now() - chrono::Duration::seconds(duration_secs);
 

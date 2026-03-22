@@ -35,8 +35,14 @@ fn veth_config_address_format_correct() {
     let cfg = veth_config_from_pid(42, addr);
 
     // Must be 10.200.X.Y format
-    assert!(cfg.host_ip.starts_with("10.200."), "Host IP must be in 10.200.0.0/16");
-    assert!(cfg.sandbox_ip.starts_with("10.200."), "Sandbox IP must be in 10.200.0.0/16");
+    assert!(
+        cfg.host_ip.starts_with("10.200."),
+        "Host IP must be in 10.200.0.0/16"
+    );
+    assert!(
+        cfg.sandbox_ip.starts_with("10.200."),
+        "Sandbox IP must be in 10.200.0.0/16"
+    );
     assert_eq!(cfg.cidr, 30, "Must use /30 point-to-point subnet");
 
     // Interface names must include PID
@@ -53,11 +59,7 @@ fn veth_config_host_and_sandbox_in_same_subnet() {
         let cfg = veth_config_from_pid(pid, addr);
 
         // Parse IPs and verify they're in the same /30
-        let host_parts: Vec<u8> = cfg
-            .host_ip
-            .split('.')
-            .map(|s| s.parse().unwrap())
-            .collect();
+        let host_parts: Vec<u8> = cfg.host_ip.split('.').map(|s| s.parse().unwrap()).collect();
         let sb_parts: Vec<u8> = cfg
             .sandbox_ip
             .split('.')
@@ -97,7 +99,10 @@ fn preflight_report_non_linux_has_ebpf_false() {
             tls_probe_mode: TlsProbeMode::Disabled,
         };
         let report = preflight_check(&config);
-        assert!(!report.ebpf_available, "eBPF must be unavailable on non-Linux");
+        assert!(
+            !report.ebpf_available,
+            "eBPF must be unavailable on non-Linux"
+        );
         assert!(!report.user_namespaces);
         assert!(!report.seccomp_available);
     }

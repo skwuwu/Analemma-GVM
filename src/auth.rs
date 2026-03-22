@@ -50,8 +50,7 @@ impl JwtConfig {
             _ => return Ok(None),
         };
 
-        let key = hex::decode(&hex_secret)
-            .map_err(|_| anyhow!("JWT secret must be valid hex"))?;
+        let key = hex::decode(&hex_secret).map_err(|_| anyhow!("JWT secret must be valid hex"))?;
 
         if key.len() < 32 {
             return Err(anyhow!(
@@ -112,7 +111,10 @@ pub fn issue_token(
         return Err(anyhow!("agent_id must not be empty"));
     }
     if agent_id.len() > MAX_AGENT_ID_LEN {
-        return Err(anyhow!("agent_id exceeds maximum length ({})", MAX_AGENT_ID_LEN));
+        return Err(anyhow!(
+            "agent_id exceeds maximum length ({})",
+            MAX_AGENT_ID_LEN
+        ));
     }
     if agent_id.contains(':') {
         return Err(anyhow!("agent_id must not contain ':'"));
@@ -207,17 +209,17 @@ fn encode_jwt(secret: &JwtSecret, claims: &Claims) -> Result<String> {
     let header = r#"{"alg":"HS256","typ":"JWT"}"#;
     let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
 
-    let payload_json = serde_json::to_string(claims)
-        .map_err(|e| anyhow!("Failed to serialize claims: {}", e))?;
+    let payload_json =
+        serde_json::to_string(claims).map_err(|e| anyhow!("Failed to serialize claims: {}", e))?;
     let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json.as_bytes());
 
     let signing_input = format!("{}.{}", header_b64, payload_b64);
 
-    let mut mac = HmacSha256::new_from_slice(&secret.key)
-        .map_err(|e| anyhow!("HMAC key error: {}", e))?;
+    let mut mac =
+        HmacSha256::new_from_slice(&secret.key).map_err(|e| anyhow!("HMAC key error: {}", e))?;
     mac.update(signing_input.as_bytes());
     let signature = mac.finalize().into_bytes();
-    let sig_b64 = URL_SAFE_NO_PAD.encode(&signature);
+    let sig_b64 = URL_SAFE_NO_PAD.encode(signature);
 
     Ok(format!("{}.{}", signing_input, sig_b64))
 }
@@ -238,10 +240,10 @@ fn decode_jwt(secret: &JwtSecret, token: &str) -> Result<Claims> {
     let header_bytes = URL_SAFE_NO_PAD
         .decode(parts[0])
         .map_err(|_| anyhow!("Invalid token encoding"))?;
-    let header_str = std::str::from_utf8(&header_bytes)
-        .map_err(|_| anyhow!("Invalid token header encoding"))?;
-    let header_json: serde_json::Value = serde_json::from_str(header_str)
-        .map_err(|_| anyhow!("Invalid token header"))?;
+    let header_str =
+        std::str::from_utf8(&header_bytes).map_err(|_| anyhow!("Invalid token header encoding"))?;
+    let header_json: serde_json::Value =
+        serde_json::from_str(header_str).map_err(|_| anyhow!("Invalid token header"))?;
     match header_json.get("alg").and_then(|v| v.as_str()) {
         Some("HS256") => {}
         Some(alg) => {
@@ -258,8 +260,8 @@ fn decode_jwt(secret: &JwtSecret, token: &str) -> Result<Claims> {
         .decode(parts[2])
         .map_err(|_| anyhow!("Invalid token encoding"))?;
 
-    let mut mac = HmacSha256::new_from_slice(&secret.key)
-        .map_err(|e| anyhow!("HMAC key error: {}", e))?;
+    let mut mac =
+        HmacSha256::new_from_slice(&secret.key).map_err(|e| anyhow!("HMAC key error: {}", e))?;
     mac.update(signing_input.as_bytes());
     mac.verify_slice(&signature)
         .map_err(|_| anyhow!("Invalid token signature"))?;
@@ -269,8 +271,8 @@ fn decode_jwt(secret: &JwtSecret, token: &str) -> Result<Claims> {
         .decode(parts[1])
         .map_err(|_| anyhow!("Invalid token encoding"))?;
 
-    let claims: Claims = serde_json::from_slice(&payload_bytes)
-        .map_err(|_| anyhow!("Invalid token payload"))?;
+    let claims: Claims =
+        serde_json::from_slice(&payload_bytes).map_err(|_| anyhow!("Invalid token payload"))?;
 
     Ok(claims)
 }
@@ -312,8 +314,7 @@ mod tests {
     #[test]
     fn issue_without_tenant() {
         let config = test_config(3600);
-        let token = issue_token(&config, "agent-002", None, "proxy")
-            .expect("issue must succeed");
+        let token = issue_token(&config, "agent-002", None, "proxy").expect("issue must succeed");
 
         let identity = verify_token(&config, &token).expect("verify must succeed");
         assert_eq!(identity.agent_id, "agent-002");
@@ -323,8 +324,7 @@ mod tests {
     #[test]
     fn expired_token_rejected() {
         let config = test_config(0); // TTL = 0 seconds
-        let token = issue_token(&config, "agent-001", None, "proxy")
-            .expect("issue must succeed");
+        let token = issue_token(&config, "agent-001", None, "proxy").expect("issue must succeed");
 
         // Sleep beyond leeway
         std::thread::sleep(std::time::Duration::from_secs(EXPIRY_LEEWAY_SECS + 1));
@@ -340,8 +340,8 @@ mod tests {
     #[test]
     fn tampered_signature_rejected() {
         let config = test_config(3600);
-        let mut token = issue_token(&config, "agent-001", None, "proxy")
-            .expect("issue must succeed");
+        let mut token =
+            issue_token(&config, "agent-001", None, "proxy").expect("issue must succeed");
 
         // Flip last character of signature
         let last = token.pop().expect("token must have characters");
@@ -355,8 +355,7 @@ mod tests {
     #[test]
     fn tampered_payload_rejected() {
         let config = test_config(3600);
-        let token = issue_token(&config, "agent-001", None, "proxy")
-            .expect("issue must succeed");
+        let token = issue_token(&config, "agent-001", None, "proxy").expect("issue must succeed");
 
         // Modify payload section (second part)
         let parts: Vec<&str> = token.split('.').collect();
@@ -376,8 +375,7 @@ mod tests {
             token_ttl_secs: 3600,
         };
 
-        let token = issue_token(&config_a, "agent-001", None, "proxy")
-            .expect("issue must succeed");
+        let token = issue_token(&config_a, "agent-001", None, "proxy").expect("issue must succeed");
 
         let result = verify_token(&config_b, &token);
         assert!(result.is_err(), "Wrong secret must reject token");
@@ -411,10 +409,7 @@ mod tests {
     #[test]
     fn extract_bearer_token_valid() {
         let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            "Authorization",
-            "Bearer my-jwt-token".parse().unwrap(),
-        );
+        headers.insert("Authorization", "Bearer my-jwt-token".parse().unwrap());
 
         assert_eq!(extract_bearer_token(&headers), Some("my-jwt-token"));
     }
@@ -466,8 +461,8 @@ mod tests {
     #[test]
     fn token_response_format() {
         let config = test_config(3600);
-        let resp = issue_token_response(&config, "agent-001", None, "proxy")
-            .expect("issue must succeed");
+        let resp =
+            issue_token_response(&config, "agent-001", None, "proxy").expect("issue must succeed");
 
         assert_eq!(resp.token_type, "Bearer");
         assert_eq!(resp.expires_in, 3600);
@@ -575,8 +570,7 @@ mod tests {
             iss: "evil-proxy".to_string(), // Wrong issuer
         };
 
-        let token = encode_jwt(&config.secret, &claims)
-            .expect("encoding must succeed");
+        let token = encode_jwt(&config.secret, &claims).expect("encoding must succeed");
 
         let result = verify_token(&config, &token);
         assert!(result.is_err(), "Wrong issuer must be rejected");
@@ -604,8 +598,7 @@ mod tests {
             iss: "gvm-proxy".to_string(),
         };
 
-        let token = encode_jwt(&config.secret, &claims)
-            .expect("encoding must succeed");
+        let token = encode_jwt(&config.secret, &claims).expect("encoding must succeed");
 
         let result = verify_token(&config, &token);
         assert!(result.is_err(), "Future iat must be rejected");
@@ -631,10 +624,12 @@ mod tests {
             iss: "gvm-proxy".to_string(),
         };
 
-        let token = encode_jwt(&config.secret, &claims)
-            .expect("encoding must succeed");
+        let token = encode_jwt(&config.secret, &claims).expect("encoding must succeed");
 
         let result = verify_token(&config, &token);
-        assert!(result.is_ok(), "Slight clock skew within leeway must be accepted");
+        assert!(
+            result.is_ok(),
+            "Slight clock skew within leeway must be accepted"
+        );
     }
 }

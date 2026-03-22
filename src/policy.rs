@@ -331,7 +331,12 @@ fn rule_matches(rule: &PolicyRule, operation: &OperationMetadata) -> bool {
 
     rule.conditions.iter().all(|cond| {
         let field_value = resolve_field(&cond.field, operation);
-        evaluate_condition(&cond.operator, &field_value, &cond.value, &cond.compiled_regex)
+        evaluate_condition(
+            &cond.operator,
+            &field_value,
+            &cond.value,
+            &cond.compiled_regex,
+        )
     })
 }
 
@@ -345,10 +350,12 @@ fn resolve_field(field: &str, operation: &OperationMetadata) -> serde_json::Valu
             Some(id) => serde_json::Value::String(id.clone()),
             None => serde_json::Value::Null,
         },
-        "resource.tier" => serde_json::Value::String(tier_as_policy_str(&operation.resource.tier).to_string()),
-        "resource.sensitivity" => {
-            serde_json::Value::String(sensitivity_as_policy_str(&operation.resource.sensitivity).to_string())
+        "resource.tier" => {
+            serde_json::Value::String(tier_as_policy_str(&operation.resource.tier).to_string())
         }
+        "resource.sensitivity" => serde_json::Value::String(
+            sensitivity_as_policy_str(&operation.resource.sensitivity).to_string(),
+        ),
 
         "subject.agent_id" => serde_json::Value::String(operation.subject.agent_id.clone()),
         "subject.tenant_id" => match &operation.subject.tenant_id {
@@ -498,7 +505,7 @@ const KNOWN_FIELD_PREFIXES: &[&str] = &[
     "subject.agent_id",
     "subject.tenant_id",
     "subject.session_id",
-    "context.",  // dynamic context attributes (context.amount, context.currency, etc.)
+    "context.", // dynamic context attributes (context.amount, context.currency, etc.)
 ];
 
 /// Validate that a condition field name is recognized.
@@ -549,11 +556,15 @@ fn compile_rule(cfg: &PolicyRuleConfig) -> Result<PolicyRule> {
             if pattern.len() > MAX_REGEX_LEN {
                 anyhow::bail!(
                     "Regex pattern too long in rule {}: {} > {} bytes",
-                    cfg.id, pattern.len(), MAX_REGEX_LEN
+                    cfg.id,
+                    pattern.len(),
+                    MAX_REGEX_LEN
                 );
             }
-            Some(regex::Regex::new(&pattern)
-                .with_context(|| format!("Invalid regex in rule {}: {}", cfg.id, pattern))?)
+            Some(
+                regex::Regex::new(&pattern)
+                    .with_context(|| format!("Invalid regex in rule {}: {}", cfg.id, pattern))?,
+            )
         } else {
             None
         };
@@ -874,8 +885,10 @@ fn values_could_overlap(a: &Condition, b: &Condition) -> bool {
         }
         // For numeric comparisons, ranges could overlap but we can't easily determine
         // without full range analysis. Be conservative: same field = potential overlap.
-        (Operator::Gt | Operator::Gte | Operator::Lt | Operator::Lte,
-         Operator::Gt | Operator::Gte | Operator::Lt | Operator::Lte) => true,
+        (
+            Operator::Gt | Operator::Gte | Operator::Lt | Operator::Lte,
+            Operator::Gt | Operator::Gte | Operator::Lt | Operator::Lte,
+        ) => true,
         // In/NotIn — conservative: could overlap
         (Operator::In, _) | (_, Operator::In) => true,
         // Default: different operators on same field — not enough info to determine
@@ -916,8 +929,14 @@ fn operator_name(op: &Operator) -> &'static str {
 /// Check if two decisions contradict each other.
 /// Contradiction = one allows traffic and the other blocks it.
 fn decisions_contradict(a: &EnforcementDecision, b: &EnforcementDecision) -> bool {
-    let a_allows = matches!(a, EnforcementDecision::Allow | EnforcementDecision::AuditOnly { .. });
-    let b_allows = matches!(b, EnforcementDecision::Allow | EnforcementDecision::AuditOnly { .. });
+    let a_allows = matches!(
+        a,
+        EnforcementDecision::Allow | EnforcementDecision::AuditOnly { .. }
+    );
+    let b_allows = matches!(
+        b,
+        EnforcementDecision::Allow | EnforcementDecision::AuditOnly { .. }
+    );
     let a_blocks = matches!(
         a,
         EnforcementDecision::Deny { .. } | EnforcementDecision::RequireApproval { .. }
@@ -964,9 +983,18 @@ mod tests {
             compiled_regex: None,
         };
 
-        let op = make_operation("gvm.payment.charge", Sensitivity::High, ResourceTier::External);
+        let op = make_operation(
+            "gvm.payment.charge",
+            Sensitivity::High,
+            ResourceTier::External,
+        );
         let field_val = resolve_field(&cond.field, &op);
-        assert!(evaluate_condition(&cond.operator, &field_val, &cond.value, &cond.compiled_regex));
+        assert!(evaluate_condition(
+            &cond.operator,
+            &field_val,
+            &cond.value,
+            &cond.compiled_regex
+        ));
     }
 
     #[test]
@@ -980,7 +1008,12 @@ mod tests {
 
         let op = make_operation("gvm.storage.read", Sensitivity::Low, ResourceTier::Internal);
         let field_val = resolve_field(&cond.field, &op);
-        assert!(evaluate_condition(&cond.operator, &field_val, &cond.value, &cond.compiled_regex));
+        assert!(evaluate_condition(
+            &cond.operator,
+            &field_val,
+            &cond.value,
+            &cond.compiled_regex
+        ));
     }
 
     #[test]
@@ -992,13 +1025,22 @@ mod tests {
             compiled_regex: None,
         };
 
-        let mut op = make_operation("gvm.payment.refund", Sensitivity::High, ResourceTier::External);
+        let mut op = make_operation(
+            "gvm.payment.refund",
+            Sensitivity::High,
+            ResourceTier::External,
+        );
         op.context
             .attributes
             .insert("amount".to_string(), serde_json::json!(1000));
 
         let field_val = resolve_field(&cond.field, &op);
-        assert!(evaluate_condition(&cond.operator, &field_val, &cond.value, &cond.compiled_regex));
+        assert!(evaluate_condition(
+            &cond.operator,
+            &field_val,
+            &cond.value,
+            &cond.compiled_regex
+        ));
     }
 
     // ─── Conflict Detection Tests ───
@@ -1038,7 +1080,9 @@ mod tests {
 
         let warnings = validate_conflicts(&rules, &HashMap::new(), &HashMap::new());
         assert!(
-            warnings.iter().any(|w| w.kind == WarningKind::DuplicatePriority),
+            warnings
+                .iter()
+                .any(|w| w.kind == WarningKind::DuplicatePriority),
             "should detect duplicate priority"
         );
     }
@@ -1078,7 +1122,9 @@ mod tests {
 
         let warnings = validate_conflicts(&rules, &HashMap::new(), &HashMap::new());
         assert!(
-            warnings.iter().any(|w| w.kind == WarningKind::ContradictoryDecision),
+            warnings
+                .iter()
+                .any(|w| w.kind == WarningKind::ContradictoryDecision),
             "should detect contradictory decisions on same conditions"
         );
     }
@@ -1121,7 +1167,9 @@ mod tests {
 
         let warnings = validate_conflicts(&global, &tenant_rules, &HashMap::new());
         assert!(
-            warnings.iter().any(|w| w.kind == WarningKind::IneffectiveRule),
+            warnings
+                .iter()
+                .any(|w| w.kind == WarningKind::IneffectiveRule),
             "should detect tenant Allow overridden by global Deny"
         );
     }
@@ -1198,7 +1246,9 @@ mod tests {
         let warnings = validate_conflicts(&rules, &HashMap::new(), &HashMap::new());
         // Unconditional catch-all (Allow) + specific Deny = contradictory
         assert!(
-            warnings.iter().any(|w| w.kind == WarningKind::ContradictoryDecision),
+            warnings
+                .iter()
+                .any(|w| w.kind == WarningKind::ContradictoryDecision),
             "unconditional Allow rule should contradict specific Deny"
         );
     }
@@ -1238,7 +1288,9 @@ mod tests {
 
         let warnings = validate_conflicts(&rules, &HashMap::new(), &HashMap::new());
         assert!(
-            warnings.iter().any(|w| w.kind == WarningKind::ContradictoryDecision),
+            warnings
+                .iter()
+                .any(|w| w.kind == WarningKind::ContradictoryDecision),
             "Eq 'gvm.payment.charge' should overlap with StartsWith 'gvm.payment'"
         );
     }
@@ -1299,6 +1351,9 @@ mod tests {
         );
         let (decision, rule_id) = engine.evaluate(&op);
         assert!(matches!(decision, EnforcementDecision::Deny { .. }));
-        assert_eq!(rule_id.expect("deny rule must produce matched_rule_id"), "deny-critical-delete");
+        assert_eq!(
+            rule_id.expect("deny rule must produce matched_rule_id"),
+            "deny-critical-delete"
+        );
     }
 }

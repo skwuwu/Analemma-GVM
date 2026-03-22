@@ -201,9 +201,7 @@ fn extract_anthropic(json: &serde_json::Value) -> Option<LLMTrace> {
         .map(|blocks| {
             blocks
                 .iter()
-                .filter(|block| {
-                    block.get("type").and_then(|t| t.as_str()) == Some("thinking")
-                })
+                .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("thinking"))
                 .filter_map(|block| block.get("thinking").and_then(|t| t.as_str()))
                 .collect::<Vec<_>>()
                 .join("\n---\n")
@@ -290,7 +288,10 @@ fn reconstruct_openai_sse(chunks: &[serde_json::Value]) -> Option<LLMTrace> {
     for chunk in chunks {
         // Capture model from any chunk
         if model.is_none() {
-            model = chunk.get("model").and_then(|v| v.as_str()).map(String::from);
+            model = chunk
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(String::from);
         }
 
         // Accumulate reasoning_content deltas
@@ -525,9 +526,7 @@ fn extract_gemini_usage(json: &serde_json::Value) -> Option<LLMUsage> {
     let usage = json.get("usageMetadata")?;
     Some(LLMUsage {
         prompt_tokens: usage.get("promptTokenCount").and_then(|v| v.as_u64()),
-        completion_tokens: usage
-            .get("candidatesTokenCount")
-            .and_then(|v| v.as_u64()),
+        completion_tokens: usage.get("candidatesTokenCount").and_then(|v| v.as_u64()),
         total_tokens: usage.get("totalTokenCount").and_then(|v| v.as_u64()),
     })
 }
@@ -550,10 +549,7 @@ mod tests {
             Some("gemini")
         );
         assert_eq!(identify_llm_provider("api.bank.com"), None);
-        assert_eq!(
-            identify_llm_provider("api.openai.com:443"),
-            Some("openai")
-        );
+        assert_eq!(identify_llm_provider("api.openai.com:443"), Some("openai"));
     }
 
     #[test]
@@ -576,9 +572,9 @@ mod tests {
         });
 
         // With raw storage enabled for test assertions
-        let trace = extract_thinking_trace_with_privacy(
-            "openai", body.to_string().as_bytes(), true,
-        ).expect("valid OpenAI response must parse");
+        let trace =
+            extract_thinking_trace_with_privacy("openai", body.to_string().as_bytes(), true)
+                .expect("valid OpenAI response must parse");
         assert_eq!(trace.provider, "openai");
         assert_eq!(trace.model.as_deref(), Some("o1-preview"));
         assert_eq!(
@@ -604,16 +600,19 @@ mod tests {
             }
         });
 
-        let trace = extract_thinking_trace_with_privacy(
-            "anthropic", body.to_string().as_bytes(), true,
-        ).expect("valid Anthropic response must parse");
+        let trace =
+            extract_thinking_trace_with_privacy("anthropic", body.to_string().as_bytes(), true)
+                .expect("valid Anthropic response must parse");
         assert_eq!(trace.provider, "anthropic");
         assert_eq!(trace.model.as_deref(), Some("claude-sonnet-4-20250514"));
         assert_eq!(
             trace.thinking.as_deref(),
             Some("First, I need to consider...")
         );
-        assert_eq!(trace.usage.as_ref().expect("usage").prompt_tokens, Some(200));
+        assert_eq!(
+            trace.usage.as_ref().expect("usage").prompt_tokens,
+            Some(200)
+        );
         // Anthropic: computed_total should work since both fields present
         assert_eq!(trace.usage.as_ref().unwrap().computed_total(), Some(300));
     }
@@ -637,14 +636,11 @@ mod tests {
             }
         });
 
-        let trace = extract_thinking_trace_with_privacy(
-            "gemini", body.to_string().as_bytes(), true,
-        ).expect("valid Gemini response must parse");
+        let trace =
+            extract_thinking_trace_with_privacy("gemini", body.to_string().as_bytes(), true)
+                .expect("valid Gemini response must parse");
         assert_eq!(trace.provider, "gemini");
-        assert_eq!(
-            trace.model.as_deref(),
-            Some("gemini-2.0-flash-thinking")
-        );
+        assert_eq!(trace.model.as_deref(), Some("gemini-2.0-flash-thinking"));
         assert_eq!(
             trace.thinking.as_deref(),
             Some("Reasoning through the problem...")
@@ -662,9 +658,9 @@ mod tests {
             "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
         });
 
-        let trace = extract_thinking_trace_with_privacy(
-            "openai", body.to_string().as_bytes(), true,
-        ).expect("valid OpenAI response must parse");
+        let trace =
+            extract_thinking_trace_with_privacy("openai", body.to_string().as_bytes(), true)
+                .expect("valid OpenAI response must parse");
         assert!(trace.thinking.is_none());
         assert_eq!(trace.usage.as_ref().expect("usage").total_tokens, Some(15));
     }
@@ -704,11 +700,15 @@ mod tests {
             "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
         });
 
-        let trace = extract_thinking_trace("openai", body.to_string().as_bytes())
-            .expect("must parse");
+        let trace =
+            extract_thinking_trace("openai", body.to_string().as_bytes()).expect("must parse");
         // Default mode: thinking is hashed, not raw
         let thinking = trace.thinking.as_deref().expect("must have thinking");
-        assert!(thinking.starts_with("sha256:"), "thinking must be hashed: {}", thinking);
+        assert!(
+            thinking.starts_with("sha256:"),
+            "thinking must be hashed: {}",
+            thinking
+        );
         assert!(!thinking.contains("secret reasoning"));
     }
 
@@ -725,9 +725,9 @@ mod tests {
             "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
         });
 
-        let trace = extract_thinking_trace_with_privacy(
-            "openai", body.to_string().as_bytes(), true,
-        ).expect("must parse");
+        let trace =
+            extract_thinking_trace_with_privacy("openai", body.to_string().as_bytes(), true)
+                .expect("must parse");
         assert_eq!(trace.thinking.as_deref(), Some("secret reasoning here"));
     }
 
@@ -742,7 +742,10 @@ mod tests {
 
         let t1 = extract_thinking_trace("openai", bytes.as_bytes()).unwrap();
         let t2 = extract_thinking_trace("openai", bytes.as_bytes()).unwrap();
-        assert_eq!(t1.thinking, t2.thinking, "same input must produce same hash");
+        assert_eq!(
+            t1.thinking, t2.thinking,
+            "same input must produce same hash"
+        );
     }
 
     #[test]
@@ -801,9 +804,8 @@ mod tests {
             "data: [DONE]\n\n",
         );
 
-        let trace = extract_thinking_trace_from_sse_with_privacy(
-            "openai", body.as_bytes(), true,
-        ).expect("must parse OpenAI SSE");
+        let trace = extract_thinking_trace_from_sse_with_privacy("openai", body.as_bytes(), true)
+            .expect("must parse OpenAI SSE");
         assert_eq!(trace.provider, "openai");
         assert_eq!(trace.model.as_deref(), Some("o1-preview"));
         assert_eq!(trace.thinking.as_deref(), Some("Let me think..."));
@@ -836,9 +838,9 @@ mod tests {
             "data: {\"type\":\"message_stop\"}\n\n",
         );
 
-        let trace = extract_thinking_trace_from_sse_with_privacy(
-            "anthropic", body.as_bytes(), true,
-        ).expect("must parse Anthropic SSE");
+        let trace =
+            extract_thinking_trace_from_sse_with_privacy("anthropic", body.as_bytes(), true)
+                .expect("must parse Anthropic SSE");
         assert_eq!(trace.provider, "anthropic");
         assert_eq!(trace.model.as_deref(), Some("claude-sonnet-4-20250514"));
         assert_eq!(trace.thinking.as_deref(), Some("First, consider..."));
@@ -858,9 +860,8 @@ mod tests {
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Final answer.\"}]}}],\"modelVersion\":\"gemini-2.0-flash-thinking\",\"usageMetadata\":{\"promptTokenCount\":50,\"candidatesTokenCount\":30,\"totalTokenCount\":80}}\n\n",
         );
 
-        let trace = extract_thinking_trace_from_sse_with_privacy(
-            "gemini", body.as_bytes(), true,
-        ).expect("must parse Gemini SSE");
+        let trace = extract_thinking_trace_from_sse_with_privacy("gemini", body.as_bytes(), true)
+            .expect("must parse Gemini SSE");
         assert_eq!(trace.provider, "gemini");
         assert_eq!(trace.thinking.as_deref(), Some("Thinking deeply..."));
         assert_eq!(trace.usage.as_ref().expect("usage").total_tokens, Some(80));
@@ -874,9 +875,8 @@ mod tests {
             "data: [DONE]\n\n",
         );
 
-        let trace = extract_thinking_trace_from_sse_with_privacy(
-            "openai", body.as_bytes(), true,
-        ).expect("must parse");
+        let trace = extract_thinking_trace_from_sse_with_privacy("openai", body.as_bytes(), true)
+            .expect("must parse");
         assert!(trace.thinking.is_none());
         assert_eq!(trace.usage.as_ref().expect("usage").total_tokens, Some(15));
     }
@@ -889,10 +889,12 @@ mod tests {
             "data: [DONE]\n\n",
         );
 
-        let trace = extract_thinking_trace_from_sse("openai", body.as_bytes())
-            .expect("must parse");
+        let trace = extract_thinking_trace_from_sse("openai", body.as_bytes()).expect("must parse");
         let thinking = trace.thinking.as_deref().expect("must have thinking");
-        assert!(thinking.starts_with("sha256:"), "SSE thinking must be hashed");
+        assert!(
+            thinking.starts_with("sha256:"),
+            "SSE thinking must be hashed"
+        );
         assert!(!thinking.contains("secret"));
     }
 

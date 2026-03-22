@@ -1,242 +1,277 @@
-# Network SRR rules — Layer 2 fallback defense for direct HTTP calls bypassing SDK
-
-# ── SSRF Prevention: IPv4 + IPv6 loopback/metadata/private ──
+# -- _default.toml --
+# GVM Default Ruleset
+# Applied when no skill-specific ruleset matches.
+# Unknown domains → Shadow cautious mode (Delay + audit log).
 
 [[rules]]
+pattern = "localhost/*"
 method = "*"
-pattern = "localhost/{any}"
-decision = { type = "Deny", reason = "SSRF: localhost access blocked" }
-description = "Block all localhost access (also catches IPv6 [::1] via normalization)"
-
-[[rules]]
-method = "*"
-pattern = "127.0.0.1/{any}"
-decision = { type = "Deny", reason = "SSRF: loopback access blocked" }
-description = "Block IPv4 loopback (also catches [::ffff:127.0.0.1] via normalization)"
-
-[[rules]]
-method = "*"
-pattern = "169.254.169.254/{any}"
-decision = { type = "Deny", reason = "SSRF: cloud metadata access blocked" }
-description = "Block cloud metadata (also catches [fd00:ec2::254] via normalization)"
-
-[[rules]]
-method = "*"
-pattern = "metadata.google.internal/{any}"
-decision = { type = "Deny", reason = "SSRF: GCP metadata access blocked" }
-description = "Block GCP metadata endpoint"
-
-# ── Deny rules (highest priority) ──
-
-[[rules]]
-method = "POST"
-pattern = "api.bank.com/transfer/{any}"
-decision = { type = "Deny", reason = "Wire transfer — blocked by proxy" }
-description = "Block all direct wire transfer attempts"
-
-[[rules]]
-method = "DELETE"
-pattern = "api.bank.com/audit-log/{any}"
-decision = { type = "Deny", reason = "Audit log deletion — blocked by proxy" }
-description = "Block audit trail deletion"
-
-[[rules]]
-method = "DELETE"
-pattern = "{host}.database.com/{any}"
-decision = { type = "Deny", reason = "Database deletion — blocked by proxy" }
-description = "Block all database delete operations"
-
-[[rules]]
-method = "DELETE"
-pattern = "api.internal.dev/database/{any}"
-decision = { type = "Deny", reason = "Database deletion — blocked by proxy" }
-description = "Block database drop operations"
-
-[[rules]]
-method = "POST"
-pattern = "evil-exfil.attacker.com/{any}"
-decision = { type = "Deny", reason = "External exfiltration — blocked by proxy" }
-description = "Block data exfiltration to known malicious hosts"
-
-[[rules]]
-method = "POST"
-pattern = "webhook.external-dump.com/{any}"
-decision = { type = "Deny", reason = "External data dump — blocked by proxy" }
-description = "Block data export to external dump services"
-
-# ── Delay rules (monitored operations) ──
-
-[[rules]]
-method = "POST"
-pattern = "api.slack.com/{any}"
-decision = { type = "Delay", milliseconds = 300 }
-description = "Delay Slack message sends for review window"
-
-[[rules]]
-method = "POST"
-pattern = "gmail.googleapis.com/{any}"
-decision = { type = "Delay", milliseconds = 300 }
-description = "Delay Gmail sends for review window"
-
-[[rules]]
-method = "POST"
-pattern = "api.internal.dev/deployments/{any}"
-decision = { type = "Delay", milliseconds = 300 }
-description = "Delay deployments for review window"
-
-# ── Allow rules (safe operations) ──
-
-[[rules]]
-method = "GET"
-pattern = "gmail.googleapis.com/{any}"
 decision = { type = "Allow" }
-description = "Gmail inbox read — IC-1 instant"
+reason = "Localhost traffic (local tools, canvas, obsidian)"
 
 [[rules]]
-method = "GET"
-pattern = "api.bank.com/{any}"
-decision = { type = "Allow" }
-description = "Bank API reads — IC-1 instant"
-
-[[rules]]
-method = "GET"
-pattern = "api.internal.dev/deployments/{any}"
-decision = { type = "Allow" }
-description = "Deployment status checks — IC-1 instant"
-
-[[rules]]
-method = "GET"
-pattern = "api.internal.dev/analytics/{any}"
-decision = { type = "Allow" }
-description = "Analytics queries — IC-1 instant"
-
-# ── Critical reads blocked ──
-
-[[rules]]
-method = "GET"
-pattern = "api.internal.dev/config/{any}"
-decision = { type = "Deny", reason = "Config/secret file access — blocked by proxy" }
-description = "Block access to config files containing secrets"
-
-# ── Delete Gmail blocked ──
-
-[[rules]]
-method = "DELETE"
-pattern = "gmail.googleapis.com/{any}"
-decision = { type = "Deny", reason = "Email deletion — blocked by proxy" }
-description = "Block all email deletion operations"
-
-# ── LLM Provider Control ──
-
-# Approved models only — unapproved models on the same endpoint are denied.
-# SRR first-match order: model-specific rules must come before the catch-all.
-
-[[rules]]
-method = "POST"
-pattern = "api.openai.com/v1/chat/completions"
-payload_field = "model"
-payload_match = ["gpt-4o", "gpt-4-turbo", "gpt-4o-mini"]
-max_body_bytes = 65536
-decision = { type = "Delay", milliseconds = 300 }
-description = "Approved OpenAI chat models — IC-2 with audit"
-
-[[rules]]
-method = "POST"
-pattern = "api.openai.com/v1/chat/completions"
-decision = { type = "Deny", reason = "Unauthorized model. Only approved models (gpt-4o, gpt-4-turbo, gpt-4o-mini) are permitted." }
-description = "Block unapproved OpenAI chat models"
-
-[[rules]]
-method = "POST"
-pattern = "api.openai.com/v1/embeddings"
-decision = { type = "Delay", milliseconds = 300 }
-description = "OpenAI embeddings — IC-2 with audit"
-
-[[rules]]
-method = "POST"
-pattern = "api.openai.com/v1/{any}"
-decision = { type = "Deny", reason = "Only chat/completions and embeddings endpoints are authorized" }
-description = "Block other OpenAI endpoints (fine-tuning, images, audio, etc.)"
-
-[[rules]]
-method = "POST"
-pattern = "api.anthropic.com/v1/messages"
-payload_field = "model"
-payload_match = ["claude-sonnet-4-20250514", "claude-haiku-4-5-20251001"]
-max_body_bytes = 65536
-decision = { type = "Delay", milliseconds = 300 }
-description = "Approved Anthropic models — IC-2 with audit"
-
-[[rules]]
-method = "POST"
-pattern = "api.anthropic.com/v1/messages"
-decision = { type = "Deny", reason = "Unauthorized Anthropic model" }
-description = "Block unapproved Anthropic models"
-
-[[rules]]
-method = "POST"
-pattern = "api.anthropic.com/v1/{any}"
-decision = { type = "Deny", reason = "Only messages endpoint is authorized" }
-description = "Block other Anthropic endpoints"
-
-# Unauthorized LLM providers
-[[rules]]
-method = "POST"
-pattern = "api.together.ai/{any}"
-decision = { type = "Deny", reason = "Unauthorized LLM provider" }
-description = "Block Together AI"
-
-[[rules]]
-method = "POST"
-pattern = "api.groq.com/{any}"
-decision = { type = "Deny", reason = "Unauthorized LLM provider" }
-description = "Block Groq"
-
-[[rules]]
-method = "POST"
-pattern = "generativelanguage.googleapis.com/{any}"
-decision = { type = "Deny", reason = "Unauthorized LLM provider" }
-description = "Block Google Gemini direct API"
-
-[[rules]]
-method = "POST"
-pattern = "api.cohere.ai/{any}"
-decision = { type = "Deny", reason = "Unauthorized LLM provider" }
-description = "Block Cohere"
-
-[[rules]]
-method = "POST"
-pattern = "api.mistral.ai/{any}"
-decision = { type = "Deny", reason = "Unauthorized LLM provider" }
-description = "Block Mistral"
-
-[[rules]]
-method = "POST"
-pattern = "api.replicate.com/{any}"
-decision = { type = "Deny", reason = "Unauthorized LLM provider" }
-description = "Block Replicate"
-
-# ── Payload Inspection (GraphQL/gRPC defense) ──
-
-[[rules]]
-method = "POST"
-pattern = "api.bank.com/graphql"
-payload_field = "operationName"
-payload_match = ["TransferFunds", "DeleteAccount", "ModifyPermissions"]
-max_body_bytes = 65536
-decision = { type = "Deny", reason = "Dangerous GraphQL operation" }
-description = "Block high-risk GraphQL operations on banking API"
-
-[[rules]]
-method = "POST"
-pattern = "api.bank.com/graphql"
-decision = { type = "Delay", milliseconds = 300 }
-description = "Default delay for non-dangerous GraphQL operations"
-
-# ── Default-to-Caution (catch-all) ──
-
-[[rules]]
+pattern = "127.0.0.1/*"
 method = "*"
-pattern = "{any}"
+decision = { type = "Allow" }
+reason = "Loopback traffic"
+
+# Default-to-Caution: unknown domains get delayed and logged.
+# Review logs with `gvm audit list` to discover new domains,
+# then add explicit rules or install a skill-specific ruleset.
+
+# -- github.toml --
+# GVM Ruleset: GitHub
+# Covers: github skill, gh-issues skill, coding-agent skill
+# Domains: api.github.com
+
+[[rules]]
+pattern = "api.github.com"
+path_regex = "^/repos/[^/]+/[^/]+/pulls$"
+method = "GET"
+decision = { type = "Allow" }
+reason = "List pull requests (read-only)"
+
+[[rules]]
+pattern = "api.github.com"
+path_regex = "^/repos/[^/]+/[^/]+/pulls/.*"
+method = "GET"
+decision = { type = "Allow" }
+reason = "Get pull request details (read-only)"
+
+[[rules]]
+pattern = "api.github.com"
+path_regex = "^/repos/[^/]+/[^/]+/issues$"
+method = "GET"
+decision = { type = "Allow" }
+reason = "List issues (read-only)"
+
+[[rules]]
+pattern = "api.github.com"
+path_regex = "^/repos/[^/]+/[^/]+/issues/.*"
+method = "GET"
+decision = { type = "Allow" }
+reason = "Get issue details (read-only)"
+
+[[rules]]
+pattern = "api.github.com"
+path_regex = "^/repos/[^/]+/[^/]+/actions/runs$"
+method = "GET"
+decision = { type = "Allow" }
+reason = "List CI runs (read-only)"
+
+[[rules]]
+pattern = "api.github.com"
+path_regex = "^/repos/[^/]+/[^/]+/commits$"
+method = "GET"
+decision = { type = "Allow" }
+reason = "List commits (read-only)"
+
+[[rules]]
+pattern = "api.github.com"
+path_regex = "^/repos/[^/]+/[^/]+/labels$"
+method = "GET"
+decision = { type = "Allow" }
+reason = "List labels (read-only)"
+
+[[rules]]
+pattern = "api.github.com"
+path_regex = "^/repos/[^/]+/[^/]+/contents/.*"
+method = "GET"
+decision = { type = "Allow" }
+reason = "Read file contents (read-only)"
+
+# Write operations -- Delay for audit trail
+[[rules]]
+pattern = "api.github.com"
+path_regex = "^/repos/[^/]+/[^/]+/issues$"
+method = "POST"
 decision = { type = "Delay", milliseconds = 300 }
-description = "Default-to-Caution: unregistered URLs get 300ms delay"
+reason = "Create issue (write -- delayed for audit)"
+
+[[rules]]
+pattern = "api.github.com"
+path_regex = "^/repos/[^/]+/[^/]+/issues/[^/]+/comments$"
+method = "POST"
+decision = { type = "Delay", milliseconds = 300 }
+reason = "Add comment (write -- delayed for audit)"
+
+[[rules]]
+pattern = "api.github.com"
+path_regex = "^/repos/[^/]+/[^/]+/pulls$"
+method = "POST"
+decision = { type = "Delay", milliseconds = 300 }
+reason = "Create pull request (write -- delayed for audit)"
+
+[[rules]]
+pattern = "api.github.com"
+path_regex = "^/repos/[^/]+/[^/]+/issues/.*"
+method = "PATCH"
+decision = { type = "Delay", milliseconds = 300 }
+reason = "Update issue/PR (write -- delayed for audit)"
+
+# Deny dangerous operations
+[[rules]]
+pattern = "api.github.com"
+path_regex = "^/repos/[^/]+/[^/]+/git/refs/.*"
+method = "DELETE"
+decision = { type = "Deny", reason = "Delete branch (destructive -- blocked)" }
+
+[[rules]]
+pattern = "api.github.com"
+path_regex = "^/repos/[^/]+/[^/]+/pulls/[^/]+/merge$"
+method = "PUT"
+decision = { type = "Deny", reason = "PR merge blocked (manual only)" }
+description = "GitHub: PR merge blocked"
+
+[[rules]]
+pattern = "api.github.com"
+path_regex = "^/repos/[^/]+$"
+method = "DELETE"
+decision = { type = "Deny", reason = "Repository deletion blocked" }
+description = "GitHub: repo delete blocked"
+
+# -- slack.toml --
+# GVM Ruleset: Slack
+# Covers: slack skill
+# Domains: slack.com
+
+# Read operations -- Allow
+[[rules]]
+pattern = "slack.com/api/conversations.history"
+method = "POST"
+decision = { type = "Allow" }
+reason = "Read channel messages (read-only)"
+
+[[rules]]
+pattern = "slack.com/api/conversations.list"
+method = "GET"
+decision = { type = "Allow" }
+reason = "List channels (read-only)"
+
+[[rules]]
+pattern = "slack.com/api/users.info"
+method = "GET"
+decision = { type = "Allow" }
+reason = "Get user info (read-only)"
+
+[[rules]]
+pattern = "slack.com/api/emoji.list"
+method = "GET"
+decision = { type = "Allow" }
+reason = "List emoji (read-only)"
+
+[[rules]]
+pattern = "slack.com/api/reactions.get"
+method = "GET"
+decision = { type = "Allow" }
+reason = "Get reactions (read-only)"
+
+[[rules]]
+pattern = "slack.com/api/pins.list"
+method = "GET"
+decision = { type = "Allow" }
+reason = "List pins (read-only)"
+
+# Write operations -- Delay
+[[rules]]
+pattern = "slack.com/api/chat.postMessage"
+method = "POST"
+decision = { type = "Delay", milliseconds = 500 }
+reason = "Send message (write -- delayed for audit)"
+
+[[rules]]
+pattern = "slack.com/api/reactions.add"
+method = "POST"
+decision = { type = "Allow" }
+reason = "Add reaction (low-risk write)"
+
+[[rules]]
+pattern = "slack.com/api/pins.add"
+method = "POST"
+decision = { type = "Delay", milliseconds = 300 }
+reason = "Pin message (write -- delayed for audit)"
+
+# Destructive -- Deny
+[[rules]]
+pattern = "slack.com/api/chat.delete"
+method = "POST"
+decision = { type = "Deny", reason = "Delete message (destructive -- blocked)" }
+
+[[rules]]
+pattern = "slack.com/api/chat.update"
+method = "POST"
+decision = { type = "Delay", milliseconds = 1000 }
+reason = "Edit message (write -- 1s delay for audit)"
+
+[[rules]]
+pattern = "slack.com/api/conversations.archive"
+method = "POST"
+decision = { type = "Deny", reason = "Channel archive blocked" }
+description = "Slack: archive channel blocked"
+
+[[rules]]
+pattern = "slack.com/api/conversations.kick"
+method = "POST"
+decision = { type = "Deny", reason = "Channel kick blocked" }
+description = "Slack: kick user blocked"
+
+[[rules]]
+pattern = "slack.com/api/files.upload"
+method = "POST"
+decision = { type = "Delay", milliseconds = 3000 }
+description = "Slack: file upload (3s delay)"
+
+# -- web-browsing.toml --
+# GVM Ruleset: Web Browsing & Search
+# Covers: brave-search, firecrawl, tavily, xurl, web_search/web_fetch tools
+# Search APIs allowed. Arbitrary POST to unknown domains handled by Shadow Mode.
+
+# ── Brave Search ──
+
+[[rules]]
+pattern = "api.search.brave.com/*"
+method = "GET"
+decision = { type = "Allow" }
+description = "Brave Search: query"
+
+# ── Firecrawl ──
+
+[[rules]]
+pattern = "api.firecrawl.dev/v1/scrape"
+method = "POST"
+decision = { type = "Allow" }
+description = "Firecrawl: scrape page"
+
+[[rules]]
+pattern = "api.firecrawl.dev/v1/crawl"
+method = "POST"
+decision = { type = "Delay", milliseconds = 1000 }
+description = "Firecrawl: crawl site (1s delay)"
+
+[[rules]]
+pattern = "api.firecrawl.dev/v1/crawl/*"
+method = "GET"
+decision = { type = "Allow" }
+description = "Firecrawl: check crawl status"
+
+# ── Tavily ──
+
+[[rules]]
+pattern = "api.tavily.com/search"
+method = "POST"
+decision = { type = "Allow" }
+description = "Tavily: search"
+
+[[rules]]
+pattern = "api.tavily.com/extract"
+method = "POST"
+decision = { type = "Allow" }
+description = "Tavily: extract content"
+
+# ── Serper (Google Search API) ──
+
+[[rules]]
+pattern = "google.serper.dev/search"
+method = "POST"
+decision = { type = "Allow" }
+description = "Serper: Google search"

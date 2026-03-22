@@ -233,13 +233,9 @@ fn bench_vault(c: &mut Criterion) {
 
     let ledger = rt.block_on(async {
         Arc::new(
-            Ledger::new(
-                &wal_path,
-                "nats://localhost:4222",
-                "gvm-bench",
-            )
-            .await
-            .expect("ledger must initialize with valid WAL path"),
+            Ledger::new(&wal_path, "nats://localhost:4222", "gvm-bench")
+                .await
+                .expect("ledger must initialize with valid WAL path"),
         )
     });
 
@@ -259,16 +255,24 @@ fn bench_vault(c: &mut Criterion) {
             BenchmarkId::new("write_read_roundtrip_bytes", size),
             &plaintext,
             |b, pt| {
-                b.to_async(tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench iteration"))
-                    .iter(|| {
-                        let v = v.clone();
-                        let pt = pt.clone();
-                        async move {
-                            v.write("bench-key", &pt, "bench-agent").await.expect("vault write must succeed with valid key and data");
-                            let result = v.read("bench-key", "bench-agent").await.expect("vault read must succeed for previously written key");
-                            black_box(result);
-                        }
-                    });
+                b.to_async(
+                    tokio::runtime::Runtime::new()
+                        .expect("tokio runtime must initialize for bench iteration"),
+                )
+                .iter(|| {
+                    let v = v.clone();
+                    let pt = pt.clone();
+                    async move {
+                        v.write("bench-key", &pt, "bench-agent")
+                            .await
+                            .expect("vault write must succeed with valid key and data");
+                        let result = v
+                            .read("bench-key", "bench-agent")
+                            .await
+                            .expect("vault read must succeed for previously written key");
+                        black_box(result);
+                    }
+                });
             },
         );
     }
@@ -285,50 +289,56 @@ fn bench_wal(c: &mut Criterion) {
 
     // Single durable append (fsync)
     group.bench_function("durable_append_fsync", |b| {
-        b.to_async(tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench iteration"))
-            .iter_custom(|iters| async move {
-                let tmp_dir = tempfile::tempdir().expect("temp directory must be creatable for bench setup");
-                let wal_path = tmp_dir.path().join("bench_wal.log");
-                let ledger = Ledger::new(
-                    &wal_path,
-                    "nats://localhost:4222",
-                    "gvm-bench",
-                )
+        b.to_async(
+            tokio::runtime::Runtime::new()
+                .expect("tokio runtime must initialize for bench iteration"),
+        )
+        .iter_custom(|iters| async move {
+            let tmp_dir =
+                tempfile::tempdir().expect("temp directory must be creatable for bench setup");
+            let wal_path = tmp_dir.path().join("bench_wal.log");
+            let ledger = Ledger::new(&wal_path, "nats://localhost:4222", "gvm-bench")
                 .await
                 .expect("ledger must initialize with valid WAL path");
 
-                let start = std::time::Instant::now();
-                for i in 0..iters {
-                    let event = make_test_event(&i.to_string());
-                    ledger.append_durable(&event).await.expect("durable append must succeed for valid event");
-                }
-                start.elapsed()
-            });
+            let start = std::time::Instant::now();
+            for i in 0..iters {
+                let event = make_test_event(&i.to_string());
+                ledger
+                    .append_durable(&event)
+                    .await
+                    .expect("durable append must succeed for valid event");
+            }
+            start.elapsed()
+        });
     });
 
     // Batch of 100 sequential appends
     group.bench_function("100_sequential_appends", |b| {
-        b.to_async(tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench iteration"))
-            .iter_custom(|iters| async move {
-                let tmp_dir = tempfile::tempdir().expect("temp directory must be creatable for bench setup");
-                let wal_path = tmp_dir.path().join("bench_wal.log");
-                let ledger = Ledger::new(
-                    &wal_path,
-                    "nats://localhost:4222",
-                    "gvm-bench",
-                )
+        b.to_async(
+            tokio::runtime::Runtime::new()
+                .expect("tokio runtime must initialize for bench iteration"),
+        )
+        .iter_custom(|iters| async move {
+            let tmp_dir =
+                tempfile::tempdir().expect("temp directory must be creatable for bench setup");
+            let wal_path = tmp_dir.path().join("bench_wal.log");
+            let ledger = Ledger::new(&wal_path, "nats://localhost:4222", "gvm-bench")
                 .await
                 .expect("ledger must initialize with valid WAL path");
 
-                let start = std::time::Instant::now();
-                for _ in 0..iters {
-                    for i in 0..100 {
-                        let event = make_test_event(&i.to_string());
-                        ledger.append_durable(&event).await.expect("durable append must succeed for valid event");
-                    }
+            let start = std::time::Instant::now();
+            for _ in 0..iters {
+                for i in 0..100 {
+                    let event = make_test_event(&i.to_string());
+                    ledger
+                        .append_durable(&event)
+                        .await
+                        .expect("durable append must succeed for valid event");
                 }
-                start.elapsed()
-            });
+            }
+            start.elapsed()
+        });
     });
 
     group.finish();
@@ -386,8 +396,7 @@ fn bench_classification(c: &mut Criterion) {
         let payload = br#"{"to":"user@example.com","subject":"Hello","body":"Test message"}"#;
         b.iter(|| {
             let (policy_decision, _) = policy.evaluate(&op);
-            let srr_decision =
-                srr.check("POST", "smtp.gmail.com", "/send", Some(payload));
+            let srr_decision = srr.check("POST", "smtp.gmail.com", "/send", Some(payload));
             let final_decision = max_strict(policy_decision, srr_decision.decision);
             black_box(final_decision);
         });
@@ -408,30 +417,39 @@ fn bench_wal_group_commit(c: &mut Criterion) {
             BenchmarkId::new("concurrent_appends", concurrency),
             &concurrency,
             |b, &n| {
-                b.to_async(tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench iteration"))
-                    .iter_custom(|iters| async move {
-                        let tmp_dir = tempfile::tempdir().expect("temp directory must be creatable for bench setup");
-                        let wal_path = tmp_dir.path().join("bench_gc_wal.log");
-                        let ledger = Arc::new(
-                            Ledger::new(&wal_path, "", "").await.expect("ledger must initialize with valid WAL path"),
-                        );
+                b.to_async(
+                    tokio::runtime::Runtime::new()
+                        .expect("tokio runtime must initialize for bench iteration"),
+                )
+                .iter_custom(|iters| async move {
+                    let tmp_dir = tempfile::tempdir()
+                        .expect("temp directory must be creatable for bench setup");
+                    let wal_path = tmp_dir.path().join("bench_gc_wal.log");
+                    let ledger = Arc::new(
+                        Ledger::new(&wal_path, "", "")
+                            .await
+                            .expect("ledger must initialize with valid WAL path"),
+                    );
 
-                        let start = std::time::Instant::now();
-                        for _ in 0..iters {
-                            let mut handles = Vec::with_capacity(n);
-                            for i in 0..n {
-                                let ledger = ledger.clone();
-                                handles.push(tokio::spawn(async move {
-                                    let event = make_test_event(&i.to_string());
-                                    ledger.append_durable(&event).await.expect("concurrent durable append must succeed");
-                                }));
-                            }
-                            for h in handles {
-                                h.await.expect("spawned task must complete without panic");
-                            }
+                    let start = std::time::Instant::now();
+                    for _ in 0..iters {
+                        let mut handles = Vec::with_capacity(n);
+                        for i in 0..n {
+                            let ledger = ledger.clone();
+                            handles.push(tokio::spawn(async move {
+                                let event = make_test_event(&i.to_string());
+                                ledger
+                                    .append_durable(&event)
+                                    .await
+                                    .expect("concurrent durable append must succeed");
+                            }));
                         }
-                        start.elapsed()
-                    });
+                        for h in handles {
+                            h.await.expect("spawned task must complete without panic");
+                        }
+                    }
+                    start.elapsed()
+                });
             },
         );
     }
@@ -486,14 +504,11 @@ fn bench_srr_scale(c: &mut Criterion) {
 
         // Middle rule match
         let mid_host = format!("host-{}.example.com", rule_count / 2);
-        group.bench_function(
-            BenchmarkId::new("mid_rule_match", rule_count),
-            |b| {
-                b.iter(|| {
-                    black_box(srr.check("POST", &mid_host, "/test", None));
-                });
-            },
-        );
+        group.bench_function(BenchmarkId::new("mid_rule_match", rule_count), |b| {
+            b.iter(|| {
+                black_box(srr.check("POST", &mid_host, "/test", None));
+            });
+        });
     }
 
     group.finish();
@@ -509,7 +524,8 @@ fn bench_policy_scale(c: &mut Criterion) {
     for rule_count in [100, 500, 1_000] {
         let dir = tempfile::tempdir().expect("temp directory must be creatable for bench setup");
         let policy_dir = dir.path().join("policies");
-        std::fs::create_dir(&policy_dir).expect("policy subdirectory must be creatable in temp dir");
+        std::fs::create_dir(&policy_dir)
+            .expect("policy subdirectory must be creatable in temp dir");
 
         let mut toml = String::new();
         for i in 0..rule_count {
@@ -541,30 +557,38 @@ type = "Allow"
 "#,
         );
 
-        std::fs::write(policy_dir.join("global.toml"), &toml).expect("generated policy config must be writable to temp file");
-        let engine = PolicyEngine::load(&policy_dir).expect("generated policy config must parse as valid rules");
+        std::fs::write(policy_dir.join("global.toml"), &toml)
+            .expect("generated policy config must be writable to temp file");
+        let engine = PolicyEngine::load(&policy_dir)
+            .expect("generated policy config must parse as valid rules");
 
         // Best case: first rule match
-        let op_first = make_operation("gvm.test.op0", Sensitivity::Low, ResourceTier::Internal, None, "bench");
-        group.bench_function(
-            BenchmarkId::new("first_rule_match", rule_count),
-            |b| {
-                b.iter(|| {
-                    black_box(engine.evaluate(&op_first));
-                });
-            },
+        let op_first = make_operation(
+            "gvm.test.op0",
+            Sensitivity::Low,
+            ResourceTier::Internal,
+            None,
+            "bench",
         );
+        group.bench_function(BenchmarkId::new("first_rule_match", rule_count), |b| {
+            b.iter(|| {
+                black_box(engine.evaluate(&op_first));
+            });
+        });
 
         // Worst case: no match, falls through
-        let op_nomatch = make_operation("gvm.nomatch.ever", Sensitivity::Low, ResourceTier::Internal, None, "bench");
-        group.bench_function(
-            BenchmarkId::new("fallthrough_all", rule_count),
-            |b| {
-                b.iter(|| {
-                    black_box(engine.evaluate(&op_nomatch));
-                });
-            },
+        let op_nomatch = make_operation(
+            "gvm.nomatch.ever",
+            Sensitivity::Low,
+            ResourceTier::Internal,
+            None,
+            "bench",
         );
+        group.bench_function(BenchmarkId::new("fallthrough_all", rule_count), |b| {
+            b.iter(|| {
+                black_box(engine.evaluate(&op_nomatch));
+            });
+        });
     }
 
     group.finish();
@@ -579,17 +603,20 @@ fn bench_ic2_delay_accuracy(c: &mut Criterion) {
     group.sample_size(10); // Fewer samples since each takes 300ms+
 
     group.bench_function("300ms_delay_accuracy", |b| {
-        b.to_async(tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench iteration"))
-            .iter(|| async {
-                let target = std::time::Duration::from_millis(300);
-                let start = std::time::Instant::now();
-                tokio::time::sleep(target).await;
-                let elapsed = start.elapsed();
-                let error_ms = (elapsed.as_millis() as i64 - 300).abs();
-                black_box(error_ms);
-                // In the benchmark, we're measuring the actual tokio::sleep accuracy
-                // which is what the proxy uses for IC-2 delays
-            });
+        b.to_async(
+            tokio::runtime::Runtime::new()
+                .expect("tokio runtime must initialize for bench iteration"),
+        )
+        .iter(|| async {
+            let target = std::time::Duration::from_millis(300);
+            let start = std::time::Instant::now();
+            tokio::time::sleep(target).await;
+            let elapsed = start.elapsed();
+            let error_ms = (elapsed.as_millis() as i64 - 300).abs();
+            black_box(error_ms);
+            // In the benchmark, we're measuring the actual tokio::sleep accuracy
+            // which is what the proxy uses for IC-2 delays
+        });
     });
 
     group.finish();
@@ -606,7 +633,11 @@ fn bench_vault_large(c: &mut Criterion) {
     let wal_path = tmp_dir.path().join("bench_vault_large.log");
 
     let ledger = rt.block_on(async {
-        Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger must initialize with valid WAL path"))
+        Arc::new(
+            Ledger::new(&wal_path, "", "")
+                .await
+                .expect("ledger must initialize with valid WAL path"),
+        )
     });
 
     let vault = Arc::new(Vault::new(ledger).expect("vault must initialize with valid ledger"));
@@ -622,16 +653,24 @@ fn bench_vault_large(c: &mut Criterion) {
             BenchmarkId::new("write_read_bytes", size),
             &plaintext,
             |b, pt| {
-                b.to_async(tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench iteration"))
-                    .iter(|| {
-                        let v = v.clone();
-                        let pt = pt.clone();
-                        async move {
-                            v.write("bench-large", &pt, "bench-agent").await.expect("vault write must succeed with valid key and data");
-                            let result = v.read("bench-large", "bench-agent").await.expect("vault read must succeed for previously written key");
-                            black_box(result);
-                        }
-                    });
+                b.to_async(
+                    tokio::runtime::Runtime::new()
+                        .expect("tokio runtime must initialize for bench iteration"),
+                )
+                .iter(|| {
+                    let v = v.clone();
+                    let pt = pt.clone();
+                    async move {
+                        v.write("bench-large", &pt, "bench-agent")
+                            .await
+                            .expect("vault write must succeed with valid key and data");
+                        let result = v
+                            .read("bench-large", "bench-agent")
+                            .await
+                            .expect("vault read must succeed for previously written key");
+                        black_box(result);
+                    }
+                });
             },
         );
     }
@@ -716,14 +755,18 @@ fn bench_wasm_vs_native(c: &mut Criterion) {
     let native_engine = WasmEngine::native();
     group.bench_function("native_deny", |b| {
         b.iter(|| {
-            let resp = native_engine.evaluate(black_box(&req_deny)).expect("native engine must evaluate valid deny request");
+            let resp = native_engine
+                .evaluate(black_box(&req_deny))
+                .expect("native engine must evaluate valid deny request");
             black_box(resp);
         });
     });
 
     group.bench_function("native_allow", |b| {
         b.iter(|| {
-            let resp = native_engine.evaluate(black_box(&req_allow)).expect("native engine must evaluate valid allow request");
+            let resp = native_engine
+                .evaluate(black_box(&req_allow))
+                .expect("native engine must evaluate valid allow request");
             black_box(resp);
         });
     });
@@ -731,19 +774,24 @@ fn bench_wasm_vs_native(c: &mut Criterion) {
     // ── Wasm evaluation (warm call — module already loaded) ──
     let wasm_path = Path::new("data/gvm_engine.wasm");
     if wasm_path.exists() {
-        let wasm_engine = WasmEngine::load(wasm_path).expect("wasm module must load from verified existing path");
+        let wasm_engine =
+            WasmEngine::load(wasm_path).expect("wasm module must load from verified existing path");
         assert!(wasm_engine.is_wasm(), "Wasm engine must be in Wasm mode");
 
         group.bench_function("wasm_deny", |b| {
             b.iter(|| {
-                let resp = wasm_engine.evaluate(black_box(&req_deny)).expect("wasm engine must evaluate valid deny request");
+                let resp = wasm_engine
+                    .evaluate(black_box(&req_deny))
+                    .expect("wasm engine must evaluate valid deny request");
                 black_box(resp);
             });
         });
 
         group.bench_function("wasm_allow", |b| {
             b.iter(|| {
-                let resp = wasm_engine.evaluate(black_box(&req_allow)).expect("wasm engine must evaluate valid allow request");
+                let resp = wasm_engine
+                    .evaluate(black_box(&req_allow))
+                    .expect("wasm engine must evaluate valid allow request");
                 black_box(resp);
             });
         });
@@ -765,7 +813,9 @@ fn bench_wasm_vs_native(c: &mut Criterion) {
         group.bench_function("e2e_with_wasm", |b| {
             b.iter(|| {
                 let srr_decision = srr.check("POST", "smtp.gmail.com", "/send", None);
-                let wasm_resp = wasm_engine.evaluate(black_box(&req_allow)).expect("wasm engine must evaluate valid request in e2e pipeline");
+                let wasm_resp = wasm_engine
+                    .evaluate(black_box(&req_allow))
+                    .expect("wasm engine must evaluate valid request in e2e pipeline");
                 let (wasm_decision, _) = WasmEngine::response_to_decision(&wasm_resp);
                 let final_d = max_strict(wasm_decision, srr_decision.decision);
                 black_box(final_d);
@@ -808,7 +858,11 @@ fn bench_vault_p99(c: &mut Criterion) {
     let wal_path = tmp_dir.path().join("bench_vault_p99.log");
 
     let ledger = rt.block_on(async {
-        Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger must initialize with valid WAL path"))
+        Arc::new(
+            Ledger::new(&wal_path, "", "")
+                .await
+                .expect("ledger must initialize with valid WAL path"),
+        )
     });
 
     let vault = Arc::new(Vault::new(ledger).expect("vault must initialize with valid ledger"));
@@ -825,15 +879,20 @@ fn bench_vault_p99(c: &mut Criterion) {
             BenchmarkId::new("write_only_bytes", size),
             &plaintext,
             |b, pt| {
-                b.to_async(tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench iteration"))
-                    .iter(|| {
-                        let v = v.clone();
-                        let pt = pt.clone();
-                        async move {
-                            v.write("bench-p99", &pt, "bench-agent").await.expect("vault write must succeed with valid key and data");
-                            black_box(());
-                        }
-                    });
+                b.to_async(
+                    tokio::runtime::Runtime::new()
+                        .expect("tokio runtime must initialize for bench iteration"),
+                )
+                .iter(|| {
+                    let v = v.clone();
+                    let pt = pt.clone();
+                    async move {
+                        v.write("bench-p99", &pt, "bench-agent")
+                            .await
+                            .expect("vault write must succeed with valid key and data");
+                        black_box(());
+                    }
+                });
             },
         );
     }
@@ -844,33 +903,43 @@ fn bench_vault_p99(c: &mut Criterion) {
     // Monolithic 256KB write
     let v = vault.clone();
     group.bench_function("monolithic_256kb", |b| {
-        b.to_async(tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench iteration"))
-            .iter(|| {
-                let v = v.clone();
-                let data = large_data.clone();
-                async move {
-                    v.write("bench-mono", &data, "bench-agent").await.expect("vault monolithic write must succeed with valid data");
-                    black_box(());
-                }
-            });
+        b.to_async(
+            tokio::runtime::Runtime::new()
+                .expect("tokio runtime must initialize for bench iteration"),
+        )
+        .iter(|| {
+            let v = v.clone();
+            let data = large_data.clone();
+            async move {
+                v.write("bench-mono", &data, "bench-agent")
+                    .await
+                    .expect("vault monolithic write must succeed with valid data");
+                black_box(());
+            }
+        });
     });
 
     // Chunked: 16 x 16KB writes
     let v = vault.clone();
     group.bench_function("chunked_16x16kb", |b| {
-        b.to_async(tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench iteration"))
-            .iter(|| {
-                let v = v.clone();
-                let data = large_data.clone();
-                async move {
-                    for i in 0..16 {
-                        let chunk = &data[i * 16384..(i + 1) * 16384];
-                        let key = format!("bench-chunk-{}", i);
-                        v.write(&key, chunk, "bench-agent").await.expect("vault chunked write must succeed with valid chunk data");
-                    }
-                    black_box(());
+        b.to_async(
+            tokio::runtime::Runtime::new()
+                .expect("tokio runtime must initialize for bench iteration"),
+        )
+        .iter(|| {
+            let v = v.clone();
+            let data = large_data.clone();
+            async move {
+                for i in 0..16 {
+                    let chunk = &data[i * 16384..(i + 1) * 16384];
+                    let key = format!("bench-chunk-{}", i);
+                    v.write(&key, chunk, "bench-agent")
+                        .await
+                        .expect("vault chunked write must succeed with valid chunk data");
                 }
-            });
+                black_box(());
+            }
+        });
     });
 
     group.finish();
@@ -918,7 +987,11 @@ fn bench_vault_contention_p99(c: &mut Criterion) {
     let wal_path = tmp_dir.path().join("bench_vault_contention.log");
 
     let ledger = rt.block_on(async {
-        Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger must initialize with valid WAL path"))
+        Arc::new(
+            Ledger::new(&wal_path, "", "")
+                .await
+                .expect("ledger must initialize with valid WAL path"),
+        )
     });
 
     let vault = Arc::new(Vault::new(ledger).expect("vault must initialize with valid ledger"));
@@ -940,35 +1013,41 @@ fn bench_vault_contention_p99(c: &mut Criterion) {
                 ),
                 &concurrency,
                 |b, &n| {
-                    b.to_async(tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench iteration"))
-                        .iter_custom(|iters| {
-                            let v = v.clone();
-                            let pt = plaintext.clone();
-                            async move {
-                                let mut total = std::time::Duration::ZERO;
-                                for _ in 0..iters {
-                                    let mut handles = Vec::with_capacity(n);
-                                    let start = std::time::Instant::now();
-                                    for i in 0..n {
-                                        let v = v.clone();
-                                        let pt = pt.clone();
-                                        handles.push(tokio::spawn(async move {
-                                            let key = format!("contention-{}", i);
-                                            v.write(&key, &pt, "bench-agent").await
-                                                .expect("vault write must succeed under contention");
-                                            let result = v.read(&key, "bench-agent").await
-                                                .expect("vault read must succeed under contention");
-                                            black_box(result);
-                                        }));
-                                    }
-                                    for h in handles {
-                                        h.await.expect("contention task must complete");
-                                    }
-                                    total += start.elapsed();
+                    b.to_async(
+                        tokio::runtime::Runtime::new()
+                            .expect("tokio runtime must initialize for bench iteration"),
+                    )
+                    .iter_custom(|iters| {
+                        let v = v.clone();
+                        let pt = plaintext.clone();
+                        async move {
+                            let mut total = std::time::Duration::ZERO;
+                            for _ in 0..iters {
+                                let mut handles = Vec::with_capacity(n);
+                                let start = std::time::Instant::now();
+                                for i in 0..n {
+                                    let v = v.clone();
+                                    let pt = pt.clone();
+                                    handles.push(tokio::spawn(async move {
+                                        let key = format!("contention-{}", i);
+                                        v.write(&key, &pt, "bench-agent")
+                                            .await
+                                            .expect("vault write must succeed under contention");
+                                        let result = v
+                                            .read(&key, "bench-agent")
+                                            .await
+                                            .expect("vault read must succeed under contention");
+                                        black_box(result);
+                                    }));
                                 }
-                                total
+                                for h in handles {
+                                    h.await.expect("contention task must complete");
+                                }
+                                total += start.elapsed();
                             }
-                        });
+                            total
+                        }
+                    });
                 },
             );
         }
@@ -979,35 +1058,41 @@ fn bench_vault_contention_p99(c: &mut Criterion) {
     let plaintext_16k: Vec<u8> = (0..16384).map(|i| (i % 256) as u8).collect();
 
     group.bench_function("p99_explicit_16kb_50writers", |b| {
-        b.to_async(tokio::runtime::Runtime::new().expect("tokio runtime must initialize for bench iteration"))
-            .iter(|| {
-                let v = v.clone();
-                let pt = plaintext_16k.clone();
-                async move {
-                    // Measure the slowest writer out of 50 concurrent writers
-                    let mut handles = Vec::with_capacity(50);
-                    for i in 0..50 {
-                        let v = v.clone();
-                        let pt = pt.clone();
-                        handles.push(tokio::spawn(async move {
-                            let start = std::time::Instant::now();
-                            let key = format!("p99-{}", i);
-                            v.write(&key, &pt, "bench-agent").await
-                                .expect("vault write must succeed");
-                            let _ = v.read(&key, "bench-agent").await
-                                .expect("vault read must succeed");
-                            start.elapsed()
-                        }));
-                    }
-                    let mut latencies = Vec::with_capacity(50);
-                    for h in handles {
-                        latencies.push(h.await.expect("p99 task must complete"));
-                    }
-                    latencies.sort();
-                    // Return p99 latency (index 49 of 50 = 98th percentile)
-                    black_box(latencies[latencies.len() - 1]);
+        b.to_async(
+            tokio::runtime::Runtime::new()
+                .expect("tokio runtime must initialize for bench iteration"),
+        )
+        .iter(|| {
+            let v = v.clone();
+            let pt = plaintext_16k.clone();
+            async move {
+                // Measure the slowest writer out of 50 concurrent writers
+                let mut handles = Vec::with_capacity(50);
+                for i in 0..50 {
+                    let v = v.clone();
+                    let pt = pt.clone();
+                    handles.push(tokio::spawn(async move {
+                        let start = std::time::Instant::now();
+                        let key = format!("p99-{}", i);
+                        v.write(&key, &pt, "bench-agent")
+                            .await
+                            .expect("vault write must succeed");
+                        let _ = v
+                            .read(&key, "bench-agent")
+                            .await
+                            .expect("vault read must succeed");
+                        start.elapsed()
+                    }));
                 }
-            });
+                let mut latencies = Vec::with_capacity(50);
+                for h in handles {
+                    latencies.push(h.await.expect("p99 task must complete"));
+                }
+                latencies.sort();
+                // Return p99 latency (index 49 of 50 = 98th percentile)
+                black_box(latencies[latencies.len() - 1]);
+            }
+        });
     });
 
     group.finish();
@@ -1076,19 +1161,20 @@ fn bench_wasm_cold_start(c: &mut Criterion) {
         b.iter(|| {
             let engine = WasmEngine::load(black_box(wasm_path))
                 .expect("wasm module must load from valid path");
-            let resp = engine.evaluate(black_box(&req))
+            let resp = engine
+                .evaluate(black_box(&req))
                 .expect("first evaluation must succeed");
             black_box(resp);
         });
     });
 
     // Warm evaluation baseline (for comparison with cold start)
-    let warm_engine = WasmEngine::load(wasm_path)
-        .expect("wasm module must load for warm baseline");
+    let warm_engine = WasmEngine::load(wasm_path).expect("wasm module must load for warm baseline");
 
     group.bench_function("warm_eval_baseline", |b| {
         b.iter(|| {
-            let resp = warm_engine.evaluate(black_box(&req))
+            let resp = warm_engine
+                .evaluate(black_box(&req))
                 .expect("warm evaluation must succeed");
             black_box(resp);
         });
@@ -1162,7 +1248,16 @@ fn bench_ebpf_setup(c: &mut Criterion) {
                     .args(["link", "del", "gvm-bench0"])
                     .output();
                 let _ = std::process::Command::new("ip")
-                    .args(["link", "add", "gvm-bench0", "type", "veth", "peer", "name", "gvm-bench1"])
+                    .args([
+                        "link",
+                        "add",
+                        "gvm-bench0",
+                        "type",
+                        "veth",
+                        "peer",
+                        "name",
+                        "gvm-bench1",
+                    ])
                     .output();
                 let _ = std::process::Command::new("ip")
                     .args(["link", "set", "gvm-bench0", "up"])
@@ -1179,44 +1274,110 @@ fn bench_ebpf_setup(c: &mut Criterion) {
                 // TCP to proxy
                 let _ = std::process::Command::new("tc")
                     .args([
-                        "filter", "add", "dev", "gvm-bench0", "ingress",
-                        "protocol", "ip", "prio", "1", "u32",
-                        "match", "ip", "protocol", "6", "0xff",
-                        "match", "ip", "dst", proxy_ip_str, "255.255.255.255",
-                        "match", "ip", "dport", "0x1f90", "0xffff",
-                        "action", "ok",
+                        "filter",
+                        "add",
+                        "dev",
+                        "gvm-bench0",
+                        "ingress",
+                        "protocol",
+                        "ip",
+                        "prio",
+                        "1",
+                        "u32",
+                        "match",
+                        "ip",
+                        "protocol",
+                        "6",
+                        "0xff",
+                        "match",
+                        "ip",
+                        "dst",
+                        proxy_ip_str,
+                        "255.255.255.255",
+                        "match",
+                        "ip",
+                        "dport",
+                        "0x1f90",
+                        "0xffff",
+                        "action",
+                        "ok",
                     ])
                     .output();
 
                 // UDP DNS
                 let _ = std::process::Command::new("tc")
                     .args([
-                        "filter", "add", "dev", "gvm-bench0", "ingress",
-                        "protocol", "ip", "prio", "2", "u32",
-                        "match", "ip", "protocol", "17", "0xff",
-                        "match", "ip", "dst", proxy_ip_str, "255.255.255.255",
-                        "match", "ip", "dport", "0x0035", "0xffff",
-                        "action", "ok",
+                        "filter",
+                        "add",
+                        "dev",
+                        "gvm-bench0",
+                        "ingress",
+                        "protocol",
+                        "ip",
+                        "prio",
+                        "2",
+                        "u32",
+                        "match",
+                        "ip",
+                        "protocol",
+                        "17",
+                        "0xff",
+                        "match",
+                        "ip",
+                        "dst",
+                        proxy_ip_str,
+                        "255.255.255.255",
+                        "match",
+                        "ip",
+                        "dport",
+                        "0x0035",
+                        "0xffff",
+                        "action",
+                        "ok",
                     ])
                     .output();
 
                 // ARP
                 let _ = std::process::Command::new("tc")
                     .args([
-                        "filter", "add", "dev", "gvm-bench0", "ingress",
-                        "protocol", "arp", "prio", "3", "u32",
-                        "match", "u32", "0", "0",
-                        "action", "ok",
+                        "filter",
+                        "add",
+                        "dev",
+                        "gvm-bench0",
+                        "ingress",
+                        "protocol",
+                        "arp",
+                        "prio",
+                        "3",
+                        "u32",
+                        "match",
+                        "u32",
+                        "0",
+                        "0",
+                        "action",
+                        "ok",
                     ])
                     .output();
 
                 // Drop all else
                 let _ = std::process::Command::new("tc")
                     .args([
-                        "filter", "add", "dev", "gvm-bench0", "ingress",
-                        "protocol", "all", "prio", "99", "u32",
-                        "match", "u32", "0", "0",
-                        "action", "drop",
+                        "filter",
+                        "add",
+                        "dev",
+                        "gvm-bench0",
+                        "ingress",
+                        "protocol",
+                        "all",
+                        "prio",
+                        "99",
+                        "u32",
+                        "match",
+                        "u32",
+                        "0",
+                        "0",
+                        "action",
+                        "drop",
                     ])
                     .output();
 
@@ -1245,7 +1406,16 @@ fn bench_ebpf_setup(c: &mut Criterion) {
                     .args(["link", "del", "gvm-bench0"])
                     .output();
                 let _ = std::process::Command::new("ip")
-                    .args(["link", "add", "gvm-bench0", "type", "veth", "peer", "name", "gvm-bench1"])
+                    .args([
+                        "link",
+                        "add",
+                        "gvm-bench0",
+                        "type",
+                        "veth",
+                        "peer",
+                        "name",
+                        "gvm-bench1",
+                    ])
                     .output();
                 let _ = std::process::Command::new("ip")
                     .args(["link", "set", "gvm-bench0", "up"])
@@ -1257,12 +1427,21 @@ fn bench_ebpf_setup(c: &mut Criterion) {
                     .args(["qdisc", "add", "dev", "gvm-bench0", "clsact"])
                     .output();
                 for (prio, args) in [
-                    ("1", vec!["protocol", "ip", "u32", "match", "ip", "protocol", "6", "0xff", "action", "ok"]),
-                    ("99", vec!["protocol", "all", "u32", "match", "u32", "0", "0", "action", "drop"]),
+                    (
+                        "1",
+                        vec![
+                            "protocol", "ip", "u32", "match", "ip", "protocol", "6", "0xff",
+                            "action", "ok",
+                        ],
+                    ),
+                    (
+                        "99",
+                        vec![
+                            "protocol", "all", "u32", "match", "u32", "0", "0", "action", "drop",
+                        ],
+                    ),
                 ] {
-                    let mut cmd_args = vec![
-                        "filter", "add", "dev", "gvm-bench0", "ingress",
-                    ];
+                    let mut cmd_args = vec!["filter", "add", "dev", "gvm-bench0", "ingress"];
                     cmd_args.push("prio");
                     cmd_args.push(prio);
                     cmd_args.extend(args.iter());

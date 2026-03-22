@@ -95,7 +95,8 @@ impl CheckpointRegistry {
         if step as usize >= MAX_CHECKPOINT_STEPS {
             anyhow::bail!(
                 "checkpoint step {} exceeds maximum ({})",
-                step, MAX_CHECKPOINT_STEPS
+                step,
+                MAX_CHECKPOINT_STEPS
             );
         }
 
@@ -107,18 +108,15 @@ impl CheckpointRegistry {
 
         // Validate agent count bound before inserting new agent
         if !trees.contains_key(agent_id) && trees.len() >= MAX_CHECKPOINT_AGENTS {
-            anyhow::bail!(
-                "checkpoint agent limit reached ({})",
-                MAX_CHECKPOINT_AGENTS
-            );
+            anyhow::bail!("checkpoint agent limit reached ({})", MAX_CHECKPOINT_AGENTS);
         }
 
-        let tree = trees.entry(agent_id.to_string()).or_insert_with(|| {
-            AgentCheckpointTree {
+        let tree = trees
+            .entry(agent_id.to_string())
+            .or_insert_with(|| AgentCheckpointTree {
                 leaves: Vec::new(),
                 merkle_root: String::new(),
-            }
-        });
+            });
 
         let step_idx = step as usize;
 
@@ -219,8 +217,7 @@ impl CheckpointRegistry {
                 };
             }
         };
-        let proof_verified =
-            merkle::verify_merkle_proof(&computed_hash, &proof, &tree.merkle_root);
+        let proof_verified = merkle::verify_merkle_proof(&computed_hash, &proof, &tree.merkle_root);
 
         if !content_verified || !proof_verified {
             tracing::warn!(
@@ -257,6 +254,7 @@ fn resolve_vault_agent_id(
     headers: &HeaderMap,
     declared_agent_id: &str,
 ) -> Result<String, Response<Body>> {
+    #![allow(clippy::result_large_err)]
     if let Some(ref jwt) = jwt_config {
         match auth::extract_bearer_token(headers) {
             Some(token) => match auth::verify_token(jwt, token) {
@@ -307,6 +305,7 @@ pub struct VaultReadResponse {
 
 /// Validate that an identifier does not contain the namespace separator `:`,
 /// preventing namespace traversal attacks (e.g., agent_id="admin:foo" + key="bar" → "admin:foo:bar").
+#[allow(clippy::result_large_err)]
 fn validate_vault_identifier(id: &str, field_name: &str) -> Result<(), Response<Body>> {
     if id.is_empty() {
         return Err(json_response(
@@ -362,7 +361,10 @@ pub async fn vault_write(
         .write(&scoped_key, body.value.as_bytes(), &agent_id)
         .await
     {
-        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"status": "ok", "key": key})),
+        Ok(()) => json_response(
+            StatusCode::OK,
+            &serde_json::json!({"status": "ok", "key": key}),
+        ),
         Err(e) => {
             tracing::error!(key = %key, agent = %agent_id, error = %e, "Vault write failed");
             json_response(
@@ -383,7 +385,10 @@ pub async fn vault_read(
     Path(key): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response<Body> {
-    let declared_agent_id = params.get("agent_id").map(|s| s.as_str()).unwrap_or("unknown");
+    let declared_agent_id = params
+        .get("agent_id")
+        .map(|s| s.as_str())
+        .unwrap_or("unknown");
     if let Err(resp) = validate_vault_identifier(declared_agent_id, "agent_id") {
         return resp;
     }
@@ -410,7 +415,10 @@ pub async fn vault_read(
                 }),
             )
         }
-        Ok(None) => json_response(StatusCode::NOT_FOUND, &serde_json::json!({"error": "Key not found", "key": key})),
+        Ok(None) => json_response(
+            StatusCode::NOT_FOUND,
+            &serde_json::json!({"error": "Key not found", "key": key}),
+        ),
         Err(e) => {
             tracing::error!(key = %key, agent = %agent_id, error = %e, "Vault read failed");
             json_response(
@@ -431,7 +439,10 @@ pub async fn vault_delete(
     Path(key): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response<Body> {
-    let declared_agent_id = params.get("agent_id").map(|s| s.as_str()).unwrap_or("unknown");
+    let declared_agent_id = params
+        .get("agent_id")
+        .map(|s| s.as_str())
+        .unwrap_or("unknown");
     if let Err(resp) = validate_vault_identifier(declared_agent_id, "agent_id") {
         return resp;
     }
@@ -448,7 +459,10 @@ pub async fn vault_delete(
     let scoped_key = format!("{}:{}", agent_id, key);
 
     match state.vault.delete(&scoped_key, &agent_id).await {
-        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"status": "deleted", "key": key})),
+        Ok(()) => json_response(
+            StatusCode::OK,
+            &serde_json::json!({"status": "deleted", "key": key}),
+        ),
         Err(e) => {
             tracing::error!(key = %key, agent = %agent_id, error = %e, "Vault delete failed");
             json_response(
@@ -472,7 +486,11 @@ pub async fn checkpoint_write(
     body: axum::body::Bytes,
 ) -> Response<Body> {
     // Register plaintext hash as Merkle leaf BEFORE encryption
-    let reg = match state.checkpoint_registry.register(&agent_id, step, &body).await {
+    let reg = match state
+        .checkpoint_registry
+        .register(&agent_id, step, &body)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(agent = %agent_id, step = step, error = %e, "Checkpoint registration failed");
@@ -665,7 +683,7 @@ pub async fn check(
         },
         payload: crate::types::PayloadDescriptor::default(),
     };
-    let (policy_decision, matched_rule) = state.policy.evaluate(&operation);
+    let (policy_decision, _matched_rule) = state.policy.evaluate(&operation);
 
     // Layer 2: Network SRR evaluation (use actual target_path for accurate matching)
     let srr = state.srr.read().unwrap_or_else(|e| {
@@ -694,7 +712,10 @@ pub async fn check(
         crate::types::EnforcementDecision::Allow => ("Allow".to_string(), None),
         crate::types::EnforcementDecision::Delay { milliseconds } => (
             format!("Delay {}ms", milliseconds),
-            Some(format!("Request will be delayed {}ms before forwarding", milliseconds)),
+            Some(format!(
+                "Request will be delayed {}ms before forwarding",
+                milliseconds
+            )),
         ),
         crate::types::EnforcementDecision::RequireApproval { .. } => (
             "RequireApproval".to_string(),
