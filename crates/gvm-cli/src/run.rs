@@ -1,15 +1,19 @@
 use crate::ui::{BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
 use anyhow::{Context, Result};
 
-/// Run an AI agent through GVM governance.
+/// Run a command through GVM governance.
 ///
-/// Three isolation modes:
+/// Supports two modes:
+/// - Script mode: `gvm run agent.py` (auto-detects interpreter)
+/// - Binary mode: `gvm run -- openclaw gateway` (arbitrary binary + args)
+///
+/// Three isolation levels:
 /// - Default (no flags): runs locally with HTTP_PROXY set to GVM proxy.
-/// - --sandbox: Linux-native isolation (namespaces + seccomp + veth). Production recommended.
+/// - --sandbox: Linux-native isolation (namespaces + seccomp + veth + uprobe).
 /// - --contained: Docker-based isolation. Dev/CI or non-Linux platforms.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_agent(
-    script: &str,
+    command: &[String],
     agent_id: &str,
     proxy: &str,
     image: &str,
@@ -20,19 +24,194 @@ pub async fn run_agent(
     sandbox: bool,
     interactive: bool,
 ) -> Result<()> {
+    if command.is_empty() {
+        anyhow::bail!(
+            "No command specified. Usage: gvm run agent.py  OR  gvm run -- openclaw gateway"
+        );
+    }
     if sandbox && contained {
         anyhow::bail!("Cannot use --sandbox and --contained together. Choose one isolation mode.");
     }
 
+    // Determine mode: script (single file) or binary (arbitrary command)
+    let is_binary_mode = command.len() > 1 || !looks_like_script(&command[0]);
+    let script = &command[0];
+
     ensure_proxy_available(proxy).await?;
 
     if sandbox {
-        run_sandboxed(script, agent_id, proxy, interactive).await
+        if is_binary_mode {
+            run_binary_sandboxed(command, agent_id, proxy, interactive).await
+        } else {
+            run_sandboxed(script, agent_id, proxy, interactive).await
+        }
     } else if contained {
         run_contained(script, agent_id, proxy, image, memory, cpus, detach).await
+    } else if is_binary_mode {
+        run_binary_local(command, agent_id, proxy, interactive).await
     } else {
         run_local(script, agent_id, proxy, interactive).await
     }
+}
+
+/// Check if the first argument looks like a script file (has a known extension).
+fn looks_like_script(arg: &str) -> bool {
+    let path = std::path::Path::new(arg);
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("py" | "js" | "ts" | "sh" | "bash")
+    )
+}
+
+/// Run an arbitrary binary with GVM proxy environment (Layer 2 only).
+///
+/// Example: `gvm run -- openclaw gateway`
+async fn run_binary_local(
+    command: &[String],
+    agent_id: &str,
+    proxy: &str,
+    interactive: bool,
+) -> Result<()> {
+    let binary = &command[0];
+    let args = &command[1..];
+
+    println!();
+    println!("{BOLD}Analemma GVM \u{2014} Binary Mode (Layer 2){RESET}");
+    println!("{DIM}All outbound HTTP/HTTPS routed through GVM proxy.{RESET}");
+    println!();
+    println!("  {DIM}Agent ID:{RESET}     {CYAN}{}{RESET}", agent_id);
+    println!("  {DIM}Command:{RESET}      {} {}", binary, args.join(" "));
+    println!("  {DIM}Proxy:{RESET}        {}", proxy);
+    println!();
+
+    println!("  {BOLD}Security layers active:{RESET}");
+    println!("    {GREEN}\u{2713}{RESET} Layer 2: Enforcement Proxy (HTTPS_PROXY)");
+    println!("    {DIM}\u{25cb}{RESET} Layer 3: OS Containment {DIM}(add --sandbox for kernel isolation){RESET}");
+    println!();
+
+    let wal_path = "data/wal.log";
+    let wal_start_len = std::fs::metadata(wal_path).map(|m| m.len()).unwrap_or(0);
+
+    println!("  {DIM}--- Output below ---{RESET}");
+    println!();
+
+    let status = tokio::process::Command::new(binary)
+        .args(args)
+        .env("HTTP_PROXY", proxy)
+        .env("HTTPS_PROXY", proxy)
+        .env("http_proxy", proxy)
+        .env("https_proxy", proxy)
+        .env("GVM_AGENT_ID", agent_id)
+        .env("GVM_PROXY_URL", proxy)
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .await
+        .with_context(|| format!("Failed to execute: {}", binary))?;
+
+    println!();
+    if status.success() {
+        println!("  {GREEN}Process completed successfully{RESET}");
+    } else {
+        println!(
+            "  {YELLOW}Process exited with code: {}{RESET}",
+            status.code().unwrap_or(-1)
+        );
+    }
+    println!();
+
+    print_wal_audit(wal_path, wal_start_len, agent_id);
+
+    if interactive {
+        crate::suggest::suggest_rules_interactive(
+            wal_path,
+            wal_start_len,
+            "config/srr_network.toml",
+        );
+    }
+    Ok(())
+}
+
+/// Run an arbitrary binary inside Linux-native sandbox (Layer 2 + 3).
+///
+/// Example: `gvm run --sandbox -- openclaw gateway`
+async fn run_binary_sandboxed(
+    command: &[String],
+    agent_id: &str,
+    proxy: &str,
+    _interactive: bool,
+) -> Result<()> {
+    let binary = &command[0];
+    let args = &command[1..];
+
+    println!();
+    println!("{BOLD}Analemma GVM \u{2014} Binary Sandbox Mode (Layer 2 + 3){RESET}");
+    println!("{DIM}Kernel isolation: namespace + seccomp + veth + uprobe.{RESET}");
+    println!();
+    println!("  {DIM}Agent ID:{RESET}     {CYAN}{}{RESET}", agent_id);
+    println!("  {DIM}Command:{RESET}      {} {}", binary, args.join(" "));
+    println!("  {DIM}Proxy:{RESET}        {}", proxy);
+    println!();
+
+    // Resolve binary path
+    let binary_path =
+        which::which(binary).with_context(|| format!("Binary not found: {}", binary))?;
+
+    let proxy_url: url::Url = proxy
+        .parse()
+        .with_context(|| format!("Invalid proxy URL: {}", proxy))?;
+    let proxy_host = proxy_url.host_str().unwrap_or("127.0.0.1");
+    let proxy_port = proxy_url.port().unwrap_or(8080);
+    let proxy_addr: std::net::SocketAddr = format!("{}:{}", proxy_host, proxy_port)
+        .parse()
+        .with_context(|| format!("Cannot parse proxy address: {}:{}", proxy_host, proxy_port))?;
+
+    let config = gvm_sandbox::SandboxConfig {
+        script_path: binary_path.clone(),
+        workspace_dir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        interpreter: binary_path.to_str().unwrap_or(binary).to_string(),
+        interpreter_args: args.iter().map(|s| s.to_string()).collect(),
+        proxy_addr,
+        agent_id: agent_id.to_string(),
+        seccomp_profile: None,
+        tls_probe_mode: gvm_sandbox::TlsProbeMode::Audit,
+        proxy_url: Some(proxy.to_string()),
+    };
+
+    println!("  {BOLD}Security layers active:{RESET}");
+    println!("    {GREEN}\u{2713}{RESET} Layer 2: Enforcement Proxy");
+    println!("    {GREEN}\u{2713}{RESET} Layer 3: OS Containment");
+    println!("      {DIM}\u{2022} PID namespace: isolated process tree{RESET}");
+    println!("      {DIM}\u{2022} Mount namespace: minimal rootfs{RESET}");
+    println!("      {DIM}\u{2022} Network namespace: veth pair, proxy-only routing{RESET}");
+    println!("      {DIM}\u{2022} Seccomp-BPF: syscall whitelist{RESET}");
+    println!("      {DIM}\u{2022} eBPF uprobe: TLS plaintext inspection{RESET}");
+    println!();
+    println!("  {DIM}--- Output below ---{RESET}");
+    println!();
+
+    let result = gvm_sandbox::launch_sandboxed(config);
+
+    println!();
+    match result {
+        Ok(sr) => {
+            if sr.exit_code == 0 {
+                println!("  {GREEN}Process completed successfully{RESET}");
+            } else {
+                println!(
+                    "  {YELLOW}Process exited with code: {}{RESET}",
+                    sr.exit_code
+                );
+            }
+            println!("  {DIM}Sandbox setup: {}ms{RESET}", sr.setup_ms);
+        }
+        Err(e) => {
+            println!("  {RED}Sandbox execution failed: {}{RESET}", e);
+            println!("  {DIM}Try without --sandbox, or use --contained for Docker.{RESET}");
+        }
+    }
+    println!();
+    Ok(())
 }
 
 fn is_local_proxy_url(proxy: &str) -> bool {

@@ -62,10 +62,18 @@ enum Commands {
         config_dir: String,
     },
 
-    /// Run an agent through GVM governance (proxy + audit trail)
+    /// Run a command through GVM governance (proxy + audit trail).
+    ///
+    /// Supports scripts and arbitrary binaries:
+    ///   gvm run agent.py                          # auto-detect interpreter
+    ///   gvm run -- openclaw gateway               # arbitrary binary
+    ///   gvm run --sandbox -- openclaw gateway      # with kernel isolation
+    ///   gvm run --contained -- python agent.py     # with Docker
     Run {
-        /// Path to agent script (e.g. agent.py)
-        script: String,
+        /// Command to run. Can be a script (auto-detects interpreter) or
+        /// arbitrary binary args after `--` (e.g. `-- openclaw gateway`).
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
 
         /// Agent ID for audit trail
         #[arg(long, default_value = "agent-001")]
@@ -76,17 +84,14 @@ enum Commands {
         proxy: String,
 
         /// Interactive mode: suggest SRR rules for unregistered URLs after the run.
-        /// When Default-to-Caution triggers, prompts you to add an explicit rule.
         #[arg(long, short = 'i')]
         interactive: bool,
 
         /// Use Linux-native sandbox (Layer 3: namespace + seccomp isolation).
-        /// Recommended for production on Linux. No Docker required.
         #[arg(long)]
         sandbox: bool,
 
         /// Use Docker containment (Layer 3: network isolation).
-        /// Alternative to --sandbox for dev/CI or non-Linux platforms.
         #[arg(long)]
         contained: bool,
 
@@ -295,7 +300,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Commands::Run {
-            script,
+            command,
             agent_id,
             proxy,
             interactive,
@@ -307,7 +312,7 @@ async fn main() -> anyhow::Result<()> {
             detach,
         } => {
             run::run_agent(
-                &script,
+                &command,
                 &agent_id,
                 &proxy,
                 &image,

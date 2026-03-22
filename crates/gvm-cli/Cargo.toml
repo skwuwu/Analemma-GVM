@@ -33,3 +33,4 @@ sha2 = "0.10"
 hex = "0.4"
 gvm-sandbox = { path = "../gvm-sandbox" }
 url = "2"
+which = "7"

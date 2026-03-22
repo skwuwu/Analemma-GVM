@@ -1,3 +1,4 @@
+#![allow(clippy::manual_div_ceil, clippy::manual_is_multiple_of)]
 //! Merkle tree computation and WAL integrity verification.
 //!
 //! # Architecture
