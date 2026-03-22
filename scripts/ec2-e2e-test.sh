@@ -80,10 +80,13 @@ echo ""
 
 # Check prerequisites
 echo -e "${YELLOW}Checking prerequisites...${NC}"
-command -v cargo >/dev/null || { echo "Rust not installed"; exit 1; }
+# Ensure rustup default is set (sudo may lose this)
+rustup default 1.85.0 2>/dev/null || rustup default stable 2>/dev/null || true
+command -v cargo >/dev/null || { echo "Rust not installed. Run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"; exit 1; }
 command -v node >/dev/null || { echo "Node.js not installed"; exit 1; }
 command -v python3 >/dev/null || { echo "Python3 not installed"; exit 1; }
-echo -e "  Rust: $(rustc --version)"
+command -v curl >/dev/null || { echo "curl not installed. Run: apt-get install -y curl"; exit 1; }
+echo -e "  Rust: $(rustc --version 2>/dev/null || echo 'unknown')"
 echo -e "  Node: $(node --version)"
 echo -e "  Kernel: $(uname -r)"
 echo ""
@@ -166,8 +169,9 @@ print(r.status_code)
 
     # Check WAL recorded the CONNECT
     sleep 1
-    WAL_CONNECT=$(grep -c "CONNECT" data/wal.log 2>/dev/null || echo 0)
-    [ "$WAL_CONNECT" -gt 0 ] && pass "3b: WAL CONNECT logged ($WAL_CONNECT events)" || fail "3b: no CONNECT in WAL"
+    WAL_CONNECT=$(grep -c "CONNECT" data/wal.log 2>/dev/null || echo "0")
+    WAL_CONNECT=$(echo "$WAL_CONNECT" | tr -d '[:space:]')
+    [ "$WAL_CONNECT" -gt 0 ] 2>/dev/null && pass "3b: WAL CONNECT logged ($WAL_CONNECT events)" || fail "3b: no CONNECT in WAL"
 
     # Anthropic API (needs key, optional)
     if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
@@ -233,10 +237,10 @@ if should_run 5; then
     header "5: SRR Policy Decisions"
 
     check_policy() {
-        local METHOD="$1" HOST="$2" PATH="$3" EXPECTED="$4" LABEL="$5"
+        local METHOD="$1" HOST="$2" URLPATH="$3" EXPECTED="$4" LABEL="$5"
         local DECISION=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
             -H "Content-Type: application/json" \
-            -d "{\"method\":\"$METHOD\",\"target_host\":\"$HOST\",\"target_path\":\"$PATH\",\"operation\":\"test\"}" \
+            -d "{\"method\":\"$METHOD\",\"target_host\":\"$HOST\",\"target_path\":\"$URLPATH\",\"operation\":\"test\"}" \
             | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
         if echo "$DECISION" | grep -q "$EXPECTED"; then
             pass "5: $LABEL = $DECISION"
