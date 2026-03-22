@@ -4,21 +4,27 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   pull_request:
-    branches: [main]
+    branches: [main, master]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   test:
-    name: Test
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
       - run: cargo test --workspace
 
   clippy:
@@ -41,3 +47,43 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+
+  # Smoke test: build + proxy health check + MCP policy check
+  e2e-smoke:
+    name: E2E Smoke (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build proxy
+        run: cargo build --release -p gvm-proxy
+
+      - name: Start proxy and run health check
+        run: |
+          ./target/release/gvm-proxy --config config/proxy.toml &
+          PROXY_PID=$!
+          sleep 3
+
+          # Health check
+          STATUS=$(curl -sf http://127.0.0.1:8080/gvm/health | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])")
+          echo "Health: $STATUS"
+          [ "$STATUS" = "healthy" ] || exit 1
+
+          # SRR policy check (github read = Allow)
+          DECISION=$(curl -sf -X POST http://127.0.0.1:8080/gvm/check \
+            -H "Content-Type: application/json" \
+            -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/test/test/issues","operation":"test"}' \
+            | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['decision'])")
+          echo "Policy check: $DECISION"
+
+          # SRR policy check (github delete = Deny)
+          DENY=$(curl -sf -X POST http://127.0.0.1:8080/gvm/check \
+            -H "Content-Type: application/json" \
+            -d '{"method":"DELETE","target_host":"api.github.com","target_path":"/repos/test/test/git/refs/heads/main","operation":"test"}' \
+            | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['decision'])")
+          echo "Delete branch: $DENY"
+
+          kill $PROXY_PID 2>/dev/null
+          echo "E2E smoke passed"
