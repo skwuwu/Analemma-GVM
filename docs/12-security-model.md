@@ -507,6 +507,18 @@ Fuzz targets (`fuzz/fuzz_targets/`):
 
 ---
 
+### Multi-PID Uprobe (Planned v0.3)
+
+**Limitation**: The current TLS uprobe attaches to a single PID (the sandbox child process). If the agent spawns sub-processes (e.g., Node.js agent calls a Python MCP tool), the child processes load separate libssl.so instances. Their SSL_write_ex calls are not captured.
+
+**Impact**: In multi-runtime scenarios (Node.js + Python in one session), only the main process's HTTPS traffic is monitored by uprobe. Sub-process traffic is still governed by the proxy CONNECT tunnel (domain-level enforcement) but not by path-level uprobe inspection.
+
+**Planned mitigation (v0.3)**: Scan `/proc/*/maps` for all processes that load libssl.so within the sandbox PID namespace. Auto-attach uprobe to each discovered TLS library. Re-scan periodically or on `fork()`/`exec()` detection via proc connector.
+
+**Current coverage**: The gateway process's uprobe covers the core traffic (LLM API calls), which is the primary enforcement target.
+
+---
+
 ## Versioning
 
 This document will be updated as:
