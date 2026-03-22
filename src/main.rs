@@ -347,7 +347,8 @@ async fn main() {
 
     tracing::info!(address = %config.server.listen, "GVM Proxy listening");
 
-    // Use hyper directly to handle CONNECT method (axum doesn't route CONNECT)
+    // Use hyper directly to handle CONNECT method (axum doesn't route CONNECT).
+    // Named functions avoid deeply nested closures that trigger rustc ICE on 1.94.0.
     let app_for_connect = app.clone();
     let state_for_connect = connect_state;
 
@@ -357,45 +358,50 @@ async fn main() {
             Err(e) => { tracing::error!(error = %e, "Accept failed"); continue; }
         };
         let app = app_for_connect.clone();
-        let connect_state = state_for_connect.clone();
-
-        tokio::spawn(async move {
-            let io = hyper_util::rt::TokioIo::new(stream);
-
-            let service = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
-                let app = app.clone();
-                let cs = connect_state.clone();
-                async move {
-                    if req.method() == hyper::Method::CONNECT {
-                        gvm_proxy::proxy::handle_connect(cs, req).await
-                    } else {
-                        // Convert Incoming body to axum Body for normal requests
-                        let (parts, body) = req.into_parts();
-                        let body = Body::new(body);
-                        let req = Request::from_parts(parts, body);
-                        Ok(app.clone().oneshot(req).await.unwrap_or_else(|e| {
-                            let _ = e;
-                            Response::builder()
-                                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                .body(Body::empty())
-                                .unwrap()
-                        }))
-                    }
-                }
-            });
-
-            if let Err(e) = hyper::server::conn::http1::Builder::new()
-                .preserve_header_case(true)
-                .serve_connection(io, service)
-                .with_upgrades()
-                .await
-            {
-                if !e.is_incomplete_message() {
-                    tracing::debug!(error = %e, "Connection error");
-                }
-            }
-        });
+        let cs = state_for_connect.clone();
+        tokio::spawn(serve_connection(stream, app, cs));
     }
+}
+
+async fn serve_connection(
+    stream: tokio::net::TcpStream,
+    app: axum::Router,
+    state: gvm_proxy::proxy::AppState,
+) {
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let svc = hyper::service::service_fn(move |req| {
+        let a = app.clone();
+        let s = state.clone();
+        route_request(req, a, s)
+    });
+    let conn = hyper::server::conn::http1::Builder::new()
+        .preserve_header_case(true)
+        .serve_connection(io, svc)
+        .with_upgrades();
+    if let Err(e) = conn.await {
+        if !e.is_incomplete_message() {
+            tracing::debug!(error = %e, "Connection error");
+        }
+    }
+}
+
+async fn route_request(
+    req: Request<hyper::body::Incoming>,
+    app: axum::Router,
+    state: gvm_proxy::proxy::AppState,
+) -> Result<Response<Body>, std::convert::Infallible> {
+    if req.method() == hyper::Method::CONNECT {
+        return gvm_proxy::proxy::handle_connect(state, req).await;
+    }
+    let (parts, body) = req.into_parts();
+    let req = Request::from_parts(parts, Body::new(body));
+    let resp = app.oneshot(req).await.unwrap_or_else(|_| {
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::empty())
+            .unwrap()
+    });
+    Ok(resp)
 }
 
 /// Print a human-readable startup summary of loaded governance rules.
