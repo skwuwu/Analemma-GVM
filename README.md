@@ -432,18 +432,50 @@ class MyAgent(GVMAgent):
 
 > More: `unified_demo` (scripted finance), `hostile_demo` (adversarial), `langchain_demo` (LangChain+Gmail), `rollback_demo` (checkpoint/rollback). All require `cargo run`.
 
-### MCP Integration (OpenClaw, Claude Desktop, Cursor)
-
-GVM is available as an MCP server — no SDK, no code changes. Install one skill and your agent is governed:
+### `gvm run` — run any command through GVM governance
 
 ```bash
-cargo binstall gvm-proxy
-git clone https://github.com/skwuwu/analemma-gvm-openclaw.git ~/.openclaw/skills/gvm-governance
+# Script mode (auto-detect interpreter)
+gvm run agent.py
+gvm run --sandbox agent.py          # + kernel isolation + uprobe
+
+# Binary mode (arbitrary command)
+gvm run -- openclaw gateway          # Layer 2: proxy only
+gvm run --sandbox -- openclaw gateway # Layer 2+3: proxy + namespace + seccomp + uprobe
+gvm run -- python -m my_agent        # any command
 ```
 
-The MCP server auto-launches the proxy with Shadow Mode. Agent calls `gvm_fetch`/`gvm_read`/`gvm_write` for governed API access — intent declaration, policy check, and execution in one tool call.
+`gvm run` injects `HTTPS_PROXY` into all child processes. With `--sandbox`, adds Linux namespace isolation, seccomp-BPF syscall filtering, eBPF TC network enforcement, and uprobe TLS plaintext inspection.
 
-See the [MCP integration repo →](https://github.com/skwuwu/analemma-gvm-openclaw) for full docs, preset rulesets, and conversational demos.
+### OpenClaw / MCP Integration
+
+Two integration paths — both work, choose based on your needs:
+
+**Path A: HTTPS_PROXY (zero config, all traffic governed)**
+
+```bash
+gvm run -- openclaw gateway   # all OpenClaw traffic goes through GVM proxy
+```
+
+Every outbound HTTP/HTTPS from OpenClaw (LLM calls, Skills, MCP servers, web_fetch, exec curl) is automatically governed. No code changes, no MCP setup.
+
+**Path B: MCP Server (structured governance tools)**
+
+```json
+{
+  "mcpServers": {
+    "gvm-governance": {
+      "command": "node",
+      "args": ["~/.openclaw/skills/gvm-governance/mcp-server/dist/index.js"],
+      "env": { "GVM_PROXY_URL": "http://127.0.0.1:8080" }
+    }
+  }
+}
+```
+
+Agent gets `gvm_fetch`, `gvm_policy_check`, `gvm_status`, `gvm_select_rulesets` tools. Works with OpenClaw, Claude Desktop, Cursor, and any MCP client.
+
+See the [MCP integration repo →](https://github.com/skwuwu/analemma-gvm-openclaw) for rulesets, demos, and docs.
 
 ---
 
@@ -451,11 +483,12 @@ See the [MCP integration repo →](https://github.com/skwuwu/analemma-gvm-opencl
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| **v1.0 — MVP Launch** | 3-layer enforcement, WAL ledger, encrypted vault, Python SDK, CLI, Linux sandbox, Merkle checkpoints, JWT identity | **Done** |
-| **v1.1 — Hardening** | WAL streaming recovery + rotation, IC-3 webhook callback, ABAC Wasm hot-path | Next |
-| **v2.0 — Infrastructure** | NATS JetStream, Redis vault backend, policy hot-reload, TLS termination, Prometheus metrics | Planned |
+| **v0.1 — Alpha** | 3-layer enforcement, WAL ledger, encrypted vault, Python SDK, CLI, Linux sandbox, Merkle checkpoints, CONNECT tunnel, Shadow Mode, MCP integration, eBPF uprobe TLS capture | **Done** |
+| **v0.2 — Hardening** | WAL streaming recovery + rotation, IC-3 webhook callback, SRR hot-reload, Base64 payload decoding, `gvm run` binary mode | **Done** |
+| **v0.3 — Defense-in-Depth** | Multi-PID uprobe, chunked transfer reassembly, anomaly detection (low-and-slow exfiltration), WebSocket proxy | Planned |
+| **v1.0 — Production** | NATS JetStream, Redis vault backend, TLS termination, Prometheus metrics | Planned |
 
-Long-term: multi-agent governance (global Merkle chain enables cross-agent collusion detection — [architecture rationale →](docs/13-roadmap.md#multi-agent-governance)), filesystem/shell/database capability controls, TypeScript/Go SDK, Envoy filter mode. [Full roadmap →](docs/13-roadmap.md)
+Long-term: multi-agent governance, filesystem/shell/database capability controls, TypeScript/Go SDK, Envoy filter mode. [Full roadmap →](docs/13-roadmap.md)
 
 ---
 
@@ -546,7 +579,11 @@ Achievable with custom Envoy filters + OPA extensions + additional systems, but 
 
 Until WAL hardening ships, the Merkle chain is cryptographically sound but operationally fragile under infrastructure stress (crash during recovery, WAL exceeding available memory).
 
-**Shadow Mode**: Intent store entries have a configurable TTL (default 30s). If an intent is claimed but never confirmed (e.g., agent crashes mid-request), the entry expires and is released automatically. The intent store uses atomic operations to prevent TOCTOU races on concurrent consumption. Shadow Mode requires explicit opt-in via `[shadow]` config section or `GVM_SHADOW_MODE` env var.
+**Shadow Mode**: Intent store with configurable TTL (default 30s). Atomic operations prevent TOCTOU races. Opt-in via `GVM_SHADOW_MODE` env var.
+
+**uprobe TLS capture**: Captures SSL_write_ex plaintext for path-level HTTPS enforcement. Known limitations: (1) SSL_write fires after kernel queues packet — SIGSTOP is "immediate session freeze", not "pre-transmission block". (2) Single-PID only — child processes need separate uprobe attachment (planned v0.3). (3) Non-OpenSSL TLS (BoringSSL, custom stacks) not covered — L4 proxy enforcement only.
+
+**SRR hot-reload**: `POST /gvm/reload` atomically swaps rules. Parse failure preserves existing rules. `gvm_select_rulesets` MCP tool triggers reload automatically.
 
 > Full security model and known attack surface: [Security Model →](docs/12-security-model.md)
 
@@ -565,7 +602,7 @@ Until WAL hardening ships, the Merkle chain is cryptographically sound but opera
 | [6](docs/06-proxy.md) | Proxy Pipeline |
 | [7](docs/07-sdk.md) | Python SDK |
 | [8](docs/08-memory-security.md) | Memory & Runtime Security Report |
-| [9](docs/09-test-report.md) | Test Coverage Report (242 tests, 0 failures) |
+| [9](docs/09-test-report.md) | Test Coverage Report |
 | [11](docs/11-competitive-analysis.md) | Competitive Analysis: GVM vs OPA+Envoy |
 | [12](docs/12-security-model.md) | Security Model & Known Attack Surface |
 | [13](docs/13-roadmap.md) | Roadmap |
