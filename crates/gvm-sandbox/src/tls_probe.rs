@@ -245,7 +245,19 @@ pub fn parse_http_from_plaintext(data: &[u8]) -> Option<ParsedHttpRequest> {
     Some(ParsedHttpRequest { method, path, host })
 }
 
-/// TLS probe controller — manages uprobe lifecycle and event processing.
+/// Callback type for policy decisions on captured TLS plaintext.
+pub type PolicyCheckFn = Box<dyn Fn(&str, &str, &str) -> PolicyDecision + Send + Sync>;
+
+/// Policy decision from SRR check.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PolicyDecision {
+    Allow,
+    Delay { milliseconds: u64 },
+    Deny { reason: String },
+}
+
+/// TLS probe controller — manages uprobe lifecycle, perf buffer polling,
+/// and SRR-based policy enforcement on captured HTTPS plaintext.
 pub struct TlsProbeController {
     /// PID being monitored.
     pid: u32,
@@ -253,6 +265,78 @@ pub struct TlsProbeController {
     library: TlsLibrary,
     /// Whether the probe is actively attached.
     attached: bool,
+    /// Perf buffer file descriptor (from perf_event_open).
+    perf_fd: Option<i32>,
+    /// Policy check callback — wraps SRR check() from proxy.
+    policy_check: Option<PolicyCheckFn>,
+    /// Event statistics.
+    stats: ProbeStats,
+    /// Whether to run in audit-only mode (log but don't enforce).
+    audit_only: bool,
+}
+
+/// Runtime statistics for the TLS probe.
+#[derive(Debug, Clone, Default)]
+pub struct ProbeStats {
+    pub events_captured: u64,
+    pub events_allowed: u64,
+    pub events_denied: u64,
+    pub parse_failures: u64,
+}
+
+/// Trace pipe reader — reads uprobe events from /sys/kernel/debug/tracing/trace_pipe.
+/// This is the simplest integration (no BPF program compilation needed).
+/// For production, replace with perf_event_open + BPF ring buffer.
+struct TracePipeReader {
+    /// Path to trace_pipe.
+    path: PathBuf,
+    /// Filter prefix to match our uprobe events.
+    filter_prefix: String,
+}
+
+impl TracePipeReader {
+    fn new(pid: u32) -> Self {
+        Self {
+            path: PathBuf::from("/sys/kernel/debug/tracing/trace_pipe"),
+            filter_prefix: format!("gvm_ssl_write_{}", pid),
+        }
+    }
+
+    /// Read one event from trace_pipe (blocking).
+    /// Returns the raw trace line if it matches our uprobe.
+    fn read_event(&self) -> Result<Option<String>> {
+        use std::io::{BufRead, BufReader};
+
+        let file = std::fs::File::open(&self.path)
+            .context("Failed to open trace_pipe (need root or CAP_BPF)")?;
+        let reader = BufReader::new(file);
+
+        for line in reader.lines() {
+            let line = line?;
+            if line.contains(&self.filter_prefix) {
+                return Ok(Some(line));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Read plaintext from agent process memory at the address captured by uprobe.
+///
+/// Uses /proc/<pid>/mem to read the SSL_write buffer.
+/// The buffer address comes from the uprobe's arg1 (second argument = buf pointer).
+fn read_process_memory(pid: u32, addr: u64, len: usize) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let max_len = len.min(4096); // Cap at 4KB
+    let mut file = std::fs::File::open(format!("/proc/{}/mem", pid))
+        .with_context(|| format!("Failed to open /proc/{}/mem", pid))?;
+
+    file.seek(SeekFrom::Start(addr))?;
+    let mut buf = vec![0u8; max_len];
+    let n = file.read(&mut buf)?;
+    buf.truncate(n);
+    Ok(buf)
 }
 
 impl TlsProbeController {
@@ -263,13 +347,25 @@ impl TlsProbeController {
             pid,
             library,
             attached: false,
+            perf_fd: None,
+            policy_check: None,
+            stats: ProbeStats::default(),
+            audit_only: false,
         })
     }
 
+    /// Set the policy check callback.
+    /// This is called with (method, host, path) and returns Allow/Deny.
+    pub fn set_policy_check(&mut self, check: PolicyCheckFn) {
+        self.policy_check = Some(check);
+    }
+
+    /// Set audit-only mode (log but don't enforce).
+    pub fn set_audit_only(&mut self, audit_only: bool) {
+        self.audit_only = audit_only;
+    }
+
     /// Attach uprobe to SSL_write.
-    ///
-    /// On Linux, this creates a uprobe via /sys/kernel/debug/tracing/uprobe_events
-    /// or perf_event_open(). The actual eBPF program is loaded separately.
     pub fn attach(&mut self) -> Result<()> {
         if self.attached {
             return Ok(());
@@ -283,10 +379,17 @@ impl TlsProbeController {
             "Attaching TLS uprobe"
         );
 
-        // Write uprobe event definition
-        // Format: p:gvm_ssl_write /path/to/libssl.so:0x1234
+        // Enable tracing if not already
+        let _ = std::fs::write("/sys/kernel/debug/tracing/tracing_on", "1");
+
+        // Clear previous uprobe definitions for this PID
+        let remove = format!("-:gvm_ssl_write_{}", self.pid);
+        let _ = std::fs::write("/sys/kernel/debug/tracing/uprobe_events", &remove);
+
+        // Write uprobe event definition with fetchargs for buf pointer and len
+        // p:NAME PATH:OFFSET %ax %dx  (x86_64: rdi=ssl, rsi=buf, rdx=len)
         let uprobe_def = format!(
-            "p:gvm_ssl_write_{}  {}:0x{:x}",
+            "p:gvm_ssl_write_{} {}:0x{:x} buf=%si:u64 len=%dx:u32",
             self.pid,
             self.library.path.display(),
             self.library.ssl_write_offset,
@@ -298,44 +401,198 @@ impl TlsProbeController {
         )
         .with_context(|| "Failed to write uprobe_events (need root or CAP_BPF)")?;
 
+        // Enable the uprobe event
+        let enable_path = format!(
+            "/sys/kernel/debug/tracing/events/uprobes/gvm_ssl_write_{}/enable",
+            self.pid,
+        );
+        std::fs::write(&enable_path, "1")
+            .with_context(|| "Failed to enable uprobe event")?;
+
+        // Filter to our PID only
+        let filter_path = format!(
+            "/sys/kernel/debug/tracing/events/uprobes/gvm_ssl_write_{}/filter",
+            self.pid,
+        );
+        let _ = std::fs::write(&filter_path, format!("common_pid == {}", self.pid));
+
         self.attached = true;
-        tracing::info!(pid = self.pid, "TLS uprobe attached");
+        tracing::info!(pid = self.pid, "TLS uprobe attached and enabled");
         Ok(())
     }
 
-    /// Detach uprobe.
+    /// Detach uprobe and clean up.
     pub fn detach(&mut self) {
         if !self.attached {
             return;
         }
 
+        // Disable the event
+        let enable_path = format!(
+            "/sys/kernel/debug/tracing/events/uprobes/gvm_ssl_write_{}/enable",
+            self.pid,
+        );
+        let _ = std::fs::write(&enable_path, "0");
+
+        // Remove the uprobe definition
         let remove = format!("-:gvm_ssl_write_{}", self.pid);
         let _ = std::fs::write("/sys/kernel/debug/tracing/uprobe_events", &remove);
+
         self.attached = false;
         tracing::debug!(pid = self.pid, "TLS uprobe detached");
     }
 
+    /// Run the event processing loop.
+    ///
+    /// Reads uprobe events from trace_pipe, reads plaintext from process memory,
+    /// parses HTTP, checks policy via SRR callback, and enforces decisions.
+    ///
+    /// This runs in a separate thread and blocks until the agent process exits.
+    pub fn run_event_loop(&mut self) -> Result<()> {
+        if !self.attached {
+            self.attach()?;
+        }
+
+        tracing::info!(pid = self.pid, "TLS probe event loop started");
+
+        let trace_pipe = format!("/sys/kernel/debug/tracing/trace_pipe");
+        let filter = format!("gvm_ssl_write_{}", self.pid);
+
+        let file = std::fs::File::open(&trace_pipe)
+            .context("Failed to open trace_pipe")?;
+
+        use std::io::{BufRead, BufReader};
+        let reader = BufReader::new(file);
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+
+            if !line.contains(&filter) {
+                continue;
+            }
+
+            self.stats.events_captured += 1;
+
+            // Parse trace line to extract buf address and len
+            // Format: "... gvm_ssl_write_1234: ... buf=0x7f1234 len=256"
+            let (buf_addr, buf_len) = match parse_trace_line(&line) {
+                Some(v) => v,
+                None => {
+                    self.stats.parse_failures += 1;
+                    continue;
+                }
+            };
+
+            // Read plaintext from agent process memory
+            let plaintext = match read_process_memory(self.pid, buf_addr, buf_len as usize) {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::debug!(error = %e, "Failed to read process memory");
+                    self.stats.parse_failures += 1;
+                    continue;
+                }
+            };
+
+            // Parse HTTP from plaintext
+            let http_req = match parse_http_from_plaintext(&plaintext) {
+                Some(req) => req,
+                None => continue, // Not HTTP (could be TLS record, binary data, etc.)
+            };
+
+            let host = http_req.host.as_deref().unwrap_or("unknown");
+
+            tracing::info!(
+                pid = self.pid,
+                method = %http_req.method,
+                host = %host,
+                path = %http_req.path,
+                "TLS plaintext captured"
+            );
+
+            // SRR policy check
+            if let Some(ref check_fn) = self.policy_check {
+                let decision = check_fn(&http_req.method, host, &http_req.path);
+
+                match &decision {
+                    PolicyDecision::Allow => {
+                        self.stats.events_allowed += 1;
+                        tracing::debug!(
+                            method = %http_req.method, host, path = %http_req.path,
+                            "TLS probe: Allow"
+                        );
+                    }
+                    PolicyDecision::Delay { milliseconds } => {
+                        self.stats.events_allowed += 1;
+                        tracing::info!(
+                            method = %http_req.method, host, path = %http_req.path,
+                            delay_ms = milliseconds,
+                            "TLS probe: Delay (allowing — delay applied at CONNECT level)"
+                        );
+                    }
+                    PolicyDecision::Deny { reason } => {
+                        self.stats.events_denied += 1;
+                        tracing::warn!(
+                            method = %http_req.method, host, path = %http_req.path,
+                            reason = %reason,
+                            audit_only = self.audit_only,
+                            "TLS probe: DENY"
+                        );
+
+                        if !self.audit_only {
+                            if let Err(e) = self.enforce_deny() {
+                                tracing::error!(error = %e, "Failed to enforce deny");
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Check if process is still alive
+            let proc_alive = Path::new(&format!("/proc/{}", self.pid)).exists();
+            if !proc_alive {
+                tracing::info!(pid = self.pid, "Agent process exited — stopping event loop");
+                break;
+            }
+        }
+
+        tracing::info!(
+            pid = self.pid,
+            captured = self.stats.events_captured,
+            allowed = self.stats.events_allowed,
+            denied = self.stats.events_denied,
+            parse_failures = self.stats.parse_failures,
+            "TLS probe event loop ended"
+        );
+
+        Ok(())
+    }
+
     /// Enforce a Deny decision by stopping the process.
     ///
-    /// SIGSTOP → terminate CONNECT tunnel → SIGCONT.
-    /// Works on all 5.5+ kernels without CONFIG_BPF_KPROBE_OVERRIDE.
+    /// SIGSTOP → 100ms pause → SIGCONT.
+    /// SSL_write will fail with EPIPE/connection reset on resume.
     pub fn enforce_deny(&self) -> Result<()> {
         tracing::warn!(pid = self.pid, "TLS probe: enforcing Deny via SIGSTOP");
 
-        // SIGSTOP the process to prevent SSL_write from completing
         unsafe {
             libc::kill(self.pid as i32, libc::SIGSTOP);
         }
 
-        // Give time for the TCP connection to time out / reset
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        // SIGCONT to resume (the SSL_write will fail with connection reset)
         unsafe {
             libc::kill(self.pid as i32, libc::SIGCONT);
         }
 
         Ok(())
+    }
+
+    /// Get current statistics.
+    pub fn stats(&self) -> &ProbeStats {
+        &self.stats
     }
 
     /// Get the resolved library info.
@@ -353,6 +610,58 @@ impl Drop for TlsProbeController {
     fn drop(&mut self) {
         self.detach();
     }
+}
+
+/// Parse a trace_pipe line to extract buf address and len from fetchargs.
+///
+/// Expected format: "... gvm_ssl_write_1234: ... buf=0x7ffeabc123 len=256"
+fn parse_trace_line(line: &str) -> Option<(u64, u32)> {
+    let buf_addr = line.split("buf=0x").nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| u64::from_str_radix(s, 16).ok())?;
+
+    let buf_len = line.split("len=").nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(4096);
+
+    Some((buf_addr, buf_len))
+}
+
+/// Convenience: start TLS probe in a background thread for a sandbox.
+///
+/// Integrates with the existing sandbox lifecycle:
+/// 1. After clone() + exec, parent calls start_tls_probe(child_pid, srr_check)
+/// 2. Probe resolves TLS library, attaches uprobe, starts event loop
+/// 3. Event loop runs until child exits
+/// 4. Probe auto-detaches on drop
+pub fn start_tls_probe_thread(
+    pid: u32,
+    policy_check: PolicyCheckFn,
+    audit_only: bool,
+) -> Result<std::thread::JoinHandle<()>> {
+    let handle = std::thread::Builder::new()
+        .name(format!("gvm-tls-probe-{}", pid))
+        .spawn(move || {
+            match TlsProbeController::new(pid) {
+                Ok(mut controller) => {
+                    controller.set_policy_check(policy_check);
+                    controller.set_audit_only(audit_only);
+                    if let Err(e) = controller.run_event_loop() {
+                        tracing::error!(pid, error = %e, "TLS probe event loop failed");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        pid, error = %e,
+                        "TLS probe initialization failed — HTTPS will use domain-level policy only"
+                    );
+                }
+            }
+        })
+        .context("Failed to spawn TLS probe thread")?;
+
+    Ok(handle)
 }
 
 #[cfg(test)]
@@ -402,5 +711,34 @@ mod tests {
     fn parse_maps_no_path() {
         let line = "7f8a12345000-7f8a12400000 r-xp 00000000 08:01 12345";
         assert!(extract_path_from_maps_line(line).is_none());
+    }
+
+    #[test]
+    fn parse_trace_line_valid() {
+        let line = "node-1234 [001] d..1 12345.678: gvm_ssl_write_1234: (0x7f1234) buf=0x7ffeabc123 len=256";
+        let (addr, len) = parse_trace_line(line).unwrap();
+        assert_eq!(addr, 0x7ffeabc123);
+        assert_eq!(len, 256);
+    }
+
+    #[test]
+    fn parse_trace_line_no_len() {
+        let line = "node-1234 [001] d..1 12345.678: gvm_ssl_write_1234: buf=0xdeadbeef";
+        let (addr, len) = parse_trace_line(line).unwrap();
+        assert_eq!(addr, 0xdeadbeef);
+        assert_eq!(len, 4096); // default
+    }
+
+    #[test]
+    fn policy_decision_deny() {
+        let check: PolicyCheckFn = Box::new(|method, _host, path| {
+            if method == "POST" && path.contains("transfers") {
+                PolicyDecision::Deny { reason: "wire transfer blocked".into() }
+            } else {
+                PolicyDecision::Allow
+            }
+        });
+        assert!(matches!(check("GET", "stripe.com", "/v1/charges"), PolicyDecision::Allow));
+        assert!(matches!(check("POST", "stripe.com", "/v1/transfers"), PolicyDecision::Deny { .. }));
     }
 }

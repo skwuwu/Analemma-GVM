@@ -108,6 +108,36 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     let setup_ms = start.elapsed().as_millis() as u64;
     tracing::info!(setup_ms = setup_ms, "Sandbox setup complete, waiting for agent");
 
+    // 3.5. Start TLS probe (uprobe on SSL_write for HTTPS L7 inspection)
+    // Runs in background thread — captures plaintext before encryption.
+    // Gracefully degrades if uprobe attachment fails (domain-level policy still active).
+    let _tls_probe_handle = {
+        let child_raw = child_pid.as_raw() as u32;
+        // Give the child process a moment to exec and load TLS libraries
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        match crate::tls_probe::start_tls_probe_thread(
+            child_raw,
+            Box::new(|_method, _host, _path| {
+                // Default: audit-only (log all TLS plaintext, don't enforce)
+                // SRR integration is provided by the caller via set_policy_check
+                crate::tls_probe::PolicyDecision::Allow
+            }),
+            true, // audit_only = true by default
+        ) {
+            Ok(handle) => {
+                tracing::info!(pid = child_raw, "TLS uprobe probe started (audit-only)");
+                Some(handle)
+            }
+            Err(e) => {
+                tracing::debug!(
+                    pid = child_raw, error = %e,
+                    "TLS probe not available — using domain-level HTTPS policy only"
+                );
+                None
+            }
+        }
+    };
+
     // 4. Wait for child to exit and detect seccomp violations
     let wait_result = waitpid(child_pid, None);
     let seccomp_violations = match &wait_result {
