@@ -308,6 +308,7 @@ async fn run_sandboxed(script: &str, agent_id: &str, proxy: &str, interactive: b
         proxy_addr,
         agent_id: agent_id.to_string(),
         seccomp_profile: None,
+        tls_probe_mode: gvm_sandbox::TlsProbeMode::Audit,
     };
 
     // Run pre-flight checks

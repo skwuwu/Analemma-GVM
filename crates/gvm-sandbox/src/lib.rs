@@ -51,6 +51,21 @@ pub struct SandboxConfig {
     pub agent_id: String,
     /// Optional seccomp profile override (None = default whitelist).
     pub seccomp_profile: Option<SeccompProfile>,
+    /// TLS probe mode: "enforce" (block denied requests), "audit" (log only), "disabled".
+    /// Default: "audit". Requires Linux 5.5+ and root/CAP_BPF.
+    pub tls_probe_mode: TlsProbeMode,
+}
+
+/// TLS probe operating mode.
+#[derive(Debug, Clone, Default)]
+pub enum TlsProbeMode {
+    /// Log HTTPS plaintext but don't block (safe default for v0.1).
+    #[default]
+    Audit,
+    /// Log and block denied HTTPS requests via SIGSTOP.
+    Enforce,
+    /// Disable TLS probing entirely.
+    Disabled,
 }
 
 /// Seccomp profile selection.

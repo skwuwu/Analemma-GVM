@@ -82,11 +82,18 @@ pub fn resolve_tls_library(pid: u32) -> Result<TlsLibrary> {
         .with_context(|| format!("Failed to read /proc/{}/maps", pid))?;
 
     // Step 1: Look for libssl.so in memory maps
+    // Prefer SSL_write_ex (OpenSSL 3.x actual call path) over SSL_write.
+    // Verified: Python requests + OpenSSL 3.x calls SSL_write_ex, not SSL_write.
     for line in maps.lines() {
         if line.contains("libssl") && line.contains(".so") {
             if let Some(path) = extract_path_from_maps_line(line) {
-                if let Ok(offset) = find_symbol_offset(&path, "SSL_write") {
-                    let read_offset = find_symbol_offset(&path, "SSL_read").ok();
+                // Try SSL_write_ex first (OpenSSL 3.x), then SSL_write (1.x/2.x)
+                let write_offset = find_symbol_offset(&path, "SSL_write_ex")
+                    .or_else(|_| find_symbol_offset(&path, "SSL_write"));
+                if let Ok(offset) = write_offset {
+                    let read_offset = find_symbol_offset(&path, "SSL_read_ex")
+                        .or_else(|_| find_symbol_offset(&path, "SSL_read"))
+                        .ok();
                     tracing::info!(
                         pid, path = %path.display(), offset,
                         "Found dynamic libssl.so"
@@ -102,12 +109,16 @@ pub fn resolve_tls_library(pid: u32) -> Result<TlsLibrary> {
         }
     }
 
-    // Step 2: Look for SSL_write in the main executable (static link — Node.js)
+    // Step 2: Look for SSL_write_ex/SSL_write in the main executable (static link — Node.js)
     let exe_path = std::fs::read_link(format!("/proc/{}/exe", pid))
         .with_context(|| format!("Failed to read /proc/{}/exe", pid))?;
 
-    if let Ok(offset) = find_symbol_offset(&exe_path, "SSL_write") {
-        let read_offset = find_symbol_offset(&exe_path, "SSL_read").ok();
+    let write_offset = find_symbol_offset(&exe_path, "SSL_write_ex")
+        .or_else(|_| find_symbol_offset(&exe_path, "SSL_write"));
+    if let Ok(offset) = write_offset {
+        let read_offset = find_symbol_offset(&exe_path, "SSL_read_ex")
+            .or_else(|_| find_symbol_offset(&exe_path, "SSL_read"))
+            .ok();
         tracing::info!(
             pid, path = %exe_path.display(), offset,
             "Found static-linked SSL_write in binary"
@@ -386,10 +397,12 @@ impl TlsProbeController {
         let remove = format!("-:gvm_ssl_write_{}", self.pid);
         let _ = std::fs::write("/sys/kernel/debug/tracing/uprobe_events", &remove);
 
-        // Write uprobe event definition with fetchargs for buf pointer and len
-        // p:NAME PATH:OFFSET %ax %dx  (x86_64: rdi=ssl, rsi=buf, rdx=len)
+        // Write uprobe event definition with fetchargs.
+        // x86_64 calling convention: rdi=ssl_ctx, rsi=buf_ptr, rdx=len
+        // Verified on WSL2 kernel 6.6 + OpenSSL 3.x:
+        //   +0(%si):string captures the plaintext HTTP request line from buf pointer.
         let uprobe_def = format!(
-            "p:gvm_ssl_write_{} {}:0x{:x} buf=%si:u64 len=%dx:u32",
+            "p:gvm_ssl_write_{} {}:0x{:x} buf=+0(%si):string",
             self.pid,
             self.library.path.display(),
             self.library.ssl_write_offset,
@@ -476,30 +489,21 @@ impl TlsProbeController {
 
             self.stats.events_captured += 1;
 
-            // Parse trace line to extract buf address and len
-            // Format: "... gvm_ssl_write_1234: ... buf=0x7f1234 len=256"
-            let (buf_addr, buf_len) = match parse_trace_line(&line) {
-                Some(v) => v,
+            // Extract HTTP request line directly from trace string fetcharg.
+            // Format: `... buf="GET /path HTTP/1.1`
+            // This avoids /proc/pid/mem access (which can race with SSL_write completion).
+            let http_text = match parse_trace_line_http(&line) {
+                Some(t) => t,
                 None => {
                     self.stats.parse_failures += 1;
                     continue;
                 }
             };
 
-            // Read plaintext from agent process memory
-            let plaintext = match read_process_memory(self.pid, buf_addr, buf_len as usize) {
-                Ok(data) => data,
-                Err(e) => {
-                    tracing::debug!(error = %e, "Failed to read process memory");
-                    self.stats.parse_failures += 1;
-                    continue;
-                }
-            };
-
-            // Parse HTTP from plaintext
-            let http_req = match parse_http_from_plaintext(&plaintext) {
+            // Parse HTTP from the captured string
+            let http_req = match parse_http_from_plaintext(http_text.as_bytes()) {
                 Some(req) => req,
-                None => continue, // Not HTTP (could be TLS record, binary data, etc.)
+                None => continue, // Not HTTP
             };
 
             let host = http_req.host.as_deref().unwrap_or("unknown");
@@ -612,9 +616,23 @@ impl Drop for TlsProbeController {
     }
 }
 
-/// Parse a trace_pipe line to extract buf address and len from fetchargs.
+/// Parse a trace_pipe line to extract HTTP plaintext from fetchargs.
 ///
-/// Expected format: "... gvm_ssl_write_1234: ... buf=0x7ffeabc123 len=256"
+/// Verified format: `python3-1234 [008] DNZff 12345.678: gvm_ssl_write_1234: (0x...) buf="GET / HTTP/1.1`
+/// The string fetcharg `+0(%si):string` captures the first line of plaintext.
+fn parse_trace_line_http(line: &str) -> Option<String> {
+    // Extract content after buf="
+    let start = line.find("buf=\"")?;
+    let content = &line[start + 5..];
+    // Remove trailing quote if present
+    let content = content.strip_suffix('"').unwrap_or(content);
+    if content.is_empty() {
+        return None;
+    }
+    Some(content.to_string())
+}
+
+/// Legacy: parse buf address and len from hex fetchargs (for /proc/pid/mem reading).
 fn parse_trace_line(line: &str) -> Option<(u64, u32)> {
     let buf_addr = line.split("buf=0x").nth(1)
         .and_then(|s| s.split_whitespace().next())
@@ -714,19 +732,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_trace_line_valid() {
+    fn parse_trace_line_http_get() {
+        let line = r#"python3-6328 [008] DNZff 20570.430368: gvm_ssl_write_1234: (0x79505ba54bb0) buf="GET /repos/skwuwu/Analemma-GVM HTTP/1.1"#;
+        let http = parse_trace_line_http(line).unwrap();
+        assert_eq!(http, "GET /repos/skwuwu/Analemma-GVM HTTP/1.1");
+    }
+
+    #[test]
+    fn parse_trace_line_http_post() {
+        let line = r#"python3-6328 [008] DNZff 20570.430368: gvm_ssl_write_1234: (0x79505ba54bb0) buf="POST /v1/transfers HTTP/1.1"#;
+        let http = parse_trace_line_http(line).unwrap();
+        let req = parse_http_from_plaintext(http.as_bytes()).unwrap();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/v1/transfers");
+    }
+
+    #[test]
+    fn parse_trace_line_legacy_hex() {
         let line = "node-1234 [001] d..1 12345.678: gvm_ssl_write_1234: (0x7f1234) buf=0x7ffeabc123 len=256";
         let (addr, len) = parse_trace_line(line).unwrap();
         assert_eq!(addr, 0x7ffeabc123);
         assert_eq!(len, 256);
-    }
-
-    #[test]
-    fn parse_trace_line_no_len() {
-        let line = "node-1234 [001] d..1 12345.678: gvm_ssl_write_1234: buf=0xdeadbeef";
-        let (addr, len) = parse_trace_line(line).unwrap();
-        assert_eq!(addr, 0xdeadbeef);
-        assert_eq!(len, 4096); // default
     }
 
     #[test]

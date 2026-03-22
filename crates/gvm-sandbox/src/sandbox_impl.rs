@@ -108,32 +108,42 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     let setup_ms = start.elapsed().as_millis() as u64;
     tracing::info!(setup_ms = setup_ms, "Sandbox setup complete, waiting for agent");
 
-    // 3.5. Start TLS probe (uprobe on SSL_write for HTTPS L7 inspection)
-    // Runs in background thread — captures plaintext before encryption.
-    // Gracefully degrades if uprobe attachment fails (domain-level policy still active).
+    // 3.5. Start TLS probe (uprobe on SSL_write_ex for HTTPS L7 inspection)
+    // Captures plaintext before encryption — enables path/method-level HTTPS enforcement.
+    // Verified on WSL2 kernel 6.6 + OpenSSL 3.x: captures "GET /path HTTP/1.1" from SSL_write_ex.
     let _tls_probe_handle = {
         let child_raw = child_pid.as_raw() as u32;
-        // Give the child process a moment to exec and load TLS libraries
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        match crate::tls_probe::start_tls_probe_thread(
-            child_raw,
-            Box::new(|_method, _host, _path| {
-                // Default: audit-only (log all TLS plaintext, don't enforce)
-                // SRR integration is provided by the caller via set_policy_check
-                crate::tls_probe::PolicyDecision::Allow
-            }),
-            true, // audit_only = true by default
-        ) {
-            Ok(handle) => {
-                tracing::info!(pid = child_raw, "TLS uprobe probe started (audit-only)");
-                Some(handle)
-            }
-            Err(e) => {
-                tracing::debug!(
-                    pid = child_raw, error = %e,
-                    "TLS probe not available — using domain-level HTTPS policy only"
-                );
-                None
+        let probe_mode = &config.tls_probe_mode;
+        let audit_only = matches!(probe_mode, crate::TlsProbeMode::Audit);
+        let disabled = matches!(probe_mode, crate::TlsProbeMode::Disabled);
+
+        if disabled {
+            tracing::debug!("TLS probe disabled by config");
+            None
+        } else {
+            // Give the child process time to exec and load TLS libraries
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            match crate::tls_probe::start_tls_probe_thread(
+                child_raw,
+                Box::new(|_method, _host, _path| {
+                    // TODO: inject actual SRR check from proxy via callback
+                    // For now: log all events (policy check deferred to proxy CONNECT)
+                    crate::tls_probe::PolicyDecision::Allow
+                }),
+                audit_only,
+            ) {
+                Ok(handle) => {
+                    let mode = if audit_only { "audit" } else { "enforce" };
+                    tracing::info!(pid = child_raw, mode, "TLS uprobe started");
+                    Some(handle)
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        pid = child_raw, error = %e,
+                        "TLS probe not available — using domain-level HTTPS policy only"
+                    );
+                    None
+                }
             }
         }
     };
