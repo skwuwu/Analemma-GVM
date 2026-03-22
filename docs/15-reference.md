@@ -25,6 +25,7 @@ The proxy loads configuration in this order (first match wins):
 | `GVM_VAULT_KEY` | AES-256 key for Vault encryption (64 hex chars) | Random ephemeral key |
 | `GVM_SECRETS_KEY` | Encryption key for `secrets.toml` | None (plaintext) |
 | `GVM_PROXY_URL` | Override proxy URL in Python SDK | `http://127.0.0.1:8080` |
+| `GVM_SHADOW_MODE` | Shadow Mode: `strict`, `cautious`, `permissive`, `disabled` | `disabled` |
 | `RUST_LOG` | Proxy log level | `info` |
 
 ### Proxy Configuration (`config/proxy.toml`)
@@ -247,7 +248,117 @@ gvm run -i agent.py                  # Interactive: suggest rules after run
 gvm run --sandbox agent.py           # Linux namespace isolation
 gvm run --contained agent.py         # Docker isolation
 gvm run --contained --detach agent.py  # Docker in background
+
+# Binary mode: run any command through GVM proxy
+gvm run -- openclaw gateway            # Arbitrary binary + args
+gvm run --sandbox -- openclaw gateway  # Binary in Linux sandbox
 ```
+
+### Binary Mode (`gvm run -- <command>`)
+
+When the argument after `--` is not a recognized script file (`.py`, `.js`, `.ts`, `.sh`, `.bash`) or when multiple arguments follow `--`, `gvm run` enters **binary mode**. The specified command is executed with `HTTP_PROXY` and `HTTPS_PROXY` set to route all outbound traffic through the GVM proxy.
+
+Binary mode provides **Layer 2 enforcement only** (SRR URL-based rules). No SDK headers are injected, so ABAC policy evaluation is not available. All audit output goes to stderr to keep stdout clean for piping.
+
+With `--sandbox`, binary mode uses Linux-native isolation (namespaces + seccomp + veth + uprobe) — the same security layers as script sandbox mode.
+
+---
+
+## Proxy API Endpoints
+
+Management endpoints served directly by the proxy under `/gvm/`.
+
+### `POST /gvm/reload`
+
+Hot-reload SRR rules from the config file. Atomically swaps the rule set. On parse failure, existing rules are preserved and an error is returned.
+
+| Field | Value |
+|-------|-------|
+| Method | POST |
+| Body | None |
+| Success | `200 {"reloaded": true, "rules": <count>}` |
+| Parse failure | `400 {"reloaded": false, "error": "..."}` |
+
+### `POST /gvm/intent`
+
+Register a Shadow Mode intent for pre-flight verification. MCP tools or SDK call this before the agent makes an outbound HTTP request.
+
+| Field | Value |
+|-------|-------|
+| Method | POST |
+| Body | `{"method", "host", "path", "operation", "agent_id", "ttl_secs?"}` |
+| Success | `201 {"registered": true, "intent_id": <id>, ...}` |
+| Capacity exceeded | `429 {"error": "Intent store full"}` |
+
+### `POST /gvm/check`
+
+Dry-run policy evaluation. Evaluates ABAC + SRR without forwarding, WAL writing, or credential injection.
+
+| Field | Value |
+|-------|-------|
+| Method | POST |
+| Body | `{"operation", "target_host", "target_path", "method", "resource?"}` |
+| Success | `200 {"decision", "srr_decision", "engine_ms", "matched_rule", "dry_run": true}` |
+
+---
+
+## Shadow Mode
+
+Shadow Mode adds 2-phase intent verification. Agents declare intent before making API calls; the proxy verifies the match.
+
+### Environment Variable
+
+```
+GVM_SHADOW_MODE=strict|cautious|permissive|disabled
+```
+
+| Mode | Unverified request behavior |
+|------|-----------------------------|
+| `strict` | Deny (HTTP 403) |
+| `cautious` | Delay (default 5000ms) + audit warning |
+| `permissive` | Allow + audit warning |
+| `disabled` | No verification (default) |
+
+### Configuration (`proxy.toml`)
+
+```toml
+[shadow]
+mode = "strict"
+intent_ttl_secs = 30        # Intent expiry
+cautious_delay_ms = 5000    # Delay for cautious mode
+```
+
+---
+
+## SandboxConfig Fields
+
+Configuration fields for `gvm run --sandbox` (Linux-native isolation). Defined in `crates/gvm-sandbox/src/lib.rs`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `script_path` | `PathBuf` | Absolute path to the agent script or binary |
+| `workspace_dir` | `PathBuf` | Directory exposed inside the sandbox (read-only bind mount) |
+| `interpreter` | `String` | Interpreter or binary to execute (python, node, bash, or binary path) |
+| `interpreter_args` | `Vec<String>` | Arguments passed to the interpreter |
+| `proxy_addr` | `SocketAddr` | GVM proxy address for the veth network route |
+| `agent_id` | `String` | Agent ID injected as environment variable |
+| `seccomp_profile` | `Option<SeccompProfile>` | Seccomp profile override (None = default whitelist) |
+| `tls_probe_mode` | `TlsProbeMode` | TLS probe mode: `Audit` (default), `Enforce`, `Disabled` |
+| `proxy_url` | `Option<String>` | Proxy URL for uprobe `/gvm/check` queries (None = allow-all) |
+
+### `tls_probe_mode`
+
+Controls uprobe-based TLS plaintext inspection inside the sandbox. Requires Linux 5.5+ and root/CAP_BPF.
+
+| Mode | Behavior |
+|------|----------|
+| `Audit` | Log HTTPS plaintext but do not block (default, safe for v0.1) |
+| `Enforce` | Log and block denied HTTPS requests via SIGSTOP |
+| `Disabled` | Disable TLS probing entirely |
+
+### `proxy_url`
+
+When set (e.g., `"http://127.0.0.1:8080"`), the uprobe queries the proxy's `/gvm/check` endpoint for SRR decisions on observed TLS connections. When `None`, uprobe uses allow-all mode (audit-only regardless of `tls_probe_mode`).
 
 ---
 

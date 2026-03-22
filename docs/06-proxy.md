@@ -340,7 +340,222 @@ pub struct LLMUsage {
 
 ---
 
-## 6.10 Test Coverage
+## 6.10 CONNECT Tunnel (HTTPS Proxy)
+
+**Source**: `src/proxy.rs` (function `connect_tunnel`)
+
+For HTTPS traffic, clients issue a `CONNECT host:port` request. The proxy performs a **blind TCP relay** — TLS content is not inspected (no MITM). Policy enforcement is limited to domain and port level.
+
+### Flow
+
+```
+Client                    Proxy                       Upstream
+  │                         │                            │
+  │─── CONNECT host:443 ──>│                            │
+  │                         │── check_domain(host) ────>│
+  │                         │   (SRR domain-level)      │
+  │                         │                            │
+  │                   ┌─────┴─────┐                      │
+  │                   │ Decision  │                      │
+  │                   ▼           ▼                      │
+  │              Allow/Delay    Deny                     │
+  │                   │           │                      │
+  │                   │     ←─ 403 ──                    │
+  │                   │                                  │
+  │  ←─ 200 ─────────│                                  │
+  │                   │── TCP connect ──────────────────>│
+  │<══════════════════╪══ Blind relay (bidirectional) ══>│
+  │                   │                                  │
+```
+
+### Domain-Level Policy (`check_domain()`)
+
+Unlike normal HTTP requests where SRR matches method + host + path, CONNECT tunnels only have a host to evaluate. The `check_domain()` function applies these rules:
+
+| Condition | Decision |
+|-----------|----------|
+| Any non-Deny, non-catch-all rule exists for this host | Allow |
+| Only Deny rules exist for this host | Deny |
+| No rules match at all | Default-to-Caution (Delay 300ms) |
+
+### WAL Integration
+
+- **Denied tunnels**: Synchronous WAL write with transport info (`method: "CONNECT"`, `path: ":port"`).
+- **Allowed tunnels**: Async WAL write (loss tolerated, same as IC-1). Tunneled content is not auditable since TLS is opaque.
+
+### Shadow Mode for CONNECT
+
+When Shadow Mode is enabled, CONNECT requests are also subject to intent verification. In `Strict` mode, a CONNECT without a prior `gvm_declare_intent` is denied. Intent is confirmed immediately upon tunnel establishment (no WAL for tunneled content).
+
+### Limitations
+
+- No path-level or body-level enforcement (requires TLS inspection, planned for v0.2).
+- No method-level enforcement (CONNECT is always the method).
+- Port is logged but not currently used for policy decisions.
+
+---
+
+## 6.11 Shadow Mode and Intent Store
+
+**Source**: `src/intent_store.rs`, `src/proxy.rs`, `src/api.rs`
+
+Shadow Mode adds a **2-phase intent verification** layer on top of standard SRR/ABAC enforcement. Before making an outbound HTTP request, the agent declares its intent (via MCP tool or SDK). The proxy then verifies that incoming requests match a previously declared intent.
+
+### Intent Lifecycle
+
+```
+MCP gvm_declare_intent
+        │
+        ▼
+  POST /gvm/intent → IntentStore::register()
+        │
+        ▼
+   ┌──────────┐
+   │  Active   │ ← Ready to be claimed
+   └─────┬────┘
+         │  proxy request arrives
+         ▼
+   ┌──────────┐
+   │ Claimed   │ ← Marked, pending WAL write
+   └─────┬────┘
+    ┌────┴─────┐
+    │          │
+    ▼          ▼
+ confirm()  release()
+ (WAL OK)   (WAL fail)
+    │          │
+    ▼          ▼
+ Consumed   Active
+ (deleted)  (restored)
+```
+
+**Invariant**: Intent deletion occurs ONLY on `confirm()`. This ensures: no decision without audit, no audit without decision (TOCTOU prevention).
+
+### Shadow Modes
+
+Controlled via `GVM_SHADOW_MODE` environment variable:
+
+| Mode | On unverified request | Recommended for |
+|------|----------------------|-----------------|
+| `strict` | Deny (HTTP 403) | Production |
+| `cautious` | Delay (default 5000ms) + audit warning | Staging / rollout |
+| `permissive` | Allow + audit warning | Onboarding / development |
+| `disabled` | No verification (default) | Legacy / opt-out |
+
+### ABAC Re-evaluation
+
+When a claimed intent includes an `operation` name, Shadow Mode performs ABAC re-evaluation using the declared operation. If the combined decision (ABAC + SRR) is stricter than the SRR-only decision, the stricter decision is used. This catches cases where the agent's declared operation would itself be restricted by policy.
+
+### Configuration
+
+```toml
+# In proxy.toml or via environment variables
+[shadow]
+mode = "strict"          # or cautious, permissive, disabled
+intent_ttl_secs = 30     # Intent expiry (default: 30s)
+cautious_delay_ms = 5000 # Delay for cautious mode (default: 5000ms)
+```
+
+### Limits and Safety
+
+- **Max intents**: 10,000 (hard cap). Returns HTTP 429 when exceeded.
+- **Claim timeout**: 10 seconds (2x typical WAL fsync). Orphaned claims are released back to Active.
+- **Case-insensitive matching**: Method and host matching is case-insensitive.
+- **Path prefix matching**: Intent path is matched as a prefix of the request path.
+- **Mutex poison**: Returns unverified (fail-closed) on mutex poison.
+
+---
+
+## 6.12 Control Plane Endpoints
+
+The proxy exposes management endpoints under the `/gvm/` path prefix. These are handled directly by the proxy (never forwarded to upstream).
+
+### `POST /gvm/reload` — SRR Hot-Reload
+
+Reloads SRR rules from the config file without restarting the proxy. Atomically swaps the rule set. On parse failure, existing rules are preserved.
+
+**Request**: No body required.
+
+**Response (success)**:
+```json
+{"reloaded": true, "rules": 42}
+```
+
+**Response (parse failure)**:
+```json
+{"reloaded": false, "error": "Parse failed: ... Existing rules preserved."}
+```
+
+### `POST /gvm/intent` — Register Shadow Mode Intent
+
+Registers a declared intent for shadow verification. Called by MCP tools or SDK before the agent makes an outbound HTTP request.
+
+**Request**:
+```json
+{
+  "method": "POST",
+  "host": "api.slack.com",
+  "path": "/api/chat.postMessage",
+  "operation": "gvm.messaging.send",
+  "agent_id": "agent-001",
+  "ttl_secs": 30
+}
+```
+
+**Response (success, 201)**:
+```json
+{
+  "registered": true,
+  "intent_id": 1,
+  "method": "POST",
+  "host": "api.slack.com",
+  "path": "/api/chat.postMessage",
+  "operation": "gvm.messaging.send",
+  "ttl_secs": 30,
+  "shadow_mode": "Strict"
+}
+```
+
+**Response (capacity exceeded, 429)**:
+```json
+{"error": "Intent store full (max 10000)"}
+```
+
+### `POST /gvm/check` — Dry-Run Policy Check
+
+Evaluates ABAC + SRR policies without forwarding, WAL writing, or credential injection. Useful for pre-flight checks and UI tooling.
+
+**Request**:
+```json
+{
+  "operation": "gvm.payment.charge",
+  "target_host": "api.bank.com",
+  "target_path": "/transfer/123",
+  "method": "POST",
+  "resource": {"service": "stripe", "tier": "external", "sensitivity": "critical"}
+}
+```
+
+**Response**:
+```json
+{
+  "decision": "Deny",
+  "srr_decision": "Deny { reason: \"Wire transfer blocked\" }",
+  "engine_ms": 0.1,
+  "operation": "gvm.payment.charge",
+  "method": "POST",
+  "target_host": "api.bank.com",
+  "matched_rule": "Wire transfer rule",
+  "dry_run": true,
+  "next_action": "This operation is blocked by policy. Contact your administrator."
+}
+```
+
+**Fields**: `operation` defaults to `"unknown"`, `method` defaults to `"POST"`, `target_host` defaults to `"unknown"`, `target_path` defaults to `"/"`. When `operation` is `"unknown"` or `"test"`, only the SRR decision is returned (ABAC is not meaningful without a real operation).
+
+---
+
+## 6.13 Test Coverage
 
 Proxy pipeline tests are covered indirectly through:
 
@@ -355,7 +570,7 @@ Proxy pipeline tests are covered indirectly through:
 
 ---
 
-## 6.9 Governance Block Response
+## 6.14 Governance Block Response
 
 When the proxy blocks an operation (Deny, RequireApproval, Throttle, or infrastructure failure), it returns a standard `GovernanceBlockResponse` JSON body. This is the contract between the proxy and all agent SDKs — every blocked request uses this format so agents can react programmatically.
 

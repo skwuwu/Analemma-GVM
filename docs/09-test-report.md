@@ -1,8 +1,8 @@
 # Part 9: Test & Benchmark Report
 
-**Total: 257 Rust Tests (120 core unit + 7 engine + 17 CLI + 32 boundary + 17 edge + 28 hostile + 12 integration + 12 merkle + 12 stress) — All Pass**
+**Total: 277 Rust Tests (120 core unit + 7 engine + 17 CLI + 32 boundary + 17 edge + 28 hostile + 12 integration + 12 merkle + 12 stress + 10 tls_probe + 7 sandbox security + 3 base64) + 34 EC2 E2E Scenarios — All Pass**
 **Benchmarks: 17 groups / 76 benchmark cases (Criterion v0.5)**
-**Last Verified: 2026-03-20 (`cargo test --workspace --all-targets`)**
+**Last Verified: 2026-03-23 (`cargo test --workspace --all-targets`)**
 
 ---
 
@@ -32,6 +32,12 @@ crates/gvm-cli/
 ├── src/run.rs          # 8 proxy URL detection unit tests
 ├── src/suggest.rs      # 6 path generalization tests
 ├── tests/cli_integration.rs # 3 command surface integration tests
+crates/gvm-sandbox/
+├── src/tls_probe.rs    # 10 TLS probe tests (symbol resolution, HTTP parsing, policy callback)
+├── tests/security.rs   # 7 sandbox config + preflight tests
+scripts/
+├── ec2-e2e-test.sh     # 34 Linux E2E scenarios (EC2/Codespace)
+├── ec2-setup.sh        # One-command EC2 setup
 benches/
 ├── pipeline.rs         # 17 benchmark groups (Criterion)
 ```
@@ -575,6 +581,13 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 | **Decision Correctness** | [hostile:5-6](tests/hostile.rs), [edge:10-11](tests/edge_cases.rs), [boundary:6,14](tests/boundary.rs) |
 | **Wasm Isolation** | [boundary:1-7](tests/boundary.rs), [wasm_engine](src/wasm_engine.rs) (4) |
 | **Encryption Integrity** | [vault](src/vault.rs) (7), [boundary:21-23,26](tests/boundary.rs) |
+| **uprobe TLS Capture** | tls_probe tests (10), EC2 tests 4, 8, 21, 30b |
+| **CONNECT Tunnel** | EC2 tests 3, 11, 24 |
+| **Shadow Mode** | EC2 tests 7 (intent verification) |
+| **SRR Hot-Reload** | EC2 tests 10, 15 |
+| **Base64 Payload** | srr::tests::base64_* (3), EC2 test 17 |
+| **Fail-Closed** | EC2 tests 8c, 19, 20 |
+| **Multi-Service** | EC2 tests 29, 31, 32 |
 
 ---
 
@@ -611,7 +624,51 @@ cargo bench --bench pipeline -- "ebpf_kernel"       # eBPF TC setup (Linux only)
 
 ---
 
-## 9.8 Coverage Gaps and Future Tests
+## 9.9 EC2 Linux E2E Test Suite
+
+**Script**: [`scripts/ec2-e2e-test.sh`](../scripts/ec2-e2e-test.sh) — 34 scenarios, requires Linux (EC2 or Codespace).
+**Setup**: [`scripts/ec2-setup.sh`](../scripts/ec2-setup.sh) — one-command dependency install.
+
+| # | Test | What it verifies |
+|---|------|-----------------|
+| 1 | Native Build | cargo build on Linux |
+| 2 | Proxy Health | Start + /gvm/health |
+| 3 | CONNECT Tunnel | Real HTTPS to GitHub + Anthropic |
+| 4 | uprobe Capture | SSL_write_ex plaintext |
+| 5 | SRR Policy (7) | Allow/Delay/Deny accuracy |
+| 6 | MCP Integration (8) | gvm_status, policy_check, fetch, rulesets, audit |
+| 7 | OpenClaw Agent | LLM call through proxy |
+| 8 | uprobe Enforcement | SIGSTOP + fail-closed |
+| 9 | Long-Running | 200 requests, memory stable |
+| 10 | Hot-Reload | Delay→Allow + zero loss |
+| 11 | Concurrent CONNECT | 10 parallel tunnels |
+| 12 | Semantic Violation | read Allow + delete Deny |
+| 13 | Burst Traffic | 100 rapid requests |
+| 14 | MCP Cross-Layer | Allow→Deny→Deny |
+| 15 | MCP Ruleset Lifecycle | apply→verify→re-apply |
+| 16 | Infinite Loop | 1291 requests in 10s, proxy survives |
+| 17 | Base64 Detection | Payload decoding verification |
+| 18 | Multi-Session (20) | 20 concurrent decisions correct |
+| 19 | Proxy Crash | kill -9 → fail-closed |
+| 20 | Proxy Hang | SIGSTOP → timeout → Deny |
+| 21 | Trace Pipe Stress | 10 uprobe events, 0 lost |
+| 22 | Restart Recovery | WAL preserved + rules re-loaded |
+| 23 | Auth Session | login→refresh→write→deny flow |
+| 24 | Real Allow/Deny | Actual HTTP 200 through proxy |
+| 25 | OpenClaw Workflow | LLM + web_fetch |
+| 26 | Deny Error Quality | 403 JSON with reason |
+| 27 | GitHub MCP Server | npx MCP through proxy |
+| 28 | Kill Chain | read→summarize→exfil blocked |
+| 29 | All-Service Matrix | GitHub/Slack/Discord/Gmail/Telegram/Brave/Tavily (22) |
+| 30 | gog Proxy Bypass | uprobe catches direct HTTPS |
+| 31 | Telegram API | Bot API Allow/Delay/Deny + real getMe |
+| 32 | Multi-Service Workflow | OpenClaw + multi-service policy |
+| 33 | gvm run Binary | curl/python3/openclaw via gvm run |
+| 34 | gvm run Integration | GitHub/MCP/OpenClaw/Telegram/kill chain via gvm run |
+
+---
+
+## 9.10 Coverage Gaps and Future Tests
 
 | Gap | Priority | Tracking Issue |
 |-----|----------|---------------|

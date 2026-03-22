@@ -1,6 +1,6 @@
 # Analemma-GVM Roadmap
 
-> **Last updated**: 2026-03-19
+> **Last updated**: 2026-03-23
 
 ---
 
@@ -161,6 +161,29 @@
 
 ---
 
+## v0.2 — Done
+
+- [x] Shadow Mode + intent store (2-phase intent lifecycle, `POST /gvm/intent`, strict/permissive modes)
+- [x] CONNECT tunnel (HTTPS transparent proxy support)
+- [x] SRR hot-reload (`POST /gvm/reload` — runtime policy updates without proxy restart)
+- [x] eBPF uprobe TLS capture (SSL_write_ex plaintext tap)
+- [x] uprobe SRR policy callback (`/gvm/check` enforcement from uprobe thread, fail-closed)
+- [x] Base64 payload decoding in SRR (body + field value decoding for encoded payloads)
+- [x] `gvm run` binary mode (`gvm run -- openclaw gateway` with HTTPS_PROXY injection)
+- [x] MCP integration (intent lifecycle for MCP-compatible governance)
+- [x] Telegram/Discord rulesets (Telegram Bot API path_regex, Discord channel/guild delete rules)
+
+---
+
+## v0.3 — Planned
+
+- [ ] Multi-PID uprobe (scan `/proc/*/maps` for multi-process TLS capture)
+- [ ] Chunked transfer body reassembly (inspect chunked-encoded HTTP bodies)
+- [ ] Anomaly detection (low-and-slow exfiltration pattern matching)
+- [ ] WebSocket proxy support (frame-level inspection and policy enforcement)
+
+---
+
 ## v2.0 — Runtime & Infrastructure (Launch + 2-3 months)
 
 ### `gvm run` — Network Namespace Enforcement
@@ -181,7 +204,7 @@
 - [x] Sandbox preflight gating for critical prerequisites (`CAP_NET_ADMIN`, `ip`, `iptables`, userns, seccomp, eBPF)
 - [x] Local proxy auto-start for `gvm run` when localhost target is unreachable
 - [ ] Mandatory-by-default interception profile (reject non-contained launch in production)
-- [ ] Transparent proxy parity (`SO_ORIGINAL_DST`, CONNECT tunnel)
+- [x] Transparent proxy parity (`SO_ORIGINAL_DST`, CONNECT tunnel)
 - [ ] macOS/Windows host-level interception fallback (currently Docker fallback only)
 - [ ] Static library list for common interpreters (Python, Node) as ldd fallback
 - [ ] `mknod`-based /dev node creation as alternative to bind-mount
@@ -204,7 +227,7 @@
 ### Proxy Enhancements
 
 - [ ] TLS termination + certificate management
-- [ ] HTTP CONNECT tunnel support (for HTTPS transparent proxy)
+- [x] HTTP CONNECT tunnel support (for HTTPS transparent proxy)
 - [x] SSE response passthrough with bounded thinking trace tap (1MB capture)
 - [ ] gRPC detection + passthrough (no inspection yet)
 - [ ] Pluggable isolation backend interface:

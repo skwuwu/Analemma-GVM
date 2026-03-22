@@ -4,6 +4,44 @@
 
 ---
 
+## 2026-03-23: Documentation Update — SRR, Proxy, and Reference Guide
+
+### What Changed
+- `docs/03-srr.md`: Added sections for Base64 payload decoding (3.6.1), path_regex matching (3.7), and SRR hot-reload (3.8). Renumbered subsequent sections.
+- `docs/06-proxy.md`: Added sections for CONNECT tunnel (6.10), Shadow Mode + Intent Store (6.11), and control plane endpoints `/gvm/reload`, `/gvm/intent`, `/gvm/check` (6.12). Renumbered Governance Block Response to 6.14.
+- `docs/15-reference.md`: Added proxy API endpoints (reload, intent, check), binary mode documentation, Shadow Mode env var and config, SandboxConfig fields (tls_probe_mode, proxy_url).
+
+### Affected Files
+- `docs/03-srr.md`, `docs/06-proxy.md`, `docs/15-reference.md`, `docs/14-implementation-log.md`
+
+### Risk Assessment
+None. Documentation-only changes reflecting existing implemented features.
+
+---
+
+## 2026-03-23: Binary Mode, Base64 Decoding, MCP Rulesets, EC2 E2E Tests
+
+### What Changed
+- `gvm run` binary mode: `gvm run -- openclaw gateway` with HTTPS_PROXY injection for arbitrary binaries
+- `gvm run --sandbox` for arbitrary binaries (namespace + seccomp + uprobe isolation)
+- gvm run stdout-to-stderr fix (clean stdout for piping)
+- Base64 payload decoding in SRR (body + field value decoding for encoded payloads)
+- Telegram ruleset (path_regex for Bot API endpoint matching)
+- Discord ruleset: channel/guild delete rules added
+- EC2 E2E test suite: 34 scenarios covering proxy enforcement, sandbox, and uprobe paths
+- OpenClaw config fix (mcpServers invalid key removal)
+
+### Affected Files
+- `crates/gvm-cli/src/main.rs`, `crates/gvm-cli/src/run.rs` (binary mode + stdout fix)
+- `src/srr.rs` (Base64 decoding in SRR evaluation)
+- `scripts/ec2-e2e-test.sh` (34 E2E test scenarios)
+- `rulesets/telegram.toml`, `rulesets/discord.toml` (MCP repo rulesets)
+
+### Risk Assessment
+Low-Medium. Binary mode extends existing `gvm run` with HTTPS_PROXY injection -- no changes to core proxy or policy engine. Base64 decoding adds a new SRR evaluation path but is opt-in per rule. E2E tests are test-only additions.
+
+---
+
 ## 2026-03-22: Uprobe SRR Policy Enforcement
 
 ### What Changed

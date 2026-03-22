@@ -120,9 +120,81 @@ When a payload rule is skipped (body too large, JSON parse failure, field missin
 
 **OOM Protection**: Bodies exceeding `max_body_bytes` (default 65536) are **never parsed**. The rule is skipped and evaluation continues to subsequent rules. This prevents adversarial payloads from causing memory exhaustion.
 
+### Base64 Payload Decoding
+
+SRR automatically decodes Base64-encoded content before pattern matching. This prevents bypass via encoding obfuscation. Two decoding strategies are applied in order:
+
+1. **Entire body is Base64**: If the body fails JSON parsing, SRR attempts standard Base64 decoding of the entire body (after trimming whitespace). If decoding succeeds and the result is valid JSON, payload inspection proceeds on the decoded JSON.
+
+2. **Individual field values are Base64**: After normal JSON parsing succeeds, SRR checks whether the target `payload_field` value is itself a Base64-encoded string. If so, the decoded content is compared against `payload_match` entries using **substring matching** (`contains`), not exact equality. This catches cases like a webhook body where `{"data": "Z2hwX2FiYzEyM3NlY3JldHRva2Vu"}` contains an encoded GitHub token (`ghp_abc123secrettoken`).
+
+| Scenario | Decoding | Match Type |
+|----------|----------|------------|
+| Normal JSON body | None | Exact string equality |
+| Entire body is Base64-encoded JSON | Decode body, then extract field | Exact string equality |
+| JSON field value is Base64-encoded | Decode field value | Substring match (`contains`) |
+| Non-JSON, non-Base64 body | Rule skipped | — |
+
+**Security note**: Base64 decoding uses standard alphabet only (RFC 4648). URL-safe or non-standard encodings are not decoded — these cause the rule to be skipped, and evaluation falls through to subsequent rules.
+
 ---
 
-## 3.7 Configuration Example
+## 3.7 Path Regex Matching
+
+**Config field**: `path_regex` (optional, per-rule)
+
+The default path matching (prefix wildcard with trailing `*`) does not support mid-pattern wildcards. For URLs like Telegram's `/bot<token>/sendMessage` where the variable segment appears in the middle, `path_regex` provides full regex matching via Rust's `regex` crate.
+
+```toml
+[[rules]]
+method = "POST"
+pattern = "api.telegram.org"
+path_regex = "^/bot[^/]+/sendMessage$"
+decision = { type = "Delay", milliseconds = 500 }
+description = "Telegram message send — review delay"
+```
+
+**Behavior**:
+
+- When `path_regex` is set, it **overrides** the path portion of `pattern` for matching. The host portion of `pattern` is still used for host matching.
+- Regex is **pre-compiled at load time** using Rust's automata-based regex engine (guaranteed O(n) linear-time matching, no backtracking).
+- Invalid regex patterns cause a **startup error** (fail-fast).
+- Regex length is bounded to 10,000 bytes to prevent resource exhaustion.
+- Both the normalized path and the original request path are tested against the regex — normalization expands what gets caught, it never hides matches.
+
+| Use Case | Example `path_regex` |
+|----------|---------------------|
+| Versioned API endpoints | `"^/api/v[1-3]/users/.*"` |
+| Sensitive admin paths (case-insensitive) | `"(?i)/(admin\|internal\|debug)(/\|$)"` |
+| Telegram bot URLs | `"^/bot[^/]+/sendMessage$"` |
+| Destructive DB operations | `"^/(drop\|truncate\|delete)/"` |
+
+**Note**: A rule with `method = "*"`, `pattern = "{any}"`, and `path_regex` set is **not** treated as a catch-all rule, since the regex restricts which paths match.
+
+---
+
+## 3.8 SRR Hot-Reload
+
+The SRR rule set can be reloaded at runtime without restarting the proxy via `POST /gvm/reload`.
+
+**Reload flow**:
+
+1. Proxy receives `POST /gvm/reload`
+2. Loads and parses the SRR config file (`config/srr_network.toml`)
+3. Pre-compiles all regex patterns, validates all rules
+4. On **success**: acquires a write lock on the SRR and atomically swaps the entire rule set. Returns `200 OK` with the new rule count.
+5. On **parse failure**: existing rules are **preserved unchanged**. Returns `400 Bad Request` with the parse error. The proxy continues operating with the previous rules.
+
+**Atomicity guarantee**: The rule set is stored behind an `RwLock`. The write lock is held only for the pointer swap (not during parsing). Concurrent requests continue to evaluate against the old rules until the swap completes.
+
+```
+POST /gvm/reload → 200 {"reloaded": true, "rules": 42}
+POST /gvm/reload → 400 {"reloaded": false, "error": "Parse failed: ... Existing rules preserved."}
+```
+
+---
+
+## 3.9 Configuration Example
 
 ```toml
 # Block wire transfers
@@ -161,7 +233,7 @@ decision = { type = "Delay", milliseconds = 300 }
 
 ---
 
-## 3.8 Header Forgery Defense
+## 3.10 Header Forgery Defense
 
 The SRR's primary security value: it **ignores** the semantic operation header (`X-GVM-Operation`).
 
@@ -176,7 +248,7 @@ The agent's lie is caught at Layer 2 regardless of what it declared at Layer 1.
 
 ---
 
-## 3.9 Test Coverage
+## 3.11 Test Coverage
 
 | Test | Assertion |
 |------|-----------|
