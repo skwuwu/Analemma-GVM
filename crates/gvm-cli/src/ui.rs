@@ -10,6 +10,7 @@ pub const RESET: &str = "\x1b[0m";
 const WIDTH: usize = 72;
 
 /// Print a single dry-run check result.
+#[allow(clippy::too_many_arguments)]
 pub fn print_check_result(
     operation: &str,
     service: &str,

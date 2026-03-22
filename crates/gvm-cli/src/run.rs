@@ -7,6 +7,7 @@ use crate::ui::{BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
 /// - Default (no flags): runs locally with HTTP_PROXY set to GVM proxy.
 /// - --sandbox: Linux-native isolation (namespaces + seccomp + veth). Production recommended.
 /// - --contained: Docker-based isolation. Dev/CI or non-Linux platforms.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_agent(
     script: &str,
     agent_id: &str,
@@ -513,7 +514,7 @@ fn print_wal_audit(wal_path: &str, start_offset: u64, agent_id: &str) {
         println!("  {DIM}Review the blocked operations above. Your agent attempted actions{RESET}");
         println!("  {DIM}that violate your security policies.{RESET}");
         println!();
-    } else if events.len() > 0 {
+    } else if !events.is_empty() {
         println!("  {GREEN}\u{2713} All {} agent actions were within policy.{RESET}", events.len());
         println!();
     }
