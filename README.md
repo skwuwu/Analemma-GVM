@@ -2,7 +2,7 @@
 
 **Governance Virtual Machine — A Security Kernel for AI Agent I/O**
 
-**Status: v0.1.0-alpha (pre-release software).**
+**Status: v0.2 (pre-release software). Primary platform: Linux.**
 
 > **How is this different from NVIDIA OpenShell?**
 > OpenShell sandboxes agents with Docker+K3s (allow/deny).
@@ -428,7 +428,8 @@ class MyAgent(GVMAgent):
 |------|--------------|----------|
 | `python -m gvm.mock_demo` | **Start here.** Full proxy enforcement, mock LLM | No |
 | `python -m gvm.llm_demo` | Claude autonomous agent, live governance | Yes |
-| [**OpenClaw / MCP**](https://github.com/skwuwu/analemma-gvm-openclaw) | MCP server for OpenClaw, Claude Desktop, Cursor | No (proxy only) |
+| `gvm run -- openclaw gateway` | Any agent through GVM proxy | Varies |
+| [MCP integration](https://github.com/skwuwu/analemma-gvm-openclaw) | 12 preset rulesets, MCP server for Claude Desktop/Cursor | No (proxy only) |
 
 > More: `unified_demo` (scripted finance), `hostile_demo` (adversarial), `langchain_demo` (LangChain+Gmail), `rollback_demo` (checkpoint/rollback). All require `cargo run`.
 
@@ -447,35 +448,66 @@ gvm run -- python -m my_agent        # any command
 
 `gvm run` injects `HTTPS_PROXY` into all child processes. With `--sandbox`, adds Linux namespace isolation, seccomp-BPF syscall filtering, eBPF TC network enforcement, and uprobe TLS plaintext inspection.
 
-### OpenClaw / MCP Integration
+### Platform Support
 
-Two integration paths — both work, choose based on your needs:
+| Feature | Linux | macOS | Windows |
+|---------|-------|-------|---------|
+| Proxy + SRR + WAL + Merkle | Yes | Yes | Yes |
+| `gvm run` (HTTPS_PROXY) | Yes | Yes | Yes |
+| `--sandbox` (namespace + seccomp + eBPF) | **Yes** | No | No |
+| uprobe TLS capture (SSL_write_ex) | **Yes** (kernel 5.5+) | No | No |
+| `--contained` (Docker) | Yes | Yes | Yes |
+| Shadow Mode | Yes | Yes | Yes |
+| CONNECT tunnel | Yes | Yes | Yes |
 
-**Path A: HTTPS_PROXY (zero config, all traffic governed)**
+### Defense Layers (Linux)
 
-```bash
-gvm run -- openclaw gateway   # all OpenClaw traffic goes through GVM proxy
+```
+Layer 2: HTTP Proxy (all platforms)
+  └─ SRR: URL/method/path matching + Base64 payload decoding
+  └─ CONNECT tunnel: domain-level HTTPS enforcement
+  └─ WAL: Merkle-chained audit log
+  └─ Hot-reload: POST /gvm/reload (zero-downtime rule swap)
+
+Layer 3: OS Isolation (Linux only, --sandbox)
+  └─ Namespace: PID/mount/net isolation
+  └─ Seccomp-BPF: ~45 syscalls whitelisted
+  └─ eBPF TC filter: kernel-level proxy-only enforcement
+  └─ uprobe: SSL_write_ex plaintext capture → SRR policy check → SIGSTOP on Deny
 ```
 
-Every outbound HTTP/HTTPS from OpenClaw (LLM calls, Skills, MCP servers, web_fetch, exec curl) is automatically governed. No code changes, no MCP setup.
+### Agent Integration Examples
 
-**Path B: MCP Server (structured governance tools)**
+GVM governs any agent that makes HTTP calls. No framework dependency.
+
+```bash
+# Any script/binary
+gvm run agent.py                         # Python agent
+gvm run -- node my_agent.js              # Node.js agent
+gvm run --sandbox -- ./my_rust_agent     # Rust binary + kernel isolation
+
+# Agent frameworks
+gvm run -- openclaw gateway              # OpenClaw
+gvm run -- python -m crewai run          # CrewAI
+HTTP_PROXY=http://localhost:8080 autogen  # AutoGen (manual proxy)
+```
+
+**MCP Server** (optional — for Claude Desktop, Cursor, OpenClaw MCP clients):
 
 ```json
 {
   "mcpServers": {
     "gvm-governance": {
       "command": "node",
-      "args": ["~/.openclaw/skills/gvm-governance/mcp-server/dist/index.js"],
+      "args": ["path/to/mcp-server/dist/index.js"],
       "env": { "GVM_PROXY_URL": "http://127.0.0.1:8080" }
     }
   }
 }
 ```
 
-Agent gets `gvm_fetch`, `gvm_policy_check`, `gvm_status`, `gvm_select_rulesets` tools. Works with OpenClaw, Claude Desktop, Cursor, and any MCP client.
-
-See the [MCP integration repo →](https://github.com/skwuwu/analemma-gvm-openclaw) for rulesets, demos, and docs.
+Provides `gvm_fetch`, `gvm_policy_check`, `gvm_status`, `gvm_select_rulesets` tools.
+See the [MCP integration repo →](https://github.com/skwuwu/analemma-gvm-openclaw) for 12 preset rulesets and docs.
 
 ---
 
