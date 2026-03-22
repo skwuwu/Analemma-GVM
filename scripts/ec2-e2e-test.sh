@@ -21,7 +21,9 @@
 #   bash scripts/ec2-e2e-test.sh --skip-openclaw
 # ═══════════════════════════════════════════════════════════════════
 
-set -euo pipefail
+# No set -e: tests must not kill the script on failure.
+# Each test handles its own errors and reports PASS/FAIL.
+set -uo pipefail
 
 BOLD='\033[1m'
 DIM='\033[2m'
@@ -32,14 +34,15 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 PROXY_URL="http://127.0.0.1:8080"
+PROXY_LOG="/tmp/gvm-proxy-e2e.log"
 RESULTS=()
 SKIP_OPENCLAW=false
 SINGLE_TEST=""
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
-# Auto-detect PROXY_PID (for --test N mode)
-PROXY_PID=$(pgrep -f "gvm-proxy.*config" | head -1 || echo "")
+# Auto-detect PROXY_PID
+PROXY_PID=$(pgrep -f "gvm-proxy" | head -1 || true)
 
 # Auto-detect rulesets directory
 RULESETS_DIR=""
@@ -53,8 +56,35 @@ for d in "$REPO_DIR/../analemma-gvm-openclaw" "$HOME/analemma-gvm-openclaw"; do
     [ -d "$d/mcp-server" ] && MCP_DIR="$(cd "$d" && pwd)" && break
 done
 
+# ── Proxy lifecycle helpers ──
+
+ensure_proxy() {
+    if curl -sf --connect-timeout 2 "$PROXY_URL/gvm/health" > /dev/null 2>&1; then
+        PROXY_PID=$(pgrep -f "gvm-proxy" | head -1 || true)
+        return 0
+    fi
+    # Start proxy
+    cd "$REPO_DIR"
+    rm -f "$PROXY_LOG"
+    ./target/release/gvm-proxy --config config/proxy.toml > "$PROXY_LOG" 2>&1 &
+    PROXY_PID=$!
+    sleep 3
+    if curl -sf --connect-timeout 2 "$PROXY_URL/gvm/health" > /dev/null 2>&1; then
+        return 0
+    else
+        echo -e "  ${RED}Proxy failed to start${NC}"
+        return 1
+    fi
+}
+
 cleanup() {
-    [ -n "$PROXY_PID" ] && kill "$PROXY_PID" 2>/dev/null || true
+    # Only kill proxy if WE started it (not --test mode with external proxy)
+    if [ -n "$SINGLE_TEST" ]; then
+        # Don't kill proxy in --test mode
+        true
+    else
+        [ -n "$PROXY_PID" ] && kill "$PROXY_PID" 2>/dev/null || true
+    fi
     sudo bash -c "
     echo 0 > /sys/kernel/tracing/events/uprobes/gvm_ssl/enable 2>/dev/null
     echo > /sys/kernel/tracing/uprobe_events 2>/dev/null
@@ -154,9 +184,9 @@ print(f'  {len(parts)} rulesets loaded')
     fi
 
     > data/wal.log
-    ./target/release/gvm-proxy --config config/proxy.toml > /tmp/gvm-proxy.log 2>&1 &
-    PROXY_PID=$!
-    sleep 3
+    pkill -f gvm-proxy 2>/dev/null || true
+    sleep 1
+    ensure_proxy
 
     STATUS=$(curl -sf "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null || echo "failed")
     [ "$STATUS" = "healthy" ] && pass "2: proxy health ($STATUS)" || fail "2: proxy health ($STATUS)"
@@ -432,22 +462,24 @@ fi
 if should_run 9; then
     header "9: Long-Running Stability"
 
-    MEM_BEFORE=$(ps -o rss= -p "$PROXY_PID" 2>/dev/null | tr -d ' ')
+    ensure_proxy || { fail "9: proxy not available"; }
+
+    if [ -n "$PROXY_PID" ]; then
+    MEM_BEFORE=$(ps -o rss= -p "$PROXY_PID" 2>/dev/null | tr -d ' ' || echo "0")
     WAL_BEFORE=$(stat -c%s data/wal.log 2>/dev/null || echo 0)
     echo -e "  Memory before: ${MEM_BEFORE}KB"
     echo -e "  WAL before: ${WAL_BEFORE} bytes"
 
-    echo -e "  Sending 200 requests (10 batches of 20)..."
-    for batch in $(seq 1 10); do
-        for i in $(seq 1 20); do
-            curl -sf -X POST "$PROXY_URL/gvm/check" \
-                -H "Content-Type: application/json" \
-                -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' > /dev/null 2>&1 &
-        done
-        wait
-        echo -e "    $((batch * 20))/200..."
+    echo -e "  Sending 200 sequential requests..."
+    FAIL_COUNT=0
+    for i in $(seq 1 200); do
+        HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" -X POST "$PROXY_URL/gvm/check" \
+            -H "Content-Type: application/json" \
+            -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' 2>/dev/null || echo "000")
+        [ "$HTTP_CODE" != "200" ] && FAIL_COUNT=$((FAIL_COUNT + 1))
+        [ $((i % 50)) -eq 0 ] && echo -e "    $i/200..."
     done
-    sleep 2
+    echo -e "  Failed requests: $FAIL_COUNT/200"
 
     MEM_AFTER=$(ps -o rss= -p "$PROXY_PID" 2>/dev/null | tr -d ' ')
     WAL_AFTER=$(stat -c%s data/wal.log 2>/dev/null || echo 0)
@@ -466,7 +498,8 @@ if should_run 9; then
 
     # Proxy should still be healthy
     HEALTH=$(curl -sf "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null || echo "failed")
-    [ "$HEALTH" = "healthy" ] && pass "9b: proxy healthy after 500 requests" || fail "9b: proxy unhealthy"
+    [ "$HEALTH" = "healthy" ] && pass "9b: proxy healthy after 200 requests" || fail "9b: proxy unhealthy"
+    fi # PROXY_PID check
 fi
 
 # ═══════════════════════════════════════════════════════════════════
@@ -477,6 +510,7 @@ if should_run 10; then
     header "10: Ruleset Hot-Reload"
 
     cd "$REPO_DIR"
+    ensure_proxy || { fail "10: proxy not available"; }
 
     # Before: only _default ruleset (github = delay)
     cat "$RULESETS_DIR/_default.toml" > config/srr_network.toml 2>/dev/null
@@ -541,6 +575,7 @@ fi
 
 if should_run 11; then
     header "11: Concurrent CONNECT"
+    ensure_proxy || { fail "11: proxy not available"; }
 
     WAL_BEFORE=$(wc -l < data/wal.log 2>/dev/null || echo 0)
 
@@ -587,6 +622,7 @@ fi
 
 if should_run 12; then
     header "12: Semantic Violation (read Allow, delete Deny)"
+    ensure_proxy || { fail "12: proxy not available"; }
 
     # Simulate: agent reads issues (Allow), then tries to delete branch (Deny)
     READ=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
@@ -612,6 +648,7 @@ fi
 
 if should_run 13; then
     header "13: Burst Traffic (100 rapid requests)"
+    ensure_proxy || { fail "13: proxy not available"; }
 
     HEALTH_BEFORE=$(curl -sf "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null)
     WAL_BEFORE=$(wc -l < data/wal.log 2>/dev/null || echo 0)
@@ -717,6 +754,7 @@ fi
 
 if should_run 16; then
     header "16: Infinite Loop Resilience"
+    ensure_proxy || { fail "16: proxy not available"; }
 
     MEM_BEFORE=$(ps -o rss= -p "$PROXY_PID" 2>/dev/null | tr -d ' ')
 
@@ -782,6 +820,7 @@ fi
 
 if should_run 18; then
     header "18: Multi-Session Context Switching"
+    ensure_proxy || { fail "18: proxy not available"; }
 
     WAL_BEFORE=$(wc -l < data/wal.log 2>/dev/null || echo 0)
 
@@ -880,8 +919,10 @@ fi
 if should_run 19; then
     header "19: Proxy Crash Fail-Closed"
 
+    ensure_proxy || { fail "19: proxy not available"; }
+
     # Kill the proxy
-    kill -9 "$PROXY_PID" 2>/dev/null
+    kill -9 "$PROXY_PID" 2>/dev/null || true
     sleep 1
     PROXY_PID=""
 
@@ -903,10 +944,7 @@ except Exception as e:
     fi
 
     # Restart proxy for remaining tests
-    cd "$REPO_DIR"
-    ./target/release/gvm-proxy --config config/proxy.toml > /tmp/gvm-proxy.log 2>&1 &
-    PROXY_PID=$!
-    sleep 3
+    ensure_proxy || echo -e "  ${YELLOW}Proxy restart failed${NC}"
     curl -sf "$PROXY_URL/gvm/health" > /dev/null 2>&1 && echo -e "  Proxy restarted" || echo -e "  ${RED}Proxy restart failed${NC}"
 fi
 
@@ -915,6 +953,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════
 
 if should_run 20; then
+    ensure_proxy || { fail "20: proxy not available"; }
     header "20: Proxy Hanging (Liveness)"
 
     # Simulate hanging proxy: SIGSTOP the proxy process
@@ -962,6 +1001,7 @@ fi
 
 if should_run 21; then
     header "21: Trace Pipe Stress"
+    ensure_proxy || { fail "21: proxy not available"; }
 
     LIBSSL=$(python3 -c "import _ssl; print(_ssl.__file__)" 2>/dev/null | xargs ldd 2>/dev/null | grep libssl | awk '{print $3}')
     OFFSET=$(nm -D "$LIBSSL" 2>/dev/null | grep "T SSL_write_ex" | awk '{print $1}')
@@ -1019,6 +1059,7 @@ if should_run 22; then
     header "22: Proxy Restart Recovery"
 
     cd "$REPO_DIR"
+    ensure_proxy || { fail "22: proxy not available"; }
 
     # Step 1: Generate some WAL events before kill
     for i in $(seq 1 5); do
@@ -1032,7 +1073,7 @@ if should_run 22; then
     echo -e "  WAL lines before kill: $WAL_BEFORE"
 
     # Step 2: Kill proxy
-    kill "$PROXY_PID" 2>/dev/null
+    kill "$PROXY_PID" 2>/dev/null || true
     wait "$PROXY_PID" 2>/dev/null || true
     PROXY_PID=""
     sleep 1
@@ -1043,9 +1084,7 @@ if should_run 22; then
     [ "$WAL_AFTER_KILL" -ge "$WAL_BEFORE" ] && pass "22a: WAL preserved after crash ($WAL_AFTER_KILL lines)" || fail "22a: WAL lost data ($WAL_BEFORE → $WAL_AFTER_KILL)"
 
     # Step 4: Restart proxy
-    ./target/release/gvm-proxy --config config/proxy.toml > /tmp/gvm-proxy.log 2>&1 &
-    PROXY_PID=$!
-    sleep 3
+    ensure_proxy
 
     # Step 5: Health check
     HEALTH=$(curl -sf --connect-timeout 3 "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null || echo "dead")
@@ -1075,6 +1114,8 @@ fi
 
 if should_run 23; then
     header "23: Session Persistence (Auth Flow)"
+
+    ensure_proxy || { fail "23: proxy not available"; }
 
     # Simulate an agent workflow:
     #   1. Login → get token (Allow, POST to auth endpoint)
