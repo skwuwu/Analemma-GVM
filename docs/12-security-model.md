@@ -537,6 +537,18 @@ Fuzz targets (`fuzz/fuzz_targets/`):
 
 ---
 
+### Chunked Transfer Body Reassembly (Planned v0.3)
+
+**Limitation**: The uprobe captures each `SSL_write_ex` call individually. HTTP headers (method+path+host) are in the first write and always captured. However, if request body data is sent across multiple SSL_write calls (chunked transfer encoding), the uprobe does not reassemble them into a complete body for pattern matching.
+
+**Impact**: An agent could split sensitive data (API keys, PII) across multiple SSL_write calls to avoid per-write pattern detection. Each individual chunk may not contain a recognizable pattern.
+
+**Current defense**: The proxy CONNECT tunnel enforces domain-level policy (the primary gate). SRR `payload_match` works on bodies passed to `/gvm/check` in non-tunnel mode. The uprobe captures the HTTP request line (method+path) which is sufficient for path-level enforcement.
+
+**Planned mitigation (v0.3)**: Uprobe event aggregator that buffers SSL_write events per TID within a configurable window (e.g., 100ms), reassembles the HTTP request, and runs SRR payload inspection on the complete body.
+
+---
+
 ### Multi-PID Uprobe (Planned v0.3)
 
 **Limitation**: The current TLS uprobe attaches to a single PID (the sandbox child process). If the agent spawns sub-processes (e.g., Node.js agent calls a Python MCP tool), the child processes load separate libssl.so instances. Their SSL_write_ex calls are not captured.

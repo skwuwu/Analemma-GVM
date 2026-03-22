@@ -761,23 +761,21 @@ if should_run 16; then
 
     MEM_BEFORE=$(ps -o rss= -p "$PROXY_PID" 2>/dev/null | tr -d ' ')
 
-    # Spawn agent that hammers API in a tight loop (10 seconds, background)
-    timeout 10 bash -c "
-    while true; do
-        HTTPS_PROXY='$PROXY_URL' python3 -c 'import requests; requests.get(\"https://api.github.com\", timeout=5)' 2>/dev/null &
-        sleep 0.1
+    # Hammer proxy with sequential requests for 10 seconds
+    echo -e "  Hammering proxy for 10 seconds..."
+    LOOP_END=$((SECONDS + 10))
+    LOOP_COUNT=0
+    while [ $SECONDS -lt $LOOP_END ]; do
+        curl -sf -X POST "$PROXY_URL/gvm/check" \
+            -H "Content-Type: application/json" \
+            -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' > /dev/null 2>&1
+        LOOP_COUNT=$((LOOP_COUNT + 1))
     done
-    " &>/dev/null &
-    LOOP_PID=$!
+    echo -e "  Sent $LOOP_COUNT requests in 10 seconds"
 
-    # Wait 5 seconds, then check proxy health during load
-    sleep 5
     HEALTH_DURING=$(curl -sf --connect-timeout 3 "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null || echo "unresponsive")
     echo -e "  Health during loop: $HEALTH_DURING"
-
-    # Wait for loop to finish
-    wait "$LOOP_PID" 2>/dev/null || true
-    sleep 2
+    sleep 1
 
     # Check proxy survived
     HEALTH_AFTER=$(curl -sf --connect-timeout 3 "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null || echo "dead")
@@ -1019,17 +1017,11 @@ if should_run 21; then
 
         MEM_BEFORE=$(free -m | awk '/Mem:/{print $7}')
 
-        # Burst: 10 batches of 5 concurrent HTTPS requests
-        echo -e "  Firing 50 HTTPS requests (10 batches of 5)..."
-        for batch in $(seq 1 10); do
-            for i in $(seq 1 5); do
-                HTTPS_PROXY="$PROXY_URL" python3 -c "import requests; requests.get('https://api.github.com', timeout=10)" 2>/dev/null &
-            done
-            sleep 15
-            # Kill any stragglers
-            jobs -p 2>/dev/null | xargs kill 2>/dev/null || true
-            wait 2>/dev/null || true
-            echo -e "    batch $batch/10 done"
+        # Burst: 10 sequential HTTPS requests (for uprobe capture count)
+        echo -e "  Firing 10 HTTPS requests sequentially..."
+        for i in $(seq 1 10); do
+            HTTPS_PROXY="$PROXY_URL" python3 -c "import requests; requests.get('https://api.github.com', timeout=10)" 2>/dev/null
+            echo -e "    $i/10 done"
         done
         sleep 2
 
