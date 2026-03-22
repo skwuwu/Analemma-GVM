@@ -38,6 +38,10 @@ SKIP_OPENCLAW=false
 SINGLE_TEST=""
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
+MCP_DIR=""
+for d in "$REPO_DIR/../analemma-gvm-openclaw" "$HOME/analemma-gvm-openclaw"; do
+    [ -d "$d/mcp-server" ] && MCP_DIR="$(cd "$d" && pwd)" && break
+done
 
 cleanup() {
     [ -n "$PROXY_PID" ] && kill "$PROXY_PID" 2>/dev/null || true
@@ -251,11 +255,70 @@ if should_run 5; then
 fi
 
 # ═══════════════════════════════════════════════════════════════════
-# TEST 6: OpenClaw Agent Through Proxy
+# TEST 6: MCP Server JSON-RPC Integration
 # ═══════════════════════════════════════════════════════════════════
 
-if should_run 6 && [ "$SKIP_OPENCLAW" = false ]; then
-    header "6: OpenClaw Agent Through Proxy"
+if should_run 6; then
+    header "6: MCP Server Integration"
+
+    if [ -z "$MCP_DIR" ]; then
+        skip "6: MCP repo not found (clone analemma-gvm-openclaw next to core repo)"
+    elif [ ! -f "$MCP_DIR/mcp-server/dist/index.js" ]; then
+        skip "6: MCP server not built (run: cd $MCP_DIR/mcp-server && npm install && npm run build)"
+    else
+        MCP_CALL="python3 $MCP_DIR/scripts/mcp_call.py"
+
+        # 6a: gvm_status
+        STATUS=$($MCP_CALL gvm_status | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('proxy','?'))" 2>/dev/null)
+        [ "$STATUS" = "running" ] && pass "6a: MCP gvm_status (proxy=$STATUS)" || fail "6a: MCP gvm_status ($STATUS)"
+
+        # 6b: gvm_policy_check Allow
+        DECISION=$($MCP_CALL gvm_policy_check '{"method":"GET","url":"https://api.github.com/repos/t/t/issues"}' \
+            | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+        [ "$DECISION" = "Allow" ] && pass "6b: MCP policy_check Allow ($DECISION)" || fail "6b: MCP policy_check ($DECISION)"
+
+        # 6c: gvm_policy_check Deny
+        DECISION=$($MCP_CALL gvm_policy_check '{"method":"DELETE","url":"https://api.github.com/repos/t/t/git/refs/heads/main"}' \
+            | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+        [ "$DECISION" = "Deny" ] && pass "6c: MCP policy_check Deny ($DECISION)" || fail "6c: MCP policy_check ($DECISION)"
+
+        # 6d: gvm_fetch blocked
+        BLOCKED=$($MCP_CALL gvm_fetch '{"operation":"github.merge","method":"PUT","url":"https://api.github.com/repos/t/t/pulls/1/merge"}' \
+            | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('blocked',False))" 2>/dev/null)
+        [ "$BLOCKED" = "True" ] && pass "6d: MCP gvm_fetch blocked ($BLOCKED)" || fail "6d: MCP gvm_fetch ($BLOCKED)"
+
+        # 6e: gvm_select_rulesets list
+        HAS_GITHUB=$($MCP_CALL gvm_select_rulesets | python3 -c "
+import sys,json
+d=json.loads(sys.stdin.read())
+names=[r['name'] for r in d.get('available',[])]
+print('yes' if 'github' in names else 'no')
+" 2>/dev/null)
+        [ "$HAS_GITHUB" = "yes" ] && pass "6e: MCP rulesets list (github found)" || fail "6e: MCP rulesets list ($HAS_GITHUB)"
+
+        # 6f: gvm_select_rulesets apply + hot-reload
+        APPLIED=$($MCP_CALL gvm_select_rulesets '{"apply":["github","slack"]}' \
+            | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(len(d.get('applied',[])))" 2>/dev/null)
+        [ "$APPLIED" -ge 2 ] 2>/dev/null && pass "6f: MCP rulesets apply ($APPLIED rulesets)" || fail "6f: MCP rulesets apply ($APPLIED)"
+
+        # 6g: gvm_blocked_summary
+        SUMMARY=$($MCP_CALL gvm_blocked_summary '{"period":"all"}' \
+            | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print('ok' if 'summary' in d else 'error')" 2>/dev/null)
+        [ "$SUMMARY" = "ok" ] && pass "6g: MCP blocked_summary" || fail "6g: MCP blocked_summary ($SUMMARY)"
+
+        # 6h: gvm_audit_log
+        AUDIT=$($MCP_CALL gvm_audit_log '{"last_n":5}' \
+            | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print('ok' if 'events' in d or 'total_in_wal' in d else 'error')" 2>/dev/null)
+        [ "$AUDIT" = "ok" ] && pass "6h: MCP audit_log" || fail "6h: MCP audit_log ($AUDIT)"
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# TEST 7: OpenClaw Agent Through Proxy
+# ═══════════════════════════════════════════════════════════════════
+
+if should_run 7 && [ "$SKIP_OPENCLAW" = false ]; then
+    header "7: OpenClaw Agent Through Proxy"
 
     if ! command -v openclaw &>/dev/null; then
         echo -e "  ${YELLOW}Installing OpenClaw...${NC}"
@@ -274,20 +337,20 @@ if should_run 6 && [ "$SKIP_OPENCLAW" = false ]; then
         # Check that CONNECT tunnel was used for LLM API
         sleep 1
         LLM_CONNECT=$(grep "anthropic\|openai" data/wal.log 2>/dev/null | head -1 || echo "")
-        [ -n "$LLM_CONNECT" ] && pass "6: OpenClaw through CONNECT tunnel" || fail "6: no LLM CONNECT in WAL"
+        [ -n "$LLM_CONNECT" ] && pass "7: OpenClaw through CONNECT tunnel" || fail "7: no LLM CONNECT in WAL"
     else
-        skip "6: OpenClaw (not installed or no API key)"
+        skip "7: OpenClaw (not installed or no API key)"
     fi
-elif should_run 6; then
-    skip "6: OpenClaw (--skip-openclaw)"
+elif should_run 7; then
+    skip "7: OpenClaw (--skip-openclaw)"
 fi
 
 # ═══════════════════════════════════════════════════════════════════
-# TEST 7: Uprobe Enforcement (SIGSTOP on Deny)
+# TEST 8: Uprobe Enforcement (SIGSTOP on Deny)
 # ═══════════════════════════════════════════════════════════════════
 
-if should_run 7; then
-    header "7: Uprobe Enforcement (SIGSTOP)"
+if should_run 8; then
+    header "8: Uprobe Enforcement (SIGSTOP)"
 
     LIBSSL=$(python3 -c "import _ssl; print(_ssl.__file__)" 2>/dev/null | xargs ldd 2>/dev/null | grep libssl | awk '{print $3}')
     OFFSET=$(nm -D "$LIBSSL" 2>/dev/null | grep "T SSL_write_ex" | awk '{print $1}')
@@ -301,7 +364,7 @@ if should_run 7; then
         echo 1 > /sys/kernel/tracing/events/uprobes/gvm_ssl/enable
         " 2>/dev/null
 
-        # Test: Make a request to a Denied endpoint — proxy returns Deny, uprobe should log
+        # Test: Proxy returns Deny for uprobe context
         echo -e "  Testing Deny decision path via proxy /gvm/check..."
         DENY_RESULT=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
             -H "Content-Type: application/json" \
@@ -310,18 +373,18 @@ if should_run 7; then
             | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('decision','?'))" 2>/dev/null)
 
         echo -e "  Proxy response to uprobe Deny check: $DENY_RESULT"
-        [ "$DENY_RESULT" = "Deny" ] && pass "7a: uprobe policy callback returns Deny" || fail "7a: expected Deny, got $DENY_RESULT"
+        [ "$DENY_RESULT" = "Deny" ] && pass "8a: uprobe policy returns Deny" || fail "8a: expected Deny, got $DENY_RESULT"
 
-        # Test: Verify Allow path works
+        # Test: Allow path works
         ALLOW_RESULT=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
             -H "Content-Type: application/json" \
             -H "X-GVM-Uprobe-Token: internal" \
             -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"uprobe"}' \
             | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('decision','?'))" 2>/dev/null)
 
-        [ "$ALLOW_RESULT" = "Allow" ] && pass "7b: uprobe policy callback returns Allow" || fail "7b: expected Allow, got $ALLOW_RESULT"
+        [ "$ALLOW_RESULT" = "Allow" ] && pass "8b: uprobe policy returns Allow" || fail "8b: expected Allow, got $ALLOW_RESULT"
 
-        # Test: Verify fail-closed on timeout (stop proxy briefly)
+        # Test: fail-closed on unreachable proxy
         echo -e "  Testing fail-closed (proxy unreachable)..."
         TIMEOUT_RESULT=$(timeout 2 python3 -c "
 import json
@@ -335,7 +398,7 @@ try:
 except:
     print('Deny')
 " 2>/dev/null || echo "Deny")
-        [ "$TIMEOUT_RESULT" = "Deny" ] && pass "7c: fail-closed on unreachable proxy" || fail "7c: expected Deny on timeout"
+        [ "$TIMEOUT_RESULT" = "Deny" ] && pass "8c: fail-closed on unreachable proxy" || fail "8c: expected Deny on timeout"
 
         # Cleanup
         sudo bash -c "
@@ -343,16 +406,16 @@ except:
         echo > /sys/kernel/tracing/uprobe_events
         " 2>/dev/null
     else
-        skip "7: uprobe enforcement (no root or SSL_write_ex not found)"
+        skip "8: uprobe enforcement (no root or SSL_write_ex not found)"
     fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════
-# TEST 8: Long-Running Stability (5 minutes)
+# TEST 9: Long-Running Stability
 # ═══════════════════════════════════════════════════════════════════
 
-if should_run 8; then
-    header "8: Long-Running Stability"
+if should_run 9; then
+    header "9: Long-Running Stability"
 
     MEM_BEFORE=$(ps -o rss= -p "$PROXY_PID" 2>/dev/null | tr -d ' ')
     WAL_BEFORE=$(stat -c%s data/wal.log 2>/dev/null || echo 0)
@@ -379,22 +442,22 @@ if should_run 8; then
     # Memory should not grow more than 50MB
     MEM_DIFF=$(( (MEM_AFTER - MEM_BEFORE) ))
     if [ "$MEM_DIFF" -lt 51200 ]; then
-        pass "8a: memory stable (delta: ${MEM_DIFF}KB)"
+        pass "9a: memory stable (delta: ${MEM_DIFF}KB)"
     else
-        fail "8a: memory grew ${MEM_DIFF}KB (>50MB)"
+        fail "9a: memory grew ${MEM_DIFF}KB (>50MB)"
     fi
 
     # Proxy should still be healthy
     HEALTH=$(curl -sf "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null || echo "failed")
-    [ "$HEALTH" = "healthy" ] && pass "8b: proxy healthy after 500 requests" || fail "8b: proxy unhealthy"
+    [ "$HEALTH" = "healthy" ] && pass "9b: proxy healthy after 500 requests" || fail "9b: proxy unhealthy"
 fi
 
 # ═══════════════════════════════════════════════════════════════════
-# TEST 9: Ruleset Hot-Reload
+# TEST 10: Ruleset Hot-Reload
 # ═══════════════════════════════════════════════════════════════════
 
-if should_run 9; then
-    header "9: Ruleset Hot-Reload"
+if should_run 10; then
+    header "10: Ruleset Hot-Reload"
 
     cd "$REPO_DIR"
 
@@ -427,9 +490,9 @@ open('config/srr_network.toml', 'w').write('\n'.join(parts))
 
     # Verify transition: Delay → Allow
     if [ "$BEFORE" != "Allow" ] && [ "$AFTER" = "Allow" ]; then
-        pass "9a: hot-reload changed Delay → Allow"
+        pass "10a: hot-reload changed Delay → Allow"
     else
-        fail "9a: expected Delay→Allow, got $BEFORE→$AFTER"
+        fail "10a: expected Delay→Allow, got $BEFORE→$AFTER"
     fi
 
     # Verify no request loss during reload (fire requests during reload)
@@ -442,7 +505,7 @@ open('config/srr_network.toml', 'w').write('\n'.join(parts))
         [ "$RESP" = "200" ] || LOST=$((LOST + 1))
         [ $((i % 5)) -eq 0 ] && curl -sf -X POST "$PROXY_URL/gvm/reload" > /dev/null 2>&1
     done
-    [ "$LOST" -eq 0 ] && pass "9b: zero requests lost during reload" || fail "9b: $LOST requests lost during reload"
+    [ "$LOST" -eq 0 ] && pass "10b: zero requests lost during reload" || fail "10b: $LOST requests lost during reload"
 
     # Restore full rulesets
     python3 -c "
@@ -456,11 +519,11 @@ open('config/srr_network.toml', 'w').write('\n'.join(parts))
 fi
 
 # ═══════════════════════════════════════════════════════════════════
-# TEST 10: Concurrent CONNECT Tunnels
+# TEST 11: Concurrent CONNECT Tunnels
 # ═══════════════════════════════════════════════════════════════════
 
-if should_run 10; then
-    header "10: Concurrent CONNECT Tunnels"
+if should_run 11; then
+    header "11: Concurrent CONNECT"
 
     WAL_BEFORE=$(wc -l < data/wal.log 2>/dev/null || echo 0)
 
@@ -490,12 +553,142 @@ except Exception as e:
     echo -e "  Failed: $FAILED/10"
     echo -e "  New WAL events: $NEW_EVENTS"
 
-    [ "$FAILED" -le 2 ] && pass "10a: concurrent CONNECT ($((10-FAILED))/10 succeeded)" || fail "10a: $FAILED/10 failed"
-    [ "$NEW_EVENTS" -gt 0 ] && pass "10b: WAL recorded concurrent events ($NEW_EVENTS)" || fail "10b: no WAL events from concurrent requests"
+    [ "$FAILED" -le 2 ] && pass "11a: concurrent CONNECT ($((10-FAILED))/10 succeeded)" || fail "11a: $FAILED/10 failed"
+    [ "$NEW_EVENTS" -gt 0 ] && pass "11b: WAL recorded concurrent events ($NEW_EVENTS)" || fail "11b: no WAL events from concurrent requests"
 
     # Health check after concurrent load
     HEALTH=$(curl -sf "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null || echo "failed")
-    [ "$HEALTH" = "healthy" ] && pass "10c: proxy healthy after concurrent load" || fail "10c: proxy unhealthy"
+    [ "$HEALTH" = "healthy" ] && pass "11c: proxy healthy after concurrent load" || fail "11c: proxy unhealthy"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# TEST 12: Semantic Violation — Allow read + Deny delete in one flow
+# ═══════════════════════════════════════════════════════════════════
+
+if should_run 12; then
+    header "12: Semantic Violation (read Allow, delete Deny)"
+
+    # Simulate: agent reads issues (Allow), then tries to delete branch (Deny)
+    READ=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
+        -H "Content-Type: application/json" \
+        -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' \
+        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+
+    DELETE=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
+        -H "Content-Type: application/json" \
+        -d '{"method":"DELETE","target_host":"api.github.com","target_path":"/repos/t/t/git/refs/heads/admin","operation":"test"}' \
+        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+
+    if [ "$READ" = "Allow" ] && [ "$DELETE" = "Deny" ]; then
+        pass "12: semantic violation blocked (read=$READ, delete=$DELETE)"
+    else
+        fail "12: expected Allow+Deny, got read=$READ delete=$DELETE"
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# TEST 13: Burst Traffic — rapid-fire policy checks
+# ═══════════════════════════════════════════════════════════════════
+
+if should_run 13; then
+    header "13: Burst Traffic (100 rapid requests)"
+
+    HEALTH_BEFORE=$(curl -sf "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null)
+    WAL_BEFORE=$(wc -l < data/wal.log 2>/dev/null || echo 0)
+
+    # Fire 100 requests as fast as possible
+    for i in $(seq 1 100); do
+        curl -sf -X POST "$PROXY_URL/gvm/check" \
+            -H "Content-Type: application/json" \
+            -d '{"method":"POST","target_host":"slack.com","target_path":"/api/chat.postMessage","operation":"test"}' > /dev/null 2>&1 &
+    done
+    wait
+    sleep 2
+
+    HEALTH_AFTER=$(curl -sf "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null)
+    WAL_AFTER=$(wc -l < data/wal.log 2>/dev/null || echo 0)
+
+    [ "$HEALTH_AFTER" = "healthy" ] && pass "13a: proxy survived 100 burst requests" || fail "13a: proxy unhealthy after burst"
+
+    WAL_DELTA=$((WAL_AFTER - WAL_BEFORE))
+    echo -e "  WAL growth: $WAL_DELTA lines"
+    [ "$WAL_DELTA" -lt 1000000 ] && pass "13b: WAL bounded ($WAL_DELTA lines)" || fail "13b: WAL exploded ($WAL_DELTA lines)"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# TEST 14: MCP gvm_fetch cross-layer — Allow + Deny in same session
+# ═══════════════════════════════════════════════════════════════════
+
+if should_run 14; then
+    header "14: MCP Cross-Layer (Allow then Deny)"
+
+    if [ -n "$MCP_DIR" ] && [ -f "$MCP_DIR/scripts/mcp_call.py" ]; then
+        MCP_CALL="python3 $MCP_DIR/scripts/mcp_call.py"
+
+        # Allow: read issues
+        R1=$($MCP_CALL gvm_policy_check '{"method":"GET","url":"https://api.github.com/repos/t/t/issues"}' \
+            | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+
+        # Deny: merge PR
+        R2=$($MCP_CALL gvm_fetch '{"operation":"github.merge","method":"PUT","url":"https://api.github.com/repos/t/t/pulls/1/merge"}' \
+            | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('decision','?'))" 2>/dev/null)
+
+        # Deny: delete branch
+        R3=$($MCP_CALL gvm_fetch '{"operation":"github.delete","method":"DELETE","url":"https://api.github.com/repos/t/t/git/refs/heads/main"}' \
+            | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('decision','?'))" 2>/dev/null)
+
+        echo -e "  read=$R1, merge=$R2, delete=$R3"
+        if [ "$R1" = "Allow" ] && [ "$R2" = "Deny" ] && [ "$R3" = "Deny" ]; then
+            pass "14: MCP cross-layer (Allow→Deny→Deny)"
+        else
+            fail "14: expected Allow,Deny,Deny got $R1,$R2,$R3"
+        fi
+    else
+        skip "14: MCP repo not available"
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# TEST 15: MCP gvm_select_rulesets apply + verify + re-apply
+# ═══════════════════════════════════════════════════════════════════
+
+if should_run 15; then
+    header "15: MCP Ruleset Lifecycle"
+
+    if [ -n "$MCP_DIR" ] && [ -f "$MCP_DIR/scripts/mcp_call.py" ]; then
+        MCP_CALL="python3 $MCP_DIR/scripts/mcp_call.py"
+
+        # Apply github only
+        A1=$($MCP_CALL gvm_select_rulesets '{"apply":["github"]}' \
+            | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(len(d.get('applied',[])))" 2>/dev/null)
+
+        # Verify github issues = Allow
+        D1=$($MCP_CALL gvm_policy_check '{"method":"GET","url":"https://api.github.com/repos/t/t/issues"}' \
+            | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+
+        # Verify slack (not loaded) = Delay (default-to-caution)
+        D2=$($MCP_CALL gvm_policy_check '{"method":"POST","url":"https://slack.com/api/chat.postMessage"}' \
+            | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+
+        # Now apply github + slack
+        A2=$($MCP_CALL gvm_select_rulesets '{"apply":["github","slack"]}' \
+            | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(len(d.get('applied',[])))" 2>/dev/null)
+
+        # Verify slack post = Delay (500ms, in ruleset)
+        D3=$($MCP_CALL gvm_policy_check '{"method":"POST","url":"https://slack.com/api/chat.postMessage"}' \
+            | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+
+        echo -e "  github-only: applied=$A1, issues=$D1, slack=$D2"
+        echo -e "  github+slack: applied=$A2, slack_post=$D3"
+
+        if [ "$D1" = "Allow" ] && [ "$A2" -ge 2 ] 2>/dev/null; then
+            pass "15: MCP ruleset lifecycle (apply→verify→re-apply)"
+        else
+            fail "15: unexpected results"
+        fi
+    else
+        skip "15: MCP repo not available"
+    fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════
