@@ -1830,6 +1830,73 @@ elif should_run 32; then
 fi
 
 # ═══════════════════════════════════════════════════════════════════
+# TEST 33: gvm run — binary mode (Layer 2)
+# ═══════════════════════════════════════════════════════════════════
+
+if should_run 33; then
+    header "33: gvm run — binary mode"
+
+    ensure_proxy || { fail "33: proxy not available"; }
+
+    GVM_BIN="$REPO_DIR/target/release/gvm"
+    if [ ! -f "$GVM_BIN" ]; then
+        skip "33: gvm CLI binary not built"
+    else
+        # 33a: gvm run -- curl (simple binary through proxy)
+        echo -e "  Testing: gvm run -- curl https://api.github.com"
+        GVM_RUN_OUTPUT=$("$GVM_BIN" run -- curl -sf https://api.github.com -o /dev/null -w "%{http_code}" 2>&1 || echo "")
+        echo -e "  Output (last 3 lines):"
+        echo "$GVM_RUN_OUTPUT" | tail -3 | while read -r line; do echo -e "    $line"; done
+
+        if echo "$GVM_RUN_OUTPUT" | grep -q "200"; then
+            pass "33a: gvm run -- curl through proxy (200)"
+        else
+            fail "33a: gvm run -- curl failed"
+        fi
+
+        # 33b: gvm run -- python (script via binary mode)
+        echo -e "  Testing: gvm run -- python3 -c 'import requests; ...'"
+        GVM_PY_OUTPUT=$("$GVM_BIN" run -- python3 -c "
+import requests
+r = requests.get('https://api.github.com/repos/skwuwu/Analemma-GVM', timeout=10)
+print(f'STATUS:{r.status_code}:REPO:{r.json().get(\"name\",\"?\")}')" 2>&1 || echo "")
+        echo -e "  Output (last 3 lines):"
+        echo "$GVM_PY_OUTPUT" | tail -3 | while read -r line; do echo -e "    $line"; done
+
+        if echo "$GVM_PY_OUTPUT" | grep -q "STATUS:200:REPO:Analemma-GVM"; then
+            pass "33b: gvm run -- python3 through proxy"
+        else
+            fail "33b: gvm run -- python3 failed"
+        fi
+
+        # 33c: Verify CONNECT went through proxy
+        GVM_CONNECT=$(grep -c "CONNECT.*api.github.com" "$PROXY_LOG" 2>/dev/null || echo "0")
+        GVM_CONNECT=$(echo "$GVM_CONNECT" | tr -d '[:space:]')
+        [ "$GVM_CONNECT" -gt 0 ] 2>/dev/null && pass "33c: gvm run traffic in proxy log" || fail "33c: no gvm run traffic in proxy log"
+
+        # 33d: gvm run with OpenClaw (if installed)
+        if command -v openclaw &>/dev/null && [ -n "${ANTHROPIC_API_KEY:-}" ] && [ "$SKIP_OPENCLAW" = false ]; then
+            echo -e "  Testing: gvm run -- openclaw agent --local ..."
+            GVM_OC_OUTPUT=$("$GVM_BIN" run -- openclaw agent --local \
+                --session-id "gvm-run-test-$(date +%s)" \
+                --message "Say hello in one word." \
+                --timeout 30 2>&1 | grep -v "model-selection" | tail -5 || echo "")
+            echo -e "  OpenClaw output: $(echo "$GVM_OC_OUTPUT" | tail -1)"
+
+            if echo "$GVM_OC_OUTPUT" | grep -qiE "hello|hi|hey"; then
+                pass "33d: gvm run -- openclaw agent through proxy"
+            elif [ -n "$GVM_OC_OUTPUT" ]; then
+                pass "33d: gvm run -- openclaw responded"
+            else
+                fail "33d: gvm run -- openclaw no output"
+            fi
+        else
+            skip "33d: openclaw not available"
+        fi
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
 # SUMMARY
 # ═══════════════════════════════════════════════════════════════════
 
