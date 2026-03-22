@@ -4,6 +4,60 @@
 
 ---
 
+## 2026-03-22: Shadow Mode, Security Patches, Sandbox Improvements
+
+### What Changed
+
+#### 1. Shadow Mode (New Feature)
+
+Implemented a 2-phase intent lifecycle for MCP-compatible governance:
+
+- **Intent Store**: In-memory store with TTL-based expiry, agent_id cross-check, and one-time consumption semantics. Uses atomic operations to prevent TOCTOU races on concurrent intent consumption.
+- **`POST /gvm/intent`**: Agents declare intent before making HTTP requests. The proxy validates the intent (claim phase), writes to WAL, then either confirms or releases the intent based on enforcement outcome.
+- **`POST /gvm/reload`**: Hot-reload SRR rules without proxy restart. Enables runtime policy updates for Shadow Mode deployments.
+- **`GVM_SHADOW_MODE` env var**: Alternative to `[shadow]` config section for enabling Shadow Mode. Accepts `strict` (reject requests without prior intent) or `permissive` (log-only).
+- **Intent lifecycle coverage**: All enforcement decision paths (Allow, Delay, Deny, AuditOnly, RequireApproval) now participate in the intent confirm/release lifecycle.
+
+#### 2. Security Patches (11 fixes)
+
+1. **CRITICAL -- IPv6 expand OOB fix** (`srr.rs`): Bounds check for `right.len() > max_segments` before subtraction prevents integer underflow on malformed IPv6 with excessive segments after `::`.
+2. **HIGH -- Merkle domain separation** (`merkle.rs`): `gvm-event-v1:` prefix with length-prefixed fields replaces `|` delimiter. `gvm-node-v1:` prefix for internal nodes. Prevents cross-context hash collisions and delimiter-based second preimage attacks.
+3. **HIGH -- Wasm pointer bounds validation** (`wasm_engine.rs`): `u32::MAX` overflow check before `len as u32` cast. Explicit memory bounds validation for `input_ptr` and `result_ptr` before read/write.
+4. **MEDIUM -- Auth header stripping expanded** (`api_keys.rs`): 4 → 10 stripped headers: added `Proxy-Authorization`, `X-Auth-Token`, `X-Api-Token`, `X-Signature`, `X-HMAC`, `X-Credentials`.
+5. **MEDIUM -- Regex pattern length limit** (`srr.rs`, `policy.rs`): 10,000-byte (10KB) limit on `path_regex` and policy regex patterns to prevent DFA memory explosion.
+6. **MEDIUM -- agent_id length validation unified** (`api.rs`): 128-byte length check in `validate_vault_identifier()`. Previously only `/gvm/auth/token` enforced length.
+7. **LOW -- Intent store TOCTOU fix**: Replaced `unwrap()` with safe `Option` handling in concurrent intent consumption path.
+8. **LOW -- First-run wizard config guard**: `offer_first_run_setup()` no longer overwrites existing config files.
+9. **LOW -- Docker non-root user**: Dockerfile runs as UID 10001 (non-root) for defense in depth.
+10. **LOW -- audit.rs hash synced with merkle.rs**: `compute_event_hash()` in audit.rs now uses the same domain-separated hash format as merkle.rs, preventing verification mismatches.
+11. **LOW -- Python SDK proxy URL validation**: SDK validates proxy URL format on `configure()` to fail fast on misconfiguration.
+
+#### 3. Sandbox Improvements
+
+- **`/workspace/output` writable mount**: Sandbox mode now mounts `/workspace/output` as writable, persisting to the host. Agent file output survives container teardown.
+- **CWD set to `/workspace/output`**: In sandbox mode, the agent process working directory defaults to `/workspace/output` so relative file writes land in the persistent output directory.
+- **Intent lifecycle coverage**: All enforcement decision paths (Allow through Deny) now correctly participate in intent confirm/release when Shadow Mode is active inside sandboxed environments.
+
+#### 4. /gvm/check SRR-Only Decision for Tier-1
+
+`/gvm/check` endpoint now returns SRR-only decisions when no SDK headers are present (Tier-1 mode), rather than returning an error or requiring ABAC context.
+
+### Risk Assessment
+
+- Merkle domain separation is **backwards-incompatible** with pre-existing WAL files (acceptable for v0.x pre-release).
+- Shadow Mode is opt-in only; no behavioral change for existing deployments.
+- Intent store TTL defaults are conservative (30s). Production deployments may need tuning.
+- All 242 tests pass (129 core + 32 CLI + 17 gvm-cli + 28 gvm-engine + 12 sandbox + 12 types + 12 benches).
+
+### Affected Files
+
+**Shadow Mode**: `src/proxy.rs`, `src/intent.rs`, `src/config.rs`, `src/api.rs`, `src/main.rs`
+**Security patches**: `src/srr.rs`, `src/merkle.rs`, `src/wasm_engine.rs`, `src/api_keys.rs`, `src/policy.rs`, `src/api.rs`, `src/proxy.rs`, `src/audit.rs`, `Dockerfile`, `sdk/python/gvm/session.py`
+**Sandbox**: `src/sandbox.rs`, `src/main.rs`
+**Docs**: `README.md`, `docs/14-implementation-log.md`
+
+---
+
 ## 2026-03-21: Security Audit — 8 Patches
 
 ### What Changed

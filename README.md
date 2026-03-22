@@ -58,7 +58,7 @@ We chose deterministic infrastructure control over ML-based classification. That
 | **Lightweight** | Single Rust binary, no GPU, sub-μs policy eval | No ML model to load or run |
 | **Zero dependencies** | No K8s, no Docker, no sidecar | HTTP proxy is the only moving part |
 | **Structurally unbypassable** | Agent has no keys, no direct network path | Enforcement is architectural, not cooperative |
-| **Tamper-proof audit** | Merkle hash chain for IC-2+ events (Delay/Deny/RequireApproval), async NATS for IC-1 (Allow) | IC-2+ events are WAL-first + Merkle chained; IC-1 events are fire-and-forget (loss tolerated < 0.1%) |
+| **Tamper-proof audit** | Merkle hash chain with domain separation (`gvm-event-v1:` prefix, length-prefixed fields) for IC-2+ events, async NATS for IC-1 (Allow) | IC-2+ events are WAL-first + Merkle chained; IC-1 events are fire-and-forget (loss tolerated < 0.1%) |
 | **Clean rollback** | Checkpoint = Merkle leaf, state restore is cryptographically verified | Deterministic state transitions are reversible |
 
 These are not five separate features. They are five consequences of one architectural choice: **govern actions at the infrastructure boundary, not at the language boundary.**
@@ -246,7 +246,7 @@ HTTP_PROXY=http://localhost:8080 ./my_agent
 
 **Shadow Mode** (`[shadow]` in proxy.toml or `GVM_SHADOW_MODE=strict` env var): the proxy rejects any HTTP request that lacks a prior MCP intent declaration. This makes governance mandatory for MCP agents without requiring OS-level isolation. Works on any OS.
 
-**`--sandbox`**: the agent process runs in isolated Linux namespaces (user/PID/mount/net). Its only network path is through the proxy veth pair. A TC ingress filter on the host-side veth runs in the kernel and cannot be removed even if the agent gains apparent `CAP_NET_ADMIN` inside the user namespace. Seccomp-BPF (dual-layer: log + kill) blocks dangerous syscalls (`ptrace`, `bpf`, `mount`, `unshare`, namespace escape vectors) — violations terminate the process immediately.
+**`--sandbox`**: the agent process runs in isolated Linux namespaces (user/PID/mount/net). Its only network path is through the proxy veth pair. A TC ingress filter on the host-side veth runs in the kernel and cannot be removed even if the agent gains apparent `CAP_NET_ADMIN` inside the user namespace. Seccomp-BPF (dual-layer: log + kill) blocks dangerous syscalls (`ptrace`, `bpf`, `mount`, `unshare`, namespace escape vectors) — violations terminate the process immediately. `/workspace/output` is mounted writable inside the sandbox (persists to host), and CWD is set to `/workspace/output` so agent file output survives container teardown.
 
 **Shadow + `--sandbox`** (recommended for production): two independent enforcement layers. Shadow Mode ensures every request has declared intent (proxy-level). `--sandbox` ensures the agent cannot bypass the proxy (kernel-level). Even if one layer fails, the other catches it.
 
@@ -345,12 +345,12 @@ class FinanceAgent(GVMAgent):
 ```
  Agent (any framework)     GVM Proxy (Rust)           External APIs
  ┌──────────────┐    ┌───────────────────────┐    ┌──────────────┐
- │  @ic()       │───>│ Layer 1: Semantic     │───>│ Stripe       │
- │  decorator   │    │   ABAC Policy Engine  │    │ Slack        │
- │              │    │ Layer 2: Network SRR  │    │ Gmail        │
- │  gvm_session │    │ Layer 3: Capability   │    │ Database     │
- │  ()          │    │   Token (API Key)     │    │ ...          │
- └──────────────┘    │                       │    └──────────────┘
+ │  @ic()       │───>│ Shadow: Intent Store  │───>│ Stripe       │
+ │  decorator   │    │ Layer 1: Semantic     │    │ Slack        │
+ │              │    │   ABAC Policy Engine  │    │ Gmail        │
+ │  gvm_session │    │ Layer 2: Network SRR  │    │ Database     │
+ │  ()          │    │ Layer 3: Capability   │    │ ...          │
+ └──────────────┘    │   Token (API Key)     │    └──────────────┘
                      │ WAL → NATS Ledger     │
                      │ AES-256-GCM Vault     │
                      └───────────────────────┘
@@ -409,8 +409,9 @@ class MyAgent(GVMAgent):
 
 | Component | Moat | Details |
 |-----------|------|---------|
+| **Shadow Mode (Intent Store)** | 2-phase intent lifecycle (claim → WAL write → confirm/release), agent_id cross-check, TTL expiry, TOCTOU-safe consumption. `POST /gvm/intent` + `POST /gvm/reload` | [Details →](docs/06-proxy.md) |
 | **ABAC Policy Engine** | Hierarchical rules (Global > Tenant > Agent), lower layers can only be stricter | [Details →](docs/02-policy.md) |
-| **Network SRR** | URL inspection independent of SDK headers, regex path matching, payload inspection | [Details →](docs/03-srr.md) |
+| **Network SRR** | URL inspection independent of SDK headers, regex path matching, payload inspection, hot-reload via `POST /gvm/reload` | [Details →](docs/03-srr.md) |
 | **WAL-First Ledger** | Crash-safe audit: fsync before action for IC-2+ events, global Merkle chain (cross-agent ordering + collusion detection), async NATS for IC-1 | [Details →](docs/04-ledger.md) |
 | **Encrypted Vault** | AES-256-GCM + `zeroize` on drop, no key material in freed memory | [Details →](docs/05-vault.md) |
 | **Proxy Pipeline** | CatchPanicLayer + backpressure + 1024 connection limit, sub-μs policy eval | [Details →](docs/06-proxy.md) |
@@ -545,6 +546,8 @@ Achievable with custom Envoy filters + OPA extensions + additional systems, but 
 
 Until WAL hardening ships, the Merkle chain is cryptographically sound but operationally fragile under infrastructure stress (crash during recovery, WAL exceeding available memory).
 
+**Shadow Mode**: Intent store entries have a configurable TTL (default 30s). If an intent is claimed but never confirmed (e.g., agent crashes mid-request), the entry expires and is released automatically. The intent store uses atomic operations to prevent TOCTOU races on concurrent consumption. Shadow Mode requires explicit opt-in via `[shadow]` config section or `GVM_SHADOW_MODE` env var.
+
 > Full security model and known attack surface: [Security Model →](docs/12-security-model.md)
 
 ---
@@ -562,9 +565,13 @@ Until WAL hardening ships, the Merkle chain is cryptographically sound but opera
 | [6](docs/06-proxy.md) | Proxy Pipeline |
 | [7](docs/07-sdk.md) | Python SDK |
 | [8](docs/08-memory-security.md) | Memory & Runtime Security Report |
-| [9](docs/09-test-report.md) | Test Coverage Report (252 tests, 0 failures) |
+| [9](docs/09-test-report.md) | Test Coverage Report (242 tests, 0 failures) |
 | [11](docs/11-competitive-analysis.md) | Competitive Analysis: GVM vs OPA+Envoy |
 | [12](docs/12-security-model.md) | Security Model & Known Attack Surface |
+| [13](docs/13-roadmap.md) | Roadmap |
+| [14](docs/14-implementation-log.md) | Implementation Log |
+| [14](docs/14-quickstart.md) | Quick Start Guide |
+| [15](docs/15-reference.md) | Reference |
 
 ---
 
