@@ -165,6 +165,7 @@ pub fn setup_host_network(config: &VethConfig) -> Result<()> {
 /// - host_ip:{proxy_port} via TCP (GVM proxy)
 /// - host_ip:53 via UDP (DNS, resolved by host)
 /// - loopback (127.0.0.1)
+///
 /// All other outbound traffic is dropped.
 pub fn setup_sandbox_network(config: &VethConfig) -> Result<()> {
     // 1. Bring up loopback

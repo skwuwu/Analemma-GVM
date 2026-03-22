@@ -212,7 +212,7 @@ fn parse_ldd_output(output: &str) -> Vec<PathBuf> {
         // or:     "/lib64/ld-linux-x86-64.so.2 (0x...)"
         if let Some(arrow_pos) = line.find("=>") {
             let after_arrow = &line[arrow_pos + 2..];
-            if let Some(path_str) = after_arrow.trim().split_whitespace().next() {
+            if let Some(path_str) = after_arrow.split_whitespace().next() {
                 if path_str.starts_with('/') {
                     libs.push(PathBuf::from(path_str));
                 }

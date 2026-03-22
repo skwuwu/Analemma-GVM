@@ -129,7 +129,7 @@ fn build_default_filter(default_action: SeccompAction) -> Result<seccompiler::Bp
     // CLONE_NEWUSER grants apparent root + CAP_NET_ADMIN inside the user namespace,
     // but without AF_NETLINK sockets, agents cannot modify iptables rules.
     rules.insert(
-        libc::SYS_socket as i64,
+        libc::SYS_socket,
         vec![
             // Allow AF_UNIX (1) — needed for Python multiprocessing, IPC
             SeccompRule::new(vec![SeccompCondition::new(

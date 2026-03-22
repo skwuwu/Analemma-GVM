@@ -471,7 +471,7 @@ impl TlsProbeController {
 
         tracing::info!(pid = self.pid, "TLS probe event loop started");
 
-        let trace_pipe = format!("/sys/kernel/debug/tracing/trace_pipe");
+        let trace_pipe = "/sys/kernel/debug/tracing/trace_pipe".to_string();
         let filter = format!("gvm_ssl_write_{}", self.pid);
 
         let file = std::fs::File::open(&trace_pipe)
