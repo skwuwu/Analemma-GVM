@@ -990,6 +990,64 @@ if should_run 21; then
 fi
 
 # ═══════════════════════════════════════════════════════════════════
+# TEST 22: Proxy Restart Recovery
+# ═══════════════════════════════════════════════════════════════════
+
+if should_run 22; then
+    header "22: Proxy Restart Recovery"
+
+    cd "$REPO_DIR"
+
+    # Step 1: Generate some WAL events before kill
+    for i in $(seq 1 5); do
+        curl -sf -X POST "$PROXY_URL/gvm/check" \
+            -H "Content-Type: application/json" \
+            -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' > /dev/null 2>&1
+    done
+    sleep 1
+
+    WAL_BEFORE=$(wc -l < data/wal.log 2>/dev/null || echo 0)
+    echo -e "  WAL lines before kill: $WAL_BEFORE"
+
+    # Step 2: Kill proxy
+    kill "$PROXY_PID" 2>/dev/null
+    wait "$PROXY_PID" 2>/dev/null || true
+    PROXY_PID=""
+    sleep 1
+
+    # Step 3: Verify WAL file survived
+    WAL_AFTER_KILL=$(wc -l < data/wal.log 2>/dev/null || echo 0)
+    echo -e "  WAL lines after kill: $WAL_AFTER_KILL"
+    [ "$WAL_AFTER_KILL" -ge "$WAL_BEFORE" ] && pass "22a: WAL preserved after crash ($WAL_AFTER_KILL lines)" || fail "22a: WAL lost data ($WAL_BEFORE → $WAL_AFTER_KILL)"
+
+    # Step 4: Restart proxy
+    ./target/release/gvm-proxy --config config/proxy.toml > /tmp/gvm-proxy.log 2>&1 &
+    PROXY_PID=$!
+    sleep 3
+
+    # Step 5: Health check
+    HEALTH=$(curl -sf --connect-timeout 3 "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null || echo "dead")
+    [ "$HEALTH" = "healthy" ] && pass "22b: proxy restarted healthy" || fail "22b: proxy failed to restart ($HEALTH)"
+
+    # Step 6: Verify SRR rules re-loaded
+    RULES=$(curl -sf "$PROXY_URL/gvm/info" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('srr',{}).get('total_rules', d.get('rules',0)))" 2>/dev/null || echo 0)
+    echo -e "  SRR rules after restart: $RULES"
+    [ "${RULES:-0}" -gt 0 ] 2>/dev/null && pass "22c: SRR rules re-loaded ($RULES rules)" || fail "22c: no SRR rules after restart"
+
+    # Step 7: New request works correctly
+    DECISION=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
+        -H "Content-Type: application/json" \
+        -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' \
+        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+    [ "$DECISION" = "Allow" ] && pass "22d: post-restart policy check works ($DECISION)" || fail "22d: post-restart check failed ($DECISION)"
+
+    # Step 8: WAL continues appending (not truncated)
+    sleep 1
+    WAL_FINAL=$(wc -l < data/wal.log 2>/dev/null || echo 0)
+    [ "$WAL_FINAL" -gt "$WAL_AFTER_KILL" ] && pass "22e: WAL appending after restart ($WAL_FINAL lines)" || fail "22e: WAL not growing ($WAL_FINAL)"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
 # SUMMARY
 # ═══════════════════════════════════════════════════════════════════
 
