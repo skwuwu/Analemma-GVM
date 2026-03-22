@@ -507,7 +507,11 @@ async fn vault_1mb_value_roundtrip() {
 async fn wal_1000_concurrent_durable_appends() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger with valid path must initialize"));
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("ledger with valid path must initialize"),
+    );
 
     let start = Instant::now();
 
@@ -516,7 +520,10 @@ async fn wal_1000_concurrent_durable_appends() {
         let ledger = ledger.clone();
         handles.push(tokio::spawn(async move {
             let event = make_test_event(&format!("concurrent-{}", i));
-            ledger.append_durable(&event).await.expect("concurrent durable append must succeed");
+            ledger
+                .append_durable(&event)
+                .await
+                .expect("concurrent durable append must succeed");
         }));
     }
 
@@ -534,7 +541,9 @@ async fn wal_1000_concurrent_durable_appends() {
     );
 
     // Verify WAL has exactly 1,000 event entries (exclude MerkleBatchRecord lines)
-    let content = tokio::fs::read_to_string(&wal_path).await.expect("WAL file must be readable after concurrent writes");
+    let content = tokio::fs::read_to_string(&wal_path)
+        .await
+        .expect("WAL file must be readable after concurrent writes");
     let event_count = content
         .lines()
         .filter(|line| !line.contains("\"merkle_root\""))
@@ -574,7 +583,10 @@ async fn wal_sustained_load_10k_events() {
         let ledger = ledger.clone();
         handles.push(tokio::spawn(async move {
             let event = make_test_event(&format!("sustained-{}", i));
-            ledger.append_durable(&event).await.expect("sustained load append must succeed");
+            ledger
+                .append_durable(&event)
+                .await
+                .expect("sustained load append must succeed");
         }));
     }
 
@@ -592,7 +604,9 @@ async fn wal_sustained_load_10k_events() {
     );
 
     // Verify WAL has all event entries (exclude MerkleBatchRecord lines)
-    let content = tokio::fs::read_to_string(&wal_path).await.expect("WAL file must be readable after sustained load");
+    let content = tokio::fs::read_to_string(&wal_path)
+        .await
+        .expect("WAL file must be readable after sustained load");
     let event_count = content
         .lines()
         .filter(|line| !line.contains("\"merkle_root\""))
@@ -604,7 +618,10 @@ async fn wal_sustained_load_10k_events() {
     );
 
     // Verify WAL file size is reasonable (each event ~500 bytes JSON)
-    let file_size = tokio::fs::metadata(&wal_path).await.expect("WAL file metadata must be accessible").len();
+    let file_size = tokio::fs::metadata(&wal_path)
+        .await
+        .expect("WAL file metadata must be accessible")
+        .len();
     assert!(
         file_size > 0 && file_size < 100_000_000,
         "WAL file size {} bytes seems unreasonable for {} events",

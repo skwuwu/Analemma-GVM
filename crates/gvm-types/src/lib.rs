@@ -74,22 +74,12 @@ pub struct OperationContext {
     pub attributes: HashMap<String, serde_json::Value>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct PayloadDescriptor {
     pub content_hash: String,
     pub size_bytes: u64,
     /// Flagged patterns from SRR pattern matching
     pub flagged_patterns: Vec<String>,
-}
-
-impl Default for PayloadDescriptor {
-    fn default() -> Self {
-        Self {
-            content_hash: String::new(),
-            size_bytes: 0,
-            flagged_patterns: Vec::new(),
-        }
-    }
 }
 
 // ─── Enforcement Decision Model (PART 3.2) ───
@@ -364,11 +354,12 @@ pub fn max_strict(a: EnforcementDecision, b: EnforcementDecision) -> Enforcement
 /// Configured per-decision type via `[enforcement.on_block]` in proxy.toml.
 /// The proxy includes this in every block response so agents can react
 /// programmatically without hardcoding retry/halt logic.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BlockResponseMode {
     /// Stop execution immediately. Agent must not retry or continue.
     /// Use for Deny decisions where the operation is categorically forbidden.
+    #[default]
     Halt,
 
     /// Suggest an alternative action. Agent may adapt and retry differently.
@@ -378,12 +369,6 @@ pub enum BlockResponseMode {
     /// Roll back the current transaction and retry after conditions change.
     /// Use for Throttle/temporary blocks where retry is expected.
     Rollback,
-}
-
-impl Default for BlockResponseMode {
-    fn default() -> Self {
-        Self::Halt
-    }
 }
 
 /// Standard JSON response body returned when a governance decision blocks an operation.

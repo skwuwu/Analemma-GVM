@@ -140,7 +140,7 @@ pub fn attach_tc_filter(
         proxy_ip.octets()[2],
         proxy_ip.octets()[3]
     );
-    let ip_u32 = format!("0x{}", ip_hex);
+    let _ip_u32 = format!("0x{}", ip_hex);
     let port_hex = format!("0x{:04x}", proxy_port);
     let dns_port_hex = "0x0035"; // port 53
 

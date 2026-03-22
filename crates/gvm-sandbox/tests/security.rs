@@ -94,6 +94,7 @@ fn preflight_report_non_linux_has_ebpf_false() {
             proxy_addr: "127.0.0.1:8080".parse().unwrap(),
             agent_id: "test-agent".to_string(),
             seccomp_profile: None,
+            tls_probe_mode: TlsProbeMode::Disabled,
         };
         let report = preflight_check(&config);
         assert!(!report.ebpf_available, "eBPF must be unavailable on non-Linux");
@@ -112,6 +113,7 @@ fn sandbox_config_clone() {
         proxy_addr: "10.200.0.1:8080".parse().unwrap(),
         agent_id: "agent-001".to_string(),
         seccomp_profile: Some(SeccompProfile::Default),
+        tls_probe_mode: TlsProbeMode::Disabled,
     };
 
     let cloned = config.clone();
@@ -210,6 +212,7 @@ fn launch_on_non_linux_returns_error() {
         proxy_addr: "127.0.0.1:8080".parse().unwrap(),
         agent_id: "test".to_string(),
         seccomp_profile: None,
+        tls_probe_mode: TlsProbeMode::Disabled,
     };
 
     let result = launch_sandboxed(config);
@@ -224,7 +227,7 @@ fn launch_on_non_linux_returns_error() {
 
 // ─── Helper to access VethConfig (re-exported for testing) ───
 
-fn veth_config_from_pid(pid: u32, proxy_addr: SocketAddr) -> VethConfigTestHelper {
+fn veth_config_from_pid(pid: u32, _proxy_addr: SocketAddr) -> VethConfigTestHelper {
     // Replicate VethConfig::from_pid logic for cross-platform testing
     let third_octet = (pid % 256) as u8;
     let fourth_base = ((pid / 256) % 64) as u8 * 4;

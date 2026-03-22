@@ -21,7 +21,6 @@
 //! bpf_override_return NOT used (requires CONFIG_BPF_KPROBE_OVERRIDE, rarely enabled).
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Resolved TLS library info for uprobe attachment.
@@ -269,6 +268,7 @@ pub enum PolicyDecision {
 
 /// TLS probe controller — manages uprobe lifecycle, perf buffer polling,
 /// and SRR-based policy enforcement on captured HTTPS plaintext.
+#[allow(dead_code)]
 pub struct TlsProbeController {
     /// PID being monitored.
     pid: u32,
@@ -298,6 +298,7 @@ pub struct ProbeStats {
 /// Trace pipe reader — reads uprobe events from /sys/kernel/debug/tracing/trace_pipe.
 /// This is the simplest integration (no BPF program compilation needed).
 /// For production, replace with perf_event_open + BPF ring buffer.
+#[allow(dead_code)]
 struct TracePipeReader {
     /// Path to trace_pipe.
     path: PathBuf,
@@ -305,6 +306,7 @@ struct TracePipeReader {
     filter_prefix: String,
 }
 
+#[allow(dead_code)]
 impl TracePipeReader {
     fn new(pid: u32) -> Self {
         Self {
@@ -336,6 +338,7 @@ impl TracePipeReader {
 ///
 /// Uses /proc/<pid>/mem to read the SSL_write buffer.
 /// The buffer address comes from the uprobe's arg1 (second argument = buf pointer).
+#[allow(dead_code)]
 fn read_process_memory(pid: u32, addr: u64, len: usize) -> Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -633,6 +636,7 @@ fn parse_trace_line_http(line: &str) -> Option<String> {
 }
 
 /// Legacy: parse buf address and len from hex fetchargs (for /proc/pid/mem reading).
+#[allow(dead_code)]
 fn parse_trace_line(line: &str) -> Option<(u64, u32)> {
     let buf_addr = line.split("buf=0x").nth(1)
         .and_then(|s| s.split_whitespace().next())
