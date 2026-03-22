@@ -114,6 +114,8 @@ mod seccomp;
 mod capability;
 #[cfg(target_os = "linux")]
 pub mod ebpf;
+#[cfg(target_os = "linux")]
+pub mod tls_probe;
 
 #[cfg(target_os = "linux")]
 mod sandbox_impl;
