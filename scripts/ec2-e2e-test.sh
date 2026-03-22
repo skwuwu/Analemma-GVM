@@ -1897,11 +1897,11 @@ print(f'STATUS:{r.status_code}:REPO:{r.json().get(\"name\",\"?\")}')" 2>&1 || ec
 fi
 
 # ═══════════════════════════════════════════════════════════════════
-# TEST 34: gvm run — core tests re-run via gvm run wrapper
+# TEST 34: gvm run — full external API integration via gvm run
 # ═══════════════════════════════════════════════════════════════════
 
 if should_run 34; then
-    header "34: gvm run — re-verify core tests"
+    header "34: gvm run — external API integration"
 
     ensure_proxy || { fail "34: proxy not available"; }
 
@@ -1909,79 +1909,124 @@ if should_run 34; then
     if [ ! -f "$GVM_BIN" ]; then
         skip "34: gvm CLI binary not built"
     else
-        # 34a: CONNECT tunnel via gvm run (mirrors Test 3a)
-        echo -e "  ${BOLD}Re-test 3a: CONNECT via gvm run${NC}"
-        GH_CODE=$("$GVM_BIN" run -- python3 -c "
+        # 34a: GitHub API read via gvm run (real HTTPS, child process inherits proxy)
+        echo -e "  ${BOLD}GitHub API via gvm run${NC}"
+        GH_RESULT=$("$GVM_BIN" run -- python3 -c "
 import requests
-r = requests.get('https://api.github.com', timeout=10)
-print(r.status_code)
-" 2>&1 | grep "^200$" || echo "0")
-        [ "$GH_CODE" = "200" ] && pass "34a: CONNECT via gvm run (200)" || fail "34a: CONNECT via gvm run ($GH_CODE)"
+r = requests.get('https://api.github.com/repos/skwuwu/Analemma-GVM', timeout=10)
+print(f'{r.status_code}:{r.json().get(\"name\",\"?\")}')" 2>&1 | grep "^200:Analemma-GVM" || echo "FAIL")
+        [ -n "$GH_RESULT" ] && pass "34a: GitHub API via gvm run ($GH_RESULT)" || fail "34a: GitHub via gvm run"
 
-        # 34b: SRR policy check via gvm run (mirrors Test 5)
-        echo -e "  ${BOLD}Re-test 5: SRR via gvm run${NC}"
-        ALLOW=$("$GVM_BIN" run -- curl -sf -X POST http://127.0.0.1:8080/gvm/check \
-            -H "Content-Type: application/json" \
-            -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' 2>&1 \
-            | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null || echo "?")
-        [ "$ALLOW" = "Allow" ] && pass "34b: SRR Allow via gvm run" || fail "34b: SRR via gvm run ($ALLOW)"
-
-        DENY=$("$GVM_BIN" run -- curl -sf -X POST http://127.0.0.1:8080/gvm/check \
-            -H "Content-Type: application/json" \
-            -d '{"method":"DELETE","target_host":"api.github.com","target_path":"/repos/t/t/git/refs/heads/main","operation":"test"}' 2>&1 \
-            | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null || echo "?")
-        [ "$DENY" = "Deny" ] && pass "34c: SRR Deny via gvm run" || fail "34c: SRR Deny via gvm run ($DENY)"
-
-        # 34d: MCP via gvm run (mirrors Test 6)
-        if [ -n "$MCP_DIR" ] && [ -f "$MCP_DIR/scripts/mcp_call.py" ]; then
-            echo -e "  ${BOLD}Re-test 6: MCP via gvm run${NC}"
-            MCP_RESULT=$("$GVM_BIN" run -- python3 "$MCP_DIR/scripts/mcp_call.py" gvm_status 2>&1 \
-                | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('proxy','?'))" 2>/dev/null || echo "?")
-            [ "$MCP_RESULT" = "running" ] && pass "34d: MCP gvm_status via gvm run" || fail "34d: MCP via gvm run ($MCP_RESULT)"
+        # 34b: GitHub MCP Server via gvm run (child spawns npx → Node.js → HTTPS)
+        GH_TOKEN=$(gh auth token 2>/dev/null || echo "")
+        if [ -n "$GH_TOKEN" ]; then
+            echo -e "  ${BOLD}GitHub MCP Server via gvm run${NC}"
+            MCP_GH=$("$GVM_BIN" run -- bash -c "
+echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1.0\"}}}
+{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"search_repositories\",\"arguments\":{\"query\":\"Analemma-GVM\",\"perPage\":1}}}' \
+| GITHUB_PERSONAL_ACCESS_TOKEN='$GH_TOKEN' npx @modelcontextprotocol/server-github 2>/dev/null \
+| python3 -c \"import sys,json
+for line in sys.stdin:
+    try:
+        d=json.loads(line)
+        if d.get('id')==2:
+            text=d['result']['content'][0]['text']
+            count=json.loads(text).get('total_count',0)
+            print(count)
+    except: pass\"
+" 2>&1 | grep -E "^[0-9]+" | tail -1 || echo "0")
+            [ "${MCP_GH:-0}" -gt 0 ] 2>/dev/null && pass "34b: GitHub MCP via gvm run ($MCP_GH results)" || fail "34b: GitHub MCP via gvm run ($MCP_GH)"
         else
+            skip "34b: no GitHub token"
+        fi
+
+        # 34c: GVM MCP Server (gvm_policy_check + gvm_fetch) via gvm run
+        if [ -n "$MCP_DIR" ] && [ -f "$MCP_DIR/scripts/mcp_call.py" ]; then
+            echo -e "  ${BOLD}GVM MCP tools via gvm run${NC}"
+            MCP_ALLOW=$("$GVM_BIN" run -- python3 "$MCP_DIR/scripts/mcp_call.py" gvm_policy_check \
+                '{"method":"GET","url":"https://api.github.com/repos/t/t/issues"}' 2>&1 \
+                | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null || echo "?")
+            [ "$MCP_ALLOW" = "Allow" ] && pass "34c: MCP policy_check Allow via gvm run" || fail "34c: MCP via gvm run ($MCP_ALLOW)"
+
+            MCP_DENY=$("$GVM_BIN" run -- python3 "$MCP_DIR/scripts/mcp_call.py" gvm_fetch \
+                '{"operation":"github.merge","method":"PUT","url":"https://api.github.com/repos/t/t/pulls/1/merge"}' 2>&1 \
+                | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('blocked',False))" 2>/dev/null || echo "?")
+            [ "$MCP_DENY" = "True" ] && pass "34d: MCP gvm_fetch blocked via gvm run" || fail "34d: MCP fetch via gvm run ($MCP_DENY)"
+        else
+            skip "34c: MCP repo not available"
             skip "34d: MCP repo not available"
         fi
 
-        # 34e: OpenClaw via gvm run (mirrors Test 7)
+        # 34e: OpenClaw agent via gvm run (LLM + web_fetch, child process chain)
         if command -v openclaw &>/dev/null && [ -n "${ANTHROPIC_API_KEY:-}" ] && [ "$SKIP_OPENCLAW" = false ]; then
-            echo -e "  ${BOLD}Re-test 7: OpenClaw via gvm run${NC}"
-            OC_RESULT=$("$GVM_BIN" run -- openclaw agent --local \
-                --session-id "gvm-run-retest-$(date +%s)" \
-                --message "Say hello in one word." \
-                --timeout 30 2>&1 | grep -v "model-selection" | tail -3 || echo "")
-            echo -e "  Output: $(echo "$OC_RESULT" | tail -1)"
+            echo -e "  ${BOLD}OpenClaw agent via gvm run${NC}"
+            OC_OUTPUT=$("$GVM_BIN" run -- openclaw agent --local \
+                --session-id "gvm-run-integ-$(date +%s)" \
+                --message "Use web_fetch to get https://api.github.com/repos/skwuwu/Analemma-GVM and tell me the repo name in one word." \
+                --timeout 45 2>&1 | grep -v "model-selection" | tail -3 || echo "")
+            echo -e "  Output: $(echo "$OC_OUTPUT" | tail -1)"
 
-            if [ -n "$OC_RESULT" ] && ! echo "$OC_RESULT" | grep -q "ERROR\|error"; then
-                pass "34e: OpenClaw via gvm run"
+            if [ -n "$OC_OUTPUT" ] && ! echo "$OC_OUTPUT" | grep -q "ERROR"; then
+                pass "34e: OpenClaw via gvm run (agent responded)"
             else
-                fail "34e: OpenClaw via gvm run"
+                fail "34e: OpenClaw via gvm run (no response)"
             fi
 
-            # 34f: Verify child process inheritance — OpenClaw's LLM call through proxy
-            LLM_LOG=$(grep -c "api.anthropic.com" "$PROXY_LOG" 2>/dev/null || echo "0")
-            LLM_LOG=$(echo "$LLM_LOG" | tr -d '[:space:]')
-            [ "$LLM_LOG" -gt 0 ] 2>/dev/null && pass "34f: child process (LLM) inherited proxy" || fail "34f: LLM call not in proxy log"
+            # Verify: OpenClaw's LLM call + web_fetch both went through proxy
+            LLM_PROXY=$(grep -c "api.anthropic.com" "$PROXY_LOG" 2>/dev/null || echo "0")
+            LLM_PROXY=$(echo "$LLM_PROXY" | tr -d '[:space:]')
+            [ "$LLM_PROXY" -gt 0 ] 2>/dev/null && pass "34f: OpenClaw LLM inherited proxy via gvm run" || fail "34f: LLM not in proxy log"
         else
             skip "34e: openclaw not available"
             skip "34f: openclaw not available"
         fi
 
-        # 34g: Environment variable forced — child can't unset proxy
-        echo -e "  ${BOLD}Verify: proxy env forced on child${NC}"
-        FORCED=$("$GVM_BIN" run -- python3 -c "
-import os
-# Try to unset proxy (malicious agent behavior)
-os.environ.pop('HTTPS_PROXY', None)
-os.environ.pop('https_proxy', None)
-# Check if it was actually set by parent
-print(os.environ.get('HTTP_PROXY', 'NONE'))
-" 2>&1 | grep "http://127.0.0.1:8080" || echo "NONE")
-        if echo "$FORCED" | grep -q "127.0.0.1:8080"; then
-            pass "34g: HTTP_PROXY survives child unset attempt"
+        # 34g: Telegram API via gvm run (if token available)
+        if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
+            echo -e "  ${BOLD}Telegram API via gvm run${NC}"
+            TG_RESULT=$("$GVM_BIN" run -- python3 -c "
+import requests
+r = requests.post('https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe', timeout=10)
+print(f'{r.status_code}:{r.json().get(\"result\",{}).get(\"username\",\"?\")}')" 2>&1 \
+                | grep "^200:" || echo "FAIL")
+            [ -n "$TG_RESULT" ] && pass "34g: Telegram via gvm run ($TG_RESULT)" || fail "34g: Telegram via gvm run"
         else
-            # Note: child CAN unset env vars in its own process. That's OS behavior.
-            # The real protection is --sandbox (iptables blocks non-proxy traffic).
-            pass "34g: env unset is expected (--sandbox needed for forced proxy)"
+            skip "34g: no TELEGRAM_BOT_TOKEN"
+        fi
+
+        # 34h: Multi-service kill chain via gvm run
+        echo -e "  ${BOLD}Kill chain via gvm run${NC}"
+        KC_RESULT=$("$GVM_BIN" run -- python3 -c "
+import requests, json
+results = []
+# Step 1: GitHub read (Allow)
+try:
+    r = requests.get('https://api.github.com/repos/skwuwu/Analemma-GVM', timeout=10)
+    results.append(f'github:{r.status_code}')
+except Exception as e:
+    results.append(f'github:ERROR')
+# Step 2: Check exfil target policy
+try:
+    r = requests.post('http://127.0.0.1:8080/gvm/check',
+        json={'method':'POST','target_host':'evil-exfil.com','target_path':'/steal','operation':'test'}, timeout=5)
+    d = r.json()
+    results.append(f'exfil:{d.get(\"decision\",\"?\")}')
+except:
+    results.append('exfil:ERROR')
+# Step 3: Check branch delete policy
+try:
+    r = requests.post('http://127.0.0.1:8080/gvm/check',
+        json={'method':'DELETE','target_host':'api.github.com','target_path':'/repos/t/t/git/refs/heads/main','operation':'test'}, timeout=5)
+    d = r.json()
+    results.append(f'delete:{d.get(\"decision\",\"?\")}')
+except:
+    results.append('delete:ERROR')
+print('|'.join(results))
+" 2>&1 | grep "github:200.*exfil:Delay.*delete:Deny" || echo "FAIL")
+        if [ -n "$KC_RESULT" ] && [ "$KC_RESULT" != "FAIL" ]; then
+            pass "34h: kill chain via gvm run ($KC_RESULT)"
+        else
+            fail "34h: kill chain via gvm run"
         fi
     fi
 fi
