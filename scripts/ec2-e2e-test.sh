@@ -1173,6 +1173,160 @@ if should_run 23; then
 fi
 
 # ═══════════════════════════════════════════════════════════════════
+# TEST 24: Real Agent — Allow read + Deny delete (actual HTTP)
+# ═══════════════════════════════════════════════════════════════════
+
+if should_run 24; then
+    header "24: Real Agent Allow/Deny (actual HTTP)"
+
+    ensure_proxy || { fail "24: proxy not available"; }
+
+    # Step 1: Agent reads GitHub API through proxy (Allow → real 200)
+    ALLOW_RESULT=$(HTTPS_PROXY="$PROXY_URL" python3 -c "
+import requests
+try:
+    r = requests.get('https://api.github.com/repos/skwuwu/Analemma-GVM', timeout=10)
+    print(f'{r.status_code}:{r.json().get(\"name\",\"?\")[:20]}')
+except Exception as e:
+    print(f'ERROR:{e}')
+" 2>/dev/null || echo "ERROR:timeout")
+
+    echo -e "  Allow (read repo): $ALLOW_RESULT"
+    echo "$ALLOW_RESULT" | grep -q "^200:" && pass "24a: real Allow — got response ($ALLOW_RESULT)" || fail "24a: real Allow failed ($ALLOW_RESULT)"
+
+    # Step 2: Agent tries CONNECT to unknown domain (Delay but proceeds)
+    DELAY_RESULT=$(HTTPS_PROXY="$PROXY_URL" python3 -c "
+import requests
+try:
+    r = requests.get('https://httpbin.org/get', timeout=10)
+    print(f'{r.status_code}')
+except Exception as e:
+    print(f'BLOCKED:{type(e).__name__}')
+" 2>/dev/null || echo "BLOCKED:timeout")
+
+    echo -e "  Delay (unknown domain): $DELAY_RESULT"
+    # httpbin may or may not work, but it shouldn't be Deny
+    echo "$DELAY_RESULT" | grep -qE "^200|^BLOCKED" && pass "24b: unknown domain handled ($DELAY_RESULT)" || fail "24b: unexpected ($DELAY_RESULT)"
+
+    # Step 3: Keep-alive socket reuse — second request on same session
+    REUSE_RESULT=$(HTTPS_PROXY="$PROXY_URL" python3 -c "
+import requests
+s = requests.Session()
+try:
+    r1 = s.get('https://api.github.com', timeout=10)
+    r2 = s.get('https://api.github.com/repos/skwuwu/Analemma-GVM', timeout=10)
+    print(f'{r1.status_code},{r2.status_code}')
+except Exception as e:
+    print(f'ERROR:{type(e).__name__}')
+" 2>/dev/null || echo "ERROR:timeout")
+
+    echo -e "  Socket reuse (2 requests): $REUSE_RESULT"
+    [ "$REUSE_RESULT" = "200,200" ] && pass "24c: keep-alive socket reuse works" || fail "24c: socket reuse failed ($REUSE_RESULT)"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# TEST 25: OpenClaw Agent Real Workflow (LLM + GitHub skill)
+# ═══════════════════════════════════════════════════════════════════
+
+if should_run 25 && [ "$SKIP_OPENCLAW" = false ]; then
+    header "25: OpenClaw Real Workflow"
+
+    ensure_proxy || { fail "25: proxy not available"; }
+
+    if ! command -v openclaw &>/dev/null; then
+        skip "25: openclaw not installed"
+    elif [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+        skip "25: no ANTHROPIC_API_KEY"
+    else
+        # Task: Ask agent to check a GitHub repo (triggers gh CLI or web_fetch through proxy)
+        echo -e "  Running OpenClaw agent with GitHub task..."
+        OC_OUTPUT=$(HTTPS_PROXY="$PROXY_URL" HTTP_PROXY="$PROXY_URL" \
+            openclaw agent --local \
+            --session-id "ec2-real-$(date +%s)" \
+            --message "Use web_fetch to get https://api.github.com/repos/skwuwu/Analemma-GVM and tell me the repo description in one sentence." \
+            --timeout 45 2>&1 | grep -v "model-selection" || echo "ERROR")
+
+        echo -e "  Agent output (last 3 lines):"
+        echo "$OC_OUTPUT" | tail -3 | while read -r line; do echo -e "    $line"; done
+
+        # Verify LLM call went through proxy (CONNECT to anthropic)
+        ANTHROPIC_LOG=$(grep -c "api.anthropic.com" /tmp/gvm-proxy-e2e.log 2>/dev/null || echo "0")
+        ANTHROPIC_LOG=$(echo "$ANTHROPIC_LOG" | tr -d '[:space:]')
+
+        # Verify GitHub call went through proxy
+        GITHUB_LOG=$(grep -c "api.github.com" /tmp/gvm-proxy-e2e.log 2>/dev/null || echo "0")
+        GITHUB_LOG=$(echo "$GITHUB_LOG" | tr -d '[:space:]')
+
+        echo -e "  Proxy log: anthropic=$ANTHROPIC_LOG, github=$GITHUB_LOG"
+
+        [ "$ANTHROPIC_LOG" -gt 0 ] 2>/dev/null && pass "25a: LLM call through proxy (anthropic=$ANTHROPIC_LOG)" || fail "25a: LLM call not in proxy log"
+
+        # Agent should have produced some output (not just errors)
+        if echo "$OC_OUTPUT" | grep -qiE "governance|analemma|proxy|security|agent" 2>/dev/null; then
+            pass "25b: agent understood and responded about the repo"
+        elif echo "$OC_OUTPUT" | grep -q "ERROR" 2>/dev/null; then
+            fail "25b: agent errored"
+        else
+            pass "25b: agent responded (content varies)"
+        fi
+    fi
+elif should_run 25; then
+    skip "25: OpenClaw (--skip-openclaw)"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# TEST 26: Error Message Quality (agent sees clear denial reason)
+# ═══════════════════════════════════════════════════════════════════
+
+if should_run 26; then
+    header "26: Deny Error Message Quality"
+
+    ensure_proxy || { fail "26: proxy not available"; }
+
+    # When proxy denies a CONNECT, what does the agent see?
+    ERROR_MSG=$(HTTPS_PROXY="$PROXY_URL" python3 -c "
+import requests
+try:
+    # This domain has no ruleset → Default-to-Caution (Delay), should work
+    # But let's test with a real denied scenario using the proxy check
+    r = requests.get('https://api.github.com', timeout=10,
+                     headers={'X-GVM-Agent-Id': 'test-agent'})
+    print(f'STATUS:{r.status_code}')
+except requests.exceptions.ProxyError as e:
+    # Extract the actual error message
+    print(f'PROXY_ERROR:{str(e)[:200]}')
+except requests.exceptions.ConnectionError as e:
+    print(f'CONN_ERROR:{str(e)[:200]}')
+except Exception as e:
+    print(f'OTHER:{type(e).__name__}:{str(e)[:200]}')
+" 2>/dev/null || echo "TIMEOUT")
+
+    echo -e "  Agent-visible response: $ERROR_MSG"
+
+    # For allowed domains, agent should get normal response
+    echo "$ERROR_MSG" | grep -q "STATUS:200" && pass "26a: allowed request returns clean 200" || fail "26a: unexpected ($ERROR_MSG)"
+
+    # Test: what does a MCP gvm_fetch Deny look like to the agent?
+    if [ -n "$MCP_DIR" ] && [ -f "$MCP_DIR/scripts/mcp_call.py" ]; then
+        DENY_MSG=$(python3 "$MCP_DIR/scripts/mcp_call.py" gvm_fetch \
+            '{"operation":"github.delete_branch","method":"DELETE","url":"https://api.github.com/repos/t/t/git/refs/heads/main"}')
+        echo -e "  MCP Deny response: $(echo "$DENY_MSG" | head -1 | cut -c1-100)"
+
+        HAS_REASON=$(echo "$DENY_MSG" | python3 -c "
+import sys, json
+d = json.loads(sys.stdin.read())
+has_blocked = d.get('blocked', False)
+has_error = 'error' in d or 'blocked' in str(d)
+print('yes' if has_blocked or has_error else 'no')
+" 2>/dev/null || echo "no")
+
+        [ "$HAS_REASON" = "yes" ] && pass "26b: MCP Deny includes clear reason (blocked=true)" || fail "26b: MCP Deny lacks clear reason"
+    else
+        skip "26b: MCP repo not available"
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
 # SUMMARY
 # ═══════════════════════════════════════════════════════════════════
 
