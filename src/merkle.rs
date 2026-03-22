@@ -86,7 +86,7 @@ pub fn compute_merkle_root(leaf_hashes: &[String]) -> anyhow::Result<String> {
         .collect::<anyhow::Result<Vec<_>>>()?;
 
     while current_level.len() > 1 {
-        let mut next_level = Vec::with_capacity(current_level.len().div_ceil(2));
+        let mut next_level = Vec::with_capacity((current_level.len() + 1) / 2);
 
         for chunk in current_level.chunks(2) {
             let mut hasher = Sha256::new();
@@ -155,12 +155,8 @@ pub fn generate_merkle_proof(
             current_level.push(last);
         }
 
-        let sibling_idx = if idx.is_multiple_of(2) {
-            idx + 1
-        } else {
-            idx - 1
-        };
-        let is_right = idx.is_multiple_of(2); // sibling is on the right
+        let sibling_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
+        let is_right = idx % 2 == 0; // sibling is on the right
         proof.push((hex::encode(current_level[sibling_idx]), is_right));
 
         // Build next level

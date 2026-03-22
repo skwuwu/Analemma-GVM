@@ -92,7 +92,7 @@ impl RateLimiter {
             .check_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let force_cleanup = buckets.len() >= MAX_BUCKETS;
-        if force_cleanup || (count.is_multiple_of(CLEANUP_INTERVAL) && count > 0) {
+        if force_cleanup || (count % CLEANUP_INTERVAL == 0 && count > 0) {
             if force_cleanup {
                 tracing::warn!(
                     buckets = buckets.len(),
