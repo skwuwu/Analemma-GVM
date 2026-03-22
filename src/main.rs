@@ -10,10 +10,13 @@ use gvm_proxy::registry::OperationRegistry;
 use gvm_proxy::srr::NetworkSRR;
 use gvm_proxy::vault::Vault;
 use gvm_proxy::wasm_engine::WasmEngine;
+use axum::body::Body;
+use axum::http::{Request, Response, StatusCode};
 use axum::Router;
 use std::path::Path;
 use std::sync::Arc;
 use tower::ServiceBuilder;
+use tower::ServiceExt;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 
@@ -295,6 +298,9 @@ async fn main() {
         },
     };
 
+    // Clone state for CONNECT handler before moving into axum router
+    let connect_state = state.clone();
+
     // 11. Build axum router with security layers
     //     - /gvm/* routes: admin, health, vault API
     //     - fallback: proxy handler (all other requests)
@@ -334,14 +340,62 @@ async fn main() {
                 .layer(tower::limit::ConcurrencyLimitLayer::new(1024)),
         );
 
-    // 12. Start server
+    // 12. Start server with CONNECT tunnel support
     let listener = tokio::net::TcpListener::bind(&config.server.listen)
         .await
         .expect("Failed to bind to listen address");
 
     tracing::info!(address = %config.server.listen, "GVM Proxy listening");
 
-    axum::serve(listener, app).await.expect("Server error");
+    // Use hyper directly to handle CONNECT method (axum doesn't route CONNECT)
+    let app_for_connect = app.clone();
+    let state_for_connect = connect_state;
+
+    loop {
+        let (stream, _addr) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => { tracing::error!(error = %e, "Accept failed"); continue; }
+        };
+        let app = app_for_connect.clone();
+        let connect_state = state_for_connect.clone();
+
+        tokio::spawn(async move {
+            let io = hyper_util::rt::TokioIo::new(stream);
+
+            let service = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                let app = app.clone();
+                let cs = connect_state.clone();
+                async move {
+                    if req.method() == hyper::Method::CONNECT {
+                        gvm_proxy::proxy::handle_connect(cs, req).await
+                    } else {
+                        // Convert Incoming body to axum Body for normal requests
+                        let (parts, body) = req.into_parts();
+                        let body = Body::new(body);
+                        let req = Request::from_parts(parts, body);
+                        Ok(app.clone().oneshot(req).await.unwrap_or_else(|e| {
+                            let _ = e;
+                            Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .body(Body::empty())
+                                .unwrap()
+                        }))
+                    }
+                }
+            });
+
+            if let Err(e) = hyper::server::conn::http1::Builder::new()
+                .preserve_header_case(true)
+                .serve_connection(io, service)
+                .with_upgrades()
+                .await
+            {
+                if !e.is_incomplete_message() {
+                    tracing::debug!(error = %e, "Connection error");
+                }
+            }
+        });
+    }
 }
 
 /// Print a human-readable startup summary of loaded governance rules.

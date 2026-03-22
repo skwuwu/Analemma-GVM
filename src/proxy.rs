@@ -1506,3 +1506,186 @@ mod tests {
         );
     }
 }
+
+// ─── CONNECT Tunnel (HTTPS Proxy) ────────────────────────────────────────────
+//
+// Blind relay: CONNECT host:port → domain-level policy check → TCP relay.
+// TLS content is not inspected (no MITM). Policy enforcement is domain + port only.
+// Path/method/body level enforcement requires TLS inspection (v0.2).
+
+pub async fn handle_connect(
+    state: AppState,
+    request: Request<hyper::body::Incoming>,
+) -> Result<Response<Body>, std::convert::Infallible> {
+    let result = handle_connect_inner(state, request).await;
+    Ok(result)
+}
+
+async fn handle_connect_inner(state: AppState, request: Request<hyper::body::Incoming>) -> Response<Body> {
+    // Extract target host:port from CONNECT request URI
+    let target = request.uri().authority()
+        .map(|a| a.to_string())
+        .or_else(|| request.uri().host().map(|h| {
+            let port = request.uri().port_u16().unwrap_or(443);
+            format!("{}:{}", h, port)
+        }))
+        .unwrap_or_default();
+
+    if target.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "CONNECT: missing target host");
+    }
+
+    let host = target.split(':').next().unwrap_or(&target);
+    let port = target.split(':').nth(1).and_then(|p| p.parse::<u16>().ok()).unwrap_or(443);
+
+    // Domain-level SRR policy check (drop guard before any .await)
+    let (srr_result_decision, srr_result_matched, srr_result_catch_all) = {
+        let srr = state.srr.read().unwrap_or_else(|e| e.into_inner());
+        let r = srr.check("CONNECT", host, "/", None);
+        (r.decision.clone(), r.matched_description.clone(), r.is_catch_all)
+    };
+
+    let decision = &srr_result_decision;
+
+    tracing::info!(
+        method = "CONNECT",
+        host = %host,
+        port = port,
+        decision = ?decision,
+        rule = ?srr_result_matched,
+        "CONNECT tunnel request"
+    );
+
+    // Shadow Mode check for CONNECT
+    if state.shadow_config.mode != crate::intent_store::ShadowMode::Disabled {
+        let claim = state.intent_store.claim("CONNECT", host, "/", None);
+        if !claim.verified {
+            match state.shadow_config.mode {
+                crate::intent_store::ShadowMode::Strict => {
+                    tracing::warn!(host = %host, "Shadow STRICT: CONNECT without intent — DENY");
+                    return error_response(
+                        StatusCode::FORBIDDEN,
+                        "Shadow verification failed for CONNECT tunnel",
+                    );
+                }
+                _ => {} // Cautious/Permissive: allow CONNECT but log
+            }
+        } else {
+            // Confirm immediately for CONNECT (no WAL for tunneled content)
+            state.intent_store.confirm(claim.claim_id);
+        }
+    }
+
+    // Enforce decision
+    match decision {
+        EnforcementDecision::Deny { reason } => {
+            tracing::warn!(host = %host, reason = %reason, "CONNECT denied");
+
+            // WAL record for denied CONNECT
+            let event = GVMEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                trace_id: uuid::Uuid::new_v4().to_string(),
+                agent_id: "unknown".to_string(),
+                operation: format!("connect:{}", host),
+                decision: "Deny".to_string(),
+                decision_source: "SRR".to_string(),
+                status: EventStatus::Failed { reason: reason.clone() },
+                enforcement_point: "proxy".to_string(),
+                timestamp: chrono::Utc::now(),
+                payload: PayloadDescriptor::default(),
+                transport: Some(TransportInfo {
+                    method: "CONNECT".to_string(),
+                    host: host.to_string(),
+                    path: format!(":{}", port),
+                    status_code: None,
+                }),
+                resource: ResourceDescriptor::default(),
+                context: Default::default(),
+                matched_rule_id: srr_result_matched.clone(),
+                nats_sequence: None,
+                event_hash: None,
+                llm_trace: None,
+                default_caution: false,
+                tenant_id: None,
+                parent_event_id: None,
+                session_id: String::new(),
+            };
+            state.ledger.append_async(event).await;
+
+            return error_response(StatusCode::FORBIDDEN, &format!("CONNECT denied: {}", reason));
+        }
+        _ => {
+            // Allow, Delay, etc. — proceed with tunnel
+        }
+    }
+
+    // WAL record for allowed CONNECT (async, loss tolerated)
+    let event = GVMEvent {
+        event_id: uuid::Uuid::new_v4().to_string(),
+        trace_id: uuid::Uuid::new_v4().to_string(),
+        agent_id: "unknown".to_string(),
+        operation: format!("connect:{}", host),
+        decision: format!("{:?}", decision),
+        decision_source: "SRR".to_string(),
+        status: EventStatus::Confirmed,
+        enforcement_point: "proxy".to_string(),
+        timestamp: chrono::Utc::now(),
+        payload: PayloadDescriptor::default(),
+        transport: Some(TransportInfo {
+            method: "CONNECT".to_string(),
+            host: host.to_string(),
+            path: format!(":{}", port),
+            status_code: None,
+        }),
+        resource: ResourceDescriptor::default(),
+        context: Default::default(),
+        matched_rule_id: srr_result_matched.clone(),
+        nats_sequence: None,
+        event_hash: None,
+        llm_trace: None,
+        default_caution: srr_result_catch_all,
+        tenant_id: None,
+        parent_event_id: None,
+        session_id: String::new(),
+    };
+    state.ledger.append_async(event).await;
+
+    // Establish TCP connection to target
+    let target_addr = format!("{}:{}", host, port);
+
+    // Respond with 200 Connection Established, then upgrade to raw TCP
+    tokio::task::spawn(async move {
+        match hyper::upgrade::on(request).await {
+            Ok(upgraded) => {
+                match tokio::net::TcpStream::connect(&target_addr).await {
+                    Ok(upstream) => {
+                        let (mut client_read, mut client_write) =
+                            tokio::io::split(hyper_util::rt::TokioIo::new(upgraded));
+                        let (mut upstream_read, mut upstream_write) =
+                            tokio::io::split(upstream);
+
+                        let c2s = tokio::io::copy(&mut client_read, &mut upstream_write);
+                        let s2c = tokio::io::copy(&mut upstream_read, &mut client_write);
+
+                        tokio::select! {
+                            r = c2s => { if let Err(e) = r { tracing::debug!(error = %e, "CONNECT client→upstream ended"); } }
+                            r = s2c => { if let Err(e) = r { tracing::debug!(error = %e, "CONNECT upstream→client ended"); } }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(target = %target_addr, error = %e, "CONNECT: failed to connect to upstream");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "CONNECT: upgrade failed");
+            }
+        }
+    });
+
+    // Return 200 to signal tunnel is established
+    Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::empty())
+        .unwrap()
+}
