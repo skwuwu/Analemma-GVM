@@ -127,15 +127,94 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         } else {
             // Give the child process time to exec and load TLS libraries
             std::thread::sleep(std::time::Duration::from_millis(500));
-            match crate::tls_probe::start_tls_probe_thread(
-                child_raw,
-                Box::new(|_method, _host, _path| {
-                    // TODO: inject actual SRR check from proxy via callback
-                    // For now: log all events (policy check deferred to proxy CONNECT)
+
+            // Build policy callback: query proxy /gvm/check for SRR decisions.
+            //
+            // Security notes:
+            //   1. Race condition: SSL_write_ex fires AFTER the kernel queues the
+            //      packet. SIGSTOP freezes the process but the triggering write may
+            //      already be on the wire. This is "immediate session freeze on
+            //      violation", not "pre-transmission block". Documented as known
+            //      limitation — proxy CONNECT-level enforcement is the primary gate.
+            //   2. Fail-closed: if the proxy is unreachable or times out, the
+            //      callback returns Deny (SIGSTOP). This prevents bypass via proxy
+            //      DoS but may freeze the agent on transient proxy hiccups.
+            //   3. Timeout: 50ms cap. The uprobe thread is not on the hot path, but
+            //      long blocks would delay SIGSTOP delivery.
+            //   4. Auth: X-GVM-Uprobe-Token header prevents sandboxed agents from
+            //      spoofing policy check requests to /gvm/check.
+            let policy_callback: crate::tls_probe::PolicyCheckFn = if let Some(ref proxy_url) =
+                config.proxy_url
+            {
+                let check_url = format!("{}/gvm/check", proxy_url.trim_end_matches('/'));
+                let agent = ureq::AgentBuilder::new()
+                    .timeout_connect(std::time::Duration::from_millis(50))
+                    .timeout_read(std::time::Duration::from_millis(50))
+                    .timeout_write(std::time::Duration::from_millis(50))
+                    .build();
+                Box::new(move |method: &str, host: &str, path: &str| {
+                    let body = serde_json::json!({
+                        "method": method,
+                        "target_host": host,
+                        "target_path": path,
+                        "operation": "uprobe",
+                    });
+                    match agent
+                        .post(&check_url)
+                        .set("Content-Type", "application/json")
+                        .set("X-GVM-Uprobe-Token", "internal")
+                        .send_string(&body.to_string())
+                    {
+                        Ok(resp) => {
+                            let text = resp.into_string().unwrap_or_default();
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                                let decision = json
+                                    .get("decision")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("Deny");
+                                match decision {
+                                    d if d.contains("Allow") => {
+                                        crate::tls_probe::PolicyDecision::Allow
+                                    }
+                                    d if d.contains("Delay") => {
+                                        let ms = json
+                                            .get("delay_ms")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(300);
+                                        crate::tls_probe::PolicyDecision::Delay { milliseconds: ms }
+                                    }
+                                    _ => {
+                                        let reason = json
+                                            .get("next_action")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("blocked by policy")
+                                            .to_string();
+                                        crate::tls_probe::PolicyDecision::Deny { reason }
+                                    }
+                                }
+                            } else {
+                                // Unparseable response: fail-closed
+                                crate::tls_probe::PolicyDecision::Deny {
+                                    reason: "uprobe: unparseable proxy response".into(),
+                                }
+                            }
+                        }
+                        Err(_e) => {
+                            // Proxy unreachable or timeout: fail-closed (SIGSTOP)
+                            crate::tls_probe::PolicyDecision::Deny {
+                                reason: "uprobe: proxy unreachable — fail-closed".into(),
+                            }
+                        }
+                    }
+                })
+            } else {
+                // No proxy URL: audit-only (no enforcement possible)
+                Box::new(|_method: &str, _host: &str, _path: &str| {
                     crate::tls_probe::PolicyDecision::Allow
-                }),
-                audit_only,
-            ) {
+                })
+            };
+
+            match crate::tls_probe::start_tls_probe_thread(child_raw, policy_callback, audit_only) {
                 Ok(handle) => {
                     let mode = if audit_only { "audit" } else { "enforce" };
                     tracing::info!(pid = child_raw, mode, "TLS uprobe started");

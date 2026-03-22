@@ -97,6 +97,7 @@ fn preflight_report_non_linux_has_ebpf_false() {
             agent_id: "test-agent".to_string(),
             seccomp_profile: None,
             tls_probe_mode: TlsProbeMode::Disabled,
+            proxy_url: None,
         };
         let report = preflight_check(&config);
         assert!(
@@ -119,6 +120,7 @@ fn sandbox_config_clone() {
         agent_id: "agent-001".to_string(),
         seccomp_profile: Some(SeccompProfile::Default),
         tls_probe_mode: TlsProbeMode::Disabled,
+        proxy_url: None,
     };
 
     let cloned = config.clone();
@@ -218,6 +220,7 @@ fn launch_on_non_linux_returns_error() {
         agent_id: "test".to_string(),
         seccomp_profile: None,
         tls_probe_mode: TlsProbeMode::Disabled,
+        proxy_url: None,
     };
 
     let result = launch_sandboxed(config);

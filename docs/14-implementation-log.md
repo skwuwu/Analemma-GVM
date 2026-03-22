@@ -4,6 +4,35 @@
 
 ---
 
+## 2026-03-22: Uprobe SRR Policy Enforcement
+
+### What Changed
+- Connected uprobe TLS probe to proxy's SRR policy engine via `/gvm/check` HTTP callback
+- Added `proxy_url` field to `SandboxConfig` for uprobe→proxy communication
+- Added `ureq` dependency for sync HTTP calls from uprobe thread
+- Fail-closed design: proxy unreachable or timeout (50ms) → Deny (SIGSTOP)
+- `X-GVM-Uprobe-Token` header for basic auth separation
+
+### Why
+The uprobe captured HTTPS plaintext but had a hardcoded Allow-all callback. Without SRR integration, the uprobe could log but never enforce path-level HTTPS policies.
+
+### Affected Files
+- `crates/gvm-sandbox/src/sandbox_impl.rs`: real policy callback via ureq HTTP
+- `crates/gvm-sandbox/src/lib.rs`: `proxy_url` field in SandboxConfig
+- `crates/gvm-sandbox/Cargo.toml`: ureq + serde_json deps
+- `crates/gvm-cli/src/run.rs`: passes proxy URL to sandbox config
+- `docs/linux-e2e-test.md`: Test 6 (uprobe enforcement) + security model table
+
+### Known Limitations
+- **Race condition**: SSL_write_ex fires after kernel queues packet. SIGSTOP cannot prevent the first write. This is "immediate session freeze on violation", not "pre-transmission block".
+- **Auth**: `X-GVM-Uprobe-Token` is a static string, not cryptographically verified. Sandboxed agents with iptables bypass could forge it.
+- **Fail-closed risk**: Proxy transient unavailability freezes the agent (SIGSTOP). Acceptable for security but may surprise users.
+
+### Risk Assessment
+Low-Medium. The uprobe is a defense-in-depth layer, not the primary enforcement point. Proxy CONNECT-level enforcement + iptables remain the primary gates.
+
+---
+
 ## 2026-03-22: Shadow Mode, Security Patches, Sandbox Improvements
 
 ### What Changed

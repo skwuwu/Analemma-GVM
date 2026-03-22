@@ -54,6 +54,10 @@ pub struct SandboxConfig {
     /// TLS probe mode: "enforce" (block denied requests), "audit" (log only), "disabled".
     /// Default: "audit". Requires Linux 5.5+ and root/CAP_BPF.
     pub tls_probe_mode: TlsProbeMode,
+    /// GVM proxy URL for uprobe policy enforcement (e.g., "http://127.0.0.1:8080").
+    /// When set, uprobe queries the proxy's /gvm/check endpoint for SRR decisions.
+    /// When None, uprobe uses allow-all (audit-only regardless of tls_probe_mode).
+    pub proxy_url: Option<String>,
 }
 
 /// TLS probe operating mode.

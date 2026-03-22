@@ -193,9 +193,101 @@ kill $PROXY_PID
 SCRIPT
 ```
 
+## Test 6: Uprobe Policy Enforcement (Proxy + uprobe SRR callback)
+
+Tests the full uprobe enforcement path: SSL_write_ex capture → HTTP parse → proxy /gvm/check → SIGSTOP on Deny.
+
+Requires: root, kernel 5.5+, proxy running with github ruleset.
+
+```bash
+cd ~/Analemma-GVM
+
+# Load github ruleset (Allow reads, Deny merges/deletes)
+python3 -c "
+import os
+rulesets = os.path.expanduser('~/analemma-gvm-openclaw/rulesets')
+parts = []
+for f in ['_default.toml', 'github.toml']:
+    path = os.path.join(rulesets, f)
+    if os.path.exists(path): parts.append(open(path).read())
+open('config/srr_network.toml', 'w').write('\n'.join(parts))
+print(f'{len(parts)} rulesets loaded')
+"
+
+./target/release/gvm-proxy --config config/proxy.toml &
+PROXY_PID=$!
+sleep 2
+curl -sf http://127.0.0.1:8080/gvm/health && echo " OK"
+
+# Register uprobe on SSL_write_ex
+LIBSSL=$(python3 -c "import _ssl; print(_ssl.__file__)" | xargs ldd | grep libssl | awk '{print $3}')
+OFFSET=$(nm -D $LIBSSL | grep "T SSL_write_ex" | awk '{print $1}')
+echo "libssl: $LIBSSL offset: 0x$OFFSET"
+
+sudo bash -c "
+echo > /sys/kernel/tracing/trace
+mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null
+echo 'p:gvm_ssl $LIBSSL:0x$OFFSET buf=+0(%si):string' > /sys/kernel/tracing/uprobe_events
+echo 1 > /sys/kernel/tracing/events/uprobes/gvm_ssl/enable
+"
+
+# Test 6a: GitHub read (should capture plaintext, proxy returns Allow)
+echo "=== Test 6a: GitHub read (Allow) ==="
+HTTPS_PROXY=http://127.0.0.1:8080 python3 -c "
+import requests
+r = requests.get('https://api.github.com/repos/skwuwu/Analemma-GVM/issues', timeout=10)
+print(f'Status: {r.status_code}')
+"
+sleep 1
+echo "uprobe capture:"
+sudo cat /sys/kernel/tracing/trace | grep gvm_ssl | tail -3 | sed 's/.*buf="//'
+
+# Test 6b: Verify proxy policy check returns correct decisions
+echo ""
+echo "=== Test 6b: Policy check (read=Allow, merge=Deny) ==="
+curl -sf -X POST http://127.0.0.1:8080/gvm/check \
+  -H "Content-Type: application/json" \
+  -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"uprobe"}' \
+  | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(f'Read issues: {d[\"decision\"]}')"
+
+curl -sf -X POST http://127.0.0.1:8080/gvm/check \
+  -H "Content-Type: application/json" \
+  -d '{"method":"PUT","target_host":"api.github.com","target_path":"/repos/t/t/pulls/1/merge","operation":"uprobe"}' \
+  | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(f'Merge PR: {d[\"decision\"]}')"
+
+curl -sf -X POST http://127.0.0.1:8080/gvm/check \
+  -H "Content-Type: application/json" \
+  -d '{"method":"DELETE","target_host":"api.github.com","target_path":"/repos/t/t/git/refs/heads/main","operation":"uprobe"}' \
+  | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(f'Delete branch: {d[\"decision\"]}')"
+
+# Expected:
+#   Test 6a: Status 200, uprobe captures "GET /repos/skwuwu/Analemma-GVM/issues HTTP/1.1"
+#   Test 6b: Read issues = Allow, Merge PR = Deny, Delete branch = Deny
+
+# Cleanup
+sudo bash -c "
+echo 0 > /sys/kernel/tracing/events/uprobes/gvm_ssl/enable
+echo > /sys/kernel/tracing/uprobe_events
+"
+kill $PROXY_PID 2>/dev/null
+```
+
+## Uprobe Security Model
+
+| Property | Status | Notes |
+|----------|--------|-------|
+| Plaintext capture | Working | SSL_write_ex fetcharg `+0(%si):string` |
+| HTTP parsing | Working | Method + path + Host from first write |
+| SRR policy check | Working | Callback queries proxy `/gvm/check` |
+| SIGSTOP enforcement | Working | Process frozen on Deny decision |
+| Fail-closed | Working | Proxy timeout/unreachable = Deny |
+| Real-time block | **Limitation** | SSL_write fires after kernel queues packet. SIGSTOP freezes process but first write may be on wire. This is "immediate session freeze", not "pre-transmission block". |
+| Auth | Partial | `X-GVM-Uprobe-Token` header, but not cryptographically verified yet |
+
 ## Known Issues
 
-- **rustc 1.94.0 ICE**: Linux에서 `main.rs`의 hyper service_fn이 컴파일러 패닉 유발. `rustup default 1.85.0` 사용.
-- **WSL2 메모리**: wasmtime 빌드에 ~3GB RAM 필요. `.wslconfig`에서 `memory=8GB` 설정.
-- **OpenSSL 3.x**: `SSL_write_ex` 사용 (not `SSL_write`). offset이 다름.
-- **OpenSSL 1.x**: `SSL_write` 사용. `nm -D libssl.so.1.1 | grep SSL_write` 로 확인.
+- **rustc 1.94.0 ICE**: hyper service_fn closures trigger compiler panic on Linux. Use `rustup default 1.85.0`.
+- **WSL2 memory**: wasmtime needs ~3GB RAM. Set `memory=8GB` in `.wslconfig`.
+- **OpenSSL 3.x**: use `SSL_write_ex` (not `SSL_write`). Offset differs per build.
+- **OpenSSL 1.x**: use `SSL_write`. `nm -D libssl.so.1.1 | grep SSL_write`.
+- **uprobe race condition**: SSL_write_ex fires after kernel queues packet. SIGSTOP cannot prevent the triggering write from reaching the wire. Proxy CONNECT-level enforcement is the primary gate; uprobe is defense-in-depth.
