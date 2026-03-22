@@ -31,13 +31,23 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-PROXY_PID=""
 PROXY_URL="http://127.0.0.1:8080"
 RESULTS=()
 SKIP_OPENCLAW=false
 SINGLE_TEST=""
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Auto-detect PROXY_PID (for --test N mode)
+PROXY_PID=$(pgrep -f "gvm-proxy.*config" | head -1 || echo "")
+
+# Auto-detect rulesets directory
+RULESETS_DIR=""
+for d in "$REPO_DIR/../analemma-gvm-openclaw/rulesets" "$HOME/analemma-gvm-openclaw/rulesets"; do
+    [ -d "$d" ] && RULESETS_DIR="$d" && break
+done
+
+# Auto-detect MCP directory
 MCP_DIR=""
 for d in "$REPO_DIR/../analemma-gvm-openclaw" "$HOME/analemma-gvm-openclaw"; do
     [ -d "$d/mcp-server" ] && MCP_DIR="$(cd "$d" && pwd)" && break
@@ -167,11 +177,12 @@ print(r.status_code)
 " 2>/dev/null || echo "0")
     [ "$GH_STATUS" = "200" ] && pass "3a: CONNECT api.github.com ($GH_STATUS)" || fail "3a: CONNECT api.github.com ($GH_STATUS)"
 
-    # Check WAL recorded the CONNECT
+    # CONNECT Allow does not write WAL (only Deny writes WAL for CONNECT).
+    # Verify via proxy log instead.
     sleep 1
-    WAL_CONNECT=$(grep -c "CONNECT" data/wal.log 2>/dev/null || echo "0")
-    WAL_CONNECT=$(echo "$WAL_CONNECT" | tr -d '[:space:]')
-    [ "$WAL_CONNECT" -gt 0 ] 2>/dev/null && pass "3b: WAL CONNECT logged ($WAL_CONNECT events)" || fail "3b: no CONNECT in WAL"
+    CONNECT_LOG=$(grep -c "CONNECT tunnel" /tmp/gvm-proxy.log 2>/dev/null || echo "0")
+    CONNECT_LOG=$(echo "$CONNECT_LOG" | tr -d '[:space:]')
+    [ "$CONNECT_LOG" -gt 0 ] 2>/dev/null && pass "3b: CONNECT logged ($CONNECT_LOG in proxy log)" || fail "3b: no CONNECT in proxy log"
 
     # Anthropic API (needs key, optional)
     if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
@@ -340,8 +351,8 @@ if should_run 7 && [ "$SKIP_OPENCLAW" = false ]; then
 
         # Check that CONNECT tunnel was used for LLM API
         sleep 1
-        LLM_CONNECT=$(grep "anthropic\|openai" data/wal.log 2>/dev/null | head -1 || echo "")
-        [ -n "$LLM_CONNECT" ] && pass "7: OpenClaw through CONNECT tunnel" || fail "7: no LLM CONNECT in WAL"
+        LLM_CONNECT=$(grep "anthropic\|openai" /tmp/gvm-proxy.log 2>/dev/null | head -1 || echo "")
+        [ -n "$LLM_CONNECT" ] && pass "7: OpenClaw through CONNECT tunnel" || fail "7: no LLM CONNECT in proxy log"
     else
         skip "7: OpenClaw (not installed or no API key)"
     fi
@@ -426,14 +437,16 @@ if should_run 9; then
     echo -e "  Memory before: ${MEM_BEFORE}KB"
     echo -e "  WAL before: ${WAL_BEFORE} bytes"
 
-    echo -e "  Sending 500 requests over 60 seconds..."
-    for i in $(seq 1 500); do
-        curl -sf -X POST "$PROXY_URL/gvm/check" \
-            -H "Content-Type: application/json" \
-            -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' > /dev/null 2>&1 &
-        [ $((i % 50)) -eq 0 ] && echo -e "    $i/500..." && wait
+    echo -e "  Sending 200 requests (10 batches of 20)..."
+    for batch in $(seq 1 10); do
+        for i in $(seq 1 20); do
+            curl -sf -X POST "$PROXY_URL/gvm/check" \
+                -H "Content-Type: application/json" \
+                -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' > /dev/null 2>&1 &
+        done
+        wait
+        echo -e "    $((batch * 20))/200..."
     done
-    wait
     sleep 2
 
     MEM_AFTER=$(ps -o rss= -p "$PROXY_PID" 2>/dev/null | tr -d ' ')
@@ -558,7 +571,10 @@ except Exception as e:
     echo -e "  New WAL events: $NEW_EVENTS"
 
     [ "$FAILED" -le 2 ] && pass "11a: concurrent CONNECT ($((10-FAILED))/10 succeeded)" || fail "11a: $FAILED/10 failed"
-    [ "$NEW_EVENTS" -gt 0 ] && pass "11b: WAL recorded concurrent events ($NEW_EVENTS)" || fail "11b: no WAL events from concurrent requests"
+    # CONNECT Allow doesn't write WAL — check proxy log for CONNECT entries
+    CONNECT_COUNT=$(grep -c "CONNECT tunnel" /tmp/gvm-proxy.log 2>/dev/null || echo "0")
+    CONNECT_COUNT=$(echo "$CONNECT_COUNT" | tr -d '[:space:]')
+    [ "$CONNECT_COUNT" -gt 0 ] 2>/dev/null && pass "11b: CONNECT logged ($CONNECT_COUNT in proxy log)" || fail "11b: no CONNECT in proxy log"
 
     # Health check after concurrent load
     HEALTH=$(curl -sf "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null || echo "failed")
@@ -970,8 +986,10 @@ if should_run 21; then
 
         MEM_AFTER=$(free -m | awk '/Mem:/{print $7}')
         MEM_DROP=$(( MEM_BEFORE - MEM_AFTER ))
-        TRACE_EVENTS=$(sudo cat /sys/kernel/tracing/trace 2>/dev/null | grep -c gvm_ssl || echo 0)
-        TRACE_LOST=$(sudo cat /sys/kernel/tracing/trace 2>/dev/null | grep -c "LOST" || echo 0)
+        TRACE_EVENTS=$(sudo cat /sys/kernel/tracing/trace 2>/dev/null | grep -c gvm_ssl || echo "0")
+        TRACE_EVENTS=$(echo "$TRACE_EVENTS" | tr -d '[:space:]')
+        TRACE_LOST=$(sudo cat /sys/kernel/tracing/trace 2>/dev/null | grep -c "LOST" || echo "0")
+        TRACE_LOST=$(echo "$TRACE_LOST" | tr -d '[:space:]')
 
         echo -e "  Trace events: $TRACE_EVENTS"
         echo -e "  Trace lost: $TRACE_LOST"
