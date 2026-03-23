@@ -446,7 +446,7 @@ gvm run --sandbox -- openclaw gateway # Layer 2+3: proxy + namespace + seccomp +
 gvm run -- python -m my_agent        # any command
 ```
 
-`gvm run` injects `HTTPS_PROXY` into all child processes. With `--sandbox`, adds Linux namespace isolation, seccomp-BPF syscall filtering, eBPF TC network enforcement, and uprobe TLS plaintext inspection.
+`gvm run` injects `HTTPS_PROXY` into all child processes. With `--sandbox`, adds Linux namespace isolation, seccomp-BPF syscall filtering, and eBPF TC network enforcement. Transparent MITM (ephemeral CA inside sandbox for full L7 HTTPS inspection) is planned for v0.3.
 
 ### Platform Support
 
@@ -455,17 +455,17 @@ gvm run -- python -m my_agent        # any command
 | Proxy + SRR + WAL + Merkle | Yes | Yes | Yes |
 | `gvm run` (HTTPS_PROXY) | Yes | Yes | Yes |
 | `--sandbox` (namespace + seccomp + eBPF) | **Yes** | No | No |
-| uprobe TLS capture (SSL_write_ex) | **Yes** (kernel 5.5+) | No | No |
+| Transparent MITM (auto CA in sandbox) | **Planned v0.3** | `gvm trust-ca` | `gvm trust-ca` |
 | `--contained` (Docker) | Yes | Yes | Yes |
 | Shadow Mode | Yes | Yes | Yes |
-| CONNECT tunnel | Yes | Yes | Yes |
+| CONNECT tunnel (domain-level) | Yes | Yes | Yes |
 
 ### Defense Layers (Linux)
 
 ```
 Layer 2: HTTP Proxy (all platforms)
   └─ SRR: URL/method/path matching + Base64 payload decoding
-  └─ CONNECT tunnel: domain-level HTTPS enforcement
+  └─ CONNECT tunnel: domain-level HTTPS enforcement (current)
   └─ WAL: Merkle-chained audit log
   └─ Hot-reload: POST /gvm/reload (zero-downtime rule swap)
 
@@ -473,8 +473,20 @@ Layer 3: OS Isolation (Linux only, --sandbox)
   └─ Namespace: PID/mount/net isolation
   └─ Seccomp-BPF: ~45 syscalls whitelisted
   └─ eBPF TC filter: kernel-level proxy-only enforcement
-  └─ uprobe: SSL_write_ex plaintext capture → SRR policy check → SIGSTOP on Deny
+  └─ Transparent MITM: ephemeral CA auto-injected into sandbox (planned v0.3)
+      → full L7: API key injection, path/method/body inspection, forgery detection
+      → all work on HTTPS — no manual CA setup
 ```
+
+**HTTPS inspection roadmap:**
+
+| Mode | Current (v0.2) | Planned (v0.3) |
+|------|---------------|----------------|
+| `--sandbox` (Linux) | CONNECT blind relay (domain-level) | **Transparent MITM** — ephemeral CA injected into sandbox, full L7 inspection |
+| macOS / non-sandbox | CONNECT blind relay | Optional MITM via `gvm trust-ca` (one-time manual CA install) |
+| MITM refused | CONNECT blind relay | CONNECT blind relay (domain-only) |
+
+In sandbox mode, the user does nothing — GVM auto-generates a per-session CA, injects it into `/etc/ssl/certs/` inside the namespace, redirects 443 traffic to the proxy, and performs TLS termination → plaintext inspection → re-encryption. The host system's CA store is never touched.
 
 ### Agent Integration Examples
 
@@ -515,9 +527,10 @@ See the [MCP integration repo →](https://github.com/skwuwu/analemma-gvm-opencl
 
 | Phase | Scope | Status |
 |-------|-------|--------|
-| **v0.1 — Alpha** | 3-layer enforcement, WAL ledger, encrypted vault, Python SDK, CLI, Linux sandbox, Merkle checkpoints, CONNECT tunnel, Shadow Mode, MCP integration, eBPF uprobe TLS capture | **Done** |
-| **v0.2 — Hardening** | WAL streaming recovery + rotation, IC-3 webhook callback, SRR hot-reload, Base64 payload decoding, `gvm run` binary mode | **Done** |
-| **v0.3 — Defense-in-Depth** | Multi-PID uprobe, chunked transfer reassembly, anomaly detection (low-and-slow exfiltration), WebSocket proxy | Planned |
+| **v0.1 — Alpha** | 3-layer enforcement, WAL ledger, encrypted vault, Python SDK, CLI, Linux sandbox, Merkle checkpoints, CONNECT tunnel, Shadow Mode, MCP integration | **Done** |
+| **v0.2 — Hardening** | SRR hot-reload, Base64 payload decoding, `gvm run` binary mode, eBPF TC network enforcement, 34 E2E tests | **Done** |
+| **v0.3 — Full L7** | **Transparent MITM** (ephemeral CA in sandbox), full HTTPS path/method/body inspection, API key injection on HTTPS, anomaly detection | Planned |
+| **v1.0 — Production** | NATS JetStream, Redis vault backend, TLS termination hardening, Prometheus metrics | Planned |
 | **v1.0 — Production** | NATS JetStream, Redis vault backend, TLS termination, Prometheus metrics | Planned |
 
 Long-term: multi-agent governance, filesystem/shell/database capability controls, TypeScript/Go SDK, Envoy filter mode. [Full roadmap →](docs/13-roadmap.md)
@@ -613,7 +626,7 @@ Until WAL hardening ships, the Merkle chain is cryptographically sound but opera
 
 **Shadow Mode**: Intent store with configurable TTL (default 30s). Atomic operations prevent TOCTOU races. Opt-in via `GVM_SHADOW_MODE` env var.
 
-**uprobe TLS capture**: Captures SSL_write_ex plaintext for path-level HTTPS enforcement. Known limitations: (1) SSL_write fires after kernel queues packet — SIGSTOP is "immediate session freeze", not "pre-transmission block". (2) Single-PID only — child processes need separate uprobe attachment (planned v0.3). (3) Non-OpenSSL TLS (BoringSSL, custom stacks) not covered — L4 proxy enforcement only.
+**HTTPS inspection**: Currently CONNECT blind relay (domain-level only). Transparent MITM with ephemeral CA (full L7 path/method/body inspection on HTTPS) is planned for v0.3. In sandbox mode, CA injection will be automatic — no user action needed. Non-sandbox environments will require `gvm trust-ca` (one-time).
 
 **SRR hot-reload**: `POST /gvm/reload` atomically swaps rules. Parse failure preserves existing rules. `gvm_select_rulesets` MCP tool triggers reload automatically.
 
