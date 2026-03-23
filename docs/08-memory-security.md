@@ -248,7 +248,7 @@ The `gvm-sandbox` crate provides Linux-native process isolation using four kerne
 | PID namespace | `CLONE_NEWPID` | `namespace.rs` | Isolated process tree |
 | Mount namespace | `CLONE_NEWNS` + `pivot_root` | `mount.rs` | Read-only workspace, minimal rootfs (tmpfs 64MB) |
 | Network namespace | `CLONE_NEWNET` + veth pair | `network.rs` | Proxy-path routing via veth + DNAT (v1 opt-in path) |
-| Syscall filter | seccomp-BPF (whitelist, ~45 syscalls) | `seccomp.rs` | Default-deny; blocks ptrace, mount, bpf, unshare |
+| Syscall filter | seccomp-BPF (whitelist, ~111 syscalls) | `seccomp.rs` | Default-deny; blocks ptrace, mount, bpf, unshare |
 
 **Network isolation** is the critical enforcement boundary: the agent runs in an isolated netns with a dedicated veth pair and child-level `HTTP_PROXY`/`HTTPS_PROXY` injection, while host iptables config provides a DNAT path to the configured proxy endpoint. This gives stronger containment than cooperative mode; transparent interception parity remains roadmap work.
 

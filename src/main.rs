@@ -349,7 +349,23 @@ async fn main() {
         .await
         .expect("Failed to bind to listen address");
 
-    tracing::info!(address = %config.server.listen, "GVM Proxy listening");
+    tracing::info!(address = %config.server.listen, "GVM Proxy listening (HTTP)");
+
+    // 13. Start TLS MITM listener (port 8443) for sandbox HTTPS inspection
+    let tls_port = {
+        let parts: Vec<&str> = config.server.listen.rsplitn(2, ':').collect();
+        let base_port: u16 = parts[0].parse().unwrap_or(8080);
+        let tls_port = base_port + 363; // 8080→8443
+        let host = if parts.len() > 1 { parts[1] } else { "0.0.0.0" };
+        format!("{}:{}", host, tls_port)
+    };
+
+    let tls_state = connect_state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = start_tls_listener(&tls_port, tls_state).await {
+            tracing::warn!(error = %e, "TLS MITM listener failed to start (sandbox HTTPS inspection unavailable)");
+        }
+    });
 
     // Use hyper directly to handle CONNECT method (axum doesn't route CONNECT).
     // Named functions avoid deeply nested closures that trigger rustc ICE on 1.94.0.
@@ -409,6 +425,166 @@ async fn route_request(
             .unwrap()
     });
     Ok(resp)
+}
+
+/// TLS MITM listener for sandbox HTTPS inspection.
+///
+/// Accepts TLS connections on port 8443, terminates TLS using the ephemeral CA,
+/// inspects the plaintext HTTP request, applies SRR policy, and forwards to upstream.
+async fn start_tls_listener(
+    listen_addr: &str,
+    state: gvm_proxy::proxy::AppState,
+) -> anyhow::Result<()> {
+    use gvm_proxy::tls_proxy::{
+        build_client_config, build_server_config, read_http_request, GvmCertResolver,
+    };
+    use tokio::io::AsyncWriteExt;
+
+    // Install crypto provider
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
+    // Generate ephemeral CA for this session
+    let ca = gvm_sandbox::ca::EphemeralCA::generate()?;
+    let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
+    let mut ca_params = rcgen::CertificateParams::default();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.distinguished_name = {
+        let mut dn = rcgen::DistinguishedName::new();
+        dn.push(rcgen::DnType::CommonName, "GVM MITM CA");
+        dn
+    };
+    let ca_cert = ca_params.self_signed(&ca_key)?;
+    let ca_cert_pem = ca_cert.pem().into_bytes();
+    let ca_key_pem = ca_key.serialize_pem().into_bytes();
+
+    let resolver = std::sync::Arc::new(GvmCertResolver::new(&ca_cert_pem, &ca_key_pem)?);
+    let server_config = std::sync::Arc::new(build_server_config(resolver)?);
+    let client_config = std::sync::Arc::new(build_client_config()?);
+
+    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    tracing::info!(address = %listen_addr, "GVM TLS MITM proxy listening");
+
+    loop {
+        let (stream, addr) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::debug!(error = %e, "TLS accept failed");
+                continue;
+            }
+        };
+
+        let sc = server_config.clone();
+        let cc = client_config.clone();
+        let st = state.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = handle_tls_connection(stream, sc, cc, st).await {
+                tracing::debug!(error = %e, addr = %addr, "TLS connection error");
+            }
+        });
+    }
+}
+
+/// Handle a single MITM TLS connection:
+/// 1. TLS handshake with agent (using ephemeral leaf cert from SNI)
+/// 2. Read plaintext HTTP request
+/// 3. Apply SRR policy check
+/// 4. If allowed: connect to upstream, forward request, relay response
+/// 5. If denied: return 403 to agent
+async fn handle_tls_connection(
+    stream: tokio::net::TcpStream,
+    server_config: std::sync::Arc<rustls::ServerConfig>,
+    client_config: std::sync::Arc<rustls::ClientConfig>,
+    state: gvm_proxy::proxy::AppState,
+) -> anyhow::Result<()> {
+    use gvm_proxy::tls_proxy::read_http_request;
+    use tokio::io::AsyncWriteExt;
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+    // 1. TLS handshake (SNI → dynamic cert via GvmCertResolver)
+    let acceptor = TlsAcceptor::from(server_config);
+    let mut tls_stream = acceptor.accept(stream).await?;
+
+    // 2. Read plaintext HTTP from decrypted stream
+    let req = read_http_request(&mut tls_stream).await?;
+
+    let host = if req.host.is_empty() {
+        "unknown".to_string()
+    } else {
+        req.host.clone()
+    };
+
+    tracing::info!(
+        method = %req.method,
+        host = %host,
+        path = %req.path,
+        "MITM: inspecting HTTPS request"
+    );
+
+    // 3. SRR policy check
+    let srr_result = {
+        let srr = state.srr.read().unwrap_or_else(|e| e.into_inner());
+        let body_ref = if req.body.is_empty() {
+            None
+        } else {
+            Some(req.body.as_slice())
+        };
+        srr.check(&req.method, &host, &req.path, body_ref)
+    };
+
+    let decision = &srr_result.decision;
+    tracing::info!(decision = ?decision, host = %host, path = %req.path, "MITM: SRR decision");
+
+    // 4. Enforce decision
+    match decision {
+        gvm_types::EnforcementDecision::Deny { reason } => {
+            // Return 403 to agent
+            let response = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\r\n\
+                 {{\"blocked\":true,\"decision\":\"Deny\",\"reason\":\"{}\"}}\r\n",
+                reason
+            );
+            tls_stream.write_all(response.as_bytes()).await?;
+            tls_stream.shutdown().await?;
+            tracing::warn!(host = %host, path = %req.path, reason = %reason, "MITM: request DENIED");
+            return Ok(());
+        }
+        gvm_types::EnforcementDecision::Delay { milliseconds } => {
+            tokio::time::sleep(std::time::Duration::from_millis(*milliseconds)).await;
+        }
+        _ => {} // Allow, AuditOnly, etc. — proceed
+    }
+
+    // 5. Connect to upstream with TLS
+    let connector = TlsConnector::from(client_config);
+    let upstream_host = host.split(':').next().unwrap_or(&host);
+    let upstream_addr = format!("{}:443", upstream_host);
+
+    let upstream_tcp = tokio::net::TcpStream::connect(&upstream_addr).await?;
+    let server_name = rustls::pki_types::ServerName::try_from(upstream_host.to_string())?;
+    let mut upstream_tls = connector.connect(server_name, upstream_tcp).await?;
+
+    // 6. Forward the original request (reconstruct from parsed parts)
+    upstream_tls.write_all(&req.raw_head).await?;
+    if !req.body.is_empty() {
+        upstream_tls.write_all(&req.body).await?;
+    }
+
+    // 7. Relay upstream response back to agent
+    let mut buf = vec![0u8; 8192];
+    loop {
+        use tokio::io::AsyncReadExt;
+        let n = upstream_tls.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        tls_stream.write_all(&buf[..n]).await?;
+    }
+
+    tls_stream.shutdown().await.ok();
+    Ok(())
 }
 
 /// Print a human-readable startup summary of loaded governance rules.

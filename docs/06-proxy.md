@@ -206,7 +206,7 @@ The Tower middleware stack provides three layers of runtime protection:
 | `RequestBodyLimitLayer` | Reject bodies > 1MB (OOM defense) | 1,048,576 bytes |
 | `ConcurrencyLimitLayer` | Limit in-flight requests (FD exhaustion) | 1,024 connections |
 
-**Order matters**: Panic catch is outermost (catches panics from any inner layer). Body limit is next (rejects before buffering). Concurrency limit is innermost (applied after body is accepted).
+**Order matters**: Tower applies layers in reverse declaration order. The concurrency limit is checked first (rejects when at capacity), body limit is next (rejects oversized bodies), and panic catch is innermost (converts panics from the handler into HTTP 500). In code, `CatchPanicLayer` is declared first but wraps outermost in the call stack.
 
 ---
 
@@ -240,8 +240,8 @@ When the proxy processes an IC-2 (Delay) response from a known LLM provider, it 
 
 Extraction behavior is transport-aware to avoid output drops:
 
-- **JSON (`application/json`)**: bounded buffering only when `Content-Length` is present and ≤ 256KB. Unknown-size or oversized JSON is passed through unchanged (no extraction).
-- **SSE (`text/event-stream`)**: passthrough streaming (no full pre-buffering), while tapping up to 1MB for best-effort extraction. On stream completion, any extracted trace is appended asynchronously as a follow-up WAL update.
+- **JSON (`application/json`)**: tap-stream captures up to 256KB (`MAX_JSON_TRACE_CAPTURE_BYTES`) of the response body for extraction. The response is forwarded immediately (no pre-buffering). `Content-Length` is **not** checked — all JSON responses from known LLM providers are tapped regardless of size, but only the first 256KB is captured for trace extraction.
+- **SSE (`text/event-stream`)**: tap-stream captures up to 1MB (`MAX_SSE_TRACE_CAPTURE_BYTES`) for best-effort extraction. The response streams through immediately. On stream completion, any extracted trace is appended asynchronously as a follow-up WAL update.
 
 ### Activation Conditions
 
@@ -253,7 +253,7 @@ Trace extraction baseline conditions:
 
 Additional extraction gates by response type:
 
-- **JSON**: requires `Content-Length` and bounded size (≤ 256KB)
+- **JSON**: requires `Content-Type: application/json`; tap capture is bounded to 256KB
 - **SSE**: requires `Content-Type: text/event-stream`; tap capture is bounded to 1MB
 
 IC-1 (Allow) responses are forwarded without buffering. Deny/RequireApproval responses never reach upstream.

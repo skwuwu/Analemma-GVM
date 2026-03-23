@@ -106,7 +106,7 @@ gvm run --sandbox my_agent.py
       iptables OUTPUT → DROP (all else)
   → IPv6 fully disabled (sysctl + ip6tables DROP fallback)
   → resolv.conf aligned to host veth IP (DNS resolution via host only)
-  → seccomp-BPF: ~45 syscalls whitelisted
+  → seccomp-BPF: ~111 syscalls whitelisted
 ```
 
 Defense-in-depth enforcement layers (v0.2.4):

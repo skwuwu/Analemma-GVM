@@ -222,7 +222,7 @@ This is the conservative middle ground: unknown operations are not broken (they 
 | PID namespace | Process isolation |
 | Mount namespace | `pivot_root` to minimal read-only filesystem |
 | Network namespace | veth pair + DNAT proxy path (opt-in, process-scoped in v1) |
-| seccomp-BPF | ~45 allowed syscalls (default profile) |
+| seccomp-BPF | ~111 allowed syscalls (default profile) |
 
 The network namespace is the critical piece: `gvm run --sandbox` injects `HTTP_PROXY`/`HTTPS_PROXY` in the child and configures a veth+DNAT path to the proxy endpoint. This gives stronger containment than cooperative proxy mode, while transparent interception parity (`SO_ORIGINAL_DST`, CONNECT, IPv6 hardening) remains roadmap work.
 

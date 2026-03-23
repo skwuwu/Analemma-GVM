@@ -81,7 +81,7 @@ GVM works in two tiers. **Tier 1 requires zero code changes** — set `HTTP_PROX
 
 > ¹ SRR payload inspection rules (`payload_field` / `payload_match`) are parsed and loaded but currently inactive — the proxy passes `body = None` to SRR in both tiers. Host/method/path rules work fully. Payload inspection is planned for a future release.
 >
-> ² OS isolation is independent of SDK usage. `--sandbox` (Linux only) applies to the **agent process**: user/PID/mount/net namespace isolation, seccomp-BPF syscall whitelist (~45 allowed, `ptrace`/`bpf`/`mount` killed), and TC ingress filter on the host veth (kernel-level, unbypassable even with CAP_NET_ADMIN inside the namespace). The proxy process itself is not sandboxed. Without `--sandbox`, the agent could bypass governance by making direct HTTPS connections.
+> ² OS isolation is independent of SDK usage. `--sandbox` (Linux only) applies to the **agent process**: user/PID/mount/net namespace isolation, seccomp-BPF syscall whitelist (~111 allowed, `ptrace`/`bpf`/`mount` killed), and TC ingress filter on the host veth (kernel-level, unbypassable even with CAP_NET_ADMIN inside the namespace). The proxy process itself is not sandboxed. Without `--sandbox`, the agent could bypass governance by making direct HTTPS connections.
 >
 > ³ API key injection currently works on **HTTP requests only**. HTTPS traffic uses CONNECT blind relay (domain-level), so the proxy cannot modify headers or inject credentials. Full HTTPS API key injection requires transparent MITM, planned for v0.3. See [HTTP vs HTTPS capability table](#http-vs-https-capabilities) below.
 
@@ -440,11 +440,11 @@ class MyAgent(GVMAgent):
 ```bash
 # Script mode (auto-detect interpreter)
 gvm run agent.py
-gvm run --sandbox agent.py          # + kernel isolation + uprobe
+gvm run --sandbox agent.py          # + kernel isolation (namespace + seccomp + eBPF)
 
 # Binary mode (arbitrary command)
 gvm run -- openclaw gateway          # Layer 2: proxy only
-gvm run --sandbox -- openclaw gateway # Layer 2+3: proxy + namespace + seccomp + uprobe
+gvm run --sandbox -- openclaw gateway # Layer 2+3: proxy + namespace + seccomp + eBPF TC
 gvm run -- python -m my_agent        # any command
 ```
 
@@ -473,7 +473,7 @@ Layer 2: HTTP Proxy (all platforms)
 
 Layer 3: OS Isolation (Linux only, --sandbox)
   └─ Namespace: PID/mount/net isolation
-  └─ Seccomp-BPF: ~45 syscalls whitelisted
+  └─ Seccomp-BPF: ~111 syscalls whitelisted
   └─ eBPF TC filter: kernel-level proxy-only enforcement
   └─ Transparent MITM: ephemeral CA auto-injected into sandbox (planned v0.3)
       → full L7: API key injection, path/method/body inspection, forgery detection
@@ -533,7 +533,6 @@ See the [MCP integration repo →](https://github.com/skwuwu/analemma-gvm-opencl
 | **v0.2 — Hardening** | SRR hot-reload, Base64 payload decoding, `gvm run` binary mode, eBPF TC network enforcement, 34 E2E tests | **Done** |
 | **v0.3 — Full L7** | **Transparent MITM** (ephemeral CA in sandbox), full HTTPS path/method/body inspection, API key injection on HTTPS, anomaly detection | Planned |
 | **v1.0 — Production** | NATS JetStream, Redis vault backend, TLS termination hardening, Prometheus metrics | Planned |
-| **v1.0 — Production** | NATS JetStream, Redis vault backend, TLS termination, Prometheus metrics | Planned |
 
 Long-term: multi-agent governance, filesystem/shell/database capability controls, TypeScript/Go SDK, Envoy filter mode. [Full roadmap →](docs/13-roadmap.md)
 

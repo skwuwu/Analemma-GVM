@@ -4,6 +4,36 @@
 
 ---
 
+## 2026-03-23: Documentation Audit — 20 Issues Fixed Across 13 Documents
+
+### What Changed
+
+Full cross-reference audit of all 18 documentation files against actual codebase. 20 issues found and fixed:
+
+**Critical/High (5 fixes)**
+- seccomp syscall count: `~45` → `~111` in 08-memory-security.md, 11-competitive-analysis.md, 12-security-model.md, README.md (4 locations). Actual whitelist has 111 unique syscalls — previous count understated attack surface by 2.5x.
+- 05-vault.md: Removed contradictory claim that "WAL stores encrypted ciphertext" (lines 201, 289). WAL actually stores metadata only (hash + size). Same doc line 245 was correct. Unified to "metadata only" everywhere.
+- 06-proxy.md: Fixed Tower middleware execution order description. Tower applies layers in reverse declaration order (Concurrency→Body→Panic), not declaration order.
+- 06-proxy.md: Removed false claim that LLM trace extraction checks Content-Length header. Code taps all JSON responses up to 256KB regardless of Content-Length.
+- README.md: Replaced `uprobe` references in quick-start examples with `eBPF TC` (architectural shift from commit adf5764).
+
+**Medium (8 fixes)**
+- 00-overview.md: Test count 250 → 305. Unit test location "src/lib.rs" → "src/*.rs".
+- 10-architecture-changes.md: Test summary table — all 11 file counts corrected. Total 199 → 305. Added missing sandbox test category (30 tests).
+- 13-roadmap.md: Test count 218 → 305.
+- 04-ledger.md: Updated `recover_from_wal()` code snippet from `read_to_string` to `BufReader::lines()` streaming (reflects code change from earlier this session).
+- 07-sdk.md: Added `GVMRollbackError` to error hierarchy tree (was implemented but missing from tree).
+- 15-reference.md: Added undocumented `semantic_file` config field to SRR section.
+- README.md: Removed duplicate v1.0 roadmap row.
+
+### Affected Files
+- `docs/00-overview.md`, `docs/04-ledger.md`, `docs/05-vault.md`, `docs/06-proxy.md`, `docs/07-sdk.md`, `docs/08-memory-security.md`, `docs/10-architecture-changes.md`, `docs/11-competitive-analysis.md`, `docs/12-security-model.md`, `docs/13-roadmap.md`, `docs/15-reference.md`, `README.md`
+
+### Risk Assessment
+Documentation-only changes. No code impact. All fixes verified against actual source code via automated grep/count and manual review.
+
+---
+
 ## 2026-03-23: Security Hardening — WAL OOM, Rate Limiter Determinism, README Honesty
 
 ### What Changed

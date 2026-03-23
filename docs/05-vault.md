@@ -198,7 +198,7 @@ The intermediate `Vec<u8>` from hex decoding is zeroed on **all code paths** (su
 4. Store in backend via VaultBackend.put()
 ```
 
-The WAL records the **encrypted** value, not plaintext. Even if the WAL file is compromised, stored values remain encrypted.
+The WAL records **metadata only** (content hash + size), not the encrypted value or plaintext. Even if the WAL file is compromised, no secret values are exposed. Note: this means state recovery from WAL is not possible with `InMemoryBackend` — the WAL provides audit trail only, not data durability.
 
 ### Read (Async Audit)
 
@@ -240,7 +240,7 @@ The MVP `InMemoryBackend` loses all data on process restart. For persistent stat
 | **Redis with TLS** | Fast, TTL support, pub/sub for invalidation | Operational overhead, separate process |
 | **File-based (sled/rocksdb)** | No external dependency, embedded | No built-in TTL, compaction management |
 | **DynamoDB** | Serverless, auto-scaling | Network latency, AWS-only |
-| **WAL recovery** | No new dependency | WAL stores metadata (hash+size), not full encrypted values |
+| **WAL recovery** | No new dependency | WAL stores metadata only (hash+size) — **audit trail only, not state recovery** |
 
 **Key constraint**: WAL currently records only metadata (content hash + size) for vault writes, not the full encrypted value. Full WAL-based recovery would require storing the encrypted ciphertext in the WAL — a design change with WAL size implications.
 
@@ -286,7 +286,7 @@ The MVP `InMemoryBackend` loses all data on process restart. For persistent stat
 | Ciphertext tampering | AES-256-GCM authentication tag detects modification | `test_tampered_ciphertext_fails` |
 | Error information leak | Generic "integrity error" message, details logged internally | `test_wrong_key_returns_integrity_error` |
 | Intermediate key exposure | `bytes.zeroize()` on all paths (success + error) | Code review |
-| WAL contains secrets | WAL stores encrypted ciphertext, not plaintext | By design |
+| WAL contains secrets | WAL stores metadata only (hash + size), not ciphertext or plaintext | By design |
 | Audit log leaks values | Read audit events record key name only, not value | By design |
 
 ---

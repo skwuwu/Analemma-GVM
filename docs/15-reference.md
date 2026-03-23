@@ -48,6 +48,7 @@ infrastructure_failure = "halt"  # Halt if WAL fails
 
 [srr]
 network_file = "config/srr_network.toml"
+semantic_file = "config/srr_semantic.toml"  # Optional: semantic SRR rules
 hot_reload = true                # Live-reload without restart
 
 [policies]

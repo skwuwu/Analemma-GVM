@@ -238,7 +238,7 @@ pub fn setup_sandbox_network(config: &VethConfig) -> Result<()> {
         "ACCEPT",
     ])?;
 
-    // Allow TCP to proxy port on host IP only
+    // Allow TCP to proxy HTTP port on host IP
     run_iptables(&[
         "-A",
         "OUTPUT",
@@ -250,6 +250,39 @@ pub fn setup_sandbox_network(config: &VethConfig) -> Result<()> {
         &proxy_port,
         "-j",
         "ACCEPT",
+    ])?;
+
+    // Allow TCP to proxy TLS port (8443) for MITM inspection
+    let tls_port = (config.proxy_addr.port() + 363).to_string(); // 8080→8443
+    run_iptables(&[
+        "-A",
+        "OUTPUT",
+        "-p",
+        "tcp",
+        "-d",
+        &config.host_ip,
+        "--dport",
+        &tls_port,
+        "-j",
+        "ACCEPT",
+    ])?;
+
+    // DNAT: redirect all outbound 443 traffic to proxy TLS port
+    // This captures direct HTTPS (bypassing HTTPS_PROXY) and routes it
+    // through the MITM proxy for full L7 inspection.
+    run_iptables(&[
+        "-t",
+        "nat",
+        "-A",
+        "OUTPUT",
+        "-p",
+        "tcp",
+        "--dport",
+        "443",
+        "-j",
+        "DNAT",
+        "--to-destination",
+        &format!("{}:{}", config.host_ip, tls_port),
     ])?;
 
     // Allow UDP DNS to host IP only (resolv.conf must point to host_ip)
@@ -273,7 +306,8 @@ pub fn setup_sandbox_network(config: &VethConfig) -> Result<()> {
         sandbox_ip = %config.sandbox_ip,
         gateway = %config.host_ip,
         proxy_port = %proxy_port,
-        "Sandbox network locked down: proxy-only OUTPUT, IPv6 disabled"
+        tls_port = %tls_port,
+        "Sandbox network locked down: proxy-only OUTPUT + DNAT 443→TLS proxy"
     );
 
     Ok(())

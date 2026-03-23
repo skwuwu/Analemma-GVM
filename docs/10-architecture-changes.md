@@ -175,18 +175,19 @@ Batch N+1:
 
 | Test File | Count | Category |
 |-----------|-------|----------|
-| `src/` (unit tests) | 85 | Registry (4), Policy (10), SRR (19), Vault (7), WasmEngine (4), Merkle (9), LLM-trace (26), Proxy (6) |
+| `src/` (unit tests) | 137 | Auth (22), SRR (27), LLM-trace (26), Vault (15), Policy (10), Merkle (9), IntentStore (9), Proxy (6), TLS-proxy (5), Registry (4), WasmEngine (4) |
 | `crates/gvm-engine/src/lib.rs` | 7 | Policy engine evaluation + cross-layer strictness |
 | `crates/gvm-cli/src/run.rs` | 8 | Proxy URL detection (localhost, IPv6, IPv4, remote host) |
 | `crates/gvm-cli/src/suggest.rs` | 6 | Path generalization helper (numeric IDs, UUIDs) |
-| `crates/gvm-cli/tests/cli_integration.rs` | 3 | Main command surface integration tests |
-| `tests/hostile.rs` | 11 | Adversarial/concurrency |
-| `tests/integration.rs` | 5 | End-to-end pipeline |
+| `crates/gvm-cli/tests/cli_integration.rs` | 4 | Main command surface integration tests |
+| `crates/gvm-sandbox/` | 30 | CA (5), eBPF (3), TLS probe (10), Security (12) |
+| `tests/hostile.rs` | 28 | Adversarial/concurrency |
+| `tests/integration.rs` | 12 | End-to-end pipeline |
 | `tests/edge_cases.rs` | 17 | Input boundaries, conflicts |
 | `tests/stress.rs` | 12 | Scale, performance |
-| `tests/boundary.rs` | 30 | Cross-boundary security (incl. 4 IPv6 SSRF) |
+| `tests/boundary.rs` | 32 | Cross-boundary security (incl. 4 IPv6 SSRF) |
 | `tests/merkle.rs` | 12 | Merkle tree integrity |
-| **Total** | **199** | **All passing** |
+| **Total** | **305** | **All passing** |
 
 ---
 

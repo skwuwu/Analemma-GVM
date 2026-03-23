@@ -254,7 +254,8 @@ Resources are serialized as JSON in `X-GVM-Resource` header and used by the ABAC
 GVMError
 ├── GVMDeniedError          # HTTP 403 — Deny decision
 ├── GVMApprovalRequiredError # HTTP 403 — IC-3 RequireApproval
-└── GVMRateLimitError        # HTTP 429 — Throttle exceeded
+├── GVMRateLimitError        # HTTP 429 — Throttle exceeded
+└── GVMRollbackError         # Auto-rollback triggered on Deny (GVMAgent only)
 ```
 
 ```python

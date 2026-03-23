@@ -183,22 +183,35 @@ self.wal.append(event).await?;  // group commit: batched fsync + Merkle
 
 ```rust
 pub async fn recover_from_wal(&self) -> Result<RecoveryReport> {
-    let content = tokio::fs::read_to_string(&self.wal.path).await?;
+    // Stream line-by-line via BufReader to avoid OOM on large WAL files.
+    let file = std::fs::File::open(&self.wal.path)?;
+    let reader = std::io::BufReader::new(file);
 
-    for line in content.lines() {
-        match serde_json::from_str::<GVMEvent>(line) {
+    use std::io::BufRead;
+    for line_result in reader.lines() {
+        let line = match line_result {
+            Ok(l) => l,
+            Err(e) => {
+                // I/O error mid-read — stop recovery at this point
+                tracing::error!(error = %e, "WAL I/O error during recovery");
+                break;
+            }
+        };
+        // Skip batch records and empty lines
+        if line.trim().is_empty() || line.contains("\"merkle_root\"") { continue; }
+
+        match serde_json::from_str::<GVMEvent>(&line) {
             Ok(event) if event.status == Pending => {
-                // Mark as Expired — execution uncertain
                 let mut expired = event;
                 expired.status = EventStatus::Expired;
                 self.wal.append(&expired).await?;
             }
             Err(e) => {
-                // Corrupted entry — skip, log error, continue
-                tracing::error!("Corrupt WAL entry, skipping");
+                // Corrupted entry — skip, log warning, continue
+                tracing::warn!("Corrupt WAL entry, skipping");
                 continue;
             }
-            _ => {} // Non-Pending entries are fine
+            _ => {}
         }
     }
 }
