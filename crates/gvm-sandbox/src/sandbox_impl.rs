@@ -26,6 +26,22 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     let interpreter_path = which_interpreter(&config.interpreter)
         .with_context(|| format!("Interpreter '{}' not found in PATH", config.interpreter))?;
 
+    // Generate ephemeral CA for transparent MITM (if proxy_url set)
+    let ca_cert_pem: Option<Vec<u8>> = if config.proxy_url.is_some() {
+        match crate::ca::EphemeralCA::generate() {
+            Ok(ca) => {
+                tracing::info!("Ephemeral CA generated for sandbox MITM");
+                Some(ca.ca_cert_pem().to_vec())
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "CA generation failed — HTTPS inspection disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Create coordination pipe
     let (parent_fd, child_fd) = coordination_pipe()?;
 
@@ -38,12 +54,18 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     // Prepare data for the child closure
     let child_config = config.clone();
     let child_interpreter_path = interpreter_path.clone();
+    let child_ca_pem = ca_cert_pem.clone();
 
     let child_pid = unsafe {
         nix::sched::clone(
             Box::new(move || {
                 // ── Child process (inside new namespaces) ──
-                child_entry(child_fd, &child_config, &child_interpreter_path)
+                child_entry(
+                    child_fd,
+                    &child_config,
+                    &child_interpreter_path,
+                    child_ca_pem.as_deref(),
+                )
             }),
             &mut stack,
             clone_flags,
@@ -283,6 +305,7 @@ fn child_entry(
     coord_fd: std::os::unix::io::RawFd,
     config: &SandboxConfig,
     interpreter_path: &std::path::Path,
+    ca_cert_pem: Option<&[u8]>,
 ) -> isize {
     // Wait for parent to complete UID mapping and network setup
     let network_seed = match wait_for_parent(coord_fd) {
@@ -308,6 +331,7 @@ fn child_entry(
         &config.workspace_dir,
         interpreter_path,
         &veth_config.host_ip,
+        ca_cert_pem,
     ) {
         eprintln!("gvm-sandbox: mount namespace setup failed: {}", e);
         return 1;
@@ -343,6 +367,15 @@ fn child_entry(
     std::env::set_var("GVM_PROXY_URL", &proxy_url);
     std::env::set_var("HOME", "/workspace");
     std::env::set_var("TMPDIR", "/tmp");
+
+    // CA trust store env vars (for transparent MITM in sandbox)
+    if ca_cert_pem.is_some() {
+        let ca_path = "/etc/ssl/certs/gvm-ca.crt";
+        std::env::set_var("SSL_CERT_FILE", ca_path);
+        std::env::set_var("REQUESTS_CA_BUNDLE", ca_path);
+        std::env::set_var("NODE_EXTRA_CA_CERTS", ca_path);
+        std::env::set_var("CURL_CA_BUNDLE", ca_path);
+    }
 
     // Build argv: [interpreter, ...args]
     let c_bin = std::ffi::CString::new(bin_path.clone()).unwrap();

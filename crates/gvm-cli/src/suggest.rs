@@ -1,6 +1,6 @@
 use crate::ui::{BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
 use std::collections::BTreeMap;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 
 /// A URL pattern that hit Default-to-Caution (no explicit SRR rule).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -17,22 +17,35 @@ struct CautionTarget {
 /// identifies unique (method, host, path) combos that triggered default-to-caution,
 /// and prompts the operator to add explicit SRR rules.
 pub fn suggest_rules_interactive(wal_path: &str, start_offset: u64, srr_file: &str) {
-    let content = match std::fs::read_to_string(wal_path) {
-        Ok(c) => c,
+    use std::io::BufRead;
+
+    let file = match std::fs::File::open(wal_path) {
+        Ok(f) => f,
         Err(_) => return,
     };
 
-    let new_content = if (start_offset as usize) < content.len() {
-        &content[start_offset as usize..]
+    // Seek past already-processed events instead of loading entire file.
+    // Previous implementation used read_to_string (OOM risk on large WALs).
+    let reader = if start_offset > 0 {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = file;
+        if file.seek(SeekFrom::Start(start_offset)).is_err() {
+            return;
+        }
+        std::io::BufReader::new(file)
     } else {
-        return;
+        std::io::BufReader::new(file)
     };
 
     // Collect unique (method, host, path) combos that hit default-to-caution
     let mut caution_targets: BTreeMap<CautionTarget, usize> = BTreeMap::new();
 
-    for line in new_content.lines() {
-        let event: serde_json::Value = match serde_json::from_str(line) {
+    for line_result in reader.lines() {
+        let line = match line_result {
+            Ok(l) => l,
+            Err(_) => break, // I/O error — stop reading
+        };
+        let event: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(_) => continue,
         };

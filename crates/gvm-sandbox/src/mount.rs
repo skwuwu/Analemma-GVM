@@ -22,6 +22,7 @@ pub fn setup_mount_namespace(
     workspace_dir: &Path,
     interpreter_path: &Path,
     dns_server: &str,
+    ca_cert_pem: Option<&[u8]>,
 ) -> Result<()> {
     let new_root = PathBuf::from("/tmp/gvm-sandbox-root");
 
@@ -117,6 +118,11 @@ pub fn setup_mount_namespace(
 
     // Create minimal /etc files (DNS points to veth host IP)
     create_minimal_etc(&new_root, dns_server)?;
+
+    // Inject ephemeral CA into sandbox trust store (for transparent MITM)
+    if let Some(ca_pem) = ca_cert_pem {
+        inject_ca_cert(&new_root, ca_pem)?;
+    }
 
     // pivot_root: swap root filesystem
     let old_root = new_root.join("old_root");
@@ -289,5 +295,39 @@ fn create_minimal_etc(new_root: &Path, dns_server: &str) -> Result<()> {
         format!("nameserver {}\n", dns_server),
     )?;
 
+    Ok(())
+}
+
+/// Inject ephemeral CA certificate into the sandbox's trust store.
+///
+/// Writes the CA PEM to multiple cert paths (Debian, RHEL, Alpine) so it
+/// works regardless of the base image. Also sets environment variables
+/// that Python/Node/curl use to find the CA.
+///
+/// The CA is written to tmpfs (sandbox root is tmpfs) — never touches host disk.
+fn inject_ca_cert(new_root: &Path, ca_pem: &[u8]) -> Result<()> {
+    // Write to multiple cert store paths (distribution-agnostic)
+    let cert_dirs = [
+        "etc/ssl/certs",       // Debian/Ubuntu
+        "etc/pki/tls/certs",   // RHEL/CentOS
+        "etc/ca-certificates", // Alpine
+    ];
+
+    let mut injected = false;
+    for dir in &cert_dirs {
+        let dir_path = new_root.join(dir);
+        if std::fs::create_dir_all(&dir_path).is_ok() {
+            let cert_path = dir_path.join("gvm-ca.crt");
+            std::fs::write(&cert_path, ca_pem)
+                .with_context(|| format!("Failed to write CA to {}", cert_path.display()))?;
+            injected = true;
+        }
+    }
+
+    if !injected {
+        anyhow::bail!("Failed to inject CA into any trust store path");
+    }
+
+    tracing::debug!("Ephemeral CA injected into sandbox trust store");
     Ok(())
 }

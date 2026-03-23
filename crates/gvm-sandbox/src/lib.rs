@@ -119,6 +119,10 @@ pub struct PreflightReport {
     pub issues: Vec<String>,
 }
 
+// ── Cross-platform modules ──
+
+pub mod ca;
+
 // ── Platform-specific implementation ──
 
 #[cfg(target_os = "linux")]

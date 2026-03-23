@@ -1,6 +1,6 @@
 # Analemma-GVM
 
-**Governance Virtual Machine — A Security Kernel for AI Agent I/O**
+**Governance Virtual Machine — A Security Proxy for AI Agent I/O**
 
 **Status: v0.2 (pre-release software). Primary platform: Linux.**
 
@@ -41,7 +41,7 @@ Most AI security approaches rely on model-level inference control, prompt guardr
 
 **We don't correct what agents *say*. We control what agents *do*.**
 
-This is the same insight that separates OS-level security from application-level security. Anti-virus scans files; the kernel enforces permissions. We are building the kernel.
+This is the same insight that separates infrastructure-level enforcement from application-level checks. Anti-virus scans files; the firewall blocks packets. GVM is the firewall for agent actions — an HTTP governance proxy that enforces rules on actual network requests, not on agent self-reports.
 
 ---
 
@@ -70,7 +70,7 @@ GVM works in two tiers. **Tier 1 requires zero code changes** — set `HTTP_PROX
 | **Code changes** | None | Add `@ic()` decorator to functions |
 | **SRR: host / method / path rules** | ✓ | ✓ |
 | **SRR: payload field inspection** | — (body not buffered)¹ | — (body not buffered)¹ |
-| **API key injection** | ✓ | ✓ |
+| **API key injection** | ✓ (HTTP only)³ | ✓ (HTTP only)³ |
 | **Merkle audit (IC-2+)** | ✓ (agent="unknown") | ✓ (per-agent, per-operation) |
 | **Default-to-Caution** | ✓ (Delay 300ms on unknown URLs) | ✓ |
 | **Semantic policy (ABAC)** | — | ✓ |
@@ -82,8 +82,10 @@ GVM works in two tiers. **Tier 1 requires zero code changes** — set `HTTP_PROX
 > ¹ SRR payload inspection rules (`payload_field` / `payload_match`) are parsed and loaded but currently inactive — the proxy passes `body = None` to SRR in both tiers. Host/method/path rules work fully. Payload inspection is planned for a future release.
 >
 > ² OS isolation is independent of SDK usage. `--sandbox` (Linux only) applies to the **agent process**: user/PID/mount/net namespace isolation, seccomp-BPF syscall whitelist (~45 allowed, `ptrace`/`bpf`/`mount` killed), and TC ingress filter on the host veth (kernel-level, unbypassable even with CAP_NET_ADMIN inside the namespace). The proxy process itself is not sandboxed. Without `--sandbox`, the agent could bypass governance by making direct HTTPS connections.
+>
+> ³ API key injection currently works on **HTTP requests only**. HTTPS traffic uses CONNECT blind relay (domain-level), so the proxy cannot modify headers or inject credentials. Full HTTPS API key injection requires transparent MITM, planned for v0.3. See [HTTP vs HTTPS capability table](#http-vs-https-capabilities) below.
 
-**Tier 1 alone** blocks known-bad URLs by host/method/path, injects credentials, and logs everything with WAL — that's already more than most agent deployments have. **Tier 2** adds the cross-layer forgery detection that catches a lying agent. Start with the proxy, add the SDK when you need deeper control.
+**Tier 1 alone** blocks known-bad URLs by host/method/path, injects credentials on HTTP (HTTPS injection requires v0.3 MITM), and logs everything with WAL — that's already more than most agent deployments have. **Tier 2** adds the cross-layer forgery detection that catches a lying agent. Start with the proxy, add the SDK when you need deeper control.
 
 The agent cannot bypass this. Not because it's told not to, but because the architecture makes bypass structurally impossible:
 
@@ -572,7 +574,7 @@ GVM is lightweight because it uses deterministic pattern matching (URL, method, 
 
 ## OPA+Envoy vs GVM
 
-> OPA is a policy engine for microservices. GVM is a security kernel for AI agents.
+> OPA is a policy engine for microservices. GVM is a governance proxy for AI agents.
 > They solve different problems that happen to share a surface similarity.
 
 **The core divergence**: OPA+Envoy assumes honest services — your engineers write the code, your CI deploys it, requests follow known API contracts. GVM assumes adversarial agents — an LLM generates actions at runtime, headers may be forged, and the agent may be prompt-injected.
@@ -607,6 +609,26 @@ Achievable with custom Envoy filters + OPA extensions + additional systems, but 
 
 ---
 
+## HTTP vs HTTPS Capabilities
+
+GVM is an HTTP proxy. What the proxy can inspect and modify depends on the protocol:
+
+| Capability | HTTP | HTTPS (CONNECT relay, v0.2) | HTTPS (MITM, planned v0.3) |
+|------------|------|----------------------------|---------------------------|
+| **Host filtering** | ✓ | ✓ (from CONNECT target) | ✓ |
+| **Path/method inspection** | ✓ | ✗ (encrypted tunnel) | ✓ |
+| **API key injection** | ✓ | ✗ (cannot modify headers) | ✓ |
+| **Payload/body inspection** | ✓¹ | ✗ (encrypted tunnel) | ✓ |
+| **WAL audit logging** | Full (host, method, path, headers) | Domain + method only | Full |
+| **SRR rule matching** | Host + method + path | Host only | Host + method + path |
+| **Forgery detection (with SDK)** | ✓ | Host-level only | ✓ |
+
+> **What this means in practice**: Most AI API providers (OpenAI, Anthropic, Stripe, etc.) use HTTPS. In v0.2, GVM can block/allow by domain but cannot inspect paths, inject API keys, or read payloads on HTTPS traffic. Full L7 HTTPS governance requires the transparent MITM planned for v0.3 (`--sandbox` mode: automatic; non-sandbox: `gvm trust-ca`).
+>
+> **If you need full governance today**, route agent traffic over HTTP to the proxy and let the proxy handle the upstream HTTPS connection. This is how the `HTTP_PROXY` pattern works by default for most HTTP client libraries.
+
+---
+
 ## Known Limitations
 
 > What's implemented works. These are the edges we haven't polished yet.
@@ -615,7 +637,7 @@ Achievable with custom Envoy filters + OPA extensions + additional systems, but 
 
 | Area | Current State | Planned Fix | Priority |
 |------|--------------|-------------|----------|
-| **WAL Recovery** | Loads entire WAL into memory (OOM risk on GB+ files) | Streaming `BufReader` recovery | v1.1 |
+| **WAL Recovery** | ~~Loads entire WAL into memory~~ Fixed: streaming `BufReader` recovery | — | Done |
 | **WAL Rotation** | Single file, no rotation | Size-based rotation with Merkle chain linking | v1.1 |
 | **WAL Sequence** | Resets to 0 on restart | Initialize from last WAL event count | v1.1 |
 | **IC-3 Approval** | Returns 403 with no approval mechanism | Webhook callback + approval queue | v1.1 |

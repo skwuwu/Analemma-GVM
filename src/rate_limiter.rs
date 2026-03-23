@@ -3,8 +3,12 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// Fixed-point scale: 1 token = 1000 millitokens.
+/// All arithmetic uses u64 to eliminate floating-point non-determinism.
+const MILLIS_PER_TOKEN: u64 = 1000;
+
 /// Token-bucket rate limiter keyed by agent ID.
-/// Used for Throttle enforcement decisions.
+/// Uses millitoken (u64) fixed-point arithmetic for deterministic decisions.
 pub struct RateLimiter {
     buckets: Mutex<HashMap<String, TokenBucket>>,
     /// Counter for periodic stale bucket cleanup.
@@ -12,9 +16,12 @@ pub struct RateLimiter {
 }
 
 struct TokenBucket {
-    tokens: f64,
-    max_tokens: f64,
-    refill_rate: f64, // tokens per second
+    /// Current tokens in millitokens (1000 = 1 token).
+    millitokens: u64,
+    /// Maximum tokens in millitokens.
+    max_millitokens: u64,
+    /// Refill rate in millitokens per second.
+    refill_rate_millis_per_sec: u64,
     last_refill: Instant,
     last_access: Instant,
 }
@@ -30,12 +37,14 @@ const MAX_BUCKETS: usize = 10_000;
 
 impl TokenBucket {
     fn new(max_per_minute: u64) -> Self {
-        let max_tokens = max_per_minute as f64;
+        let max_millitokens = max_per_minute.saturating_mul(MILLIS_PER_TOKEN);
         let now = Instant::now();
         Self {
-            tokens: max_tokens,
-            max_tokens,
-            refill_rate: max_tokens / 60.0,
+            millitokens: max_millitokens,
+            max_millitokens,
+            // rate = max_per_minute tokens / 60 seconds, in millitokens/sec
+            // = max_per_minute * 1000 / 60
+            refill_rate_millis_per_sec: max_per_minute.saturating_mul(MILLIS_PER_TOKEN) / 60,
             last_refill: now,
             last_access: now,
         }
@@ -46,8 +55,8 @@ impl TokenBucket {
         self.refill();
         self.last_access = Instant::now();
 
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
+        if self.millitokens >= MILLIS_PER_TOKEN {
+            self.millitokens -= MILLIS_PER_TOKEN;
             true
         } else {
             false
@@ -56,8 +65,14 @@ impl TokenBucket {
 
     fn refill(&mut self) {
         let now = Instant::now();
-        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.max_tokens);
+        let elapsed_ms = now.duration_since(self.last_refill).as_millis() as u64;
+        // Compute refill: rate_millis_per_sec * elapsed_ms / 1000
+        // Use checked arithmetic to avoid overflow on very long idle periods.
+        let refill_amount = self.refill_rate_millis_per_sec.saturating_mul(elapsed_ms) / 1000;
+        self.millitokens = self
+            .millitokens
+            .saturating_add(refill_amount)
+            .min(self.max_millitokens);
         self.last_refill = now;
     }
 }
@@ -135,11 +150,12 @@ impl RateLimiter {
             .or_insert_with(|| TokenBucket::new(max_per_minute));
 
         // Update max if policy changed, and clamp current tokens to new max
-        let new_max = max_per_minute as f64;
-        if (bucket.max_tokens - new_max).abs() > f64::EPSILON {
-            bucket.max_tokens = new_max;
-            bucket.refill_rate = new_max / 60.0;
-            bucket.tokens = bucket.tokens.min(new_max);
+        let new_max_millis = max_per_minute.saturating_mul(MILLIS_PER_TOKEN);
+        if bucket.max_millitokens != new_max_millis {
+            bucket.max_millitokens = new_max_millis;
+            bucket.refill_rate_millis_per_sec =
+                max_per_minute.saturating_mul(MILLIS_PER_TOKEN) / 60;
+            bucket.millitokens = bucket.millitokens.min(new_max_millis);
         }
 
         bucket.try_consume()

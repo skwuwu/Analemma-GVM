@@ -578,9 +578,16 @@ impl Ledger {
     /// - Events not in NATS are re-published
     /// - Events still in Pending after recovery window are marked Expired
     pub async fn recover_from_wal(&self) -> Result<RecoveryReport> {
-        let content = tokio::fs::read_to_string(&self.wal.path).await?;
+        // Stream WAL line-by-line via BufReader to avoid OOM on large files.
+        // Previous implementation used read_to_string which loaded the entire
+        // WAL into memory — a crash-recovery killer for GB+ files.
+        let file = std::fs::File::open(&self.wal.path)
+            .map_err(|e| anyhow!("Failed to open WAL for recovery: {}", e))?;
+        let reader = std::io::BufReader::new(file);
+
         let mut pending_count = 0u64;
         let mut expired_count = 0u64;
+        let mut corrupt_count = 0u64;
 
         // Track event_ids we've already seen to handle duplicates.
         // WAL may contain both the original Pending event and a later Expired
@@ -588,7 +595,19 @@ impl Ledger {
         // event_ids we've already processed to avoid re-expiring them.
         let mut processed_ids = std::collections::HashSet::new();
 
-        for line in content.lines() {
+        use std::io::BufRead;
+        for line_result in reader.lines() {
+            let line = match line_result {
+                Ok(l) => l,
+                Err(e) => {
+                    // I/O error mid-read (e.g. truncated file from crash).
+                    // Log and stop — remaining data is unreliable.
+                    tracing::error!(error = %e, "WAL I/O error during recovery — stopping at this point");
+                    corrupt_count += 1;
+                    break;
+                }
+            };
+
             if line.trim().is_empty() {
                 continue;
             }
@@ -598,10 +617,13 @@ impl Ledger {
                 continue;
             }
 
-            let event: GVMEvent = match serde_json::from_str(line) {
+            let event: GVMEvent = match serde_json::from_str(&line) {
                 Ok(e) => e,
                 Err(e) => {
-                    tracing::error!(error = %e, "Corrupt WAL entry, skipping");
+                    // Corrupt line — likely from crash mid-write (truncated JSON).
+                    // Skip and continue: earlier complete lines are still valid.
+                    tracing::warn!(error = %e, "Corrupt WAL entry, skipping");
+                    corrupt_count += 1;
                     continue;
                 }
             };
@@ -628,6 +650,13 @@ impl Ledger {
                 }
                 expired_count += 1;
             }
+        }
+
+        if corrupt_count > 0 {
+            tracing::warn!(
+                corrupt_lines = corrupt_count,
+                "WAL recovery encountered corrupt entries (likely from crash mid-write)"
+            );
         }
 
         if expired_count > 0 {
