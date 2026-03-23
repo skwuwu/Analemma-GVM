@@ -641,7 +641,7 @@ GVM is an HTTP proxy. What the proxy can inspect and modify depends on the proto
 | **WAL Rotation** | Single file, no rotation | Size-based rotation with Merkle chain linking | v1.1 |
 | **WAL Sequence** | Resets to 0 on restart | Initialize from last WAL event count | v1.1 |
 | **IC-3 Approval** | Returns 403 with no approval mechanism | Webhook callback + approval queue | v1.1 |
-| **Numeric Precision** | Policy comparisons use `f64` (boundary-case rounding risk) | Decimal-based comparison | v1.1 |
+| **Numeric Precision** | ~~Rate limiter uses `f64`~~ Fixed: millitoken `u64` fixed-point arithmetic | — | Done |
 | **Vault Key** | Ephemeral random key if `GVM_VAULT_KEY` not set | Require explicit key in production | v1.1 |
 
 Until WAL hardening ships, the Merkle chain is cryptographically sound but operationally fragile under infrastructure stress (crash during recovery, WAL exceeding available memory).

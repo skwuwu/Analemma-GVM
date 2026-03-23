@@ -14,6 +14,7 @@ pub mod proxy;
 pub mod rate_limiter;
 pub mod registry;
 pub mod srr;
+pub mod tls_proxy;
 pub mod types;
 pub mod vault;
 pub mod wasm_engine;

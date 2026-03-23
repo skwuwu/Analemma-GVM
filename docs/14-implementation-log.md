@@ -4,6 +4,35 @@
 
 ---
 
+## 2026-03-23: Security Hardening — WAL OOM, Rate Limiter Determinism, README Honesty
+
+### What Changed
+
+**1. WAL OOM Fix (Critical)**
+- `src/ledger.rs`: `recover_from_wal()` replaced `tokio::fs::read_to_string` (loads entire WAL into memory) with `std::io::BufReader::lines()` streaming. Added corrupt-line counter and I/O error handling that stops recovery gracefully instead of panicking.
+- `crates/gvm-cli/src/suggest.rs`: `suggest_rules_interactive()` replaced `std::fs::read_to_string` with `std::fs::File::open` + `BufReader` + `Seek` to start_offset. Eliminates OOM risk on large WAL files during interactive rule suggestion.
+
+**2. Rate Limiter Fixed-Point (Non-determinism Fix)**
+- `src/rate_limiter.rs`: Complete rewrite from `f64` floating-point to `u64` millitoken fixed-point arithmetic (1 token = 1000 millitokens). Eliminates accumulated floating-point precision errors in long-running rate limiting decisions. All comparisons are now exact integer operations. Uses `saturating_mul`/`saturating_add` for overflow safety.
+
+**3. README Honesty (Architectural Transparency)**
+- Replaced "Security Kernel" with "Security Proxy" in title.
+- Removed "We are building the kernel" overstatement; replaced with firewall analogy.
+- Marked API key injection as "HTTP only" with footnote explaining CONNECT relay limitation.
+- Added "HTTP vs HTTPS Capabilities" comparison table showing exactly what works on each protocol in v0.2 vs planned v0.3 MITM.
+- Updated Known Limitations table to reflect WAL OOM and Numeric Precision as fixed.
+- Changed OPA comparison section from "security kernel" to "governance proxy".
+
+### Affected Files
+- `src/ledger.rs`, `src/rate_limiter.rs`, `crates/gvm-cli/src/suggest.rs`, `README.md`
+
+### Risk Assessment
+- **WAL recovery**: Behavioral change — corrupt last line now logs warning and continues (previously would fail to parse but still continue). I/O errors now stop recovery instead of propagating through the entire string. Streaming means memory usage is O(line) not O(file).
+- **Rate limiter**: Behavioral change — millitoken granularity (1/1000th token) vs f64. For max_per_minute < 60, the integer division `max * 1000 / 60` truncates slightly differently than f64 division. This is strictly more correct (deterministic, no accumulation drift).
+- **README**: No code impact. Transparency improvement.
+
+---
+
 ## 2026-03-23: Documentation Update — SRR, Proxy, and Reference Guide
 
 ### What Changed

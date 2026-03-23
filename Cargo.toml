@@ -52,6 +52,14 @@ zeroize = { version = "1", features = ["derive"] }
 wasmtime = "29"
 wasmtime-wasi = "29"
 gvm-engine = { path = "crates/gvm-engine" }
+gvm-sandbox = { path = "crates/gvm-sandbox" }
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+rcgen = "0.13"
+httparse = "1"
+dashmap = "6"
+rustls-pemfile = "2"
+webpki-roots = "0.26"
 
 [dev-dependencies]
 tempfile = "3"
