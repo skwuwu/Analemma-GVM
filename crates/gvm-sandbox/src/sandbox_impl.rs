@@ -9,7 +9,10 @@ use crate::mount::setup_mount_namespace;
 use crate::namespace::{
     coordination_pipe, sandbox_clone_flags, signal_child_ready, wait_for_parent, write_uid_map,
 };
-use crate::network::{cleanup_host_network, setup_host_network, setup_sandbox_network, VethConfig};
+use crate::network::{
+    cleanup_host_network, clear_network_state, record_network_state, setup_host_network,
+    setup_sandbox_network, VethConfig,
+};
 use crate::seccomp::{apply_seccomp_filter, count_seccomp_violations};
 use crate::{SandboxConfig, SandboxResult};
 use anyhow::{Context, Result};
@@ -92,7 +95,7 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         tracing::warn!(error = %e, "Host network setup failed — sandbox will have no network");
     } else {
         // Record network state for orphan cleanup on crash
-        if let Err(e) = network::record_network_state(&veth_config) {
+        if let Err(e) = record_network_state(&veth_config) {
             tracing::debug!(error = %e, "Failed to record network state (orphan cleanup unavailable)");
         }
     }
@@ -302,7 +305,7 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
             ebpf::detach_tc_filter(&veth_config.host_iface);
         }
         cleanup_host_network(&veth_config);
-        network::clear_network_state();
+        clear_network_state();
     }
 
     Ok(SandboxResult {

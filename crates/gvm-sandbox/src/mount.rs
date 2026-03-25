@@ -335,7 +335,7 @@ fn try_mount_overlayfs(
     let upper_size = format!("size={}m", policy.upper_size_mb);
     if mount(
         Some("tmpfs"),
-        &upper_dir.parent().unwrap_or(&upper_dir),
+        upper_dir.parent().unwrap_or(&upper_dir),
         Some("tmpfs"),
         MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
         Some(upper_size.as_str()),
