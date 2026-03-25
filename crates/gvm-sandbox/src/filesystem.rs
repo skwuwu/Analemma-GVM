@@ -344,4 +344,79 @@ mod tests {
         let (action, _) = classify_file(Path::new("package.json"), &policy);
         assert!(matches!(action, FileAction::ManualCommit));
     }
+
+    /// Priority test: when a file matches patterns in multiple categories,
+    /// the stricter category wins (discard > manual_commit > auto_merge).
+    /// This is consistent with SRR's max_strict principle.
+    #[test]
+    fn priority_stricter_category_wins() {
+        // Create a policy where *.json appears in BOTH auto_merge AND manual_commit
+        let policy = FilesystemPolicy {
+            auto_merge: vec!["*.json".into(), "*.csv".into()],
+            manual_commit: vec!["*.json".into(), "*.py".into()],
+            discard: vec!["*.log".into()],
+            default: "auto_merge".into(),
+            upper_size_mb: 256,
+        };
+
+        // *.json is in both auto_merge and manual_commit.
+        // manual_commit is checked first (stricter) → must win.
+        let (action, pattern) = classify_file(Path::new("config.json"), &policy);
+        assert!(
+            matches!(action, FileAction::ManualCommit),
+            "manual_commit must win over auto_merge for overlapping patterns (got {:?})",
+            action,
+        );
+        assert_eq!(pattern, "*.json");
+    }
+
+    /// Priority test: discard beats manual_commit for overlapping patterns.
+    #[test]
+    fn priority_discard_beats_manual_commit() {
+        let policy = FilesystemPolicy {
+            auto_merge: vec![],
+            manual_commit: vec!["*.log".into()], // also in discard
+            discard: vec!["*.log".into()],
+            default: "auto_merge".into(),
+            upper_size_mb: 256,
+        };
+
+        let (action, _) = classify_file(Path::new("debug.log"), &policy);
+        assert!(
+            matches!(action, FileAction::Discard),
+            "discard must win over manual_commit (got {:?})",
+            action,
+        );
+    }
+
+    /// Priority test: a file matching no pattern gets the default action.
+    #[test]
+    fn priority_default_auto_merge() {
+        let policy = FilesystemPolicy {
+            auto_merge: vec![],
+            manual_commit: vec![],
+            discard: vec![],
+            default: "auto_merge".into(),
+            upper_size_mb: 256,
+        };
+
+        let (action, pattern) = classify_file(Path::new("anything.xyz"), &policy);
+        assert!(matches!(action, FileAction::AutoMerge));
+        assert_eq!(pattern, "default");
+    }
+
+    /// Priority test: default = "discard" works.
+    #[test]
+    fn priority_default_discard() {
+        let policy = FilesystemPolicy {
+            auto_merge: vec![],
+            manual_commit: vec![],
+            discard: vec![],
+            default: "discard".into(),
+            upper_size_mb: 256,
+        };
+
+        let (action, _) = classify_file(Path::new("anything.xyz"), &policy);
+        assert!(matches!(action, FileAction::Discard));
+    }
 }
