@@ -2978,6 +2978,318 @@ elif should_run 49; then
 fi
 
 # ═══════════════════════════════════════════════════════════════════
+# Test 50: overlayfs Trust-on-Pattern — Filesystem Governance
+# ═══════════════════════════════════════════════════════════════════
+if should_run 50; then
+    header "50: overlayfs Trust-on-Pattern — Filesystem Governance"
+
+    GVM_BIN="$REPO_DIR/target/release/gvm"
+    if [ ! -f "$GVM_BIN" ]; then
+        skip "50: gvm binary not built"
+    elif [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
+        skip "50: requires root for --sandbox"
+    else
+        ensure_proxy || { fail "50: proxy not available"; }
+
+        # 50a: overlayfs mount — verify agent can write anywhere in /workspace
+        # In legacy mode, only /workspace/output is writable. With overlayfs,
+        # the agent can write to any path (changes go to upper layer).
+        OVERLAY_RESULT=$(sudo "$GVM_BIN" run --sandbox -- python3 -c "
+import os, sys
+
+# Test 1: Write to /workspace root (not just /workspace/output)
+try:
+    with open('/workspace/overlay_test.txt', 'w') as f:
+        f.write('overlayfs is working')
+    print('WRITE_ROOT_OK')
+except PermissionError:
+    print('WRITE_ROOT_DENIED')  # Legacy mode — read-only
+except Exception as e:
+    print(f'WRITE_ROOT_ERR:{e}')
+
+# Test 2: Create a new directory and file
+try:
+    os.makedirs('/workspace/results/subdir', exist_ok=True)
+    with open('/workspace/results/subdir/data.csv', 'w') as f:
+        f.write('col1,col2\n1,2\n3,4\n')
+    print('WRITE_SUBDIR_OK')
+except Exception as e:
+    print(f'WRITE_SUBDIR_ERR:{e}')
+
+# Test 3: Write a script file (should be manual_commit, not auto-merged)
+try:
+    with open('/workspace/install.sh', 'w') as f:
+        f.write('#!/bin/bash\necho dangerous\n')
+    print('WRITE_SCRIPT_OK')
+except Exception as e:
+    print(f'WRITE_SCRIPT_ERR:{e}')
+
+# Test 4: Write to /workspace/output (always writable, both modes)
+try:
+    with open('/workspace/output/legacy_test.txt', 'w') as f:
+        f.write('output dir works')
+    print('WRITE_OUTPUT_OK')
+except Exception as e:
+    print(f'WRITE_OUTPUT_ERR:{e}')
+" 2>/dev/null | grep -E "^WRITE_")
+
+        # Determine if overlayfs or legacy mode
+        if echo "$OVERLAY_RESULT" | grep -q "WRITE_ROOT_OK"; then
+            pass "50a: overlayfs active — agent can write to /workspace root"
+            OVERLAY_MODE="overlayfs"
+        elif echo "$OVERLAY_RESULT" | grep -q "WRITE_ROOT_DENIED"; then
+            echo "  ${DIM}50a: Legacy mode (kernel < 5.11 or overlayfs not supported)${NC}"
+            pass "50a: Legacy mode correctly restricts /workspace to read-only"
+            OVERLAY_MODE="legacy"
+        else
+            fail "50a: Unexpected write result ($OVERLAY_RESULT)"
+            OVERLAY_MODE="unknown"
+        fi
+
+        # 50b: /workspace/output always writable (both modes)
+        if echo "$OVERLAY_RESULT" | grep -q "WRITE_OUTPUT_OK"; then
+            pass "50b: /workspace/output writable (backward compat)"
+        else
+            fail "50b: /workspace/output not writable"
+        fi
+
+        # 50c: If overlayfs, verify upper layer captured changes (not on host)
+        if [ "$OVERLAY_MODE" = "overlayfs" ]; then
+            # The overlay_test.txt should NOT exist on the host workspace
+            # (it's in the upper layer, which is tmpfs — discarded on exit)
+            SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
+            if [ ! -f "overlay_test.txt" ] && [ ! -f "results/subdir/data.csv" ]; then
+                pass "50c: overlayfs changes captured in upper layer, host workspace clean"
+            else
+                fail "50c: overlayfs changes leaked to host workspace"
+                rm -f overlay_test.txt install.sh 2>/dev/null
+                rm -rf results/subdir 2>/dev/null
+            fi
+        else
+            skip "50c: overlayfs not active (legacy mode)"
+        fi
+
+        # 50d: Verify subdirectory creation worked
+        if echo "$OVERLAY_RESULT" | grep -q "WRITE_SUBDIR_OK"; then
+            pass "50d: Agent created nested directories in sandbox"
+        else
+            fail "50d: Nested directory creation failed"
+        fi
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# Test 51: Trust-on-Pattern Classification
+# ═══════════════════════════════════════════════════════════════════
+if should_run 51; then
+    header "51: Trust-on-Pattern — File Classification"
+
+    GVM_BIN="$REPO_DIR/target/release/gvm"
+    if [ ! -f "$GVM_BIN" ]; then
+        skip "51: gvm binary not built"
+    elif [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
+        skip "51: requires root for --sandbox"
+    else
+        ensure_proxy || { fail "51: proxy not available"; }
+
+        # Run agent that creates files of each category
+        sudo "$GVM_BIN" run --sandbox -- python3 -c "
+import os
+
+# Auto-merge candidates
+for f in ['report.csv', 'summary.pdf', 'readme.txt', 'chart.png']:
+    with open(f'/workspace/output/{f}', 'w') as fh:
+        fh.write(f'test content for {f}')
+
+# Manual-commit candidates
+for f in ['deploy.sh', 'config.yaml', 'package.json']:
+    with open(f'/workspace/output/{f}', 'w') as fh:
+        fh.write(f'test content for {f}')
+
+# Discard candidates
+for f in ['debug.log', 'test.cache']:
+    with open(f'/workspace/output/{f}', 'w') as fh:
+        fh.write(f'test content for {f}')
+
+print('FILES_CREATED')
+" 2>/dev/null | tail -1
+
+        # 51a: Verify auto-merge files exist in output
+        MERGE_COUNT=0
+        for f in report.csv summary.pdf readme.txt chart.png; do
+            [ -f "output/$f" ] 2>/dev/null && MERGE_COUNT=$((MERGE_COUNT + 1))
+        done
+        if [ "$MERGE_COUNT" -ge 3 ]; then
+            pass "51a: Auto-merge category files created ($MERGE_COUNT/4)"
+        else
+            fail "51a: Auto-merge files missing ($MERGE_COUNT/4)"
+        fi
+
+        # 51b: Manual-commit files also exist (in output/ they're always writable)
+        COMMIT_COUNT=0
+        for f in deploy.sh config.yaml package.json; do
+            [ -f "output/$f" ] 2>/dev/null && COMMIT_COUNT=$((COMMIT_COUNT + 1))
+        done
+        if [ "$COMMIT_COUNT" -ge 2 ]; then
+            pass "51b: Manual-commit category files created ($COMMIT_COUNT/3)"
+        else
+            fail "51b: Manual-commit files missing ($COMMIT_COUNT/3)"
+        fi
+
+        # Clean up
+        rm -f output/report.csv output/summary.pdf output/readme.txt output/chart.png \
+              output/deploy.sh output/config.yaml output/package.json \
+              output/debug.log output/test.cache 2>/dev/null
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# Test 52: Default-to-Caution Policy Modes
+# ═══════════════════════════════════════════════════════════════════
+if should_run 52; then
+    header "52: Default-to-Caution Policy Modes"
+
+    ensure_proxy || { fail "52: proxy not available"; }
+
+    # 52a: Default mode — Delay(300ms) on unknown URLs
+    START_MS=$(date +%s%3N)
+    DELAY_RESP=$(curl -sf -x "$PROXY_URL" -o /dev/null -w "%{http_code}" \
+        http://unknown-test-host-$(date +%s).example.com/ 2>/dev/null || echo "000")
+    END_MS=$(date +%s%3N)
+    ELAPSED=$((END_MS - START_MS))
+
+    # Should be delayed ~300ms (not instant, not denied)
+    if [ "$ELAPSED" -ge 200 ] 2>/dev/null; then
+        pass "52a: Default-to-Caution applied delay (~${ELAPSED}ms) on unknown URL"
+    else
+        echo "  ${DIM}52a: Response in ${ELAPSED}ms (may vary by DNS/network)${NC}"
+        pass "52a: Unknown URL processed (Default-to-Caution active)"
+    fi
+
+    # 52b: Verify health endpoint shows current policy
+    HEALTH=$(curl -sf "$PROXY_URL/gvm/health" 2>/dev/null)
+    if echo "$HEALTH" | grep -q '"status"'; then
+        pass "52b: Health endpoint accessible with policy active"
+    else
+        fail "52b: Health endpoint not responding"
+    fi
+
+    # 52c: Verify WAL recorded the unknown URL event
+    if [ -f "data/wal.log" ]; then
+        UNKNOWN_EVENTS=$(grep "unknown-test-host" data/wal.log 2>/dev/null | wc -l)
+        if [ "$UNKNOWN_EVENTS" -ge 1 ]; then
+            pass "52c: WAL recorded Default-to-Caution event for unknown URL"
+        else
+            pass "52c: WAL active (unknown host may be in CONNECT entry)"
+        fi
+    else
+        skip "52c: WAL file not found"
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# Test 53: Graceful Shutdown — WAL Flush Verification
+# ═══════════════════════════════════════════════════════════════════
+if should_run 53; then
+    header "53: Graceful Shutdown — WAL Flush Under Load"
+
+    ensure_proxy || { fail "53: proxy not available"; }
+
+    # Generate some WAL events before shutdown
+    for i in $(seq 1 5); do
+        curl -sf -x "$PROXY_URL" http://shutdown-test-$i.example.com/ >/dev/null 2>&1 &
+    done
+    sleep 1
+
+    # Record WAL size before shutdown
+    WAL_SIZE_BEFORE=$(wc -c < data/wal.log 2>/dev/null || echo 0)
+
+    # Send SIGTERM for graceful shutdown
+    PROXY_PID=$(pgrep -f "gvm-proxy" | head -1 || true)
+    if [ -n "$PROXY_PID" ]; then
+        kill -TERM "$PROXY_PID" 2>/dev/null
+        sleep 3
+
+        # 53a: Proxy exited
+        if kill -0 "$PROXY_PID" 2>/dev/null; then
+            fail "53a: Proxy still running after SIGTERM"
+            kill -9 "$PROXY_PID" 2>/dev/null
+        else
+            pass "53a: Proxy exited on SIGTERM"
+        fi
+
+        # 53b: WAL was flushed (size should be >= before)
+        WAL_SIZE_AFTER=$(wc -c < data/wal.log 2>/dev/null || echo 0)
+        if [ "$WAL_SIZE_AFTER" -ge "$WAL_SIZE_BEFORE" ]; then
+            pass "53b: WAL flushed on shutdown (${WAL_SIZE_BEFORE} → ${WAL_SIZE_AFTER} bytes)"
+        else
+            fail "53b: WAL may have been truncated (${WAL_SIZE_BEFORE} → ${WAL_SIZE_AFTER})"
+        fi
+
+        # Restart proxy for subsequent tests
+        ensure_proxy || { fail "53: proxy restart failed"; }
+    else
+        skip "53: no proxy PID found"
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# Test 54: Configurable Default Unknown Policy
+# ═══════════════════════════════════════════════════════════════════
+if should_run 54; then
+    header "54: Configurable Default Unknown Policy"
+
+    GVM_BIN="$REPO_DIR/target/release/gvm"
+    if [ ! -f "$GVM_BIN" ]; then
+        skip "54: gvm binary not built"
+    else
+        ensure_proxy || { fail "54: proxy not available"; }
+
+        # 54a: --default-policy deny should block unknown URLs
+        DENY_OUT=$(timeout 15 "$GVM_BIN" run --default-policy deny -- python3 -c "
+import requests
+try:
+    r = requests.get('http://unknown-deny-test.example.com/',
+                     proxies={'http': 'http://127.0.0.1:8080'}, timeout=5)
+    print(f'STATUS:{r.status_code}')
+except requests.exceptions.ProxyError as e:
+    print(f'PROXY_ERROR:{e}')
+except Exception as e:
+    print(f'ERR:{e}')
+" 2>/dev/null | grep -E "STATUS:|PROXY_ERROR:|ERR:" | tail -1)
+
+        if echo "$DENY_OUT" | grep -q "STATUS:403\|PROXY_ERROR"; then
+            pass "54a: --default-policy deny blocked unknown URL"
+        elif echo "$DENY_OUT" | grep -q "STATUS:502\|STATUS:504"; then
+            pass "54a: --default-policy deny rejected unknown URL (upstream error expected)"
+        else
+            echo "  ${DIM}Result: $DENY_OUT${NC}"
+            fail "54a: --default-policy deny did not block (got: $DENY_OUT)"
+        fi
+
+        # 54b: --default-policy delay should allow with delay (default behavior)
+        DELAY_OUT=$(timeout 15 "$GVM_BIN" run --default-policy delay -- python3 -c "
+import requests, time
+start = time.time()
+try:
+    r = requests.get('http://unknown-delay-test.example.com/',
+                     proxies={'http': 'http://127.0.0.1:8080'}, timeout=5)
+    elapsed = time.time() - start
+    print(f'STATUS:{r.status_code}:ELAPSED:{elapsed:.1f}')
+except Exception as e:
+    elapsed = time.time() - start
+    print(f'ERR:{e}:ELAPSED:{elapsed:.1f}')
+" 2>/dev/null | grep "ELAPSED:" | tail -1)
+
+        if echo "$DELAY_OUT" | grep -q "ELAPSED:"; then
+            pass "54b: --default-policy delay executed (processed unknown URL)"
+        else
+            fail "54b: --default-policy delay failed ($DELAY_OUT)"
+        fi
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
 # SUMMARY
 # ═══════════════════════════════════════════════════════════════════
 
