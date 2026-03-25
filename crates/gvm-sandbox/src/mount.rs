@@ -67,6 +67,9 @@ pub fn setup_mount_namespace(
         // by the parent process before clone(). Kernel 6.17+ blocks bind-mount of
         // host paths inside user namespaces, but inherits parent mounts.
         let staging_ws = Path::new("/tmp/gvm-sandbox-staging-ws");
+        eprintln!("DEBUG: staging_ws={} exists={} workspace_dir={} exists={}",
+            staging_ws.display(), staging_ws.exists(),
+            workspace_dir.display(), workspace_dir.exists());
         let mount_src = if staging_ws.exists() { staging_ws } else { workspace_dir };
         let ws_target = new_root.join("workspace");
         mount(
