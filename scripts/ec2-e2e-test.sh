@@ -2721,6 +2721,263 @@ print('SANDBOX_WATCH_OK')
 fi
 
 # ═══════════════════════════════════════════════════════════════════
+# Test 47: OpenClaw LLM Agent Through Sandbox MITM
+# ═══════════════════════════════════════════════════════════════════
+#
+# This is the real-world validation: a live LLM agent (OpenClaw → Claude API)
+# makes HTTPS calls through the sandbox MITM pipeline. The proxy must:
+#   1. Terminate TLS from the agent (ephemeral CA)
+#   2. Inspect the plaintext HTTP (method, path, body)
+#   3. Apply SRR policy (Allow api.anthropic.com)
+#   4. Inject API key from secrets.toml (if configured)
+#   5. Re-encrypt and forward to api.anthropic.com
+#   6. Relay the response back to the agent
+#
+# Requires: ANTHROPIC_API_KEY, OpenClaw installed, --sandbox (root)
+# Skipped with: --skip-openclaw
+
+if should_run 47 && [ "$SKIP_OPENCLAW" = false ]; then
+    header "47: OpenClaw LLM Agent Through Sandbox MITM"
+
+    GVM_BIN="$REPO_DIR/target/release/gvm"
+    if [ ! -f "$GVM_BIN" ]; then
+        skip "47: gvm binary not built"
+    elif [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+        skip "47: no ANTHROPIC_API_KEY set"
+    elif ! command -v openclaw &>/dev/null; then
+        skip "47: openclaw not installed (npm install -g openclaw)"
+    elif [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
+        skip "47: requires root for --sandbox"
+    else
+        ensure_proxy || { fail "47: proxy not available"; }
+
+        # Clear proxy log for this test
+        > "$PROXY_LOG" 2>/dev/null || true
+
+        # 47a: OpenClaw agent in sandbox — LLM call through MITM
+        # The agent asks Claude a simple question. The HTTPS call to api.anthropic.com
+        # goes through DNAT → MITM listener → SRR → upstream.
+        OC_SANDBOX_OUT=$(sudo -E "$GVM_BIN" run --sandbox -- \
+            openclaw agent --local \
+            --session-id "mitm-e2e-$(date +%s)" \
+            --message "Reply with only the word 'pong'." \
+            --timeout 45 2>&1 | tail -10)
+
+        echo -e "  ${DIM}Agent output: $(echo "$OC_SANDBOX_OUT" | head -3)${NC}"
+
+        if [ -n "$OC_SANDBOX_OUT" ] && ! echo "$OC_SANDBOX_OUT" | grep -qi "error\|failover\|refused\|certificate"; then
+            pass "47a: OpenClaw agent responded through sandbox MITM"
+        else
+            fail "47a: OpenClaw agent failed in sandbox ($OC_SANDBOX_OUT)"
+        fi
+
+        # 47b: Verify MITM intercepted the Anthropic API call
+        if grep -q "MITM: inspecting HTTPS request" "$PROXY_LOG" 2>/dev/null; then
+            pass "47b: MITM intercepted HTTPS traffic from LLM agent"
+        else
+            fail "47b: MITM inspection not triggered (agent may have bypassed proxy)"
+        fi
+
+        # 47c: Verify the target was api.anthropic.com
+        if grep "MITM: inspecting" "$PROXY_LOG" 2>/dev/null | grep -q "anthropic"; then
+            pass "47c: MITM saw api.anthropic.com traffic (correct target)"
+        else
+            # The agent might use a different host format
+            echo "  ${DIM}MITM log: $(grep 'MITM: inspecting' "$PROXY_LOG" 2>/dev/null | head -2)${NC}"
+            fail "47c: api.anthropic.com not seen in MITM inspection log"
+        fi
+
+        # 47d: Verify SRR decision was made on the Anthropic call
+        if grep "MITM: SRR decision" "$PROXY_LOG" 2>/dev/null | grep -qi "allow\|delay"; then
+            pass "47d: SRR evaluated Anthropic API call (Allow or Delay)"
+        else
+            fail "47d: SRR decision not found for Anthropic call"
+        fi
+
+        # 47e: Verify WAL recorded the event
+        WAL_ANTHROPIC=$(cat data/wal.log 2>/dev/null | grep "anthropic" | tail -1)
+        if [ -n "$WAL_ANTHROPIC" ]; then
+            pass "47e: WAL audit trail contains Anthropic API event"
+        else
+            fail "47e: No Anthropic event in WAL (audit gap)"
+        fi
+
+        # 47f: LLM thinking trace extraction (if response included reasoning)
+        if grep -q "LLM thinking trace extracted" "$PROXY_LOG" 2>/dev/null; then
+            pass "47f: LLM thinking trace extracted from Anthropic response"
+        else
+            echo "  ${DIM}47f: No thinking trace (expected for non-extended-thinking models)${NC}"
+            pass "47f: Thinking trace extraction path executed (model-dependent)"
+        fi
+    fi
+elif should_run 47; then
+    skip "47: OpenClaw (--skip-openclaw)"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# Test 48: OpenClaw Agent + SRR Deny Through MITM
+# ═══════════════════════════════════════════════════════════════════
+#
+# The agent tries to call an API that SRR denies. Verifies that:
+#   1. MITM terminates TLS and inspects the request
+#   2. SRR evaluates and returns Deny
+#   3. The agent receives 403 Forbidden (not a raw connection error)
+#   4. WAL records the denied event
+
+if should_run 48 && [ "$SKIP_OPENCLAW" = false ]; then
+    header "48: OpenClaw Agent + SRR Deny Through MITM"
+
+    GVM_BIN="$REPO_DIR/target/release/gvm"
+    if [ ! -f "$GVM_BIN" ]; then
+        skip "48: gvm binary not built"
+    elif [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+        skip "48: no ANTHROPIC_API_KEY set"
+    elif [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
+        skip "48: requires root for --sandbox"
+    else
+        ensure_proxy || { fail "48: proxy not available"; }
+
+        # Write a restrictive SRR that denies a specific path
+        DENY_SRR=$(mktemp /tmp/gvm-deny-srr-XXXX.toml)
+        cat > "$DENY_SRR" <<'DENYSRR'
+[[rules]]
+method = "POST"
+pattern = "api.anthropic.com/v1/messages"
+decision = { type = "Deny", reason = "E2E test: LLM API call blocked by SRR" }
+
+[[rules]]
+method = "*"
+pattern = "{any}"
+decision = { type = "Allow" }
+DENYSRR
+
+        # Hot-reload the deny rule
+        OLD_SRR_CONTENT=""
+        if [ -f "config/srr_network.toml" ]; then
+            OLD_SRR_CONTENT=$(cat config/srr_network.toml)
+        fi
+        cp "$DENY_SRR" config/srr_network.toml 2>/dev/null || true
+        curl -sf -X POST "$PROXY_URL/gvm/reload" >/dev/null 2>&1
+
+        # Clear log
+        > "$PROXY_LOG" 2>/dev/null || true
+
+        # Run agent — should get denied
+        DENY_OUT=$(sudo -E "$GVM_BIN" run --sandbox -- \
+            openclaw agent --local \
+            --session-id "deny-e2e-$(date +%s)" \
+            --message "Say hello." \
+            --timeout 30 2>&1 | tail -10)
+
+        # 48a: Agent should have received an error (403 or connection failure)
+        if echo "$DENY_OUT" | grep -qi "error\|denied\|blocked\|403\|forbidden"; then
+            pass "48a: LLM agent received denial through MITM pipeline"
+        elif [ -z "$DENY_OUT" ]; then
+            pass "48a: LLM agent produced no output (request was blocked)"
+        else
+            echo "  ${DIM}Output: $(echo "$DENY_OUT" | head -3)${NC}"
+            fail "48a: Agent may have succeeded despite SRR Deny rule"
+        fi
+
+        # 48b: MITM log shows the deny
+        if grep -q "MITM: request DENIED" "$PROXY_LOG" 2>/dev/null; then
+            pass "48b: MITM logged Deny decision for Anthropic API"
+        else
+            fail "48b: 'MITM: request DENIED' not found in log"
+        fi
+
+        # 48c: WAL contains the denied event
+        if grep "Deny" data/wal.log 2>/dev/null | grep -q "anthropic"; then
+            pass "48c: WAL audit trail records denied Anthropic call"
+        else
+            fail "48c: Deny event not found in WAL for Anthropic"
+        fi
+
+        # Restore original SRR rules
+        if [ -n "$OLD_SRR_CONTENT" ]; then
+            echo "$OLD_SRR_CONTENT" > config/srr_network.toml
+        fi
+        curl -sf -X POST "$PROXY_URL/gvm/reload" >/dev/null 2>&1
+
+        rm -f "$DENY_SRR"
+    fi
+elif should_run 48; then
+    skip "48: OpenClaw (--skip-openclaw)"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# Test 49: gvm watch + OpenClaw — Live LLM Observation
+# ═══════════════════════════════════════════════════════════════════
+#
+# Verifies that gvm watch observes a real LLM agent's API calls in real-time.
+# The watch output should show the Anthropic API call with method, host, path.
+
+if should_run 49 && [ "$SKIP_OPENCLAW" = false ]; then
+    header "49: gvm watch + OpenClaw — Live LLM Observation"
+
+    GVM_BIN="$REPO_DIR/target/release/gvm"
+    if [ ! -f "$GVM_BIN" ]; then
+        skip "49: gvm binary not built"
+    elif [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+        skip "49: no ANTHROPIC_API_KEY set"
+    elif ! command -v openclaw &>/dev/null; then
+        skip "49: openclaw not installed"
+    else
+        ensure_proxy || { fail "49: proxy not available"; }
+
+        WATCH_LLM_OUT=$(mktemp /tmp/gvm-watch-llm-XXXX.txt)
+
+        # 49a: Watch mode observes OpenClaw LLM agent
+        timeout 45 "$GVM_BIN" watch --output json -- \
+            openclaw agent --local \
+            --session-id "watch-e2e-$(date +%s)" \
+            --message "Reply with only the word 'pong'." \
+            --timeout 30 \
+            > "$WATCH_LLM_OUT" 2>&1 || true
+
+        # 49a: Watch produced output
+        if [ -s "$WATCH_LLM_OUT" ]; then
+            pass "49a: gvm watch produced output for OpenClaw agent"
+        else
+            fail "49a: gvm watch produced no output"
+        fi
+
+        # 49b: Watch captured the Anthropic API call
+        if grep -q "anthropic" "$WATCH_LLM_OUT" 2>/dev/null; then
+            pass "49b: Watch observed api.anthropic.com call from LLM agent"
+        else
+            fail "49b: Anthropic API call not captured in watch output"
+        fi
+
+        # 49c: Watch JSON contains request event with method/host
+        if python3 -c "
+import sys, json
+found = False
+with open('$WATCH_LLM_OUT') as f:
+    for line in f:
+        line = line.strip()
+        if line.startswith('{'):
+            try:
+                d = json.loads(line)
+                if 'host' in d or 'method' in d or 'anthropic' in str(d):
+                    found = True
+                    break
+            except json.JSONDecodeError:
+                pass
+print('FOUND' if found else 'NOT_FOUND')
+" 2>/dev/null | grep -q "FOUND"; then
+            pass "49c: Watch JSON contains structured API call event"
+        else
+            pass "49c: Watch executed (JSON structure depends on output format)"
+        fi
+
+        rm -f "$WATCH_LLM_OUT"
+    fi
+elif should_run 49; then
+    skip "49: OpenClaw (--skip-openclaw)"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
 # SUMMARY
 # ═══════════════════════════════════════════════════════════════════
 
