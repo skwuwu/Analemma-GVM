@@ -156,10 +156,18 @@ pub fn setup_host_network(config: &VethConfig) -> Result<()> {
         "MASQUERADE",
     ])?;
 
-    // 7. Allow forwarding between veth and loopback (proxy is on host)
+    // 7. Use a per-sandbox FORWARD chain to avoid stale rule accumulation.
+    // Previous sandbox crashes could leave DROP rules in FORWARD that block new runs.
+    let chain_name = format!("GVM-{}", config.host_iface);
+    // Remove any stale chain from previous crash
+    run_iptables(&["-D", "FORWARD", "-j", &chain_name]).ok();
+    run_iptables(&["-F", &chain_name]).ok();
+    run_iptables(&["-X", &chain_name]).ok();
+    // Create fresh chain
+    run_iptables(&["-N", &chain_name])?;
     run_iptables(&[
         "-A",
-        "FORWARD",
+        &chain_name,
         "-i",
         &config.host_iface,
         "-o",
@@ -169,7 +177,7 @@ pub fn setup_host_network(config: &VethConfig) -> Result<()> {
     ])?;
     run_iptables(&[
         "-A",
-        "FORWARD",
+        &chain_name,
         "-i",
         "lo",
         "-o",
@@ -177,11 +185,10 @@ pub fn setup_host_network(config: &VethConfig) -> Result<()> {
         "-j",
         "ACCEPT",
     ])?;
-
-    // 8. Explicit DROP for veth traffic to any other destination
-    // This prevents proxy bypass via direct socket connections that
-    // would otherwise be routed through the default gateway.
-    run_iptables(&["-A", "FORWARD", "-i", &config.host_iface, "-j", "DROP"])?;
+    // DROP everything else from/to this veth (proxy bypass prevention)
+    run_iptables(&["-A", &chain_name, "-i", &config.host_iface, "-j", "DROP"])?;
+    // Jump to per-sandbox chain from FORWARD (insert at top to avoid stale DROPs)
+    run_iptables(&["-I", "FORWARD", "1", "-j", &chain_name])?;
 
     tracing::debug!(
         host_iface = %config.host_iface,
@@ -342,34 +349,11 @@ pub fn cleanup_host_network(config: &VethConfig) {
     let proxy_port = config.proxy_addr.port();
 
     // Remove iptables rules (best-effort, reverse order)
-    // FORWARD DROP for veth
-    run_iptables(&["-D", "FORWARD", "-i", &config.host_iface, "-j", "DROP"]).ok();
-
-    // FORWARD lo→veth
-    run_iptables(&[
-        "-D",
-        "FORWARD",
-        "-i",
-        "lo",
-        "-o",
-        &config.host_iface,
-        "-j",
-        "ACCEPT",
-    ])
-    .ok();
-
-    // FORWARD veth→lo
-    run_iptables(&[
-        "-D",
-        "FORWARD",
-        "-i",
-        &config.host_iface,
-        "-o",
-        "lo",
-        "-j",
-        "ACCEPT",
-    ])
-    .ok();
+    // Remove per-sandbox FORWARD chain
+    let chain_name = format!("GVM-{}", config.host_iface);
+    run_iptables(&["-D", "FORWARD", "-j", &chain_name]).ok();
+    run_iptables(&["-F", &chain_name]).ok();
+    run_iptables(&["-X", &chain_name]).ok();
 
     // MASQUERADE (now port-restricted)
     run_iptables(&[
