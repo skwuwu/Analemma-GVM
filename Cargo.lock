@@ -1291,6 +1291,7 @@ dependencies = [
  "httparse",
  "hyper",
  "hyper-util",
+ "libc",
  "matchit 0.8.6",
  "moka",
  "proptest",
