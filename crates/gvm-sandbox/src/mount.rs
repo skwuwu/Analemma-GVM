@@ -249,6 +249,11 @@ fn bind_mount_interpreter(new_root: &Path, interpreter_path: &Path) -> Result<()
         }
     }
 
+    // Mount interpreter runtime directories (Python stdlib, etc.).
+    // ldd only resolves C shared libraries (.so), but interpreters also need
+    // their language-level stdlib (e.g., /usr/lib/python3.12/*.py).
+    bind_mount_runtime_dirs(new_root, interpreter_path)?;
+
     Ok(())
 }
 
@@ -303,6 +308,103 @@ fn bind_mount_library(new_root: &Path, lib_path: &Path) -> Result<()> {
         None::<&str>,
     )?;
 
+    Ok(())
+}
+
+/// Bind-mount interpreter runtime directories that ldd does not cover.
+///
+/// ldd resolves C shared libraries (.so files), but interpreters need their
+/// language-level standard library too:
+/// - Python: /usr/lib/python3.X/ (*.py modules, encodings, etc.)
+/// - Node.js: /usr/lib/node_modules/, /usr/share/nodejs/
+/// - Ruby: /usr/lib/ruby/
+///
+/// This function probes the interpreter to discover its stdlib path and
+/// bind-mounts the necessary directory trees read-only.
+fn bind_mount_runtime_dirs(new_root: &Path, interpreter_path: &Path) -> Result<()> {
+    let name = interpreter_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    if name.starts_with("python") {
+        // Scan for Python stdlib directories directly (no probe needed).
+        // Probing with `python3 -c "import sysconfig"` is a chicken-and-egg
+        // problem — sysconfig is part of stdlib which we're trying to mount.
+        // Instead, scan the filesystem for /usr/lib/python3.X directories.
+        let mut dirs_to_mount: Vec<PathBuf> = Vec::new();
+
+        for search_dir in &["/usr/lib", "/usr/local/lib"] {
+            if let Ok(entries) = std::fs::read_dir(search_dir) {
+                for entry in entries.flatten() {
+                    let fname = entry.file_name();
+                    let fname_str = fname.to_string_lossy();
+                    if fname_str.starts_with("python3") && entry.path().is_dir() {
+                        dirs_to_mount.push(entry.path());
+                    }
+                }
+            }
+        }
+
+        // Also mount dist-packages directory if it exists
+        // (e.g., /usr/lib/python3/dist-packages on Debian/Ubuntu)
+        let dist = PathBuf::from("/usr/lib/python3/dist-packages");
+        if dist.exists() && !dirs_to_mount.contains(&dist) {
+            dirs_to_mount.push(dist);
+        }
+
+        eprintln!("DEBUG: Python runtime dirs to mount: {:?}", dirs_to_mount);
+        for dir in &dirs_to_mount {
+            if let Err(e) = bind_mount_dir_readonly(new_root, dir) {
+                eprintln!("DEBUG: Failed to mount {}: {}", dir.display(), e);
+            }
+        }
+    } else if name.starts_with("node") || name.starts_with("deno") || name.starts_with("bun") {
+        // Node.js runtime dirs
+        for dir in &["/usr/lib/node_modules", "/usr/share/nodejs"] {
+            let src = Path::new(dir);
+            if src.exists() {
+                bind_mount_dir_readonly(new_root, src).ok();
+            }
+        }
+    } else if name.starts_with("ruby") {
+        for dir in &["/usr/lib/ruby", "/usr/share/rubygems-integration"] {
+            let src = Path::new(dir);
+            if src.exists() {
+                bind_mount_dir_readonly(new_root, src).ok();
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Bind-mount an entire directory tree read-only into the sandbox.
+fn bind_mount_dir_readonly(new_root: &Path, src: &Path) -> Result<()> {
+    let relative = src.strip_prefix("/").unwrap_or(src);
+    let dst = new_root.join(relative);
+    std::fs::create_dir_all(&dst)?;
+
+    mount(
+        Some(src),
+        &dst,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+        None::<&str>,
+    )
+    .with_context(|| format!("Failed to bind-mount runtime dir {}", src.display()))?;
+
+    // Remount read-only (bind needs two-step)
+    mount(
+        None::<&str>,
+        &dst,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_RDONLY | MsFlags::MS_REMOUNT,
+        None::<&str>,
+    )
+    .ok();
+
+    tracing::debug!(src = %src.display(), "Mounted interpreter runtime directory");
     Ok(())
 }
 

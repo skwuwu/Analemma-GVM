@@ -50,10 +50,12 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     // By mounting in the parent (which has real root), the mount is visible
     // to the child's mount namespace via inheritance.
     let staging_ws = std::path::PathBuf::from("/tmp/gvm-sandbox-staging-ws");
-    let _ = std::fs::write("/tmp/gvm-sandbox-parent-debug.log", format!(
-        "PARENT: workspace_dir={} staging_ws={}\n",
-        config.workspace_dir.display(), staging_ws.display(),
-    ));
+    let sandbox_root = std::path::PathBuf::from("/tmp/gvm-sandbox-root");
+    // Clean up any stale mounts from a previous crashed run.
+    // umount2 with MNT_DETACH handles the recursive case (nested mounts).
+    nix::mount::umount2(&sandbox_root, nix::mount::MntFlags::MNT_DETACH).ok();
+    std::fs::remove_dir_all(&sandbox_root).ok();
+    nix::mount::umount(&staging_ws).ok();
     std::fs::create_dir_all(&staging_ws)
         .context("Failed to create workspace staging directory")?;
     nix::mount::mount(
@@ -323,6 +325,9 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     }
 
     // 5. Clean up host-side resources
+    // Unmount sandbox root (lazy detach handles nested mounts from failed runs)
+    nix::mount::umount2(&sandbox_root, nix::mount::MntFlags::MNT_DETACH).ok();
+    std::fs::remove_dir_all(&sandbox_root).ok();
     // Unmount the staging workspace (pre-mounted before clone for kernel 6.17+ compat)
     nix::mount::umount(&staging_ws).ok();
     std::fs::remove_dir(&staging_ws).ok();
