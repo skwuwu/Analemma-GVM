@@ -58,8 +58,14 @@ impl std::fmt::Debug for GvmCertResolver {
 }
 
 impl GvmCertResolver {
-    /// Create a resolver from CA PEM bytes.
-    pub fn new(ca_cert_pem: &[u8], ca_key_pem: &[u8]) -> Result<Self> {
+    /// Create a resolver from CA key PEM bytes.
+    ///
+    /// NOTE: `_ca_cert_pem` is currently unused because rcgen cannot reconstruct
+    /// a `Certificate` from PEM — we re-generate the CA cert from the key.
+    /// The re-generated cert has the same public key as the original, so TLS
+    /// verification succeeds. Retained in the signature for API compatibility
+    /// and future rcgen versions that may support PEM-to-Certificate parsing.
+    pub fn new(_ca_cert_pem: &[u8], ca_key_pem: &[u8]) -> Result<Self> {
         let ca_key_str = std::str::from_utf8(ca_key_pem).context("CA key not valid UTF-8")?;
 
         let ca_key = KeyPair::from_pem(ca_key_str).context("Failed to parse CA key PEM")?;
@@ -603,11 +609,10 @@ pub mod test_helpers {
     use super::*;
 
     /// Create a test CA for unit tests. Returns (cert_pem, key_pem).
+    ///
+    /// Generates a standalone CA (not via EphemeralCA) because EphemeralCA
+    /// doesn't expose the private key PEM needed by GvmCertResolver.
     pub fn create_test_ca() -> (Vec<u8>, Vec<u8>) {
-        let ca = gvm_sandbox::ca::EphemeralCA::generate().unwrap();
-        let cert_pem = ca.ca_cert_pem().to_vec();
-        // We need to also get the key — but EphemeralCA doesn't expose it.
-        // For tests, generate a standalone CA directly.
         let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let mut params = rcgen::CertificateParams::default();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
