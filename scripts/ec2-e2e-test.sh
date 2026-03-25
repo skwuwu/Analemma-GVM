@@ -250,7 +250,7 @@ print(r.status_code)
     # CONNECT Allow does not write WAL (only Deny writes WAL for CONNECT).
     # Verify via proxy log instead.
     sleep 1
-    CONNECT_LOG=$(grep -c "CONNECT tunnel" "$PROXY_LOG" 2>/dev/null || echo "0")
+    CONNECT_LOG=$(grep -c "CONNECT tunnel" "$PROXY_LOG" 2>/dev/null || true)
     CONNECT_LOG=$(echo "$CONNECT_LOG" | tr -d '[:space:]')
     [ "$CONNECT_LOG" -gt 0 ] 2>/dev/null && pass "3b: CONNECT logged ($CONNECT_LOG in proxy log)" || fail "3b: no CONNECT in proxy log"
 
@@ -292,7 +292,7 @@ if should_run 4; then
         python3 -c "import requests; requests.get('https://api.github.com/repos/skwuwu/Analemma-GVM', timeout=10)" 2>/dev/null
         sleep 1
 
-        CAPTURED=$(sudo cat /sys/kernel/tracing/trace 2>/dev/null | grep -c gvm_ssl || echo 0)
+        CAPTURED=$(sudo cat /sys/kernel/tracing/trace 2>/dev/null | grep -c gvm_ssl || true)
         PLAINTEXT=$(sudo cat /sys/kernel/tracing/trace 2>/dev/null | grep gvm_ssl | head -1 | sed 's/.*buf="//' || echo "")
 
         echo -e "  Captured events: $CAPTURED"
@@ -653,7 +653,7 @@ except Exception as e:
 
     [ "$FAILED" -le 2 ] && pass "11a: concurrent CONNECT ($((10-FAILED))/10 succeeded)" || fail "11a: $FAILED/10 failed"
     # CONNECT Allow doesn't write WAL — check proxy log for CONNECT entries
-    CONNECT_COUNT=$(grep -c "CONNECT tunnel" "$PROXY_LOG" 2>/dev/null || echo "0")
+    CONNECT_COUNT=$(grep -c "CONNECT tunnel" "$PROXY_LOG" 2>/dev/null || true)
     CONNECT_COUNT=$(echo "$CONNECT_COUNT" | tr -d '[:space:]')
     [ "$CONNECT_COUNT" -gt 0 ] 2>/dev/null && pass "11b: CONNECT logged ($CONNECT_COUNT in proxy log)" || fail "11b: no CONNECT in proxy log"
 
@@ -1070,9 +1070,9 @@ if should_run 21; then
 
         MEM_AFTER=$(free -m | awk '/Mem:/{print $7}')
         MEM_DROP=$(( MEM_BEFORE - MEM_AFTER ))
-        TRACE_EVENTS=$(sudo cat /sys/kernel/tracing/trace 2>/dev/null | grep -c gvm_ssl || echo "0")
+        TRACE_EVENTS=$(sudo cat /sys/kernel/tracing/trace 2>/dev/null | grep -c gvm_ssl || true)
         TRACE_EVENTS=$(echo "$TRACE_EVENTS" | tr -d '[:space:]')
-        TRACE_LOST=$(sudo cat /sys/kernel/tracing/trace 2>/dev/null | grep -c "LOST" || echo "0")
+        TRACE_LOST=$(sudo cat /sys/kernel/tracing/trace 2>/dev/null | grep -c "LOST" || true)
         TRACE_LOST=$(echo "$TRACE_LOST" | tr -d '[:space:]')
 
         echo -e "  Trace events: $TRACE_EVENTS"
@@ -1299,11 +1299,11 @@ if should_run 25 && [ "$SKIP_OPENCLAW" = false ]; then
         sleep 2  # wait for proxy log flush
 
         # Verify LLM call went through proxy (CONNECT to anthropic)
-        ANTHROPIC_LOG=$(grep -c "api.anthropic.com" "$PROXY_LOG" 2>/dev/null || echo "0")
+        ANTHROPIC_LOG=$(grep -c "api.anthropic.com" "$PROXY_LOG" 2>/dev/null || true)
         ANTHROPIC_LOG=$(echo "$ANTHROPIC_LOG" | tr -d '[:space:]')
 
         # Verify GitHub call went through proxy
-        GITHUB_LOG=$(grep -c "api.github.com" "$PROXY_LOG" 2>/dev/null || echo "0")
+        GITHUB_LOG=$(grep -c "api.github.com" "$PROXY_LOG" 2>/dev/null || true)
         GITHUB_LOG=$(echo "$GITHUB_LOG" | tr -d '[:space:]')
 
         echo -e "  Proxy log: anthropic=$ANTHROPIC_LOG, github=$GITHUB_LOG"
@@ -1433,7 +1433,7 @@ for line in sys.stdin:
         [ "$FILE_RESULT" = "OK" ] && pass "27b: MCP get_file_contents through proxy" || fail "27b: MCP file read failed ($FILE_RESULT)"
 
         # 27c: Verify proxy logged the MCP server's API calls
-        MCP_GITHUB=$(grep -c "api.github.com" "$PROXY_LOG" 2>/dev/null || echo "0")
+        MCP_GITHUB=$(grep -c "api.github.com" "$PROXY_LOG" 2>/dev/null || true)
         MCP_GITHUB=$(echo "$MCP_GITHUB" | tr -d '[:space:]')
         [ "$MCP_GITHUB" -gt 0 ] 2>/dev/null && pass "27c: MCP traffic in proxy log ($MCP_GITHUB entries)" || fail "27c: no MCP traffic in proxy log"
 
@@ -1476,7 +1476,7 @@ if should_run 28 && [ "$SKIP_OPENCLAW" = false ]; then
         echo "$KC_OUTPUT" | tail -5 | while read -r line; do echo -e "    $line"; done
 
         # Verify: GitHub read went through proxy
-        KC_GITHUB=$(grep -c "api.github.com" "$PROXY_LOG" 2>/dev/null || echo "0")
+        KC_GITHUB=$(grep -c "api.github.com" "$PROXY_LOG" 2>/dev/null || true)
         KC_GITHUB=$(echo "$KC_GITHUB" | tr -d '[:space:]')
         [ "$KC_GITHUB" -gt 0 ] 2>/dev/null && pass "28a: step 1 read through proxy" || fail "28a: no GitHub in proxy log"
 
@@ -1621,7 +1621,7 @@ print(r.stdout.decode().strip())
         python3 -c "import requests; requests.get('https://api.github.com', timeout=10)" 2>/dev/null
         sleep 1
 
-        BYPASS_CAPTURED=$(sudo cat /sys/kernel/tracing/trace 2>/dev/null | grep -c gvm_ssl || echo "0")
+        BYPASS_CAPTURED=$(sudo cat /sys/kernel/tracing/trace 2>/dev/null | grep -c gvm_ssl || true)
         BYPASS_CAPTURED=$(echo "$BYPASS_CAPTURED" | tr -d '[:space:]')
 
         echo -e "  Direct HTTPS (no proxy): uprobe captured $BYPASS_CAPTURED events"
@@ -1643,7 +1643,7 @@ print(r.stdout.decode().strip())
         echo -e "  gog output: ${GOG_OUTPUT:0:80}"
 
         # Check proxy log for googleapis
-        GOG_PROXY=$(grep -c "googleapis.com" "$PROXY_LOG" 2>/dev/null || echo "0")
+        GOG_PROXY=$(grep -c "googleapis.com" "$PROXY_LOG" 2>/dev/null || true)
         GOG_PROXY=$(echo "$GOG_PROXY" | tr -d '[:space:]')
 
         if [ "$GOG_PROXY" -gt 0 ] 2>/dev/null; then
@@ -1825,7 +1825,7 @@ print(f'STATUS:{r.status_code}:REPO:{r.json().get(\"name\",\"?\")}')" 2>/dev/nul
         fi
 
         # 33c: Verify CONNECT went through proxy
-        GVM_CONNECT=$(grep -c "CONNECT.*api.github.com" "$PROXY_LOG" 2>/dev/null || echo "0")
+        GVM_CONNECT=$(grep -c "CONNECT.*api.github.com" "$PROXY_LOG" 2>/dev/null || true)
         GVM_CONNECT=$(echo "$GVM_CONNECT" | tr -d '[:space:]')
         [ "$GVM_CONNECT" -gt 0 ] 2>/dev/null && pass "33c: gvm run traffic in proxy log" || fail "33c: no gvm run traffic in proxy log"
 
@@ -1929,7 +1929,7 @@ for line in sys.stdin:
             fi
 
             # Verify: OpenClaw's LLM call + web_fetch both went through proxy
-            LLM_PROXY=$(grep -c "api.anthropic.com" "$PROXY_LOG" 2>/dev/null || echo "0")
+            LLM_PROXY=$(grep -c "api.anthropic.com" "$PROXY_LOG" 2>/dev/null || true)
             LLM_PROXY=$(echo "$LLM_PROXY" | tr -d '[:space:]')
             [ "$LLM_PROXY" -gt 0 ] 2>/dev/null && pass "34f: LLM in proxy log (anthropic=$LLM_PROXY)" || pass "34f: LLM call succeeded (proxy log timing — agent responded in 34e)"
         else
@@ -2091,7 +2091,7 @@ if should_run 37; then
     ensure_proxy || { fail "37: proxy not available"; }
 
     # Record pre-kill state
-    VETH_BEFORE=$(ip link show 2>/dev/null | grep -c "gvm_" || echo 0)
+    VETH_BEFORE=$(ip link show 2>/dev/null | grep -c "gvm_" || true)
 
     # SIGKILL the proxy
     PROXY_PID_PRE=$(pgrep -f "gvm-proxy" | head -1 || true)
@@ -2104,7 +2104,7 @@ if should_run 37; then
         sleep 1
 
         # Check for leaked veth interfaces
-        VETH_AFTER=$(ip link show 2>/dev/null | grep -c "gvm_" || echo 0)
+        VETH_AFTER=$(ip link show 2>/dev/null | grep -c "gvm_" || true)
         if [ "$VETH_AFTER" -le "$VETH_BEFORE" ]; then
             pass "37: no veth leak after SIGKILL (before=$VETH_BEFORE, after=$VETH_AFTER)"
         else
@@ -2270,7 +2270,7 @@ if should_run 41; then
         fi
 
         # Check for veth interface collision (any leftover gvm veths)
-        LEFTOVER_VETHS=$(ip link show 2>/dev/null | grep -c "veth-gvm-" || echo 0)
+        LEFTOVER_VETHS=$(ip link show 2>/dev/null | grep -c "veth-gvm-" || true)
         if [ "$LEFTOVER_VETHS" -gt 0 ]; then
             echo "  ${YELLOW}NOTE: $LEFTOVER_VETHS orphaned veth interfaces remain${NC}"
         fi
@@ -2411,8 +2411,8 @@ except Exception as e:
 
         # 43c: Check if eBPF TC or iptables is active (informational)
         # This tells us which enforcement layer is protecting the sandbox
-        TC_FILTERS=$(tc filter show dev $(ip link show 2>/dev/null | grep "veth-gvm-h" | head -1 | awk -F: '{print $2}' | tr -d ' ') ingress 2>/dev/null | grep -c "u32" || echo 0)
-        IPTABLES_RULES=$(sudo iptables -L FORWARD 2>/dev/null | grep -c "veth-gvm" || echo 0)
+        TC_FILTERS=$(tc filter show dev $(ip link show 2>/dev/null | grep "veth-gvm-h" | head -1 | awk -F: '{print $2}' | tr -d ' ') ingress 2>/dev/null | grep -c "u32" || true)
+        IPTABLES_RULES=$(sudo iptables -L FORWARD 2>/dev/null | grep -c "veth-gvm" || true)
 
         if [ "$TC_FILTERS" -gt 0 ]; then
             echo "  ${DIM}Enforcement: eBPF TC ingress filter (kernel-level)${NC}"
@@ -3423,7 +3423,7 @@ for f in files_created:
 " 2>/dev/null | grep -E "^CREATED:|^FILE:" | tail -10)
 
         # 56a: All files created successfully
-        FILE_COUNT=$(echo "$PRIORITY_RESULT" | grep -c "^FILE:" || echo 0)
+        FILE_COUNT=$(echo "$PRIORITY_RESULT" | grep -c "^FILE:" || true)
         if [ "$FILE_COUNT" -ge 4 ]; then
             pass "56a: Created $FILE_COUNT test files for priority verification"
         else
