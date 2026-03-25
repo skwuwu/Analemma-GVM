@@ -349,7 +349,7 @@ fn child_entry(
         ca_cert_pem,
         config.fs_policy.as_ref(),
     ) {
-        eprintln!("gvm-sandbox: mount namespace setup failed: {}", e);
+        eprintln!("gvm-sandbox: mount namespace setup failed: {:#}", e);
         return 1;
     }
 
