@@ -23,6 +23,7 @@ pub fn setup_mount_namespace(
     interpreter_path: &Path,
     dns_server: &str,
     ca_cert_pem: Option<&[u8]>,
+    fs_policy: Option<&crate::FilesystemPolicy>,
 ) -> Result<()> {
     let new_root = PathBuf::from("/tmp/gvm-sandbox-root");
 
@@ -53,42 +54,49 @@ pub fn setup_mount_namespace(
         std::fs::create_dir_all(new_root.join(dir))?;
     }
 
-    // Bind-mount workspace (read-only)
-    mount(
-        Some(workspace_dir),
-        &new_root.join("workspace"),
-        None::<&str>,
-        MsFlags::MS_BIND | MsFlags::MS_RDONLY,
-        None::<&str>,
-    )
-    .context("Failed to bind-mount workspace")?;
+    // ── Workspace mount: overlayfs (if fs_policy set + kernel supports) or legacy ──
+    let overlayfs_mounted = if fs_policy.is_some() {
+        try_mount_overlayfs(workspace_dir, &new_root, fs_policy.unwrap())
+    } else {
+        false
+    };
 
-    // Remount workspace as truly read-only (bind mount needs two-step)
-    mount(
-        None::<&str>,
-        &new_root.join("workspace"),
-        None::<&str>,
-        MsFlags::MS_BIND | MsFlags::MS_RDONLY | MsFlags::MS_REMOUNT,
-        None::<&str>,
-    )
-    .ok(); // Best-effort remount
+    if !overlayfs_mounted {
+        // Legacy mode: /workspace read-only + /workspace/output writable
+        mount(
+            Some(workspace_dir),
+            &new_root.join("workspace"),
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+            None::<&str>,
+        )
+        .context("Failed to bind-mount workspace")?;
 
-    // /workspace/output — writable, persists to host.
-    // Agent writes results here (code, reports, artifacts).
-    // Rest of /workspace stays read-only.
-    let host_output = workspace_dir.join("output");
-    std::fs::create_dir_all(&host_output).ok();
-    let sandbox_output = new_root.join("workspace/output");
-    std::fs::create_dir_all(&sandbox_output).ok();
-    mount(
-        Some(&host_output),
-        &sandbox_output,
-        None::<&str>,
-        MsFlags::MS_BIND,
-        None::<&str>,
-    )
-    .context("Failed to bind-mount /workspace/output (writable)")?;
-    tracing::debug!("Writable output directory mounted at /workspace/output");
+        // Remount as truly read-only (bind mount needs two-step)
+        mount(
+            None::<&str>,
+            &new_root.join("workspace"),
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_RDONLY | MsFlags::MS_REMOUNT,
+            None::<&str>,
+        )
+        .ok();
+
+        // /workspace/output — writable, persists to host
+        let host_output = workspace_dir.join("output");
+        std::fs::create_dir_all(&host_output).ok();
+        let sandbox_output = new_root.join("workspace/output");
+        std::fs::create_dir_all(&sandbox_output).ok();
+        mount(
+            Some(&host_output),
+            &sandbox_output,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .context("Failed to bind-mount /workspace/output (writable)")?;
+        tracing::debug!("Workspace mounted in legacy mode (read-only + output/)");
+    }
 
     // Mount tmpfs for /tmp (writable scratch space)
     mount(
@@ -296,6 +304,99 @@ fn create_minimal_etc(new_root: &Path, dns_server: &str) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+/// Attempt to mount workspace with overlayfs for Trust-on-Pattern governance.
+///
+/// overlayfs allows the agent to write anywhere in /workspace while preserving
+/// the original files. All changes go to the upper layer (tmpfs), which is
+/// scanned at session end for the diff report.
+///
+/// Requires kernel 5.11+ (overlayfs in user namespace). Falls back to legacy
+/// mode on older kernels (returns false).
+fn try_mount_overlayfs(
+    workspace_dir: &Path,
+    new_root: &Path,
+    policy: &crate::FilesystemPolicy,
+) -> bool {
+    let upper_dir = new_root.join("tmp/gvm-overlay-upper");
+    let work_dir = new_root.join("tmp/gvm-overlay-work");
+    let merged_dir = new_root.join("workspace");
+
+    // Create overlay directories
+    if std::fs::create_dir_all(&upper_dir).is_err()
+        || std::fs::create_dir_all(&work_dir).is_err()
+    {
+        tracing::debug!("Failed to create overlay directories — falling back to legacy mode");
+        return false;
+    }
+
+    // Mount tmpfs for upper layer with size limit
+    let upper_size = format!("size={}m", policy.upper_size_mb);
+    if mount(
+        Some("tmpfs"),
+        &upper_dir.parent().unwrap_or(&upper_dir),
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        Some(upper_size.as_str()),
+    )
+    .is_err()
+    {
+        tracing::debug!("Failed to mount tmpfs for overlay upper — falling back");
+        return false;
+    }
+
+    // Re-create dirs on the new tmpfs
+    std::fs::create_dir_all(&upper_dir).ok();
+    std::fs::create_dir_all(&work_dir).ok();
+
+    // Construct overlayfs mount options
+    let mount_opts = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        workspace_dir.display(),
+        upper_dir.display(),
+        work_dir.display(),
+    );
+
+    // Attempt overlayfs mount — this is where kernel 5.11+ check happens implicitly.
+    // On older kernels, this returns EPERM in user namespace.
+    match mount(
+        Some("overlay"),
+        &merged_dir,
+        Some("overlay"),
+        MsFlags::empty(),
+        Some(mount_opts.as_str()),
+    ) {
+        Ok(()) => {
+            tracing::info!(
+                upper_size_mb = policy.upper_size_mb,
+                "Workspace mounted with overlayfs (Trust-on-Pattern governance active)"
+            );
+
+            // Also mount /workspace/output for backward compat — writable bind on top of overlay
+            let host_output = workspace_dir.join("output");
+            std::fs::create_dir_all(&host_output).ok();
+            let sandbox_output = merged_dir.join("output");
+            std::fs::create_dir_all(&sandbox_output).ok();
+            mount(
+                Some(&host_output),
+                &sandbox_output,
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            )
+            .ok(); // Best-effort — output/ still works via overlay too
+
+            true
+        }
+        Err(e) => {
+            tracing::info!(
+                error = %e,
+                "overlayfs mount failed (kernel < 5.11?) — falling back to legacy mode"
+            );
+            false
+        }
+    }
 }
 
 /// Inject ephemeral CA certificate into the sandbox's trust store.

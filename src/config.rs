@@ -25,6 +25,10 @@ pub struct ProxyConfig {
     /// Shadow verification mode — requires MCP intent declaration before outbound requests.
     #[serde(default)]
     pub shadow: crate::intent_store::ShadowConfig,
+    /// Filesystem governance (Trust-on-Pattern) for --sandbox mode.
+    /// When present, overlayfs captures all file changes; patterns determine
+    /// which are auto-merged, need manual commit, or discarded.
+    pub filesystem: Option<gvm_sandbox::FilesystemPolicy>,
 }
 
 /// JWT authentication configuration.
@@ -329,6 +333,7 @@ impl Default for ProxyConfig {
             jwt: None,
             wal: WalConfig::default(),
             shadow: crate::intent_store::ShadowConfig::default(),
+            filesystem: None,
         }
     }
 }

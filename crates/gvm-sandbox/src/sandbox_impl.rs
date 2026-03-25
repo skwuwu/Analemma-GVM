@@ -344,6 +344,7 @@ fn child_entry(
         interpreter_path,
         &veth_config.host_ip,
         ca_cert_pem,
+        config.fs_policy.as_ref(),
     ) {
         eprintln!("gvm-sandbox: mount namespace setup failed: {}", e);
         return 1;

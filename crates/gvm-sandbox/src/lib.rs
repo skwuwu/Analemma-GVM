@@ -64,6 +64,72 @@ pub struct SandboxConfig {
     /// CPU limit for the sandboxed agent as a fraction of one CPU. None = no limit.
     /// Applied via cgroup v2 `cpu.max`. Example: Some(1.0) = 1 CPU, Some(0.5) = half CPU.
     pub cpu_limit: Option<f64>,
+    /// Filesystem governance policy. None = legacy mode (/workspace/output only).
+    /// When set, overlayfs is used to capture all file changes, and Trust-on-Pattern
+    /// rules determine which changes are auto-merged, need manual commit, or discarded.
+    pub fs_policy: Option<FilesystemPolicy>,
+}
+
+/// Trust-on-Pattern filesystem governance policy.
+///
+/// Analogous to SRR for network traffic: file glob patterns determine
+/// how agent-generated files are handled at session end.
+///
+/// ```toml
+/// [filesystem]
+/// auto_merge = ["*.csv", "*.pdf", "*.txt"]
+/// manual_commit = ["*.sh", "*.py", "*.js", "*.json"]
+/// discard = ["/tmp/*", "*.log", "__pycache__/*"]
+/// default = "manual_commit"
+/// upper_size_mb = 256
+/// ```
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FilesystemPolicy {
+    /// Glob patterns for files auto-merged to host immediately (safe outputs).
+    #[serde(default)]
+    pub auto_merge: Vec<String>,
+    /// Glob patterns for files requiring manual approval at session end (potentially dangerous).
+    #[serde(default)]
+    pub manual_commit: Vec<String>,
+    /// Glob patterns for files discarded on exit (temporary artifacts).
+    #[serde(default)]
+    pub discard: Vec<String>,
+    /// Default policy for files matching no pattern: "auto_merge" | "manual_commit" | "discard".
+    #[serde(default = "default_fs_policy")]
+    pub default: String,
+    /// Size limit for overlayfs upper layer in MB (default: 256).
+    #[serde(default = "default_upper_size_mb")]
+    pub upper_size_mb: u64,
+}
+
+fn default_fs_policy() -> String {
+    "manual_commit".to_string()
+}
+
+fn default_upper_size_mb() -> u64 {
+    256
+}
+
+impl Default for FilesystemPolicy {
+    fn default() -> Self {
+        Self {
+            auto_merge: vec![
+                "*.csv".into(), "*.pdf".into(), "*.txt".into(),
+                "*.png".into(), "*.jpg".into(), "*.xml".into(),
+            ],
+            manual_commit: vec![
+                "*.sh".into(), "*.py".into(), "*.js".into(), "*.ts".into(),
+                "*.toml".into(), "*.yaml".into(), "*.conf".into(), "*.env".into(),
+                "*.json".into(),
+            ],
+            discard: vec![
+                "/tmp/*".into(), "*.log".into(), "*.cache".into(),
+                "__pycache__/*".into(), "*.pyc".into(), ".git/*".into(),
+            ],
+            default: "manual_commit".into(),
+            upper_size_mb: 256,
+        }
+    }
 }
 
 /// TLS probe operating mode.
@@ -131,6 +197,7 @@ pub struct PreflightReport {
 // ── Cross-platform modules ──
 
 pub mod ca;
+pub mod filesystem;
 
 // ── Platform-specific implementation ──
 

@@ -100,6 +100,7 @@ fn preflight_report_non_linux_has_ebpf_false() {
             proxy_url: None,
             memory_limit: None,
             cpu_limit: None,
+            fs_policy: None,
         };
         let report = preflight_check(&config);
         assert!(
@@ -125,6 +126,7 @@ fn sandbox_config_clone() {
         proxy_url: None,
         memory_limit: None,
         cpu_limit: None,
+        fs_policy: None,
     };
 
     let cloned = config.clone();
@@ -230,6 +232,7 @@ fn launch_on_non_linux_returns_error() {
         proxy_url: None,
         memory_limit: None,
         cpu_limit: None,
+        fs_policy: None,
     };
 
     let result = launch_sandboxed(config);

@@ -979,6 +979,7 @@ async fn run_agent_process(
             proxy_url: Some(proxy.to_string()),
             memory_limit: None,
             cpu_limit: None,
+            fs_policy: Some(gvm_sandbox::FilesystemPolicy::default()),
         };
 
         let result = tokio::task::spawn_blocking(move || gvm_sandbox::launch_sandboxed(config)).await
