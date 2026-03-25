@@ -25,6 +25,18 @@ pub fn setup_mount_namespace(
     ca_cert_pem: Option<&[u8]>,
     fs_policy: Option<&crate::FilesystemPolicy>,
 ) -> Result<()> {
+    // Make the entire mount tree private FIRST, before any new mounts.
+    // pivot_root requires the new root to NOT be on a shared mount.
+    // Doing this before all bind-mounts ensures they inherit private propagation.
+    mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_PRIVATE | MsFlags::MS_REC,
+        None::<&str>,
+    )
+    .context("Failed to make root mount private")?;
+
     let new_root = PathBuf::from("/tmp/gvm-sandbox-root");
 
     // Create staging root as tmpfs
@@ -148,18 +160,7 @@ pub fn setup_mount_namespace(
     }
 
     // pivot_root: swap root filesystem
-    // Make new_root a private mount. pivot_root requires that the new root
-    // is not on a shared mount. Only privatize new_root (not "/") to avoid
-    // breaking bind-mounts of interpreter libraries set up earlier.
-    mount(
-        None::<&str>,
-        &new_root,
-        None::<&str>,
-        MsFlags::MS_PRIVATE,
-        None::<&str>,
-    )
-    .context("Failed to make new_root mount private for pivot_root")?;
-
+    // MS_PRIVATE was already applied at the top of this function.
     let old_root = new_root.join("old_root");
     std::fs::create_dir_all(&old_root)?;
 
