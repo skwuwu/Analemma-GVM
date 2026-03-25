@@ -4,6 +4,439 @@
 
 ---
 
+## 2026-03-25: cgroups v2 Resource Limits for Sandbox
+
+### What Changed
+
+`--sandbox` mode now supports cgroup v2 CPU and memory limits via `--memory` and `--cpus` flags. Same flags that already worked with `--contained` (Docker) now also apply to Linux-native sandbox.
+
+**Usage:**
+```bash
+gvm run --sandbox --memory 512m --cpus 0.5 agent.py
+```
+
+**Implementation:**
+- `crates/gvm-sandbox/src/cgroup.rs` — NEW: `CgroupGuard` RAII struct
+  - Creates `/sys/fs/cgroup/gvm-agent-{pid}/` directory
+  - Writes `memory.max` (bytes) and `cpu.max` (quota/period)
+  - Moves agent PID into `cgroup.procs`
+  - RAII Drop: kills remaining processes + removes cgroup directory
+- `SandboxConfig` gains `memory_limit: Option<u64>` and `cpu_limit: Option<f64>`
+- `sandbox_impl.rs`: cgroup created after clone(), before signaling child
+- CLI `--memory`/`--cpus` flags updated to work with both `--contained` and `--sandbox`
+
+**Graceful fallback:** cgroup v2 unavailable → warning + continue without limits. This is best-effort — namespace + seccomp remain primary isolation.
+
+### Affected Files
+- `crates/gvm-sandbox/src/cgroup.rs` — NEW (~150 lines)
+- `crates/gvm-sandbox/src/lib.rs` — `SandboxConfig` fields, module declaration
+- `crates/gvm-sandbox/src/sandbox_impl.rs` — cgroup integration point
+- `crates/gvm-cli/src/run.rs` — `parse_memory_limit()`, sandbox function signatures
+- `crates/gvm-cli/src/main.rs` — flag documentation update
+- All test files with SandboxConfig constructors updated
+
+### Risk Assessment
+- **Graceful fallback**: cgroup v2 unavailable → no limits, no crash
+- **RAII cleanup**: `CgroupGuard::drop()` kills remaining processes + removes directory
+- **Linux-only**: `#[cfg(target_os = "linux")]` gated. Non-Linux builds unaffected.
+- **All tests pass** (244+ across all crates)
+
+---
+
+## 2026-03-25: SRR Payload Inspection Activation
+
+### What Changed
+
+SRR payload inspection — previously parsed from TOML but never wired to actual request bodies — is now fully active when enabled via config.
+
+**Proxy changes:**
+- New body buffering step in `proxy_handler()` before SRR classification
+- Body is swapped out of the request via `std::mem::replace`, buffered with `axum::body::to_bytes()`, then re-attached for forwarding
+- Respects `max_body_bytes` limit (default 64KB) — Content-Length pre-check avoids buffering oversized requests
+- Buffer failure → graceful fallback to host/method/path-only evaluation (logged as debug)
+
+**Configuration:**
+```toml
+[srr]
+payload_inspection = true     # default: false (backward compatible)
+max_body_bytes = 65536        # default: 64KB
+```
+
+**Design:**
+- `payload_inspection = false` (default): identical to previous behavior — body is never touched
+- `payload_inspection = true`: body buffered and passed to `srr.check()` which already has full JSON pointer matching logic (`payload_field` / `payload_match` in rules)
+- Parse failure in SRR → host/method/path fallback (best_effort, already implemented in srr.rs)
+- Body > max_body_bytes → skip payload inspection entirely
+
+### Affected Files
+- `src/proxy.rs` — body buffering + re-attach, `mut request`, `payload_inspection`/`max_body_bytes` on AppState
+- `src/config.rs` — `SrrConfig` fields: `payload_inspection`, `max_body_bytes`
+- `src/main.rs` — AppState construction
+- `tests/integration.rs` — AppState test constructors (5 locations)
+
+### Risk Assessment
+- **Backward compatible**: `payload_inspection = false` by default — no behavior change unless explicitly enabled
+- **Memory**: bounded by `max_body_bytes` (64KB default) + Content-Length pre-check. Large uploads never buffered.
+- **Body integrity**: `std::mem::replace` + `Body::from(bytes.clone())` ensures original body is preserved for forwarding
+- **138 lib tests pass** (no regressions)
+
+---
+
+## 2026-03-25: IC-3 Blocking Approval — Human-in-the-Loop Enforcement
+
+### What Changed
+
+IC-3 (RequireApproval) now actually holds the HTTP response and waits for human approval, instead of immediately returning 403. This completes GVM's graduated enforcement: Allow → Delay → HumanApproval → Deny.
+
+**Proxy changes:**
+- IC-3 handler creates a `tokio::sync::oneshot` channel and suspends the HTTP response
+- Pending approval metadata stored in `DashMap<String, PendingApproval>` on `AppState`
+- Configurable timeout (`ic3_approval_timeout_secs`, default 300s) — auto-deny on timeout (fail-close)
+- Approved → request forwarded to upstream, WAL updated with execution result
+- Denied/timeout → 403 returned, WAL records denial
+- Proxy restart → all pending channels dropped → auto-denied (fail-close, consistent with design)
+
+**API endpoints:**
+- `GET /gvm/pending` — list all pending IC-3 approval requests with metadata
+- `POST /gvm/approve` — deliver approval/denial decision by event_id
+
+**CLI changes:**
+- `gvm approve` — standalone approval monitor (polls /gvm/pending, interactive y/N prompt)
+- `gvm approve --auto-deny` — non-interactive mode for CI
+- `gvm run` — auto-polls for pending IC-3 approvals during agent execution (background task)
+
+### Affected Files
+- `src/proxy.rs` — IC-3 handler rewritten (oneshot hold + timeout), `PendingApproval` struct, `AppState` fields
+- `src/api.rs` — `pending_approvals()` and `approve_request()` endpoints
+- `src/main.rs` — route registration, AppState construction
+- `src/config.rs` — `ic3_approval_timeout_secs` field
+- `crates/gvm-cli/src/approve.rs` — NEW: standalone + background approval polling
+- `crates/gvm-cli/src/main.rs` — `Approve` subcommand
+- `crates/gvm-cli/src/run.rs` — approval poller integrated into `run_local` and `run_binary_local`
+- `tests/integration.rs` — AppState construction updated (5 locations)
+- `Cargo.toml` — `dashmap = "6"` dependency added
+
+### Risk Assessment
+- **Proxy hold**: oneshot channel is lightweight (no thread blocked). Timeout prevents resource leak.
+- **DashMap cleanup**: entries removed on approval delivery or timeout. Proxy restart drops all (fail-close).
+- **Backward compatible**: IC-3 with no CLI/approver behaves as before — times out and returns 403.
+- **No WAL schema change**: existing events unaffected.
+
+---
+
+## 2026-03-25: `gvm watch` — Observation-Only CLI Command
+
+### What Changed
+
+New `gvm watch` CLI command: observation-only mode that shows what an AI agent does without blocking anything. Designed as the entry point to the GVM funnel: `gvm watch` (observe) → `gvm run --interactive` (discover rules) → `gvm run` (enforce).
+
+**Core features:**
+1. **Real-time API call stream** — WAL tailing at 100ms intervals, live display of method/host/path/status/tokens
+2. **Session summary report** — host breakdown, LLM token usage, cost estimation, status code distribution, decision sources
+3. **Cost estimation** — per-provider/model token pricing (hardcoded, TOML externalization planned)
+4. **Anomaly detection** — burst (>10 req/2s), loop (same URL >5x/10s), unknown host warnings
+5. **Token usage** — conditional display, only when extractable from LLM provider responses
+6. **`--output json`** — JSON output for CI/CD piping and tool integration
+
+**Key design decisions:**
+- **Default = allow-all**: `gvm watch` generates a temp SRR config (`{any}/* → Allow`) in a separate temp directory, reloads proxy via `/gvm/reload`, restores original rules on exit. User's existing `srr_network.toml` is never modified.
+- **`--with-rules`** = opt-in enforcement while observing (applies existing SRR rules)
+- **Output abstraction**: `OutputMode` enum (Text/Json) for future format extensibility
+- **RAII cleanup**: `TempConfigGuard` ensures temp config is removed even on panic
+- **Zero proxy changes**: All new code is CLI-side only. Proxy unchanged.
+
+**Not included (by design):** thinking trace display, rollback, any blocking behavior in default mode.
+
+### Affected Files
+- `crates/gvm-cli/src/watch.rs` — NEW (~600 lines): WalTailer, SessionStats, AnomalyDetector, cost estimation, allow-all config
+- `crates/gvm-cli/src/main.rs` — Watch subcommand variant + match arm
+- `crates/gvm-cli/src/run.rs` — 5 functions changed from `fn` to `pub(crate) fn` for reuse
+
+### Risk Assessment
+- **No proxy changes.** CLI-only. Zero risk to enforcement behavior.
+- **Temp config cleanup**: RAII guard ensures cleanup. If process is killed (SIGKILL), temp dir persists in OS temp — harmless, cleaned on next OS temp purge.
+- **Proxy reload**: `/gvm/reload` is atomic (parse failure preserves existing rules). Original rules restored on watch exit.
+- **All 25 tests pass** (22 existing + 3 ignored + 8 new watch module tests).
+
+---
+
+## 2026-03-24: README Rewrite — Agent Developer Framing
+
+### What Changed
+
+Full README rewrite following 8 strategic directions to reposition GVM from "security proxy" to "agent operations tool":
+
+1. **First impression**: Opening changed from security-focused to agent developer pain points ("See what your agent calls. Block what it shouldn't. Roll back when it fails.")
+2. **Target persona**: Added explicit "Who Is This For?" section — primary: agent developers, secondary: security teams
+3. **"Why GVM?" reframing**: Replaced security architecture comparison table with real developer pain scenarios (unexpected API calls, cost overruns, key leakage, loops)
+4. **Quick Start two steps**: Step 1 (observe with `--interactive`, zero risk) → Step 2 (enforce with rules). Sequential progression: observe → discover → enforce
+5. **Demo reorder**: Lead with agent observation, then prompt injection catch. Demo 2 uses realistic `read_storage(bucket, key)` signature with crafted bucket name — avoids "just design the function better" counterargument
+6. **Cross-layer forgery**: Reframed from "agent manipulates code" to "prompt injection corrupts LLM judgment, passing crafted inputs through well-designed functions" — the code is correct, the LLM's judgment is the attack surface
+7. **OPA+Envoy tone**: Led with respect ("excellent, production-grade infrastructure"), moved honest assessment to section intro instead of conclusion
+8. **Works Today vs Roadmap**: Clear separation with status tables. Every feature explicitly marked as Shipping, Loaded-but-Inactive, or Roadmap with target version
+
+### Affected Files
+- `README.md` — complete rewrite (~480 lines, down from ~747)
+
+### Risk Assessment
+- **No code changes.** Documentation-only. Zero risk to runtime behavior.
+- Content accuracy verified against actual codebase implementation state (305+ tests, CLI commands, feature flags).
+
+---
+
+## 2026-03-24: WAL Sequence Persistence + Size-Based Rotation
+
+### What Changed
+
+**WAL sequence persistence**: `wal_sequence` no longer resets to 0 on restart. During `recover_from_wal()`, a pre-scan counts all event lines in the WAL and initializes the atomic counter. This ensures monotonic sequence numbers across restarts — NATS consumers can reconstruct ordering without duplicate sequences.
+
+**WAL size-based rotation**: When the WAL file exceeds `max_wal_bytes` (default 100MB), it is rotated:
+1. Current file renamed to `wal.log.<N>` (N = monotonic segment number)
+2. Fresh `wal.log` created for new writes
+3. `prev_batch_root` carries over — first batch in new segment references last root of old segment, maintaining the Merkle chain across files
+4. Old segments pruned beyond `max_wal_segments` (default 10), including their watermark sidecars
+
+**Configuration** (added to `[wal]` in proxy.toml):
+- `max_wal_bytes = 104857600` (100MB default)
+- `max_wal_segments = 10` (default)
+
+### Affected Files
+- `src/ledger.rs` — sequence init in recovery, `rotate_wal()` function, `batch_loop()` rotation check
+- `src/config.rs` — `max_wal_bytes`, `max_wal_segments` fields in WalConfig
+- `src/main.rs` — pass rotation config to GroupCommitConfig
+
+### Risk Assessment
+- **Sequence persistence**: No risk. Read-only scan of existing WAL, atomic store before any new writes.
+- **Rotation**: Medium risk. File rename during active writing — mitigated by fsync before rename and atomic new-file creation. If rename fails, continues writing to current file (logged error, not fatal).
+- All 313 tests pass.
+
+---
+
+## 2026-03-24: MITM API Key Injection (Layer 3 parity)
+
+### What Changed
+
+Implemented API key injection on the MITM TLS path, closing the gap where `--sandbox` HTTPS traffic bypassed Layer 3 credential isolation.
+
+**Problem**: `handle_tls_connection` forwarded `raw_head` directly to upstream — agent-supplied Authorization headers passed through unmodified. This meant agents needed to hold API keys for HTTPS calls, contradicting the "agent never holds credentials" guarantee.
+
+**Fix**:
+- `HttpRequest::inject_credentials()` method in `tls_proxy.rs`: strips all auth headers (Authorization, Cookie, x-api-key, etc.) and injects credentials from `secrets.toml`
+- `HttpRequest::rebuild_raw_head()`: reconstructs HTTP head bytes from modified parsed headers
+- `APIKeyStore::get_credential()`: public accessor for MITM path to look up host credentials
+- Wired into `handle_tls_connection` after SRR check, before upstream forwarding
+
+**Security properties** (same as HTTP path):
+- Agent auth headers stripped before injection (prevents credential smuggling)
+- Same `AUTH_HEADERS` list as `api_keys.rs` (Authorization, Cookie, x-api-key, apikey, x-auth-token, x-api-token, x-signature, x-hmac, x-credentials)
+- No credential if host not in `secrets.toml` → passthrough (same as HTTP path)
+
+### Affected Files
+- `src/tls_proxy.rs` — `inject_credentials()`, `rebuild_raw_head()`, `AUTH_HEADERS` const
+- `src/api_keys.rs` — `get_credential()` method
+- `src/main.rs` — credential injection in `handle_tls_connection`
+- `README.md` — HTTPS capability table updated, Known Limitations gap removed
+
+### Risk Assessment
+- Low risk. Same logic as HTTP path's `api_keys.inject()`, adapted for raw HTTP bytes
+- Header rebuild uses parsed headers (not string manipulation), so no injection risk
+- All 313 tests pass
+
+---
+
+## 2026-03-23: MITM Hardening + uprobe Feature Flag + README Honesty Pass
+
+### What Changed
+
+**Task 0: CA Unification (critical bug fix)**
+- `main.rs` `start_tls_listener` was generating its own CA, separate from the sandbox CA
+- Sandbox trust store had CA-A, MITM listener used CA-B → agent TLS handshake = `certificate verify failed`
+- Fix: Single `EphemeralCA::generate()` in `main()`, shared via parameters to TLS listener and via `GET /gvm/ca.pem` endpoint for sandbox download
+- New `mitm_ca_pem` field in AppState, new `/gvm/ca.pem` endpoint
+
+**Task 6: Certificate not_before 24h backdate**
+- CA cert: `not_before = now - 24h`, `not_after = now + 24h` (was hardcoded 2020-2099)
+- Leaf certs (both ca.rs and tls_proxy.rs): same 24h backdate window
+- Tolerates clock drift up to 24 hours on EC2/VPS instances
+- Added `time` crate dependency to both root and gvm-sandbox Cargo.toml
+
+**Task 7: memfd_create documentation cleanup**
+- memfd_create was never actually used — CA injection uses `std::fs::write()` to tmpfs
+- Removed false claims from: ca.rs doc comment, 12-security-model.md, 14-implementation-log.md
+
+**Task 5: uprobe feature flag**
+- `tls_probe.rs` gated behind `#[cfg(all(target_os = "linux", feature = "uprobe"))]`
+- eBPF TC filter (`ebpf.rs`) stays always-on — it's network enforcement, not observation
+- `TlsProbeMode` default changed from `Audit` to `Disabled`
+- CLI diagnostic messages updated: MITM listed as primary, uprobe omitted by default
+- `[features] uprobe = []` added to gvm-sandbox Cargo.toml
+
+**Task 9: README exaggeration removal**
+- "Structurally unbypassable" → qualified with `(--sandbox)`
+- "Tamper-proof audit" → "Tamper-evident audit"
+- "OS isolation" → "Linux namespace isolation"
+- "structurally impossible" → qualified with `(with --sandbox)`
+
+**Task 8: HTTPS capability table restructure**
+- Columns renamed to "MITM OFF" / "MITM ON"
+- API key injection on MITM path honestly marked as "Not yet (planned)"
+- Defense Layers diagram updated: API key injection marked as planned
+
+**Task 10: uprobe repositioning**
+- Roadmap: "Multi-PID uprobe (experimental, observation-only)"
+- tls_probe.rs module doc: marked experimental, gated behind feature flag
+- CLI diagnostic: MITM listed as primary inspection mechanism
+
+**Tasks 11-16: EC2 test scripts (6 new tests)**
+- Test 35: MITM full pipeline (HTTPS → TLS term → plaintext → SRR → upstream via api.github.com)
+- Test 36: 5MB POST through proxy (MTU test)
+- Test 37: SIGKILL restart — orphan veth/iptables cleanup
+- Test 38: CAP_NET_ADMIN rejection (iptables -F inside sandbox → EPERM)
+- Test 39: AppArmor/SELinux compatibility (clone + CA injection on stock Ubuntu AMI)
+- Test 40: Clock drift — +23h system clock, TLS handshake with backdated cert
+
+### Affected Files
+- `src/main.rs` — CA unification, /gvm/ca.pem endpoint, start_tls_listener signature
+- `src/proxy.rs` — mitm_ca_pem field in AppState
+- `src/tls_proxy.rs` — leaf cert backdating
+- `crates/gvm-sandbox/src/ca.rs` — CA/leaf cert backdating, memfd doc fix, ca_key_pem() method
+- `crates/gvm-sandbox/src/lib.rs` — uprobe feature gate, TlsProbeMode default
+- `crates/gvm-sandbox/src/sandbox_impl.rs` — uprobe block gated behind feature
+- `crates/gvm-sandbox/src/tls_probe.rs` — experimental doc note
+- `crates/gvm-sandbox/Cargo.toml` — features section, time dependency
+- `crates/gvm-cli/src/run.rs` — TlsProbeMode::Disabled default, MITM diagnostic
+- `Cargo.toml` (root) — time dependency
+- `README.md` — exaggeration fixes, HTTPS table, uprobe repositioning
+- `docs/12-security-model.md` — memfd cleanup
+- `scripts/ec2-e2e-test.sh` — 6 new tests (35-40)
+- `tests/integration.rs` — mitm_ca_pem field in test AppState
+
+### Risk Assessment
+- **CA unification**: Critical fix. Without it, MITM pipeline was fundamentally broken
+- **Cert backdating**: Low risk. 24h window is generous. Worst case: cert rejected on extreme drift (>24h)
+- **uprobe feature flag**: Zero risk to default builds. `cargo build --features uprobe` restores old behavior
+- **README honesty**: No technical risk. Reputational improvement
+- All 305 tests pass
+
+---
+
+## 2026-03-23: Runtime Hardening — 4 Structural Vulnerabilities Fixed
+
+### What Changed
+
+Four infrastructure-level vulnerabilities fixed across proxy, TLS, and sandbox:
+
+**1. Tokio worker starvation on TLS cert generation**
+- `ResolvesServerCert::resolve()` ran CPU-bound ECDSA keygen synchronously on tokio worker threads
+- 50 concurrent new-domain handshakes would block ALL async I/O (WAL, HTTP, policy eval)
+- Fix: `peek_sni()` extracts SNI from raw TCP via `stream.peek()`, then `ensure_cached()` offloads keygen to `spawn_blocking` BEFORE the TLS handshake. `resolve()` always hits cache (0ns)
+- Files: `src/tls_proxy.rs` (peek_sni, ensure_cached), `src/main.rs` (handle_tls_connection)
+
+**2. HTTP Request Smuggling (CL/TE desync)**
+- `read_http_request` in TLS MITM path accepted both Content-Length and Transfer-Encoding headers
+- Attacker could hide a second malicious request inside the body of the first, bypassing SRR inspection
+- Fix: Zero-tolerance rejection of CL+TE conflict (RFC 7230 §3.3.3) and duplicate CL with differing values
+- File: `src/tls_proxy.rs` (read_http_request_inner)
+
+**3. FD exhaustion / Slowloris on TLS listener**
+- Port 8443 accepted unlimited connections with no timeout on handshake or read
+- Slowloris: 1 byte/sec keeps FD open → WAL writes and HTTP listener starved at ulimit
+- Fix: `Semaphore(1024)` bounds concurrent TLS connections, 10s TLS handshake timeout, 30s HTTP read timeout, 60s upstream relay timeout
+- File: `src/main.rs` (start_tls_listener, handle_tls_connection)
+
+**4. Sandbox PID 1 zombie accumulation**
+- `CLONE_NEWPID` makes agent PID 1, but agent interpreter doesn't reap orphaned children
+- `subprocess.Popen()` / `child_process.exec()` exits → zombie → PID table exhaustion
+- Fix: `fork()` inside namespace. PID 1 stays as init reaper (`waitpid(-1)` loop), child execs agent. Equivalent to tini/dumb-init without external dependency
+- File: `crates/gvm-sandbox/src/sandbox_impl.rs` (child_entry)
+
+### Risk Assessment
+- **Cert pre-warm**: Low risk. If peek_sni fails, falls back to sync generation (previous behavior)
+- **CL/TE rejection**: May reject exotic but legitimate requests with both headers — RFC 7230 says proxies MUST reject these, so this is correct behavior
+- **Timeouts**: 30s/60s are generous. Legitimate agents won't hit them. Could be made configurable later
+- **Init reaper**: fork() inside clone'd namespace is well-tested Linux pattern. Agent exit code correctly propagated
+- All 287 tests pass
+
+---
+
+## 2026-03-23: Memory Safety — WAL Recovery High Watermark + TLS Cache Bound
+
+### What Changed
+
+Two unbounded memory growth vectors fixed:
+
+**1. WAL Recovery: HashSet → High Watermark (O(N) → O(1))**
+
+`recover_from_wal()` tracked all event_ids in an unbounded `HashSet` to deduplicate Pending/Expired pairs across recoveries. On a WAL with millions of events, this HashSet alone could OOM the proxy at boot.
+
+**Root cause**: The HashSet was needed because previous recoveries append Expired entries, creating duplicate event_ids. Forward scanning encounters Pending first, then Expired — without dedup, the Pending would be re-expired unnecessarily.
+
+**Fix**: Sidecar watermark file (`<wal_path>.watermark`) stores the byte offset where the last recovery completed. Since recovery resolves ALL Pending events before the watermark, subsequent recoveries `seek()` past it and scan only new events. No HashSet, no dedup needed — O(1) memory regardless of WAL size.
+
+- Atomic write: tmp file + rename prevents partial watermark on crash
+- Clamp guard: if WAL was manually truncated (watermark > file_len), resets to 0
+- Fail-safe: if watermark write fails, next recovery re-scans from old watermark (idempotent — re-expiring is harmless)
+
+Bloom filter was considered but rejected: false positives would permanently lose unresolved financial transactions (Pending events incorrectly classified as "already processed").
+
+**2. TLS SNI Cache: DashMap → moka bounded cache**
+
+`GvmCertResolver` cached leaf certificates per-domain in an unbounded `DashMap`. An attacker could exhaust host memory by requesting unique SNI domains (1.evil.com, 2.evil.com, ..., N.evil.com).
+
+**Fix**: Replaced `DashMap` with `moka::sync::Cache` (concurrent LRU):
+- `max_capacity(10_000)` — hard cap on cached certs
+- `time_to_idle(1h)` — unused certs auto-evict
+- Thread-safe, lock-free reads (same concurrency as DashMap)
+
+Removed `dashmap` dependency entirely (no other usages in codebase).
+
+### Affected Files
+- `src/ledger.rs`: `recover_from_wal()` rewritten with watermark strategy
+- `src/tls_proxy.rs`: `DashMap` → `moka::sync::Cache` with bounds
+- `Cargo.toml`: Added `moka`, removed `dashmap`
+- `docs/12-security-model.md`: Updated WAL recovery section to reflect fix
+
+### Risk Assessment
+- **WAL watermark**: Low risk. Failure to write watermark degrades to full re-scan (previous behavior). Re-expiry is idempotent.
+- **moka cache**: Low risk. Cache miss just regenerates the cert (~0.1ms). Eviction is transparent to callers.
+- All 287 tests pass.
+
+---
+
+## 2026-03-23: Documentation Consistency Fix — MITM Status & Numbering
+
+### What Changed
+
+Fixed README and roadmap inconsistencies where transparent MITM (implemented in v0.2 via commits 2b1ceeb, d6663ed, 1a6782c) was still described as "planned v0.3" in multiple sections.
+
+**README.md fixes:**
+- Tier table footnote 3: Updated API key injection to reflect HTTPS works in `--sandbox` mode
+- Tier 1 description: Removed "HTTPS injection requires v0.3 MITM"
+- Defense Layers diagram: Changed MITM from "planned v0.3" to "v0.2"
+- HTTPS inspection table: Changed from roadmap format to status format reflecting v0.2 implementation
+- Roadmap summary table: Moved MITM to v0.2 Done, updated v0.3 scope to match roadmap.md
+- HTTP vs HTTPS capabilities table: Updated column header from "planned v0.3" to "`--sandbox` v0.2"
+- Known Limitations: Rewrote HTTPS inspection section to reflect sandbox MITM is working
+- WAL hardening note: Removed outdated "WAL exceeding available memory" (streaming recovery is done)
+- Documentation table: Fixed [14] duplication, added missing [10], renumbered quickstart→[15] and reference→[16]
+
+**docs/13-roadmap.md fixes:**
+- v0.2 Done: Added MITM items (ephemeral CA, sandbox injection, DNAT, TLS listener, SNI cert gen)
+- v1.1 Ledger: Checked off streaming WAL recovery (already implemented with BufReader)
+
+**File renames:**
+- `14-quickstart.md` → `15-quickstart.md`
+- `15-reference.md` → `16-reference.md`
+- Updated all cross-references in `00-overview.md`, `15-quickstart.md`, `16-reference.md`
+
+### Why
+Multiple sections contradicted each other — some said MITM was implemented (line 450, 665), others said it was planned for v0.3 (lines 477, 484-488, 533, 630). Users reading the README would get conflicting information about what the proxy can actually do.
+
+### Risk Assessment
+Documentation-only changes. No code modified. Low risk.
+
+---
+
 ## 2026-03-23: Documentation Audit — 20 Issues Fixed Across 13 Documents
 
 ### What Changed

@@ -183,39 +183,35 @@ self.wal.append(event).await?;  // group commit: batched fsync + Merkle
 
 ```rust
 pub async fn recover_from_wal(&self) -> Result<RecoveryReport> {
-    // Stream line-by-line via BufReader to avoid OOM on large WAL files.
-    let file = std::fs::File::open(&self.wal.path)?;
-    let reader = std::io::BufReader::new(file);
+    // High watermark: byte offset of last completed recovery.
+    // Only scan events AFTER the watermark — O(1) memory.
+    let watermark: u64 = read_watermark(&watermark_path).unwrap_or(0);
+    let file_len = file.metadata()?.len();
 
-    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(file);
+    if watermark > 0 && watermark <= file_len {
+        reader.seek(SeekFrom::Start(watermark))?;
+    }
+
     for line_result in reader.lines() {
-        let line = match line_result {
-            Ok(l) => l,
-            Err(e) => {
-                // I/O error mid-read — stop recovery at this point
-                tracing::error!(error = %e, "WAL I/O error during recovery");
-                break;
-            }
-        };
-        // Skip batch records and empty lines
-        if line.trim().is_empty() || line.contains("\"merkle_root\"") { continue; }
-
+        // ... parse, skip batch records / empty lines / corrupt entries ...
         match serde_json::from_str::<GVMEvent>(&line) {
             Ok(event) if event.status == Pending => {
                 let mut expired = event;
                 expired.status = EventStatus::Expired;
                 self.wal.append(&expired).await?;
             }
-            Err(e) => {
-                // Corrupted entry — skip, log warning, continue
-                tracing::warn!("Corrupt WAL entry, skipping");
-                continue;
-            }
             _ => {}
         }
     }
+
+    // Persist watermark: everything before file_len is now resolved.
+    // Atomic write (tmp + rename) prevents partial watermark on crash.
+    write_watermark(&watermark_path, file_len)?;
 }
 ```
+
+**High watermark strategy**: Previous recoveries resolve ALL Pending events before the watermark offset, so subsequent recoveries skip them entirely. No `HashSet` needed — O(1) memory regardless of WAL size. If watermark write fails, next recovery re-scans from the old watermark (idempotent: re-expiring is harmless).
 
 **Corruption resilience**: Corrupted WAL entries (from disk failure, truncation, or tampering) are **skipped**, not fatal. Recovery continues processing valid entries after the corruption.
 

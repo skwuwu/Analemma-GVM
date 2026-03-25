@@ -905,15 +905,117 @@ pub async fn reload_srr(State(state): State<AppState>) -> Response<Body> {
 
 // ─── Health / Admin Endpoints ───
 
-/// GET /gvm/health — Liveness check
-pub async fn health() -> Response<Body> {
+/// GET /gvm/health — Liveness + readiness check
+///
+/// Returns 200 for both healthy and degraded states (watchdog should NOT
+/// restart on degraded — WAL primary failure during restart could worsen state).
+/// Watchdog triggers restart only on unreachable (ECONNREFUSED/timeout).
+///
+/// Degraded threshold: >5 consecutive primary WAL failures (matches circuit
+/// breaker in proxy.rs — 5 consecutive failures indicates persistent disk issue,
+/// not a transient hiccup).
+pub async fn health(State(state): State<AppState>) -> Response<Body> {
+    let wal_failures = state.ledger.primary_failure_count();
+    let emergency_writes = state.ledger.emergency_write_count();
+
+    let (status, wal_status) = if wal_failures > 5 {
+        ("degraded", "primary_failed")
+    } else {
+        ("healthy", "ok")
+    };
+
     json_response(
         StatusCode::OK,
         &serde_json::json!({
-            "status": "healthy",
+            "status": status,
             "version": "0.1.0",
+            "wal": wal_status,
+            "wal_failures": wal_failures,
+            "emergency_writes": emergency_writes,
         }),
     )
+}
+
+// ─── IC-3 Approval Endpoints ───
+
+/// GET /gvm/pending — List pending IC-3 approval requests.
+///
+/// Returns all requests currently waiting for human approval. Each entry
+/// includes event_id, operation, host, path, method, agent_id, and timestamp.
+/// Used by `gvm run` CLI (auto-polling) and `gvm approve` (standalone).
+pub async fn pending_approvals(State(state): State<AppState>) -> Response<Body> {
+    let pending: Vec<serde_json::Value> = state
+        .pending_approvals
+        .iter()
+        .map(|entry| {
+            let pa = entry.value();
+            serde_json::json!({
+                "event_id": pa.event_id,
+                "operation": pa.operation,
+                "host": pa.host,
+                "path": pa.path,
+                "method": pa.method,
+                "agent_id": pa.agent_id,
+                "timestamp": pa.timestamp.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    json_response(StatusCode::OK, &serde_json::json!({ "pending": pending }))
+}
+
+/// POST /gvm/approve — Approve or deny a pending IC-3 request.
+///
+/// Request body: `{ "event_id": "...", "approved": true/false }`
+///
+/// If the event_id is found in pending_approvals, delivers the decision via the
+/// oneshot channel. The proxy handler unblocks and either forwards (approved) or
+/// returns 403 (denied). If the event_id is not found (already expired/decided),
+/// returns 404.
+pub async fn approve_request(
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Response<Body> {
+    let event_id = match body.get("event_id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({ "error": "Missing 'event_id' field" }),
+            );
+        }
+    };
+
+    let approved = body.get("approved").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // Remove from pending map and deliver decision
+    match state.pending_approvals.remove(&event_id) {
+        Some((_, pending)) => {
+            let decision_str = if approved { "approved" } else { "denied" };
+            tracing::info!(event_id = %event_id, decision = %decision_str, "IC-3: Approval decision delivered");
+
+            // Deliver decision via oneshot channel. If receiver was dropped
+            // (proxy handler timed out), the send will fail — that's OK.
+            let _ = pending.sender.send(approved);
+
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "event_id": event_id,
+                    "decision": decision_str,
+                }),
+            )
+        }
+        None => {
+            json_response(
+                StatusCode::NOT_FOUND,
+                &serde_json::json!({
+                    "error": "No pending approval for this event_id",
+                    "event_id": event_id,
+                }),
+            )
+        }
+    }
 }
 
 /// GET /gvm/info — Proxy info and loaded configuration summary.

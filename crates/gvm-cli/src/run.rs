@@ -40,10 +40,12 @@ pub async fn run_agent(
     ensure_proxy_available(proxy).await?;
 
     if sandbox {
+        let mem_limit = parse_memory_limit(memory);
+        let cpu_limit = cpus.parse::<f64>().ok();
         if is_binary_mode {
-            run_binary_sandboxed(command, agent_id, proxy, interactive).await
+            run_binary_sandboxed(command, agent_id, proxy, interactive, mem_limit, cpu_limit).await
         } else {
-            run_sandboxed(script, agent_id, proxy, interactive).await
+            run_sandboxed(script, agent_id, proxy, interactive, mem_limit, cpu_limit).await
         }
     } else if contained {
         run_contained(script, agent_id, proxy, image, memory, cpus, detach).await
@@ -55,12 +57,30 @@ pub async fn run_agent(
 }
 
 /// Check if the first argument looks like a script file (has a known extension).
-fn looks_like_script(arg: &str) -> bool {
+pub(crate) fn looks_like_script(arg: &str) -> bool {
     let path = std::path::Path::new(arg);
     matches!(
         path.extension().and_then(|e| e.to_str()),
         Some("py" | "js" | "ts" | "sh" | "bash")
     )
+}
+
+/// Parse a memory limit string (e.g. "512m", "1g", "2048m") into bytes.
+fn parse_memory_limit(s: &str) -> Option<u64> {
+    let s = s.trim().to_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    let (num_str, multiplier) = if s.ends_with('g') {
+        (&s[..s.len() - 1], 1024 * 1024 * 1024u64)
+    } else if s.ends_with('m') {
+        (&s[..s.len() - 1], 1024 * 1024u64)
+    } else if s.ends_with('k') {
+        (&s[..s.len() - 1], 1024u64)
+    } else {
+        (s.as_str(), 1u64) // raw bytes
+    };
+    num_str.parse::<u64>().ok().map(|n| n * multiplier)
 }
 
 /// Run an arbitrary binary with GVM proxy environment (Layer 2 only).
@@ -97,6 +117,16 @@ async fn run_binary_local(
     eprintln!("  {DIM}--- Output below ---{RESET}");
     eprintln!();
 
+    // Run agent, watchdog, and IC-3 approval poller in parallel
+    let proxy_url = proxy.to_string();
+    let watchdog_handle = tokio::spawn(proxy_watchdog(proxy_url));
+
+    let (approval_cancel_tx, approval_cancel_rx) = tokio::sync::watch::channel(false);
+    let approval_proxy = proxy.to_string();
+    let approval_handle = tokio::spawn(async move {
+        crate::approve::poll_and_prompt_background(&approval_proxy, approval_cancel_rx).await;
+    });
+
     let status = tokio::process::Command::new(binary)
         .args(args)
         .env("HTTP_PROXY", proxy)
@@ -110,6 +140,11 @@ async fn run_binary_local(
         .status()
         .await
         .with_context(|| format!("Failed to execute: {}", binary))?;
+
+    // Abort background tasks when agent exits
+    watchdog_handle.abort();
+    let _ = approval_cancel_tx.send(true);
+    approval_handle.abort();
 
     eprintln!();
     if status.success() {
@@ -152,6 +187,8 @@ async fn run_binary_sandboxed(
     agent_id: &str,
     proxy: &str,
     _interactive: bool,
+    memory_limit: Option<u64>,
+    cpu_limit: Option<f64>,
 ) -> Result<()> {
     let binary = &command[0];
     let args = &command[1..];
@@ -186,23 +223,39 @@ async fn run_binary_sandboxed(
         proxy_addr,
         agent_id: agent_id.to_string(),
         seccomp_profile: None,
-        tls_probe_mode: gvm_sandbox::TlsProbeMode::Audit,
+        tls_probe_mode: gvm_sandbox::TlsProbeMode::Disabled,
         proxy_url: Some(proxy.to_string()),
+        memory_limit,
+        cpu_limit,
     };
 
     eprintln!("  {BOLD}Security layers active:{RESET}");
     eprintln!("    {GREEN}\u{2713}{RESET} Layer 2: Enforcement Proxy");
-    eprintln!("    {GREEN}\u{2713}{RESET} Layer 3: OS Containment");
+    eprintln!("    {GREEN}\u{2713}{RESET} Layer 3: Linux Namespace Isolation");
     eprintln!("      {DIM}\u{2022} PID namespace: isolated process tree{RESET}");
     eprintln!("      {DIM}\u{2022} Mount namespace: minimal rootfs{RESET}");
     eprintln!("      {DIM}\u{2022} Network namespace: veth pair, proxy-only routing{RESET}");
     eprintln!("      {DIM}\u{2022} Seccomp-BPF: syscall whitelist{RESET}");
-    eprintln!("      {DIM}\u{2022} eBPF uprobe: TLS plaintext inspection{RESET}");
+    eprintln!("      {DIM}\u{2022} Transparent MITM: ephemeral CA, full L7 HTTPS inspection{RESET}");
     eprintln!();
     eprintln!("  {DIM}--- Output below ---{RESET}");
     eprintln!();
 
-    let result = gvm_sandbox::launch_sandboxed(config);
+    // Run sandbox and proxy watchdog in parallel.
+    // Sandbox blocks on waitpid (sync) — wrap in spawn_blocking.
+    // Watchdog polls /gvm/health and restarts proxy on crash.
+    let proxy_url = proxy.to_string();
+    let sandbox_task = tokio::task::spawn_blocking(move || {
+        gvm_sandbox::launch_sandboxed(config)
+    });
+
+    let watchdog_handle = tokio::spawn(proxy_watchdog(proxy_url));
+
+    // Wait for sandbox to finish (primary task)
+    let result = sandbox_task.await.unwrap_or_else(|e| Err(anyhow::anyhow!("Sandbox task panicked: {e}")));
+
+    // Abort watchdog when sandbox exits
+    watchdog_handle.abort();
 
     eprintln!();
     match result {
@@ -226,7 +279,7 @@ async fn run_binary_sandboxed(
     Ok(())
 }
 
-fn is_local_proxy_url(proxy: &str) -> bool {
+pub(crate) fn is_local_proxy_url(proxy: &str) -> bool {
     // Check if proxy URL is a localhost/loopback address
     // Handle IPv4 (127.0.0.1), IPv6 (::1 or [::1]), and hostnames (localhost)
     if proxy.contains("127.0.0.1") || proxy.contains("localhost") || proxy.contains("::1") {
@@ -240,19 +293,107 @@ fn is_local_proxy_url(proxy: &str) -> bool {
     }
 }
 
-async fn proxy_healthy(proxy: &str) -> bool {
+pub(crate) async fn proxy_healthy(proxy: &str) -> bool {
     let health_url = format!("{}/gvm/health", proxy.trim_end_matches('/'));
     matches!(reqwest::get(&health_url).await, Ok(resp) if resp.status().is_success())
 }
 
-fn workspace_root_for_proxy() -> std::path::PathBuf {
+/// Background proxy watchdog: polls `/gvm/health` every 3 seconds.
+///
+/// Restart policy:
+/// - **unreachable** (ECONNREFUSED/timeout): restart after 3 consecutive failures
+/// - **degraded** (HTTP 200 but status="degraded"): log warning, do NOT restart
+///   (WAL degraded + restart = worse state)
+/// - Maximum 3 restarts before giving up
+///
+/// NOTE: After proxy restart, sandbox agent's in-flight connections are broken.
+/// The agent will see ECONNREFUSED until the new proxy binds to the same port.
+/// The next request from the agent will succeed on the new proxy instance.
+/// If the agent's HTTP client does not retry, the agent may crash — this is
+/// the agent's responsibility, not GVM's. Document this limitation.
+pub(crate) async fn proxy_watchdog(proxy_url: String) {
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+    const MAX_RESTARTS: u32 = 3;
+    const FAILURES_BEFORE_RESTART: u32 = 3;
+
+    let mut consecutive_failures: u32 = 0;
+    let mut restarts: u32 = 0;
+
+    // Wait a bit for initial proxy startup
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    loop {
+        tokio::time::sleep(POLL_INTERVAL).await;
+
+        let health_url = format!("{}/gvm/health", proxy_url.trim_end_matches('/'));
+        match reqwest::get(&health_url).await {
+            Ok(resp) if resp.status().is_success() => {
+                // Check if degraded
+                if let Ok(body) = resp.text().await {
+                    if body.contains("\"degraded\"") {
+                        if consecutive_failures == 0 {
+                            // Log once when entering degraded state
+                            eprintln!(
+                                "  \x1b[1;33mWATCHDOG\x1b[0m: proxy is degraded (WAL issue) — \
+                                 monitoring but NOT restarting"
+                            );
+                        }
+                    }
+                }
+                consecutive_failures = 0;
+            }
+            _ => {
+                consecutive_failures += 1;
+                if consecutive_failures >= FAILURES_BEFORE_RESTART {
+                    if restarts >= MAX_RESTARTS {
+                        eprintln!(
+                            "  \x1b[0;31mWATCHDOG\x1b[0m: proxy unreachable, max restarts ({}) \
+                             exceeded — giving up",
+                            MAX_RESTARTS
+                        );
+                        return;
+                    }
+
+                    eprintln!(
+                        "  \x1b[1;33mWATCHDOG\x1b[0m: proxy unreachable ({} consecutive failures) \
+                         — attempting restart ({}/{})",
+                        consecutive_failures,
+                        restarts + 1,
+                        MAX_RESTARTS
+                    );
+
+                    match ensure_proxy_available(&proxy_url).await {
+                        Ok(()) => {
+                            restarts += 1;
+                            consecutive_failures = 0;
+                            eprintln!(
+                                "  \x1b[0;32mWATCHDOG\x1b[0m: proxy restarted successfully \
+                                 (restart {}/{})",
+                                restarts, MAX_RESTARTS
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "  \x1b[0;31mWATCHDOG\x1b[0m: proxy restart failed: {}",
+                                e
+                            );
+                            restarts += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn workspace_root_for_proxy() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
         .unwrap_or_else(|_| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
 }
 
-async fn ensure_proxy_available(proxy: &str) -> Result<()> {
+pub(crate) async fn ensure_proxy_available(proxy: &str) -> Result<()> {
     if proxy_healthy(proxy).await {
         return Ok(());
     }
@@ -397,10 +538,25 @@ async fn run_local(script: &str, agent_id: &str, proxy: &str, interactive: bool)
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
 
+    // Run agent, watchdog, and IC-3 approval poller in parallel
+    let proxy_url = proxy.to_string();
+    let watchdog_handle = tokio::spawn(proxy_watchdog(proxy_url));
+
+    let (approval_cancel_tx, approval_cancel_rx) = tokio::sync::watch::channel(false);
+    let approval_proxy = proxy.to_string();
+    let approval_handle = tokio::spawn(async move {
+        crate::approve::poll_and_prompt_background(&approval_proxy, approval_cancel_rx).await;
+    });
+
     let status = cmd
         .status()
         .await
         .with_context(|| format!("Failed to execute: {} {}", interpreter, script_arg))?;
+
+    // Abort background tasks when agent exits
+    watchdog_handle.abort();
+    let _ = approval_cancel_tx.send(true);
+    approval_handle.abort();
 
     println!();
     if status.success() {
@@ -430,7 +586,7 @@ async fn run_local(script: &str, agent_id: &str, proxy: &str, interactive: bool)
 
 /// Linux-native sandbox mode: run inside namespace + seccomp isolation.
 /// Production-recommended on Linux. No Docker required.
-async fn run_sandboxed(script: &str, agent_id: &str, proxy: &str, interactive: bool) -> Result<()> {
+async fn run_sandboxed(script: &str, agent_id: &str, proxy: &str, interactive: bool, memory_limit: Option<u64>, cpu_limit: Option<f64>) -> Result<()> {
     println!();
     println!("{BOLD}Analemma-GVM \u{2014} Linux-Native Sandbox (Layer 3){RESET}");
     println!(
@@ -509,9 +665,18 @@ async fn run_sandboxed(script: &str, agent_id: &str, proxy: &str, interactive: b
         proxy_addr,
         agent_id: agent_id.to_string(),
         seccomp_profile: None,
-        tls_probe_mode: gvm_sandbox::TlsProbeMode::Audit,
+        tls_probe_mode: gvm_sandbox::TlsProbeMode::Disabled,
         proxy_url: Some(proxy.to_string()),
+        memory_limit,
+        cpu_limit,
     };
+
+    // Clean up orphaned network from previous crash (if any)
+    match gvm_sandbox::cleanup_orphaned_network() {
+        Ok(true) => eprintln!("  {YELLOW}Cleaned up orphaned sandbox network from previous crash{RESET}"),
+        Ok(false) => {} // No orphans
+        Err(e) => eprintln!("  {DIM}Orphan cleanup: {e}{RESET}"),
+    }
 
     // Run pre-flight checks
     print!("  {DIM}Running pre-flight checks...{RESET} ");
@@ -870,6 +1035,59 @@ async fn run_contained(
         }
     }
 
+    // ── Download ephemeral CA from proxy for MITM TLS inspection ──
+    // The proxy generates a session-scoped CA and exposes it via GET /gvm/ca.pem.
+    // We inject it into the container's trust store so that:
+    //   - DNAT 443→8443 routes HTTPS to the MITM listener
+    //   - The MITM listener presents certs signed by this CA
+    //   - The agent's TLS client trusts them (CA in trust store)
+    let ca_temp_dir = tempfile::tempdir()
+        .context("Failed to create temp dir for CA")?;
+    let ca_pem_path = ca_temp_dir.path().join("gvm-ca.crt");
+
+    let ca_url = format!("{}/gvm/ca.pem", proxy.trim_end_matches('/'));
+    let mitm_available = match reqwest::get(&ca_url).await {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.bytes().await {
+                Ok(bytes) if !bytes.is_empty() => {
+                    std::fs::write(&ca_pem_path, &bytes)
+                        .context("Failed to write CA PEM")?;
+                    println!("  {GREEN}\u{2713}{RESET} MITM CA downloaded ({} bytes)", bytes.len());
+                    true
+                }
+                _ => {
+                    println!("  {YELLOW}MITM CA empty — HTTPS inspection unavailable{RESET}");
+                    false
+                }
+            }
+        }
+        _ => {
+            println!("  {YELLOW}MITM CA not available — HTTPS will use CONNECT relay (domain-level only){RESET}");
+            false
+        }
+    };
+
+    // Compute MITM listener address for DNAT (proxy port + 363 = TLS port)
+    let proxy_port = proxy_url.port().unwrap_or(8080);
+    let tls_port = proxy_port + 363; // matches main.rs convention: 8080→8443
+    let proxy_host_for_container = if use_host_network {
+        proxy_url.host_str().unwrap_or("127.0.0.1").to_string()
+    } else {
+        "host.docker.internal".to_string()
+    };
+
+    // Build DNAT entrypoint script — runs inside container before the agent
+    // Redirects all outbound 443 traffic to the proxy's MITM listener.
+    // Requires NET_ADMIN capability (added to docker run below).
+    let entrypoint_script = if mitm_available {
+        format!(
+            "iptables -t nat -A OUTPUT -p tcp --dport 443 -j DNAT --to-destination {}:{} 2>/dev/null || true && exec \"$@\"",
+            proxy_host_for_container, tls_port,
+        )
+    } else {
+        "exec \"$@\"".to_string()
+    };
+
     // Build docker run command
     let container_name = format!("gvm-agent-{}", agent_id);
     let mount_dir = script_dir.to_str().unwrap_or(".");
@@ -916,6 +1134,31 @@ async fn run_contained(
         .arg("-v")
         .arg(format!("{}:/home/agent/workspace:ro", mount_dir));
 
+    // CA injection: mount CA PEM + /etc/ssl/certs as tmpfs for Go/system trust store
+    if mitm_available {
+        // Mount CA PEM into multiple trust store paths
+        let ca_host_path = ca_pem_path.to_str().unwrap_or("");
+        cmd.arg("-v")
+            .arg(format!("{}:/usr/local/share/ca-certificates/gvm-ca.crt:ro", ca_host_path))
+            .arg("-v")
+            .arg(format!("{}:/etc/ssl/certs/gvm-ca.crt:ro", ca_host_path))
+            .arg("-v")
+            .arg(format!("{}:/etc/pki/tls/certs/gvm-ca.crt:ro", ca_host_path));
+
+        // CA trust environment variables (covers Python requests, Node.js, curl)
+        cmd.arg("-e").arg("SSL_CERT_FILE=/etc/ssl/certs/gvm-ca.crt")
+            .arg("-e").arg("REQUESTS_CA_BUNDLE=/etc/ssl/certs/gvm-ca.crt")
+            .arg("-e").arg("NODE_EXTRA_CA_CERTS=/etc/ssl/certs/gvm-ca.crt")
+            .arg("-e").arg("CURL_CA_BUNDLE=/etc/ssl/certs/gvm-ca.crt");
+
+        // NET_ADMIN capability for DNAT iptables rule inside container.
+        // Trade-off: widens attack surface, but:
+        //   - no-new-privileges prevents escalation from NET_ADMIN
+        //   - container network is already isolated (gvm-internal --internal)
+        //   - DNAT is set in the entrypoint, then iptables is not needed further
+        cmd.arg("--cap-add=NET_ADMIN");
+    }
+
     if use_host_network {
         cmd.arg("--network").arg("host");
     } else {
@@ -925,11 +1168,17 @@ async fn run_contained(
             .arg("host.docker.internal:host-gateway");
     }
 
+    // Entrypoint: shell wrapper that sets DNAT then execs the agent command
+    cmd.arg("--entrypoint").arg("sh");
     cmd.arg(image);
-
-    for arg in &container_cmd {
-        cmd.arg(arg);
-    }
+    cmd.arg("-c");
+    // Build the full command: entrypoint_script uses "exec $@" pattern
+    let agent_cmd_str = container_cmd
+        .iter()
+        .map(|s| format!("\"{}\"", s))
+        .collect::<Vec<_>>()
+        .join(" ");
+    cmd.arg(format!("{} -- {}", entrypoint_script, agent_cmd_str));
 
     if detach {
         cmd.arg("-d");
@@ -943,7 +1192,12 @@ async fn run_contained(
     println!("  {BOLD}Security layers active:{RESET}");
     println!("    {GREEN}\u{2713}{RESET} Layer 1: Governance Engine (policy evaluation)");
     println!("    {GREEN}\u{2713}{RESET} Layer 2: Enforcement Proxy (request interception)");
-    println!("    {GREEN}\u{2713}{RESET} Layer 3: OS Containment (network isolation)");
+    println!("    {GREEN}\u{2713}{RESET} Layer 3: Docker Containment");
+    if mitm_available {
+        println!("      {DIM}\u{2022} Transparent MITM: ephemeral CA injected, DNAT 443→{}{RESET}", tls_port);
+    } else {
+        println!("      {DIM}\u{2022} HTTPS: CONNECT relay (domain-level only){RESET}");
+    }
     if use_host_network {
         println!("      {DIM}\u{2022} Network: host (shared host network namespace){RESET}");
     } else {

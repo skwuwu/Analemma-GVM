@@ -64,6 +64,15 @@ pub struct DevConfig {
 #[derive(Deserialize, Clone, Debug)]
 pub struct ServerConfig {
     pub listen: String,
+    /// Graceful shutdown drain timeout in seconds (default: 5).
+    /// After receiving SIGTERM/SIGINT, the proxy stops accepting new connections
+    /// and waits up to this many seconds for in-flight requests to complete.
+    #[serde(default = "default_drain_timeout_secs")]
+    pub drain_timeout_secs: u64,
+}
+
+fn default_drain_timeout_secs() -> u64 {
+    5
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -75,6 +84,16 @@ pub struct EnforcementConfig {
     /// Controls how agents should react to blocked operations.
     #[serde(default)]
     pub on_block: OnBlockConfig,
+    /// IC-3 approval timeout in seconds (default: 300).
+    /// When IC-3 is triggered, the proxy holds the HTTP response for up to this
+    /// duration, waiting for an approval via POST /gvm/approve. On timeout, the
+    /// request is auto-denied (fail-close).
+    #[serde(default = "default_ic3_approval_timeout_secs")]
+    pub ic3_approval_timeout_secs: u64,
+}
+
+fn default_ic3_approval_timeout_secs() -> u64 {
+    300
 }
 
 /// Per-decision block response mode configuration.
@@ -148,6 +167,20 @@ pub struct SrrConfig {
     pub network_file: String,
     pub semantic_file: String,
     pub hot_reload: bool,
+    /// Enable request body buffering for SRR payload_field/payload_match rules.
+    /// When false (default), SRR evaluates host/method/path only — body is not inspected.
+    /// When true, the proxy buffers up to `max_body_bytes` of the request body and
+    /// passes it to SRR for JSON field matching. Parse failure → fallback to host/method/path.
+    #[serde(default)]
+    pub payload_inspection: bool,
+    /// Maximum request body bytes to buffer for payload inspection (default: 65536 = 64KB).
+    /// Requests with Content-Length exceeding this limit skip payload inspection.
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
+}
+
+fn default_max_body_bytes() -> usize {
+    65536 // 64KB
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -185,6 +218,15 @@ pub struct WalConfig {
     /// Maximum events per batch before forcing a flush (default: 128).
     #[serde(default = "default_max_batch_size")]
     pub max_batch_size: usize,
+    /// Maximum WAL file size in bytes before rotation (default: 100MB).
+    /// When exceeded, the current file is renamed to `wal.log.<N>` and a new
+    /// file is created. The inter-batch `prev_batch_root` field links segments.
+    #[serde(default = "default_max_wal_bytes")]
+    pub max_wal_bytes: u64,
+    /// Maximum number of rotated WAL segments to keep (default: 10).
+    /// Oldest segments are deleted when this count is exceeded.
+    #[serde(default = "default_max_wal_segments")]
+    pub max_wal_segments: usize,
 }
 
 impl Default for WalConfig {
@@ -192,8 +234,18 @@ impl Default for WalConfig {
         Self {
             batch_window_ms: 2,
             max_batch_size: 128,
+            max_wal_bytes: 100 * 1024 * 1024, // 100MB
+            max_wal_segments: 10,
         }
     }
+}
+
+fn default_max_wal_bytes() -> u64 {
+    100 * 1024 * 1024 // 100MB
+}
+
+fn default_max_wal_segments() -> usize {
+    10
 }
 
 fn default_batch_window_ms() -> u64 {
@@ -209,6 +261,7 @@ impl Default for ProxyConfig {
         Self {
             server: ServerConfig {
                 listen: "0.0.0.0:8080".to_string(),
+                drain_timeout_secs: 5,
             },
             enforcement: EnforcementConfig {
                 default_decision: DefaultDecisionConfig {
@@ -218,6 +271,7 @@ impl Default for ProxyConfig {
                 ic1_async_ledger: true,
                 ic1_loss_threshold: 0.001,
                 on_block: OnBlockConfig::default(),
+                ic3_approval_timeout_secs: default_ic3_approval_timeout_secs(),
             },
             nats: NatsConfig {
                 url: "nats://127.0.0.1:4222".to_string(),
@@ -231,6 +285,8 @@ impl Default for ProxyConfig {
                 network_file: "config/srr_network.toml".to_string(),
                 semantic_file: "config/srr_semantic.toml".to_string(),
                 hot_reload: true,
+                payload_inspection: false,
+                max_body_bytes: default_max_body_bytes(),
             },
             policies: PoliciesConfig {
                 directory: "config/policies/".to_string(),

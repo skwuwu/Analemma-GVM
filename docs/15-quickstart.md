@@ -181,7 +181,7 @@ pip install -e sdk/python       # Install once
 
 | Want to... | Go to |
 |-----------|-------|
-| Configure policies, SRR rules, secrets | [Reference Guide →](15-reference.md) |
+| Configure policies, SRR rules, secrets | [Reference Guide →](16-reference.md) |
 | Understand the 3-layer architecture | [Architecture Overview →](00-overview.md) |
 | See the full SDK API (`@ic`, `GVMAgent`, errors) | [Python SDK →](07-sdk.md) |
 | Write custom SRR rules | [Network SRR →](03-srr.md) |

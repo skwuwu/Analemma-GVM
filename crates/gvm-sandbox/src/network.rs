@@ -440,6 +440,121 @@ fn run_iptables(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+// ─── Orphan Network Resource Tracking ───
+
+const STATE_DIR: &str = "/run/gvm";
+const STATE_FILE: &str = "/run/gvm/interfaces.json";
+
+/// Record a sandbox's network resources in the state file.
+/// Called after host-side network setup succeeds.
+/// If the process crashes before cleanup, the next `gvm run` can read
+/// this file and clean up orphaned interfaces/rules.
+pub fn record_network_state(config: &VethConfig) -> Result<()> {
+    let state = serde_json::json!({
+        "veth_host": config.host_iface,
+        "veth_sandbox": config.sandbox_iface,
+        "host_ip": config.host_ip.to_string(),
+        "sandbox_ip": config.sandbox_ip.to_string(),
+        "proxy_port": config.proxy_addr.port(),
+        "pid": std::process::id(),
+        "created_at": time::OffsetDateTime::now_utc().to_string(),
+    });
+
+    if let Err(e) = std::fs::create_dir_all(STATE_DIR) {
+        tracing::debug!(error = %e, "Cannot create {STATE_DIR} — orphan cleanup unavailable");
+        return Ok(()); // Non-fatal: /run may not be writable in some environments
+    }
+
+    std::fs::write(STATE_FILE, serde_json::to_string_pretty(&state)?)
+        .with_context(|| format!("Failed to write network state to {STATE_FILE}"))?;
+
+    tracing::debug!(path = STATE_FILE, "Network state recorded for orphan cleanup");
+    Ok(())
+}
+
+/// Remove the state file after successful cleanup.
+pub fn clear_network_state() {
+    let _ = std::fs::remove_file(STATE_FILE);
+}
+
+/// Clean up orphaned network resources from a previous crash.
+/// Reads `/run/gvm/interfaces.json`, reconstructs a VethConfig,
+/// calls `cleanup_host_network`, then removes the state file.
+///
+/// Returns Ok(true) if orphans were cleaned, Ok(false) if no state file,
+/// Err on I/O failure (non-fatal — logged and continued).
+pub fn cleanup_orphaned_network() -> Result<bool> {
+    let content = match std::fs::read_to_string(STATE_FILE) {
+        Ok(c) => c,
+        Err(_) => return Ok(false), // No state file — nothing to clean
+    };
+
+    let state: serde_json::Value = serde_json::from_str(&content)
+        .context("Failed to parse orphan state file")?;
+
+    let host_iface = state["veth_host"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    if host_iface.is_empty() {
+        clear_network_state();
+        return Ok(false);
+    }
+
+    // Check if the interface still exists
+    let exists = Command::new("ip")
+        .args(["link", "show", &host_iface])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !exists {
+        // Interface already gone — just clean up state file
+        tracing::debug!(iface = %host_iface, "Orphan veth already removed");
+        clear_network_state();
+        return Ok(false);
+    }
+
+    // Reconstruct VethConfig and clean up
+    let proxy_port = state["proxy_port"].as_u64().unwrap_or(8080) as u16;
+
+    let config = VethConfig {
+        host_iface: host_iface.clone(),
+        sandbox_iface: state["veth_sandbox"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
+        host_ip: state["host_ip"]
+            .as_str()
+            .unwrap_or("10.200.0.1")
+            .to_string(),
+        sandbox_ip: state["sandbox_ip"]
+            .as_str()
+            .unwrap_or("10.200.0.2")
+            .to_string(),
+        cidr: 30,
+        child_pid: state["pid"].as_u64().unwrap_or(0) as u32,
+        proxy_addr: std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            proxy_port,
+        ),
+    };
+
+    tracing::info!(
+        iface = %host_iface,
+        pid = state["pid"].as_u64().unwrap_or(0),
+        "Cleaning up orphaned sandbox network from previous crash"
+    );
+
+    cleanup_host_network(&config);
+    crate::ebpf::detach_tc_filter(&host_iface);
+    clear_network_state();
+
+    tracing::info!("Orphaned network resources cleaned up");
+    Ok(true)
+}
+
 /// Run an `ip6tables` command, returning an error on failure.
 fn run_ip6tables(args: &[&str]) -> Result<()> {
     let output = Command::new("ip6tables")

@@ -352,6 +352,12 @@ mod tests {
     #[test]
     fn merkle_single_leaf() {
         let leaf = hash_str("event_1");
+        // Verify hash format: must be exactly 64 hex characters (SHA-256)
+        assert_eq!(leaf.len(), 64, "SHA-256 hash must be 64 hex characters");
+        assert!(
+            leaf.chars().all(|c| c.is_ascii_hexdigit()),
+            "Hash must be valid hex"
+        );
         let root = compute_merkle_root(&[leaf.clone()]).unwrap();
         assert_eq!(root, leaf, "single leaf should be its own root");
     }

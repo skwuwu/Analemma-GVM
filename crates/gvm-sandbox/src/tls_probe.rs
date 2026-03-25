@@ -1,7 +1,11 @@
 //! eBPF uprobe TLS interception — captures plaintext before encryption.
 //!
+//! **STATUS: Experimental, observation-only.** Gated behind the `uprobe` feature flag
+//! (disabled by default). MITM (transparent TLS proxy) is the primary HTTPS inspection
+//! mechanism. The uprobe is an optional defense-in-depth layer.
+//!
 //! Attaches uprobes to SSL_write() in the agent process to read HTTP requests
-//! before they are encrypted. This enables path/method-level policy enforcement
+//! before they are encrypted. This enables path/method-level policy observation
 //! on HTTPS traffic without MITM or CA certificates.
 //!
 //! Architecture:

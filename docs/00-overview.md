@@ -123,8 +123,9 @@ GVM's governance operates at two semantic levels. A third level (content semanti
 | 11 | [Competitive Analysis: GVM vs OPA+Envoy](11-competitive-analysis.md) | `docs/11-competitive-analysis.md` |
 | 12 | [Security Model & Known Attack Surface](12-security-model.md) | `docs/12-security-model.md` |
 | 13 | [Roadmap: Planned Features & Future Enhancements](13-roadmap.md) | `docs/13-roadmap.md` |
-| 14 | [Quick Start](14-quickstart.md) | 1-minute launch, isolation levels, secret injection, policy basics |
-| 15 | [Reference Guide](15-reference.md) | Configuration, environment variables, CLI, SDK API, platform support |
+| 14 | [Implementation Log](14-implementation-log.md) | Change log with what changed, why, affected files, and risk |
+| 15 | [Quick Start](15-quickstart.md) | 1-minute launch, isolation levels, secret injection, policy basics |
+| 16 | [Reference Guide](16-reference.md) | Configuration, environment variables, CLI, SDK API, platform support |
 
 ---
 

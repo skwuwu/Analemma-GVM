@@ -81,6 +81,11 @@ impl APIKeyStore {
         self.credentials.is_empty()
     }
 
+    /// Get the credential for a host, if configured. Used by MITM path for injection.
+    pub fn get_credential(&self, host: &str) -> Option<&Credential> {
+        self.credentials.get(host)
+    }
+
     /// Inject the appropriate credential into the request for the given host.
     /// This is Layer 3 (Capability Token) — the agent never has direct access to API keys.
     ///

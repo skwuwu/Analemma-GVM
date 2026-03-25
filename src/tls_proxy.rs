@@ -12,14 +12,14 @@
 //! - httparse zero-copy parsing with Status::Partial state machine
 
 use anyhow::{Context, Result};
-use dashmap::DashMap;
+use moka::sync::Cache;
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use zeroize::Zeroize;
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// TLS proxy configuration.
 pub struct TlsProxyConfig {
@@ -29,20 +29,30 @@ pub struct TlsProxyConfig {
     pub ca_key_pem: Vec<u8>,
 }
 
+/// Maximum number of cached leaf certificates.
+/// Prevents memory exhaustion from SNI cache poisoning attacks
+/// (e.g., agent requesting 1.evil.com, 2.evil.com, ..., N.evil.com).
+const MAX_CERT_CACHE_SIZE: u64 = 10_000;
+
+/// Time-to-idle for cached certificates. Unused certs are evicted after this.
+const CERT_CACHE_TTI_SECS: u64 = 3600;
+
 /// Dynamic certificate resolver — generates per-domain leaf certs on demand.
 pub struct GvmCertResolver {
     /// CA certificate for signing.
     ca_cert: rcgen::Certificate,
     /// CA key pair.
     ca_key: KeyPair,
-    /// Per-domain leaf cert cache (domain → CertifiedKey).
-    cache: DashMap<String, Arc<CertifiedKey>>,
+    /// Per-domain leaf cert cache with bounded capacity and TTI eviction.
+    /// Prevents SNI cache poisoning: an attacker requesting unlimited unique
+    /// domains cannot exhaust host memory — moka evicts LRU entries at capacity.
+    cache: Cache<String, Arc<CertifiedKey>>,
 }
 
 impl std::fmt::Debug for GvmCertResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GvmCertResolver")
-            .field("cached_domains", &self.cache.len())
+            .field("cached_domains", &self.cache.entry_count())
             .finish()
     }
 }
@@ -62,6 +72,10 @@ impl GvmCertResolver {
             dn.push(DnType::CommonName, "GVM Ephemeral CA");
             dn
         };
+        // Backdate not_before for clock drift tolerance
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::hours(24);
+        params.not_after = now + time::Duration::hours(24);
         let ca_cert = params
             .self_signed(&ca_key)
             .context("Failed to reconstruct CA cert")?;
@@ -69,15 +83,18 @@ impl GvmCertResolver {
         Ok(Self {
             ca_cert,
             ca_key,
-            cache: DashMap::new(),
+            cache: Cache::builder()
+                .max_capacity(MAX_CERT_CACHE_SIZE)
+                .time_to_idle(Duration::from_secs(CERT_CACHE_TTI_SECS))
+                .build(),
         })
     }
 
     /// Issue a leaf cert for the given domain. Caches the result.
     fn issue_and_cache(&self, domain: &str) -> Option<Arc<CertifiedKey>> {
-        // Check cache first
+        // Check cache first (moka handles TTI refresh on access)
         if let Some(cached) = self.cache.get(domain) {
-            return Some(cached.clone());
+            return Some(cached);
         }
 
         // Generate ECDSA P-256 leaf cert (~0.1ms)
@@ -89,6 +106,10 @@ impl GvmCertResolver {
             dn.push(DnType::CommonName, domain);
             dn
         };
+        // Backdate leaf cert for clock drift tolerance
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::hours(24);
+        params.not_after = now + time::Duration::hours(24);
 
         let leaf_cert = params
             .signed_by(&leaf_key, &self.ca_cert, &self.ca_key)
@@ -110,9 +131,41 @@ impl GvmCertResolver {
     }
 }
 
+impl GvmCertResolver {
+    /// Flush pending moka tasks and return the number of cached certs.
+    /// Used by tests to verify cache state after concurrent operations.
+    pub fn sync_and_count(&self) -> u64 {
+        self.cache.run_pending_tasks();
+        self.cache.entry_count()
+    }
+
+    /// Pre-warm the cert cache for a domain on a blocking thread.
+    ///
+    /// Called BEFORE TLS handshake so that `resolve()` hits cache (0ns)
+    /// and never blocks the tokio runtime with CPU-bound keygen.
+    /// This is the fix for the cooperative scheduling starvation issue:
+    /// without this, 50 concurrent new-domain TLS handshakes would block
+    /// all tokio worker threads for the duration of cert generation.
+    pub async fn ensure_cached(self: &Arc<Self>, domain: String) -> Option<Arc<CertifiedKey>> {
+        // Fast path: already cached
+        if let Some(cached) = self.cache.get(&domain) {
+            return Some(cached);
+        }
+
+        // Slow path: offload CPU-bound keygen to blocking thread pool
+        let resolver = Arc::clone(self);
+        tokio::task::spawn_blocking(move || resolver.issue_and_cache(&domain))
+            .await
+            .ok()?
+    }
+}
+
 impl ResolvesServerCert for GvmCertResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let domain = client_hello.server_name()?;
+        // After ensure_cached(), this is always a cache hit (0ns).
+        // If somehow called without pre-warming, falls back to sync generation
+        // to maintain correctness (at the cost of blocking the runtime).
         self.issue_and_cache(domain)
     }
 }
@@ -148,11 +201,26 @@ pub fn build_client_config() -> Result<rustls::ClientConfig> {
     Ok(config)
 }
 
+/// Maximum time to read a complete HTTP request header.
+/// Defends against Slowloris: attacker sending 1 byte/sec is disconnected.
+const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Parse an HTTP request from a TLS-decrypted byte stream.
 ///
 /// Handles Status::Partial by looping and accumulating bytes.
 /// Returns method, path, host, and body slice.
+///
+/// Security:
+/// - 30s timeout against Slowloris (attacker trickling bytes)
+/// - Rejects Content-Length + Transfer-Encoding conflict (RFC 7230 §3.3.3)
+/// - Rejects duplicate Content-Length headers with differing values
 pub async fn read_http_request<S: AsyncRead + Unpin>(stream: &mut S) -> Result<HttpRequest> {
+    tokio::time::timeout(REQUEST_READ_TIMEOUT, read_http_request_inner(stream))
+        .await
+        .map_err(|_| anyhow::anyhow!("HTTP request read timed out (Slowloris defense)"))?
+}
+
+async fn read_http_request_inner<S: AsyncRead + Unpin>(stream: &mut S) -> Result<HttpRequest> {
     let mut buf = Vec::with_capacity(8192);
     let mut total = 0;
     const MAX_HEADER: usize = 64 * 1024; // 64KB header limit
@@ -178,6 +246,37 @@ pub async fn read_http_request<S: AsyncRead + Unpin>(stream: &mut S) -> Result<H
                     .and_then(|h| std::str::from_utf8(h.value).ok())
                     .unwrap_or("")
                     .to_string();
+
+                // ── HTTP Request Smuggling defense (RFC 7230 §3.3.3) ──
+                // Reject requests with both Content-Length and Transfer-Encoding.
+                // A desync between our parser (httparse) and the upstream server's
+                // parser on where the request body ends could let an attacker
+                // smuggle a second request inside the body of the first.
+                let has_te = headers
+                    .iter()
+                    .any(|h| h.name.eq_ignore_ascii_case("transfer-encoding"));
+                let cl_values: Vec<&[u8]> = headers
+                    .iter()
+                    .filter(|h| h.name.eq_ignore_ascii_case("content-length"))
+                    .map(|h| h.value)
+                    .collect();
+
+                if has_te && !cl_values.is_empty() {
+                    anyhow::bail!(
+                        "Rejected: both Content-Length and Transfer-Encoding present \
+                         (request smuggling attempt)"
+                    );
+                }
+
+                // Reject duplicate Content-Length with differing values
+                if cl_values.len() > 1 {
+                    let first = cl_values[0];
+                    if cl_values.iter().skip(1).any(|v| *v != first) {
+                        anyhow::bail!(
+                            "Rejected: multiple Content-Length headers with different values"
+                        );
+                    }
+                }
 
                 // Collect all headers for forwarding
                 let header_pairs: Vec<(String, Vec<u8>)> = headers
@@ -208,7 +307,23 @@ pub async fn read_http_request<S: AsyncRead + Unpin>(stream: &mut S) -> Result<H
     }
 }
 
+/// Auth-related header names that must be stripped before credential injection.
+/// Matches the same set as api_keys.rs to prevent credential smuggling.
+const AUTH_HEADERS: &[&str] = &[
+    "authorization",
+    "cookie",
+    "proxy-authorization",
+    "x-api-key",
+    "apikey",
+    "x-auth-token",
+    "x-api-token",
+    "x-signature",
+    "x-hmac",
+    "x-credentials",
+];
+
 /// Parsed HTTP request from decrypted TLS stream.
+#[derive(Debug)]
 pub struct HttpRequest {
     pub method: String,
     pub path: String,
@@ -217,6 +332,70 @@ pub struct HttpRequest {
     pub body: Vec<u8>,
     /// Raw header bytes for forwarding (if no modification needed).
     pub raw_head: Vec<u8>,
+}
+
+impl HttpRequest {
+    /// Strip agent-supplied auth headers and inject proxy credentials.
+    ///
+    /// This is the MITM equivalent of `api_keys.rs::inject()` for the HTTP proxy path.
+    /// After injection, `raw_head` is rebuilt from the modified headers.
+    ///
+    /// Returns true if credentials were injected, false if no credential was configured
+    /// for this host (passthrough mode).
+    pub fn inject_credentials(&mut self, api_keys: &crate::api_keys::APIKeyStore) -> bool {
+        let credential = match api_keys.get_credential(&self.host) {
+            Some(c) => c,
+            None => return false,
+        };
+
+        // Strip all agent-supplied auth headers (prevent credential smuggling)
+        self.headers.retain(|(name, _)| {
+            !AUTH_HEADERS.contains(&name.to_ascii_lowercase().as_str())
+        });
+
+        // Inject the configured credential
+        match credential {
+            crate::api_keys::Credential::Bearer { token } => {
+                self.headers.push((
+                    "Authorization".to_string(),
+                    format!("Bearer {}", token).into_bytes(),
+                ));
+            }
+            crate::api_keys::Credential::OAuth2 { access_token, .. } => {
+                self.headers.push((
+                    "Authorization".to_string(),
+                    format!("Bearer {}", access_token).into_bytes(),
+                ));
+            }
+            crate::api_keys::Credential::ApiKey { header, value } => {
+                self.headers.push((header.clone(), value.clone().into_bytes()));
+            }
+        }
+
+        // Rebuild raw_head from modified headers
+        self.rebuild_raw_head();
+        true
+    }
+
+    /// Reconstruct `raw_head` from method, path, and current headers.
+    fn rebuild_raw_head(&mut self) {
+        let mut head = Vec::with_capacity(self.raw_head.len() + 256);
+        // Request line
+        head.extend_from_slice(self.method.as_bytes());
+        head.push(b' ');
+        head.extend_from_slice(self.path.as_bytes());
+        head.extend_from_slice(b" HTTP/1.1\r\n");
+        // Headers
+        for (name, value) in &self.headers {
+            head.extend_from_slice(name.as_bytes());
+            head.extend_from_slice(b": ");
+            head.extend_from_slice(value);
+            head.extend_from_slice(b"\r\n");
+        }
+        // End of headers
+        head.extend_from_slice(b"\r\n");
+        self.raw_head = head;
+    }
 }
 
 /// Resolve the original destination when SNI is absent.
@@ -256,6 +435,93 @@ pub fn get_original_dst(_fd: i32) -> Option<std::net::SocketAddr> {
     None
 }
 
+/// Extract SNI (Server Name Indication) from a TLS ClientHello without
+/// consuming the stream. Peeks at the first bytes of the TCP stream to
+/// parse the TLS record header and ClientHello extension.
+///
+/// Returns `None` if SNI cannot be extracted (non-TLS, missing extension, etc).
+/// The peeked bytes remain in the socket buffer for the actual TLS handshake.
+pub async fn peek_sni(stream: &tokio::net::TcpStream) -> Option<String> {
+    let mut buf = [0u8; 1024]; // ClientHello is typically < 512 bytes
+    let n = stream.peek(&mut buf).await.ok()?;
+    if n < 5 {
+        return None;
+    }
+
+    // TLS record: type(1) + version(2) + length(2) + payload
+    if buf[0] != 0x16 {
+        return None; // Not a TLS Handshake
+    }
+    let record_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+    let available = n.min(5 + record_len);
+    if available < 43 {
+        return None; // Too short for ClientHello
+    }
+
+    // Handshake header: type(1) + length(3)
+    let hs = &buf[5..available];
+    if hs[0] != 0x01 {
+        return None; // Not ClientHello
+    }
+
+    // Skip: handshake header(4) + client_version(2) + random(32) = 38 bytes
+    let mut pos = 38;
+    if pos >= hs.len() {
+        return None;
+    }
+
+    // Session ID (variable)
+    let session_id_len = hs[pos] as usize;
+    pos += 1 + session_id_len;
+    if pos + 2 > hs.len() {
+        return None;
+    }
+
+    // Cipher suites (variable)
+    let cs_len = u16::from_be_bytes([hs[pos], hs[pos + 1]]) as usize;
+    pos += 2 + cs_len;
+    if pos + 1 > hs.len() {
+        return None;
+    }
+
+    // Compression methods (variable)
+    let comp_len = hs[pos] as usize;
+    pos += 1 + comp_len;
+    if pos + 2 > hs.len() {
+        return None;
+    }
+
+    // Extensions length
+    let ext_len = u16::from_be_bytes([hs[pos], hs[pos + 1]]) as usize;
+    pos += 2;
+    let ext_end = (pos + ext_len).min(hs.len());
+
+    // Scan extensions for SNI (type 0x0000)
+    while pos + 4 <= ext_end {
+        let ext_type = u16::from_be_bytes([hs[pos], hs[pos + 1]]);
+        let ext_data_len = u16::from_be_bytes([hs[pos + 2], hs[pos + 3]]) as usize;
+        pos += 4;
+
+        if ext_type == 0x0000 && pos + ext_data_len <= ext_end {
+            // SNI extension: list_len(2) + type(1) + name_len(2) + name
+            if ext_data_len >= 5 {
+                let name_len =
+                    u16::from_be_bytes([hs[pos + 3], hs[pos + 4]]) as usize;
+                let name_start = pos + 5;
+                if name_start + name_len <= ext_end {
+                    return std::str::from_utf8(&hs[name_start..name_start + name_len])
+                        .ok()
+                        .map(|s| s.to_string());
+                }
+            }
+            return None;
+        }
+        pos += ext_data_len;
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,7 +543,9 @@ mod tests {
         let key3 = resolver.issue_and_cache("api.anthropic.com");
         assert!(key3.is_some());
 
-        assert_eq!(resolver.cache.len(), 2);
+        // moka defers bookkeeping; flush pending tasks before checking count.
+        resolver.cache.run_pending_tasks();
+        assert_eq!(resolver.cache.entry_count(), 2);
     }
 
     #[test]

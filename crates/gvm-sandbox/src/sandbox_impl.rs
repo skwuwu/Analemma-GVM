@@ -90,6 +90,11 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
 
     if let Err(ref e) = network_result {
         tracing::warn!(error = %e, "Host network setup failed — sandbox will have no network");
+    } else {
+        // Record network state for orphan cleanup on crash
+        if let Err(e) = network::record_network_state(&veth_config) {
+            tracing::debug!(error = %e, "Failed to record network state (orphan cleanup unavailable)");
+        }
     }
 
     // 2.5. Attach eBPF TC ingress filter on host-side veth (unbypassable enforcement)
@@ -125,6 +130,23 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         false
     };
 
+    // 2.7. Set up cgroup resource limits (if configured)
+    let _cgroup_guard = if config.memory_limit.is_some() || config.cpu_limit.is_some() {
+        match crate::cgroup::CgroupGuard::create(
+            child_pid.as_raw() as u32,
+            config.memory_limit,
+            config.cpu_limit,
+        ) {
+            Ok(guard) => guard,
+            Err(e) => {
+                tracing::warn!(error = %e, "cgroup setup failed — continuing without resource limits");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // 3. Signal child that setup is complete
     signal_child_ready(parent_fd, child_pid.as_raw() as u32)?;
 
@@ -134,9 +156,15 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         "Sandbox setup complete, waiting for agent"
     );
 
-    // 3.5. Start TLS probe (uprobe on SSL_write_ex for HTTPS L7 inspection)
-    // Captures plaintext before encryption — enables path/method-level HTTPS enforcement.
-    // Verified on WSL2 kernel 6.6 + OpenSSL 3.x: captures "GET /path HTTP/1.1" from SSL_write_ex.
+    // 3.5. TLS uprobe (experimental, observation-only — gated behind `uprobe` feature flag)
+    //
+    // The uprobe attaches to SSL_write_ex and captures plaintext before encryption.
+    // MITM (transparent TLS proxy on port 8443) is the primary HTTPS inspection mechanism.
+    // The uprobe is an optional defense-in-depth layer for environments where MITM is not
+    // available or as a secondary observation channel.
+    //
+    // Enable at compile time: cargo build --features uprobe
+    #[cfg(feature = "uprobe")]
     let _tls_probe_handle = {
         let child_raw = child_pid.as_raw() as u32;
         let probe_mode = &config.tls_probe_mode;
@@ -147,24 +175,8 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
             tracing::debug!("TLS probe disabled by config");
             None
         } else {
-            // Give the child process time to exec and load TLS libraries
             std::thread::sleep(std::time::Duration::from_millis(500));
 
-            // Build policy callback: query proxy /gvm/check for SRR decisions.
-            //
-            // Security notes:
-            //   1. Race condition: SSL_write_ex fires AFTER the kernel queues the
-            //      packet. SIGSTOP freezes the process but the triggering write may
-            //      already be on the wire. This is "immediate session freeze on
-            //      violation", not "pre-transmission block". Documented as known
-            //      limitation — proxy CONNECT-level enforcement is the primary gate.
-            //   2. Fail-closed: if the proxy is unreachable or times out, the
-            //      callback returns Deny (SIGSTOP). This prevents bypass via proxy
-            //      DoS but may freeze the agent on transient proxy hiccups.
-            //   3. Timeout: 50ms cap. The uprobe thread is not on the hot path, but
-            //      long blocks would delay SIGSTOP delivery.
-            //   4. Auth: X-GVM-Uprobe-Token header prevents sandboxed agents from
-            //      spoofing policy check requests to /gvm/check.
             let policy_callback: crate::tls_probe::PolicyCheckFn = if let Some(ref proxy_url) =
                 config.proxy_url
             {
@@ -215,14 +227,12 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
                                     }
                                 }
                             } else {
-                                // Unparseable response: fail-closed
                                 crate::tls_probe::PolicyDecision::Deny {
                                     reason: "uprobe: unparseable proxy response".into(),
                                 }
                             }
                         }
                         Err(_e) => {
-                            // Proxy unreachable or timeout: fail-closed (SIGSTOP)
                             crate::tls_probe::PolicyDecision::Deny {
                                 reason: "uprobe: proxy unreachable — fail-closed".into(),
                             }
@@ -230,7 +240,6 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
                     }
                 })
             } else {
-                // No proxy URL: audit-only (no enforcement possible)
                 Box::new(|_method: &str, _host: &str, _path: &str| {
                     crate::tls_probe::PolicyDecision::Allow
                 })
@@ -239,19 +248,21 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
             match crate::tls_probe::start_tls_probe_thread(child_raw, policy_callback, audit_only) {
                 Ok(handle) => {
                     let mode = if audit_only { "audit" } else { "enforce" };
-                    tracing::info!(pid = child_raw, mode, "TLS uprobe started");
+                    tracing::info!(pid = child_raw, mode, "TLS uprobe started (experimental)");
                     Some(handle)
                 }
                 Err(e) => {
                     tracing::debug!(
                         pid = child_raw, error = %e,
-                        "TLS probe not available — using domain-level HTTPS policy only"
+                        "TLS probe not available — MITM is primary HTTPS inspection"
                     );
                     None
                 }
             }
         }
     };
+    #[cfg(not(feature = "uprobe"))]
+    let _tls_probe_handle: Option<()> = None;
 
     // 4. Wait for child to exit and detect seccomp violations
     let wait_result = waitpid(child_pid, None);
@@ -291,6 +302,7 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
             ebpf::detach_tc_filter(&veth_config.host_iface);
         }
         cleanup_host_network(&veth_config);
+        network::clear_network_state();
     }
 
     Ok(SandboxResult {
@@ -384,12 +396,62 @@ fn child_entry(
         c_args.push(std::ffi::CString::new(arg.as_str()).unwrap());
     }
 
-    // exec replaces the process — this never returns on success
-    match nix::unistd::execv(&c_bin, &c_args) {
-        Ok(_) => unreachable!(),
-        Err(e) => {
-            eprintln!("gvm-sandbox: exec failed: {} (path: {})", e, bin_path);
+    // ── PID 1 init reaper ──
+    //
+    // We are PID 1 inside CLONE_NEWPID. If we exec directly, the agent
+    // interpreter becomes PID 1 but does NOT reap orphaned children.
+    // When the agent spawns subprocesses (subprocess.Popen, child_process.exec)
+    // that exit, they become zombies (Z state). Eventually the PID table fills
+    // and the agent can't fork at all.
+    //
+    // Fix: fork(). The child execs the agent. This process (PID 1) stays alive
+    // as a minimal init: it loops on waitpid(-1) to reap ANY child (including
+    // orphans reparented to PID 1), and exits with the agent's exit code.
+    //
+    // This is equivalent to tini/dumb-init but without an external dependency.
+    match unsafe { libc::fork() } {
+        -1 => {
+            eprintln!("gvm-sandbox: fork() for init reaper failed");
             1
+        }
+        0 => {
+            // ── Child: exec the agent ──
+            match nix::unistd::execv(&c_bin, &c_args) {
+                Ok(_) => unreachable!(),
+                Err(e) => {
+                    eprintln!("gvm-sandbox: exec failed: {} (path: {})", e, bin_path);
+                    // _exit to avoid running destructors in forked child
+                    unsafe { libc::_exit(1) };
+                }
+            }
+        }
+        agent_pid => {
+            // ── PID 1 (init reaper): wait for agent + reap orphans ──
+            let mut agent_exit_code: i32 = 1;
+
+            loop {
+                let mut status: i32 = 0;
+                let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
+                if pid < 0 {
+                    // ECHILD: no more children — all reaped, agent is gone
+                    break;
+                }
+                if pid == agent_pid {
+                    // Agent exited — record its exit code
+                    if libc::WIFEXITED(status) {
+                        agent_exit_code = libc::WEXITSTATUS(status);
+                    } else if libc::WIFSIGNALED(status) {
+                        agent_exit_code = 128 + libc::WTERMSIG(status);
+                    }
+                    // Don't break yet — there may still be orphaned children
+                    // that need reaping. Continue until ECHILD.
+                }
+                // Any other PID: orphaned child reaped (zombie cleaned up).
+            }
+
+            // Use _exit to avoid running Rust destructors in the clone'd process.
+            // The parent process (outside the namespace) handles cleanup.
+            unsafe { libc::_exit(agent_exit_code) };
         }
     }
 }

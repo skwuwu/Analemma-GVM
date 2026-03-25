@@ -17,6 +17,24 @@ use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+// ─── IC-3 Pending Approval ───
+
+/// A pending IC-3 approval request held by the proxy.
+/// The proxy creates a oneshot channel and waits for the decision.
+#[derive(Debug)]
+pub struct PendingApproval {
+    /// Oneshot sender — deliver `true` (approve) or `false` (deny)
+    pub sender: tokio::sync::oneshot::Sender<bool>,
+    /// Event metadata for display in CLI/API
+    pub event_id: String,
+    pub operation: String,
+    pub host: String,
+    pub path: String,
+    pub method: String,
+    pub agent_id: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
 // ─── Circuit Breaker Configuration ───
 
 /// Number of consecutive primary WAL failures before the circuit breaker opens.
@@ -59,6 +77,20 @@ pub struct AppState {
     pub shadow_config: crate::intent_store::ShadowConfig,
     /// SRR config file path (for hot-reload).
     pub srr_config_path: String,
+    /// MITM CA certificate PEM (for sandbox trust store download via GET /gvm/ca.pem).
+    /// None when TLS MITM is not active.
+    pub mitm_ca_pem: Option<Arc<Vec<u8>>>,
+    /// SRR payload inspection: buffer request body for JSON field matching.
+    pub payload_inspection: bool,
+    /// Maximum body bytes to buffer for payload inspection.
+    pub max_body_bytes: usize,
+    /// IC-3 pending approval queue.
+    /// Key: event_id. Value: oneshot sender for approval decision (true = approve, false = deny).
+    /// When IC-3 is triggered, the proxy holds the HTTP response and waits for
+    /// POST /gvm/approve to deliver the decision via this channel.
+    pub pending_approvals: Arc<dashmap::DashMap<String, PendingApproval>>,
+    /// IC-3 approval timeout in seconds.
+    pub ic3_approval_timeout_secs: u64,
 }
 
 /// Derive event status from upstream HTTP response.
@@ -76,7 +108,7 @@ fn event_status_from_response(response: &Response<Body>) -> EventStatus {
 /// Implements the 3-layer security pipeline (PART 5.2).
 pub async fn proxy_handler(
     State(state): State<AppState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
 ) -> Response<Body> {
     // ── Step 0: Verify JWT identity (if configured) ──
     let verified_identity = if let Some(ref jwt) = state.jwt_config {
@@ -123,6 +155,43 @@ pub async fn proxy_handler(
     // Capture the HTTP method before classification (request may be consumed later)
     let request_method = request.method().to_string();
 
+    // ── Step 1.5: Buffer request body for SRR payload inspection (if enabled) ──
+    // Body is buffered once, then re-attached to the request for forwarding.
+    let body_bytes: Option<Bytes> = if state.payload_inspection {
+        // Check Content-Length to avoid buffering oversized requests
+        let content_length = request
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+
+        if content_length > 0 && content_length <= state.max_body_bytes {
+            // Swap body out of request, buffer it, then re-attach
+            let body = std::mem::replace(request.body_mut(), Body::empty());
+            match axum::body::to_bytes(body, state.max_body_bytes).await {
+                Ok(bytes) if !bytes.is_empty() => Some(bytes),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::debug!(error = %e, "Failed to buffer request body for payload inspection — skipping");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let body_for_srr: Option<&[u8]> = body_bytes.as_deref();
+
+    // Re-attach buffered body to request so forward_request can send it upstream.
+    // If body was consumed by to_bytes(), we replace it with the buffered copy.
+    if let Some(ref bytes) = body_bytes {
+        *request.body_mut() = Body::from(bytes.clone());
+    }
+
     // ── Step 2: Classify (IC determination) ──
     let (mut classification, mut is_default_caution) = if let Some(ref headers) = gvm_headers {
         // SDK-routed: Layer 1 Semantic classification via ABAC policy engine
@@ -134,7 +203,7 @@ pub async fn proxy_handler(
             tracing::error!("SRR lock poisoned — using poisoned state (fail-closed)");
             e.into_inner()
         });
-        let srr_result = srr.check(request.method().as_str(), &target.host, &target.path, None);
+        let srr_result = srr.check(request.method().as_str(), &target.host, &target.path, body_for_srr);
         drop(srr);
 
         // Determine which layer won (max_strict picks the strictest)
@@ -168,7 +237,7 @@ pub async fn proxy_handler(
             tracing::error!("SRR lock poisoned — using poisoned state");
             e.into_inner()
         });
-        let srr_result = srr.check(request.method().as_str(), &target.host, &target.path, None);
+        let srr_result = srr.check(request.method().as_str(), &target.host, &target.path, body_for_srr);
         drop(srr);
 
         let is_catch_all = srr_result.is_catch_all;
@@ -476,7 +545,9 @@ pub async fn proxy_handler(
         }
 
         EnforcementDecision::RequireApproval { urgency } => {
-            // IC-3: block and record. Do not forward.
+            // IC-3: hold request and wait for human approval.
+            // The proxy suspends the HTTP response until POST /gvm/approve delivers
+            // a decision, or the approval timeout expires (fail-close → auto-deny).
             event.status = EventStatus::Pending;
             if let Err(e) = state.ledger.append_durable(&event).await {
                 tracing::error!(error = %e, "WAL write failed for IC-3 event");
@@ -487,32 +558,87 @@ pub async fn proxy_handler(
                 state.intent_store.confirm(claim.claim_id);
             }
 
+            let event_id = event.event_id.clone();
+            let method_str = request.method().to_string();
+
             tracing::warn!(
                 host = %target.host,
                 path = %target.path,
                 urgency = ?urgency,
-                "Request requires approval — blocked"
+                event_id = %event_id,
+                "IC-3: Request held — waiting for approval"
             );
-            governance_block_response(
-                StatusCode::FORBIDDEN,
-                GovernanceBlockResponse {
-                    blocked: true,
-                    decision: "RequireApproval".to_string(),
-                    event_id: event.event_id.clone(),
-                    trace_id: event.trace_id.clone(),
-                    operation: event.operation.clone(),
-                    reason: format!(
-                        "IC-3: Administrator approval required (urgency: {:?})",
-                        urgency
-                    ),
-                    mode: state.on_block.require_approval.clone(),
-                    next_action: "Submit approval request to your GVM administrator".to_string(),
-                    retry_after_secs: None,
-                    rollback_hint: Some(event.trace_id.clone()),
-                    matched_rule_id: classification.matched_rule_id.clone(),
-                    ic_level: 3,
-                },
-            )
+
+            // Create oneshot channel for approval decision
+            let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+
+            // Register pending approval with metadata for CLI/API display
+            state.pending_approvals.insert(event_id.clone(), PendingApproval {
+                sender: tx,
+                event_id: event_id.clone(),
+                operation: event.operation.clone(),
+                host: target.host.clone(),
+                path: target.path.clone(),
+                method: method_str,
+                agent_id: event.agent_id.clone(),
+                timestamp: event.timestamp,
+            });
+
+            // Wait for approval decision or timeout
+            let timeout_duration = std::time::Duration::from_secs(state.ic3_approval_timeout_secs);
+            let approved = match tokio::time::timeout(timeout_duration, rx).await {
+                Ok(Ok(decision)) => decision,
+                Ok(Err(_)) => {
+                    // Sender dropped (proxy shutting down) → deny
+                    tracing::warn!(event_id = %event_id, "IC-3: Approval channel closed — auto-denied");
+                    false
+                }
+                Err(_) => {
+                    // Timeout → auto-deny (fail-close)
+                    tracing::warn!(event_id = %event_id, "IC-3: Approval timeout — auto-denied");
+                    state.pending_approvals.remove(&event_id);
+                    false
+                }
+            };
+
+            if approved {
+                tracing::info!(event_id = %event_id, host = %target.host, "IC-3: Request APPROVED — forwarding");
+                let engine_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
+                let mut response = forward_request(&state, request, &target).await;
+                event.status = event_status_from_response(&response);
+                // Update WAL with execution result
+                state.ledger.append_async(event.clone()).await;
+                inject_gvm_response_headers(
+                    response.headers_mut(),
+                    &event,
+                    &classification,
+                    engine_ms,
+                    0,
+                );
+                response
+            } else {
+                tracing::warn!(event_id = %event_id, host = %target.host, "IC-3: Request DENIED by approver or timeout");
+                governance_block_response(
+                    StatusCode::FORBIDDEN,
+                    GovernanceBlockResponse {
+                        blocked: true,
+                        decision: "RequireApproval".to_string(),
+                        event_id: event.event_id.clone(),
+                        trace_id: event.trace_id.clone(),
+                        operation: event.operation.clone(),
+                        reason: format!(
+                            "IC-3: Approval denied or timed out (urgency: {:?})",
+                            urgency
+                        ),
+                        mode: state.on_block.require_approval.clone(),
+                        next_action: "Request was not approved within the timeout window.".to_string(),
+                        retry_after_secs: None,
+                        rollback_hint: Some(event.trace_id.clone()),
+                        matched_rule_id: classification.matched_rule_id.clone(),
+                        ic_level: 3,
+                    },
+                )
+            }
         }
 
         EnforcementDecision::Deny { reason } => {

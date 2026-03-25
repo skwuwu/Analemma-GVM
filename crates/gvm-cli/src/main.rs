@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod approve;
 mod audit;
 mod check;
 mod demo;
@@ -9,6 +10,7 @@ mod run;
 mod stats;
 mod suggest;
 mod ui;
+mod watch;
 
 #[derive(Parser)]
 #[command(name = "gvm", version, about = "Analemma GVM — governance CLI")]
@@ -99,17 +101,91 @@ enum Commands {
         #[arg(long, default_value = "python:3.12-slim")]
         image: String,
 
-        /// Memory limit (only with --contained)
+        /// Memory limit (--contained: Docker limit; --sandbox: cgroup v2 limit).
+        /// Format: "512m", "1g", "2048m". Default: 512m.
         #[arg(long, default_value = "512m")]
         memory: String,
 
-        /// CPU limit (only with --contained)
+        /// CPU limit (--contained: Docker CPU quota; --sandbox: cgroup v2 cpu.max).
+        /// Format: fraction of one CPU (e.g. "1.0" = 1 CPU, "0.5" = half). Default: 1.0.
         #[arg(long, default_value = "1.0")]
         cpus: String,
 
         /// Run in background (only with --contained)
         #[arg(long)]
         detach: bool,
+    },
+
+    /// Monitor and respond to pending IC-3 approval requests.
+    ///
+    /// Polls the proxy for pending approval requests and presents them
+    /// interactively for human approval or denial.
+    ///
+    ///   gvm approve                        # interactive approval prompt
+    ///   gvm approve --auto-deny            # auto-deny all pending after timeout
+    Approve {
+        /// GVM proxy URL
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        proxy: String,
+
+        /// Poll interval in seconds
+        #[arg(long, default_value = "2")]
+        poll_interval: u64,
+
+        /// Auto-deny all pending requests (non-interactive, for CI)
+        #[arg(long)]
+        auto_deny: bool,
+    },
+
+    /// Watch an agent's API calls in real-time (observation only, no enforcement).
+    ///
+    /// By default, all requests are allowed through (no blocking). Use --with-rules
+    /// to apply existing SRR rules while observing.
+    ///
+    ///   gvm watch agent.py                     # observe all API calls
+    ///   gvm watch -- node my_agent.js           # arbitrary binary
+    ///   gvm watch --with-rules agent.py         # observe with existing rules active
+    ///   gvm watch --output json agent.py        # JSON output for piping/CI
+    Watch {
+        /// Command to run (same syntax as `gvm run`).
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+
+        /// Agent ID for audit trail
+        #[arg(long, default_value = "agent-001")]
+        agent_id: String,
+
+        /// GVM proxy URL
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        proxy: String,
+
+        /// Apply existing SRR rules while watching (default: allow all, observe only).
+        #[arg(long)]
+        with_rules: bool,
+
+        /// Use Linux-native sandbox for observation.
+        #[arg(long)]
+        sandbox: bool,
+
+        /// Use Docker containment for observation.
+        #[arg(long)]
+        contained: bool,
+
+        /// Docker image (only with --contained)
+        #[arg(long, default_value = "python:3.12-slim")]
+        image: String,
+
+        /// Docker memory limit (only with --contained)
+        #[arg(long, default_value = "512m")]
+        memory: String,
+
+        /// Docker CPU limit (only with --contained)
+        #[arg(long, default_value = "1.0")]
+        cpus: String,
+
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text")]
+        output: String,
     },
 
     /// Dry-run policy check without calling external APIs
@@ -322,6 +398,41 @@ async fn main() -> anyhow::Result<()> {
                 contained,
                 sandbox,
                 interactive,
+            )
+            .await?;
+        }
+
+        Commands::Approve {
+            proxy,
+            poll_interval,
+            auto_deny,
+        } => {
+            approve::run_approve(&proxy, poll_interval, auto_deny).await?;
+        }
+
+        Commands::Watch {
+            command,
+            agent_id,
+            proxy,
+            with_rules,
+            sandbox,
+            contained,
+            image,
+            memory,
+            cpus,
+            output,
+        } => {
+            watch::run_watch(
+                &command,
+                &agent_id,
+                &proxy,
+                with_rules,
+                sandbox,
+                contained,
+                &image,
+                &memory,
+                &cpus,
+                &output,
             )
             .await?;
         }

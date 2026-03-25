@@ -44,7 +44,7 @@ let final_decision = max_strict(srr_decision.clone(), policy_decision.clone());
 
 **Attack scenario**: An agent declares `operation="gvm.storage.read"` but sends `POST api.bank.com/transfer`. Layer 1 (ABAC) sees a read operation and allows it. Layer 2 (SRR) sees a wire transfer URL and denies it. `max_strict(Allow, Deny) = Deny`. The lie is caught.
 
-OPA has no equivalent mechanism. If a service sends a header claiming `action: read`, OPA evaluates that claim at face value.
+OPA can achieve similar cross-checking if you pass both the SDK-declared operation and the actual HTTP metadata into Rego input — for example, `deny if input.metadata.operation == "read" and input.request.method == "POST" and contains(input.request.path, "/transfer")`. The difference is that GVM provides this as a built-in architectural primitive (`max_strict`) that cannot be accidentally omitted, whereas in OPA it requires the policy author to explicitly write and maintain the cross-check for every relevant operation. This is a convenience and reliability advantage, not an architectural impossibility.
 
 **Implementation status (2026-03)**:
 - Layer 1 decisions in the request hot path are currently evaluated by native `PolicyEngine` (`state.policy.evaluate(...)`).
@@ -61,13 +61,13 @@ OPA has no equivalent mechanism. If a service sends a header claiming `action: r
 | IC Level | Decision | Behavior | OPA Equivalent |
 |----------|----------|----------|----------------|
 | IC-1 | Allow | Immediate forward, async audit | `allow` |
-| IC-2 | Delay | WAL write → configurable delay → forward | *None* |
-| IC-3 | RequireApproval | WAL write → block until human approves | *None* |
+| IC-2 | Delay | WAL write → configurable delay → forward | Requires custom Envoy filter |
+| IC-3 | RequireApproval | WAL write → block until human approves | Requires custom Envoy filter + approval queue |
 | — | Deny | WAL write → unconditional block | `deny` |
 
 The Delay and RequireApproval states are critical for AI agent governance. A "send email" operation is not clearly allow-or-deny — it depends on content, recipient, and context. IC-2 creates a review window (default 300ms) with a guaranteed audit trail. IC-3 escalates to human judgment.
 
-OPA cannot express "allow, but slow down and record first" or "block until a human reviews this." You would need to build these semantics on top of OPA, at which point you are building GVM.
+OPA itself can return arbitrary JSON (including `{"decision": "delay", "delay_ms": 300}`), but Envoy's ext_authz protocol only interprets allow/deny. Implementing delay or approval semantics requires a custom Envoy filter that reads OPA's extended response and acts on it — achievable, but significant engineering effort.
 
 ---
 
@@ -170,7 +170,7 @@ Global (most strict) > Tenant > Agent (cannot weaken parent)
 
 Policy files are loaded by naming convention (`global.toml`, `tenant-{name}.toml`, `agent-{name}.toml`). A tenant policy can add restrictions but cannot relax global rules. An agent policy can further restrict but cannot relax tenant rules.
 
-In OPA, a careless Rego package can inadvertently grant broader access than intended. GVM makes this structurally impossible.
+OPA can achieve similar hierarchical enforcement through `data.global` imports and Conftest/Styra DAS policy management. GVM's hierarchy is enforced by the TOML loader's merge logic (lower layers can only add restrictions, never relax parent rules), which is simpler to set up but is ultimately a convention enforced at load time — not fundamentally different from an OPA convention enforced by tooling. Both can be misconfigured.
 
 ---
 
@@ -241,7 +241,7 @@ class MyAgent(GVMAgent):
     auto_checkpoint = "ic2+"  # Checkpoint before IC-2 and IC-3 operations
 ```
 
-**Token economics**: Without rollback, a denied operation requires re-executing all prior steps from scratch. With rollback, the agent resumes from the last checkpoint. Actual savings depend on where in the workflow the deny occurs — the later the deny, the greater the savings. In the reference 4-step Finance Agent workflow, a deny at step 3 saves ~42% of tokens (670 tokens per blocked action).
+**Token economics**: Without rollback, a denied operation requires re-executing all prior steps from scratch. With rollback, the agent resumes from the last checkpoint. Actual savings depend entirely on where in the workflow the deny occurs and how many steps preceded it — ranging from 0% (deny at step 1) to near-100% (deny at final step of a long workflow). The reference GVM demo (4-step Finance Agent, deny at step 3) shows ~42% savings, but this is a single synthetic scenario and should not be generalized.
 
 ---
 
@@ -287,38 +287,39 @@ The SDK uses these headers to make intelligent recovery decisions (e.g., `X-GVM-
 
 ## 11.4 Summary Comparison Table
 
-### Tier 1: Why GVM Exists — OPA+Envoy Cannot Replicate These
+### Tier 1: Architecturally Unique — Would Require Rebuilding GVM
 
-These capabilities are architecturally unique to AI agent governance. Building them on top of OPA+Envoy would amount to rebuilding GVM.
+These capabilities require fundamentally different components that OPA+Envoy's architecture does not include. Replicating them means building new systems, not configuring existing ones.
 
-| Capability | OPA+Envoy | GVM | Why It Can't Be Replicated |
-|-----------|-----------|-----|---------------------------|
-| **Cross-layer lie detection** | None | `max_strict(ABAC, SRR)` | Requires two independent classification engines with semantic merge — no Envoy filter or Rego package provides this |
-| **LLM thinking trace extraction** | None | OpenAI/Anthropic/Gemini | Requires protocol-aware response parsing for multiple LLM providers — fundamentally outside Envoy's scope |
-| **Checkpoint/rollback** | Not in scope | Merkle-verified state restore | Requires deep SDK integration with agent state management — a proxy cannot provide this alone |
+| Capability | OPA+Envoy | GVM | Why |
+|-----------|-----------|-----|-----|
+| **LLM thinking trace extraction** | Not in scope | OpenAI/Anthropic/Gemini response parsing | Requires protocol-aware response body parsing for multiple LLM providers — fundamentally outside Envoy's scope (Envoy does not inspect response bodies) |
+| **Checkpoint/rollback** | Not in scope | Merkle-verified state restore via SDK | Requires deep SDK integration with agent state management — a proxy alone cannot manage agent-side state |
+| **4MB single binary, no K8s** | K8s + OPA server + Envoy sidecar | `cargo run` | OPA+Envoy is a distributed system by design; GVM is a single process. This is the most practical differentiator for VPS/EC2 deployments |
 
 ### Tier 2: Significant Engineering Effort on OPA+Envoy
 
-These are achievable with Envoy custom filters + OPA extensions + additional infrastructure, but the integration cost is high — each requires solving problems that OPA+Envoy were not designed for.
+Achievable with custom Envoy filters + OPA extensions + additional infrastructure, but the integration cost is high.
 
 | Capability | OPA+Envoy | GVM | What It Would Take |
 |-----------|-----------|-----|-------------------|
-| **Graduated enforcement (IC-2/IC-3)** | Binary allow/deny | Allow/Delay/RequireApproval/Deny | Custom Envoy filter with timer + approval queue + state machine |
+| **Cross-layer verification** | Rego can cross-check metadata vs URL | Built-in `max_strict(ABAC, SRR)` | Possible in Rego (~10 lines per operation), but GVM provides it as a default that cannot be accidentally omitted |
+| **Graduated enforcement (IC-2/IC-3)** | OPA can return arbitrary JSON; Envoy only interprets allow/deny | Allow/Delay/RequireApproval/Deny | Custom Envoy filter that reads OPA's extended response + timer + approval queue |
 | **Fail-close audit** | Best-effort logs | WAL fsync before forward | Separate WAL system + Envoy filter that blocks until WAL confirms |
-| **API key isolation** | Service holds keys | Proxy injects post-enforcement | Custom Envoy filter + secrets manager integration + header stripping logic |
-| **Hierarchical monotonic policy** | Flat Rego namespace | Global > Tenant > Agent | Rego convention + custom validation tooling (no structural guarantee) |
-| **Agent sandboxing** | Not in scope | namespace+seccomp+veth | Separate process manager + network namespace tooling |
+| **API key isolation** | Service holds keys (Vault sidecar possible) | Proxy injects post-enforcement + strips agent headers | Custom Envoy filter + secrets manager + header stripping logic |
+| **Agent sandboxing** | Not in scope | namespace+seccomp+veth+MITM | Separate process manager + network namespace tooling |
 
-### Tier 3: Additional Benefits — Also Achievable with OPA+Envoy
+### Tier 3: Additional Benefits — Moderate Effort to Replicate
 
-These are genuine advantages but can be replicated with moderate effort using existing OPA+Envoy primitives.
+Genuine advantages, but achievable with existing OPA+Envoy primitives or tooling conventions.
 
 | Capability | OPA+Envoy | GVM | Gap |
 |-----------|-----------|-----|-----|
-| **Payload inspection** | Custom plugins | Built-in `payload_field` matching | **GVM advantage** (built-in vs plugin) |
-| **Default-to-Caution** | Configurable (usually allow) | `Delay(300ms)` on unknown | **GVM advantage** (default posture) |
-| **IPv6 SSRF defense** | Literal matching | Canonical normalization | **GVM advantage** (built-in normalization) |
-| **Response metadata** | Allow/deny only | 7 governance headers | **GVM advantage** (structured feedback) |
+| **Hierarchical monotonic policy** | Rego data imports + Conftest/Styra DAS | Global > Tenant > Agent TOML merge | Both are conventions enforced by tooling; GVM's is simpler to set up |
+| **Payload inspection** | Custom plugins | Built-in `payload_field` matching | Built-in vs plugin |
+| **Default-to-Caution** | Configurable (usually allow) | `Delay(300ms)` on unknown | Default posture difference |
+| **IPv6 SSRF defense** | Literal matching | Canonical normalization | Built-in normalization |
+| **Response metadata** | Allow/deny only | 7 governance headers | Structured feedback loop |
 
 ### Shared Capabilities
 

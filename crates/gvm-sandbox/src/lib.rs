@@ -58,17 +58,26 @@ pub struct SandboxConfig {
     /// When set, uprobe queries the proxy's /gvm/check endpoint for SRR decisions.
     /// When None, uprobe uses allow-all (audit-only regardless of tls_probe_mode).
     pub proxy_url: Option<String>,
+    /// Memory limit for the sandboxed agent (bytes). None = no limit.
+    /// Applied via cgroup v2 `memory.max`. Example: Some(512 * 1024 * 1024) = 512MB.
+    pub memory_limit: Option<u64>,
+    /// CPU limit for the sandboxed agent as a fraction of one CPU. None = no limit.
+    /// Applied via cgroup v2 `cpu.max`. Example: Some(1.0) = 1 CPU, Some(0.5) = half CPU.
+    pub cpu_limit: Option<f64>,
 }
 
 /// TLS probe operating mode.
+///
+/// Default: Disabled. The uprobe is experimental and gated behind the `uprobe` feature flag.
+/// MITM (transparent TLS proxy) is the primary HTTPS inspection mechanism.
 #[derive(Debug, Clone, Default)]
 pub enum TlsProbeMode {
-    /// Log HTTPS plaintext but don't block (safe default for v0.1).
-    #[default]
+    /// Log HTTPS plaintext but don't block.
     Audit,
     /// Log and block denied HTTPS requests via SIGSTOP.
     Enforce,
-    /// Disable TLS probing entirely.
+    /// Disable TLS probing entirely (default).
+    #[default]
     Disabled,
 }
 
@@ -128,6 +137,8 @@ pub mod ca;
 #[cfg(target_os = "linux")]
 mod capability;
 #[cfg(target_os = "linux")]
+mod cgroup;
+#[cfg(target_os = "linux")]
 pub mod ebpf;
 #[cfg(target_os = "linux")]
 mod mount;
@@ -137,7 +148,7 @@ mod namespace;
 mod network;
 #[cfg(target_os = "linux")]
 mod seccomp;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "uprobe"))]
 pub mod tls_probe;
 
 #[cfg(target_os = "linux")]
@@ -164,6 +175,19 @@ pub fn launch_sandboxed(_config: SandboxConfig) -> Result<SandboxResult> {
         "Linux-native sandbox requires Linux (namespaces, seccomp-BPF). \
          On this platform, use --contained for Docker-based isolation instead."
     ))
+}
+
+/// Clean up orphaned network resources from a previous sandbox crash.
+/// Call this before launching a new sandbox to ensure a clean state.
+#[cfg(target_os = "linux")]
+pub fn cleanup_orphaned_network() -> Result<bool> {
+    network::cleanup_orphaned_network()
+}
+
+/// Stub for non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+pub fn cleanup_orphaned_network() -> Result<bool> {
+    Ok(false)
 }
 
 /// Run pre-flight checks to verify the system supports sandboxing.

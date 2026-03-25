@@ -1,7 +1,7 @@
 # Reference Guide
 
 > Configuration, CLI commands, and advanced options.
-> For first-time setup, see [Quick Start →](14-quickstart.md).
+> For first-time setup, see [Quick Start →](15-quickstart.md).
 
 ---
 
@@ -240,6 +240,25 @@ gvm check --operation gvm.payment.charge \
 gvm init --industry finance --config-dir config    # Scaffold from template
 ```
 
+### Agent Observation
+
+```bash
+gvm watch agent.py                   # Observe all API calls (no enforcement)
+gvm watch -- node my_agent.js        # Binary mode observation
+gvm watch --with-rules agent.py      # Observe with existing SRR rules active
+gvm watch --output json agent.py     # JSON output for CI/CD piping
+gvm watch --sandbox agent.py         # Observe inside Linux sandbox
+```
+
+`gvm watch` runs the agent with all requests allowed through (default). No SRR rules are enforced unless `--with-rules` is set. Provides:
+- **Real-time stream**: every HTTP request displayed as it happens (method, host, path, status, token usage)
+- **Session summary**: host breakdown, LLM token/cost stats, status code distribution, anomaly warnings
+- **Anomaly detection**: burst patterns (>10 req/2s), request loops (same URL >5x/10s), unknown hosts
+- **Cost estimation**: approximate USD cost based on LLM provider/model token pricing
+- **`--output json`**: all events as JSON lines + session summary as JSON object (for piping to `jq`, CI, etc.)
+
+Watch mode generates a temporary allow-all SRR config in the OS temp directory and reloads the proxy via `POST /gvm/reload`. The original SRR rules are restored when watch exits. The user's `srr_network.toml` is never modified.
+
 ### Agent Execution
 
 ```bash
@@ -393,4 +412,4 @@ See [`config/srr_network.toml`](../config/srr_network.toml) for the full rule se
 
 ---
 
-[← Quick Start](14-quickstart.md) | [Architecture Overview →](00-overview.md)
+[← Quick Start](15-quickstart.md) | [Architecture Overview →](00-overview.md)

@@ -614,6 +614,7 @@ async fn wal_sustained_load_10k_events() {
         batch_window: Duration::from_millis(2),
         max_batch_size: 256,
         channel_capacity: 8192,
+        ..Default::default()
     };
 
     let ledger = Arc::new(

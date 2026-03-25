@@ -34,3 +34,4 @@ hex = "0.4"
 gvm-sandbox = { path = "../gvm-sandbox" }
 url = "2"
 which = "7"
+tempfile = "3"

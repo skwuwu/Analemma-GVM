@@ -243,11 +243,13 @@ Both paths pre-compile regex at config load time (fail-fast on invalid patterns)
 
 ---
 
-### 12. WAL Recovery Memory Pressure
+### 12. WAL Recovery Memory Pressure (Fixed)
 
-**Issue**: `recover_from_wal()` uses `tokio::fs::read_to_string()` which loads the entire WAL file into memory. If the WAL grows to gigabytes, recovery could trigger OOM.
+**Issue**: `recover_from_wal()` originally used `tokio::fs::read_to_string()` which loaded the entire WAL into memory, and tracked all event_ids in an unbounded `HashSet` for deduplication — both causing OOM risk on large WALs.
 
-**Planned mitigation**: Switch to `BufReader` with line-by-line streaming. This is a v1.1 item.
+**Fix (v0.2)**: Two-part fix:
+1. **Streaming**: Switched to `BufReader` with line-by-line streaming (no full-file load).
+2. **High watermark**: Replaced the unbounded `HashSet` with a sidecar file (`<wal_path>.watermark`) that stores the byte offset of the last completed recovery. Subsequent recoveries seek directly to the watermark and scan only new events — O(1) memory, zero false positives. The watermark is written atomically (write-tmp + rename) to prevent partial state.
 
 ---
 
@@ -280,6 +282,47 @@ Both paths pre-compile regex at config load time (fail-fast on invalid patterns)
 **Issue**: `wal_sequence` is initialized to `AtomicU64::new(0)` on every proxy restart. This creates duplicate sequence numbers across restarts, which could confuse NATS consumers.
 
 **Status**: Acknowledged in code as TODO. Will be fixed when NATS JetStream integration is implemented (v2) — recovery will initialize from last WAL event count.
+
+---
+
+### 16. Tokio Worker Starvation on TLS Cert Generation (Fixed)
+
+**Issue**: `GvmCertResolver::resolve()` (rustls sync callback) ran CPU-bound ECDSA keygen directly on tokio worker threads. 50 concurrent new-domain TLS handshakes would starve all async I/O — WAL writes, HTTP proxy, policy evaluation.
+
+**Fix (v0.2)**: Two-phase approach: `peek_sni()` extracts SNI from raw TCP via `stream.peek()` (non-consuming), then `ensure_cached()` offloads keygen to `tokio::task::spawn_blocking`. The TLS handshake always hits cache (0ns). Sync fallback preserved for correctness.
+
+---
+
+### 17. HTTP Request Smuggling in TLS MITM Path (Fixed)
+
+**Issue**: `read_http_request` in the TLS MITM pipeline accepted requests with both `Content-Length` and `Transfer-Encoding` headers. Parser desync between httparse (GVM) and the upstream server could let an attacker smuggle a second request inside the body of the first, bypassing SRR inspection.
+
+**Fix (v0.2)**: Zero-tolerance rejection per RFC 7230 §3.3.3:
+- Reject if both `Content-Length` and `Transfer-Encoding` are present
+- Reject if multiple `Content-Length` headers have differing values
+- 400 error (connection dropped) on any violation
+
+**Note**: The HTTP proxy path (port 8080) is protected by hyper/axum which enforces RFC 7230 strictness internally. This fix covers the TLS MITM path (port 8443) which uses raw httparse.
+
+---
+
+### 18. FD Exhaustion / Slowloris on TLS Listener (Fixed)
+
+**Issue**: TLS listener (port 8443) accepted unlimited connections with no timeout on handshake or read. Slowloris attacks (1 byte/sec) could exhaust the FD limit (ulimit -n), preventing WAL writes and HTTP listener accept().
+
+**Fix (v0.2)**:
+- `Semaphore(1024)` bounds concurrent TLS connections (matching HTTP listener's ConcurrencyLimit)
+- 10s TLS handshake timeout (drops incomplete ClientHello)
+- 30s HTTP request read timeout in `read_http_request`
+- 60s upstream relay timeout (prevents zombie connections on hanging upstreams)
+
+---
+
+### 19. Sandbox PID 1 Zombie Accumulation (Fixed)
+
+**Issue**: `CLONE_NEWPID` makes the agent process PID 1 in its namespace. PID 1 is responsible for reaping orphaned children via `waitpid()`. Agent interpreters (Python, Node) don't implement this — orphaned subprocesses become zombies, eventually exhausting the PID table.
+
+**Fix (v0.2)**: `fork()` inside the namespace after setup. PID 1 stays as a minimal init reaper (`waitpid(-1)` loop), the child execs the agent. Equivalent to tini/dumb-init without an external dependency. Agent exit code is correctly propagated to the parent outside the namespace.
 
 ---
 

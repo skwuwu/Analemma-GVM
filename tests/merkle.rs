@@ -63,10 +63,9 @@ async fn merkle_event_hash_embedded_in_wal() {
         .await
         .expect("single event append must succeed");
 
-    // Allow batch to flush
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    // append_durable().await already guarantees fsync completed (group commit
+    // waits for oneshot reply). No sleep needed — data is on disk.
     drop(ledger);
-    tokio::time::sleep(Duration::from_millis(10)).await;
 
     let content = tokio::fs::read_to_string(&wal_path)
         .await
@@ -142,9 +141,8 @@ async fn merkle_batch_record_written_to_wal() {
             .expect("batch event append must succeed");
     }
 
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    // No sleep needed: append_durable().await guarantees fsync completed.
     drop(ledger);
-    tokio::time::sleep(Duration::from_millis(10)).await;
 
     let content = tokio::fs::read_to_string(&wal_path)
         .await
@@ -187,9 +185,8 @@ async fn merkle_batch_root_recomputable() {
             .expect("balanced tree event append must succeed");
     }
 
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    // No sleep needed: append_durable().await guarantees fsync completed.
     drop(ledger);
-    tokio::time::sleep(Duration::from_millis(10)).await;
 
     let content = tokio::fs::read_to_string(&wal_path)
         .await
@@ -234,6 +231,7 @@ async fn merkle_inter_batch_chain() {
         batch_window: Duration::ZERO,
         max_batch_size: 2, // Force small batches
         channel_capacity: 32,
+        ..Default::default()
     };
     let ledger = Ledger::with_config(&wal_path, "", "", config)
         .await
@@ -250,9 +248,8 @@ async fn merkle_inter_batch_chain() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // No sleep needed: last append_durable().await guarantees fsync completed.
     drop(ledger);
-    tokio::time::sleep(Duration::from_millis(10)).await;
 
     let content = tokio::fs::read_to_string(&wal_path)
         .await
@@ -316,9 +313,8 @@ async fn merkle_wal_verification_valid() {
             .expect("verification event append must succeed");
     }
 
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    // No sleep needed: append_durable().await guarantees fsync completed.
     drop(ledger);
-    tokio::time::sleep(Duration::from_millis(10)).await;
 
     let content = tokio::fs::read_to_string(&wal_path)
         .await
@@ -349,9 +345,8 @@ async fn merkle_wal_verification_detects_tampered_event() {
             .expect("tamper test event append must succeed");
     }
 
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    // No sleep needed: append_durable().await guarantees fsync completed.
     drop(ledger);
-    tokio::time::sleep(Duration::from_millis(10)).await;
 
     // Read and tamper with the WAL
     let content = tokio::fs::read_to_string(&wal_path)
@@ -408,6 +403,7 @@ async fn merkle_wal_verification_detects_broken_chain() {
         batch_window: Duration::ZERO,
         max_batch_size: 2,
         channel_capacity: 32,
+        ..Default::default()
     };
     let ledger = Ledger::with_config(&wal_path, "", "", config)
         .await
@@ -422,9 +418,8 @@ async fn merkle_wal_verification_detects_broken_chain() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // No sleep needed: last append_durable().await guarantees fsync completed.
     drop(ledger);
-    tokio::time::sleep(Duration::from_millis(10)).await;
 
     let content = tokio::fs::read_to_string(&wal_path)
         .await
@@ -482,9 +477,8 @@ async fn merkle_proof_proves_event_in_batch() {
             .expect("proof test event append must succeed");
     }
 
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    // No sleep needed: append_durable().await guarantees fsync completed.
     drop(ledger);
-    tokio::time::sleep(Duration::from_millis(10)).await;
 
     let content = tokio::fs::read_to_string(&wal_path)
         .await
@@ -562,9 +556,8 @@ async fn merkle_concurrent_writes_produce_valid_roots() {
         handle.await.expect("concurrent write task must not panic");
     }
 
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // No sleep needed: last append_durable().await guarantees fsync completed.
     drop(ledger);
-    tokio::time::sleep(Duration::from_millis(10)).await;
 
     let content = tokio::fs::read_to_string(&wal_path)
         .await
@@ -607,9 +600,8 @@ async fn merkle_all_event_hashes_unique() {
         handle.await.expect("unique hash write task must not panic");
     }
 
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    // No sleep needed: append_durable().await guarantees fsync completed.
     drop(ledger);
-    tokio::time::sleep(Duration::from_millis(10)).await;
 
     let content = tokio::fs::read_to_string(&wal_path)
         .await

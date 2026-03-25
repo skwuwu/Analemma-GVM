@@ -102,10 +102,10 @@
 
 **Ledger** (`src/ledger.rs`):
 - [x] Shutdown flush remaining batch
-- [x] Recovery dedup by `event_id`
-- [ ] `wal_sequence` persist across restart (currently resets to 0)
-- [ ] Streaming WAL recovery (`BufReader` line-by-line instead of `read_to_string`)
-- [ ] WAL rotation (size-based segment split with Merkle chain linking)
+- [x] Recovery dedup by high watermark (O(1) memory, replaces unbounded `HashSet<event_id>`)
+- [x] `wal_sequence` persist across restart (initialized from WAL event count during recovery)
+- [x] Streaming WAL recovery (`BufReader` line-by-line instead of `read_to_string`)
+- [x] WAL rotation (size-based segment split, Merkle chain linking via `prev_batch_root`, configurable max size + segment retention)
 
 **Rate Limiter** (`src/rate_limiter.rs`):
 - [x] Mutex poison → return false (Fail-Close)
@@ -172,6 +172,8 @@
 - [x] `gvm run` binary mode (`gvm run -- openclaw gateway` with HTTPS_PROXY injection)
 - [x] MCP integration (intent lifecycle for MCP-compatible governance)
 - [x] Telegram/Discord rulesets (Telegram Bot API path_regex, Discord channel/guild delete rules)
+- [x] Transparent MITM in sandbox (ephemeral CA generation, sandbox CA injection, DNAT 443→8443, TLS MITM listener on port 8443)
+- [x] Per-domain leaf cert generation via SNI (`tls_proxy.rs`)
 
 ---
 

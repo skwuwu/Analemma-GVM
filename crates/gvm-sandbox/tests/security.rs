@@ -98,6 +98,8 @@ fn preflight_report_non_linux_has_ebpf_false() {
             seccomp_profile: None,
             tls_probe_mode: TlsProbeMode::Disabled,
             proxy_url: None,
+            memory_limit: None,
+            cpu_limit: None,
         };
         let report = preflight_check(&config);
         assert!(
@@ -121,6 +123,8 @@ fn sandbox_config_clone() {
         seccomp_profile: Some(SeccompProfile::Default),
         tls_probe_mode: TlsProbeMode::Disabled,
         proxy_url: None,
+        memory_limit: None,
+        cpu_limit: None,
     };
 
     let cloned = config.clone();
@@ -164,8 +168,11 @@ mod ebpf_tests {
         // Either way, it must NOT panic
         match result {
             EbpfAttachResult::Attached { .. } => {
-                // Clean up if somehow it attached (shouldn't happen)
                 detach_tc_filter("nonexistent-iface-12345");
+                panic!(
+                    "TC filter attached to non-existent interface — this should never happen \
+                     and indicates a bug in the eBPF attachment logic"
+                );
             }
             EbpfAttachResult::Unavailable { reason } => {
                 assert!(!reason.is_empty(), "Unavailable reason must not be empty");
@@ -221,6 +228,8 @@ fn launch_on_non_linux_returns_error() {
         seccomp_profile: None,
         tls_probe_mode: TlsProbeMode::Disabled,
         proxy_url: None,
+        memory_limit: None,
+        cpu_limit: None,
     };
 
     let result = launch_sandboxed(config);

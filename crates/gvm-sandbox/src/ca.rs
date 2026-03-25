@@ -1,19 +1,14 @@
 //! Ephemeral CA for transparent MITM TLS inspection inside sandboxes.
 //!
 //! Generates a per-session CA certificate and private key entirely in memory.
-//! The CA is injected into the sandbox's trust store via memfd/tmpfs — no
+//! The CA is injected into the sandbox's trust store via tmpfs — no
 //! cryptographic material ever touches the host disk.
 //!
 //! Leaf certificates are generated on-demand per domain (via SNI) and cached
 //! in a concurrent map for reuse within the session.
 
 use anyhow::{Context, Result};
-use rcgen::{
-    BasicConstraints, CertificateParams, CertifiedKey as RcgenCertifiedKey, DistinguishedName,
-    DnType, IsCa, KeyPair,
-};
-use std::sync::Arc;
-use std::time::Duration;
+use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
 use zeroize::Zeroize;
 
 /// Ephemeral CA — lives only in memory, zeroized on drop.
@@ -43,9 +38,11 @@ impl EphemeralCA {
             dn.push(DnType::OrganizationName, "Analemma GVM");
             dn
         };
-        // 24-hour validity — ephemeral, single session
-        params.not_before = rcgen::date_time_ymd(2020, 1, 1);
-        params.not_after = rcgen::date_time_ymd(2099, 12, 31);
+        // 24-hour validity window centered on now.
+        // Backdated not_before tolerates clock drift up to 24 hours.
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::hours(24);
+        params.not_after = now + time::Duration::hours(24);
 
         let ca_cert = params
             .self_signed(&key_pair)
@@ -67,6 +64,11 @@ impl EphemeralCA {
         &self.ca_cert_pem
     }
 
+    /// Get the CA private key in PEM format (for MITM TLS listener).
+    pub fn ca_key_pem(&self) -> Vec<u8> {
+        self.ca_key.serialize_pem().into_bytes()
+    }
+
     /// Issue a leaf certificate for the given domain, signed by this CA.
     ///
     /// Uses ECDSA P-256 (~0.1ms per generation). Caller should cache the result.
@@ -81,6 +83,10 @@ impl EphemeralCA {
             dn.push(DnType::CommonName, domain);
             dn
         };
+        // Backdate leaf cert for clock drift tolerance (matches CA window)
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::hours(24);
+        params.not_after = now + time::Duration::hours(24);
 
         let leaf_cert = params
             .signed_by(&leaf_key, &self.ca_cert, &self.ca_key)

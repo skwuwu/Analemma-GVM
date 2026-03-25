@@ -936,6 +936,7 @@ async fn nats_channel_backpressure_bounded() {
         batch_window: std::time::Duration::ZERO,
         max_batch_size: 16,
         channel_capacity: 32,
+        ..Default::default()
     };
 
     let ledger = Arc::new(

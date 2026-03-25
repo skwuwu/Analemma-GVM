@@ -750,23 +750,53 @@ mod tests {
 
     #[test]
     fn test_privacy_hash_domain_separated() {
-        // Verify the hash includes the domain prefix
-        let thinking = "test content".to_string();
+        // Verify the hash includes the domain separation prefix.
+        // Expected value is a HARDCODED known-good hash, NOT computed from the
+        // same code path. This catches bugs where the domain prefix is missing,
+        // changed, or the hash algorithm is wrong.
+        //
+        // Computed externally: SHA256("gvm-thinking-v1|test content")
+        const EXPECTED_HASH: &str =
+            "sha256:a361a2d4916a188611aa2597d124b07675e4b9c553af1cb0de9ffd2bddd73218";
+
         let trace = apply_thinking_privacy(LLMTrace {
             provider: "openai".to_string(),
             model: None,
-            thinking: Some(thinking.clone()),
+            thinking: Some("test content".to_string()),
             truncated: false,
             usage: None,
         });
 
-        // Compute expected hash
-        let mut hasher = Sha256::new();
-        hasher.update(b"gvm-thinking-v1|");
-        hasher.update(thinking.as_bytes());
-        let expected = format!("sha256:{}", hex::encode(hasher.finalize()));
+        assert_eq!(
+            trace.thinking.as_deref(),
+            Some(EXPECTED_HASH),
+            "Privacy hash must match known-good value with domain separation prefix"
+        );
+    }
 
-        assert_eq!(trace.thinking.as_deref(), Some(expected.as_str()));
+    #[test]
+    fn test_privacy_hash_without_domain_prefix_differs() {
+        // Negative test: verify that removing the domain prefix would produce
+        // a DIFFERENT hash. This proves domain separation is actually load-bearing.
+        //
+        // SHA256("test content") without prefix:
+        const HASH_WITHOUT_PREFIX: &str =
+            "sha256:6ae8a75555209fd6c44157c0aed8016e763ff435a19cf186f76863140143ff72";
+
+        let trace = apply_thinking_privacy(LLMTrace {
+            provider: "openai".to_string(),
+            model: None,
+            thinking: Some("test content".to_string()),
+            truncated: false,
+            usage: None,
+        });
+
+        assert_ne!(
+            trace.thinking.as_deref(),
+            Some(HASH_WITHOUT_PREFIX),
+            "Hash WITHOUT domain prefix must differ from hash WITH prefix — \
+             domain separation must be effective"
+        );
     }
 
     // ─── SSE streaming tests ───

@@ -122,6 +122,8 @@ async fn main() {
     let wal_config = gvm_proxy::ledger::GroupCommitConfig {
         batch_window: std::time::Duration::from_millis(config.wal.batch_window_ms),
         max_batch_size: config.wal.max_batch_size,
+        max_wal_bytes: config.wal.max_wal_bytes,
+        max_wal_segments: config.wal.max_wal_segments,
         ..Default::default()
     };
     let ledger = Ledger::with_config(
@@ -133,6 +135,7 @@ async fn main() {
     .await
     .expect("Failed to initialize ledger");
     let ledger = Arc::new(ledger);
+    let ledger_for_shutdown = ledger.clone();
 
     // 7. Run WAL crash recovery
     match ledger.recover_from_wal().await {
@@ -267,6 +270,17 @@ async fn main() {
         }
     };
 
+    // 9.9. Generate ephemeral CA for MITM TLS inspection.
+    // Single CA shared between:
+    //   - TLS MITM listener (port 8443) — uses it to terminate agent TLS
+    //   - GET /gvm/ca.pem endpoint — sandbox downloads it for trust store injection
+    // This ensures the CA injected into the sandbox matches the one used by the listener.
+    let mitm_ca = gvm_sandbox::ca::EphemeralCA::generate()
+        .expect("Failed to generate ephemeral MITM CA");
+    let mitm_ca_cert_pem = Arc::new(mitm_ca.ca_cert_pem().to_vec());
+    let mitm_ca_key_pem = Arc::new(mitm_ca.ca_key_pem());
+    tracing::info!("Ephemeral MITM CA generated (shared between TLS listener and sandbox)");
+
     // 10. Print startup policy summary
     print_startup_summary(&srr, &policy, &registry, &api_keys);
 
@@ -289,6 +303,11 @@ async fn main() {
             config.shadow.intent_ttl_secs,
         )),
         srr_config_path: config.srr.network_file.clone(),
+        mitm_ca_pem: Some(mitm_ca_cert_pem.clone()),
+        payload_inspection: config.srr.payload_inspection,
+        max_body_bytes: config.srr.max_body_bytes,
+        pending_approvals: Arc::new(dashmap::DashMap::new()),
+        ic3_approval_timeout_secs: config.enforcement.ic3_approval_timeout_secs,
         shadow_config: {
             // GVM_SHADOW_MODE env var overrides config (MCP server sets this)
             let mut sc = config.shadow.clone();
@@ -316,6 +335,9 @@ async fn main() {
         .route("/gvm/check", axum::routing::post(api::check))
         .route("/gvm/intent", axum::routing::post(api::register_intent))
         .route("/gvm/reload", axum::routing::post(api::reload_srr))
+        .route("/gvm/pending", axum::routing::get(api::pending_approvals))
+        .route("/gvm/approve", axum::routing::post(api::approve_request))
+        .route("/gvm/ca.pem", axum::routing::get(serve_mitm_ca))
         .route("/gvm/auth/token", axum::routing::post(api::auth_token))
         .route(
             "/gvm/vault/:key",
@@ -361,8 +383,10 @@ async fn main() {
     };
 
     let tls_state = connect_state.clone();
+    let tls_ca_cert = mitm_ca_cert_pem.clone();
+    let tls_ca_key = mitm_ca_key_pem.clone();
     tokio::spawn(async move {
-        if let Err(e) = start_tls_listener(&tls_port, tls_state).await {
+        if let Err(e) = start_tls_listener(&tls_port, tls_state, &tls_ca_cert, &tls_ca_key).await {
             tracing::warn!(error = %e, "TLS MITM listener failed to start (sandbox HTTPS inspection unavailable)");
         }
     });
@@ -372,17 +396,134 @@ async fn main() {
     let app_for_connect = app.clone();
     let state_for_connect = connect_state;
 
+    // ── Graceful shutdown: two-phase ──
+    // Phase 1: Accept connections until shutdown signal (SIGTERM/SIGINT).
+    // Phase 2: Stop accepting new connections, drain in-flight requests
+    //          (up to drain_timeout_secs), flush WAL, exit.
+    let drain_timeout = std::time::Duration::from_secs(config.server.drain_timeout_secs);
+
+    // Track spawned connection handles so we can abort them after drain timeout.
+    // This guarantees Arc<Ledger> references are released for WAL shutdown flush.
+    let mut connection_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
     loop {
-        let (stream, _addr) = match listener.accept().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                tracing::error!(error = %e, "Accept failed");
-                continue;
+        tokio::select! {
+            conn = listener.accept() => {
+                match conn {
+                    Ok((stream, _addr)) => {
+                        let app = app_for_connect.clone();
+                        let cs = state_for_connect.clone();
+                        let handle = tokio::spawn(async move {
+                            serve_connection(stream, app, cs).await;
+                        });
+                        connection_handles.push(handle);
+                        // Periodically clean up finished handles to avoid unbounded growth
+                        if connection_handles.len() > 2048 {
+                            connection_handles.retain(|h| !h.is_finished());
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Accept failed");
+                    }
+                }
             }
-        };
-        let app = app_for_connect.clone();
-        let cs = state_for_connect.clone();
-        tokio::spawn(serve_connection(stream, app, cs));
+            _ = shutdown_signal() => {
+                tracing::info!("Shutdown signal received — entering graceful shutdown");
+                break;
+            }
+        }
+    }
+
+    // Phase 2: Drain in-flight connections
+    // Remove already-finished handles first
+    connection_handles.retain(|h| !h.is_finished());
+    let active = connection_handles.len();
+
+    if active > 0 {
+        tracing::info!(
+            active_connections = active,
+            drain_timeout_secs = drain_timeout.as_secs(),
+            "Draining in-flight connections (new connections refused)..."
+        );
+
+        // Wait for all handles with timeout
+        let drain_result = tokio::time::timeout(
+            drain_timeout,
+            futures_util::future::join_all(
+                connection_handles.iter_mut().map(|h| async { h.await.ok(); }),
+            ),
+        )
+        .await;
+
+        match drain_result {
+            Ok(_) => {
+                tracing::info!("All connections drained cleanly");
+            }
+            Err(_) => {
+                // Drain timeout exceeded — abort remaining connections.
+                // This drops their Arc<AppState> (which holds Arc<Ledger>),
+                // allowing try_unwrap to succeed for WAL shutdown flush.
+                let remaining = connection_handles.iter().filter(|h| !h.is_finished()).count();
+                tracing::warn!(
+                    remaining,
+                    "Drain timeout reached — aborting {} remaining connections to release WAL",
+                    remaining
+                );
+                for h in &connection_handles {
+                    if !h.is_finished() {
+                        h.abort();
+                    }
+                }
+                // Brief yield to let abort propagate and drop Arc refs
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+    drop(connection_handles); // Ensure all handles are dropped
+
+    // Phase 3: Flush WAL
+    // Drop all other Arc<AppState> references so only ledger_for_shutdown remains.
+    drop(app_for_connect);
+    drop(state_for_connect);
+
+    match Arc::try_unwrap(ledger_for_shutdown) {
+        Ok(mut ledger) => {
+            ledger.shutdown().await;
+        }
+        Err(arc) => {
+            // This should not happen after aborting all connections, but handle gracefully.
+            let strong = Arc::strong_count(&arc);
+            tracing::warn!(
+                strong_refs = strong,
+                "WAL shutdown: {} references still held — batch task will flush on final drop",
+                strong
+            );
+            // Drop our reference. The batch task will flush when the last ref drops.
+            drop(arc);
+        }
+    }
+
+    tracing::info!("GVM Proxy shut down cleanly");
+}
+
+/// Wait for a shutdown signal (Ctrl+C or SIGTERM on Unix).
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("Failed to install SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await.ok();
     }
 }
 
@@ -408,6 +549,22 @@ async fn serve_connection(
     }
 }
 
+/// Serve the MITM CA certificate PEM for sandbox trust store injection.
+/// Sandbox can download this via `curl http://proxy:8080/gvm/ca.pem` and inject into /etc/ssl/certs/.
+async fn serve_mitm_ca(
+    axum::extract::State(state): axum::extract::State<gvm_proxy::proxy::AppState>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match &state.mitm_ca_pem {
+        Some(pem) => (
+            [(axum::http::header::CONTENT_TYPE, "application/x-pem-file")],
+            pem.as_ref().clone(),
+        )
+            .into_response(),
+        None => axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 async fn route_request(
     req: Request<hyper::body::Incoming>,
     app: axum::Router,
@@ -427,6 +584,18 @@ async fn route_request(
     Ok(resp)
 }
 
+/// Maximum concurrent TLS MITM connections.
+/// Matches the HTTP listener's ConcurrencyLimitLayer(1024).
+/// Prevents FD exhaustion on port 8443 — excess connections wait on the semaphore.
+const MAX_TLS_CONNECTIONS: usize = 1024;
+
+/// TLS handshake timeout. Defends against Slowloris on the TLS layer:
+/// attacker opens TCP, sends partial ClientHello, never completes.
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Upstream connect + relay timeout. Prevents zombie connections when upstream hangs.
+const UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// TLS MITM listener for sandbox HTTPS inspection.
 ///
 /// Accepts TLS connections on port 8443, terminates TLS using the ephemeral CA,
@@ -434,34 +603,23 @@ async fn route_request(
 async fn start_tls_listener(
     listen_addr: &str,
     state: gvm_proxy::proxy::AppState,
+    ca_cert_pem: &[u8],
+    ca_key_pem: &[u8],
 ) -> anyhow::Result<()> {
-    use gvm_proxy::tls_proxy::{
-        build_client_config, build_server_config, read_http_request, GvmCertResolver,
-    };
-    use tokio::io::AsyncWriteExt;
+    use gvm_proxy::tls_proxy::{build_client_config, build_server_config, GvmCertResolver};
 
     // Install crypto provider
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
 
-    // Generate ephemeral CA for this session
-    let ca = gvm_sandbox::ca::EphemeralCA::generate()?;
-    let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
-    let mut ca_params = rcgen::CertificateParams::default();
-    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    ca_params.distinguished_name = {
-        let mut dn = rcgen::DistinguishedName::new();
-        dn.push(rcgen::DnType::CommonName, "GVM MITM CA");
-        dn
-    };
-    let ca_cert = ca_params.self_signed(&ca_key)?;
-    let ca_cert_pem = ca_cert.pem().into_bytes();
-    let ca_key_pem = ca_key.serialize_pem().into_bytes();
-
-    let resolver = std::sync::Arc::new(GvmCertResolver::new(&ca_cert_pem, &ca_key_pem)?);
-    let server_config = std::sync::Arc::new(build_server_config(resolver)?);
+    // Use the shared ephemeral CA (generated once in main, same CA injected into sandbox trust store)
+    let resolver = std::sync::Arc::new(GvmCertResolver::new(ca_cert_pem, ca_key_pem)?);
+    let server_config = std::sync::Arc::new(build_server_config(resolver.clone())?);
     let client_config = std::sync::Arc::new(build_client_config()?);
+
+    // Semaphore: bound concurrent TLS connections to prevent FD exhaustion.
+    let conn_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_TLS_CONNECTIONS));
 
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     tracing::info!(address = %listen_addr, "GVM TLS MITM proxy listening");
@@ -475,12 +633,23 @@ async fn start_tls_listener(
             }
         };
 
+        let permit = match conn_semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!(addr = %addr, "TLS connection rejected: at capacity ({} max)", MAX_TLS_CONNECTIONS);
+                drop(stream);
+                continue;
+            }
+        };
+
         let sc = server_config.clone();
         let cc = client_config.clone();
         let st = state.clone();
+        let res = resolver.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_tls_connection(stream, sc, cc, st).await {
+            let _permit = permit; // held until task completes → auto-released on drop
+            if let Err(e) = handle_tls_connection(stream, sc, cc, st, res).await {
                 tracing::debug!(error = %e, addr = %addr, "TLS connection error");
             }
         });
@@ -488,26 +657,37 @@ async fn start_tls_listener(
 }
 
 /// Handle a single MITM TLS connection:
-/// 1. TLS handshake with agent (using ephemeral leaf cert from SNI)
-/// 2. Read plaintext HTTP request
-/// 3. Apply SRR policy check
-/// 4. If allowed: connect to upstream, forward request, relay response
-/// 5. If denied: return 403 to agent
+/// 1. Peek SNI + pre-warm cert cache on blocking thread (avoids tokio starvation)
+/// 2. TLS handshake with agent (cert already cached → 0ns resolve)
+/// 3. Read plaintext HTTP request (with timeout + smuggling defense)
+/// 4. Apply SRR policy check
+/// 5. If allowed: connect to upstream, forward request, relay response
+/// 6. If denied: return 403 to agent
 async fn handle_tls_connection(
     stream: tokio::net::TcpStream,
     server_config: std::sync::Arc<rustls::ServerConfig>,
     client_config: std::sync::Arc<rustls::ClientConfig>,
     state: gvm_proxy::proxy::AppState,
+    resolver: std::sync::Arc<gvm_proxy::tls_proxy::GvmCertResolver>,
 ) -> anyhow::Result<()> {
-    use gvm_proxy::tls_proxy::read_http_request;
+    use gvm_proxy::tls_proxy::{peek_sni, read_http_request};
     use tokio::io::AsyncWriteExt;
     use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-    // 1. TLS handshake (SNI → dynamic cert via GvmCertResolver)
-    let acceptor = TlsAcceptor::from(server_config);
-    let mut tls_stream = acceptor.accept(stream).await?;
+    // 1. Pre-warm cert cache: peek SNI from raw TCP, generate cert on blocking
+    //    thread pool. This prevents CPU-bound keygen from starving tokio workers.
+    //    50 concurrent new-domain handshakes would otherwise block all async I/O.
+    if let Some(sni) = peek_sni(&stream).await {
+        resolver.ensure_cached(sni).await;
+    }
 
-    // 2. Read plaintext HTTP from decrypted stream
+    // 2. TLS handshake with timeout (SNI → cache hit from step 1)
+    let acceptor = TlsAcceptor::from(server_config);
+    let mut tls_stream = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
+        .await
+        .map_err(|_| anyhow::anyhow!("TLS handshake timed out"))??;
+
+    // 3. Read plaintext HTTP from decrypted stream (has its own 30s timeout)
     let req = read_http_request(&mut tls_stream).await?;
 
     let host = if req.host.is_empty() {
@@ -523,7 +703,7 @@ async fn handle_tls_connection(
         "MITM: inspecting HTTPS request"
     );
 
-    // 3. SRR policy check
+    // 4. SRR policy check
     let srr_result = {
         let srr = state.srr.read().unwrap_or_else(|e| e.into_inner());
         let body_ref = if req.body.is_empty() {
@@ -537,10 +717,9 @@ async fn handle_tls_connection(
     let decision = &srr_result.decision;
     tracing::info!(decision = ?decision, host = %host, path = %req.path, "MITM: SRR decision");
 
-    // 4. Enforce decision
+    // 5. Enforce decision
     match decision {
         gvm_types::EnforcementDecision::Deny { reason } => {
-            // Return 403 to agent
             let response = format!(
                 "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\r\n\
                  {{\"blocked\":true,\"decision\":\"Deny\",\"reason\":\"{}\"}}\r\n",
@@ -557,34 +736,51 @@ async fn handle_tls_connection(
         _ => {} // Allow, AuditOnly, etc. — proceed
     }
 
-    // 5. Connect to upstream with TLS
-    let connector = TlsConnector::from(client_config);
-    let upstream_host = host.split(':').next().unwrap_or(&host);
-    let upstream_addr = format!("{}:443", upstream_host);
-
-    let upstream_tcp = tokio::net::TcpStream::connect(&upstream_addr).await?;
-    let server_name = rustls::pki_types::ServerName::try_from(upstream_host.to_string())?;
-    let mut upstream_tls = connector.connect(server_name, upstream_tcp).await?;
-
-    // 6. Forward the original request (reconstruct from parsed parts)
-    upstream_tls.write_all(&req.raw_head).await?;
-    if !req.body.is_empty() {
-        upstream_tls.write_all(&req.body).await?;
+    // 6. API key injection (Layer 3) — strip agent auth headers, inject proxy credentials.
+    //    This is the MITM equivalent of the HTTP path's api_keys.inject().
+    //    The agent never holds API keys; the proxy injects them post-enforcement.
+    let mut req = req;
+    if req.inject_credentials(&state.api_keys) {
+        tracing::info!(host = %host, "MITM: API key injected for upstream");
     }
 
-    // 7. Relay upstream response back to agent
-    let mut buf = vec![0u8; 8192];
-    loop {
-        use tokio::io::AsyncReadExt;
-        let n = upstream_tls.read(&mut buf).await?;
-        if n == 0 {
-            break;
+    // 7. Connect to upstream with TLS (with timeout)
+    let upstream_result = tokio::time::timeout(UPSTREAM_TIMEOUT, async {
+        let connector = TlsConnector::from(client_config);
+        let upstream_host = host.split(':').next().unwrap_or(&host);
+        let upstream_addr = format!("{}:443", upstream_host);
+
+        let upstream_tcp = tokio::net::TcpStream::connect(&upstream_addr).await?;
+        let server_name = rustls::pki_types::ServerName::try_from(upstream_host.to_string())?;
+        let mut upstream_tls = connector.connect(server_name, upstream_tcp).await?;
+
+        // 8. Forward the request (with injected credentials)
+        upstream_tls.write_all(&req.raw_head).await?;
+        if !req.body.is_empty() {
+            upstream_tls.write_all(&req.body).await?;
         }
-        tls_stream.write_all(&buf[..n]).await?;
-    }
 
-    tls_stream.shutdown().await.ok();
-    Ok(())
+        // 8. Relay upstream response back to agent
+        let mut buf = vec![0u8; 8192];
+        loop {
+            use tokio::io::AsyncReadExt;
+            let n = upstream_tls.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            tls_stream.write_all(&buf[..n]).await?;
+        }
+
+        tls_stream.shutdown().await.ok();
+        Ok::<(), anyhow::Error>(())
+    })
+    .await;
+
+    match upstream_result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => anyhow::bail!("Upstream relay timed out ({}s)", UPSTREAM_TIMEOUT.as_secs()),
+    }
 }
 
 /// Print a human-readable startup summary of loaded governance rules.
