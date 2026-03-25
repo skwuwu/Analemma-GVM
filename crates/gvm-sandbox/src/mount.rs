@@ -148,18 +148,17 @@ pub fn setup_mount_namespace(
     }
 
     // pivot_root: swap root filesystem
-    // First, make the mount tree private. pivot_root requires that the new root
-    // is not shared. Without CLONE_NEWUSER (root mode on kernel 6.17+), the
-    // mount namespace inherits shared propagation from the parent, which causes
-    // pivot_root to return EINVAL.
+    // Make new_root a private mount. pivot_root requires that the new root
+    // is not on a shared mount. Only privatize new_root (not "/") to avoid
+    // breaking bind-mounts of interpreter libraries set up earlier.
     mount(
         None::<&str>,
-        "/",
+        &new_root,
         None::<&str>,
-        MsFlags::MS_PRIVATE | MsFlags::MS_REC,
+        MsFlags::MS_PRIVATE,
         None::<&str>,
     )
-    .context("Failed to make root mount private for pivot_root")?;
+    .context("Failed to make new_root mount private for pivot_root")?;
 
     let old_root = new_root.join("old_root");
     std::fs::create_dir_all(&old_root)?;
