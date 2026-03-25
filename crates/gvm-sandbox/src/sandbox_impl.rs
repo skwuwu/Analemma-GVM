@@ -45,13 +45,30 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         None
     };
 
+    // Pre-mount workspace in parent process BEFORE clone().
+    // Kernel 6.17+ blocks bind-mount of host paths inside user namespaces.
+    // By mounting in the parent (which has real root), the mount is visible
+    // to the child's mount namespace via inheritance.
+    let staging_ws = std::path::PathBuf::from("/tmp/gvm-sandbox-staging-ws");
+    std::fs::create_dir_all(&staging_ws)
+        .context("Failed to create workspace staging directory")?;
+    nix::mount::mount(
+        Some(&config.workspace_dir),
+        &staging_ws,
+        None::<&str>,
+        nix::mount::MsFlags::MS_BIND | nix::mount::MsFlags::MS_REC,
+        None::<&str>,
+    )
+    .with_context(|| format!(
+        "Failed to pre-mount workspace in parent: {} → {}",
+        config.workspace_dir.display(), staging_ws.display()
+    ))?;
+
     // Create coordination pipe
     let (parent_fd, child_fd) = coordination_pipe()?;
 
     // Allocate child stack
     let mut stack = vec![0u8; CHILD_STACK_SIZE];
-
-    // Clone with full namespace isolation
     let clone_flags = sandbox_clone_flags();
 
     // Prepare data for the child closure
@@ -299,7 +316,11 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         );
     }
 
-    // 5. Clean up host-side network (eBPF filter + iptables rules + veth pair)
+    // 5. Clean up host-side resources
+    // Unmount the staging workspace (pre-mounted before clone for kernel 6.17+ compat)
+    nix::mount::umount(&staging_ws).ok();
+    std::fs::remove_dir(&staging_ws).ok();
+
     if network_result.is_ok() {
         if ebpf_attached {
             ebpf::detach_tc_filter(&veth_config.host_iface);

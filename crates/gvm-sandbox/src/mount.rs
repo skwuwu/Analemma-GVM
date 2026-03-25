@@ -63,9 +63,14 @@ pub fn setup_mount_namespace(
 
     if !overlayfs_mounted {
         // Legacy mode: /workspace read-only + /workspace/output writable
+        // Use the staging path (/tmp/gvm-sandbox-staging-ws) which was pre-mounted
+        // by the parent process before clone(). Kernel 6.17+ blocks bind-mount of
+        // host paths inside user namespaces, but inherits parent mounts.
+        let staging_ws = Path::new("/tmp/gvm-sandbox-staging-ws");
+        let mount_src = if staging_ws.exists() { staging_ws } else { workspace_dir };
         let ws_target = new_root.join("workspace");
         mount(
-            Some(workspace_dir),
+            Some(mount_src),
             &ws_target,
             None::<&str>,
             MsFlags::MS_BIND | MsFlags::MS_RDONLY,
@@ -73,9 +78,9 @@ pub fn setup_mount_namespace(
         )
         .with_context(|| format!(
             "Failed to bind-mount workspace: src={} dst={} exists_src={} exists_dst={}",
-            workspace_dir.display(),
+            mount_src.display(),
             ws_target.display(),
-            workspace_dir.exists(),
+            mount_src.exists(),
             ws_target.exists(),
         ))?;
 
