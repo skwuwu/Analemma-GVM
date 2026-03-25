@@ -399,6 +399,9 @@ fn try_mount_overlayfs(
                 error = %e,
                 "overlayfs mount failed (kernel < 5.11?) — falling back to legacy mode"
             );
+            // Clean up: unmount the tmpfs we mounted on overlay_base
+            // to avoid leaving stale mounts that could interfere with legacy mode
+            nix::mount::umount(&overlay_base).ok();
             false
         }
     }

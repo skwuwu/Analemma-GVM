@@ -227,7 +227,7 @@ async fn run_binary_sandboxed(
         proxy_url: Some(proxy.to_string()),
         memory_limit,
         cpu_limit,
-        fs_policy: Some(gvm_sandbox::FilesystemPolicy::default()),
+        fs_policy: None, // overlayfs Trust-on-Pattern — disabled by default until kernel 5.11+ verified
     };
 
     eprintln!("  {BOLD}Security layers active:{RESET}");
@@ -670,7 +670,7 @@ async fn run_sandboxed(script: &str, agent_id: &str, proxy: &str, interactive: b
         proxy_url: Some(proxy.to_string()),
         memory_limit,
         cpu_limit,
-        fs_policy: Some(gvm_sandbox::FilesystemPolicy::default()),
+        fs_policy: None, // overlayfs Trust-on-Pattern — disabled by default until kernel 5.11+ verified
     };
 
     // Clean up orphaned network from previous crash (if any)
