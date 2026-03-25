@@ -410,11 +410,23 @@ async fn main() {
     let tls_state = connect_state.clone();
     let tls_ca_cert = mitm_ca_cert_pem.clone();
     let tls_ca_key = mitm_ca_key_pem.clone();
+    let tls_ready = std::sync::Arc::new(tokio::sync::Notify::new());
+    let tls_ready_tx = tls_ready.clone();
     tokio::spawn(async move {
-        if let Err(e) = start_tls_listener(&tls_port, tls_state, &tls_ca_cert, &tls_ca_key).await {
+        if let Err(e) = start_tls_listener(&tls_port, tls_state, &tls_ca_cert, &tls_ca_key, tls_ready_tx).await {
             tracing::warn!(error = %e, "TLS MITM listener failed to start (sandbox HTTPS inspection unavailable)");
         }
     });
+    // Wait for TLS listener to bind (up to 5s) before accepting HTTP connections.
+    // Sandbox DNAT redirects port 443→8443, so the listener must be ready.
+    tokio::select! {
+        _ = tls_ready.notified() => {
+            tracing::debug!("TLS MITM listener ready");
+        }
+        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+            tracing::warn!("TLS MITM listener not ready after 5s — continuing without HTTPS inspection");
+        }
+    }
 
     // Use hyper directly to handle CONNECT method (axum doesn't route CONNECT).
     // Named functions avoid deeply nested closures that trigger rustc ICE on 1.94.0.
@@ -630,6 +642,7 @@ async fn start_tls_listener(
     state: gvm_proxy::proxy::AppState,
     ca_cert_pem: &[u8],
     ca_key_pem: &[u8],
+    ready: std::sync::Arc<tokio::sync::Notify>,
 ) -> anyhow::Result<()> {
     use gvm_proxy::tls_proxy::{build_client_config, build_server_config, GvmCertResolver};
 
@@ -648,6 +661,7 @@ async fn start_tls_listener(
 
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     tracing::info!(address = %listen_addr, "GVM TLS MITM proxy listening");
+    ready.notify_one();
 
     loop {
         let (stream, addr) = match listener.accept().await {

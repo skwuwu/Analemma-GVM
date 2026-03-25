@@ -385,6 +385,14 @@ fn child_entry(
         return 1;
     }
 
+    // Drop all capabilities from the bounding set.
+    // When running as root (CLONE_NEWUSER skipped), all caps are inherited.
+    // Without this, the agent can run iptables -F to remove firewall rules.
+    if let Err(e) = drop_all_capabilities() {
+        eprintln!("gvm-sandbox: capability drop failed: {}", e);
+        return 1;
+    }
+
     // Apply seccomp-BPF filter (must be last before exec)
     if let Err(e) = apply_seccomp_filter(&config.seccomp_profile) {
         eprintln!("gvm-sandbox: seccomp filter failed: {}", e);
@@ -490,4 +498,28 @@ fn child_entry(
             unsafe { libc::_exit(agent_exit_code) };
         }
     }
+}
+
+/// Drop all capabilities from the bounding set.
+///
+/// After mount/network setup completes, capabilities are no longer needed.
+/// Dropping them prevents the sandboxed agent from using iptables, mounting
+/// filesystems, loading kernel modules, etc. — even when running as root.
+fn drop_all_capabilities() -> anyhow::Result<()> {
+    // Linux capability IDs range from 0 to CAP_LAST_CAP.
+    // As of Linux 6.x, CAP_LAST_CAP is ~41. We iterate to 64 for future-proofing;
+    // prctl returns EINVAL for non-existent caps, which we safely ignore.
+    for cap in 0..64u64 {
+        let ret = unsafe {
+            libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0)
+        };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINVAL) {
+                return Err(anyhow::anyhow!("Failed to drop capability {}: {}", cap, err));
+            }
+            // EINVAL = capability doesn't exist — expected for cap > CAP_LAST_CAP
+        }
+    }
+    Ok(())
 }

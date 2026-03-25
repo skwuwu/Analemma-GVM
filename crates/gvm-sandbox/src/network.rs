@@ -110,12 +110,16 @@ pub fn setup_host_network(config: &VethConfig) -> Result<()> {
     ])?;
     run_ip(&["link", "set", &config.host_iface, "up"])?;
 
-    // 4. Enable IP forwarding for this interface
+    // 4. Enable IP forwarding (global + per-interface).
+    // Global forwarding is required for DNAT/MASQUERADE to work.
+    // Per-interface forwarding alone is not sufficient.
+    std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")
+        .context("Failed to enable global IP forwarding")?;
     std::fs::write(
         format!("/proc/sys/net/ipv4/conf/{}/forwarding", config.host_iface),
         "1",
     )
-    .ok(); // Best-effort, may need global forwarding
+    .ok();
 
     // 5. DNAT: traffic from sandbox to proxy port → actual proxy address
     let proxy_port = config.proxy_addr.port();
