@@ -79,9 +79,6 @@ pub fn setup_mount_namespace(
         // by the parent process before clone(). Kernel 6.17+ blocks bind-mount of
         // host paths inside user namespaces, but inherits parent mounts.
         let staging_ws = Path::new("/tmp/gvm-sandbox-staging-ws");
-        eprintln!("DEBUG: staging_ws={} exists={} workspace_dir={} exists={}",
-            staging_ws.display(), staging_ws.exists(),
-            workspace_dir.display(), workspace_dir.exists());
         let mount_src = if staging_ws.exists() { staging_ws } else { workspace_dir };
         let ws_target = new_root.join("workspace");
         mount(
@@ -353,12 +350,12 @@ fn bind_mount_runtime_dirs(new_root: &Path, interpreter_path: &Path) -> Result<(
             dirs_to_mount.push(dist);
         }
 
-        eprintln!("DEBUG: Python runtime dirs to mount: {:?}", dirs_to_mount);
         for dir in &dirs_to_mount {
             if let Err(e) = bind_mount_dir_readonly(new_root, dir) {
-                eprintln!("DEBUG: Failed to mount {}: {}", dir.display(), e);
+                tracing::warn!(dir = %dir.display(), error = %e, "Failed to mount Python runtime dir");
             }
         }
+        tracing::debug!(count = dirs_to_mount.len(), "Python runtime directories mounted");
     } else if name.starts_with("node") || name.starts_with("deno") || name.starts_with("bun") {
         // Node.js runtime dirs
         for dir in &["/usr/lib/node_modules", "/usr/share/nodejs"] {

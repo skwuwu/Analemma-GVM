@@ -374,12 +374,6 @@ fn child_entry(
 
     // Set up mount namespace (pivot_root)
     // DNS server must match the OUTPUT iptables rule (host veth IP)
-    // Write debug info to file (stderr may not be visible through gvm run)
-    let _ = std::fs::write("/tmp/gvm-sandbox-debug.log", format!(
-        "workspace_dir={} exists={}\nstaging=/tmp/gvm-sandbox-staging-ws exists={}\n",
-        config.workspace_dir.display(), config.workspace_dir.exists(),
-        std::path::Path::new("/tmp/gvm-sandbox-staging-ws").exists(),
-    ));
     if let Err(e) = setup_mount_namespace(
         &config.workspace_dir,
         interpreter_path,
