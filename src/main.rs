@@ -152,7 +152,7 @@ async fn main() {
         ..Default::default()
     };
     let ledger = Ledger::with_config(
-        Path::new("data/wal.log"),
+        Path::new(&std::env::var("GVM_WAL_PATH").unwrap_or_else(|_| config.wal.path.clone())),
         &config.nats.url,
         &config.nats.stream,
         wal_config,

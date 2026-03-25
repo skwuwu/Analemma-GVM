@@ -237,6 +237,11 @@ pub struct SecretsConfig {
 /// ```
 #[derive(Deserialize, Clone, Debug)]
 pub struct WalConfig {
+    /// WAL file path (default: "data/wal.log").
+    /// Override via GVM_WAL_PATH env var or [wal] path in proxy.toml.
+    /// Useful for placing WAL on a dedicated disk in production.
+    #[serde(default = "default_wal_path")]
+    pub path: String,
     /// Group commit batch window in milliseconds (default: 2ms).
     /// Events arriving within this window are batched into a single fsync.
     /// Set to 0 for minimum latency (no batching wait), at the cost of
@@ -260,12 +265,17 @@ pub struct WalConfig {
 impl Default for WalConfig {
     fn default() -> Self {
         Self {
+            path: "data/wal.log".to_string(),
             batch_window_ms: 2,
             max_batch_size: 128,
             max_wal_bytes: 100 * 1024 * 1024, // 100MB
             max_wal_segments: 10,
         }
     }
+}
+
+fn default_wal_path() -> String {
+    "data/wal.log".to_string()
 }
 
 fn default_max_wal_bytes() -> u64 {

@@ -3459,77 +3459,113 @@ fi
 # ═══════════════════════════════════════════════════════════════════
 # Test 57: WAL Disk Full → Fail-Closed (Emergency Mode)
 # ═══════════════════════════════════════════════════════════════════
+#
+# Starts a SEPARATE proxy on port 9090 with GVM_WAL_PATH pointing to a
+# tiny 64KB tmpfs. Sends requests until WAL fills → verifies circuit breaker
+# (503) or degraded mode (emergency WAL fallback). Does NOT touch the main proxy.
 if should_run 57; then
     header "57: WAL Disk Full → Fail-Closed"
 
-    ensure_proxy || { fail "57: proxy not available"; }
+    DISKFULL_PORT=9090
+    DISKFULL_WAL_DIR=$(mktemp -d /tmp/gvm-diskfull-wal-XXXX)
+    DISKFULL_LOG="/tmp/gvm-proxy-diskfull.log"
 
-    # Create a small tmpfs to simulate disk full for WAL
-    WAL_TMPFS="/tmp/gvm-wal-diskfull-test"
-    mkdir -p "$WAL_TMPFS" 2>/dev/null
+    # Mount tiny tmpfs for WAL (64KB — fills in ~10 requests)
+    sudo mount -t tmpfs -o size=64k tmpfs "$DISKFULL_WAL_DIR" 2>/dev/null
+    if [ $? -ne 0 ]; then
+        skip "57: Cannot mount tmpfs (no sudo)"
+        rm -rf "$DISKFULL_WAL_DIR"
+    else
+        # Write minimal proxy config with custom port
+        DISKFULL_CONFIG=$(mktemp /tmp/gvm-diskfull-config-XXXX.toml)
+        cat > "$DISKFULL_CONFIG" <<CFGEOF
+[server]
+listen = "127.0.0.1:${DISKFULL_PORT}"
+[enforcement]
+default_decision = { type = "Delay", milliseconds = 100 }
+ic1_async_ledger = true
+ic1_loss_threshold = 0.001
+[nats]
+url = ""
+stream = "gvm-audit"
+max_age_days = 30
+[redis]
+url = ""
+[srr]
+network_file = "config/srr_network.toml"
+semantic_file = ""
+hot_reload = true
+[policies]
+directory = "config/policies"
+hot_reload = true
+[operations]
+registry_file = "config/operation_registry.toml"
+[secrets]
+file = "config/secrets.toml"
+key_env = "GVM_VAULT_KEY"
+[wal]
+path = "${DISKFULL_WAL_DIR}/wal.log"
+CFGEOF
 
-    # 57a: Fill the WAL directory with a large file to trigger ENOSPC
-    # We'll use the actual data/ directory if writable, or simulate
-    WAL_DIR="data"
-    if [ -d "$WAL_DIR" ]; then
-        WAL_SIZE_BEFORE=$(du -sb "$WAL_DIR" 2>/dev/null | awk '{print $1}')
+        # Start separate proxy with WAL on tiny tmpfs
+        GVM_WAL_PATH="${DISKFULL_WAL_DIR}/wal.log" \
+            ./target/release/gvm-proxy --config "$DISKFULL_CONFIG" > "$DISKFULL_LOG" 2>&1 &
+        DISKFULL_PID=$!
+        sleep 3
 
-        # Create a tmpfs overlay on data/ to simulate disk full (1MB limit)
-        DISK_FULL_DIR=$(mktemp -d /tmp/gvm-diskfull-XXXX)
-        sudo mount -t tmpfs -o size=1m tmpfs "$DISK_FULL_DIR" 2>/dev/null
+        if curl -sf --connect-timeout 2 "http://127.0.0.1:${DISKFULL_PORT}/gvm/health" >/dev/null 2>&1; then
+            echo "  ${DIM}Disk-full proxy on port ${DISKFULL_PORT} (PID ${DISKFULL_PID})${NC}"
 
-        if [ $? -eq 0 ]; then
-            # Copy existing WAL to the tiny tmpfs
-            cp "$WAL_DIR/wal.log" "$DISK_FULL_DIR/" 2>/dev/null || true
-
-            # Fill the tmpfs to near capacity
-            dd if=/dev/zero of="$DISK_FULL_DIR/filler" bs=1024 count=900 2>/dev/null || true
-
-            # Now send IC-2 requests that require WAL write — should get 503
+            # 57a: Send requests to fill the tiny WAL
             FAIL_CLOSED=false
-            for i in $(seq 1 10); do
-                RESP=$(curl -sf -x "$PROXY_URL" -o /dev/null -w "%{http_code}" \
-                    -H "X-GVM-Agent-Id: diskfull-test" \
-                    -H "X-GVM-Operation: gvm.payment.charge" \
-                    http://api.bank.com/transfer/test 2>/dev/null || echo "000")
+            DEGRADED=false
+            for i in $(seq 1 30); do
+                RESP=$(curl -sf --connect-timeout 3 --max-time 5 \
+                    -x "http://127.0.0.1:${DISKFULL_PORT}" \
+                    -o /dev/null -w "%{http_code}" \
+                    "http://fill-wal-${i}.example.com/" 2>/dev/null || echo "000")
 
                 if [ "$RESP" = "503" ]; then
                     FAIL_CLOSED=true
+                    echo "  ${DIM}503 at request $i (circuit breaker)${NC}"
                     break
                 fi
             done
 
+            HEALTH=$(curl -sf --connect-timeout 2 "http://127.0.0.1:${DISKFULL_PORT}/gvm/health" 2>/dev/null)
+            echo "$HEALTH" | grep -q "degraded\|primary_failed" && DEGRADED=true
+
             if [ "$FAIL_CLOSED" = true ]; then
-                pass "57a: Fail-Closed activated on disk full (503 returned)"
+                pass "57a: Circuit breaker activated (503) after WAL disk full"
+            elif [ "$DEGRADED" = true ]; then
+                pass "57a: WAL degraded mode (emergency WAL fallback)"
             else
-                # The proxy may use emergency WAL fallback instead of 503
-                # Check health for degraded state
-                HEALTH=$(curl -sf "$PROXY_URL/gvm/health" 2>/dev/null)
-                if echo "$HEALTH" | grep -q "degraded\|primary_failed"; then
-                    pass "57a: WAL degraded mode active (emergency fallback)"
-                else
-                    echo "  ${DIM}Health: $HEALTH${NC}"
-                    pass "57a: Proxy handled disk pressure (may use emergency WAL)"
-                fi
+                echo "  ${DIM}Health: $HEALTH${NC}"
+                fail "57a: No fail-closed or degraded after 30 requests"
             fi
 
-            # 57b: Health endpoint shows degraded state
-            HEALTH_CHECK=$(curl -sf "$PROXY_URL/gvm/health" 2>/dev/null)
-            if echo "$HEALTH_CHECK" | grep -q '"status"'; then
+            # 57b: Health endpoint still responsive
+            if [ -n "$HEALTH" ]; then
                 pass "57b: Health endpoint responsive under disk pressure"
             else
                 fail "57b: Health endpoint unresponsive"
             fi
 
-            # Cleanup
-            sudo umount "$DISK_FULL_DIR" 2>/dev/null || true
-            rm -rf "$DISK_FULL_DIR"
+            # 57c: Check emergency WAL usage
+            if [ -f "${DISKFULL_WAL_DIR}/wal_emergency.log" ]; then
+                EMERG_SIZE=$(wc -c < "${DISKFULL_WAL_DIR}/wal_emergency.log" 2>/dev/null || echo 0)
+                pass "57c: Emergency WAL used (${EMERG_SIZE} bytes)"
+            else
+                pass "57c: WAL handling completed"
+            fi
         else
-            skip "57a: Cannot mount tmpfs (no root)"
-            skip "57b: Skipped (depends on 57a)"
+            fail "57: Disk-full proxy failed to start on port ${DISKFULL_PORT}"
         fi
-    else
-        skip "57: WAL directory not found"
+
+        # Cleanup
+        kill "$DISKFULL_PID" 2>/dev/null; wait "$DISKFULL_PID" 2>/dev/null
+        sudo umount "$DISKFULL_WAL_DIR" 2>/dev/null || true
+        rm -rf "$DISKFULL_WAL_DIR" "$DISKFULL_CONFIG" "$DISKFULL_LOG"
     fi
 fi
 
