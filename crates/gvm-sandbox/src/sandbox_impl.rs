@@ -50,6 +50,10 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     // By mounting in the parent (which has real root), the mount is visible
     // to the child's mount namespace via inheritance.
     let staging_ws = std::path::PathBuf::from("/tmp/gvm-sandbox-staging-ws");
+    let _ = std::fs::write("/tmp/gvm-sandbox-parent-debug.log", format!(
+        "PARENT: workspace_dir={} staging_ws={}\n",
+        config.workspace_dir.display(), staging_ws.display(),
+    ));
     std::fs::create_dir_all(&staging_ws)
         .context("Failed to create workspace staging directory")?;
     nix::mount::mount(
