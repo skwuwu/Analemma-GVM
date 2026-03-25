@@ -120,6 +120,13 @@ pub fn setup_host_network(config: &VethConfig) -> Result<()> {
         "1",
     )
     .ok();
+    // Enable route_localnet so DNAT to 127.0.0.1 works on the veth interface.
+    // Without this, packets DNATed to 127.0.0.1 are silently dropped as martians.
+    std::fs::write(
+        format!("/proc/sys/net/ipv4/conf/{}/route_localnet", config.host_iface),
+        "1",
+    )
+    .ok();
 
     // 5. DNAT: traffic from sandbox to proxy port → actual proxy address
     let proxy_port = config.proxy_addr.port();
