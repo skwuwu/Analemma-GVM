@@ -363,6 +363,8 @@ fn child_entry(
 
     // Set up mount namespace (pivot_root)
     // DNS server must match the OUTPUT iptables rule (host veth IP)
+    eprintln!("DEBUG child: workspace_dir={} exists={}", config.workspace_dir.display(), config.workspace_dir.exists());
+    eprintln!("DEBUG child: staging=/tmp/gvm-sandbox-staging-ws exists={}", std::path::Path::new("/tmp/gvm-sandbox-staging-ws").exists());
     if let Err(e) = setup_mount_namespace(
         &config.workspace_dir,
         interpreter_path,
