@@ -10,11 +10,20 @@ use std::os::fd::{IntoRawFd, OwnedFd};
 use std::os::unix::io::RawFd;
 
 /// Flags for creating a fully isolated sandbox.
+///
+/// When running as root (sudo), CLONE_NEWUSER is omitted because:
+/// 1. Kernel 6.17+ restricts bind-mount inside user namespaces (EACCES)
+/// 2. Running as root already has all capabilities — user namespace is redundant
+/// 3. Without CLONE_NEWUSER, mount/network setup works normally
+///
+/// When running as non-root, CLONE_NEWUSER is required for unprivileged namespace creation.
 pub fn sandbox_clone_flags() -> CloneFlags {
-    CloneFlags::CLONE_NEWUSER
-        | CloneFlags::CLONE_NEWPID
-        | CloneFlags::CLONE_NEWNS
-        | CloneFlags::CLONE_NEWNET
+    let base = CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWNET;
+    if nix::unistd::geteuid().is_root() {
+        base // Root: no need for CLONE_NEWUSER, avoids kernel 6.17+ mount restrictions
+    } else {
+        base | CloneFlags::CLONE_NEWUSER // Non-root: needs user namespace for unprivileged isolation
+    }
 }
 
 /// Write UID mapping for the child process.

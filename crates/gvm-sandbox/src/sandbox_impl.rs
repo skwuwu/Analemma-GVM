@@ -105,8 +105,10 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
 
     // ── Parent process: set up UID mapping and network ──
 
-    // 1. Write UID/GID mapping
-    write_uid_map(child_pid)?;
+    // 1. Write UID/GID mapping (only needed when CLONE_NEWUSER is active)
+    if !nix::unistd::geteuid().is_root() {
+        write_uid_map(child_pid)?;
+    }
 
     // 2. Set up veth network pair
     let veth_config = VethConfig::from_pid(child_pid.as_raw() as u32, config.proxy_addr);
