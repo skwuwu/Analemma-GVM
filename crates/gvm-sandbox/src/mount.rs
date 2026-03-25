@@ -63,14 +63,21 @@ pub fn setup_mount_namespace(
 
     if !overlayfs_mounted {
         // Legacy mode: /workspace read-only + /workspace/output writable
+        let ws_target = new_root.join("workspace");
         mount(
             Some(workspace_dir),
-            &new_root.join("workspace"),
+            &ws_target,
             None::<&str>,
             MsFlags::MS_BIND | MsFlags::MS_RDONLY,
             None::<&str>,
         )
-        .context("Failed to bind-mount workspace")?;
+        .with_context(|| format!(
+            "Failed to bind-mount workspace: src={} dst={} exists_src={} exists_dst={}",
+            workspace_dir.display(),
+            ws_target.display(),
+            workspace_dir.exists(),
+            ws_target.exists(),
+        ))?;
 
         // Remount as truly read-only (bind mount needs two-step)
         mount(
