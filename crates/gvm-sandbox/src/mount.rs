@@ -319,36 +319,41 @@ fn try_mount_overlayfs(
     new_root: &Path,
     policy: &crate::FilesystemPolicy,
 ) -> bool {
-    let upper_dir = new_root.join("tmp/gvm-overlay-upper");
-    let work_dir = new_root.join("tmp/gvm-overlay-work");
+    // Use a dedicated directory for overlay layers — NOT under /tmp
+    // (mounting tmpfs on /tmp would destroy other sandbox state)
+    let overlay_base = new_root.join("gvm-overlay");
+    let upper_dir = overlay_base.join("upper");
+    let work_dir = overlay_base.join("work");
     let merged_dir = new_root.join("workspace");
 
-    // Create overlay directories
-    if std::fs::create_dir_all(&upper_dir).is_err()
-        || std::fs::create_dir_all(&work_dir).is_err()
-    {
-        tracing::debug!("Failed to create overlay directories — falling back to legacy mode");
+    // Create the overlay base directory
+    if std::fs::create_dir_all(&overlay_base).is_err() {
+        tracing::debug!("Failed to create overlay base directory — falling back to legacy mode");
         return false;
     }
 
-    // Mount tmpfs for upper layer with size limit
+    // Mount tmpfs on the overlay base (contains both upper + work)
     let upper_size = format!("size={}m", policy.upper_size_mb);
     if mount(
         Some("tmpfs"),
-        upper_dir.parent().unwrap_or(&upper_dir),
+        &overlay_base,
         Some("tmpfs"),
         MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
         Some(upper_size.as_str()),
     )
     .is_err()
     {
-        tracing::debug!("Failed to mount tmpfs for overlay upper — falling back");
+        tracing::debug!("Failed to mount tmpfs for overlay — falling back");
         return false;
     }
 
-    // Re-create dirs on the new tmpfs
-    std::fs::create_dir_all(&upper_dir).ok();
-    std::fs::create_dir_all(&work_dir).ok();
+    // Create upper + work dirs on the new tmpfs
+    if std::fs::create_dir_all(&upper_dir).is_err()
+        || std::fs::create_dir_all(&work_dir).is_err()
+    {
+        tracing::debug!("Failed to create overlay upper/work dirs — falling back");
+        return false;
+    }
 
     // Construct overlayfs mount options
     let mount_opts = format!(
