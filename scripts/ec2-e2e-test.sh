@@ -120,8 +120,8 @@ echo ""
 
 # Check prerequisites
 echo -e "${YELLOW}Checking prerequisites...${NC}"
-# Ensure rustup default is set (sudo may lose this)
-rustup default 1.85.0 2>/dev/null || rustup default stable 2>/dev/null || true
+# Ensure rustup default is set to stable (sudo may lose this)
+rustup default stable 2>/dev/null || true
 command -v cargo >/dev/null || { echo "Rust not installed. Run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"; exit 1; }
 command -v node >/dev/null || { echo "Node.js not installed"; exit 1; }
 command -v python3 >/dev/null || { echo "Python3 not installed"; exit 1; }
