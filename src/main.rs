@@ -76,7 +76,7 @@ async fn main() {
     };
 
     // 4. Load Network SRR rules (Fail-Close: invalid SRR → abort with guidance)
-    let srr = match NetworkSRR::load(srr_path) {
+    let mut srr = match NetworkSRR::load(srr_path) {
         Ok(s) => {
             tracing::info!("Network SRR rules loaded");
             s
@@ -98,6 +98,31 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // 3.5. Apply configurable Default-to-Caution policy for unmatched URLs
+    // GVM_DEFAULT_UNKNOWN env var overrides proxy.toml (set by `gvm run --default-policy`)
+    let default_unknown_setting = std::env::var("GVM_DEFAULT_UNKNOWN")
+        .unwrap_or_else(|_| config.enforcement.default_unknown.clone());
+    let default_unknown_decision = match default_unknown_setting.as_str() {
+        "require_approval" => {
+            tracing::info!("Default-to-Caution: RequireApproval (unmatched URLs held for human approval)");
+            gvm_types::EnforcementDecision::RequireApproval {
+                urgency: gvm_types::ApprovalUrgency::Standard,
+            }
+        }
+        "deny" => {
+            tracing::info!("Default-to-Caution: Deny (unmatched URLs blocked immediately)");
+            gvm_types::EnforcementDecision::Deny {
+                reason: "URL not in SRR allowlist (default_unknown = deny)".to_string(),
+            }
+        }
+        _ => {
+            let ms = config.enforcement.default_delay_ms;
+            tracing::info!(delay_ms = ms, "Default-to-Caution: Delay (unmatched URLs delayed then forwarded)");
+            gvm_types::EnforcementDecision::Delay { milliseconds: ms }
+        }
+    };
+    srr.set_default_decision(default_unknown_decision);
 
     // 4. Load ABAC policy engine (graceful: empty dir → empty policy set)
     let policy = PolicyEngine::load(Path::new(&config.policies.directory))

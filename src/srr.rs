@@ -175,6 +175,12 @@ impl NetworkSRR {
         })
     }
 
+    /// Override the default decision for unmatched URLs (Default-to-Caution).
+    /// Called after loading to apply the config's `default_unknown` setting.
+    pub fn set_default_decision(&mut self, decision: EnforcementDecision) {
+        self.default_decision = decision;
+    }
+
     /// Produce a summary of loaded rules for the startup banner.
     pub fn summary(&self) -> SrrSummary {
         let mut deny = 0;

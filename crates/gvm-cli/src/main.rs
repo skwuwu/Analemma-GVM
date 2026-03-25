@@ -114,6 +114,12 @@ enum Commands {
         /// Run in background (only with --contained)
         #[arg(long)]
         detach: bool,
+
+        /// Override the default policy for unmatched URLs (overrides proxy.toml setting).
+        /// "delay" = allow after delay (dev), "require_approval" = hold for human (prod),
+        /// "deny" = block immediately (lockdown).
+        #[arg(long)]
+        default_policy: Option<String>,
     },
 
     /// Monitor and respond to pending IC-3 approval requests.
@@ -386,7 +392,12 @@ async fn main() -> anyhow::Result<()> {
             memory,
             cpus,
             detach,
+            default_policy,
         } => {
+            // Set env var for proxy to pick up (overrides proxy.toml default_unknown)
+            if let Some(ref policy) = default_policy {
+                std::env::set_var("GVM_DEFAULT_UNKNOWN", policy);
+            }
             run::run_agent(
                 &command,
                 &agent_id,

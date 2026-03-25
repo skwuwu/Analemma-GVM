@@ -90,9 +90,33 @@ pub struct EnforcementConfig {
     /// request is auto-denied (fail-close).
     #[serde(default = "default_ic3_approval_timeout_secs")]
     pub ic3_approval_timeout_secs: u64,
+    /// Policy for URLs that match no SRR rule (Default-to-Caution).
+    ///
+    /// - `"delay"` (default): Allow after delay_ms, record in WAL. Best for dev/test.
+    /// - `"require_approval"`: Hold until human approves via `gvm approve` CLI. Best for production finance/healthcare.
+    /// - `"deny"`: Block immediately. Best for high-security lockdown environments.
+    ///
+    /// ```toml
+    /// [enforcement]
+    /// default_unknown = "delay"
+    /// default_delay_ms = 300
+    /// ```
+    #[serde(default = "default_unknown_policy")]
+    pub default_unknown: String,
+    /// Delay in milliseconds for Default-to-Caution when default_unknown = "delay" (default: 300).
+    #[serde(default = "default_delay_ms")]
+    pub default_delay_ms: u64,
 }
 
 fn default_ic3_approval_timeout_secs() -> u64 {
+    300
+}
+
+fn default_unknown_policy() -> String {
+    "delay".to_string()
+}
+
+fn default_delay_ms() -> u64 {
     300
 }
 
@@ -272,6 +296,8 @@ impl Default for ProxyConfig {
                 ic1_loss_threshold: 0.001,
                 on_block: OnBlockConfig::default(),
                 ic3_approval_timeout_secs: default_ic3_approval_timeout_secs(),
+                default_unknown: "delay".to_string(),
+                default_delay_ms: 300,
             },
             nats: NatsConfig {
                 url: "nats://127.0.0.1:4222".to_string(),

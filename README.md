@@ -270,8 +270,33 @@ These layers are independent by design. Layer 2 doesn't trust Layer 1. When both
 |-------|----------|----------|
 | IC-1 | Allow | Immediate pass-through, async audit |
 | IC-2 | Delay | WAL-first write, configurable delay, then forward |
-| IC-3 | RequireApproval | Blocked (403). Approval workflow planned for v1.1 |
+| IC-3 | RequireApproval | Held until human approves via `gvm approve` CLI (timeout → auto-deny) |
 | — | Deny | Unconditional block |
+
+### Default-to-Caution: what happens with unknown URLs
+
+When an agent calls a URL that matches no SRR rule, the behavior is configurable:
+
+```toml
+# proxy.toml
+[enforcement]
+default_unknown = "delay"          # "delay" | "require_approval" | "deny"
+default_delay_ms = 300             # only used when default_unknown = "delay"
+```
+
+| Mode | Behavior | Best for |
+|------|----------|----------|
+| `delay` (default) | Allow after 300ms delay, record in WAL | **Development / testing** — agent keeps running, unknown URLs are logged for later review |
+| `require_approval` | Hold request until human approves via `gvm approve` CLI | **Production finance / healthcare** — no unregistered API call proceeds without human review |
+| `deny` | Block immediately with 403 | **High-security lockdown** — only explicitly allowed URLs can be called |
+
+CLI override (temporary, does not modify config file):
+```bash
+gvm run --default-policy require_approval my_agent.py
+gvm run --default-policy deny my_agent.py
+```
+
+Industry templates set this automatically: `saas` → `delay`, `finance` → `require_approval`.
 
 ---
 
