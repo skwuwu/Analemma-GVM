@@ -270,6 +270,10 @@ fn create_dev_nodes(new_root: &Path) -> Result<()> {
 
 /// Resolve shared library dependencies and bind-mount them.
 fn bind_mount_interpreter(new_root: &Path, interpreter_path: &Path, extra_lib_paths: &[PathBuf]) -> Result<()> {
+    // Track mounted libraries to prevent duplicate bind mounts.
+    // Mounting the same file twice (mount-on-mount) triggers a kernel panic on 6.17.0-1009-aws.
+    let mut mounted: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
     // Bind-mount the interpreter binary
     let interpreter_name = interpreter_path
         .file_name()
@@ -298,7 +302,9 @@ fn bind_mount_interpreter(new_root: &Path, interpreter_path: &Path, extra_lib_pa
             let libs: Vec<PathBuf> = parse_ldd_output(&stdout);
             eprintln!("[DBG-MOUNT] 5c: ldd found {} libs, mounting", libs.len());
             for lib_path in libs {
-                bind_mount_library(new_root, &lib_path).ok();
+                if mounted.insert(lib_path.clone()) {
+                    bind_mount_library(new_root, &lib_path).ok();
+                }
             }
             eprintln!("[DBG-MOUNT] 5d: ldd libs mounted");
         }
@@ -323,11 +329,16 @@ fn bind_mount_interpreter(new_root: &Path, interpreter_path: &Path, extra_lib_pa
     }
 
     // Bind-mount extra libraries pre-resolved by the parent process.
-    eprintln!("[DBG-MOUNT] 5e: mounting {} extra libs", extra_lib_paths.len());
+    // Skip any already mounted by interpreter's direct ldd (prevents mount-on-mount panic).
+    let mut skipped = 0;
     for lib_path in extra_lib_paths {
-        bind_mount_library(new_root, lib_path).ok();
+        if mounted.insert(lib_path.clone()) {
+            bind_mount_library(new_root, lib_path).ok();
+        } else {
+            skipped += 1;
+        }
     }
-    eprintln!("[DBG-MOUNT] 5f: extra libs mounted");
+    eprintln!("[DBG-MOUNT] 5e: mounted {} extra libs, skipped {} duplicates", extra_lib_paths.len() - skipped, skipped);
 
     // Mount interpreter runtime directories (Python stdlib, etc.).
     eprintln!("[DBG-MOUNT] 5g: bind_mount_runtime_dirs start");
