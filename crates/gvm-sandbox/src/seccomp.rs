@@ -181,6 +181,8 @@ fn build_default_filter(default_action: SeccompAction) -> Result<seccompiler::Bp
         libc::SYS_recvfrom,
         libc::SYS_sendmsg,
         libc::SYS_recvmsg,
+        libc::SYS_sendmmsg,  // glibc getaddrinfo() uses sendmmsg for DNS queries
+        libc::SYS_recvmmsg,  // glibc may use recvmmsg for batched DNS responses
         libc::SYS_getsockopt,
         libc::SYS_setsockopt,
         libc::SYS_getsockname,
