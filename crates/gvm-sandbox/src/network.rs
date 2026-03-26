@@ -147,7 +147,28 @@ pub fn setup_host_network(config: &VethConfig) -> Result<()> {
         &config.proxy_addr.to_string(),
     ])?;
 
-    // 6. MASQUERADE restricted to proxy port traffic only (not all traffic)
+    // 5b. DNAT: DNS queries from sandbox → host's systemd-resolved (127.0.0.53:53)
+    // The sandbox resolv.conf points to host_ip, but no DNS server listens there.
+    // PREROUTING DNAT redirects UDP 53 to the host's local resolver.
+    // route_localnet=1 (set above) is required for DNAT to 127.0.0.0/8.
+    run_iptables(&[
+        "-t",
+        "nat",
+        "-A",
+        "PREROUTING",
+        "-i",
+        &config.host_iface,
+        "-p",
+        "udp",
+        "--dport",
+        "53",
+        "-j",
+        "DNAT",
+        "--to-destination",
+        "127.0.0.53:53",
+    ])?;
+
+    // 6. MASQUERADE for proxy TCP and DNS UDP traffic
     run_iptables(&[
         "-t",
         "nat",
@@ -159,6 +180,20 @@ pub fn setup_host_network(config: &VethConfig) -> Result<()> {
         "tcp",
         "--dport",
         &proxy_port.to_string(),
+        "-j",
+        "MASQUERADE",
+    ])?;
+    run_iptables(&[
+        "-t",
+        "nat",
+        "-A",
+        "POSTROUTING",
+        "-s",
+        &format!("{}/{}", config.sandbox_ip, config.cidr),
+        "-p",
+        "udp",
+        "--dport",
+        "53",
         "-j",
         "MASQUERADE",
     ])?;
@@ -379,7 +414,7 @@ pub fn cleanup_host_network(config: &VethConfig) {
     ])
     .ok();
 
-    // DNAT
+    // DNAT (proxy TCP)
     run_iptables(&[
         "-t",
         "nat",
@@ -395,6 +430,42 @@ pub fn cleanup_host_network(config: &VethConfig) {
         "DNAT",
         "--to-destination",
         &config.proxy_addr.to_string(),
+    ])
+    .ok();
+
+    // DNAT (DNS UDP)
+    run_iptables(&[
+        "-t",
+        "nat",
+        "-D",
+        "PREROUTING",
+        "-i",
+        &config.host_iface,
+        "-p",
+        "udp",
+        "--dport",
+        "53",
+        "-j",
+        "DNAT",
+        "--to-destination",
+        "127.0.0.53:53",
+    ])
+    .ok();
+
+    // MASQUERADE (DNS UDP)
+    run_iptables(&[
+        "-t",
+        "nat",
+        "-D",
+        "POSTROUTING",
+        "-s",
+        &format!("{}/{}", config.sandbox_ip, config.cidr),
+        "-p",
+        "udp",
+        "--dport",
+        "53",
+        "-j",
+        "MASQUERADE",
     ])
     .ok();
 
