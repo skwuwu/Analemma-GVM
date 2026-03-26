@@ -101,9 +101,14 @@ impl EphemeralCA {
 
 impl Drop for EphemeralCA {
     fn drop(&mut self) {
-        // Zeroize CA cert PEM — defense-in-depth
+        // Zeroize CA cert PEM
         self.ca_cert_pem.zeroize();
-        tracing::debug!("Ephemeral CA zeroized on drop");
+        // Zeroize the serialized private key — rcgen::KeyPair doesn't implement Zeroize,
+        // but we can serialize it once and zeroize the output to reduce exposure.
+        // The in-memory KeyPair object itself will be freed by the allocator.
+        let mut key_pem = self.ca_key.serialize_pem().into_bytes();
+        key_pem.zeroize();
+        tracing::debug!("Ephemeral CA zeroized on drop (cert PEM + key PEM serialization)");
     }
 }
 

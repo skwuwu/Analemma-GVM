@@ -422,7 +422,7 @@ pub fn get_original_dst(fd: std::os::fd::RawFd) -> Option<std::net::SocketAddr> 
             fd,
             libc::SOL_IP,
             80, // SO_ORIGINAL_DST
-            &mut addr as *mut _ as *mut libc::c_void,
+            &mut addr as *mut libc::sockaddr_in as *mut libc::c_void,
             &mut len,
         )
     };

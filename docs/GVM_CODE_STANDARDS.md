@@ -140,6 +140,71 @@ hasher.update(event.event_id.as_bytes());
 
 - No custom cryptographic constructions. Use audited crates only (aes-gcm, sha2, hex).
 
+### 1.8 Unsafe & FFI Discipline
+
+GVM uses `unsafe` for Linux syscalls (clone, fork, waitpid, getsockopt, prctl, seccomp) and Wasm FFI. "Rust means safe" is false when `unsafe` is present.
+
+**Rules:**
+- Zero uninitialized memory into C structs before passing to syscalls: `libc::sockaddr_in = unsafe { mem::zeroed() }`
+- Explicit pointer casts — never `as *mut _` (inferred). Always `as *mut libc::sockaddr_in as *mut libc::c_void`
+- Check every syscall return value. `-1` or `< 0` → error. Never ignore.
+- Never use `std::mem::forget()` for RAII resource management. Use explicit `Drop` impls and return guards to callers. `mem::forget` leaks resources and breaks cleanup invariants.
+- Never use `std::mem::transmute`. Use `from_be`/`to_be` for endianness, `TryFrom` for type conversions.
+- Document the safety contract of every `unsafe` block in a `// SAFETY:` comment.
+
+**Wasm FFI:**
+- `slice::from_raw_parts()` from Wasm linear memory — document the assumption that Wasmtime validates bounds.
+- `copy_nonoverlapping()` — verify total copy size ≤ allocated size. Assert no overlap.
+
+### 1.9 Namespace & Sandbox Isolation
+
+Sandbox isolation is only as strong as its weakest mount/seccomp configuration.
+
+**Mount namespace:**
+- `/proc` must be mounted with `hidepid=2` inside PID namespace (prevents cross-process information leaks)
+- `/sys` must NOT be mounted inside sandbox (prevents cgroup/kernel parameter manipulation)
+- All bind-mounts inside sandbox must be read-only except `/workspace/output` and `/tmp`
+- `pivot_root` must be used, not `chroot` (chroot is escapable with `open_by_handle_at`)
+- After `pivot_root`, old root must be unmounted (`MNT_DETACH`) and directory removed
+
+**seccomp-BPF:**
+- Default-deny whitelist. New kernel syscalls are automatically blocked.
+- `socket()` must filter on `arg0` (domain): only AF_INET, AF_INET6, AF_UNIX allowed. AF_NETLINK allowed only if required for DNS. AF_PACKET blocked.
+- Dangerous syscalls killed, not just logged: `ptrace`, `process_vm_readv`, `mount`, `bpf`, `unshare`, `setns`, `open_by_handle_at`
+- `openat()` argument filtering: seccomp cannot enforce path boundaries (kernel limitation). Rely on mount namespace for path isolation. Do not add false-confidence seccomp path filters.
+
+**eBPF TC filter:**
+- TC filter must be attached to host-side veth BEFORE signaling child process ready. No packet escape window.
+- Use RAII guard (`EbpfGuard`) for filter lifecycle. Drop detaches the filter. Never use `mem::forget`.
+- If eBPF is unavailable, fall back to iptables + seccomp AF_NETLINK blocking (defense-in-depth).
+
+**Certificate MITM:**
+- CA private key must NEVER enter the sandbox namespace (not on disk, not in env, not in /proc)
+- CA certificate (public only) injected into sandbox trust store
+- All certificates backdated by 24 hours (`not_before = now - 24h`) for clock drift tolerance
+- ECDSA P-256 for all ephemeral certificates (fast generation, strong security)
+
+### 1.10 Async I/O Discipline
+
+GVM proxy runs on tokio. Blocking the executor starves all concurrent requests.
+
+**Rules:**
+- Never use `std::fs::*` inside `async fn`. Use `tokio::fs::*` with `.await`.
+  - `std::fs::read_dir` → `tokio::fs::read_dir().await`
+  - `std::fs::rename` → `tokio::fs::rename().await`
+  - `std::fs::remove_file` → `tokio::fs::remove_file().await`
+  - `std::fs::read_to_string` → `tokio::fs::read_to_string().await`
+- Never use `std::thread::sleep` in async code. Use `tokio::time::sleep().await`.
+- Never use `std::process::Command` in async code. Use `tokio::process::Command`.
+- Heavy computation (>1ms) in async handlers: wrap in `tokio::task::spawn_blocking`.
+  - Exception: SHA-256 hashing is CPU-bound but <1µs per event — acceptable inline.
+  - Exception: regex evaluation uses pre-compiled `Regex` — no compilation on hot path.
+- `fsync` is inherently blocking. WAL fsync runs inside the batch task (dedicated tokio task), not inline in the request handler. This is by design.
+
+**Cold path exceptions (startup/shutdown only):**
+- `recover_from_wal()` may use `std::fs` during startup (before accepting connections). Document with `// COLD PATH: blocking I/O acceptable at startup`.
+- Config loading (`std::fs::read_to_string` for TOML files) is cold-path only.
+
 ---
 
 ## 2. Error Handling Principles

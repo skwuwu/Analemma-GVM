@@ -382,9 +382,11 @@ async fn rotate_wal(
         .and_then(|n| n.to_str())
         .unwrap_or("wal.log");
 
+    // Use tokio::fs for all filesystem operations in this async function.
+    // Blocking std::fs calls starve the tokio executor during WAL rotation.
     let mut max_segment: u64 = 0;
-    if let Ok(entries) = std::fs::read_dir(parent) {
-        for entry in entries.flatten() {
+    if let Ok(mut entries) = tokio::fs::read_dir(parent).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if let Some(suffix) = name_str.strip_prefix(&format!("{}.", stem)) {
@@ -399,7 +401,8 @@ async fn rotate_wal(
     let rotated_path = parent.join(format!("{}.{}", stem, new_segment));
 
     // Rename current WAL → rotated segment
-    std::fs::rename(wal_path, &rotated_path)
+    tokio::fs::rename(wal_path, &rotated_path)
+        .await
         .map_err(|e| anyhow!("WAL rotation rename failed: {}", e))?;
 
     // Open fresh WAL file
@@ -419,20 +422,20 @@ async fn rotate_wal(
         "WAL rotated"
     );
 
-    // Prune old segments beyond max_wal_segments
+    // Prune old segments beyond max_wal_segments (async I/O)
     if config.max_wal_segments > 0 && new_segment as usize > config.max_wal_segments {
         let prune_up_to = new_segment - config.max_wal_segments as u64;
         for i in 1..=prune_up_to {
             let old_path = parent.join(format!("{}.{}", stem, i));
-            if old_path.exists() {
-                if let Err(e) = std::fs::remove_file(&old_path) {
+            if tokio::fs::try_exists(&old_path).await.unwrap_or(false) {
+                if let Err(e) = tokio::fs::remove_file(&old_path).await {
                     tracing::warn!(path = %old_path.display(), error = %e, "Failed to prune old WAL segment");
                 } else {
                     tracing::info!(path = %old_path.display(), "Pruned old WAL segment");
                 }
                 // Also remove the watermark for the pruned segment
                 let old_watermark = PathBuf::from(format!("{}.watermark", old_path.display()));
-                let _ = std::fs::remove_file(&old_watermark);
+                let _ = tokio::fs::remove_file(&old_watermark).await;
             }
         }
     }

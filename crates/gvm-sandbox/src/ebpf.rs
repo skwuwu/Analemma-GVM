@@ -40,12 +40,14 @@ const MIN_KERNEL_MAJOR: u32 = 4;
 const MIN_KERNEL_MINOR: u32 = 15;
 
 /// Result of eBPF attachment attempt.
-#[derive(Debug)]
 pub enum EbpfAttachResult {
-    /// eBPF TC filter attached successfully.
+    /// eBPF TC filter attached successfully. Holds a guard that detaches on drop.
+    /// Caller must keep the guard alive for the sandbox duration and drop it on cleanup.
     Attached {
         /// Interface name the filter is attached to.
         interface: String,
+        /// RAII guard — dropping this detaches the TC filter.
+        guard: EbpfGuard,
     },
     /// eBPF is unavailable; system should use iptables fallback.
     Unavailable {
@@ -243,10 +245,12 @@ pub fn try_attach_tc_filter(
 
     match attach_tc_filter(interface, proxy_ip, proxy_port) {
         Ok(guard) => {
-            // Leak the guard — cleanup will be handled by cleanup_tc_filter
-            std::mem::forget(guard);
+            // Return the guard to the caller — caller must keep it alive for the
+            // sandbox duration. Dropping the guard detaches the TC filter.
+            // Previously used mem::forget (unsafe, leak-prone); now RAII-managed.
             EbpfAttachResult::Attached {
                 interface: interface.to_string(),
+                guard,
             }
         }
         Err(e) => EbpfAttachResult::Unavailable {

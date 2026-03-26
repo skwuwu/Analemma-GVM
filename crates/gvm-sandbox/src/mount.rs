@@ -132,13 +132,15 @@ pub fn setup_mount_namespace(
     )
     .context("Failed to mount tmpfs for /tmp")?;
 
-    // Mount /proc (PID namespace aware)
+    // Mount /proc (PID namespace aware, hidepid=2 for defense-in-depth).
+    // hidepid=2: agent can only see its own /proc/<pid> entries.
+    // Combined with CLONE_NEWPID, prevents inspection of host processes.
     mount(
         Some("proc"),
         &new_root.join("proc"),
         Some("proc"),
         MsFlags::empty(),
-        None::<&str>,
+        Some("hidepid=2"),
     )
     .context("Failed to mount /proc")?;
 

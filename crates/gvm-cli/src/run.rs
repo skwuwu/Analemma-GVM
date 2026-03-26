@@ -65,6 +65,44 @@ pub(crate) fn looks_like_script(arg: &str) -> bool {
     )
 }
 
+/// Derive admin API URL from the proxy URL.
+/// Convention: admin port = proxy port + 1010 (e.g. 8080 → 9090).
+/// The admin API runs on a separate port, unreachable by the agent.
+pub(crate) fn derive_admin_url(proxy: &str) -> String {
+    match url::Url::parse(proxy) {
+        Ok(url) => {
+            let host = url.host_str().unwrap_or("127.0.0.1");
+            let proxy_port = url.port().unwrap_or(8080);
+            let admin_port = proxy_port + 1010;
+            format!("http://{}:{}", host, admin_port)
+        }
+        Err(_) => "http://127.0.0.1:9090".to_string(),
+    }
+}
+
+/// Download the MITM CA certificate from the proxy's admin API.
+/// The proxy generates the CA and holds the private key; we only get the public cert.
+/// This cert is injected into the sandbox trust store so TLS verification succeeds.
+async fn download_mitm_ca_cert(proxy: &str) -> Option<Vec<u8>> {
+    let ca_url = format!("{}/gvm/ca.pem", proxy.trim_end_matches('/'));
+    match reqwest::get(&ca_url).await {
+        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+            Ok(bytes) if !bytes.is_empty() => {
+                eprintln!("  {GREEN}\u{2713}{RESET} MITM CA certificate downloaded from proxy");
+                Some(bytes.to_vec())
+            }
+            _ => {
+                eprintln!("  {YELLOW}\u{26a0}{RESET} MITM CA endpoint returned empty response — HTTPS inspection disabled");
+                None
+            }
+        },
+        _ => {
+            eprintln!("  {YELLOW}\u{26a0}{RESET} Could not download MITM CA from proxy — HTTPS inspection disabled");
+            None
+        }
+    }
+}
+
 /// Parse a memory limit string (e.g. "512m", "1g", "2048m") into bytes.
 fn parse_memory_limit(s: &str) -> Option<u64> {
     let s = s.trim().to_lowercase();
@@ -122,9 +160,9 @@ async fn run_binary_local(
     let watchdog_handle = tokio::spawn(proxy_watchdog(proxy_url));
 
     let (approval_cancel_tx, approval_cancel_rx) = tokio::sync::watch::channel(false);
-    let approval_proxy = proxy.to_string();
+    let admin_url = derive_admin_url(proxy);
     let approval_handle = tokio::spawn(async move {
-        crate::approve::poll_and_prompt_background(&approval_proxy, approval_cancel_rx).await;
+        crate::approve::poll_and_prompt_background(&admin_url, approval_cancel_rx).await;
     });
 
     let status = tokio::process::Command::new(binary)
@@ -135,6 +173,7 @@ async fn run_binary_local(
         .env("https_proxy", proxy)
         .env("GVM_AGENT_ID", agent_id)
         .env("GVM_PROXY_URL", proxy)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .status()
@@ -215,6 +254,9 @@ async fn run_binary_sandboxed(
         .parse()
         .with_context(|| format!("Cannot parse proxy address: {}:{}", proxy_host, proxy_port))?;
 
+    // Download MITM CA cert from proxy (proxy holds private key; sandbox gets cert only)
+    let mitm_ca_cert = download_mitm_ca_cert(proxy).await;
+
     let config = gvm_sandbox::SandboxConfig {
         script_path: binary_path.clone(),
         workspace_dir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
@@ -227,7 +269,8 @@ async fn run_binary_sandboxed(
         proxy_url: Some(proxy.to_string()),
         memory_limit,
         cpu_limit,
-        fs_policy: None, // overlayfs Trust-on-Pattern — disabled by default until kernel 5.11+ verified
+        fs_policy: None,
+        mitm_ca_cert,
     };
 
     eprintln!("  {BOLD}Security layers active:{RESET}");
@@ -536,6 +579,7 @@ async fn run_local(script: &str, agent_id: &str, proxy: &str, interactive: bool)
         .env("https_proxy", proxy)
         .env("GVM_AGENT_ID", agent_id)
         .env("GVM_PROXY_URL", proxy)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
 
@@ -544,9 +588,9 @@ async fn run_local(script: &str, agent_id: &str, proxy: &str, interactive: bool)
     let watchdog_handle = tokio::spawn(proxy_watchdog(proxy_url));
 
     let (approval_cancel_tx, approval_cancel_rx) = tokio::sync::watch::channel(false);
-    let approval_proxy = proxy.to_string();
+    let admin_url = derive_admin_url(proxy);
     let approval_handle = tokio::spawn(async move {
-        crate::approve::poll_and_prompt_background(&approval_proxy, approval_cancel_rx).await;
+        crate::approve::poll_and_prompt_background(&admin_url, approval_cancel_rx).await;
     });
 
     let status = cmd
@@ -658,6 +702,9 @@ async fn run_sandboxed(script: &str, agent_id: &str, proxy: &str, interactive: b
         .parse()
         .with_context(|| format!("Cannot parse proxy address: {}:{}", proxy_host, proxy_port))?;
 
+    // Download MITM CA cert from proxy (proxy holds private key; sandbox gets cert only)
+    let mitm_ca_cert = download_mitm_ca_cert(proxy).await;
+
     let config = gvm_sandbox::SandboxConfig {
         script_path: abs_script.clone(),
         workspace_dir: script_dir.to_path_buf(),
@@ -670,7 +717,8 @@ async fn run_sandboxed(script: &str, agent_id: &str, proxy: &str, interactive: b
         proxy_url: Some(proxy.to_string()),
         memory_limit,
         cpu_limit,
-        fs_policy: None, // overlayfs Trust-on-Pattern — disabled by default until kernel 5.11+ verified
+        fs_policy: None,
+        mitm_ca_cert,
     };
 
     // Clean up orphaned network from previous crash (if any)

@@ -324,6 +324,65 @@ Both paths pre-compile regex at config load time (fail-fast on invalid patterns)
 
 **Fix (v0.2)**: `fork()` inside the namespace after setup. PID 1 stays as a minimal init reaper (`waitpid(-1)` loop), the child execs the agent. Equivalent to tini/dumb-init without an external dependency. Agent exit code is correctly propagated to the parent outside the namespace.
 
+### 20. Agent Self-Approval of IC-3 Requests (Fixed)
+
+**Attack**: An agent triggers an IC-3 (RequireApproval) request, then immediately calls `POST /gvm/approve` on the proxy to approve its own request. If the approval API is served on the same port as the proxy (which the agent knows via `HTTP_PROXY`), the agent can bypass human-in-the-loop enforcement entirely.
+
+**Secondary vector**: The agent inherits stdin from the CLI process. When `gvm run` polls for IC-3 approvals and prompts "Approve? [y/N]" on stdin, the agent could race to read stdin first, or inject terminal escape sequences to manipulate the operator's view.
+
+**Fix (v0.4)**:
+1. **Admin API port separation**: Privileged endpoints (`/gvm/approve`, `/gvm/pending`, `/gvm/reload`, `/gvm/info`) are served on a separate admin port (default: 9090), not the agent-facing proxy port (8080). The agent only knows `HTTP_PROXY=http://...:8080`. The admin port is never injected into the agent's environment. In `--sandbox` mode, iptables rules only allow traffic to the proxy port — the admin port is unreachable from the agent namespace.
+
+2. **stdin isolation**: Agent processes are spawned with `stdin(Stdio::null())`. The agent cannot read from or compete for the operator's terminal input. The CLI's IC-3 approval prompt reads from the operator's stdin exclusively.
+
+**Residual risk**: In non-sandbox mode, the agent runs on the host and could discover the admin port via port scanning or `/proc` inspection. This is inherent to cooperative enforcement — use `--sandbox` or `--contained` for structural isolation.
+
+**Future hardening**: Admin API on Unix domain socket (`/run/gvm/admin.sock`) would eliminate TCP port discovery entirely.
+
+### 21. MITM CA Private Key Exposure in Sandbox (Fixed)
+
+**Attack**: If the CA private key used for MITM TLS interception were accessible inside the sandbox, the agent could extract it and generate valid certificates for any domain, completely bypassing TLS inspection. The agent could forge certificates, establish direct TLS connections to upstream servers, and the proxy would be unable to distinguish forged traffic from legitimate traffic.
+
+**Audit findings** (v0.4):
+
+The CA key flow was audited end-to-end:
+
+| Location | CA Key Present? | Notes |
+|----------|-----------------|-------|
+| Proxy process memory (`main.rs`) | **Yes** | Held in `GvmCertResolver` for leaf cert signing. Required for MITM operation. |
+| TLS MITM listener (`tls_proxy.rs`) | **Yes** | Same process as proxy. Runs outside sandbox. |
+| Sandbox tmpfs filesystem | **No** | Only CA **certificate** (public) written to `/etc/ssl/certs/gvm-ca.crt` |
+| Sandbox environment variables | **No** | `SSL_CERT_FILE` etc. point to cert path only |
+| Sandbox `/proc` access | **No** | PID namespace isolation. Agent sees only its own `/proc/<pid>` |
+| Sandbox ptrace/process_vm_readv | **No** | Blocked by seccomp-BPF whitelist |
+
+**Prior vulnerability (fixed in v0.4)**: The sandbox (`sandbox_impl.rs`) previously generated its own independent CA, separate from the proxy's CA. This caused a CA mismatch — the trust store had CA-B but the MITM proxy signed with CA-A — making HTTPS inspection non-functional. This was an implementation bug, not a security exposure (the key never reached the sandbox, but the mismatch broke MITM).
+
+**Fix (v0.4)**:
+1. CA generation removed from `sandbox_impl.rs`. The proxy (`main.rs`) is the sole CA generator.
+2. CLI downloads the CA cert from `GET /gvm/ca.pem` before sandbox launch and passes it via `SandboxConfig.mitm_ca_cert`.
+3. The sandbox receives only the public certificate — the private key stays in the proxy process.
+4. On proxy shutdown, the CA key PEM bytes are explicitly zeroized (`zeroize` crate).
+5. `EphemeralCA::drop()` zeroizes both the cert PEM and a serialized copy of the key PEM.
+
+**Architecture**: The proxy process runs outside all sandboxed namespaces. The agent process runs inside user/PID/mount/net namespaces with seccomp-BPF. These are separate processes with no shared memory. The CA key exists only in the proxy's address space.
+
+**Trust store coverage and limitations**:
+
+| Runtime | CA Trust Mechanism | Status |
+|---------|-------------------|--------|
+| Python (requests, urllib3) | `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` env var | Supported |
+| Node.js | `NODE_EXTRA_CA_CERTS` env var | Supported |
+| Go (net/http) | System trust store (`/etc/ssl/certs/`) | Supported |
+| curl / libcurl | `CURL_CA_BUNDLE` env var | Supported |
+| Ruby (net/http) | `SSL_CERT_FILE` env var | Supported |
+| Java (HttpsURLConnection) | Requires JKS keystore import (`keytool`) | **Not auto-supported** |
+| Certificate pinning apps | Reject any MITM CA regardless of trust store | **Cannot intercept** |
+
+Java keystore import is planned as a future enhancement. Certificate pinning is a deliberate security feature; bypassing it is out of scope for GVM.
+
+**Residual risk**: The CA key exists in proxy process memory for the session duration. A host-level memory dump (e.g., `gcore`, `/proc/<pid>/mem`) could extract it. This requires host root access, which is outside GVM's threat model boundary.
+
 ---
 
 ## Enforcement Decision Behavior

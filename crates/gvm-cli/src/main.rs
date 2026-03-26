@@ -130,9 +130,9 @@ enum Commands {
     ///   gvm approve                        # interactive approval prompt
     ///   gvm approve --auto-deny            # auto-deny all pending after timeout
     Approve {
-        /// GVM proxy URL
-        #[arg(long, default_value = "http://127.0.0.1:8080")]
-        proxy: String,
+        /// GVM admin API URL (separate from agent-facing proxy port).
+        #[arg(long, default_value = "http://127.0.0.1:9090")]
+        admin: String,
 
         /// Poll interval in seconds
         #[arg(long, default_value = "2")]
@@ -414,11 +414,11 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Commands::Approve {
-            proxy,
+            admin,
             poll_interval,
             auto_deny,
         } => {
-            approve::run_approve(&proxy, poll_interval, auto_deny).await?;
+            approve::run_approve(&admin, poll_interval, auto_deny).await?;
         }
 
         Commands::Watch {

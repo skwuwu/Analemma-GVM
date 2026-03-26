@@ -68,11 +68,21 @@ pub struct DevConfig {
 #[derive(Deserialize, Clone, Debug)]
 pub struct ServerConfig {
     pub listen: String,
+    /// Admin API listen address (default: "127.0.0.1:9090").
+    /// Privileged endpoints (approve, reload, info) are served here, separated
+    /// from the agent-facing proxy port. The agent never learns this address.
+    /// This prevents a sandboxed agent from self-approving IC-3 requests.
+    #[serde(default = "default_admin_listen")]
+    pub admin_listen: String,
     /// Graceful shutdown drain timeout in seconds (default: 5).
     /// After receiving SIGTERM/SIGINT, the proxy stops accepting new connections
     /// and waits up to this many seconds for in-flight requests to complete.
     #[serde(default = "default_drain_timeout_secs")]
     pub drain_timeout_secs: u64,
+}
+
+fn default_admin_listen() -> String {
+    "127.0.0.1:9090".to_string()
 }
 
 fn default_drain_timeout_secs() -> u64 {
@@ -299,6 +309,7 @@ impl Default for ProxyConfig {
         Self {
             server: ServerConfig {
                 listen: "0.0.0.0:8080".to_string(),
+                admin_listen: default_admin_listen(),
                 drain_timeout_secs: 5,
             },
             enforcement: EnforcementConfig {

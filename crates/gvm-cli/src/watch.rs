@@ -773,10 +773,11 @@ pub async fn run_watch(
 
     run::ensure_proxy_available(proxy).await?;
 
-    // If allow-all mode, reload proxy with our temp config
+    // If allow-all mode, reload proxy with our temp config via admin API
+    let admin_url = run::derive_admin_url(proxy);
     if let Some(ref temp_dir) = temp_config_dir {
         let srr_path = temp_dir.join("srr_network.toml");
-        reload_proxy_srr(proxy, &srr_path).await?;
+        reload_proxy_srr(&admin_url, &srr_path).await?;
     }
 
     // --- Banner ---
@@ -900,7 +901,7 @@ pub async fn run_watch(
         // Reload proxy with original config
         let original_srr = config_dir.join("srr_network.toml");
         if original_srr.exists() {
-            let _ = reload_proxy_srr(proxy, &original_srr).await;
+            let _ = reload_proxy_srr(&admin_url, &original_srr).await;
         }
     }
 
@@ -980,6 +981,7 @@ async fn run_agent_process(
             memory_limit: None,
             cpu_limit: None,
             fs_policy: Some(gvm_sandbox::FilesystemPolicy::default()),
+            mitm_ca_cert: None, // Watch mode: MITM CA not needed for observation
         };
 
         let result = tokio::task::spawn_blocking(move || gvm_sandbox::launch_sandboxed(config)).await
@@ -1023,6 +1025,7 @@ async fn run_agent_process(
             .env("https_proxy", proxy)
             .env("GVM_AGENT_ID", agent_id)
             .env("GVM_PROXY_URL", proxy)
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
             .status()

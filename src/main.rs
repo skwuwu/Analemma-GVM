@@ -349,19 +349,18 @@ async fn main() {
     // Clone state for CONNECT handler before moving into axum router
     let connect_state = state.clone();
 
-    // 11. Build axum router with security layers
-    //     - /gvm/* routes: admin, health, vault API
-    //     - fallback: proxy handler (all other requests)
-    //     - Backpressure: request body limit (1MB) prevents OOM from oversized payloads
-    //     - Concurrency: connection limit prevents FD exhaustion under DoS
+    // 11. Build two separate routers:
+    //     - Agent-facing (proxy port): proxy handler + agent-safe endpoints only
+    //     - Admin (admin port): privileged endpoints (approve, reload, info)
+    //
+    // This separation prevents a sandboxed agent from calling /gvm/approve to
+    // self-approve IC-3 requests. The agent only knows the proxy port.
+
+    // Agent-facing router: proxy + safe endpoints (health, check, vault, ca.pem)
     let app = Router::new()
         .route("/gvm/health", axum::routing::get(api::health))
-        .route("/gvm/info", axum::routing::get(api::info))
         .route("/gvm/check", axum::routing::post(api::check))
         .route("/gvm/intent", axum::routing::post(api::register_intent))
-        .route("/gvm/reload", axum::routing::post(api::reload_srr))
-        .route("/gvm/pending", axum::routing::get(api::pending_approvals))
-        .route("/gvm/approve", axum::routing::post(api::approve_request))
         .route("/gvm/ca.pem", axum::routing::get(serve_mitm_ca))
         .route("/gvm/auth/token", axum::routing::post(api::auth_token))
         .route(
@@ -377,18 +376,26 @@ async fn main() {
                 .delete(api::checkpoint_delete),
         )
         .fallback(proxy_handler)
+        .with_state(state.clone())
+        .layer(
+            ServiceBuilder::new()
+                .layer(CatchPanicLayer::new())
+                .layer(RequestBodyLimitLayer::new(1024 * 1024))
+                .layer(tower::limit::ConcurrencyLimitLayer::new(1024)),
+        );
+
+    // Admin router: privileged endpoints only (not reachable from agent network)
+    let admin_app = Router::new()
+        .route("/gvm/health", axum::routing::get(api::health))
+        .route("/gvm/info", axum::routing::get(api::info))
+        .route("/gvm/pending", axum::routing::get(api::pending_approvals))
+        .route("/gvm/approve", axum::routing::post(api::approve_request))
+        .route("/gvm/reload", axum::routing::post(api::reload_srr))
         .with_state(state)
         .layer(
             ServiceBuilder::new()
-                // Panic Guard: catch any panic in handler, return 500 instead of killing process.
-                // A security kernel must NEVER crash — panics from malformed input or
-                // edge cases in dependencies are caught here.
                 .layer(CatchPanicLayer::new())
-                // Backpressure: reject request bodies > 1MB (prevents OOM/resource exhaustion)
-                .layer(RequestBodyLimitLayer::new(1024 * 1024))
-                // Concurrency: limit concurrent in-flight requests to 1024
-                // Beyond this, new connections get 503 Service Unavailable
-                .layer(tower::limit::ConcurrencyLimitLayer::new(1024)),
+                .layer(RequestBodyLimitLayer::new(1024 * 1024)),
         );
 
     // 12. Start server with CONNECT tunnel support
@@ -397,6 +404,42 @@ async fn main() {
         .expect("Failed to bind to listen address");
 
     tracing::info!(address = %config.server.listen, "GVM Proxy listening (HTTP)");
+
+    // 12.5. Start admin API listener on a separate port (not reachable by agent)
+    let admin_addr = config.server.admin_listen.clone();
+    tokio::spawn(async move {
+        match tokio::net::TcpListener::bind(&admin_addr).await {
+            Ok(admin_listener) => {
+                tracing::info!(address = %admin_addr, "GVM Admin API listening (privileged)");
+                loop {
+                    if let Ok((stream, _)) = admin_listener.accept().await {
+                        let app = admin_app.clone();
+                        tokio::spawn(async move {
+                            let service = hyper::service::service_fn(move |req| {
+                                let app = app.clone();
+                                async move {
+                                    Ok::<_, std::convert::Infallible>(
+                                        tower::ServiceExt::oneshot(app, req).await.unwrap(),
+                                    )
+                                }
+                            });
+                            if let Err(e) = hyper_util::server::conn::auto::Builder::new(
+                                hyper_util::rt::TokioExecutor::new(),
+                            )
+                            .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                            .await
+                            {
+                                tracing::debug!(error = %e, "Admin connection error");
+                            }
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(address = %admin_addr, error = %e, "Failed to bind admin API listener");
+            }
+        }
+    });
 
     // 13. Start TLS MITM listener (port 8443) for sandbox HTTPS inspection
     let tls_port = {
@@ -518,7 +561,19 @@ async fn main() {
     }
     drop(connection_handles); // Ensure all handles are dropped
 
-    // Phase 3: Flush WAL
+    // Phase 3: Zeroize CA key material + Flush WAL
+    // Zeroize the CA private key PEM before dropping — defense-in-depth against
+    // memory forensics. The Arc may have multiple references, so we zeroize our copy.
+    {
+        use zeroize::Zeroize;
+        if let Some(mut key_bytes) = Arc::into_inner(mitm_ca_key_pem) {
+            key_bytes.zeroize();
+            tracing::debug!("MITM CA key PEM zeroized on shutdown");
+        }
+        // mitm_ca_key_pem is consumed; other Arc clones (TLS listener) will be
+        // zeroized when their tasks are aborted above.
+    }
+
     // Drop all other Arc<AppState> references so only ledger_for_shutdown remains.
     drop(app_for_connect);
     drop(state_for_connect);

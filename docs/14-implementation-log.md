@@ -4,6 +4,118 @@
 
 ---
 
+## 2026-03-26: Security Audit — Unsafe/FFI, Blocking I/O, Namespace Hardening
+
+### What Changed
+
+Full security audit of 6 vulnerability categories with 4 fixes applied:
+
+**1. eBPF `mem::forget` → RAII guard (Critical)**
+- `ebpf.rs`: Removed `mem::forget(guard)`. `EbpfAttachResult::Attached` now returns the `EbpfGuard` to the caller.
+- `sandbox_impl.rs`: Holds `_ebpf_guard` for sandbox lifetime. `Drop` detaches TC filter automatically. Explicit `drop()` before veth cleanup ensures correct ordering.
+
+**2. WAL `rotate_wal()` blocking I/O → async (Critical, hot path)**
+- `ledger.rs`: `std::fs::read_dir` → `tokio::fs::read_dir().await`, `std::fs::rename` → `tokio::fs::rename().await`, `std::fs::remove_file` → `tokio::fs::remove_file().await` in prune loop.
+- Previously: WAL rotation blocked the tokio executor for the duration of directory scan + file operations. All concurrent proxy requests stalled.
+
+**3. `tls_proxy.rs` pointer cast clarity (Warning)**
+- `&mut addr as *mut _ as *mut libc::c_void` → `&mut addr as *mut libc::sockaddr_in as *mut libc::c_void`. Explicit intermediate type prevents inference-based UB risks.
+
+**4. `/proc` `hidepid=2` (Defense-in-depth)**
+- `mount.rs`: `/proc` mount now includes `hidepid=2` option. Agent can only see its own PID entries.
+
+**5. GVM_CODE_STANDARDS.md — 3 new sections**
+- §1.8 Unsafe & FFI Discipline
+- §1.9 Namespace & Sandbox Isolation
+- §1.10 Async I/O Discipline
+
+### Audit findings (no fix needed)
+- `/sys` is NOT mounted in sandbox: SAFE
+- eBPF TC race condition: SAFE (filter attached before child signal)
+- Certificate backdating: SAFE (24h window)
+- SHA-256 in async: acceptable (<1µs, CPU-bound not I/O-bound)
+- `openat()` seccomp args: mount namespace provides boundary (seccomp can't filter paths)
+
+### Affected Files
+- `crates/gvm-sandbox/src/ebpf.rs` — `EbpfAttachResult` now includes guard, `mem::forget` removed
+- `crates/gvm-sandbox/src/sandbox_impl.rs` — RAII guard lifecycle, explicit drop ordering
+- `crates/gvm-sandbox/src/mount.rs` — `/proc` with `hidepid=2`
+- `src/ledger.rs` — `rotate_wal()` async I/O
+- `src/tls_proxy.rs` — explicit pointer cast
+- `docs/GVM_CODE_STANDARDS.md` — §1.8, §1.9, §1.10
+
+### Risk Assessment
+- **eBPF fix**: Low risk. Guard was already cleaned up manually; now RAII-managed. Drop ordering verified.
+- **WAL rotation**: Low risk. Same operations, now async. Rotation is infrequent (100MB threshold).
+- **hidepid=2**: Low risk. Defense-in-depth only. May fail on kernels <3.3 (graceful: proc still mounts).
+- **All tests pass** (138 + 25 + 17 = 180)
+
+---
+
+## 2026-03-26: MITM CA Key Isolation + Zeroization (Security Fix)
+
+### What Changed
+
+**Vulnerability discovered**: `sandbox_impl.rs` generated its own CA independently from the proxy's CA in `main.rs`. These were two different key pairs — the sandbox trust store had CA-B but the MITM proxy signed with CA-A. This caused HTTPS inspection to silently fail (TLS handshake rejected by agent). While not a key exposure vulnerability (the key never entered the sandbox), it rendered MITM non-functional.
+
+**Fix 1 — Single CA source of truth:**
+- Removed CA generation from `sandbox_impl.rs`
+- Added `mitm_ca_cert: Option<Vec<u8>>` to `SandboxConfig`
+- CLI downloads CA cert from proxy's `GET /gvm/ca.pem` before sandbox launch
+- Sandbox only receives the public certificate — private key stays in proxy process
+
+**Fix 2 — CA key zeroization:**
+- `EphemeralCA::drop()`: zeroizes cert PEM + serialized key PEM copy
+- Proxy shutdown: `Arc::into_inner(mitm_ca_key_pem)` + `zeroize()` on the PEM bytes
+- `LeafCert::drop()`: already zeroized cert + key PEM (no change needed)
+
+### Affected Files
+- `crates/gvm-sandbox/src/sandbox_impl.rs` — removed CA generation, uses `config.mitm_ca_cert`
+- `crates/gvm-sandbox/src/lib.rs` — added `mitm_ca_cert` field to `SandboxConfig`
+- `crates/gvm-sandbox/src/ca.rs` — enhanced `Drop` impl with key PEM zeroization
+- `crates/gvm-cli/src/run.rs` — `download_mitm_ca_cert()` helper, sandbox configs updated
+- `src/main.rs` — CA key PEM zeroize on shutdown
+- `docs/12-security-model.md` — Attack vector #21: full CA key flow audit
+
+### Risk Assessment
+- **CA mismatch fix**: HTTPS MITM now functional (same CA for signing and trust). Previously silently broken.
+- **Zeroize**: defense-in-depth. `rcgen::KeyPair` internal memory still freed by allocator (not zeroized), but PEM serializations are explicitly zeroed.
+- **All tests pass** (138 lib + 25 CLI + 17 sandbox)
+
+---
+
+## 2026-03-26: Admin API Port Separation + stdin Isolation (Security Fix)
+
+### What Changed
+
+**Vulnerability discovered**: Agent could self-approve IC-3 requests by calling `POST /gvm/approve` on the same proxy port it uses for HTTP traffic. Additionally, agent inherited stdin from the CLI, enabling stdin race conditions.
+
+**Fix 1 — Admin/proxy port separation:**
+- Proxy port (default 8080): agent-facing. Serves proxy handler, health, check, vault, ca.pem, auth/token.
+- Admin port (default 9090): operator-facing. Serves approve, pending, reload, info. Never exposed to agent.
+- Agent environment only contains `HTTP_PROXY=...:8080` — admin port is not injected.
+- In `--sandbox` mode, iptables only allows traffic to proxy port. Admin port is unreachable from agent namespace.
+- CLI derives admin URL automatically: proxy port + 1010 (8080 → 9090).
+
+**Fix 2 — stdin isolation:**
+- All agent process launches (`run_local`, `run_binary_local`, watch) now use `stdin(Stdio::null())`.
+- Agent cannot read from or compete for the operator's terminal input.
+
+### Affected Files
+- `src/main.rs` — Router split into agent-facing `app` + operator-facing `admin_app`, separate TcpListener for admin port
+- `src/config.rs` — `admin_listen` field in `ServerConfig`
+- `crates/gvm-cli/src/run.rs` — `derive_admin_url()`, approval poller uses admin URL, `stdin(Stdio::null())`
+- `crates/gvm-cli/src/watch.rs` — reload uses admin URL, `stdin(Stdio::null())`
+- `crates/gvm-cli/src/main.rs` — `gvm approve` uses `--admin` flag (default: 9090)
+- `docs/12-security-model.md` — Attack vector #20 documented with fix details
+
+### Risk Assessment
+- **Breaking change**: CLI tools that called `/gvm/approve` or `/gvm/reload` on port 8080 must now use port 9090. `gvm approve` default updated. `gvm run` handles this automatically.
+- **Backward compatible for agents**: Agent-facing proxy port unchanged. No agent code changes needed.
+- **All tests pass** (138 lib + 25 CLI + 24 integration + 56 boundary/merkle/stress + 17 sandbox)
+
+---
+
 ## 2026-03-25: cgroups v2 Resource Limits for Sandbox
 
 ### What Changed

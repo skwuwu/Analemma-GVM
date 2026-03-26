@@ -101,6 +101,7 @@ fn preflight_report_non_linux_has_ebpf_false() {
             memory_limit: None,
             cpu_limit: None,
             fs_policy: None,
+            mitm_ca_cert: None,
         };
         let report = preflight_check(&config);
         assert!(
