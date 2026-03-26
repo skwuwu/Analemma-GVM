@@ -147,10 +147,14 @@ pub fn setup_host_network(config: &VethConfig) -> Result<()> {
         &config.proxy_addr.to_string(),
     ])?;
 
-    // 5b. DNAT: DNS queries from sandbox → host's systemd-resolved (127.0.0.53:53)
+    // 5b. DNAT: DNS queries from sandbox → host's upstream DNS resolver
     // The sandbox resolv.conf points to host_ip, but no DNS server listens there.
-    // PREROUTING DNAT redirects UDP 53 to the host's local resolver.
-    // route_localnet=1 (set above) is required for DNAT to 127.0.0.0/8.
+    // PREROUTING DNAT redirects UDP 53 to the actual upstream DNS resolver.
+    //
+    // Cannot use 127.0.0.53 (systemd-resolved stub) because it binds to lo only —
+    // packets arriving on veth with DNAT to 127.0.0.53 are delivered via INPUT on
+    // the veth interface, but the socket only accepts packets on lo.
+    let dns_target = resolve_host_dns();
     run_iptables(&[
         "-t",
         "nat",
@@ -165,8 +169,9 @@ pub fn setup_host_network(config: &VethConfig) -> Result<()> {
         "-j",
         "DNAT",
         "--to-destination",
-        "127.0.0.53:53",
+        &format!("{}:53", dns_target),
     ])?;
+    tracing::debug!(dns_target = %dns_target, "DNS DNAT configured");
 
     // 6. MASQUERADE for proxy TCP and DNS UDP traffic
     run_iptables(&[
@@ -224,6 +229,33 @@ pub fn setup_host_network(config: &VethConfig) -> Result<()> {
         "lo",
         "-o",
         &config.host_iface,
+        "-j",
+        "ACCEPT",
+    ])?;
+    // Allow DNS UDP forwarding after DNAT (veth → upstream DNS, typically via ens5)
+    // Only port 53 UDP is allowed — all other non-proxy traffic is dropped below.
+    run_iptables(&[
+        "-A",
+        &chain_name,
+        "-i",
+        &config.host_iface,
+        "-p",
+        "udp",
+        "--dport",
+        "53",
+        "-j",
+        "ACCEPT",
+    ])?;
+    // Allow DNS response packets back (ESTABLISHED/RELATED)
+    run_iptables(&[
+        "-A",
+        &chain_name,
+        "-o",
+        &config.host_iface,
+        "-m",
+        "state",
+        "--state",
+        "ESTABLISHED,RELATED",
         "-j",
         "ACCEPT",
     ])?;
@@ -434,6 +466,7 @@ pub fn cleanup_host_network(config: &VethConfig) {
     .ok();
 
     // DNAT (DNS UDP)
+    let dns_target = resolve_host_dns();
     run_iptables(&[
         "-t",
         "nat",
@@ -448,7 +481,7 @@ pub fn cleanup_host_network(config: &VethConfig) {
         "-j",
         "DNAT",
         "--to-destination",
-        "127.0.0.53:53",
+        &format!("{}:53", dns_target),
     ])
     .ok();
 
@@ -476,6 +509,39 @@ pub fn cleanup_host_network(config: &VethConfig) {
         host_iface = %config.host_iface,
         "Host network cleaned up"
     );
+}
+
+/// Resolve the host's upstream DNS server for sandbox DNAT.
+///
+/// Reads `/run/systemd/resolve/resolv.conf` (upstream DNS, not the stub) first,
+/// then falls back to `/etc/resolv.conf`. Returns the first non-loopback nameserver.
+/// If no suitable DNS found, falls back to 8.8.8.8 (Google Public DNS).
+///
+/// Cannot use 127.0.0.53 (systemd-resolved stub) because it binds to `lo` only —
+/// packets arriving on veth with DNAT to 127.0.0.53 are silently dropped.
+fn resolve_host_dns() -> String {
+    // Try systemd-resolved upstream config first (has real DNS, not stub)
+    for path in &[
+        "/run/systemd/resolve/resolv.conf",
+        "/etc/resolv.conf",
+    ] {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            for line in content.lines() {
+                let line = line.trim();
+                if let Some(ns) = line.strip_prefix("nameserver") {
+                    let ns = ns.trim();
+                    // Skip loopback addresses (stub resolvers)
+                    if !ns.starts_with("127.") {
+                        tracing::debug!(dns = %ns, source = %path, "Resolved host upstream DNS");
+                        return ns.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    tracing::warn!("No upstream DNS found, falling back to 8.8.8.8");
+    "8.8.8.8".to_string()
 }
 
 /// Run an `ip` command, returning an error on failure.
