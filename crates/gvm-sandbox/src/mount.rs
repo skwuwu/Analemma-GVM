@@ -355,6 +355,30 @@ fn bind_mount_runtime_dirs(new_root: &Path, interpreter_path: &Path) -> Result<(
                 tracing::warn!(dir = %dir.display(), error = %e, "Failed to mount Python runtime dir");
             }
         }
+
+        // Resolve shared library dependencies for Python extension modules (lib-dynload/*.so).
+        // ldd only resolves the interpreter binary's direct dependencies, missing libraries
+        // needed by C extensions like _ssl.so (needs libssl.so.3, libcrypto.so.3).
+        for dir in &dirs_to_mount {
+            let dynload = dir.join("lib-dynload");
+            if dynload.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(&dynload) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().map_or(false, |e| e == "so") {
+                            if let Ok(output) = std::process::Command::new("ldd").arg(&path).output() {
+                                if output.status.success() {
+                                    let stdout = String::from_utf8_lossy(&output.stdout);
+                                    for lib_path in parse_ldd_output(&stdout) {
+                                        bind_mount_library(new_root, &lib_path).ok();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         tracing::debug!(count = dirs_to_mount.len(), "Python runtime directories mounted");
     } else if name.starts_with("node") || name.starts_with("deno") || name.starts_with("bun") {
         // Node.js runtime dirs
