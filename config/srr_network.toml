@@ -275,3 +275,158 @@ pattern = "google.serper.dev/search"
 method = "POST"
 decision = { type = "Allow" }
 description = "Serper: Google search"
+
+# -- gmail.toml --
+# GVM Ruleset: Gmail (Google Workspace)
+# Domains: gmail.googleapis.com
+
+[[rules]]
+pattern = "gmail.googleapis.com/gmail/v1/users/*/messages"
+method = "GET"
+decision = { type = "Allow" }
+reason = "Read emails (read-only)"
+
+[[rules]]
+pattern = "gmail.googleapis.com/gmail/v1/users/*/messages/*"
+method = "GET"
+decision = { type = "Allow" }
+reason = "Get email details (read-only)"
+
+[[rules]]
+pattern = "gmail.googleapis.com/gmail/v1/users/*/messages/send"
+method = "POST"
+decision = { type = "Delay", milliseconds = 1000 }
+reason = "Send email (write — 1s delay for audit)"
+
+[[rules]]
+pattern = "gmail.googleapis.com/gmail/v1/users/*/messages/*"
+method = "DELETE"
+decision = { type = "Deny", reason = "Email deletion blocked" }
+
+[[rules]]
+pattern = "gmail.googleapis.com/gmail/v1/users/*/messages/*/trash"
+method = "POST"
+decision = { type = "Deny", reason = "Move to trash blocked" }
+
+# -- google-drive.toml --
+# GVM Ruleset: Google Drive
+# Domains: www.googleapis.com/drive
+
+[[rules]]
+pattern = "www.googleapis.com/drive/v3/files"
+method = "GET"
+decision = { type = "Allow" }
+reason = "List files (read-only)"
+
+[[rules]]
+pattern = "www.googleapis.com/drive/v3/files/*"
+method = "GET"
+decision = { type = "Allow" }
+reason = "Get file details (read-only)"
+
+[[rules]]
+pattern = "www.googleapis.com/drive/v3/files/*/trash"
+method = "POST"
+decision = { type = "Deny", reason = "Trash file blocked" }
+
+[[rules]]
+pattern = "www.googleapis.com/drive/v3/files/*"
+method = "DELETE"
+decision = { type = "Deny", reason = "File deletion blocked" }
+
+# -- discord.toml --
+# GVM Ruleset: Discord
+# Domains: discord.com
+
+[[rules]]
+pattern = "discord.com/api/v10/channels/*/messages"
+method = "GET"
+decision = { type = "Allow" }
+reason = "Read messages (read-only)"
+
+[[rules]]
+pattern = "discord.com/api/v10/channels/*/messages"
+method = "POST"
+decision = { type = "Delay", milliseconds = 500 }
+reason = "Send message (write — delayed for audit)"
+
+[[rules]]
+pattern = "discord.com/api/v10/channels/*"
+method = "DELETE"
+decision = { type = "Deny", reason = "Delete channel blocked" }
+
+[[rules]]
+pattern = "discord.com/api/v10/channels/*/messages/*"
+method = "DELETE"
+decision = { type = "Deny", reason = "Delete message blocked" }
+
+# -- telegram.toml --
+# GVM Ruleset: Telegram Bot API
+# Domains: api.telegram.org
+
+[[rules]]
+pattern = "api.telegram.org/bot*/getUpdates"
+method = "POST"
+decision = { type = "Allow" }
+reason = "Poll updates (read-only)"
+
+[[rules]]
+pattern = "api.telegram.org/bot*/getMe"
+method = "POST"
+decision = { type = "Allow" }
+reason = "Get bot info (read-only)"
+
+[[rules]]
+pattern = "api.telegram.org/bot*/sendMessage"
+method = "POST"
+decision = { type = "Delay", milliseconds = 500 }
+reason = "Send message (write — delayed for audit)"
+
+[[rules]]
+pattern = "api.telegram.org/bot*/deleteMessage"
+method = "POST"
+decision = { type = "Deny", reason = "Delete message blocked" }
+
+[[rules]]
+pattern = "api.telegram.org/bot*/banChatMember"
+method = "POST"
+decision = { type = "Deny", reason = "Ban user blocked (destructive)" }
+
+[[rules]]
+pattern = "api.telegram.org/bot*/kickChatMember"
+method = "POST"
+decision = { type = "Deny", reason = "Kick user blocked (destructive)" }
+
+# -- ai-inference.toml --
+# GVM Ruleset: AI Inference APIs
+# Domains: api.anthropic.com, api.openai.com
+
+[[rules]]
+pattern = "api.anthropic.com/v1/messages"
+method = "POST"
+decision = { type = "Allow" }
+reason = "Anthropic inference (AI-to-AI, read-equivalent)"
+
+[[rules]]
+pattern = "api.anthropic.com/v1/complete"
+method = "POST"
+decision = { type = "Allow" }
+reason = "Anthropic completion (AI-to-AI)"
+
+[[rules]]
+pattern = "api.openai.com/v1/chat/completions"
+method = "POST"
+decision = { type = "Allow" }
+reason = "OpenAI chat completion (AI-to-AI)"
+
+[[rules]]
+pattern = "api.openai.com/v1/completions"
+method = "POST"
+decision = { type = "Allow" }
+reason = "OpenAI completion (AI-to-AI)"
+
+[[rules]]
+pattern = "api.openai.com/v1/embeddings"
+method = "POST"
+decision = { type = "Allow" }
+reason = "OpenAI embeddings (AI-to-AI)"

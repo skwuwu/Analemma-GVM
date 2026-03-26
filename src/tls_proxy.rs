@@ -41,6 +41,8 @@ const CERT_CACHE_TTI_SECS: u64 = 3600;
 pub struct GvmCertResolver {
     /// CA certificate for signing.
     ca_cert: rcgen::Certificate,
+    /// CA certificate DER (included in TLS chain so clients can verify).
+    ca_cert_der: Vec<u8>,
     /// CA key pair.
     ca_key: KeyPair,
     /// Per-domain leaf cert cache with bounded capacity and TTI eviction.
@@ -86,8 +88,11 @@ impl GvmCertResolver {
             .self_signed(&ca_key)
             .context("Failed to reconstruct CA cert")?;
 
+        let ca_cert_der = ca_cert.der().to_vec();
+
         Ok(Self {
             ca_cert,
+            ca_cert_der,
             ca_key,
             cache: Cache::builder()
                 .max_capacity(MAX_CERT_CACHE_SIZE)
@@ -121,13 +126,17 @@ impl GvmCertResolver {
             .signed_by(&leaf_key, &self.ca_cert, &self.ca_key)
             .ok()?;
 
-        // Convert to rustls types
+        // Convert to rustls types.
+        // Include both leaf cert and CA cert in the chain so clients can verify
+        // the full chain even when the trust store has the original CA cert
+        // (which shares the same key but different serial/validity).
         let cert_der = CertificateDer::from(leaf_cert.der().to_vec());
+        let ca_der = CertificateDer::from(self.ca_cert_der.clone());
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
 
         let signing_key = rustls::crypto::ring::sign::any_supported_type(&key_der).ok()?;
 
-        let certified_key = CertifiedKey::new(vec![cert_der], signing_key);
+        let certified_key = CertifiedKey::new(vec![cert_der, ca_der], signing_key);
         let arc_key = Arc::new(certified_key);
 
         self.cache.insert(domain.to_string(), arc_key.clone());
