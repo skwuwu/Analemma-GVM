@@ -46,9 +46,15 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
 
     // Pre-resolve lib-dynload dependencies in the PARENT process.
     // Running ldd from PID 1 of a new PID namespace triggers kernel panic on 6.17.0-1009-aws.
-    eprintln!("[DBG] resolving lib-dynload deps in parent");
-    let extra_lib_paths = crate::mount::resolve_dynload_libs(&interpreter_path);
-    eprintln!("[DBG] resolved {} extra libs", extra_lib_paths.len());
+    let extra_lib_paths = if std::env::var("GVM_DEBUG_SKIP_DYNLOAD").is_ok() {
+        eprintln!("[DBG] SKIPPING lib-dynload resolution (GVM_DEBUG_SKIP_DYNLOAD)");
+        Vec::new()
+    } else {
+        eprintln!("[DBG] resolving lib-dynload deps in parent");
+        let libs = crate::mount::resolve_dynload_libs(&interpreter_path);
+        eprintln!("[DBG] resolved {} extra libs", libs.len());
+        libs
+    };
 
     // Pre-mount workspace in parent process BEFORE clone().
     // Kernel 6.17+ blocks bind-mount of host paths inside user namespaces.
