@@ -21,8 +21,9 @@
 //! - unshare, setns — no further namespace manipulation
 //!
 //! Socket domain restriction (defense-in-depth against CAP_NET_ADMIN escape):
-//! - socket() is allowed ONLY for AF_INET (2), AF_INET6 (10), AF_UNIX (1)
-//! - AF_NETLINK (16) is blocked — prevents iptables modification from inside sandbox
+//! - socket() is allowed ONLY for AF_INET (2), AF_INET6 (10), AF_UNIX (1), AF_NETLINK (16)
+//! - AF_NETLINK is allowed because getaddrinfo() requires NETLINK_ROUTE for DNS resolution.
+//!   Safe because all capabilities (including CAP_NET_ADMIN) are dropped before seccomp.
 //! - AF_PACKET (17) is blocked — prevents raw packet injection
 //! - This ensures agents cannot modify firewall rules even though CLONE_NEWUSER
 //!   grants apparent CAP_NET_ADMIN inside the user namespace
@@ -117,11 +118,9 @@ fn build_default_filter(default_action: SeccompAction) -> Result<seccompiler::Bp
     // Networking (HTTP traffic only — TCP/UDP sockets)
     //
     // socket() is argument-filtered: only AF_INET (2), AF_INET6 (10), AF_UNIX (1) allowed.
-    // AF_NETLINK (16) is blocked to prevent iptables modification from inside sandbox.
+    // AF_NETLINK (16) is allowed — required by getaddrinfo() for DNS resolution.
     // AF_PACKET (17) is blocked to prevent raw packet injection.
-    // This is defense-in-depth against the CAP_NET_ADMIN escape vector:
-    // CLONE_NEWUSER grants apparent root + CAP_NET_ADMIN inside the user namespace,
-    // but without AF_NETLINK sockets, agents cannot modify iptables rules.
+    // CAP_NET_ADMIN is dropped before seccomp, so AF_NETLINK cannot modify iptables.
     rules.insert(
         libc::SYS_socket,
         vec![
@@ -152,6 +151,19 @@ fn build_default_filter(default_action: SeccompAction) -> Result<seccompiler::Bp
             )
             .context("Failed to build AF_INET6 condition")?])
             .context("Failed to build AF_INET6 rule")?,
+            // Allow AF_NETLINK (16) — needed by getaddrinfo() for DNS resolution.
+            // glibc/musl use NETLINK_ROUTE to read /etc/resolv.conf and routing tables.
+            // Safe because: (1) all capabilities are dropped (no CAP_NET_ADMIN),
+            // (2) NETLINK_ROUTE is read-only without capabilities,
+            // (3) iptables modification requires CAP_NET_ADMIN which is dropped.
+            SeccompRule::new(vec![SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                libc::AF_NETLINK as u64,
+            )
+            .context("Failed to build AF_NETLINK condition")?])
+            .context("Failed to build AF_NETLINK rule")?,
         ],
     );
 
