@@ -2022,7 +2022,7 @@ SRREOF
         ensure_proxy || { fail "35: proxy not available"; }
 
         # 35b. Run agent inside sandbox — GET (should be allowed)
-        GET_RESULT=$(sudo "$GVM_BIN" run --sandbox -- python3 -c "
+        GET_RESULT=$(timeout 30 sudo "$GVM_BIN" run --sandbox -- python3 -c "
 import urllib.request, json, ssl, os
 proxy = os.environ.get('HTTPS_PROXY', os.environ.get('https_proxy', ''))
 # Use requests if available, fallback to urllib
@@ -2170,7 +2170,7 @@ if should_run 39; then
         ensure_proxy || { fail "39: proxy not available"; }
 
         # Run simple HTTPS request through sandbox
-        RESULT=$(sudo "$GVM_BIN" run --sandbox -- python3 -c "
+        RESULT=$(timeout 30 sudo "$GVM_BIN" run --sandbox -- python3 -c "
 try:
     import requests
     r = requests.get('https://api.github.com', timeout=15)
@@ -2320,7 +2320,7 @@ if should_run 42; then
         ensure_proxy || { fail "42: proxy not available"; }
 
         # 42a: mount() syscall — must be killed by seccomp
-        MOUNT_RESULT=$(sudo "$GVM_BIN" run --sandbox -- python3 -c "
+        MOUNT_RESULT=$(timeout 30 sudo "$GVM_BIN" run --sandbox -- python3 -c "
 import ctypes, os
 libc = ctypes.CDLL('libc.so.6', use_errno=True)
 # Attempt mount() — should trigger seccomp SIGSYS
@@ -2338,7 +2338,7 @@ print(f'MOUNT_SUCCEEDED:{ret}')  # Should never reach here
         fi
 
         # 42b: unshare() syscall — namespace escape attempt
-        UNSHARE_RESULT=$(sudo "$GVM_BIN" run --sandbox -- python3 -c "
+        UNSHARE_RESULT=$(timeout 30 sudo "$GVM_BIN" run --sandbox -- python3 -c "
 import ctypes, os
 libc = ctypes.CDLL('libc.so.6', use_errno=True)
 # CLONE_NEWNET = 0x40000000 — attempt network namespace escape
@@ -2359,7 +2359,7 @@ else:
         fi
 
         # 42c: ptrace() syscall — debugging/injection attempt
-        PTRACE_RESULT=$(sudo "$GVM_BIN" run --sandbox -- python3 -c "
+        PTRACE_RESULT=$(timeout 30 sudo "$GVM_BIN" run --sandbox -- python3 -c "
 import ctypes, os
 libc = ctypes.CDLL('libc.so.6', use_errno=True)
 # PTRACE_TRACEME = 0
@@ -2397,7 +2397,7 @@ if should_run 43; then
 
         # 43a: Verify proxy-only routing — agent cannot reach external IP directly
         # Use a known public IP (Google DNS 8.8.8.8) to test direct connectivity
-        DIRECT_RESULT=$(sudo "$GVM_BIN" run --sandbox -- python3 -c "
+        DIRECT_RESULT=$(timeout 30 sudo "$GVM_BIN" run --sandbox -- python3 -c "
 import socket, sys
 try:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -2418,7 +2418,7 @@ except (socket.timeout, ConnectionRefusedError, OSError) as e:
         fi
 
         # 43b: Verify proxy path works — agent CAN reach the proxy
-        PROXY_RESULT=$(sudo "$GVM_BIN" run --sandbox -- python3 -c "
+        PROXY_RESULT=$(timeout 30 sudo "$GVM_BIN" run --sandbox -- python3 -c "
 import urllib.request, os
 proxy = os.environ.get('HTTP_PROXY', '')
 try:
@@ -2449,7 +2449,7 @@ except Exception as e:
         fi
 
         # 43d: Verify IPv6 is blocked
-        IPV6_RESULT=$(sudo "$GVM_BIN" run --sandbox -- python3 -c "
+        IPV6_RESULT=$(timeout 30 sudo "$GVM_BIN" run --sandbox -- python3 -c "
 import socket
 try:
     s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
@@ -2495,7 +2495,7 @@ if should_run 44; then
 
         # 44b: MITM inspection — GET to GitHub (Allow path)
         # The proxy must terminate TLS, inspect plaintext, apply SRR, re-encrypt
-        MITM_GET=$(sudo "$GVM_BIN" run --sandbox -- python3 -c "
+        MITM_GET=$(timeout 30 sudo "$GVM_BIN" run --sandbox -- python3 -c "
 import os
 try:
     import requests
@@ -2783,7 +2783,7 @@ if should_run 47 && [ "$SKIP_OPENCLAW" = false ]; then
         # 47a: OpenClaw agent in sandbox — LLM call through MITM
         # The agent asks Claude a simple question. The HTTPS call to api.anthropic.com
         # goes through DNAT → MITM listener → SRR → upstream.
-        OC_SANDBOX_OUT=$(sudo -E "$GVM_BIN" run --sandbox -- \
+        OC_SANDBOX_OUT=$(timeout 60 sudo -E "$GVM_BIN" run --sandbox -- \
             openclaw agent --local \
             --session-id "mitm-e2e-$(date +%s)" \
             --message "Reply with only the word 'pong'." \
@@ -2889,7 +2889,7 @@ DENYSRR
         > "$PROXY_LOG" 2>/dev/null || true
 
         # Run agent — should get denied
-        DENY_OUT=$(sudo -E "$GVM_BIN" run --sandbox -- \
+        DENY_OUT=$(timeout 60 sudo -E "$GVM_BIN" run --sandbox -- \
             openclaw agent --local \
             --session-id "deny-e2e-$(date +%s)" \
             --message "Say hello." \
@@ -3020,7 +3020,7 @@ if should_run 50; then
         # 50a: overlayfs mount — verify agent can write anywhere in /workspace
         # In legacy mode, only /workspace/output is writable. With overlayfs,
         # the agent can write to any path (changes go to upper layer).
-        OVERLAY_RESULT=$(sudo "$GVM_BIN" run --sandbox -- python3 -c "
+        OVERLAY_RESULT=$(timeout 30 sudo "$GVM_BIN" run --sandbox -- python3 -c "
 import os, sys
 
 # Test 1: Write to /workspace root (not just /workspace/output)
@@ -3119,7 +3119,7 @@ if should_run 51; then
         ensure_proxy || { fail "51: proxy not available"; }
 
         # Run agent that creates files of each category
-        sudo "$GVM_BIN" run --sandbox -- python3 -c "
+        timeout 30 sudo "$GVM_BIN" run --sandbox -- python3 -c "
 import os
 
 # Auto-merge candidates
@@ -3332,7 +3332,7 @@ if should_run 55; then
         # Agent attempts to write more than the tmpfs upper layer limit (default 256MB).
         # On overlayfs: should get ENOSPC (OSError 28) — agent must NOT crash silently.
         # On legacy mode: writes to /workspace/output which is host disk — no limit.
-        ENOSPC_RESULT=$(sudo "$GVM_BIN" run --sandbox -- python3 -c "
+        ENOSPC_RESULT=$(timeout 30 sudo "$GVM_BIN" run --sandbox -- python3 -c "
 import os, sys
 
 # Determine which mode we're in
@@ -3411,7 +3411,7 @@ if should_run 56; then
         # Agent creates files that could match multiple categories.
         # The priority must be: discard > manual_commit > auto_merge > default
         # This is consistent with SRR's max_strict principle.
-        PRIORITY_RESULT=$(sudo "$GVM_BIN" run --sandbox -- python3 -c "
+        PRIORITY_RESULT=$(timeout 30 sudo "$GVM_BIN" run --sandbox -- python3 -c "
 import os
 
 # Create test files in /workspace/output (always writable)
