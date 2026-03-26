@@ -98,7 +98,6 @@ pub fn setup_mount_namespace(
         None::<&str>,
     )
     .context("Failed to make root mount private")?;
-    eprintln!("[DBG-MOUNT] 1: root private");
 
     let new_root = PathBuf::from("/tmp/gvm-sandbox-root");
 
@@ -112,7 +111,6 @@ pub fn setup_mount_namespace(
         Some("size=64m"),
     )
     .context("Failed to mount tmpfs for sandbox root")?;
-    eprintln!("[DBG-MOUNT] 2: tmpfs root");
 
     // Create directory structure
     let dirs = [
@@ -195,7 +193,6 @@ pub fn setup_mount_namespace(
         Some("size=32m"),
     )
     .context("Failed to mount tmpfs for /tmp")?;
-    eprintln!("[DBG-MOUNT] 3: workspace + /tmp");
 
     // Mount /proc (PID namespace aware, hidepid=2 for defense-in-depth).
     // hidepid=2: agent can only see its own /proc/<pid> entries.
@@ -211,16 +208,12 @@ pub fn setup_mount_namespace(
 
     // Bind-mount /dev devices
     create_dev_nodes(&new_root)?;
-    eprintln!("[DBG-MOUNT] 4: /proc + /dev");
 
     // Bind-mount interpreter and shared libraries
-    eprintln!("[DBG-MOUNT] 5: bind_mount_interpreter start");
     bind_mount_interpreter(&new_root, interpreter_path, extra_lib_paths)?;
-    eprintln!("[DBG-MOUNT] 6: bind_mount_interpreter done");
 
     // Create minimal /etc files (DNS points to veth host IP)
     create_minimal_etc(&new_root, dns_server)?;
-    eprintln!("[DBG-MOUNT] 7: /etc + CA");
 
     // Inject ephemeral CA into sandbox trust store (for transparent MITM)
     if let Some(ca_pem) = ca_cert_pem {
@@ -289,24 +282,20 @@ fn bind_mount_interpreter(new_root: &Path, interpreter_path: &Path, extra_lib_pa
     )
     .context("Failed to bind-mount interpreter")?;
 
-    eprintln!("[DBG-MOUNT] 5a: interpreter bound, running ldd");
     // Resolve shared libraries via ldd
     let ldd_output = std::process::Command::new("ldd")
         .arg(interpreter_path)
         .output();
-    eprintln!("[DBG-MOUNT] 5b: ldd done");
 
     match ldd_output {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let libs: Vec<PathBuf> = parse_ldd_output(&stdout);
-            eprintln!("[DBG-MOUNT] 5c: ldd found {} libs, mounting", libs.len());
             for lib_path in libs {
                 if mounted.insert(lib_path.clone()) {
                     bind_mount_library(new_root, &lib_path).ok();
                 }
             }
-            eprintln!("[DBG-MOUNT] 5d: ldd libs mounted");
         }
         _ => {
             // Fallback: bind-mount common library directories (less isolated but functional)
@@ -329,21 +318,16 @@ fn bind_mount_interpreter(new_root: &Path, interpreter_path: &Path, extra_lib_pa
     }
 
     // Bind-mount extra libraries pre-resolved by the parent process.
-    // Skip any already mounted by interpreter's direct ldd (prevents mount-on-mount panic).
-    let mut skipped = 0;
+    // Skip any already mounted by interpreter's direct ldd (prevents mount-on-mount panic
+    // on Linux 6.17.0-1009-aws — duplicate bind mounts trigger kernel panic).
     for lib_path in extra_lib_paths {
         if mounted.insert(lib_path.clone()) {
             bind_mount_library(new_root, lib_path).ok();
-        } else {
-            skipped += 1;
         }
     }
-    eprintln!("[DBG-MOUNT] 5e: mounted {} extra libs, skipped {} duplicates", extra_lib_paths.len() - skipped, skipped);
 
     // Mount interpreter runtime directories (Python stdlib, etc.).
-    eprintln!("[DBG-MOUNT] 5g: bind_mount_runtime_dirs start");
     bind_mount_runtime_dirs(new_root, interpreter_path)?;
-    eprintln!("[DBG-MOUNT] 5h: runtime dirs mounted");
 
     Ok(())
 }

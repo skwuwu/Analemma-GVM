@@ -4,6 +4,37 @@
 
 ---
 
+## 2026-03-26: Kernel Panic Fix — Mount Deduplication & Seccomp sendmmsg
+
+### What Changed
+
+Three fixes to resolve sandbox crashes on Linux 6.17.0-1009-aws:
+
+**1. Duplicate bind mount → kernel panic (Critical)**
+- **Root cause**: `bind_mount_interpreter()` in the child process (PID 1 of new PID namespace) mounted shared libraries twice when lib-dynload dependencies overlapped with the interpreter's direct `ldd` dependencies (e.g., `libc.so.6`, `libm.so.6`). Mount-on-mount triggers a kernel panic on 6.17.0-1009-aws.
+- **Fix**: `mount.rs` — Track mounted paths in a `HashSet<PathBuf>`. Skip any library already mounted. 3 duplicates detected and skipped per sandbox launch.
+- **Also**: Moved lib-dynload `ldd` scanning from child PID 1 to parent process via `resolve_dynload_libs()`. The parent resolves all library paths before `clone()` and passes them to the child for bind-mounting. This avoids spawning 47+ `ldd` subprocesses from PID 1 of the new PID namespace.
+
+**2. seccomp blocks sendmmsg → DNS failure (High)**
+- **Root cause**: glibc's `getaddrinfo()` uses `sendmmsg()` to batch DNS A/AAAA queries. `sendmmsg` was not in the seccomp whitelist, causing SIGSYS (exit code 159) on any DNS resolution.
+- **Fix**: `seccomp.rs` — Added `SYS_sendmmsg` and `SYS_recvmmsg` to the socket operations whitelist. These are batch versions of the already-allowed `sendmsg`/`recvmsg` with identical security properties.
+
+**3. Binary corruption on unclean reboot (Operational)**
+- **Symptom**: `gvm-proxy` binary zeroed out (all 0x00 bytes) after kernel panic + reboot. Cargo thought the binary was up-to-date because the deps hardlink still existed.
+- **Workaround**: Delete `target/release/deps/gvm_proxy-*` before rebuild. `sync` after build to flush to disk.
+
+### Affected Files
+- `crates/gvm-sandbox/src/mount.rs` — `resolve_dynload_libs()` (new), `bind_mount_interpreter()` dedup
+- `crates/gvm-sandbox/src/sandbox_impl.rs` — parent-side lib resolution, `extra_lib_paths` plumbing
+- `crates/gvm-sandbox/src/seccomp.rs` — `sendmmsg`/`recvmmsg` whitelist
+
+### Risk Assessment
+- **Kernel panic fix**: Eliminates a hard crash. HashSet dedup is conservative (skip rather than crash). No security regression — same libraries are mounted, just without duplicates.
+- **sendmmsg**: Same security as existing `sendmsg` — socket creation is still AF_restricted, network is still iptables/TC-locked to proxy only.
+- **Remaining**: DNS resolution fails because sandbox's DNS target (veth host IP:53) has no listener. Needs DNAT from veth:53 → 127.0.0.53:53 on the host side.
+
+---
+
 ## 2026-03-26: Security Audit — Unsafe/FFI, Blocking I/O, Namespace Hardening
 
 ### What Changed

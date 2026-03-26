@@ -25,13 +25,6 @@ const CHILD_STACK_SIZE: usize = 2 * 1024 * 1024;
 pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     let start = std::time::Instant::now();
 
-    // Debug: check which steps to skip for crash isolation
-    let skip_network = std::env::var("GVM_DEBUG_SKIP_NETWORK").is_ok();
-    let skip_tc = std::env::var("GVM_DEBUG_SKIP_TC").is_ok();
-    let skip_mount = std::env::var("GVM_DEBUG_SKIP_MOUNT").is_ok();
-
-    eprintln!("[DBG] launch() start, skip_network={}, skip_tc={}, skip_mount={}", skip_network, skip_tc, skip_mount);
-
     // Pre-flight: resolve interpreter path
     let interpreter_path = which_interpreter(&config.interpreter)
         .with_context(|| format!("Interpreter '{}' not found in PATH", config.interpreter))?;
@@ -47,13 +40,9 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     // Pre-resolve lib-dynload dependencies in the PARENT process.
     // Running ldd from PID 1 of a new PID namespace triggers kernel panic on 6.17.0-1009-aws.
     let extra_lib_paths = if std::env::var("GVM_DEBUG_SKIP_DYNLOAD").is_ok() {
-        eprintln!("[DBG] SKIPPING lib-dynload resolution (GVM_DEBUG_SKIP_DYNLOAD)");
         Vec::new()
     } else {
-        eprintln!("[DBG] resolving lib-dynload deps in parent");
-        let libs = crate::mount::resolve_dynload_libs(&interpreter_path);
-        eprintln!("[DBG] resolved {} extra libs", libs.len());
-        libs
+        crate::mount::resolve_dynload_libs(&interpreter_path)
     };
 
     // Pre-mount workspace in parent process BEFORE clone().
@@ -127,13 +116,7 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
 
     // 2. Set up veth network pair
     let veth_config = VethConfig::from_pid(child_pid.as_raw() as u32, config.proxy_addr);
-    eprintln!("[DBG] step 2: setup_host_network");
-    let network_result = if skip_network {
-        eprintln!("[DBG] SKIPPING network setup");
-        Err(anyhow::anyhow!("skipped by GVM_DEBUG_SKIP_NETWORK"))
-    } else {
-        setup_host_network(&veth_config)
-    };
+    let network_result = setup_host_network(&veth_config);
 
     if let Err(ref e) = network_result {
         tracing::warn!(error = %e, "Host network setup failed — sandbox will have no network");
@@ -143,15 +126,12 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
             tracing::debug!(error = %e, "Failed to record network state (orphan cleanup unavailable)");
         }
     }
-    eprintln!("[DBG] step 2 done");
-
     // 2.5. Attach eBPF TC ingress filter on host-side veth (unbypassable enforcement)
     //      This runs BEFORE signaling the child, so enforcement is active from first packet.
     //      If eBPF is unavailable, iptables provides baseline enforcement and
     //      seccomp AF_NETLINK blocking prevents iptables modification (defense-in-depth).
     // RAII guard: dropping this detaches the TC filter. Kept alive for sandbox duration.
-    eprintln!("[DBG] step 2.5: eBPF/TC filter");
-    let _ebpf_guard = if network_result.is_ok() && !skip_tc {
+    let _ebpf_guard = if network_result.is_ok() {
         let proxy_ip: std::net::Ipv4Addr = veth_config
             .host_ip
             .parse()
@@ -378,10 +358,6 @@ fn child_entry(
     ca_cert_pem: Option<&[u8]>,
     extra_lib_paths: &[std::path::PathBuf],
 ) -> isize {
-    eprintln!("[DBG-CHILD] child_entry start");
-    let skip_mount = std::env::var("GVM_DEBUG_SKIP_MOUNT").is_ok();
-    let skip_network = std::env::var("GVM_DEBUG_SKIP_NETWORK").is_ok();
-
     // Wait for parent to complete UID mapping and network setup
     let network_seed = match wait_for_parent(coord_fd) {
         Ok(seed) => seed,
@@ -390,25 +366,18 @@ fn child_entry(
             return 1;
         }
     };
-    eprintln!("[DBG-CHILD] parent signaled, network_seed={}", network_seed);
-
     // Use parent-provided seed so interface names/IPs match host-side setup.
     let veth_config = VethConfig::from_pid(network_seed, config.proxy_addr);
 
     // Set up network inside the sandbox
-    if skip_network {
-        eprintln!("[DBG-CHILD] SKIPPING sandbox network setup");
-    } else if let Err(e) = setup_sandbox_network(&veth_config) {
+    if let Err(e) = setup_sandbox_network(&veth_config) {
         // Network failure is non-fatal for debugging — agent just won't have connectivity
         eprintln!("gvm-sandbox: network setup failed (non-fatal): {}", e);
     }
-    eprintln!("[DBG-CHILD] sandbox network done");
 
     // Set up mount namespace (pivot_root)
     // DNS server must match the OUTPUT iptables rule (host veth IP)
-    if skip_mount {
-        eprintln!("[DBG-CHILD] SKIPPING mount namespace setup");
-    } else if let Err(e) = setup_mount_namespace(
+    if let Err(e) = setup_mount_namespace(
         &config.workspace_dir,
         interpreter_path,
         &veth_config.host_ip,
@@ -420,26 +389,18 @@ fn child_entry(
         return 1;
     }
 
-    eprintln!("[DBG-CHILD] mount done");
-
     // Drop all capabilities from the bounding set.
     // When running as root (CLONE_NEWUSER skipped), all caps are inherited.
     // Without this, the agent can run iptables -F to remove firewall rules.
-    eprintln!("[DBG-CHILD] dropping capabilities");
     if let Err(e) = drop_all_capabilities() {
         eprintln!("gvm-sandbox: capability drop failed: {}", e);
         return 1;
     }
-    eprintln!("[DBG-CHILD] capabilities dropped");
-
     // Apply seccomp-BPF filter (must be last before exec)
-    eprintln!("[DBG-CHILD] applying seccomp");
     if let Err(e) = apply_seccomp_filter(&config.seccomp_profile) {
         eprintln!("gvm-sandbox: seccomp filter failed: {}", e);
         return 1;
     }
-    eprintln!("[DBG-CHILD] seccomp applied");
-
     // Prepare environment variables
     let proxy_url = format!(
         "http://{}:{}",
