@@ -11,6 +11,67 @@ use anyhow::{Context, Result};
 use nix::mount::{mount, MsFlags};
 use std::path::{Path, PathBuf};
 
+/// Resolve shared library dependencies for Python lib-dynload extension modules.
+///
+/// Must be called in the PARENT process (before clone) because running ldd
+/// from PID 1 of a new PID namespace triggers a kernel panic on 6.17.0-1009-aws.
+/// The resolved paths are then passed to the child for bind-mounting.
+pub fn resolve_dynload_libs(interpreter_path: &Path) -> Vec<PathBuf> {
+    let name = interpreter_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    if !name.starts_with("python") {
+        return Vec::new();
+    }
+
+    let mut libs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for search_dir in &["/usr/lib", "/usr/local/lib"] {
+        let Ok(entries) = std::fs::read_dir(search_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let fname = entry.file_name();
+            let fname_str = fname.to_string_lossy();
+            if !fname_str.starts_with("python3") || !entry.path().is_dir() {
+                continue;
+            }
+            let dynload = entry.path().join("lib-dynload");
+            if !dynload.is_dir() {
+                continue;
+            }
+            let Ok(so_entries) = std::fs::read_dir(&dynload) else {
+                continue;
+            };
+            for so_entry in so_entries.flatten() {
+                let path = so_entry.path();
+                if path.extension().map_or(true, |e| e != "so") {
+                    continue;
+                }
+                if let Ok(output) = std::process::Command::new("ldd").arg(&path).output() {
+                    if output.status.success() {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        for lib_path in parse_ldd_output(&stdout) {
+                            if seen.insert(lib_path.clone()) {
+                                libs.push(lib_path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    tracing::debug!(
+        count = libs.len(),
+        "Pre-resolved lib-dynload dependencies in parent process"
+    );
+    libs
+}
+
 /// Set up the mount namespace for the sandboxed agent.
 ///
 /// 1. Create tmpfs staging root
@@ -24,6 +85,7 @@ pub fn setup_mount_namespace(
     dns_server: &str,
     ca_cert_pem: Option<&[u8]>,
     fs_policy: Option<&crate::FilesystemPolicy>,
+    extra_lib_paths: &[PathBuf],
 ) -> Result<()> {
     // Make the entire mount tree private FIRST, before any new mounts.
     // pivot_root requires the new root to NOT be on a shared mount.
@@ -148,7 +210,7 @@ pub fn setup_mount_namespace(
     create_dev_nodes(&new_root)?;
 
     // Bind-mount interpreter and shared libraries
-    bind_mount_interpreter(&new_root, interpreter_path)?;
+    bind_mount_interpreter(&new_root, interpreter_path, extra_lib_paths)?;
 
     // Create minimal /etc files (DNS points to veth host IP)
     create_minimal_etc(&new_root, dns_server)?;
@@ -200,7 +262,7 @@ fn create_dev_nodes(new_root: &Path) -> Result<()> {
 }
 
 /// Resolve shared library dependencies and bind-mount them.
-fn bind_mount_interpreter(new_root: &Path, interpreter_path: &Path) -> Result<()> {
+fn bind_mount_interpreter(new_root: &Path, interpreter_path: &Path, extra_lib_paths: &[PathBuf]) -> Result<()> {
     // Bind-mount the interpreter binary
     let interpreter_name = interpreter_path
         .file_name()
@@ -246,6 +308,14 @@ fn bind_mount_interpreter(new_root: &Path, interpreter_path: &Path) -> Result<()
                 }
             }
         }
+    }
+
+    // Bind-mount extra libraries pre-resolved by the parent process.
+    // These are the lib-dynload dependencies (e.g., libssl.so.3 needed by _ssl.so)
+    // resolved in the parent to avoid running ldd from PID 1 of the new PID namespace
+    // (which triggers a kernel panic on 6.17.0-1009-aws).
+    for lib_path in extra_lib_paths {
+        bind_mount_library(new_root, lib_path).ok();
     }
 
     // Mount interpreter runtime directories (Python stdlib, etc.).
@@ -358,39 +428,9 @@ fn bind_mount_runtime_dirs(new_root: &Path, interpreter_path: &Path) -> Result<(
             }
         }
 
-        // Resolve shared library dependencies for Python extension modules (lib-dynload/*.so).
-        // ldd only resolves the interpreter binary's direct dependencies, missing libraries
-        // needed by C extensions like _ssl.so (needs libssl.so.3, libcrypto.so.3).
-        //
-        // SAFETY: This runs ldd on each .so file, spawning ~47 subprocesses from PID 1
-        // of the new PID namespace. On kernel 6.17.0-1009-aws, this triggers a kernel panic.
-        // Skip via GVM_DEBUG_SKIP_DYNLOAD=1 for crash isolation.
-        let skip_dynload = std::env::var("GVM_DEBUG_SKIP_DYNLOAD").is_ok();
-        if skip_dynload {
-            tracing::debug!("Skipping lib-dynload ldd scanning (GVM_DEBUG_SKIP_DYNLOAD)");
-        }
-        if !skip_dynload {
-        for dir in &dirs_to_mount {
-            let dynload = dir.join("lib-dynload");
-            if dynload.is_dir() {
-                if let Ok(entries) = std::fs::read_dir(&dynload) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.extension().map_or(false, |e| e == "so") {
-                            if let Ok(output) = std::process::Command::new("ldd").arg(&path).output() {
-                                if output.status.success() {
-                                    let stdout = String::from_utf8_lossy(&output.stdout);
-                                    for lib_path in parse_ldd_output(&stdout) {
-                                        bind_mount_library(new_root, &lib_path).ok();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        } // end if !skip_dynload
+        // NOTE: lib-dynload shared library resolution is now done in the parent process
+        // via resolve_dynload_libs() and passed as extra_lib_paths to avoid running
+        // ldd from PID 1 of the new PID namespace (kernel panic on 6.17.0-1009-aws).
         tracing::debug!(count = dirs_to_mount.len(), "Python runtime directories mounted");
     } else if name.starts_with("node") || name.starts_with("deno") || name.starts_with("bun") {
         // Node.js runtime dirs

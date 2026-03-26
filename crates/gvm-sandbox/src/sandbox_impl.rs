@@ -44,6 +44,12 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     // never enters the sandbox namespace.
     let ca_cert_pem: Option<Vec<u8>> = config.mitm_ca_cert.clone();
 
+    // Pre-resolve lib-dynload dependencies in the PARENT process.
+    // Running ldd from PID 1 of a new PID namespace triggers kernel panic on 6.17.0-1009-aws.
+    eprintln!("[DBG] resolving lib-dynload deps in parent");
+    let extra_lib_paths = crate::mount::resolve_dynload_libs(&interpreter_path);
+    eprintln!("[DBG] resolved {} extra libs", extra_lib_paths.len());
+
     // Pre-mount workspace in parent process BEFORE clone().
     // Kernel 6.17+ blocks bind-mount of host paths inside user namespaces.
     // By mounting in the parent (which has real root), the mount is visible
@@ -80,6 +86,7 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     let child_config = config.clone();
     let child_interpreter_path = interpreter_path.clone();
     let child_ca_pem = ca_cert_pem.clone();
+    let child_extra_libs = extra_lib_paths;
 
     let child_pid = unsafe {
         nix::sched::clone(
@@ -90,6 +97,7 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
                     &child_config,
                     &child_interpreter_path,
                     child_ca_pem.as_deref(),
+                    &child_extra_libs,
                 )
             }),
             &mut stack,
@@ -362,6 +370,7 @@ fn child_entry(
     config: &SandboxConfig,
     interpreter_path: &std::path::Path,
     ca_cert_pem: Option<&[u8]>,
+    extra_lib_paths: &[std::path::PathBuf],
 ) -> isize {
     eprintln!("[DBG-CHILD] child_entry start");
     let skip_mount = std::env::var("GVM_DEBUG_SKIP_MOUNT").is_ok();
@@ -399,6 +408,7 @@ fn child_entry(
         &veth_config.host_ip,
         ca_cert_pem,
         config.fs_policy.as_ref(),
+        extra_lib_paths,
     ) {
         eprintln!("gvm-sandbox: mount namespace setup failed: {:#}", e);
         return 1;
