@@ -361,6 +361,15 @@ fn bind_mount_runtime_dirs(new_root: &Path, interpreter_path: &Path) -> Result<(
         // Resolve shared library dependencies for Python extension modules (lib-dynload/*.so).
         // ldd only resolves the interpreter binary's direct dependencies, missing libraries
         // needed by C extensions like _ssl.so (needs libssl.so.3, libcrypto.so.3).
+        //
+        // SAFETY: This runs ldd on each .so file, spawning ~47 subprocesses from PID 1
+        // of the new PID namespace. On kernel 6.17.0-1009-aws, this triggers a kernel panic.
+        // Skip via GVM_DEBUG_SKIP_DYNLOAD=1 for crash isolation.
+        let skip_dynload = std::env::var("GVM_DEBUG_SKIP_DYNLOAD").is_ok();
+        if skip_dynload {
+            tracing::debug!("Skipping lib-dynload ldd scanning (GVM_DEBUG_SKIP_DYNLOAD)");
+        }
+        if !skip_dynload {
         for dir in &dirs_to_mount {
             let dynload = dir.join("lib-dynload");
             if dynload.is_dir() {
@@ -381,6 +390,7 @@ fn bind_mount_runtime_dirs(new_root: &Path, interpreter_path: &Path) -> Result<(
                 }
             }
         }
+        } // end if !skip_dynload
         tracing::debug!(count = dirs_to_mount.len(), "Python runtime directories mounted");
     } else if name.starts_with("node") || name.starts_with("deno") || name.starts_with("bun") {
         // Node.js runtime dirs
