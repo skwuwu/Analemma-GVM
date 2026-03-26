@@ -4,6 +4,34 @@
 
 ---
 
+## 2026-03-26: DNS DNAT + MITM TLS Pipeline Complete
+
+### What Changed
+
+**DNS resolution from sandbox now works end-to-end.**
+
+The sandbox's `resolv.conf` points to the veth host IP (10.200.X.1), but no DNS server listens there. Previous attempt to DNAT to `127.0.0.53` (systemd-resolved stub) failed because the stub binds to `lo` only — packets arriving on veth after DNAT are silently dropped.
+
+**Fix**: `resolve_host_dns()` reads `/run/systemd/resolve/resolv.conf` to find the actual upstream DNS server (e.g., 172.31.0.2 on AWS VPC). PREROUTING DNAT redirects sandbox DNS to this upstream resolver. Added FORWARD chain rules for DNS UDP and ESTABLISHED/RELATED responses.
+
+**MITM TLS inspection pipeline verified:**
+1. Sandbox → DNS (DNAT to upstream) → IP resolution
+2. Sandbox → port 443 → DNAT → host:8443 (TLS MITM listener)
+3. TLS termination with ephemeral CA → plaintext HTTP inspection
+4. SRR policy evaluation → enforcement decision (Delay/Deny/Allow)
+5. Forward to upstream → response back to sandbox
+
+Proxy log confirms: `MITM: inspecting HTTPS request method=GET host=api.github.com path=/`
+
+### Affected Files
+- `crates/gvm-sandbox/src/network.rs` — `resolve_host_dns()`, DNS DNAT+MASQUERADE+FORWARD rules, cleanup
+
+### Risk Assessment
+- DNS DNAT is restricted to UDP port 53 only. The FORWARD chain allows DNS but drops all other non-proxy traffic.
+- `resolve_host_dns()` falls back to 8.8.8.8 if no upstream DNS found.
+
+---
+
 ## 2026-03-26: Kernel Panic Fix — Mount Deduplication & Seccomp sendmmsg
 
 ### What Changed
