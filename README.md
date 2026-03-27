@@ -324,13 +324,17 @@ Industry templates set this automatically: `saas` → `delay`, `finance` → `re
 | `gvm run` / `--interactive` / `--sandbox` / `--contained` | **Shipping** | CLI with auto proxy management |
 | SRR hot-reload (`POST /gvm/reload`) | **Shipping** | Atomic swap, parse failure preserves existing rules |
 | Docker fallback (`--contained`) | **Shipping** | For macOS/Windows |
+| SRR payload inspection (JSON body field matching) | **Shipping** | `payload_inspection = true` in config, max 64KB body |
+| IC-3 human-in-the-loop approval | **Shipping** | Proxy holds response, CLI prompt, auto-deny on timeout |
+| Admin/proxy port separation | **Shipping** | Agent port (8080) vs operator port (9090), prevents self-approval |
+| overlayfs Trust-on-Pattern (filesystem governance) | **Shipping** | Auto-merge / manual-commit / discard by file pattern (kernel 5.11+) |
+| cgroup v2 resource limits (`--sandbox`) | **Shipping** | `--memory 512m --cpus 0.5` |
 | Python SDK (`@ic()` + `gvm_session()`) | **Shipping** | LangChain `@tool` stackable |
 
 ### Loaded but Inactive
 
 | Feature | Current State | Impact |
 |---------|--------------|--------|
-| SRR payload inspection | Rules parsed from TOML, but proxy passes `body = None` | Host/method/path rules work fully. Body matching does not fire. |
 | Wasm hot-path | Module loads and validates, but native engine is the default | No user impact — native engine is functionally identical |
 | NATS JetStream | Connection stubbed, WAL-first design works locally | WAL is the primary audit path. NATS needed for distributed setups only. |
 
@@ -340,7 +344,6 @@ Industry templates set this automatically: `saas` → `delay`, `finance` → `re
 |---------|--------|-------|
 | IC-3 approval workflow (webhook/queue) | v1.1 | Currently IC-3 = Deny + "needs review" in audit log |
 | Non-sandbox MITM (`gvm trust-ca`) | v1.1 | macOS/Windows full HTTPS inspection without `--sandbox` |
-| SRR payload inspection activation | v1.1 | Wire up body buffering to SRR matching |
 | NATS JetStream publish | v1.0 | Async event streaming for distributed audit |
 | Redis/DynamoDB vault backend | v1.0 | Currently in-memory only |
 | Prometheus metrics endpoint | v1.0 | Governance decisions + cost tracking |
@@ -473,75 +476,32 @@ class MyAgent(GVMAgent):
 
 ## Isolation Modes
 
-### The development → production ladder
+Three levels of enforcement, same CLI and config:
 
-The recommended workflow matches how most developers already work: **develop on macOS/Windows, deploy to Linux.**
+| Step | Command | What it does | Platform |
+|------|---------|-------------|----------|
+| **Observe** | `gvm watch agent.py` | See all API calls, no blocking | Any OS |
+| **Develop** | `gvm run --contained agent.py` | Docker isolation + full HTTPS MITM | Any OS + Docker |
+| **Production** | `gvm run --sandbox agent.py` | Kernel-level isolation + overlayfs + cgroups | Linux |
 
-| Step | Command | Enforcement | HTTPS inspection | Platform |
-|------|---------|-------------|-----------------|----------|
-| **1. Observe** | `gvm run -i agent.py` | Cooperative (agent can bypass) | Domain-level only | Any OS |
-| **2. Develop** | `gvm run --contained agent.py` | Docker isolation + MITM | Full L7 (path/method/body) | Any OS with Docker |
-| **3. Production** | `gvm run --sandbox agent.py` | Kernel-level (namespace + seccomp + TC) | Full L7 (path/method/body) | Linux only |
+`--sandbox` provides the strongest guarantees: network (iptables + eBPF TC + seccomp), filesystem (overlayfs Trust-on-Pattern), resources (cgroup v2), process (seccomp ~111 syscalls). The agent cannot bypass the proxy, access the host filesystem, or self-approve IC-3 requests.
 
-Same CLI, same config files, same SRR rules at every step. Policies built in development work identically in production.
+`--contained` provides full HTTPS inspection with Docker — sufficient for development and CI/CD.
 
-### `--contained` vs `--sandbox` — honest comparison
+Without flags, enforcement is cooperative (agent respects `HTTP_PROXY`).
 
-Both provide HTTPS MITM inspection via ephemeral CA injection and DNAT. The difference is enforcement depth:
-
-| Feature | `--contained` (Docker) | `--sandbox` (Linux-native) |
-|---------|----------------------|---------------------------|
-| **Platform** | Any OS with Docker | Linux only |
-| **HTTPS MITM** | ✓ (CA injected via volume mount, DNAT via iptables in container) | ✓ (CA injected via mount namespace, DNAT via iptables + host veth) |
-| **API key injection (HTTPS)** | ✓ | ✓ |
-| **Network isolation** | Docker bridge (`--internal`) | veth pair + iptables + TC ingress filter |
-| **Proxy bypass prevention** | Hardened cooperative — Docker network + DNAT, but agent has `NET_ADMIN` for DNAT setup and could theoretically modify rules | **Structural** — TC filter on host-side veth (agent cannot touch), seccomp blocks AF_NETLINK |
-| **Seccomp** | Docker default profile only | Custom profile: ~111 syscalls, `ptrace`/`bpf`/`mount` killed, AF_NETLINK blocked |
-| **Filesystem** | Read-only root + tmpfs /tmp | Minimal rootfs via `pivot_root` |
-| **Resource limits** | Configurable (`--memory`, `--cpus`) | OS-level limits |
-| **CA trust coverage** | Python, Node.js, Go, curl, Ruby (via env vars + volume mount) | All (injected into system trust store via mount namespace) |
-| **Java support** | Requires manual keystore import | Requires manual keystore import |
-
-> **When to use which:** Use `--contained` for development and CI/CD on any OS — it provides full HTTPS inspection with Docker you already have. Use `--sandbox` for production on Linux — it provides kernel-level enforcement guarantees that Docker cannot match. The `NET_ADMIN` capability given to `--contained` for DNAT is a known trade-off: it's necessary for HTTPS MITM but weakens the isolation compared to `--sandbox`.
-
-### Platform Support
-
-| Feature | Linux | macOS | Windows |
-|---------|-------|-------|---------|
-| Proxy + SRR + WAL + Merkle | Yes | Yes | Yes |
-| `gvm run` (cooperative HTTP_PROXY) | Yes | Yes | Yes |
-| `--contained` (Docker + MITM) | Yes | Yes (Docker Desktop) | Yes (Docker Desktop) |
-| `--sandbox` (namespace + seccomp + TC) | **Yes** | No | No |
-| Shadow Mode | Yes | Yes | Yes |
-
-### HTTP vs HTTPS Capabilities
-
-| Capability | HTTP | HTTPS — no isolation | HTTPS — `--contained` | HTTPS — `--sandbox` |
-|------------|------|---------------------|----------------------|---------------------|
-| **Host filtering** | ✓ | ✓ (CONNECT target) | ✓ | ✓ |
-| **Path/method inspection** | ✓ | ✗ (encrypted) | ✓ (MITM) | ✓ (MITM) |
-| **API key injection** | ✓ | ✗ | ✓ (MITM) | ✓ (MITM) |
-| **Body inspection** | ✓ | ✗ (encrypted) | ✓ (MITM) | ✓ (MITM) |
-| **WAL audit detail** | Full | Domain only | Full | Full |
-| **SRR rule matching** | Host+method+path | Host only | Host+method+path | Host+method+path |
-| **Proxy bypass prevention** | None | None | Hardened (Docker network) | Structural (kernel) |
-
-> **Bottom line:** Both `--contained` and `--sandbox` provide full L7 HTTPS inspection. The difference is enforcement strength, not inspection capability. For most development workflows, `--contained` is sufficient.
+> **Detailed per-mode coverage** — what each mode governs (network, filesystem, process, resources) and what it doesn't: [Governance Coverage →](docs/17-governance-coverage.md)
 
 ### Agent Integration
 
 GVM governs any agent that makes HTTP calls. No framework dependency.
 
 ```bash
-# Any script/binary
 gvm run agent.py                         # Python
 gvm run -- node my_agent.js              # Node.js
-gvm run --sandbox -- ./my_rust_agent     # Rust binary + kernel isolation
-
-# Agent frameworks
-gvm run -- openclaw gateway              # OpenClaw
-gvm run -- python -m crewai run          # CrewAI
-HTTP_PROXY=http://localhost:8080 autogen  # AutoGen (manual proxy)
+gvm run --sandbox -- ./my_rust_agent     # + kernel isolation
+gvm run --contained agent.py             # + Docker isolation
+gvm run -- openclaw gateway              # Any binary
 ```
 
 ---
@@ -595,28 +555,14 @@ HTTP_PROXY=http://localhost:8080 autogen  # AutoGen (manual proxy)
 
 ## Known Limitations
 
-> These are not minor polish items — some directly affect the core value proposition. Read before deploying.
+| Gap | Impact | Details |
+|-----|--------|---------|
+| **HTTPS without `--contained`/`--sandbox`** | Domain-level only (no path/body) | Use isolation mode for full L7 |
+| **No external security audit** | Pre-release alpha, single developer | 321+ tests, but not a substitute |
+| **Java HTTPS MITM** | Requires manual keystore import | Python/Node/Go/curl/Ruby auto-supported |
+| **DNS tunneling** (`--sandbox`) | Host DNS relay can leak data | External DNS servers blocked, host relay open |
 
-**Fundamental gaps:**
-
-| Gap | Impact | Mitigation |
-|-----|--------|------------|
-| **HTTPS without isolation** | Path/method/body inspection **does not work** — only domain filtering | Use `--contained` (Docker, any OS) or `--sandbox` (Linux) for full L7 HTTPS |
-| **SRR payload inspection** | Rules are parsed but **currently inactive** — body is never inspected | Host/method/path rules work. Payload matching is roadmap |
-| **No external security audit** | Pre-release alpha, single developer, no third-party review | 321+ tests including adversarial/stress suites, but not a substitute for audit |
-
-**`--contained` (Docker) notes:**
-
-- `--cap-add=NET_ADMIN` is granted to the container for DNAT iptables setup (HTTPS → MITM listener redirect). This is a trade-off: necessary for MITM but gives the agent the theoretical ability to modify iptables rules inside the container. Mitigated by `no-new-privileges` and `--internal` Docker network.
-- CA trust coverage: Python, Node.js, Go, curl, Ruby are covered via env vars + volume mount. **Java requires manual keystore import** (`keytool -import`).
-- Proxy failure is fail-closed: Docker's `--internal` network blocks external access, so the agent cannot fall back to direct connections.
-
-**`--sandbox` (Linux) notes:**
-
-- `kernel.unprivileged_userns_clone=1` (required) has historically been an attack surface for privilege escalation (CVE-2022-0185, CVE-2023-2640). GVM mitigates with seccomp blocking of `unshare`/`clone3`/`setns`, but the sysctl widens the host's attack surface. **Minimum**: kernel ≥ 4.15 (functional). **Recommended**: LTS kernel ≥ 6.1.
-- Proxy failure is fail-closed: iptables OUTPUT DROP + TC filter = no network path without proxy. Watchdog auto-restarts proxy (max 3 attempts). Agent sees `ECONNREFUSED` during restart window.
-
-> Full security model and known attack surface: [Security Model →](docs/12-security-model.md)
+> Full details: [Security Model →](docs/12-security-model.md) · [Governance Coverage →](docs/17-governance-coverage.md)
 
 ---
 
@@ -641,6 +587,7 @@ HTTP_PROXY=http://localhost:8080 autogen  # AutoGen (manual proxy)
 | [14](docs/14-implementation-log.md) | Implementation Log |
 | [15](docs/15-quickstart.md) | Quick Start Guide |
 | [16](docs/16-reference.md) | Reference |
+| [17](docs/17-governance-coverage.md) | Governance Coverage by Mode |
 
 ---
 

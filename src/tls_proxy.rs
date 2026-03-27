@@ -62,15 +62,26 @@ impl std::fmt::Debug for GvmCertResolver {
 impl GvmCertResolver {
     /// Create a resolver from CA key PEM bytes.
     ///
-    /// NOTE: `_ca_cert_pem` is currently unused because rcgen cannot reconstruct
-    /// a `Certificate` from PEM — we re-generate the CA cert from the key.
-    /// The re-generated cert has the same public key as the original, so TLS
-    /// verification succeeds. Retained in the signature for API compatibility
-    /// and future rcgen versions that may support PEM-to-Certificate parsing.
-    pub fn new(_ca_cert_pem: &[u8], ca_key_pem: &[u8]) -> Result<Self> {
+    /// `ca_cert_pem` is the original CA certificate (served via /gvm/ca.pem and
+    /// injected into the sandbox trust store). Its DER is included in the TLS
+    /// cert chain so clients can verify: leaf → original CA → trust store.
+    ///
+    /// The signing key is extracted from `ca_key_pem` and used to sign leaf certs
+    /// via a reconstructed rcgen Certificate (necessary because rcgen cannot parse
+    /// PEM back to Certificate). Both the original and reconstructed certs share
+    /// the same key, so signatures are valid against either.
+    pub fn new(ca_cert_pem: &[u8], ca_key_pem: &[u8]) -> Result<Self> {
         let ca_key_str = std::str::from_utf8(ca_key_pem).context("CA key not valid UTF-8")?;
 
         let ca_key = KeyPair::from_pem(ca_key_str).context("Failed to parse CA key PEM")?;
+
+        // Extract original CA cert DER from PEM (for inclusion in TLS chain).
+        // This is the cert clients have in their trust store, so it must be in the chain.
+        let original_ca_der = rustls_pemfile::certs(&mut &ca_cert_pem[..])
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("No certificate found in CA PEM"))?
+            .context("Failed to parse CA cert PEM")?
+            .to_vec();
 
         // Reconstruct CA cert from key (self-signed)
         let mut params = CertificateParams::default();
@@ -88,11 +99,9 @@ impl GvmCertResolver {
             .self_signed(&ca_key)
             .context("Failed to reconstruct CA cert")?;
 
-        let ca_cert_der = ca_cert.der().to_vec();
-
         Ok(Self {
             ca_cert,
-            ca_cert_der,
+            ca_cert_der: original_ca_der,
             ca_key,
             cache: Cache::builder()
                 .max_capacity(MAX_CERT_CACHE_SIZE)
