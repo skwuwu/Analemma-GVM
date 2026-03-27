@@ -419,7 +419,14 @@ async fn main() {
                                 let app = app.clone();
                                 async move {
                                     Ok::<_, std::convert::Infallible>(
-                                        tower::ServiceExt::oneshot(app, req).await.unwrap(),
+                                        tower::ServiceExt::oneshot(app, req)
+                                            .await
+                                            .unwrap_or_else(|_| {
+                                                axum::http::Response::builder()
+                                                    .status(500)
+                                                    .body(axum::body::Body::from("Internal error"))
+                                                    .unwrap_or_default()
+                                            }),
                                     )
                                 }
                             });
@@ -671,7 +678,7 @@ async fn route_request(
         Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
             .body(Body::empty())
-            .unwrap()
+            .unwrap_or_default()
     });
     Ok(resp)
 }

@@ -2,7 +2,7 @@
 
 **See what your AI agent calls. Block what it shouldn't. Roll back when it fails.**
 
-4MB binary. Single process. No Docker, no K8s, no GPU.
+Single binary (~17MB release). Single process. No Docker, no K8s, no GPU.
 
 > GVM is an HTTP proxy that sits between your AI agent and the internet — it shows you every API call, enforces URL/method/payload rules, injects credentials so the agent never holds keys, and logs everything in a tamper-evident audit chain.
 

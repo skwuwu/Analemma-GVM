@@ -417,10 +417,16 @@ fn child_entry(
     let bin_path = format!("/bin/{}", interpreter_name);
 
     // Set environment and exec
+    // HTTP_PROXY only — NOT HTTPS_PROXY.
+    // In sandbox mode, all TCP 443 traffic is DNATed to the MITM TLS listener (port 8443).
+    // Setting HTTPS_PROXY would cause clients to use CONNECT tunneling, which creates
+    // an end-to-end TLS tunnel that bypasses MITM inspection entirely.
+    // Without HTTPS_PROXY, clients connect directly to 443, hit DNAT → MITM.
     std::env::set_var("HTTP_PROXY", &proxy_url);
-    std::env::set_var("HTTPS_PROXY", &proxy_url);
     std::env::set_var("http_proxy", &proxy_url);
-    std::env::set_var("https_proxy", &proxy_url);
+    // Explicitly unset HTTPS_PROXY to prevent inherited values
+    std::env::remove_var("HTTPS_PROXY");
+    std::env::remove_var("https_proxy");
     std::env::set_var("GVM_AGENT_ID", &config.agent_id);
     std::env::set_var("GVM_PROXY_URL", &proxy_url);
     std::env::set_var("HOME", "/workspace");
