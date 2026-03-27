@@ -91,6 +91,13 @@ pub struct AppState {
     pub pending_approvals: Arc<dashmap::DashMap<String, PendingApproval>>,
     /// IC-3 approval timeout in seconds.
     pub ic3_approval_timeout_secs: u64,
+    /// TLS MITM resolver for CONNECT handler inline inspection.
+    /// Shared with the port-8443 TLS listener for a single cert cache.
+    pub mitm_resolver: Option<std::sync::Arc<crate::tls_proxy::GvmCertResolver>>,
+    /// Pre-built rustls ServerConfig for agent-facing TLS termination.
+    pub mitm_server_config: Option<std::sync::Arc<rustls::ServerConfig>>,
+    /// Pre-built rustls ClientConfig for upstream TLS connections.
+    pub mitm_client_config: Option<std::sync::Arc<rustls::ClientConfig>>,
 }
 
 /// Derive event status from upstream HTTP response.
@@ -1793,33 +1800,64 @@ async fn handle_connect_inner(
     };
     state.ledger.append_async(event).await;
 
-    // Establish TCP connection to target
+    // MITM TLS inspection on CONNECT tunnel.
+    // Instead of blind TCP relay, terminate TLS with the agent, inspect the
+    // plaintext HTTP request, apply SRR policy, then re-encrypt to upstream.
+    // Falls back to blind relay if MITM is not configured.
+    let host_owned = host.to_string();
     let target_addr = format!("{}:{}", host, port);
+    let mitm_resolver = state.mitm_resolver.clone();
+    let mitm_sc = state.mitm_server_config.clone();
+    let mitm_cc = state.mitm_client_config.clone();
+    let connect_state = state.clone();
 
-    // Respond with 200 Connection Established, then upgrade to raw TCP
     tokio::task::spawn(async move {
-        match hyper::upgrade::on(request).await {
-            Ok(upgraded) => match tokio::net::TcpStream::connect(&target_addr).await {
-                Ok(upstream) => {
-                    let (mut client_read, mut client_write) =
-                        tokio::io::split(hyper_util::rt::TokioIo::new(upgraded));
-                    let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
-
-                    let c2s = tokio::io::copy(&mut client_read, &mut upstream_write);
-                    let s2c = tokio::io::copy(&mut upstream_read, &mut client_write);
-
-                    tokio::select! {
-                        r = c2s => { if let Err(e) = r { tracing::debug!(error = %e, "CONNECT client→upstream ended"); } }
-                        r = s2c => { if let Err(e) = r { tracing::debug!(error = %e, "CONNECT upstream→client ended"); } }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(target = %target_addr, error = %e, "CONNECT: failed to connect to upstream");
-                }
-            },
+        let upgraded = match hyper::upgrade::on(request).await {
+            Ok(u) => u,
             Err(e) => {
                 tracing::error!(error = %e, "CONNECT: upgrade failed");
+                return;
             }
+        };
+
+        // MITM path: TLS termination + L7 inspection
+        if let (Some(resolver), Some(sc), Some(cc)) = (mitm_resolver, mitm_sc, mitm_cc) {
+            // Pre-warm cert cache on blocking thread (avoids stalling tokio)
+            if resolver.ensure_cached(host_owned.clone()).await.is_none() {
+                tracing::warn!(host = %host_owned, "CONNECT MITM: cert generation failed, falling back to tunnel");
+                blind_relay(upgraded, &target_addr).await;
+                return;
+            }
+
+            // TLS accept on the upgraded connection
+            let acceptor = tokio_rustls::TlsAcceptor::from(sc);
+            let tls_stream = match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                acceptor.accept(hyper_util::rt::TokioIo::new(upgraded)),
+            )
+            .await
+            {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    tracing::debug!(host = %host_owned, error = %e, "CONNECT MITM: TLS handshake failed");
+                    return;
+                }
+                Err(_) => {
+                    tracing::debug!(host = %host_owned, "CONNECT MITM: TLS handshake timed out");
+                    return;
+                }
+            };
+
+            if let Err(e) = crate::tls_proxy::handle_mitm_stream(
+                tls_stream, &host_owned, cc, &connect_state,
+            )
+            .await
+            {
+                tracing::debug!(host = %host_owned, error = %e, "CONNECT MITM: stream handling error");
+            }
+        } else {
+            // Legacy fallback: blind TCP relay (no MITM configured)
+            blind_relay(upgraded, &target_addr).await;
         }
     });
 
@@ -1828,4 +1866,26 @@ async fn handle_connect_inner(
         .status(StatusCode::OK)
         .body(Body::empty())
         .unwrap()
+}
+
+/// Blind TCP relay fallback (when MITM is not configured).
+async fn blind_relay(upgraded: hyper::upgrade::Upgraded, target_addr: &str) {
+    match tokio::net::TcpStream::connect(target_addr).await {
+        Ok(upstream) => {
+            let (mut client_read, mut client_write) =
+                tokio::io::split(hyper_util::rt::TokioIo::new(upgraded));
+            let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
+
+            let c2s = tokio::io::copy(&mut client_read, &mut upstream_write);
+            let s2c = tokio::io::copy(&mut upstream_read, &mut client_write);
+
+            tokio::select! {
+                r = c2s => { if let Err(e) = r { tracing::debug!(error = %e, "CONNECT relay client→upstream ended"); } }
+                r = s2c => { if let Err(e) = r { tracing::debug!(error = %e, "CONNECT relay upstream→client ended"); } }
+            }
+        }
+        Err(e) => {
+            tracing::error!(target = %target_addr, error = %e, "CONNECT: failed to connect to upstream");
+        }
+    }
 }

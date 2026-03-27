@@ -121,6 +121,8 @@ Defense-in-depth enforcement layers (v0.2.4):
 
 After sandbox network setup, the agent can only reach: (1) GVM proxy via TCP on the host veth IP, (2) DNS via UDP 53 on the same host veth IP, (3) loopback. All other egress is dropped at multiple layers. IPv6 is disabled to prevent bypassing IPv4 firewall rules.
 
+**Known limitation — DNS tunneling**: DNS queries are allowed through the host's upstream resolver for name resolution. An agent could encode data in DNS query hostnames (e.g., `base64-data.attacker.com`) to exfiltrate information at low bandwidth (~50 bytes/query). Current mitigations: (1) DNS is restricted to the host's resolver only (no arbitrary DNS server), (2) all DNS goes through DNAT which enables future iptables LOG-based monitoring. Planned mitigation: local DNS cache/filter that restricts queries to domains seen in SRR rules.
+
 **Environment compatibility**:
 
 | Kernel | TC filter | iptables | seccomp AF_NETLINK | Enforcement |

@@ -426,6 +426,105 @@ impl HttpRequest {
     }
 }
 
+/// Handle a MITM TLS stream: read plaintext HTTP, apply SRR, forward to upstream.
+///
+/// Shared between the port-8443 TLS listener and the CONNECT handler.
+/// `S` can be `TcpStream` (DNAT path) or `TokioIo<Upgraded>` (CONNECT path).
+pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    mut tls_stream: tokio_rustls::server::TlsStream<S>,
+    host_hint: &str,
+    client_config: std::sync::Arc<rustls::ClientConfig>,
+    state: &crate::proxy::AppState,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // 1. Read plaintext HTTP from decrypted stream
+    let req = read_http_request(&mut tls_stream).await?;
+
+    let host = if req.host.is_empty() {
+        host_hint.to_string()
+    } else {
+        req.host.clone()
+    };
+
+    tracing::info!(
+        method = %req.method,
+        host = %host,
+        path = %req.path,
+        "MITM: inspecting HTTPS request"
+    );
+
+    // 2. SRR policy check (full: method + path + body)
+    let srr_result = {
+        let srr = state.srr.read().unwrap_or_else(|e| e.into_inner());
+        let body_ref = if req.body.is_empty() {
+            None
+        } else {
+            Some(req.body.as_slice())
+        };
+        srr.check(&req.method, &host, &req.path, body_ref)
+    };
+
+    let decision = &srr_result.decision;
+    tracing::info!(decision = ?decision, host = %host, path = %req.path, "MITM: SRR decision");
+
+    // 3. Enforce decision
+    match decision {
+        gvm_types::EnforcementDecision::Deny { reason } => {
+            let response = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\r\n\
+                 {{\"blocked\":true,\"decision\":\"Deny\",\"reason\":\"{}\"}}\r\n",
+                reason
+            );
+            tls_stream.write_all(response.as_bytes()).await?;
+            tls_stream.shutdown().await?;
+            tracing::warn!(host = %host, path = %req.path, reason = %reason, "MITM: request DENIED");
+            return Ok(());
+        }
+        gvm_types::EnforcementDecision::Delay { milliseconds } => {
+            tokio::time::sleep(std::time::Duration::from_millis(*milliseconds)).await;
+        }
+        _ => {} // Allow, AuditOnly, etc.
+    }
+
+    // 4. API key injection (strip agent auth, inject proxy credentials)
+    let mut req = req;
+    if req.inject_credentials(&state.api_keys) {
+        tracing::info!(host = %host, "MITM: API key injected for upstream");
+    }
+
+    // 5. Connect to upstream with TLS
+    let connector = tokio_rustls::TlsConnector::from(client_config);
+    let upstream_host = host.split(':').next().unwrap_or(&host);
+    let upstream_addr = format!("{}:443", upstream_host);
+
+    let upstream_tcp = tokio::net::TcpStream::connect(&upstream_addr).await
+        .context("MITM: failed to connect to upstream")?;
+    let server_name = rustls::pki_types::ServerName::try_from(upstream_host.to_string())
+        .map_err(|e| anyhow::anyhow!("MITM: invalid server name: {}", e))?;
+    let mut upstream_tls = connector.connect(server_name, upstream_tcp).await
+        .context("MITM: upstream TLS handshake failed")?;
+
+    // 6. Forward request
+    upstream_tls.write_all(&req.raw_head).await?;
+    if !req.body.is_empty() {
+        upstream_tls.write_all(&req.body).await?;
+    }
+
+    // 7. Relay response back to agent
+    let mut buf = vec![0u8; 8192];
+    loop {
+        let n = upstream_tls.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        tls_stream.write_all(&buf[..n]).await?;
+    }
+
+    tls_stream.shutdown().await.ok();
+    Ok(())
+}
+
 /// Resolve the original destination when SNI is absent.
 ///
 /// Uses SO_ORIGINAL_DST on the accepted socket to recover the

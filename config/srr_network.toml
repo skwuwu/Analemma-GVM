@@ -33,7 +33,7 @@ reason = "List pull requests (read-only)"
 
 [[rules]]
 pattern = "api.github.com"
-path_regex = "^/repos/[^/]+/[^/]+/pulls/.*"
+path_regex = "^/repos/[^/]+/[^/]+/pulls/.*$"
 method = "GET"
 decision = { type = "Allow" }
 reason = "Get pull request details (read-only)"
@@ -47,7 +47,7 @@ reason = "List issues (read-only)"
 
 [[rules]]
 pattern = "api.github.com"
-path_regex = "^/repos/[^/]+/[^/]+/issues/.*"
+path_regex = "^/repos/[^/]+/[^/]+/issues/.*$"
 method = "GET"
 decision = { type = "Allow" }
 reason = "Get issue details (read-only)"
@@ -75,7 +75,7 @@ reason = "List labels (read-only)"
 
 [[rules]]
 pattern = "api.github.com"
-path_regex = "^/repos/[^/]+/[^/]+/contents/.*"
+path_regex = "^/repos/[^/]+/[^/]+/contents/.*$"
 method = "GET"
 decision = { type = "Allow" }
 reason = "Read file contents (read-only)"
@@ -104,7 +104,7 @@ reason = "Create pull request (write -- delayed for audit)"
 
 [[rules]]
 pattern = "api.github.com"
-path_regex = "^/repos/[^/]+/[^/]+/issues/.*"
+path_regex = "^/repos/[^/]+/[^/]+/issues/.*$"
 method = "PATCH"
 decision = { type = "Delay", milliseconds = 300 }
 reason = "Update issue/PR (write -- delayed for audit)"
