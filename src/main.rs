@@ -514,7 +514,41 @@ async fn main() {
     // This guarantees Arc<Ledger> references are released for WAL shutdown flush.
     let mut connection_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
+    // Raise FD limit to support high connection counts.
+    // Default ulimit (1024) is too low for proxy + MITM (each request uses 2-4 FDs).
+    #[cfg(unix)]
+    {
+        let target_nofile = 65536;
+        let rlim = libc::rlimit {
+            rlim_cur: target_nofile,
+            rlim_max: target_nofile,
+        };
+        unsafe {
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) == 0 {
+                tracing::info!(nofile = target_nofile, "FD limit raised");
+            } else {
+                // Try soft limit only (may not have permission for hard limit)
+                let mut current = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                libc::getrlimit(libc::RLIMIT_NOFILE, &mut current);
+                let soft = libc::rlimit {
+                    rlim_cur: current.rlim_max,
+                    rlim_max: current.rlim_max,
+                };
+                libc::setrlimit(libc::RLIMIT_NOFILE, &soft);
+                tracing::info!(nofile = current.rlim_max, "FD limit raised to hard limit");
+            }
+        }
+    }
+
     loop {
+        // Aggressively clean up finished handles to prevent FD leak
+        if connection_handles.len() > 256 {
+            connection_handles.retain(|h| !h.is_finished());
+        }
+
         tokio::select! {
             conn = listener.accept() => {
                 match conn {
@@ -526,13 +560,15 @@ async fn main() {
                             serve_connection(stream, app, cs, peer_ip).await;
                         });
                         connection_handles.push(handle);
-                        // Periodically clean up finished handles to avoid unbounded growth
-                        if connection_handles.len() > 2048 {
-                            connection_handles.retain(|h| !h.is_finished());
-                        }
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "Accept failed");
+                        // EMFILE (too many open files): clean up handles and pause briefly
+                        let err_str = format!("{}", e);
+                        if err_str.contains("Too many open files") || err_str.contains("os error 24") {
+                            connection_handles.retain(|h| !h.is_finished());
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                        tracing::error!(error = %e, active = connection_handles.len(), "Accept failed");
                     }
                 }
             }

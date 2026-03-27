@@ -44,11 +44,17 @@ REPO_DIR="$(dirname "$SCRIPT_DIR")"
 # Auto-detect PROXY_PID
 PROXY_PID=$(pgrep -f "gvm-proxy" | head -1 || true)
 
-# Auto-detect rulesets directory
+# Auto-detect rulesets directory (clone if missing)
 RULESETS_DIR=""
 for d in "$REPO_DIR/../analemma-gvm-openclaw/rulesets" "$HOME/analemma-gvm-openclaw/rulesets"; do
     [ -d "$d" ] && RULESETS_DIR="$d" && break
 done
+if [ -z "$RULESETS_DIR" ]; then
+    echo -e "  ${YELLOW}Cloning analemma-gvm-openclaw for test rulesets...${NC}"
+    git clone --depth 1 https://github.com/skwuwu/analemma-gvm-openclaw.git \
+        "$HOME/analemma-gvm-openclaw" 2>/dev/null || true
+    [ -d "$HOME/analemma-gvm-openclaw/rulesets" ] && RULESETS_DIR="$HOME/analemma-gvm-openclaw/rulesets"
+fi
 
 # Auto-detect MCP directory
 MCP_DIR=""
@@ -3492,7 +3498,7 @@ fi
 if should_run 57; then
     header "57: WAL Disk Full → Fail-Closed"
 
-    DISKFULL_PORT=9090
+    DISKFULL_PORT=9190
     DISKFULL_WAL_DIR=$(mktemp -d /tmp/gvm-diskfull-wal-XXXX)
     DISKFULL_LOG="/tmp/gvm-proxy-diskfull.log"
 
