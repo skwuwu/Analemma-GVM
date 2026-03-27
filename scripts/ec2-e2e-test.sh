@@ -34,6 +34,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 PROXY_URL="http://127.0.0.1:8080"
+ADMIN_URL="http://127.0.0.1:9090"
 PROXY_LOG="/tmp/gvm-proxy-e2e.log"
 RESULTS=()
 SKIP_OPENCLAW=false
@@ -563,7 +564,7 @@ if should_run 10; then
 
     # Before: only _default ruleset (github = delay)
     cat "$RULESETS_DIR/_default.toml" > config/srr_network.toml 2>/dev/null
-    curl -sf -X POST "$PROXY_URL/gvm/reload" > /dev/null
+    curl -sf -X POST "$ADMIN_URL/gvm/reload" > /dev/null
 
     BEFORE=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
         -H "Content-Type: application/json" \
@@ -579,7 +580,7 @@ for f in ['$RULESETS_DIR/_default.toml', '$RULESETS_DIR/github.toml']:
     except: pass
 open('config/srr_network.toml', 'w').write('\n'.join(parts))
 "
-    RELOAD_RESP=$(curl -sf -X POST "$PROXY_URL/gvm/reload" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('rules','?'))" 2>/dev/null)
+    RELOAD_RESP=$(curl -sf -X POST "$ADMIN_URL/gvm/reload" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('rules','?'))" 2>/dev/null)
     echo -e "  Reload: $RELOAD_RESP rules"
 
     AFTER=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
@@ -603,7 +604,7 @@ open('config/srr_network.toml', 'w').write('\n'.join(parts))
             -H "Content-Type: application/json" \
             -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' 2>/dev/null || echo "000")
         [ "$RESP" = "200" ] || LOST=$((LOST + 1))
-        [ $((i % 5)) -eq 0 ] && curl -sf -X POST "$PROXY_URL/gvm/reload" > /dev/null 2>&1
+        [ $((i % 5)) -eq 0 ] && curl -sf -X POST "$ADMIN_URL/gvm/reload" > /dev/null 2>&1
     done
     [ "$LOST" -eq 0 ] && pass "10b: zero requests lost during reload" || fail "10b: $LOST requests lost during reload"
 
@@ -615,7 +616,7 @@ for f in ['_default.toml', 'github.toml', 'slack.toml', 'web-browsing.toml']:
     except: pass
 open('config/srr_network.toml', 'w').write('\n'.join(parts))
 "
-    curl -sf -X POST "$PROXY_URL/gvm/reload" > /dev/null
+    curl -sf -X POST "$ADMIN_URL/gvm/reload" > /dev/null
 fi
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1526,7 +1527,7 @@ for f in sorted(os.listdir(rulesets)):
 open('$REPO_DIR/config/srr_network.toml', 'w').write('\n'.join(parts))
 print(f'  {len(parts)} rulesets loaded (all)')
 "
-        curl -sf -X POST "$PROXY_URL/gvm/reload" > /dev/null 2>&1
+        curl -sf -X POST "$ADMIN_URL/gvm/reload" > /dev/null 2>&1
         sleep 1
     fi
 
@@ -2889,7 +2890,7 @@ DENYSRR
             OLD_SRR_CONTENT=$(cat config/srr_network.toml)
         fi
         cp "$DENY_SRR" config/srr_network.toml 2>/dev/null || true
-        curl -sf -X POST "$PROXY_URL/gvm/reload" >/dev/null 2>&1
+        curl -sf -X POST "$ADMIN_URL/gvm/reload" >/dev/null 2>&1
 
         # Clear log
         > "$PROXY_LOG" 2>/dev/null || true
@@ -2929,7 +2930,7 @@ DENYSRR
         if [ -n "$OLD_SRR_CONTENT" ]; then
             echo "$OLD_SRR_CONTENT" > config/srr_network.toml
         fi
-        curl -sf -X POST "$PROXY_URL/gvm/reload" >/dev/null 2>&1
+        curl -sf -X POST "$ADMIN_URL/gvm/reload" >/dev/null 2>&1
 
         rm -f "$DENY_SRR"
     fi
@@ -3709,7 +3710,7 @@ if should_run 59; then
 
     # 59a: Request WITHOUT prior intent declaration (strict mode should block)
     # First, check if shadow mode is enabled
-    SHADOW_CHECK=$(curl -sf "$PROXY_URL/gvm/info" 2>/dev/null | \
+    SHADOW_CHECK=$(curl -sf "$ADMIN_URL/gvm/info" 2>/dev/null | \
         python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('shadow_mode','disabled'))" 2>/dev/null)
 
     if [ "$SHADOW_CHECK" = "disabled" ] || [ -z "$SHADOW_CHECK" ]; then
