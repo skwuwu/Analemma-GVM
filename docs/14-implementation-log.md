@@ -4,6 +4,36 @@
 
 ---
 
+## 2026-03-27: MITM TLS End-to-End Fix — CA Chain, DN Match, Proxy Bypass
+
+### What Changed
+
+Four fixes to make MITM TLS inspection work with `requests`/`curl` in sandbox:
+
+**1. CA Distinguished Name mismatch (Critical)**
+- GvmCertResolver reconstructed CA with `CN=GVM Ephemeral CA` but original EphemeralCA had `CN=GVM Ephemeral CA, O=Analemma GVM`. Leaf cert's issuer DN didn't match chain CA's subject → OpenSSL error 20 "unable to get local issuer certificate".
+- Fix: Added `O=Analemma GVM` to reconstructed CA's DN.
+
+**2. Original CA cert in TLS chain (Critical)**
+- Resolver included its regenerated CA in the chain, but sandbox trust store had the original CA from `/gvm/ca.pem`. Different serial/validity caused mismatch.
+- Fix: Parse original CA PEM → DER and include in TLS chain instead of regenerated.
+
+**3. HTTPS_PROXY causes CONNECT bypass (Critical)**
+- When `HTTPS_PROXY` is set, Python `requests`/`curl` use CONNECT tunneling → end-to-end TLS → bypasses MITM entirely. Client gets real upstream cert but trust store only has GVM CA.
+- Fix: Don't set `HTTPS_PROXY` in sandbox. DNAT 443→8443 handles all HTTPS transparently.
+
+**4. System CA bundle path for certifi (Medium)**
+- Python `certifi.where()` returns `/etc/ssl/certs/ca-certificates.crt` which didn't exist in sandbox. Even with `REQUESTS_CA_BUNDLE` set, some internal paths read the default location.
+- Fix: Write GVM CA to `ca-certificates.crt` and `cert.pem` in addition to `gvm-ca.crt`.
+
+### Affected Files
+- `src/tls_proxy.rs` — DN fix, original CA DER in chain
+- `crates/gvm-sandbox/src/sandbox_impl.rs` — remove HTTPS_PROXY
+- `crates/gvm-sandbox/src/mount.rs` — system CA bundle paths
+- `config/srr_network.toml` — telegram/discord/gmail/AI provider rules added
+
+---
+
 ## 2026-03-26: DNS DNAT + MITM TLS Pipeline Complete
 
 ### What Changed
