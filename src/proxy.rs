@@ -1801,14 +1801,19 @@ async fn handle_connect_inner(
     state.ledger.append_async(event).await;
 
     // MITM TLS inspection on CONNECT tunnel.
-    // Instead of blind TCP relay, terminate TLS with the agent, inspect the
-    // plaintext HTTP request, apply SRR policy, then re-encrypt to upstream.
-    // Falls back to blind relay if MITM is not configured.
+    // Only apply MITM for connections from sandbox veth IPs (10.200.0.0/16).
+    // Cooperative mode (127.0.0.1) uses blind relay for end-to-end TLS.
+    let peer_ip = request.extensions().get::<std::net::IpAddr>().copied();
+    let is_sandbox = peer_ip.map_or(false, |ip| match ip {
+        std::net::IpAddr::V4(v4) => v4.octets()[0] == 10 && v4.octets()[1] == 200,
+        _ => false,
+    });
+
     let host_owned = host.to_string();
     let target_addr = format!("{}:{}", host, port);
-    let mitm_resolver = state.mitm_resolver.clone();
-    let mitm_sc = state.mitm_server_config.clone();
-    let mitm_cc = state.mitm_client_config.clone();
+    let mitm_resolver = if is_sandbox { state.mitm_resolver.clone() } else { None };
+    let mitm_sc = if is_sandbox { state.mitm_server_config.clone() } else { None };
+    let mitm_cc = if is_sandbox { state.mitm_client_config.clone() } else { None };
     let connect_state = state.clone();
 
     tokio::task::spawn(async move {

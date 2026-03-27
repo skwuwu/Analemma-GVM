@@ -518,11 +518,12 @@ async fn main() {
         tokio::select! {
             conn = listener.accept() => {
                 match conn {
-                    Ok((stream, _addr)) => {
+                    Ok((stream, addr)) => {
                         let app = app_for_connect.clone();
                         let cs = state_for_connect.clone();
+                        let peer_ip = addr.ip();
                         let handle = tokio::spawn(async move {
-                            serve_connection(stream, app, cs).await;
+                            serve_connection(stream, app, cs, peer_ip).await;
                         });
                         connection_handles.push(handle);
                         // Periodically clean up finished handles to avoid unbounded growth
@@ -651,9 +652,12 @@ async fn serve_connection(
     stream: tokio::net::TcpStream,
     app: axum::Router,
     state: gvm_proxy::proxy::AppState,
+    peer_ip: std::net::IpAddr,
 ) {
     let io = hyper_util::rt::TokioIo::new(stream);
-    let svc = hyper::service::service_fn(move |req| {
+    let svc = hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
+        // Pass peer IP to handlers via request extensions
+        req.extensions_mut().insert(peer_ip);
         let a = app.clone();
         let s = state.clone();
         route_request(req, a, s)
