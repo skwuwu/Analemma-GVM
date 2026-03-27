@@ -118,12 +118,13 @@ In production, set `GVM_SECRETS_KEY` to encrypt `secrets.toml`. Plaintext is for
 
 ### Decision Types
 
-| Type | Fields | IC Level |
-|------|--------|----------|
-| `Allow` | — | IC-1 |
-| `Delay` | `milliseconds` | IC-2 |
-| `RequireApproval` | `urgency` | IC-3 |
-| `Deny` | `reason` | — |
+| Type | Fields | IC Level | Block response `ic_level` |
+|------|--------|----------|--------------------------|
+| `Allow` | — | IC-1 | — (not blocked) |
+| `Delay` | `milliseconds` | IC-2 | — (forwarded after delay) |
+| `RequireApproval` | `urgency` | IC-3 | 3 |
+| `Deny` | `reason` | — | 4 |
+| `Throttle` | `max_per_minute` | — | 2 (when rate limit exceeded) |
 
 ### Custom Operations (`config/operation_registry.toml`)
 

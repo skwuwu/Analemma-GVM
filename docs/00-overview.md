@@ -147,7 +147,7 @@ See [Part 8: Memory & Runtime Security](08-memory-security.md) for full analysis
 
 ---
 
-## Test Coverage: 305 Tests
+## Test Coverage: 367+ Tests
 
 | Category | Count | Source |
 |----------|-------|--------|

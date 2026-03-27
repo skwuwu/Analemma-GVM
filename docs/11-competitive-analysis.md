@@ -295,7 +295,7 @@ These capabilities require fundamentally different components that OPA+Envoy's a
 |-----------|-----------|-----|-----|
 | **LLM thinking trace extraction** | Not in scope | OpenAI/Anthropic/Gemini response parsing | Requires protocol-aware response body parsing for multiple LLM providers — fundamentally outside Envoy's scope (Envoy does not inspect response bodies) |
 | **Checkpoint/rollback** | Not in scope | Merkle-verified state restore via SDK | Requires deep SDK integration with agent state management — a proxy alone cannot manage agent-side state |
-| **4MB single binary, no K8s** | K8s + OPA server + Envoy sidecar | `cargo run` | OPA+Envoy is a distributed system by design; GVM is a single process. This is the most practical differentiator for VPS/EC2 deployments |
+| **Single binary (~17MB release), no K8s** | K8s + OPA server + Envoy sidecar | `cargo run` | OPA+Envoy is a distributed system by design; GVM is a single process. This is the most practical differentiator for VPS/EC2 deployments |
 
 ### Tier 2: Significant Engineering Effort on OPA+Envoy
 

@@ -1,8 +1,10 @@
 # Part 9: Test & Benchmark Report
 
-**Total: 277 Rust Tests (120 core unit + 7 engine + 17 CLI + 32 boundary + 17 edge + 28 hostile + 12 integration + 12 merkle + 12 stress + 10 tls_probe + 7 sandbox security + 3 base64) + 34 EC2 E2E Scenarios — All Pass**
-**Benchmarks: 17 groups / 76 benchmark cases (Criterion v0.5)**
-**Last Verified: 2026-03-23 (`cargo test --workspace --all-targets`)**
+**Total: 367+ Rust Tests across all crates + 34 EC2 E2E Scenarios — All Pass**
+**Benchmarks: 19 benchmark functions (Criterion v0.5)**
+**Last Verified: 2026-03-27 (`cargo test --workspace`)**
+
+> Note: Test count grows with each feature. The number above reflects `grep -r '#[test]\|#[tokio::test]' src/ crates/ tests/` at time of writing. Run `cargo test` to verify current count.
 
 ---
 
