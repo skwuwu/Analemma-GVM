@@ -646,6 +646,17 @@ fn inject_ca_cert(new_root: &Path, ca_pem: &[u8]) -> Result<()> {
         anyhow::bail!("Failed to inject CA into any trust store path");
     }
 
+    // Also write to the system CA bundle path that certifi/requests defaults to.
+    // Python's `certifi.where()` returns `/etc/ssl/certs/ca-certificates.crt` on Ubuntu.
+    // If this file doesn't exist, `requests` can't find any CAs even when
+    // REQUESTS_CA_BUNDLE is set (internal urllib3 context creation reads it).
+    let system_bundle = new_root.join("etc/ssl/certs/ca-certificates.crt");
+    std::fs::write(&system_bundle, ca_pem).ok();
+
+    // Also write to the certifi package's expected location
+    let certifi_bundle = new_root.join("etc/ssl/certs/cert.pem");
+    std::fs::write(&certifi_bundle, ca_pem).ok();
+
     tracing::debug!("Ephemeral CA injected into sandbox trust store");
     Ok(())
 }
