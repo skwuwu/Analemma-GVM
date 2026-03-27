@@ -86,9 +86,13 @@ impl GvmCertResolver {
         // Reconstruct CA cert from key (self-signed)
         let mut params = CertificateParams::default();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        // DN must match the original EphemeralCA (ca.rs) exactly.
+        // Mismatch causes "unable to get local issuer certificate" because
+        // the leaf cert's issuer DN won't match the chain CA's subject DN.
         params.distinguished_name = {
             let mut dn = DistinguishedName::new();
             dn.push(DnType::CommonName, "GVM Ephemeral CA");
+            dn.push(DnType::OrganizationName, "Analemma GVM");
             dn
         };
         // Backdate not_before for clock drift tolerance
