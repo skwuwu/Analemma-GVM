@@ -6,7 +6,8 @@
       "Bash(cd \"c:\\\\Users\\\\gimgy\\\\OneDrive\\\\바탕 화면\\\\Analemma-GVM\" __NEW_LINE_eeb061d735b93f12__ echo '=== 1. gvm run --contained --help ===' ./target/release/gvm.exe run --help)",
       "Read(//c/Users/gimgy/OneDrive/바탕 화면/Analemma-GVM/**)",
       "Bash(/dev/null ./target/release/gvm.exe run --contained /tmp/test_coop.py)",
-      "Bash(/dev/null __NEW_LINE_bfe76077a7ce49ea__ rm /tmp/test_coop.py)"
+      "Bash(/dev/null __NEW_LINE_bfe76077a7ce49ea__ rm /tmp/test_coop.py)",
+      "Bash(MSYS_NO_PATHCONV=1 docker run --rm --entrypoint sh --cap-add=NET_ADMIN --user root gvm-agent:latest -c \"setpriv --help 2>&1 | grep -A2 ''cap\\\\|inh\\\\|bounding''\")"
     ]
   }
 }

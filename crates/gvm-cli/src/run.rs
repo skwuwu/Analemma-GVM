@@ -1184,10 +1184,10 @@ async fn run_contained(
     };
 
     // Build DNAT entrypoint script — runs inside container before the agent.
-    // Redirects outbound traffic to proxy:
-    //   - TCP 443 → MITM TLS listener (full L7 inspection)
-    //   - TCP 80  → proxy HTTP port (HTTP inspection)
-    // Requires NET_ADMIN capability (added to docker run below).
+    // Phase 1 (root + NET_ADMIN): set up iptables DNAT rules
+    // Phase 2 (cap drop): drop NET_ADMIN so agent cannot modify iptables
+    // This closes the "agent can iptables -F" vulnerability while keeping
+    // DNAT setup working. Uses setpriv (util-linux, available in Debian/Ubuntu).
     let entrypoint_script = if mitm_available {
         format!(
             "if ! command -v iptables >/dev/null 2>&1; then \
@@ -1200,7 +1200,7 @@ async fn run_contained(
              iptables -t nat -A OUTPUT -p tcp --dport 443 -j DNAT --to-destination $GVM_HOST:{tls} && \
              iptables -t nat -A OUTPUT -p tcp --dport 80 -j DNAT --to-destination $GVM_HOST:{http} && \
              unset HTTPS_PROXY https_proxy && \
-             exec \"$@\"",
+             exec setpriv --inh-caps=-net_admin --bounding-set=-net_admin -- \"$@\"",
             host = proxy_host_for_container,
             tls = tls_port,
             http = proxy_port,
