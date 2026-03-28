@@ -4,6 +4,37 @@
 
 ---
 
+## 2026-03-28: E2E Mock Server, Security Tests, False-Pass Cleanup
+
+### What Changed
+
+**1. Mock GitHub/httpbin server (scripts/mock-github.py)**
+- Created a local HTTP server that simulates GitHub API and httpbin responses.
+- Avoids hitting the 60 req/hour unauthenticated GitHub API rate limit during E2E runs.
+- Routes: GitHub repos/issues/pulls/actions/contents + httpbin /get and /post echo.
+- Proxy host_overrides in proxy.toml are patched at startup to route api.github.com and httpbin.org to the mock; original config is restored in cleanup.
+
+**2. Security tests 61-63 (scripts/ec2-e2e-test.sh)**
+- Test 61 (IC-3 Self-Approval Prevention): sandboxed agent attempts TCP connect to admin port 9090. Verifies iptables OUTPUT chain blocks non-proxy ports.
+- Test 62 (DNS Exfiltration Logging): sandboxed agent resolves a suspicious domain. Checks WAL/proxy logs for the query. Documents the known gap that DNS (UDP 53) bypasses L7 proxy.
+- Test 63 (Config File Manipulation): non-sandboxed agent modifies srr_network.toml (documents cooperative-mode limitation); sandboxed agent verifies config is protected by mount namespace.
+
+**3. Test 17 rewrite (Base64 Exfiltration Detection)**
+- Replaced unconditional `pass` with actual proxy-through-WAL test: sends base64 payload to evil-exfil.attacker.com, checks WAL for recorded events, and verifies SRR decision.
+
+**4. False-pass cleanup**
+- Changed 7 fallback `pass` calls to `skip` where the underlying assertion did not actually succeed (tests 44e, 46c, 49c, 58c, 60a, 60b, 60d). These previously inflated the pass count.
+
+### Affected Files
+- `scripts/mock-github.py` — new file
+- `scripts/ec2-e2e-test.sh` — mock server lifecycle, tests 61-63, test 17 rewrite, false-pass fixes
+- `config/proxy.toml` — dynamically patched at E2E runtime (backup/restore)
+
+### Risk Assessment
+- **Low**: mock server only binds to 127.0.0.1:9999 and is killed on exit. proxy.toml is backed up before modification and restored in cleanup trap. New tests are additive. False-pass-to-skip changes may reduce reported pass count but improve accuracy.
+
+---
+
 ## 2026-03-28: E2E Test Reliability Fixes + Enable Overlayfs by Default
 
 ### What Changed
