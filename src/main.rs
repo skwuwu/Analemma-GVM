@@ -379,10 +379,13 @@ async fn main() {
 
     // Agent-facing router: proxy + safe endpoints (health, check, info, vault, ca.pem)
     // /gvm/info is read-only (GET) so safe on agent port. MCP server needs it.
-    // /gvm/approve and /gvm/reload remain admin-only (write operations).
+    // /gvm/reload is also on agent port but restricted to loopback (127.0.0.1) only.
+    // Sandbox agents come from 10.200.x.x and cannot reach it.
+    // /gvm/approve remains admin-only (IC-3 self-approval prevention).
     let app = Router::new()
         .route("/gvm/health", axum::routing::get(api::health))
         .route("/gvm/info", axum::routing::get(api::info))
+        .route("/gvm/reload", axum::routing::post(reload_srr_localhost_only))
         .route("/gvm/check", axum::routing::post(api::check))
         .route("/gvm/intent", axum::routing::post(api::register_intent))
         .route("/gvm/ca.pem", axum::routing::get(serve_mitm_ca))
@@ -685,6 +688,34 @@ async fn shutdown_signal() {
     {
         ctrl_c.await.ok();
     }
+}
+
+/// Reload SRR rules — allowed on agent port only from loopback (127.0.0.1).
+/// Sandbox agents (10.200.x.x) cannot trigger reloads. MCP server (localhost) can.
+/// This prevents agents from modifying their own governance rules while allowing
+/// the MCP server (which runs on the same host) to hot-reload rulesets.
+async fn reload_srr_localhost_only(
+    axum::extract::State(state): axum::extract::State<gvm_proxy::proxy::AppState>,
+    request: Request<Body>,
+) -> Response<Body> {
+    let peer_ip = request.extensions().get::<std::net::IpAddr>().copied();
+    let is_loopback = peer_ip.map_or(false, |ip| ip.is_loopback());
+
+    if !is_loopback {
+        tracing::warn!(
+            peer = ?peer_ip,
+            "Reload attempt from non-loopback address blocked (use admin port 9090)"
+        );
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                r#"{"error":"Reload only allowed from localhost. Use admin port for remote access."}"#,
+            ))
+            .unwrap();
+    }
+
+    api::reload_srr(axum::extract::State(state)).await
 }
 
 async fn serve_connection(

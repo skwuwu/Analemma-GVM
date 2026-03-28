@@ -471,10 +471,27 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
     // 3. Enforce decision
     match decision {
         gvm_types::EnforcementDecision::Deny { reason } => {
+            let event_id = uuid::Uuid::new_v4().to_string();
+            let trace_id = uuid::Uuid::new_v4().to_string();
+            let body = serde_json::json!({
+                "blocked": true,
+                "decision": "Deny",
+                "reason": reason,
+                "event_id": event_id,
+                "trace_id": trace_id,
+                "method": req.method,
+                "host": host,
+                "path": req.path,
+                "next_action": format!(
+                    "Blocked by SRR rule. To allow: add an Allow rule for {} {} in config/srr_network.toml and run POST /gvm/reload.",
+                    req.method, host
+                ),
+                "matched_rule": srr_result.matched_description.as_deref().unwrap_or(""),
+            });
+            let body_str = body.to_string();
             let response = format!(
-                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\r\n\
-                 {{\"blocked\":true,\"decision\":\"Deny\",\"reason\":\"{}\"}}\r\n",
-                reason
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body_str.len(), body_str
             );
             tls_stream.write_all(response.as_bytes()).await?;
             tls_stream.shutdown().await?;

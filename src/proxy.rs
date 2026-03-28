@@ -960,10 +960,19 @@ async fn forward_request(
         }
         Err(e) => {
             // Log full error for operators, but return sanitized message to clients.
-            // Hyper errors can reveal internal network topology (hostnames, ports,
-            // connection refused details) which aids reconnaissance attacks.
+            // Don't leak internal topology (hostnames, ports, connection details).
             tracing::error!(error = %e, debug = ?e, "Upstream request failed");
-            error_response(StatusCode::BAD_GATEWAY, "Upstream service unavailable")
+            error_response_detailed(
+                StatusCode::BAD_GATEWAY,
+                "Upstream service unavailable",
+                None,
+                None,
+                Some(&format!(
+                    "The proxy could not reach the upstream server for {}. Check if the target host is correct and reachable.",
+                    target.host
+                )),
+                None,
+            )
         }
     }
 }

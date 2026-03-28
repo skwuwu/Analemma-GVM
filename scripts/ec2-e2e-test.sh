@@ -4467,7 +4467,8 @@ if should_run 67; then
     #   - The SRR rule that matched
     #   - The reason for denial
     #   - Actionable guidance (how to allow it)
-    DENY_BODY=$(curl -sf -x "$PROXY_URL" \
+    # Note: do NOT use -f (--fail) — it suppresses body on 4xx responses
+    DENY_BODY=$(curl -s -x "$PROXY_URL" \
         -H "Content-Type: application/json" \
         -d '{"title":"test"}' \
         -X DELETE \
