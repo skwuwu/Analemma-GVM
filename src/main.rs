@@ -377,9 +377,12 @@ async fn main() {
     // This separation prevents a sandboxed agent from calling /gvm/approve to
     // self-approve IC-3 requests. The agent only knows the proxy port.
 
-    // Agent-facing router: proxy + safe endpoints (health, check, vault, ca.pem)
+    // Agent-facing router: proxy + safe endpoints (health, check, info, vault, ca.pem)
+    // /gvm/info is read-only (GET) so safe on agent port. MCP server needs it.
+    // /gvm/approve and /gvm/reload remain admin-only (write operations).
     let app = Router::new()
         .route("/gvm/health", axum::routing::get(api::health))
+        .route("/gvm/info", axum::routing::get(api::info))
         .route("/gvm/check", axum::routing::post(api::check))
         .route("/gvm/intent", axum::routing::post(api::register_intent))
         .route("/gvm/ca.pem", axum::routing::get(serve_mitm_ca))
