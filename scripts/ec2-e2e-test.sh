@@ -3637,8 +3637,9 @@ path = "${DISKFULL_WAL_DIR}/wal.log"
 CFGEOF
 
         # Start separate proxy with WAL on tiny tmpfs
+        GVM_CONFIG="$DISKFULL_CONFIG" \
         GVM_WAL_PATH="${DISKFULL_WAL_DIR}/wal.log" \
-            ./target/release/gvm-proxy --config "$DISKFULL_CONFIG" > "$DISKFULL_LOG" 2>&1 &
+            ./target/release/gvm-proxy > "$DISKFULL_LOG" 2>&1 &
         DISKFULL_PID=$!
 
         # Wait for disk-full proxy to start (CA generation takes time)
