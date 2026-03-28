@@ -401,7 +401,7 @@ async fn main() {
         .layer(
             ServiceBuilder::new()
                 .layer(CatchPanicLayer::new())
-                .layer(RequestBodyLimitLayer::new(1024 * 1024))
+                .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))
                 .layer(tower::limit::ConcurrencyLimitLayer::new(1024)),
         );
 
@@ -416,7 +416,7 @@ async fn main() {
         .layer(
             ServiceBuilder::new()
                 .layer(CatchPanicLayer::new())
-                .layer(RequestBodyLimitLayer::new(1024 * 1024)),
+                .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024)),
         );
 
     // 12. Start server with CONNECT tunnel support

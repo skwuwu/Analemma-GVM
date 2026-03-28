@@ -778,6 +778,12 @@ if should_run 15; then
     if [ -n "$MCP_DIR" ] && [ -f "$MCP_DIR/scripts/mcp_call.py" ]; then
         MCP_CALL="python3 $MCP_DIR/scripts/mcp_call.py"
 
+        # Verify MCP server is reachable (mcp_call.py connects to it)
+        MCP_PROBE=$($MCP_CALL gvm_status '{}' 2>/dev/null | python3 -c "import sys,json; json.loads(sys.stdin.read()); print('ok')" 2>/dev/null)
+        if [ "$MCP_PROBE" != "ok" ]; then
+            skip "15: MCP server not running (mcp_call.py returned invalid response)"
+        else
+
         # Apply github only
         A1=$($MCP_CALL gvm_select_rulesets '{"apply":["github"]}' \
             | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(len(d.get('applied',[])))" 2>/dev/null)
@@ -806,6 +812,7 @@ if should_run 15; then
         else
             fail "15: unexpected results"
         fi
+        fi  # MCP_PROBE check
     else
         skip "15: MCP repo not available"
     fi
@@ -3560,9 +3567,18 @@ CFGEOF
         GVM_WAL_PATH="${DISKFULL_WAL_DIR}/wal.log" \
             ./target/release/gvm-proxy --config "$DISKFULL_CONFIG" > "$DISKFULL_LOG" 2>&1 &
         DISKFULL_PID=$!
-        sleep 3
 
-        if curl -sf --connect-timeout 2 "http://127.0.0.1:${DISKFULL_PORT}/gvm/health" >/dev/null 2>&1; then
+        # Wait for disk-full proxy to start (CA generation takes time)
+        DISKFULL_READY=false
+        for i in $(seq 1 15); do
+            if curl -sf --connect-timeout 2 "http://127.0.0.1:${DISKFULL_PORT}/gvm/health" >/dev/null 2>&1; then
+                DISKFULL_READY=true
+                break
+            fi
+            sleep 1
+        done
+
+        if [ "$DISKFULL_READY" = true ]; then
             echo "  ${DIM}Disk-full proxy on port ${DISKFULL_PORT} (PID ${DISKFULL_PID})${NC}"
 
             # 57a: Send requests to fill the tiny WAL
