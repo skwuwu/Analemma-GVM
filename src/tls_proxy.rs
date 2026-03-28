@@ -493,32 +493,54 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
         tracing::info!(host = %host, "MITM: API key injected for upstream");
     }
 
-    // 5. Connect to upstream with TLS
-    let connector = tokio_rustls::TlsConnector::from(client_config);
+    // 5. Connect to upstream (TLS or HTTP via host_overrides for dev/mock)
     let upstream_host = host.split(':').next().unwrap_or(&host);
-    let upstream_addr = format!("{}:443", upstream_host);
+    let override_addr = state.host_overrides.get(upstream_host);
 
-    let upstream_tcp = tokio::net::TcpStream::connect(&upstream_addr).await
-        .context("MITM: failed to connect to upstream")?;
-    let server_name = rustls::pki_types::ServerName::try_from(upstream_host.to_string())
-        .map_err(|e| anyhow::anyhow!("MITM: invalid server name: {}", e))?;
-    let mut upstream_tls = connector.connect(server_name, upstream_tcp).await
-        .context("MITM: upstream TLS handshake failed")?;
+    if let Some(local_addr) = override_addr {
+        // Dev mode: route to local mock server via HTTP (no TLS)
+        let addr = if local_addr.contains(':') {
+            local_addr.clone()
+        } else {
+            format!("{}:80", local_addr)
+        };
+        let mut upstream = tokio::net::TcpStream::connect(&addr).await
+            .context("MITM: failed to connect to dev override")?;
 
-    // 6. Forward request
-    upstream_tls.write_all(&req.raw_head).await?;
-    if !req.body.is_empty() {
-        upstream_tls.write_all(&req.body).await?;
-    }
-
-    // 7. Relay response back to agent
-    let mut buf = vec![0u8; 8192];
-    loop {
-        let n = upstream_tls.read(&mut buf).await?;
-        if n == 0 {
-            break;
+        upstream.write_all(&req.raw_head).await?;
+        if !req.body.is_empty() {
+            upstream.write_all(&req.body).await?;
         }
-        tls_stream.write_all(&buf[..n]).await?;
+
+        let mut buf = vec![0u8; 8192];
+        loop {
+            let n = upstream.read(&mut buf).await?;
+            if n == 0 { break; }
+            tls_stream.write_all(&buf[..n]).await?;
+        }
+    } else {
+        // Production: connect upstream with TLS
+        let connector = tokio_rustls::TlsConnector::from(client_config);
+        let upstream_addr = format!("{}:443", upstream_host);
+
+        let upstream_tcp = tokio::net::TcpStream::connect(&upstream_addr).await
+            .context("MITM: failed to connect to upstream")?;
+        let server_name = rustls::pki_types::ServerName::try_from(upstream_host.to_string())
+            .map_err(|e| anyhow::anyhow!("MITM: invalid server name: {}", e))?;
+        let mut upstream_tls = connector.connect(server_name, upstream_tcp).await
+            .context("MITM: upstream TLS handshake failed")?;
+
+        upstream_tls.write_all(&req.raw_head).await?;
+        if !req.body.is_empty() {
+            upstream_tls.write_all(&req.body).await?;
+        }
+
+        let mut buf = vec![0u8; 8192];
+        loop {
+            let n = upstream_tls.read(&mut buf).await?;
+            if n == 0 { break; }
+            tls_stream.write_all(&buf[..n]).await?;
+        }
     }
 
     tls_stream.shutdown().await.ok();
