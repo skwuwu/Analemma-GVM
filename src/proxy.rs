@@ -1199,17 +1199,20 @@ fn extract_target(request: &Request<Body>) -> Option<Target> {
     let path = request.uri().path().to_string();
     let query = request.uri().query().map(String::from);
 
-    // Select scheme based on target host.
-    let stripped = gvm_types::strip_port(&host);
-    let is_local = stripped == "localhost"
-        || stripped == "127.0.0.1"
-        || stripped == "[::1]"
-        || stripped == "::1";
-    let scheme = if is_local {
-        "http".to_string()
-    } else {
-        "https".to_string()
-    };
+    // Use the request's actual scheme if present (absolute-form URI: http://host/path).
+    // Fall back to https for external hosts, http for localhost.
+    let scheme = request
+        .uri()
+        .scheme_str()
+        .map(String::from)
+        .unwrap_or_else(|| {
+            let stripped = gvm_types::strip_port(&host);
+            let is_local = stripped == "localhost"
+                || stripped == "127.0.0.1"
+                || stripped == "[::1]"
+                || stripped == "::1";
+            if is_local { "http" } else { "https" }.to_string()
+        });
 
     Some(Target {
         scheme,
