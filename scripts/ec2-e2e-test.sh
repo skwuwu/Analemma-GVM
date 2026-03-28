@@ -1996,14 +1996,15 @@ for line in sys.stdin:
         # Note: gvm run outputs a banner to stdout. Extract only JSON lines.
         if [ -n "$MCP_DIR" ] && [ -f "$MCP_DIR/scripts/mcp_call.py" ]; then
             echo -e "  ${BOLD}GVM MCP tools via gvm run${NC}"
+            # gvm run outputs banner to stderr; redirect stderr to /dev/null so only mcp_call.py JSON on stdout
             MCP_ALLOW=$("$GVM_BIN" run -- python3 "$MCP_DIR/scripts/mcp_call.py" gvm_policy_check \
-                '{"method":"GET","url":"https://api.github.com/repos/t/t/issues"}' 2>&1 \
-                | grep "^{" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null || echo "?")
+                '{"method":"GET","url":"https://api.github.com/repos/t/t/issues"}' 2>/dev/null \
+                | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null || echo "?")
             [ "$MCP_ALLOW" = "Allow" ] && pass "34c: MCP policy_check Allow via gvm run" || fail "34c: MCP via gvm run ($MCP_ALLOW)"
 
             MCP_DENY=$("$GVM_BIN" run -- python3 "$MCP_DIR/scripts/mcp_call.py" gvm_fetch \
-                '{"operation":"github.merge","method":"PUT","url":"https://api.github.com/repos/t/t/pulls/1/merge"}' 2>&1 \
-                | grep "^{" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('blocked',False))" 2>/dev/null || echo "?")
+                '{"operation":"github.merge","method":"PUT","url":"https://api.github.com/repos/t/t/pulls/1/merge"}' 2>/dev/null \
+                | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('blocked',False))" 2>/dev/null || echo "?")
             [ "$MCP_DENY" = "True" ] && pass "34d: MCP gvm_fetch blocked via gvm run" || fail "34d: MCP fetch via gvm run ($MCP_DENY)"
         else
             skip "34c: MCP repo not available"
