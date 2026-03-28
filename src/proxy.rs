@@ -962,7 +962,7 @@ async fn forward_request(
             // Log full error for operators, but return sanitized message to clients.
             // Hyper errors can reveal internal network topology (hostnames, ports,
             // connection refused details) which aids reconnaissance attacks.
-            tracing::error!(error = %e, "Upstream request failed");
+            tracing::error!(error = %e, debug = ?e, "Upstream request failed");
             error_response(StatusCode::BAD_GATEWAY, "Upstream service unavailable")
         }
     }
