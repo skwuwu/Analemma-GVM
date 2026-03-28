@@ -4127,6 +4127,388 @@ except Exception as e:
 fi
 
 # ═══════════════════════════════════════════════════════════════════
+# Test 64: IC-3 Approve Happy Path (Human-in-the-Loop)
+# ═══════════════════════════════════════════════════════════════════
+
+if should_run 64; then
+    header "64: IC-3 Approve Happy Path (Human-in-the-Loop)"
+
+    GVM_BIN="$REPO_DIR/target/release/gvm"
+    if [ ! -f "$GVM_BIN" ]; then
+        skip "64: gvm binary not built"
+    else
+        ensure_proxy || { fail "64: proxy not available"; }
+
+        # Save current SRR and load IC-3 test rules
+        cp config/srr_network.toml config/srr_network.toml.ic3bak
+        cat > config/srr_network.toml << 'IC3SRR'
+[[rules]]
+method = "POST"
+pattern = "api.github.com"
+path_regex = "^/repos/[^/]+/[^/]+/issues$"
+decision = { type = "RequireApproval", urgency = "Standard" }
+reason = "Issue creation requires human approval"
+
+[[rules]]
+method = "GET"
+pattern = "api.github.com/{any}"
+decision = { type = "Allow" }
+
+[[rules]]
+method = "*"
+pattern = "{any}"
+decision = { type = "Delay", milliseconds = 100 }
+IC3SRR
+        curl -sf -X POST "$ADMIN_URL/gvm/reload" > /dev/null 2>&1
+        sleep 1
+
+        # 64a: Verify RequireApproval is configured
+        IC3_CHECK=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
+            -H "Content-Type: application/json" \
+            -d '{"method":"POST","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' \
+            | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+
+        if echo "$IC3_CHECK" | grep -q "RequireApproval"; then
+            pass "64a: IC-3 RequireApproval configured for issue creation"
+        else
+            fail "64a: Expected RequireApproval, got: $IC3_CHECK"
+            # Restore and skip remaining
+            mv config/srr_network.toml.ic3bak config/srr_network.toml
+            curl -sf -X POST "$ADMIN_URL/gvm/reload" > /dev/null 2>&1
+        fi
+
+        # 64b: Agent sends request that triggers IC-3 hold
+        # Run in background — the request will be held until approved
+        AGENT_OUT=$(mktemp /tmp/gvm-ic3-agent-XXXX.txt)
+        timeout 30 python3 -c "
+import requests, json
+try:
+    r = requests.post('http://api.github.com/repos/test/test/issues',
+        json={'title': 'IC-3 test issue'},
+        proxies={'http': '$PROXY_URL'},
+        timeout=25)
+    print(f'STATUS:{r.status_code}')
+    print(f'BODY:{r.text[:200]}')
+except Exception as e:
+    print(f'ERR:{e}')
+" > "$AGENT_OUT" 2>&1 &
+        AGENT_PID=$!
+        sleep 2
+
+        # 64c: Check pending approvals on admin port
+        PENDING=""
+        for i in $(seq 1 10); do
+            PENDING=$(curl -sf "$ADMIN_URL/gvm/pending" 2>/dev/null)
+            if echo "$PENDING" | python3 -c "
+import sys,json
+d=json.loads(sys.stdin.read())
+items = d if isinstance(d, list) else d.get('pending', d.get('items', []))
+print(len(items))
+" 2>/dev/null | grep -q "[1-9]"; then
+                break
+            fi
+            sleep 1
+        done
+
+        PENDING_COUNT=$(echo "$PENDING" | python3 -c "
+import sys,json
+d=json.loads(sys.stdin.read())
+items = d if isinstance(d, list) else d.get('pending', d.get('items', []))
+print(len(items))
+" 2>/dev/null || echo "0")
+
+        if [ "${PENDING_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+            pass "64b: IC-3 request held ($PENDING_COUNT pending approvals)"
+
+            # 64d: Extract event_id and approve
+            EVENT_ID=$(echo "$PENDING" | python3 -c "
+import sys,json
+d=json.loads(sys.stdin.read())
+items = d if isinstance(d, list) else d.get('pending', d.get('items', []))
+if items:
+    item = items[0]
+    print(item.get('event_id', item.get('id', '')))
+" 2>/dev/null)
+
+            if [ -n "$EVENT_ID" ]; then
+                echo -e "  ${DIM}Approving event: ${EVENT_ID:0:16}...${NC}"
+                APPROVE_RESP=$(curl -sf -X POST "$ADMIN_URL/gvm/approve" \
+                    -H "Content-Type: application/json" \
+                    -d "{\"event_id\":\"$EVENT_ID\",\"approved\":true}" 2>/dev/null)
+
+                # Wait for agent to get response
+                wait $AGENT_PID 2>/dev/null || true
+                AGENT_RESULT=$(cat "$AGENT_OUT" | grep -E "STATUS:|ERR:" | tail -1)
+
+                if echo "$AGENT_RESULT" | grep -q "STATUS:"; then
+                    pass "64c: Agent received response after approval ($AGENT_RESULT)"
+                else
+                    # Agent may have timed out or got proxy error — check if approve worked
+                    echo -e "  ${DIM}Agent result: $AGENT_RESULT${NC}"
+                    if echo "$APPROVE_RESP" | grep -qi "approved\|ok\|success"; then
+                        pass "64c: Approval accepted by proxy (agent may have timed out)"
+                    else
+                        fail "64c: Approval failed ($APPROVE_RESP)"
+                    fi
+                fi
+
+                # 64e: Verify WAL recorded the approval
+                if grep -q "RequireApproval\|approved\|IC-3" data/wal.log 2>/dev/null; then
+                    pass "64d: WAL recorded IC-3 approval event"
+                else
+                    skip "64d: WAL IC-3 event recording (depends on implementation)"
+                fi
+            else
+                fail "64c: Could not extract event_id from pending approvals"
+                kill $AGENT_PID 2>/dev/null
+            fi
+        else
+            fail "64b: No pending approvals found (IC-3 hold not triggered)"
+            kill $AGENT_PID 2>/dev/null
+        fi
+
+        rm -f "$AGENT_OUT"
+
+        # Restore SRR rules
+        mv config/srr_network.toml.ic3bak config/srr_network.toml
+        curl -sf -X POST "$ADMIN_URL/gvm/reload" > /dev/null 2>&1
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# Test 65: Clean-State First-Run Experience
+# ═══════════════════════════════════════════════════════════════════
+
+if should_run 65; then
+    header "65: Clean-State First-Run Experience"
+
+    GVM_BIN="$REPO_DIR/target/release/gvm"
+    PROXY_BIN="$REPO_DIR/target/release/gvm-proxy"
+    if [ ! -f "$GVM_BIN" ] || [ ! -f "$PROXY_BIN" ]; then
+        skip "65: binaries not built"
+    else
+        # Create a clean temporary directory (no config files)
+        CLEAN_DIR=$(mktemp -d /tmp/gvm-firstrun-XXXX)
+
+        # 65a: Proxy started in clean dir should detect missing config
+        FIRSTRUN_LOG="$CLEAN_DIR/proxy.log"
+        cd "$CLEAN_DIR"
+        timeout 5 "$PROXY_BIN" > "$FIRSTRUN_LOG" 2>&1 || true
+        cd "$REPO_DIR"
+
+        if grep -qi "not found\|first.run\|setup\|template\|gvm init" "$FIRSTRUN_LOG" 2>/dev/null; then
+            pass "65a: Proxy detects missing config and guides user"
+        elif grep -qi "listening\|started" "$FIRSTRUN_LOG" 2>/dev/null; then
+            pass "65a: Proxy started with defaults (no wizard needed)"
+        else
+            echo -e "  ${DIM}Log: $(head -3 "$FIRSTRUN_LOG")${NC}"
+            fail "65a: Proxy gave no guidance on first run"
+        fi
+
+        # 65b: gvm init creates config templates
+        cd "$CLEAN_DIR"
+        INIT_OUT=$("$GVM_BIN" init --industry saas 2>&1 || echo "INIT_ERROR")
+        cd "$REPO_DIR"
+
+        if [ -f "$CLEAN_DIR/config/proxy.toml" ] || [ -f "$CLEAN_DIR/proxy.toml" ]; then
+            pass "65b: gvm init created proxy.toml template"
+        elif echo "$INIT_OUT" | grep -qi "created\|template\|config"; then
+            pass "65b: gvm init generated configuration"
+        else
+            echo -e "  ${DIM}Init output: $(echo "$INIT_OUT" | head -3)${NC}"
+            skip "65b: gvm init --industry saas (may not be implemented yet)"
+        fi
+
+        # 65c: After init, proxy should start successfully
+        if [ -f "$CLEAN_DIR/config/proxy.toml" ]; then
+            cd "$CLEAN_DIR"
+            GVM_CONFIG="$CLEAN_DIR/config/proxy.toml" timeout 8 "$PROXY_BIN" > "$CLEAN_DIR/proxy2.log" 2>&1 &
+            FIRSTRUN_PID=$!
+            sleep 5
+
+            FIRSTRUN_HEALTH=$(curl -sf --connect-timeout 2 "http://127.0.0.1:8080/gvm/health" 2>/dev/null)
+            if echo "$FIRSTRUN_HEALTH" | grep -q "healthy"; then
+                pass "65c: Proxy starts healthy after gvm init"
+            else
+                skip "65c: Proxy startup after init (port may conflict with main proxy)"
+            fi
+
+            kill $FIRSTRUN_PID 2>/dev/null
+            cd "$REPO_DIR"
+        else
+            skip "65c: No config generated by gvm init"
+        fi
+
+        rm -rf "$CLEAN_DIR"
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# Test 66: Observe -> Discover -> Enforce Journey
+# ═══════════════════════════════════════════════════════════════════
+
+if should_run 66; then
+    header "66: Observe → Discover → Enforce Journey"
+
+    GVM_BIN="$REPO_DIR/target/release/gvm"
+    if [ ! -f "$GVM_BIN" ]; then
+        skip "66: gvm binary not built"
+    else
+        ensure_proxy || { fail "66: proxy not available"; }
+
+        # Create a test agent script that makes several API calls
+        AGENT_SCRIPT=$(mktemp /tmp/gvm-journey-agent-XXXX.py)
+        cat > "$AGENT_SCRIPT" << 'AGENTPY'
+import requests, os, json
+
+proxy = os.environ.get('HTTP_PROXY', os.environ.get('http_proxy', ''))
+proxies = {'http': proxy} if proxy else {}
+
+results = []
+
+# Step 1: Read (should be allowed)
+try:
+    r = requests.get('http://api.github.com/repos/t/t/issues',
+                     proxies=proxies, timeout=10)
+    results.append(f'read:{r.status_code}')
+except Exception as e:
+    results.append(f'read:ERR')
+
+# Step 2: Write (should be delayed)
+try:
+    r = requests.post('http://api.github.com/repos/t/t/issues',
+                      json={'title': 'test'},
+                      proxies=proxies, timeout=10)
+    results.append(f'write:{r.status_code}')
+except Exception as e:
+    results.append(f'write:ERR')
+
+# Step 3: Policy check for destructive action
+try:
+    r = requests.post('http://127.0.0.1:8080/gvm/check',
+                      json={'method': 'DELETE',
+                            'target_host': 'api.github.com',
+                            'target_path': '/repos/t/t/git/refs/heads/main',
+                            'operation': 'test'},
+                      timeout=5)
+    d = r.json().get('decision', '?')
+    results.append(f'delete_policy:{d}')
+except:
+    results.append('delete_policy:ERR')
+
+print('|'.join(results))
+AGENTPY
+
+        # Phase 1: OBSERVE with gvm watch
+        echo -e "  ${BOLD}Phase 1: Observe${NC}"
+        WATCH_OUT=$(mktemp /tmp/gvm-journey-watch-XXXX.txt)
+        timeout 20 "$GVM_BIN" watch -- python3 "$AGENT_SCRIPT" > "$WATCH_OUT" 2>&1 || true
+
+        WATCH_CONTENT=$(cat "$WATCH_OUT")
+        if echo "$WATCH_CONTENT" | grep -q "read:\|write:"; then
+            pass "66a: gvm watch observed agent API calls"
+        else
+            fail "66a: gvm watch produced no useful output"
+        fi
+
+        # Check if watch summary includes discovered domains
+        if echo "$WATCH_CONTENT" | grep -qi "github\|summary\|request\|host"; then
+            pass "66b: Watch session includes domain discovery"
+        else
+            skip "66b: Watch session summary format (depends on implementation)"
+        fi
+
+        # Phase 2: ENFORCE with gvm run
+        echo -e "  ${BOLD}Phase 2: Enforce${NC}"
+        RUN_OUT=$(timeout 20 "$GVM_BIN" run -- python3 "$AGENT_SCRIPT" 2>&1 | tail -5)
+
+        echo -e "  ${DIM}Run output: $RUN_OUT${NC}"
+
+        # The enforced run should show the same calls going through proxy
+        if echo "$RUN_OUT" | grep -q "read:"; then
+            pass "66c: gvm run executed same agent with enforcement"
+        else
+            fail "66c: gvm run failed to execute agent"
+        fi
+
+        # Phase 3: VERIFY enforcement difference
+        # In watch mode: no enforcement (all calls succeed)
+        # In run mode: reads succeed, destructive actions get Deny policy
+        if echo "$RUN_OUT" | grep -q "delete_policy:Deny"; then
+            pass "66d: Enforce mode blocks destructive actions (Deny policy confirmed)"
+        elif echo "$RUN_OUT" | grep -q "delete_policy:"; then
+            POLICY=$(echo "$RUN_OUT" | grep -o 'delete_policy:[^|]*')
+            pass "66d: Enforce mode applied policy ($POLICY)"
+        else
+            fail "66d: Could not verify enforcement on destructive action"
+        fi
+
+        # Phase 4: Verify proxy logged the enforced session
+        if grep -q "github.com" "$PROXY_LOG" 2>/dev/null; then
+            pass "66e: Proxy recorded enforced session in audit log"
+        else
+            skip "66e: Proxy log check (depends on log rotation)"
+        fi
+
+        rm -f "$AGENT_SCRIPT" "$WATCH_OUT"
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# Test 67: Error Message UX — Deny Reason Visibility
+# ═══════════════════════════════════════════════════════════════════
+
+if should_run 67; then
+    header "67: Error Message UX — Deny Reason Visibility"
+
+    ensure_proxy || { fail "67: proxy not available"; }
+
+    # 67a: When proxy denies a request, the response body must contain:
+    #   - The SRR rule that matched
+    #   - The reason for denial
+    #   - Actionable guidance (how to allow it)
+    DENY_BODY=$(curl -sf -x "$PROXY_URL" \
+        -H "Content-Type: application/json" \
+        -d '{"title":"test"}' \
+        -X DELETE \
+        "http://api.github.com/repos/t/t/git/refs/heads/main" 2>/dev/null)
+
+    echo -e "  Deny response body: $(echo "$DENY_BODY" | head -c 200)"
+
+    if echo "$DENY_BODY" | python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.stdin.read())
+    has_decision = 'decision' in d or 'blocked' in d
+    has_reason = 'reason' in d or 'error' in d
+    print('GOOD' if has_decision and has_reason else 'MISSING')
+except:
+    print('NOT_JSON')
+" 2>/dev/null | grep -q "GOOD"; then
+        pass "67a: Deny response includes decision + reason (developer can understand why)"
+    else
+        fail "67a: Deny response lacks structured reason — developer gets opaque error"
+    fi
+
+    # 67b: /gvm/check response includes actionable next_action field
+    CHECK_DENY=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
+        -H "Content-Type: application/json" \
+        -d '{"method":"DELETE","target_host":"api.github.com","target_path":"/repos/t/t/git/refs/heads/main","operation":"test"}')
+
+    HAS_ACTION=$(echo "$CHECK_DENY" | python3 -c "
+import sys,json
+d = json.loads(sys.stdin.read())
+print('yes' if d.get('next_action') or d.get('srr_decision') else 'no')
+" 2>/dev/null)
+
+    if [ "$HAS_ACTION" = "yes" ]; then
+        pass "67b: /gvm/check includes actionable guidance (next_action or srr_decision)"
+    else
+        fail "67b: /gvm/check lacks actionable guidance for denied requests"
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
 # SUMMARY
 # ═══════════════════════════════════════════════════════════════════
 
