@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd \"c:\\\\Users\\\\gimgy\\\\OneDrive\\\\바탕 화면\\\\Analemma-GVM\" for t in 69 70 71 72 74 75)",
+      "Bash(do echo:*)"
+    ]
+  }
+}

@@ -44,6 +44,15 @@ SINGLE_TEST=""
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
+# Auto-detect GVM binary (Windows: .exe suffix)
+if [ -f "$REPO_DIR/target/release/gvm.exe" ]; then
+    GVM_BIN="$REPO_DIR/target/release/gvm.exe"
+elif [ -f "$REPO_DIR/target/release/gvm" ]; then
+    GVM_BIN="$REPO_DIR/target/release/gvm"
+else
+    GVM_BIN=""
+fi
+
 # Auto-detect PROXY_PID
 PROXY_PID=$(pgrep -f "gvm-proxy" | head -1 || true)
 
@@ -1891,7 +1900,7 @@ if should_run 33; then
 
     ensure_proxy || { fail "33: proxy not available"; }
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if [ ! -f "$GVM_BIN" ]; then
         skip "33: gvm CLI binary not built"
     else
@@ -1958,7 +1967,7 @@ if should_run 34; then
 
     ensure_proxy || { fail "34: proxy not available"; }
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if [ ! -f "$GVM_BIN" ]; then
         skip "34: gvm CLI binary not built"
     else
@@ -2092,7 +2101,7 @@ fi
 if should_run 35; then
     header "35: MITM Full Pipeline (HTTPS → TLS termination → SRR → upstream)"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if [ ! -f "$GVM_BIN" ]; then
         skip "35: gvm binary not built (cargo build --release first)"
     elif [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
@@ -2220,7 +2229,7 @@ fi
 if should_run 38; then
     header "38: CAP_NET_ADMIN — iptables -F Blocked Inside Sandbox"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if [ ! -f "$GVM_BIN" ]; then
         skip "38: gvm binary not built"
     elif [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
@@ -2255,7 +2264,7 @@ fi
 if should_run 39; then
     header "39: AppArmor/SELinux — Sandbox on Stock AMI"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     AA_STATUS=$(sudo apparmor_status 2>/dev/null | head -1 || echo "not installed")
     SE_STATUS=$(getenforce 2>/dev/null || echo "not installed")
     echo -e "  ${DIM}AppArmor: $AA_STATUS${NC}"
@@ -2336,7 +2345,7 @@ if should_run 41; then
     # Spawn 20 sandbox processes in parallel and check for veth/IP collisions.
     # Each sandbox derives IP from PID: 10.200.(pid%256).(pid/256*4+1)
     # Collisions are possible if two processes get PIDs that map to the same subnet.
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if [ ! -f "$GVM_BIN" ]; then
         skip "41: gvm binary not built"
     elif [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
@@ -2410,7 +2419,7 @@ fi
 if should_run 42; then
     header "42: Seccomp-BPF Violation — Blocked Syscall Detection"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if [ ! -f "$GVM_BIN" ]; then
         skip "42: gvm binary not built"
     elif [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
@@ -2486,7 +2495,7 @@ fi
 if should_run 43; then
     header "43: eBPF Fallback — iptables-Only Isolation"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if [ ! -f "$GVM_BIN" ]; then
         skip "43: gvm binary not built"
     elif [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
@@ -2576,7 +2585,7 @@ fi
 if should_run 44; then
     header "44: Sandbox MITM — Full L7 HTTPS Inspection Pipeline"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if [ ! -f "$GVM_BIN" ]; then
         skip "44: gvm binary not built"
     elif [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
@@ -2753,7 +2762,7 @@ fi
 if should_run 46; then
     header "46: gvm watch — Agent Observation Mode"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if [ ! -f "$GVM_BIN" ]; then
         skip "46: gvm binary not built"
     else
@@ -2864,7 +2873,7 @@ fi
 if should_run 47 && [ "$SKIP_OPENCLAW" = false ]; then
     header "47: OpenClaw LLM Agent Through Sandbox MITM"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if [ ! -f "$GVM_BIN" ]; then
         skip "47: gvm binary not built"
     elif [ -z "${ANTHROPIC_API_KEY:-}" ]; then
@@ -2952,7 +2961,7 @@ fi
 if should_run 48 && [ "$SKIP_OPENCLAW" = false ]; then
     header "48: OpenClaw Agent + SRR Deny Through MITM"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if [ ! -f "$GVM_BIN" ]; then
         skip "48: gvm binary not built"
     elif [ -z "${ANTHROPIC_API_KEY:-}" ]; then
@@ -3040,7 +3049,7 @@ fi
 if should_run 49 && [ "$SKIP_OPENCLAW" = false ]; then
     header "49: gvm watch + OpenClaw — Live LLM Observation"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if [ ! -f "$GVM_BIN" ]; then
         skip "49: gvm binary not built"
     elif [ -z "${ANTHROPIC_API_KEY:-}" ]; then
@@ -3108,7 +3117,7 @@ fi
 if should_run 50; then
     header "50: overlayfs Trust-on-Pattern — Filesystem Governance"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if [ ! -f "$GVM_BIN" ]; then
         skip "50: gvm binary not built"
     elif [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
@@ -3213,7 +3222,7 @@ fi
 if should_run 51; then
     header "51: Trust-on-Pattern — File Classification"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if [ ! -f "$GVM_BIN" ]; then
         skip "51: gvm binary not built"
     elif [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
@@ -3368,7 +3377,7 @@ fi
 if should_run 54; then
     header "54: Configurable Default Unknown Policy"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if [ ! -f "$GVM_BIN" ]; then
         skip "54: gvm binary not built"
     else
@@ -3424,7 +3433,7 @@ fi
 if should_run 55; then
     header "55: overlayfs tmpfs Size Limit — ENOSPC"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if [ ! -f "$GVM_BIN" ]; then
         skip "55: gvm binary not built"
     elif [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
@@ -3503,7 +3512,7 @@ fi
 if should_run 56; then
     header "56: Trust-on-Pattern — Overlapping Pattern Priority"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if [ ! -f "$GVM_BIN" ]; then
         skip "56: gvm binary not built"
     elif [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
@@ -3788,7 +3797,7 @@ if should_run 58; then
         fi
 
         # 58f: Verify WAL audit integrity via gvm audit verify (if available)
-        GVM_BIN="$REPO_DIR/target/release/gvm"
+        # GVM_BIN set at top of script (auto-detects .exe on Windows)
         if [ -f "$GVM_BIN" ]; then
             VERIFY_RESULT=$("$GVM_BIN" audit verify 2>&1 | tail -3)
             if echo "$VERIFY_RESULT" | grep -qi "valid\|verified\|intact\|ok"; then
@@ -3962,7 +3971,7 @@ fi
 if should_run 61; then
     header "61: IC-3 Self-Approval Prevention"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if [ ! -f "$GVM_BIN" ]; then
         skip "61: gvm binary not found"
     elif [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
@@ -4004,7 +4013,7 @@ fi
 if should_run 62; then
     header "62: DNS Exfiltration Logging"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if [ ! -f "$GVM_BIN" ]; then
         skip "62: gvm binary not found"
     elif [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
@@ -4051,7 +4060,7 @@ fi
 if should_run 63; then
     header "63: Config File Manipulation"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if [ ! -f "$GVM_BIN" ]; then
         skip "63: gvm binary not found"
     else
@@ -4135,7 +4144,7 @@ fi
 if should_run 64; then
     header "64: IC-3 Approve Happy Path (Human-in-the-Loop)"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if [ ! -f "$GVM_BIN" ]; then
         skip "64: gvm binary not built"
     else
@@ -4284,7 +4293,7 @@ fi
 if should_run 65; then
     header "65: Clean-State First-Run Experience"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     PROXY_BIN="$REPO_DIR/target/release/gvm-proxy"
     if [ ! -f "$GVM_BIN" ] || [ ! -f "$PROXY_BIN" ]; then
         skip "65: binaries not built"
@@ -4352,7 +4361,7 @@ fi
 if should_run 66; then
     header "66: Observe → Discover → Enforce Journey"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if [ ! -f "$GVM_BIN" ]; then
         skip "66: gvm binary not built"
     else
@@ -4521,7 +4530,7 @@ fi
 if should_run 68; then
     header "68: Contained MITM Pipeline"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if ! docker --version >/dev/null 2>&1; then
         skip "68: Docker not available"
     elif [ ! -f "$GVM_BIN" ]; then
@@ -4620,7 +4629,7 @@ fi
 if should_run 69; then
     header "69: Contained SRR Deny Through MITM"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if ! docker --version >/dev/null 2>&1; then
         skip "69: Docker not available"
     elif [ ! -f "$GVM_BIN" ]; then
@@ -4701,7 +4710,7 @@ fi
 if should_run 70; then
     header "70: Contained — Missing iptables Error"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if ! docker --version >/dev/null 2>&1; then
         skip "70: Docker not available"
     elif [ ! -f "$GVM_BIN" ]; then
@@ -4741,7 +4750,7 @@ fi
 if should_run 71; then
     header "71: Contained — Proxy Bypass Impossible"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if ! docker --version >/dev/null 2>&1; then
         skip "71: Docker not available"
     elif [ ! -f "$GVM_BIN" ]; then
@@ -4836,7 +4845,7 @@ fi
 if should_run 72; then
     header "72: Contained — Read-Only Filesystem"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if ! docker --version >/dev/null 2>&1; then
         skip "72: Docker not available"
     elif [ ! -f "$GVM_BIN" ]; then
@@ -4949,7 +4958,7 @@ fi
 if should_run 73; then
     header "73: Sandbox vs Contained Parity"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if ! docker --version >/dev/null 2>&1; then
         skip "73: Docker not available"
     elif [ ! -f "$GVM_BIN" ]; then
@@ -5047,7 +5056,7 @@ fi
 if should_run 74; then
     header "74: Contained UX — Session Summary"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if ! docker --version >/dev/null 2>&1; then
         skip "74: Docker not available"
     elif [ ! -f "$GVM_BIN" ]; then
@@ -5099,7 +5108,7 @@ fi
 if should_run 75; then
     header "75: Contained — NET_ADMIN Limitation Documentation"
 
-    GVM_BIN="$REPO_DIR/target/release/gvm"
+    # GVM_BIN set at top of script (auto-detects .exe on Windows)
     if ! docker --version >/dev/null 2>&1; then
         skip "75: Docker not available"
     elif [ ! -f "$GVM_BIN" ]; then
