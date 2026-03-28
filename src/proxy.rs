@@ -1882,7 +1882,7 @@ async fn handle_connect_inner(
     Response::builder()
         .status(StatusCode::OK)
         .body(Body::empty())
-        .unwrap()
+        .unwrap_or_default()
 }
 
 /// Blind TCP relay fallback (when MITM is not configured).

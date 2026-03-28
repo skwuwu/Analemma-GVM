@@ -604,6 +604,7 @@ impl Ledger {
     /// proxy restarts, the hash mismatch is visible in the audit trail.
     ///
     /// Called at proxy startup (after config load) and on policy hot-reload.
+    // COLD PATH: blocking std::fs::read() acceptable — called at startup/reload, not per-request.
     pub async fn record_config_load(
         &self,
         config_files: &[(&str, &std::path::Path)],
@@ -708,6 +709,7 @@ impl Ledger {
     /// On subsequent recoveries, only events after the watermark are scanned.
     /// This works because recovery appends Expired entries for all unresolved
     /// Pendings — so everything before the watermark is fully resolved.
+    // COLD PATH: blocking std::fs I/O acceptable — called at startup before accepting connections.
     pub async fn recover_from_wal(&self) -> Result<RecoveryReport> {
         use std::io::{BufRead, Seek, SeekFrom};
 
