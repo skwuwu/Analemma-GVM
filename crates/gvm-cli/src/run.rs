@@ -1322,6 +1322,10 @@ async fn run_contained(
             .arg("host.docker.internal:host-gateway");
     }
 
+    if detach {
+        cmd.arg("-d");
+    }
+
     // Entrypoint: shell wrapper that sets DNAT then execs the agent command.
     // Uses `sh -c 'script' _ arg1 arg2` pattern where _ is $0 and args become $@.
     cmd.arg("--entrypoint").arg("sh");
@@ -1331,10 +1335,6 @@ async fn run_contained(
     cmd.arg("_"); // $0 placeholder for sh -c
     for arg in &container_cmd {
         cmd.arg(arg);
-    }
-
-    if detach {
-        cmd.arg("-d");
     }
 
     println!("  {BOLD}Starting contained agent...{RESET}");
