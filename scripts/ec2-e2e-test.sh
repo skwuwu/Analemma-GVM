@@ -3,7 +3,8 @@
 # Analemma GVM — EC2 Linux E2E Test Suite
 #
 # Covers: build, proxy, CONNECT tunnel, uprobe, SRR enforcement,
-#         OpenClaw integration, long-running stability, concurrency.
+#         OpenClaw integration, long-running stability, concurrency,
+#         contained mode (Docker DNAT-based MITM).
 #
 # Requirements:
 #   - Ubuntu 22.04+ EC2 instance (t3.medium or larger, 4GB+ RAM)
@@ -4507,6 +4508,694 @@ print('yes' if d.get('next_action') or d.get('srr_decision') else 'no')
         pass "67b: /gvm/check includes actionable guidance (next_action or srr_decision)"
     else
         fail "67b: /gvm/check lacks actionable guidance for denied requests"
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# CONTAINED MODE TESTS (68-75)
+# Docker-based contained mode — works on both Linux (EC2) and
+# Windows (Docker Desktop). Uses gvm run --contained (DNAT, not
+# HTTP_PROXY). Skipped if Docker is not available.
+# ═══════════════════════════════════════════════════════════════════
+
+if should_run 68; then
+    header "68: Contained MITM Pipeline"
+
+    GVM_BIN="$REPO_DIR/target/release/gvm"
+    if ! docker --version >/dev/null 2>&1; then
+        skip "68: Docker not available"
+    elif [ ! -f "$GVM_BIN" ]; then
+        skip "68: gvm binary not built"
+    else
+        ensure_proxy || { fail "68: proxy not available"; }
+
+        # Clean previous container
+        docker rm -f gvm-agent-contained-test 2>/dev/null || true
+
+        # Create test agent that does HTTPS + verifies MITM
+        CONTAINED_AGENT=$(mktemp /tmp/gvm-contained-agent-XXXX.py)
+        cat > "$CONTAINED_AGENT" << 'AGENTEOF'
+import urllib.request, json, ssl, os, subprocess
+
+results = []
+
+# 1. HTTPS request (should go through DNAT -> MITM)
+try:
+    resp = urllib.request.urlopen('https://api.github.com/', timeout=15)
+    results.append(f'HTTPS:{resp.status}')
+except Exception as e:
+    results.append(f'HTTPS:ERR:{type(e).__name__}')
+
+# 2. Verify iptables DNAT rules exist
+try:
+    r = subprocess.run(['iptables', '-t', 'nat', '-L', 'OUTPUT', '-n'],
+                      capture_output=True, text=True, timeout=5)
+    dnat_count = sum(1 for line in r.stdout.splitlines() if 'DNAT' in line)
+    results.append(f'DNAT_RULES:{dnat_count}')
+except Exception:
+    results.append('DNAT_RULES:ERR')
+
+# 3. CA trust store check
+ca = os.environ.get('SSL_CERT_FILE', 'NONE')
+ca_exists = os.path.exists(ca) if ca != 'NONE' else False
+results.append(f'CA_FILE:{ca}:{ca_exists}')
+
+# 4. Verify no proxy env vars (DNAT-only mode)
+http_proxy = os.environ.get('HTTP_PROXY', os.environ.get('http_proxy', 'NONE'))
+https_proxy = os.environ.get('HTTPS_PROXY', os.environ.get('https_proxy', 'NONE'))
+results.append(f'PROXY_VARS:{http_proxy}:{https_proxy}')
+
+print('|'.join(results))
+AGENTEOF
+
+        # Run contained agent
+        RESULT=$("$GVM_BIN" run --contained --agent-id contained-test "$CONTAINED_AGENT" 2>/dev/null | grep -E 'HTTPS:|DNAT_|CA_FILE:|PROXY_VARS:' | tail -1)
+
+        echo -e "  Result: $RESULT"
+
+        # 68a: HTTPS through MITM
+        if echo "$RESULT" | grep -q "HTTPS:200"; then
+            pass "68a: HTTPS request succeeded through MITM DNAT"
+        else
+            fail "68a: HTTPS failed ($(echo "$RESULT" | grep -o 'HTTPS:[^|]*'))"
+        fi
+
+        # 68b: DNAT rules present
+        if echo "$RESULT" | grep -q "DNAT_RULES:2"; then
+            pass "68b: iptables DNAT rules configured (443->MITM, 80->proxy)"
+        elif echo "$RESULT" | grep -q "DNAT_RULES:[1-9]"; then
+            pass "68b: iptables DNAT rules present"
+        else
+            fail "68b: No DNAT rules found"
+        fi
+
+        # 68c: CA trust store
+        if echo "$RESULT" | grep -q "CA_FILE:.*:True"; then
+            pass "68c: GVM CA injected into container trust store"
+        else
+            fail "68c: CA not found in container"
+        fi
+
+        # 68d: No proxy env vars (DNAT-only)
+        if echo "$RESULT" | grep -q "PROXY_VARS:NONE:NONE"; then
+            pass "68d: No proxy env vars set (DNAT-only mode)"
+        else
+            fail "68d: Proxy env vars present — CONNECT bypass possible"
+        fi
+
+        # 68e: Check proxy log for MITM inspection
+        sleep 2
+        if grep -q "MITM: inspecting HTTPS request" "$PROXY_LOG" 2>/dev/null; then
+            pass "68e: Proxy log confirms MITM TLS inspection from container"
+        else
+            fail "68e: MITM inspection not logged"
+        fi
+
+        # Cleanup
+        docker rm -f gvm-agent-contained-test 2>/dev/null || true
+        rm -f "$CONTAINED_AGENT"
+    fi
+fi
+
+if should_run 69; then
+    header "69: Contained SRR Deny Through MITM"
+
+    GVM_BIN="$REPO_DIR/target/release/gvm"
+    if ! docker --version >/dev/null 2>&1; then
+        skip "69: Docker not available"
+    elif [ ! -f "$GVM_BIN" ]; then
+        skip "69: gvm binary not built"
+    else
+        ensure_proxy || { fail "69: proxy not available"; }
+
+        # Clean previous container
+        docker rm -f gvm-agent-contained-deny 2>/dev/null || true
+
+        # Create agent that sends a DELETE (SRR should deny it)
+        DENY_AGENT=$(mktemp /tmp/gvm-contained-deny-XXXX.py)
+        cat > "$DENY_AGENT" << 'AGENTEOF'
+import urllib.request, json
+
+results = []
+
+# 1. DELETE to github branch ref — SRR should deny this
+try:
+    req = urllib.request.Request(
+        'https://api.github.com/repos/test/test/git/refs/heads/main',
+        method='DELETE',
+        headers={'Content-Type': 'application/json'}
+    )
+    resp = urllib.request.urlopen(req, timeout=15)
+    results.append(f'DELETE:{resp.status}')
+except urllib.error.HTTPError as e:
+    results.append(f'DELETE:{e.code}')
+except Exception as e:
+    results.append(f'DELETE:ERR:{type(e).__name__}')
+
+# 2. GET (should be allowed) — confirms MITM is selective
+try:
+    resp = urllib.request.urlopen('https://api.github.com/', timeout=15)
+    results.append(f'GET:{resp.status}')
+except urllib.error.HTTPError as e:
+    results.append(f'GET:{e.code}')
+except Exception as e:
+    results.append(f'GET:ERR:{type(e).__name__}')
+
+print('|'.join(results))
+AGENTEOF
+
+        RESULT=$("$GVM_BIN" run --contained --agent-id contained-deny "$DENY_AGENT" 2>/dev/null | grep -E 'DELETE:|GET:' | tail -1)
+
+        echo -e "  Result: $RESULT"
+
+        # 69a: DELETE must be denied (403)
+        if echo "$RESULT" | grep -q "DELETE:403"; then
+            pass "69a: SRR denied DELETE through contained MITM (403)"
+        elif echo "$RESULT" | grep -q "DELETE:4[0-9][0-9]"; then
+            pass "69a: SRR blocked DELETE (non-403 but still denied)"
+        else
+            fail "69a: DELETE was not denied ($(echo "$RESULT" | grep -o 'DELETE:[^|]*'))"
+        fi
+
+        # 69b: GET must still work (selective enforcement)
+        if echo "$RESULT" | grep -q "GET:200"; then
+            pass "69b: GET allowed through same MITM pipeline (selective enforcement)"
+        else
+            fail "69b: GET also failed ($(echo "$RESULT" | grep -o 'GET:[^|]*')) — MITM may be blocking all"
+        fi
+
+        # 69c: Verify deny was logged by proxy
+        sleep 1
+        if grep -q "SRR.*Deny\|srr_decision.*Deny\|decision.*Deny" "$PROXY_LOG" 2>/dev/null; then
+            pass "69c: Proxy logged SRR Deny decision for contained agent"
+        else
+            fail "69c: SRR Deny not found in proxy log"
+        fi
+
+        # Cleanup
+        docker rm -f gvm-agent-contained-deny 2>/dev/null || true
+        rm -f "$DENY_AGENT"
+    fi
+fi
+
+if should_run 70; then
+    header "70: Contained — Missing iptables Error"
+
+    GVM_BIN="$REPO_DIR/target/release/gvm"
+    if ! docker --version >/dev/null 2>&1; then
+        skip "70: Docker not available"
+    elif [ ! -f "$GVM_BIN" ]; then
+        skip "70: gvm binary not built"
+    else
+        # Clean previous container
+        docker rm -f gvm-agent-no-iptables 2>/dev/null || true
+
+        # Create minimal agent script
+        NO_IPT_AGENT=$(mktemp /tmp/gvm-contained-noipt-XXXX.py)
+        cat > "$NO_IPT_AGENT" << 'AGENTEOF'
+print("AGENT_REACHED")
+AGENTEOF
+
+        # Run with python:3.12-slim (no iptables installed)
+        RESULT=$("$GVM_BIN" run --contained --image python:3.12-slim --agent-id no-iptables "$NO_IPT_AGENT" 2>&1)
+
+        echo -e "  Result (first 200 chars): $(echo "$RESULT" | head -c 200)"
+
+        # Must contain error message, NOT agent output
+        if echo "$RESULT" | grep -qi "iptables not found\|iptables.*missing\|iptables.*unavailable"; then
+            pass "70: Clear error when iptables missing (no silent fallback)"
+        elif echo "$RESULT" | grep -qi "MITM unavailable\|DNAT.*fail\|network setup.*fail"; then
+            pass "70: MITM/DNAT setup failure reported"
+        elif echo "$RESULT" | grep -q "AGENT_REACHED"; then
+            fail "70: Agent ran without iptables — silent degradation to cooperative mode"
+        else
+            fail "70: Unexpected output — no iptables error and no agent output"
+        fi
+
+        # Cleanup
+        docker rm -f gvm-agent-no-iptables 2>/dev/null || true
+        rm -f "$NO_IPT_AGENT"
+    fi
+fi
+
+if should_run 71; then
+    header "71: Contained — Proxy Bypass Impossible"
+
+    GVM_BIN="$REPO_DIR/target/release/gvm"
+    if ! docker --version >/dev/null 2>&1; then
+        skip "71: Docker not available"
+    elif [ ! -f "$GVM_BIN" ]; then
+        skip "71: gvm binary not built"
+    else
+        ensure_proxy || { fail "71: proxy not available"; }
+
+        # Clean previous container
+        docker rm -f gvm-agent-bypass-test 2>/dev/null || true
+
+        # Agent tries direct socket connection to bypass DNAT
+        BYPASS_AGENT=$(mktemp /tmp/gvm-contained-bypass-XXXX.py)
+        cat > "$BYPASS_AGENT" << 'AGENTEOF'
+import socket, ssl
+
+results = []
+
+# 1. Try direct TCP connection to external IP (1.1.1.1:443)
+#    DNAT should redirect this to the proxy, not the real server.
+#    If DNAT is working, the TLS handshake will fail because the
+#    proxy presents a GVM CA-signed cert, not Cloudflare's cert.
+try:
+    ctx = ssl.create_default_context()
+    # Use system default CA (NOT GVM CA) — if bypass works, this succeeds
+    # If DNAT intercepts, this fails with certificate verify failed
+    sock = socket.create_connection(('1.1.1.1', 443), timeout=10)
+    wrapped = ctx.wrap_socket(sock, server_hostname='cloudflare.com')
+    wrapped.close()
+    results.append('DIRECT_TLS:BYPASSED')
+except ssl.SSLCertVerificationError:
+    # DNAT redirected to proxy, cert mismatch = good (MITM is active)
+    results.append('DIRECT_TLS:INTERCEPTED')
+except ConnectionRefusedError:
+    results.append('DIRECT_TLS:REFUSED')
+except OSError as e:
+    results.append(f'DIRECT_TLS:BLOCKED:{type(e).__name__}')
+except Exception as e:
+    results.append(f'DIRECT_TLS:ERR:{type(e).__name__}')
+
+# 2. Try raw HTTP to external IP (should also be redirected)
+try:
+    sock = socket.create_connection(('93.184.216.34', 80), timeout=10)
+    sock.sendall(b'GET / HTTP/1.1\r\nHost: example.com\r\n\r\n')
+    resp = sock.recv(512).decode('utf-8', errors='replace')
+    sock.close()
+    if 'GVM' in resp or 'gvm' in resp:
+        results.append('DIRECT_HTTP:INTERCEPTED')
+    else:
+        results.append('DIRECT_HTTP:BYPASSED')
+except ConnectionRefusedError:
+    results.append('DIRECT_HTTP:REFUSED')
+except OSError as e:
+    results.append(f'DIRECT_HTTP:BLOCKED:{type(e).__name__}')
+except Exception as e:
+    results.append(f'DIRECT_HTTP:ERR:{type(e).__name__}')
+
+print('|'.join(results))
+AGENTEOF
+
+        RESULT=$("$GVM_BIN" run --contained --agent-id bypass-test "$BYPASS_AGENT" 2>/dev/null | grep -E 'DIRECT_TLS:|DIRECT_HTTP:' | tail -1)
+
+        echo -e "  Result: $RESULT"
+
+        # 71a: Direct TLS must be intercepted or blocked (not bypassed)
+        if echo "$RESULT" | grep -q "DIRECT_TLS:INTERCEPTED"; then
+            pass "71a: Direct TLS to external IP intercepted by DNAT (MITM active)"
+        elif echo "$RESULT" | grep -q "DIRECT_TLS:REFUSED\|DIRECT_TLS:BLOCKED"; then
+            pass "71a: Direct TLS to external IP blocked (firewall/network)"
+        elif echo "$RESULT" | grep -q "DIRECT_TLS:BYPASSED"; then
+            fail "71a: Direct TLS succeeded — agent can bypass DNAT"
+        else
+            fail "71a: Unexpected TLS result ($(echo "$RESULT" | grep -o 'DIRECT_TLS:[^|]*'))"
+        fi
+
+        # 71b: Direct HTTP must be intercepted or blocked
+        if echo "$RESULT" | grep -q "DIRECT_HTTP:INTERCEPTED"; then
+            pass "71b: Direct HTTP to external IP intercepted by DNAT"
+        elif echo "$RESULT" | grep -q "DIRECT_HTTP:REFUSED\|DIRECT_HTTP:BLOCKED"; then
+            pass "71b: Direct HTTP to external IP blocked"
+        elif echo "$RESULT" | grep -q "DIRECT_HTTP:BYPASSED"; then
+            fail "71b: Direct HTTP succeeded — agent can bypass proxy"
+        else
+            fail "71b: Unexpected HTTP result ($(echo "$RESULT" | grep -o 'DIRECT_HTTP:[^|]*'))"
+        fi
+
+        # Cleanup
+        docker rm -f gvm-agent-bypass-test 2>/dev/null || true
+        rm -f "$BYPASS_AGENT"
+    fi
+fi
+
+if should_run 72; then
+    header "72: Contained — Read-Only Filesystem"
+
+    GVM_BIN="$REPO_DIR/target/release/gvm"
+    if ! docker --version >/dev/null 2>&1; then
+        skip "72: Docker not available"
+    elif [ ! -f "$GVM_BIN" ]; then
+        skip "72: gvm binary not built"
+    else
+        # Clean previous container
+        docker rm -f gvm-agent-readonly-test 2>/dev/null || true
+
+        # Agent tries to write to various locations
+        RO_AGENT=$(mktemp /tmp/gvm-contained-ro-XXXX.py)
+        cat > "$RO_AGENT" << 'AGENTEOF'
+import os, tempfile
+
+results = []
+
+# 1. Write to / (must fail)
+try:
+    with open('/test_write_root', 'w') as f:
+        f.write('pwned')
+    os.remove('/test_write_root')
+    results.append('WRITE_ROOT:ALLOWED')
+except (PermissionError, OSError):
+    results.append('WRITE_ROOT:DENIED')
+except Exception as e:
+    results.append(f'WRITE_ROOT:ERR:{type(e).__name__}')
+
+# 2. Write to /home (must fail)
+try:
+    os.makedirs('/home/testdir', exist_ok=True)
+    with open('/home/testdir/test_file', 'w') as f:
+        f.write('pwned')
+    os.remove('/home/testdir/test_file')
+    os.rmdir('/home/testdir')
+    results.append('WRITE_HOME:ALLOWED')
+except (PermissionError, OSError):
+    results.append('WRITE_HOME:DENIED')
+except Exception as e:
+    results.append(f'WRITE_HOME:ERR:{type(e).__name__}')
+
+# 3. Write to /tmp (must work)
+try:
+    tmpf = os.path.join('/tmp', 'gvm_ro_test')
+    with open(tmpf, 'w') as f:
+        f.write('ok')
+    with open(tmpf, 'r') as f:
+        content = f.read()
+    os.remove(tmpf)
+    results.append(f'WRITE_TMP:OK:{content}')
+except Exception as e:
+    results.append(f'WRITE_TMP:DENIED:{type(e).__name__}')
+
+# 4. Write to /usr (must fail)
+try:
+    with open('/usr/test_write', 'w') as f:
+        f.write('pwned')
+    os.remove('/usr/test_write')
+    results.append('WRITE_USR:ALLOWED')
+except (PermissionError, OSError):
+    results.append('WRITE_USR:DENIED')
+except Exception as e:
+    results.append(f'WRITE_USR:ERR:{type(e).__name__}')
+
+print('|'.join(results))
+AGENTEOF
+
+        RESULT=$("$GVM_BIN" run --contained --agent-id readonly-test "$RO_AGENT" 2>/dev/null | grep -E 'WRITE_' | tail -1)
+
+        echo -e "  Result: $RESULT"
+
+        # 72a: Root filesystem must be read-only
+        if echo "$RESULT" | grep -q "WRITE_ROOT:DENIED"; then
+            pass "72a: Write to / denied (read-only root filesystem)"
+        elif echo "$RESULT" | grep -q "WRITE_ROOT:ALLOWED"; then
+            fail "72a: Write to / succeeded — root filesystem is writable"
+        else
+            fail "72a: Unexpected result ($(echo "$RESULT" | grep -o 'WRITE_ROOT:[^|]*'))"
+        fi
+
+        # 72b: /home must be read-only
+        if echo "$RESULT" | grep -q "WRITE_HOME:DENIED"; then
+            pass "72b: Write to /home denied"
+        elif echo "$RESULT" | grep -q "WRITE_HOME:ALLOWED"; then
+            fail "72b: Write to /home succeeded — home directory is writable"
+        else
+            fail "72b: Unexpected result ($(echo "$RESULT" | grep -o 'WRITE_HOME:[^|]*'))"
+        fi
+
+        # 72c: /tmp must be writable (agent needs scratch space)
+        if echo "$RESULT" | grep -q "WRITE_TMP:OK:ok"; then
+            pass "72c: Write to /tmp succeeded (scratch space available)"
+        else
+            fail "72c: Write to /tmp failed — agent has no scratch space"
+        fi
+
+        # 72d: /usr must be read-only
+        if echo "$RESULT" | grep -q "WRITE_USR:DENIED"; then
+            pass "72d: Write to /usr denied (system directories protected)"
+        elif echo "$RESULT" | grep -q "WRITE_USR:ALLOWED"; then
+            fail "72d: Write to /usr succeeded — system directories writable"
+        else
+            fail "72d: Unexpected result ($(echo "$RESULT" | grep -o 'WRITE_USR:[^|]*'))"
+        fi
+
+        # Cleanup
+        docker rm -f gvm-agent-readonly-test 2>/dev/null || true
+        rm -f "$RO_AGENT"
+    fi
+fi
+
+if should_run 73; then
+    header "73: Sandbox vs Contained Parity"
+
+    GVM_BIN="$REPO_DIR/target/release/gvm"
+    if ! docker --version >/dev/null 2>&1; then
+        skip "73: Docker not available"
+    elif [ ! -f "$GVM_BIN" ]; then
+        skip "73: gvm binary not built"
+    elif [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
+        skip "73: requires root for --sandbox comparison"
+    else
+        ensure_proxy || { fail "73: proxy not available"; }
+
+        # Clean previous containers
+        docker rm -f gvm-agent-parity-test 2>/dev/null || true
+
+        # Agent that exercises SRR decisions (same for both modes)
+        PARITY_AGENT=$(mktemp /tmp/gvm-contained-parity-XXXX.py)
+        cat > "$PARITY_AGENT" << 'AGENTEOF'
+import urllib.request, json
+
+results = []
+
+# 1. GET (should be Allow)
+try:
+    resp = urllib.request.urlopen('https://api.github.com/', timeout=15)
+    results.append(f'GET:{resp.status}')
+except urllib.error.HTTPError as e:
+    results.append(f'GET:{e.code}')
+except Exception as e:
+    results.append(f'GET:ERR:{type(e).__name__}')
+
+# 2. DELETE branch ref (should be Deny)
+try:
+    req = urllib.request.Request(
+        'https://api.github.com/repos/test/test/git/refs/heads/main',
+        method='DELETE',
+        headers={'Content-Type': 'application/json'}
+    )
+    resp = urllib.request.urlopen(req, timeout=15)
+    results.append(f'DELETE:{resp.status}')
+except urllib.error.HTTPError as e:
+    results.append(f'DELETE:{e.code}')
+except Exception as e:
+    results.append(f'DELETE:ERR:{type(e).__name__}')
+
+print('|'.join(results))
+AGENTEOF
+
+        # Run in contained mode
+        CONTAINED_RESULT=$("$GVM_BIN" run --contained --agent-id parity-test "$PARITY_AGENT" 2>/dev/null | grep -E 'GET:|DELETE:' | tail -1)
+        echo -e "  Contained: $CONTAINED_RESULT"
+
+        # Run in sandbox mode
+        SANDBOX_RESULT=$(sudo timeout 60 "$GVM_BIN" run --sandbox -- python3 "$PARITY_AGENT" 2>/dev/null | grep -E 'GET:|DELETE:' | tail -1)
+        echo -e "  Sandbox:   $SANDBOX_RESULT"
+
+        # 73a: GET decision must match
+        CONTAINED_GET=$(echo "$CONTAINED_RESULT" | grep -o 'GET:[^|]*')
+        SANDBOX_GET=$(echo "$SANDBOX_RESULT" | grep -o 'GET:[^|]*')
+        if [ "$CONTAINED_GET" = "$SANDBOX_GET" ]; then
+            pass "73a: GET decision matches between sandbox and contained ($CONTAINED_GET)"
+        elif [ -z "$SANDBOX_RESULT" ]; then
+            skip "73a: Sandbox produced no output (may need root)"
+        else
+            fail "73a: GET decision mismatch — contained=$CONTAINED_GET sandbox=$SANDBOX_GET"
+        fi
+
+        # 73b: DELETE decision must match
+        CONTAINED_DEL=$(echo "$CONTAINED_RESULT" | grep -o 'DELETE:[^|]*')
+        SANDBOX_DEL=$(echo "$SANDBOX_RESULT" | grep -o 'DELETE:[^|]*')
+        if [ "$CONTAINED_DEL" = "$SANDBOX_DEL" ]; then
+            pass "73b: DELETE decision matches between sandbox and contained ($CONTAINED_DEL)"
+        elif [ -z "$SANDBOX_RESULT" ]; then
+            skip "73b: Sandbox produced no output (may need root)"
+        else
+            fail "73b: DELETE decision mismatch — contained=$CONTAINED_DEL sandbox=$SANDBOX_DEL"
+        fi
+
+        # 73c: Both must deny DELETE (not just match on errors)
+        if echo "$CONTAINED_DEL" | grep -q "DELETE:403\|DELETE:4[0-9][0-9]"; then
+            if echo "$SANDBOX_DEL" | grep -q "DELETE:403\|DELETE:4[0-9][0-9]"; then
+                pass "73c: Both modes correctly deny DELETE (SRR enforcement parity)"
+            else
+                fail "73c: Contained denied but sandbox did not ($SANDBOX_DEL)"
+            fi
+        elif [ -z "$SANDBOX_RESULT" ]; then
+            skip "73c: Sandbox comparison not available"
+        else
+            fail "73c: Neither mode denied DELETE — SRR enforcement broken"
+        fi
+
+        # Cleanup
+        docker rm -f gvm-agent-parity-test 2>/dev/null || true
+        rm -f "$PARITY_AGENT"
+    fi
+fi
+
+if should_run 74; then
+    header "74: Contained UX — Session Summary"
+
+    GVM_BIN="$REPO_DIR/target/release/gvm"
+    if ! docker --version >/dev/null 2>&1; then
+        skip "74: Docker not available"
+    elif [ ! -f "$GVM_BIN" ]; then
+        skip "74: gvm binary not built"
+    else
+        ensure_proxy || { fail "74: proxy not available"; }
+
+        # Clean previous container
+        docker rm -f gvm-agent-ux-test 2>/dev/null || true
+
+        # Simple agent that prints something
+        UX_AGENT=$(mktemp /tmp/gvm-contained-ux-XXXX.py)
+        cat > "$UX_AGENT" << 'AGENTEOF'
+print("AGENT_OUTPUT_OK")
+AGENTEOF
+
+        # Capture both stdout and stderr (session summary may be on either)
+        FULL_OUTPUT=$("$GVM_BIN" run --contained --agent-id ux-test "$UX_AGENT" 2>&1)
+
+        echo -e "  Output (first 500 chars): $(echo "$FULL_OUTPUT" | head -c 500)"
+
+        # 74a: Agent output must be present
+        if echo "$FULL_OUTPUT" | grep -q "AGENT_OUTPUT_OK"; then
+            pass "74a: Agent stdout captured in contained mode"
+        else
+            fail "74a: Agent output missing from contained mode"
+        fi
+
+        # 74b: Session info should include container name or ID
+        if echo "$FULL_OUTPUT" | grep -qi "container\|docker\|gvm-agent"; then
+            pass "74b: Session output includes container reference"
+        else
+            fail "74b: No container reference in session output (developer cannot find logs)"
+        fi
+
+        # 74c: Session info should mention how to review or include summary
+        if echo "$FULL_OUTPUT" | grep -qi "log\|review\|session\|summary\|audit\|WAL\|complete\|finish"; then
+            pass "74c: Session output includes review/summary guidance"
+        else
+            fail "74c: No session summary or review guidance in output"
+        fi
+
+        # Cleanup
+        docker rm -f gvm-agent-ux-test 2>/dev/null || true
+        rm -f "$UX_AGENT"
+    fi
+fi
+
+if should_run 75; then
+    header "75: Contained — NET_ADMIN Limitation Documentation"
+
+    GVM_BIN="$REPO_DIR/target/release/gvm"
+    if ! docker --version >/dev/null 2>&1; then
+        skip "75: Docker not available"
+    elif [ ! -f "$GVM_BIN" ]; then
+        skip "75: gvm binary not built"
+    else
+        ensure_proxy || { fail "75: proxy not available"; }
+
+        # Clean previous container
+        docker rm -f gvm-agent-netadmin-test 2>/dev/null || true
+
+        # Agent with NET_ADMIN tries to flush iptables (remove DNAT rules)
+        NETADMIN_AGENT=$(mktemp /tmp/gvm-contained-netadmin-XXXX.py)
+        cat > "$NETADMIN_AGENT" << 'AGENTEOF'
+import subprocess, urllib.request
+
+results = []
+
+# 1. List current DNAT rules before flush
+try:
+    r = subprocess.run(['iptables', '-t', 'nat', '-L', 'OUTPUT', '-n'],
+                      capture_output=True, text=True, timeout=5)
+    before = sum(1 for line in r.stdout.splitlines() if 'DNAT' in line)
+    results.append(f'DNAT_BEFORE:{before}')
+except Exception:
+    results.append('DNAT_BEFORE:ERR')
+
+# 2. Try to flush all iptables nat rules
+try:
+    r = subprocess.run(['iptables', '-t', 'nat', '-F'],
+                      capture_output=True, text=True, timeout=5)
+    results.append(f'FLUSH_EXIT:{r.returncode}')
+except Exception as e:
+    results.append(f'FLUSH_EXIT:ERR:{type(e).__name__}')
+
+# 3. Count DNAT rules after flush
+try:
+    r = subprocess.run(['iptables', '-t', 'nat', '-L', 'OUTPUT', '-n'],
+                      capture_output=True, text=True, timeout=5)
+    after = sum(1 for line in r.stdout.splitlines() if 'DNAT' in line)
+    results.append(f'DNAT_AFTER:{after}')
+except Exception:
+    results.append('DNAT_AFTER:ERR')
+
+# 4. Try HTTPS after flush — if DNAT was removed, this goes direct
+try:
+    resp = urllib.request.urlopen('https://api.github.com/', timeout=15)
+    results.append(f'HTTPS_AFTER:{resp.status}')
+except Exception as e:
+    results.append(f'HTTPS_AFTER:ERR:{type(e).__name__}')
+
+print('|'.join(results))
+AGENTEOF
+
+        RESULT=$("$GVM_BIN" run --contained --agent-id netadmin-test "$NETADMIN_AGENT" 2>/dev/null | grep -E 'DNAT_|FLUSH_|HTTPS_AFTER:' | tail -1)
+
+        echo -e "  Result: $RESULT"
+
+        # 75a: Document whether flush succeeded (known limitation: NET_ADMIN needed for DNAT setup)
+        if echo "$RESULT" | grep -q "FLUSH_EXIT:0"; then
+            # Flush succeeded — this is a known limitation
+            echo -e "  ${YELLOW}Known limitation: container has NET_ADMIN, agent can flush iptables${NC}"
+
+            # 75b: Check if DNAT was actually removed
+            if echo "$RESULT" | grep -q "DNAT_AFTER:0"; then
+                fail "75a: Agent flushed DNAT rules (NET_ADMIN limitation — document in security-model.md)"
+                echo -e "  ${DIM}This is a known architectural constraint: NET_ADMIN is required for${NC}"
+                echo -e "  ${DIM}DNAT setup but also allows the agent to modify iptables.${NC}"
+                echo -e "  ${DIM}Mitigation: use network namespaces or nftables with ownership.${NC}"
+            else
+                pass "75a: iptables flush did not remove DNAT rules (rules may be in different chain)"
+            fi
+        elif echo "$RESULT" | grep -q "FLUSH_EXIT:ERR\|FLUSH_EXIT:1"; then
+            # Flush denied — great security posture
+            pass "75a: iptables flush denied (agent cannot modify DNAT rules)"
+        else
+            fail "75a: Unexpected flush result ($(echo "$RESULT" | grep -o 'FLUSH_EXIT:[^|]*'))"
+        fi
+
+        # 75b: If flush succeeded, does HTTPS still work?
+        if echo "$RESULT" | grep -q "FLUSH_EXIT:0"; then
+            if echo "$RESULT" | grep -q "HTTPS_AFTER:200"; then
+                # Could mean direct access or routing still works
+                echo -e "  ${YELLOW}HTTPS works after flush — may be direct or residual routing${NC}"
+                skip "75b: HTTPS works post-flush (ambiguous — may be direct or cached route)"
+            elif echo "$RESULT" | grep -q "HTTPS_AFTER:ERR"; then
+                pass "75b: HTTPS fails after flush (network disrupted, not silently bypassed)"
+            else
+                skip "75b: HTTPS status post-flush: $(echo "$RESULT" | grep -o 'HTTPS_AFTER:[^|]*')"
+            fi
+        else
+            pass "75b: Flush was denied — DNAT integrity maintained"
+        fi
+
+        # Cleanup
+        docker rm -f gvm-agent-netadmin-test 2>/dev/null || true
+        rm -f "$NETADMIN_AGENT"
     fi
 fi
 

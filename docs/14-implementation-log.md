@@ -4,6 +4,32 @@
 
 ---
 
+## 2026-03-29: Contained Mode E2E Tests (68-75)
+
+### What Changed
+
+Added 8 new E2E tests (68-75) for Docker-based contained mode (`gvm run --contained`). These tests validate the DNAT-based MITM pipeline that intercepts all container traffic without requiring HTTP_PROXY/HTTPS_PROXY environment variables.
+
+**Tests added:**
+- **Test 68** — Contained MITM pipeline: HTTPS through DNAT, iptables rules, CA injection, no proxy env vars, proxy log verification. Mirrors sandbox Test 44.
+- **Test 69** — SRR Deny through contained MITM: DELETE request denied (403), GET still allowed, deny logged.
+- **Test 70** — Missing iptables error: `python:3.12-slim` image (no iptables) must produce clear error, not silent fallback.
+- **Test 71** — Proxy bypass impossible: direct socket to external IP must be intercepted by DNAT or blocked.
+- **Test 72** — Read-only filesystem: writes to /, /home, /usr denied; /tmp writable.
+- **Test 73** — Sandbox vs contained parity: same agent run in both modes must produce identical SRR decisions.
+- **Test 74** — Session summary UX: output includes container reference and review guidance.
+- **Test 75** — NET_ADMIN limitation: documents that agent can flush iptables (known architectural constraint).
+
+**Cross-platform:** All tests check `docker --version` and skip if Docker is unavailable. Works on both Linux (EC2) and Windows (Docker Desktop).
+
+### Affected Files
+- `scripts/ec2-e2e-test.sh` — tests 68-75 added, header comment updated
+
+### Risk Assessment
+- **Low**: All tests are additive and gated behind Docker availability checks. Each test uses unique container names and cleans up on completion. No changes to production code.
+
+---
+
 ## 2026-03-28: E2E Mock Server, Security Tests, False-Pass Cleanup
 
 ### What Changed
