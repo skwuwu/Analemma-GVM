@@ -75,13 +75,23 @@ ensure_proxy() {
     rm -f "$PROXY_LOG"
     ./target/release/gvm-proxy --config config/proxy.toml > "$PROXY_LOG" 2>&1 &
     PROXY_PID=$!
-    sleep 3
-    if curl -sf --connect-timeout 2 "$PROXY_URL/gvm/health" > /dev/null 2>&1; then
-        return 0
-    else
-        echo -e "  ${RED}Proxy failed to start${NC}"
-        return 1
-    fi
+
+    # Wait for proxy to be fully ready (health + SRR engine loaded)
+    for i in $(seq 1 10); do
+        if curl -sf --connect-timeout 2 "$PROXY_URL/gvm/health" > /dev/null 2>&1; then
+            # Verify SRR is loaded by checking /gvm/check returns valid JSON
+            CHECK=$(curl -sf --max-time 2 -X POST "$PROXY_URL/gvm/check" \
+                -H "Content-Type: application/json" \
+                -d '{"method":"GET","target_host":"localhost","target_path":"/","operation":"test"}' 2>/dev/null)
+            if echo "$CHECK" | python3 -c "import sys,json; json.loads(sys.stdin.read())" 2>/dev/null; then
+                return 0
+            fi
+        fi
+        sleep 0.5
+    done
+
+    echo -e "  ${RED}Proxy failed to start (health or SRR not ready after 10 retries)${NC}"
+    return 1
 }
 
 cleanup() {
@@ -3035,7 +3045,7 @@ try:
     with open('/workspace/overlay_test.txt', 'w') as f:
         f.write('overlayfs is working')
     print('WRITE_ROOT_OK')
-except PermissionError:
+except (PermissionError, OSError):
     print('WRITE_ROOT_DENIED')  # Legacy mode — read-only
 except Exception as e:
     print(f'WRITE_ROOT_ERR:{e}')
@@ -3046,6 +3056,8 @@ try:
     with open('/workspace/results/subdir/data.csv', 'w') as f:
         f.write('col1,col2\n1,2\n3,4\n')
     print('WRITE_SUBDIR_OK')
+except (PermissionError, OSError):
+    print('WRITE_SUBDIR_DENIED')
 except Exception as e:
     print(f'WRITE_SUBDIR_ERR:{e}')
 
@@ -3054,6 +3066,8 @@ try:
     with open('/workspace/install.sh', 'w') as f:
         f.write('#!/bin/bash\necho dangerous\n')
     print('WRITE_SCRIPT_OK')
+except (PermissionError, OSError):
+    print('WRITE_SCRIPT_DENIED')
 except Exception as e:
     print(f'WRITE_SCRIPT_ERR:{e}')
 
@@ -3500,6 +3514,7 @@ if should_run 57; then
     header "57: WAL Disk Full → Fail-Closed"
 
     DISKFULL_PORT=9190
+    DISKFULL_ADMIN_PORT=$((DISKFULL_PORT + 1010))
     DISKFULL_WAL_DIR=$(mktemp -d /tmp/gvm-diskfull-wal-XXXX)
     DISKFULL_LOG="/tmp/gvm-proxy-diskfull.log"
 
@@ -3514,6 +3529,7 @@ if should_run 57; then
         cat > "$DISKFULL_CONFIG" <<CFGEOF
 [server]
 listen = "127.0.0.1:${DISKFULL_PORT}"
+admin_listen = "127.0.0.1:${DISKFULL_ADMIN_PORT}"
 [enforcement]
 default_decision = { type = "Delay", milliseconds = 100 }
 ic1_async_ledger = true

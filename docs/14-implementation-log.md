@@ -4,6 +4,38 @@
 
 ---
 
+## 2026-03-28: E2E Test Reliability Fixes + Enable Overlayfs by Default
+
+### What Changed
+
+Four fixes to improve E2E test reliability and enable overlayfs filesystem governance:
+
+**1. ensure_proxy retry logic (scripts/ec2-e2e-test.sh)**
+- Previously, `ensure_proxy` did a single health check after `sleep 3`. If the SRR engine was still loading, tests would fail with confusing errors.
+- Fix: Retry up to 10 times (0.5s each), checking both `/gvm/health` and `/gvm/check` (POST with a real SRR request). Proxy is only considered ready when `/gvm/check` returns valid JSON.
+
+**2. Test 50 OSError catch (scripts/ec2-e2e-test.sh)**
+- Sandbox filesystem errors surface as `OSError(errno=30)` (read-only filesystem), not `PermissionError`. The Python test blocks for WRITE_SUBDIR and WRITE_SCRIPT only caught generic `Exception`, masking the denied case.
+- Fix: All four write test blocks now catch `(PermissionError, OSError)` and print the `_DENIED` variant.
+
+**3. Test 57 admin_listen port conflict (scripts/ec2-e2e-test.sh)**
+- The disk-full proxy config omitted `admin_listen`, causing it to bind to the default admin port which conflicts with the main proxy.
+- Fix: Added `DISKFULL_ADMIN_PORT` (offset +1010 from DISKFULL_PORT) and `admin_listen` to the config.
+
+**4. Enable overlayfs by default (crates/gvm-cli/src/run.rs)**
+- Both `run_binary_sandboxed` and `run_sandboxed` had `fs_policy: None` (legacy mode). This meant `/workspace` was read-only except for `/workspace/output`, which is too restrictive for typical agent workloads.
+- Fix: Changed both to `fs_policy: Some(FilesystemPolicy::default())`, enabling overlayfs with Trust-on-Pattern rules on kernel >= 5.11. Falls back to legacy mode on older kernels.
+
+### Affected Files
+- `scripts/ec2-e2e-test.sh` — Fixes 1, 2, 3
+- `crates/gvm-cli/src/run.rs` — Fix 4
+
+### Risk Assessment
+- **Low**: E2E test script changes are non-functional (test reliability only).
+- **Medium**: Enabling overlayfs by default changes sandbox behavior. However, `FilesystemPolicy::default()` uses conservative Trust-on-Pattern rules (data files auto-merge, scripts require manual commit, temp files discarded). Falls back gracefully on unsupported kernels.
+
+---
+
 ## 2026-03-27: MITM TLS End-to-End Fix — CA Chain, DN Match, Proxy Bypass
 
 ### What Changed
