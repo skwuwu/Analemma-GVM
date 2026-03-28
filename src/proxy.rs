@@ -1813,19 +1813,21 @@ async fn handle_connect_inner(
     state.ledger.append_async(event).await;
 
     // MITM TLS inspection on CONNECT tunnel.
-    // Only apply MITM for connections from sandbox veth IPs (10.200.0.0/16).
-    // Cooperative mode (127.0.0.1) uses blind relay for end-to-end TLS.
+    // Apply MITM for connections from isolated environments (sandbox or Docker)
+    // where the GVM CA is injected into the trust store.
+    // Cooperative mode (127.0.0.1) uses blind relay — no CA injection, would fail.
     let peer_ip = request.extensions().get::<std::net::IpAddr>().copied();
-    let is_sandbox = peer_ip.map_or(false, |ip| match ip {
-        std::net::IpAddr::V4(v4) => v4.octets()[0] == 10 && v4.octets()[1] == 200,
-        _ => false,
-    });
+    tracing::debug!(peer = ?peer_ip, "CONNECT MITM: checking peer IP");
+    // MITM for any non-loopback connection. Isolated environments (sandbox,
+    // Docker) have the GVM CA injected, so MITM verification succeeds.
+    // Only loopback (127.0.0.1) cooperative mode is excluded — no CA injection.
+    let is_isolated = peer_ip.map_or(false, |ip| !ip.is_loopback());
 
     let host_owned = host.to_string();
     let target_addr = format!("{}:{}", host, port);
-    let mitm_resolver = if is_sandbox { state.mitm_resolver.clone() } else { None };
-    let mitm_sc = if is_sandbox { state.mitm_server_config.clone() } else { None };
-    let mitm_cc = if is_sandbox { state.mitm_client_config.clone() } else { None };
+    let mitm_resolver = if is_isolated { state.mitm_resolver.clone() } else { None };
+    let mitm_sc = if is_isolated { state.mitm_server_config.clone() } else { None };
+    let mitm_cc = if is_isolated { state.mitm_client_config.clone() } else { None };
     let connect_state = state.clone();
 
     tokio::task::spawn(async move {

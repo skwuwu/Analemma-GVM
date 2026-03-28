@@ -1015,6 +1015,20 @@ async fn run_contained(
 
     let abs_script = std::fs::canonicalize(script_path)
         .with_context(|| format!("Cannot resolve path: {}", script))?;
+    // On Windows, canonicalize produces \\?\ UNC prefix and backslashes.
+    // Docker expects /c/Users/... format for volume mounts.
+    #[cfg(windows)]
+    let abs_script = {
+        let s = abs_script.to_string_lossy().to_string();
+        let s = s.trim_start_matches(r"\\?\").replace('\\', "/");
+        // Convert "C:/Users/..." to "/c/Users/..." for Docker
+        let s = if s.chars().nth(1) == Some(':') {
+            format!("/{}/{}", s.chars().next().unwrap().to_lowercase(), &s[3..])
+        } else {
+            s
+        };
+        std::path::PathBuf::from(s)
+    };
     let script_dir = abs_script.parent().unwrap();
     let script_name = abs_script.file_name().unwrap().to_str().unwrap();
     let script_ext = abs_script
@@ -1058,21 +1072,27 @@ async fn run_contained(
     if use_host_network {
         println!("  {DIM}Network:{RESET}      host {DIM}(local proxy compatibility){RESET}");
     } else {
-        println!("  {DIM}Network:{RESET}      gvm-internal {DIM}(isolated){RESET}");
+        println!("  {DIM}Network:{RESET}      gvm-bridge {DIM}(isolated){RESET}");
     }
     println!();
 
     if !use_host_network {
-        // Ensure gvm-internal network exists
+        // Ensure gvm-bridge network exists.
+        // Uses a regular bridge (not --internal) because --internal blocks all
+        // external routing including host.docker.internal, making the proxy
+        // unreachable from the container. Network isolation is enforced by:
+        //   - DNAT redirecting HTTPS to MITM proxy (iptables in entrypoint)
+        //   - HTTPS_PROXY env var routing HTTP through proxy
+        //   - No direct internet access for non-proxied traffic
         let net_check = tokio::process::Command::new("docker")
-            .args(["network", "inspect", "gvm-internal"])
+            .args(["network", "inspect", "gvm-bridge"])
             .output()
             .await?;
 
         if !net_check.status.success() {
-            println!("  {YELLOW}Creating gvm-internal network (isolated)...{RESET}");
+            println!("  {YELLOW}Creating gvm-bridge network...{RESET}");
             let net_create = tokio::process::Command::new("docker")
-                .args(["network", "create", "--internal", "gvm-internal"])
+                .args(["network", "create", "gvm-bridge"])
                 .output()
                 .await?;
 
@@ -1126,13 +1146,21 @@ async fn run_contained(
         "host.docker.internal".to_string()
     };
 
-    // Build DNAT entrypoint script — runs inside container before the agent
-    // Redirects all outbound 443 traffic to the proxy's MITM listener.
+    // Build DNAT entrypoint script — runs inside container before the agent.
+    // Redirects outbound traffic to proxy:
+    //   - TCP 443 → MITM TLS listener (full L7 inspection)
+    //   - TCP 80  → proxy HTTP port (HTTP inspection)
     // Requires NET_ADMIN capability (added to docker run below).
     let entrypoint_script = if mitm_available {
         format!(
-            "iptables -t nat -A OUTPUT -p tcp --dport 443 -j DNAT --to-destination {}:{} 2>/dev/null || true && exec \"$@\"",
+            "if command -v iptables >/dev/null 2>&1; then \
+               iptables -t nat -A OUTPUT -p tcp --dport 443 -j DNAT --to-destination {}:{} 2>/dev/null && \
+               iptables -t nat -A OUTPUT -p tcp --dport 80 -j DNAT --to-destination {}:{} 2>/dev/null && \
+               unset HTTPS_PROXY https_proxy; \
+             fi; \
+             exec \"$@\"",
             proxy_host_for_container, tls_port,
+            proxy_host_for_container, proxy_port,
         )
     } else {
         "exec \"$@\"".to_string()
@@ -1172,8 +1200,13 @@ async fn run_contained(
         .arg("-w")
         .arg("/home/agent/workspace")
         .arg("-e")
-        .arg(format!("GVM_AGENT_ID={}", agent_id))
-        .arg("-e")
+        .arg(format!("GVM_AGENT_ID={}", agent_id));
+
+    // Set proxy env vars for HTTP traffic. For HTTPS:
+    // - If MITM+DNAT works (iptables available), DNAT handles 443→MITM
+    // - If DNAT fails (no iptables), HTTPS_PROXY enables CONNECT fallback
+    // The entrypoint tries DNAT; if it succeeds, unset HTTPS_PROXY.
+    cmd.arg("-e")
         .arg(format!("HTTP_PROXY={}", container_proxy))
         .arg("-e")
         .arg(format!("HTTPS_PROXY={}", container_proxy))
@@ -1181,17 +1214,36 @@ async fn run_contained(
         .arg(format!("http_proxy={}", container_proxy))
         .arg("-e")
         .arg(format!("https_proxy={}", container_proxy))
+        .arg("-e")
+        .arg(format!("GVM_PROXY_URL={}", container_proxy));
+
+    cmd
         .arg("-v")
         .arg(format!("{}:/home/agent/workspace:ro", mount_dir));
 
     // CA injection: mount CA PEM + /etc/ssl/certs as tmpfs for Go/system trust store
     if mitm_available {
         // Mount CA PEM into multiple trust store paths
-        let ca_host_path = ca_pem_path.to_str().unwrap_or("");
+        let ca_host_path_raw = ca_pem_path.to_str().unwrap_or("");
+        // On Windows, convert path to Docker-compatible format
+        #[cfg(windows)]
+        let ca_host_path = {
+            let s = ca_host_path_raw.replace('\\', "/");
+            let s = s.trim_start_matches(r"\\?\").to_string();
+            if s.chars().nth(1) == Some(':') {
+                format!("/{}/{}", s.chars().next().unwrap().to_lowercase(), &s[3..])
+            } else {
+                s
+            }
+        };
+        #[cfg(not(windows))]
+        let ca_host_path = ca_host_path_raw.to_string();
         cmd.arg("-v")
             .arg(format!("{}:/usr/local/share/ca-certificates/gvm-ca.crt:ro", ca_host_path))
             .arg("-v")
             .arg(format!("{}:/etc/ssl/certs/gvm-ca.crt:ro", ca_host_path))
+            .arg("-v")
+            .arg(format!("{}:/etc/ssl/certs/ca-certificates.crt:ro", ca_host_path))
             .arg("-v")
             .arg(format!("{}:/etc/pki/tls/certs/gvm-ca.crt:ro", ca_host_path));
 
@@ -1204,7 +1256,7 @@ async fn run_contained(
         // NET_ADMIN capability for DNAT iptables rule inside container.
         // Trade-off: widens attack surface, but:
         //   - no-new-privileges prevents escalation from NET_ADMIN
-        //   - container network is already isolated (gvm-internal --internal)
+        //   - container network is already isolated (gvm-bridge --internal)
         //   - DNAT is set in the entrypoint, then iptables is not needed further
         cmd.arg("--cap-add=NET_ADMIN");
     }
@@ -1213,22 +1265,21 @@ async fn run_contained(
         cmd.arg("--network").arg("host");
     } else {
         cmd.arg("--network")
-            .arg("gvm-internal")
+            .arg("gvm-bridge")
             .arg("--add-host")
             .arg("host.docker.internal:host-gateway");
     }
 
-    // Entrypoint: shell wrapper that sets DNAT then execs the agent command
+    // Entrypoint: shell wrapper that sets DNAT then execs the agent command.
+    // Uses `sh -c 'script' _ arg1 arg2` pattern where _ is $0 and args become $@.
     cmd.arg("--entrypoint").arg("sh");
     cmd.arg(image);
     cmd.arg("-c");
-    // Build the full command: entrypoint_script uses "exec $@" pattern
-    let agent_cmd_str = container_cmd
-        .iter()
-        .map(|s| format!("\"{}\"", s))
-        .collect::<Vec<_>>()
-        .join(" ");
-    cmd.arg(format!("{} -- {}", entrypoint_script, agent_cmd_str));
+    cmd.arg(&entrypoint_script);
+    cmd.arg("_"); // $0 placeholder for sh -c
+    for arg in &container_cmd {
+        cmd.arg(arg);
+    }
 
     if detach {
         cmd.arg("-d");
@@ -1251,7 +1302,7 @@ async fn run_contained(
     if use_host_network {
         println!("      {DIM}\u{2022} Network: host (shared host network namespace){RESET}");
     } else {
-        println!("      {DIM}\u{2022} Network: gvm-internal (no external access){RESET}");
+        println!("      {DIM}\u{2022} Network: gvm-bridge (no external access){RESET}");
     }
     println!("      {DIM}\u{2022} Filesystem: read-only root{RESET}");
     println!("      {DIM}\u{2022} Privileges: no-new-privileges{RESET}");
