@@ -128,6 +128,7 @@ fn sandbox_config_clone() {
         memory_limit: None,
         cpu_limit: None,
         fs_policy: None,
+        mitm_ca_cert: None,
     };
 
     let cloned = config.clone();
@@ -234,6 +235,7 @@ fn launch_on_non_linux_returns_error() {
         memory_limit: None,
         cpu_limit: None,
         fs_policy: None,
+        mitm_ca_cert: None,
     };
 
     let result = launch_sandboxed(config);

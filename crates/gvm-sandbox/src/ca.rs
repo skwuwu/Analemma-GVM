@@ -164,10 +164,20 @@ mod tests {
     #[test]
     fn issue_ip_address_cert() {
         let ca = EphemeralCA::generate().unwrap();
-        // IP address as SAN (for SNI-less connections)
+        // IP address as SAN — rcgen supports IP SANs since 0.12+.
+        // Verify the cert is actually issued with valid PEM content.
         let leaf = ca.issue_leaf_cert("142.250.190.46");
-        // rcgen may or may not support IP SANs — test that it doesn't panic
-        assert!(leaf.is_ok() || leaf.is_err());
+        match leaf {
+            Ok(cert) => {
+                assert!(cert.cert_pem.contains("BEGIN CERTIFICATE"), "IP SAN cert must have valid PEM");
+                assert!(cert.key_pem.contains("BEGIN PRIVATE KEY"), "IP SAN cert must have valid key");
+            }
+            Err(e) => {
+                // If rcgen doesn't support IP SANs, that's acceptable — just ensure
+                // the error message is meaningful, not a panic.
+                assert!(!e.to_string().is_empty(), "Error must have a message: {}", e);
+            }
+        }
     }
 
     #[test]

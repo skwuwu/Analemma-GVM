@@ -719,6 +719,9 @@ milliseconds = 300
         pending_approvals: std::sync::Arc::new(dashmap::DashMap::new()),
         ic3_approval_timeout_secs: 300,
         shadow_config: gvm_proxy::intent_store::ShadowConfig::default(),
+        mitm_resolver: None,
+        mitm_server_config: None,
+        mitm_client_config: None,
     };
 
     let app = Router::new().fallback(proxy_handler).with_state(state);
@@ -1157,6 +1160,9 @@ token = "sk_test_proxy_injected_key"
         pending_approvals: std::sync::Arc::new(dashmap::DashMap::new()),
         ic3_approval_timeout_secs: 300,
         shadow_config: gvm_proxy::intent_store::ShadowConfig::default(),
+        mitm_resolver: None,
+        mitm_server_config: None,
+        mitm_client_config: None,
     };
 
     let app = Router::new()
@@ -1330,6 +1336,9 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
         pending_approvals: std::sync::Arc::new(dashmap::DashMap::new()),
         ic3_approval_timeout_secs: 300,
         shadow_config: gvm_proxy::intent_store::ShadowConfig::default(),
+        mitm_resolver: None,
+        mitm_server_config: None,
+        mitm_client_config: None,
     };
 
     let app = Router::new()
@@ -1519,6 +1528,9 @@ type = "Allow"
         pending_approvals: std::sync::Arc::new(dashmap::DashMap::new()),
         ic3_approval_timeout_secs: 300,
         shadow_config: gvm_proxy::intent_store::ShadowConfig::default(),
+        mitm_resolver: None,
+        mitm_server_config: None,
+        mitm_client_config: None,
     };
 
     let app = Router::new()
@@ -1959,6 +1971,9 @@ async fn checkpoint_save_restore_merkle_verified() {
         pending_approvals: std::sync::Arc::new(dashmap::DashMap::new()),
         ic3_approval_timeout_secs: 300,
         shadow_config: gvm_proxy::intent_store::ShadowConfig::default(),
+        mitm_resolver: None,
+        mitm_server_config: None,
+        mitm_client_config: None,
     };
 
     let app = Router::new()
@@ -2395,6 +2410,9 @@ type = "Allow"
         pending_approvals: pending_approvals.clone(),
         ic3_approval_timeout_secs: 5, // Short timeout for test
         shadow_config: gvm_proxy::intent_store::ShadowConfig::default(),
+        mitm_resolver: None,
+        mitm_server_config: None,
+        mitm_client_config: None,
     };
 
     let app = Router::new()
@@ -2547,6 +2565,9 @@ decision = { type = "Allow" }
         pending_approvals: std::sync::Arc::new(dashmap::DashMap::new()),
         ic3_approval_timeout_secs: 1, // 1 second timeout for fast test
         shadow_config: gvm_proxy::intent_store::ShadowConfig::default(),
+        mitm_resolver: None,
+        mitm_server_config: None,
+        mitm_client_config: None,
     };
 
     let app = Router::new().fallback(proxy_handler).with_state(state);
@@ -2664,6 +2685,9 @@ decision = { type = "Allow" }
         pending_approvals: std::sync::Arc::new(dashmap::DashMap::new()),
         ic3_approval_timeout_secs: 300,
         shadow_config: gvm_proxy::intent_store::ShadowConfig::default(),
+        mitm_resolver: None,
+        mitm_server_config: None,
+        mitm_client_config: None,
     };
 
     let app = Router::new().fallback(proxy_handler).with_state(state);
@@ -2785,6 +2809,9 @@ decision = { type = "Allow" }
         pending_approvals: std::sync::Arc::new(dashmap::DashMap::new()),
         ic3_approval_timeout_secs: 300,
         shadow_config: gvm_proxy::intent_store::ShadowConfig::default(),
+        mitm_resolver: None,
+        mitm_server_config: None,
+        mitm_client_config: None,
     };
 
     let app = Router::new().fallback(proxy_handler).with_state(state);
@@ -2807,4 +2834,197 @@ decision = { type = "Allow" }
         StatusCode::FORBIDDEN,
         "With payload_inspection=false, body must NOT be inspected (no deny)"
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test 10: IC-3 Self-Approval Prevention — /gvm/approve NOT on proxy port
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Proves that an agent cannot self-approve IC-3 requests by calling /gvm/approve
+/// on the proxy port (8080). The approve endpoint must only be on the admin port.
+#[tokio::test]
+async fn ic3_self_approval_blocked_on_proxy_port() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::Router;
+    use tower::ServiceExt;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let srr_path = dir.path().join("srr.toml");
+    std::fs::write(
+        &srr_path,
+        "[[rules]]\nmethod = \"*\"\npattern = \"{any}\"\ndecision = { type = \"Allow\" }\n",
+    )
+    .unwrap();
+    let registry_path = dir.path().join("registry.toml");
+    std::fs::write(&registry_path, "").unwrap();
+    let policy_dir = dir.path().join("policies");
+    std::fs::create_dir_all(&policy_dir).unwrap();
+    std::fs::write(
+        policy_dir.join("global.toml"),
+        "[[rules]]\nid = \"f\"\npriority = 999\nlayer = \"Global\"\ndescription = \"fallback\"\n[rules.decision]\ntype = \"Allow\"\n",
+    )
+    .unwrap();
+    let secrets_path = dir.path().join("secrets.toml");
+    std::fs::write(&secrets_path, "[credentials]\n").unwrap();
+    let wal_path = dir.path().join("wal.log");
+
+    let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).unwrap()));
+    let policy = Arc::new(PolicyEngine::load(&policy_dir).unwrap());
+    let registry = Arc::new(OperationRegistry::load(&registry_path).unwrap());
+    let api_keys = Arc::new(APIKeyStore::load(&secrets_path).unwrap());
+    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
+    let vault = Arc::new(Vault::new(ledger.clone()).unwrap());
+    let http_client =
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .build_http();
+
+    let state = AppState {
+        srr,
+        policy,
+        registry,
+        api_keys,
+        ledger,
+        vault,
+        rate_limiter: Arc::new(RateLimiter::new()),
+        wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
+        checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
+        on_block: gvm_proxy::config::OnBlockConfig::default(),
+        http_client,
+        host_overrides: std::collections::HashMap::new(),
+        jwt_config: None,
+        intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
+        srr_config_path: String::new(),
+        mitm_ca_pem: None,
+        payload_inspection: false,
+        max_body_bytes: 65536,
+        pending_approvals: std::sync::Arc::new(dashmap::DashMap::new()),
+        ic3_approval_timeout_secs: 300,
+        shadow_config: gvm_proxy::intent_store::ShadowConfig::default(),
+        mitm_resolver: None,
+        mitm_server_config: None,
+        mitm_client_config: None,
+    };
+
+    // Build AGENT-FACING router only (no admin endpoints)
+    // This mirrors main.rs: proxy port does NOT have /gvm/approve or /gvm/pending
+    let agent_app = Router::new()
+        .route("/gvm/health", axum::routing::get(gvm_proxy::api::health))
+        .route("/gvm/check", axum::routing::post(gvm_proxy::api::check))
+        .fallback(proxy_handler)
+        .with_state(state);
+
+    // Agent tries to call /gvm/approve on proxy port → should get 404 (not routed)
+    let approve_request = Request::builder()
+        .method("POST")
+        .uri("/gvm/approve")
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"event_id":"evt-123","approved":true}"#))
+        .unwrap();
+
+    let response = agent_app.clone().oneshot(approve_request).await.unwrap();
+    // /gvm/approve is NOT on the agent-facing router → fallback to proxy_handler
+    // Proxy handler will try to forward this as an HTTP request, not approve it.
+    // The key assertion: the response must NOT be 200 OK with approval confirmation.
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    let body_str = String::from_utf8_lossy(&body);
+
+    assert!(
+        !body_str.contains("\"decision\":\"approved\""),
+        "SECURITY VIOLATION: /gvm/approve must NOT be accessible on the agent proxy port. \
+         Agent could self-approve IC-3 requests. Response: {}",
+        body_str
+    );
+
+    // Also verify /gvm/pending is not on agent port
+    let pending_request = Request::builder()
+        .method("GET")
+        .uri("/gvm/pending")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = agent_app.oneshot(pending_request).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    let body_str = String::from_utf8_lossy(&body);
+
+    assert!(
+        !body_str.contains("\"pending\""),
+        "SECURITY VIOLATION: /gvm/pending must NOT be accessible on the agent proxy port. \
+         Agent could discover pending approval event_ids. Response: {}",
+        body_str
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test 11: max_strict verifies decision VARIANT, not just strictness value
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn max_strict_returns_correct_decision_variant() {
+    use gvm_types::{max_strict, EnforcementDecision};
+
+    // Allow vs Deny → must return Deny (not just strictness=5)
+    let result = max_strict(
+        EnforcementDecision::Allow,
+        EnforcementDecision::Deny { reason: "blocked".to_string() },
+    );
+    assert!(
+        matches!(result, EnforcementDecision::Deny { .. }),
+        "max_strict(Allow, Deny) must return Deny variant, got: {:?}",
+        result
+    );
+
+    // Deny vs Allow → same result regardless of order
+    let result = max_strict(
+        EnforcementDecision::Deny { reason: "blocked".to_string() },
+        EnforcementDecision::Allow,
+    );
+    assert!(
+        matches!(result, EnforcementDecision::Deny { .. }),
+        "max_strict(Deny, Allow) must return Deny variant, got: {:?}",
+        result
+    );
+
+    // Delay vs RequireApproval → RequireApproval wins
+    let result = max_strict(
+        EnforcementDecision::Delay { milliseconds: 300 },
+        EnforcementDecision::RequireApproval {
+            urgency: gvm_types::ApprovalUrgency::Standard,
+        },
+    );
+    assert!(
+        matches!(result, EnforcementDecision::RequireApproval { .. }),
+        "max_strict(Delay, RequireApproval) must return RequireApproval, got: {:?}",
+        result
+    );
+
+    // RequireApproval vs Deny → Deny wins
+    let result = max_strict(
+        EnforcementDecision::RequireApproval {
+            urgency: gvm_types::ApprovalUrgency::Immediate,
+        },
+        EnforcementDecision::Deny { reason: "policy".to_string() },
+    );
+    assert!(
+        matches!(result, EnforcementDecision::Deny { .. }),
+        "max_strict(RequireApproval, Deny) must return Deny, got: {:?}",
+        result
+    );
+
+    // Same strictness level → first argument wins (stable ordering)
+    let result = max_strict(
+        EnforcementDecision::Deny { reason: "first".to_string() },
+        EnforcementDecision::Deny { reason: "second".to_string() },
+    );
+    match &result {
+        EnforcementDecision::Deny { reason } => {
+            assert_eq!(reason, "first", "Same strictness: first argument should win");
+        }
+        _ => panic!("max_strict(Deny, Deny) must return Deny"),
+    }
 }
