@@ -17,19 +17,22 @@
 
 FROM python:3.12-slim
 
+# Install iptables (required for DNAT MITM TLS inspection) and
+# ca-certificates (for system trust store). Without iptables,
+# contained mode cannot redirect HTTPS to the MITM proxy.
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends iptables ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
 # Create non-root user for agent execution
 RUN groupadd -r gvm-agent && useradd -r -g gvm-agent -d /home/agent -m agent
 
-# Install GVM Python SDK
-COPY sdk/python/ /opt/gvm-sdk/
-RUN pip install --no-cache-dir /opt/gvm-sdk/ && \
-    rm -rf /opt/gvm-sdk/
+# Install GVM Python SDK if available (optional — base image works without it)
+# COPY sdk/python/ /opt/gvm-sdk/
+# RUN pip install --no-cache-dir /opt/gvm-sdk/ && rm -rf /opt/gvm-sdk/
 
-# Set proxy environment — all HTTP traffic routes through GVM proxy
-ENV HTTP_PROXY=http://gvm-proxy:8080
-ENV HTTPS_PROXY=http://gvm-proxy:8080
-ENV http_proxy=http://gvm-proxy:8080
-ENV https_proxy=http://gvm-proxy:8080
+# Proxy env vars are set by gvm run --contained at runtime (not baked in).
+# This allows the CLI to control proxy routing per-session.
 
 # Agent workspace
 WORKDIR /home/agent/workspace

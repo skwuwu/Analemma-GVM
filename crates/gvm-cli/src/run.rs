@@ -1005,6 +1005,43 @@ async fn run_contained(
     let docker_version = String::from_utf8_lossy(&docker_check.stdout);
     println!("  {DIM}Docker:{RESET}       {}", docker_version.trim());
 
+    // Auto-build gvm-agent image if it doesn't exist
+    if image == "gvm-agent:latest" {
+        let img_check = tokio::process::Command::new("docker")
+            .args(["image", "inspect", "gvm-agent:latest"])
+            .output()
+            .await?;
+
+        if !img_check.status.success() {
+            let dockerfile = workspace_root_for_proxy().join("Dockerfile.agent");
+            if dockerfile.exists() {
+                println!("  {YELLOW}Building gvm-agent image (first time only)...{RESET}");
+                let build_ctx = dockerfile.parent().unwrap_or(std::path::Path::new("."));
+                let build = tokio::process::Command::new("docker")
+                    .args(["build", "-t", "gvm-agent:latest", "-f"])
+                    .arg(&dockerfile)
+                    .arg(build_ctx)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .output()
+                    .await?;
+
+                if build.status.success() {
+                    println!("  {GREEN}gvm-agent image built{RESET}");
+                } else {
+                    let err = String::from_utf8_lossy(&build.stderr);
+                    println!("  {RED}Failed to build gvm-agent image: {}{RESET}", err.lines().last().unwrap_or(""));
+                    println!("  {DIM}Build with: docker build -t gvm-agent:latest -f Dockerfile.agent .{RESET}");
+                    return Ok(());
+                }
+            } else {
+                println!("  {RED}gvm-agent image not found and Dockerfile.agent missing{RESET}");
+                println!("  {DIM}Build manually: docker build -t gvm-agent:latest -f Dockerfile.agent .{RESET}");
+                return Ok(());
+            }
+        }
+    }
+
     // Resolve script path
     let script_path = std::path::Path::new(script);
     if !script_path.exists() {
@@ -1153,14 +1190,20 @@ async fn run_contained(
     // Requires NET_ADMIN capability (added to docker run below).
     let entrypoint_script = if mitm_available {
         format!(
-            "if command -v iptables >/dev/null 2>&1; then \
-               iptables -t nat -A OUTPUT -p tcp --dport 443 -j DNAT --to-destination {}:{} 2>/dev/null && \
-               iptables -t nat -A OUTPUT -p tcp --dport 80 -j DNAT --to-destination {}:{} 2>/dev/null && \
-               unset HTTPS_PROXY https_proxy; \
-             fi; \
+            "if ! command -v iptables >/dev/null 2>&1; then \
+               echo '[GVM] ERROR: iptables not found. MITM TLS inspection requires iptables.' >&2; \
+               echo '[GVM] Use the gvm-agent base image: gvm run --contained --image gvm-agent:latest' >&2; \
+               echo '[GVM] Or add iptables to your image: RUN apt-get install -y iptables' >&2; \
+               exit 1; \
+             fi && \
+             GVM_HOST=$(getent hosts {host} | awk '{{print $1}}' | head -1) && \
+             iptables -t nat -A OUTPUT -p tcp --dport 443 -j DNAT --to-destination $GVM_HOST:{tls} && \
+             iptables -t nat -A OUTPUT -p tcp --dport 80 -j DNAT --to-destination $GVM_HOST:{http} && \
+             unset HTTPS_PROXY https_proxy && \
              exec \"$@\"",
-            proxy_host_for_container, tls_port,
-            proxy_host_for_container, proxy_port,
+            host = proxy_host_for_container,
+            tls = tls_port,
+            http = proxy_port,
         )
     } else {
         "exec \"$@\"".to_string()
@@ -1202,19 +1245,25 @@ async fn run_contained(
         .arg("-e")
         .arg(format!("GVM_AGENT_ID={}", agent_id));
 
-    // Set proxy env vars for HTTP traffic. For HTTPS:
-    // - If MITM+DNAT works (iptables available), DNAT handles 443→MITM
-    // - If DNAT fails (no iptables), HTTPS_PROXY enables CONNECT fallback
-    // The entrypoint tries DNAT; if it succeeds, unset HTTPS_PROXY.
+    if mitm_available {
+        // MITM mode: NO proxy env vars. All traffic goes through DNAT:
+        //   TCP 443 → MITM TLS listener (full L7 inspection)
+        //   TCP 80  → proxy HTTP port (HTTP inspection)
+        // Proxy env vars would cause CONNECT tunneling which bypasses MITM.
+        cmd.arg("-e")
+            .arg(format!("GVM_PROXY_URL={}", container_proxy));
+    } else {
+        // No MITM: CONNECT relay for HTTPS (domain-level only)
+        cmd.arg("-e")
+            .arg(format!("HTTP_PROXY={}", container_proxy))
+            .arg("-e")
+            .arg(format!("HTTPS_PROXY={}", container_proxy))
+            .arg("-e")
+            .arg(format!("http_proxy={}", container_proxy))
+            .arg("-e")
+            .arg(format!("https_proxy={}", container_proxy));
+    }
     cmd.arg("-e")
-        .arg(format!("HTTP_PROXY={}", container_proxy))
-        .arg("-e")
-        .arg(format!("HTTPS_PROXY={}", container_proxy))
-        .arg("-e")
-        .arg(format!("http_proxy={}", container_proxy))
-        .arg("-e")
-        .arg(format!("https_proxy={}", container_proxy))
-        .arg("-e")
         .arg(format!("GVM_PROXY_URL={}", container_proxy));
 
     cmd
@@ -1258,7 +1307,10 @@ async fn run_contained(
         //   - no-new-privileges prevents escalation from NET_ADMIN
         //   - container network is already isolated (gvm-bridge --internal)
         //   - DNAT is set in the entrypoint, then iptables is not needed further
-        cmd.arg("--cap-add=NET_ADMIN");
+        // NET_ADMIN + root required for iptables DNAT setup in entrypoint.
+        // no-new-privileges prevents escalation from root.
+        cmd.arg("--cap-add=NET_ADMIN")
+            .arg("--user").arg("root");
     }
 
     if use_host_network {

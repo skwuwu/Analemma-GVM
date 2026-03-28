@@ -98,7 +98,7 @@ enum Commands {
         contained: bool,
 
         /// Docker image (only with --contained)
-        #[arg(long, default_value = "python:3.12-slim")]
+        #[arg(long, default_value = "gvm-agent:latest")]
         image: String,
 
         /// Memory limit (--contained: Docker limit; --sandbox: cgroup v2 limit).
@@ -178,7 +178,7 @@ enum Commands {
         contained: bool,
 
         /// Docker image (only with --contained)
-        #[arg(long, default_value = "python:3.12-slim")]
+        #[arg(long, default_value = "gvm-agent:latest")]
         image: String,
 
         /// Docker memory limit (only with --contained)
