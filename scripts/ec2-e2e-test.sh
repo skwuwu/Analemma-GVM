@@ -4589,9 +4589,13 @@ AGENTEOF
             fail "68a: HTTPS failed ($(echo "$RESULT" | grep -o 'HTTPS:[^|]*'))"
         fi
 
-        # 68b: DNAT rules present
+        # 68b: DNAT rules present (agent may not be able to read them after cap drop)
         if echo "$RESULT" | grep -q "DNAT_RULES:2"; then
-            pass "68b: iptables DNAT rules configured (443->MITM, 80->proxy)"
+            pass "68b: iptables DNAT rules visible (443→MITM, 80→proxy)"
+        elif echo "$RESULT" | grep -q "DNAT_RULES:0\|DNAT_RULES:ERR"; then
+            # After setpriv drops NET_ADMIN, agent cannot list iptables rules.
+            # DNAT still works (proven by 68a HTTPS:200). This is correct security behavior.
+            pass "68b: NET_ADMIN dropped — agent cannot read iptables (DNAT proven by 68a)"
         elif echo "$RESULT" | grep -q "DNAT_RULES:[1-9]"; then
             pass "68b: iptables DNAT rules present"
         else
@@ -5180,9 +5184,9 @@ AGENTEOF
             else
                 pass "75a: iptables flush did not remove DNAT rules (rules may be in different chain)"
             fi
-        elif echo "$RESULT" | grep -q "FLUSH_EXIT:ERR\|FLUSH_EXIT:1"; then
-            # Flush denied — great security posture
-            pass "75a: iptables flush denied (agent cannot modify DNAT rules)"
+        elif echo "$RESULT" | grep -qE "FLUSH_EXIT:[1-9]|FLUSH_EXIT:ERR"; then
+            # Flush denied (exit code 1-255) — expected after setpriv drops NET_ADMIN
+            pass "75a: iptables flush denied — agent cannot modify DNAT rules (cap drop working)"
         else
             fail "75a: Unexpected flush result ($(echo "$RESULT" | grep -o 'FLUSH_EXIT:[^|]*'))"
         fi
