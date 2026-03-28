@@ -3673,6 +3673,9 @@ CFGEOF
 
             HEALTH=$(curl -sf --connect-timeout 2 "http://127.0.0.1:${DISKFULL_PORT}/gvm/health" 2>/dev/null)
             echo "$HEALTH" | grep -q "degraded\|primary_failed" && DEGRADED=true
+            # Also check emergency_writes > 0 (WAL failover active)
+            EMERG=$(echo "$HEALTH" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('emergency_writes',0))" 2>/dev/null)
+            [ "${EMERG:-0}" -gt 0 ] 2>/dev/null && DEGRADED=true
 
             if [ "$FAIL_CLOSED" = true ]; then
                 pass "57a: Circuit breaker activated (503) after WAL disk full"
