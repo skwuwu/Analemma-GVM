@@ -313,7 +313,34 @@ async fn read_http_request_inner<S: AsyncRead + Unpin>(stream: &mut S) -> Result
                     .map(|h| (h.name.to_string(), h.value.to_vec()))
                     .collect();
 
-                let body = buf[body_offset..].to_vec();
+                // Read remaining body based on Content-Length.
+                // After header parsing, buf[body_offset..] contains whatever body
+                // bytes arrived with the header read. If Content-Length indicates more,
+                // keep reading until we have the full body.
+                let content_length: usize = cl_values
+                    .first()
+                    .and_then(|v| std::str::from_utf8(v).ok())
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(0);
+
+                let mut body = buf[body_offset..].to_vec();
+                let raw_head = buf[..body_offset].to_vec();
+
+                if content_length > 0 && body.len() < content_length {
+                    let remaining = content_length - body.len();
+                    // Cap to prevent OOM (64KB body limit for MITM inspection)
+                    let cap = remaining.min(64 * 1024);
+                    let mut rest = vec![0u8; cap];
+                    let mut read_so_far = 0;
+                    while read_so_far < cap {
+                        let n = stream.read(&mut rest[read_so_far..]).await?;
+                        if n == 0 {
+                            break; // upstream closed
+                        }
+                        read_so_far += n;
+                    }
+                    body.extend_from_slice(&rest[..read_so_far]);
+                }
 
                 return Ok(HttpRequest {
                     method,
@@ -321,7 +348,7 @@ async fn read_http_request_inner<S: AsyncRead + Unpin>(stream: &mut S) -> Result
                     host,
                     headers: header_pairs,
                     body,
-                    raw_head: buf[..body_offset].to_vec(),
+                    raw_head,
                 });
             }
             Ok(httparse::Status::Partial) => {
@@ -537,6 +564,7 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                 break;
             }
             tls_stream.write_all(&buf[..n]).await?;
+            tls_stream.flush().await?;
         }
     } else {
         // Production: connect upstream with TLS
@@ -558,6 +586,9 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
             upstream_tls.write_all(&req.body).await?;
         }
 
+        // Relay response: read from upstream, write to agent, flush after each chunk.
+        // flush() is critical for SSE/streaming — without it, small chunks stay in the
+        // TLS record buffer (up to 16KB) and never reach the agent, causing timeout.
         let mut buf = vec![0u8; 8192];
         loop {
             let n = upstream_tls.read(&mut buf).await?;
@@ -565,6 +596,7 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                 break;
             }
             tls_stream.write_all(&buf[..n]).await?;
+            tls_stream.flush().await?;
         }
     }
 
