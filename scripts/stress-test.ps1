@@ -58,6 +58,17 @@ if (-not (docker version 2>$null)) {
     exit 1
 }
 
+# Verify host.docker.internal is resolvable from Docker (WSL2 known issue)
+Write-Host "  Checking host.docker.internal resolution..." -NoNewline
+$hostCheck = docker run --rm python:3.12-slim python3 -c "import socket; socket.getaddrinfo('host.docker.internal', 8080)" 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Host " FAILED" -ForegroundColor Red
+    Write-Host "  host.docker.internal is not resolvable from Docker containers."
+    Write-Host "  This is a known WSL2/Docker Desktop issue. Try restarting Docker Desktop."
+    exit 1
+}
+Write-Host " OK" -ForegroundColor Green
+
 # ── Start Proxy ──
 $ProxyJob = Start-Process -FilePath $ProxyBin -ArgumentList "--config", "$RepoDir\config\proxy.toml" `
     -RedirectStandardOutput "$ResultsDir\proxy.log" -RedirectStandardError "$ResultsDir\proxy-err.log" `
@@ -180,7 +191,7 @@ while ($true) {
     } catch {}
 
     # Chaos: T+20 proxy kill
-    if ($elapsedMin -ge 20 -and -not $ChaosKillDone) {
+    if ($elapsedMin -ge 15 -and -not $ChaosKillDone) {
         $ChaosKillDone = $true
         $ts = Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ"
         "[$ts] INJECT: taskkill proxy (PID $ProxyPid)" | Out-File -FilePath $ChaosLog -Encoding utf8 -Append
@@ -194,10 +205,26 @@ while ($true) {
         $ProxyPid = $ProxyJob.Id
         Start-Sleep -Seconds 3
         "[$ts] RESTART: proxy PID $ProxyPid" | Out-File -FilePath $ChaosLog -Encoding utf8 -Append
-    fi
+
+        # Verify SRR rules loaded after restart (fail-open prevention)
+        Start-Sleep -Seconds 2
+        try {
+            $check = Invoke-RestMethod -Uri "$ProxyUrl/gvm/check" -Method POST `
+                -ContentType "application/json" `
+                -Body '{"method":"POST","target_host":"webhook.site","target_path":"/test","operation":"test"}' `
+                -TimeoutSec 5
+            if ($check.decision -match "Deny") {
+                "[$ts] VERIFY: SRR rules loaded (webhook.site -> Deny)" | Out-File -FilePath $ChaosLog -Encoding utf8 -Append
+            } else {
+                "[$ts] FAIL: SRR rules NOT loaded — fail-open risk (got: $($check.decision))" | Out-File -FilePath $ChaosLog -Encoding utf8 -Append
+            }
+        } catch {
+            "[$ts] WARN: SRR verification failed (proxy may still be starting)" | Out-File -FilePath $ChaosLog -Encoding utf8 -Append
+        }
+    }
 
     # Chaos: T+40 disk pressure (create large file in WAL directory)
-    if ($elapsedMin -ge 40 -and -not $ChaosDiskDone) {
+    if ($elapsedMin -ge 35 -and -not $ChaosDiskDone) {
         $ChaosDiskDone = $true
         $ts = Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ"
         "[$ts] INJECT: disk pressure" | Out-File -FilePath $ChaosLog -Encoding utf8 -Append

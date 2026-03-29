@@ -26,11 +26,14 @@ set -uo pipefail
 DURATION_MIN=${DURATION_MIN:-60}
 NUM_AGENTS=${NUM_AGENTS:-5}
 MODE="sandbox"  # sandbox or contained
+# Agent stagger: 60s × 5 agents = T+4m. Baseline starts at T+8m.
+# First chaos at T+15m gives 7 minutes of stable baseline.
 STAGGER_SEC=60
-CHAOS_KILL_MIN=20
-CHAOS_NETWORK_MIN=30
-CHAOS_DISK_MIN=40
-CHAOS_DISK_RELEASE_MIN=45
+BASELINE_START_MIN=8
+CHAOS_KILL_MIN=15
+CHAOS_NETWORK_MIN=25
+CHAOS_DISK_MIN=35
+CHAOS_DISK_RELEASE_MIN=40
 METRIC_INTERVAL=60
 MAX_MEM_INCREASE_MB=100
 MAX_FD_CONSECUTIVE_INCREASE=60
@@ -282,21 +285,61 @@ chaos_proxy_kill() {
         curl -sf -X POST "$ADMIN_URL/gvm/reload" > /dev/null 2>&1
         chaos_log "MANUAL RESTART: proxy PID $pid"
     fi
+
+    # Verify SRR rules are loaded after restart (fail-open prevention)
+    sleep 2
+    local srr_check
+    srr_check=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
+        -H "Content-Type: application/json" \
+        -d '{"method":"POST","target_host":"webhook.site","target_path":"/test","operation":"test"}' \
+        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null || echo "unreachable")
+
+    if echo "$srr_check" | grep -qi "Deny"; then
+        chaos_log "VERIFY: SRR rules loaded correctly after restart (webhook.site → Deny)"
+    else
+        chaos_log "FAIL: SRR rules NOT loaded after restart — fail-open risk (got: $srr_check)"
+    fi
 }
 
 chaos_network_partition() {
-    chaos_log "INJECT: network partition — 5000ms delay + 20% packet loss on proxy upstream"
-    # Add latency to outbound proxy traffic (not agent→proxy, but proxy→upstream)
-    sudo tc qdisc add dev eth0 root netem delay 5000ms loss 20% 2>/dev/null || {
-        chaos_log "WARN: tc qdisc failed (may need root or eth0 is wrong interface)"
-        return
+    chaos_log "INJECT: network partition — 5000ms delay + 20% loss on proxy upstream"
+    # Apply tc netem ONLY to proxy's upstream connections, not the entire host.
+    # Use iptables mark to tag proxy-originated packets, then tc filter on that mark.
+    # This avoids disrupting metrics collection (curl to localhost) and agent→proxy traffic.
+    local proxy_pid
+    proxy_pid=$(cat "$RESULTS_DIR/proxy.pid" 2>/dev/null || echo "0")
+    local iface
+    iface=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' || echo "eth0")
+
+    # Mark packets from proxy process with fwmark 42
+    sudo iptables -t mangle -A OUTPUT -m owner --pid-owner "$proxy_pid" \
+        -p tcp --dport 443 -j MARK --set-mark 42 2>/dev/null || true
+    sudo iptables -t mangle -A OUTPUT -m owner --pid-owner "$proxy_pid" \
+        -p tcp --dport 80 -j MARK --set-mark 42 2>/dev/null || true
+
+    # Apply netem only to marked packets via tc handle/filter
+    sudo tc qdisc add dev "$iface" root handle 1: prio 2>/dev/null || true
+    sudo tc qdisc add dev "$iface" parent 1:3 handle 30: netem delay 5000ms loss 20% 2>/dev/null || {
+        chaos_log "WARN: tc qdisc failed — falling back to interface-wide netem"
+        sudo tc qdisc add dev "$iface" root netem delay 5000ms loss 20% 2>/dev/null || true
     }
-    chaos_log "Network partition active — monitoring FD count for socket leaks"
+    sudo tc filter add dev "$iface" parent 1:0 protocol ip handle 42 fw flowid 1:3 2>/dev/null || true
+
+    chaos_log "Network partition active on $iface (proxy PID $proxy_pid only) — monitoring FD count"
 }
 
 chaos_network_restore() {
     chaos_log "RESTORE: removing network partition"
-    sudo tc qdisc del dev eth0 root 2>/dev/null || true
+    local iface
+    iface=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' || echo "eth0")
+    sudo tc qdisc del dev "$iface" root 2>/dev/null || true
+    # Clean up iptables marks
+    local proxy_pid
+    proxy_pid=$(cat "$RESULTS_DIR/proxy.pid" 2>/dev/null || echo "0")
+    sudo iptables -t mangle -D OUTPUT -m owner --pid-owner "$proxy_pid" \
+        -p tcp --dport 443 -j MARK --set-mark 42 2>/dev/null || true
+    sudo iptables -t mangle -D OUTPUT -m owner --pid-owner "$proxy_pid" \
+        -p tcp --dport 80 -j MARK --set-mark 42 2>/dev/null || true
     chaos_log "Network partition removed"
 }
 
@@ -425,7 +468,16 @@ evaluate_results() {
         fi
     fi
 
-    # 6. Final verdict
+    # 6. Export audit log for post-mortem analysis
+    if [ -f "$REPO_DIR/data/wal.log" ] && [ -f "$GVM_BIN" ]; then
+        "$GVM_BIN" audit export --since 2h --wal "$REPO_DIR/data/wal.log" --format jsonl \
+            > "$RESULTS_DIR/audit-export.jsonl" 2>/dev/null || true
+        local event_count
+        event_count=$(wc -l < "$RESULTS_DIR/audit-export.jsonl" 2>/dev/null || echo "0")
+        echo "audit_export: $event_count events → audit-export.jsonl" >> "$SUMMARY"
+    fi
+
+    # 7. Final verdict
     echo "" >> "$SUMMARY"
     if $pass; then
         echo "═══ VERDICT: PASS ═══" >> "$SUMMARY"
