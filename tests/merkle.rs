@@ -367,7 +367,7 @@ async fn merkle_wal_verification_detects_tampered_event() {
     }
 
     let tampered = lines.join("\n");
-    let report = merkle::verify_wal(&tampered);
+    let _report = merkle::verify_wal(&tampered);
 
     // The batch is still "valid" because the stored event_hash didn't change —
     // but recomputing the event hash reveals tampering. The verify_wal function

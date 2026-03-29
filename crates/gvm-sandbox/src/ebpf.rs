@@ -342,9 +342,14 @@ mod tests {
 
     #[test]
     fn attach_result_variants() {
-        // Verify enum variants compile correctly
+        // Verify enum variants compile correctly.
+        // Guard's Drop calls detach_tc_filter("test0") which harmlessly fails
+        // on nonexistent interface (tc command returns error, silently ignored).
         let attached = EbpfAttachResult::Attached {
             interface: "test0".to_string(),
+            guard: EbpfGuard {
+                interface: "test0".to_string(),
+            },
         };
         let unavailable = EbpfAttachResult::Unavailable {
             reason: "test".to_string(),

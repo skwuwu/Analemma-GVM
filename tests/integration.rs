@@ -1643,7 +1643,7 @@ type = "Allow"
 
 #[test]
 fn policy_conflict_regex_vs_startswith_overlap_is_documented_false_negative() {
-    use gvm_proxy::policy::{validate_conflicts, WarningKind};
+    // validate_conflicts and WarningKind are called internally by PolicyEngine::load
 
     // The conflict detector uses heuristics that cannot detect overlap between
     // Regex and StartsWith operators. This test documents the known limitation.
@@ -1688,7 +1688,7 @@ type = "Allow"
     // Since we can't access internal fields directly, load the rules manually:
     let rules_content = std::fs::read_to_string(policy_dir.path().join("global.toml"))
         .expect("reading policy file must succeed");
-    let parsed: toml::Value = rules_content.parse().expect("TOML must parse");
+    let _parsed: toml::Value = rules_content.parse().expect("TOML must parse");
     // Use validate_conflicts with the engine's loaded rules.
     // We'll just test the evaluate path since we can't easily extract rules.
 
@@ -1992,7 +1992,7 @@ async fn checkpoint_save_restore_merkle_verified() {
         "state": {"balance": 100000, "step": 2},
         "metadata": {"agent": "finance-agent", "version": "1.0"}
     });
-    let body_bytes = serde_json::to_vec(&checkpoint_data).unwrap();
+    let _body_bytes = serde_json::to_vec(&checkpoint_data).unwrap();
 
     // Steps must be sequential starting from 0 (enforced by CheckpointRegistry)
     let body_bytes = b"{\"state\":\"test\",\"step\":0}".to_vec();
@@ -2869,7 +2869,7 @@ decision = { type = "Allow" }
 #[tokio::test]
 async fn ic3_self_approval_blocked_on_proxy_port() {
     use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::http::Request;
     use axum::Router;
     use tower::ServiceExt;
 
@@ -2950,7 +2950,7 @@ async fn ic3_self_approval_blocked_on_proxy_port() {
     // /gvm/approve is NOT on the agent-facing router → fallback to proxy_handler
     // Proxy handler will try to forward this as an HTTP request, not approve it.
     // The key assertion: the response must NOT be 200 OK with approval confirmation.
-    let status = response.status();
+    let _status = response.status();
     let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
         .unwrap_or_default();

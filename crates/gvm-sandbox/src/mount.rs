@@ -48,7 +48,7 @@ pub fn resolve_dynload_libs(interpreter_path: &Path) -> Vec<PathBuf> {
             };
             for so_entry in so_entries.flatten() {
                 let path = so_entry.path();
-                if !path.extension().is_some_and(|e| e == "so") {
+                if path.extension().is_none_or(|e| e != "so") {
                     continue;
                 }
                 if let Ok(output) = std::process::Command::new("ldd").arg(&path).output() {
@@ -129,8 +129,8 @@ pub fn setup_mount_namespace(
     }
 
     // ── Workspace mount: overlayfs (if fs_policy set + kernel supports) or legacy ──
-    let overlayfs_mounted = if fs_policy.is_some() {
-        try_mount_overlayfs(workspace_dir, &new_root, fs_policy.unwrap())
+    let overlayfs_mounted = if let Some(policy) = fs_policy {
+        try_mount_overlayfs(workspace_dir, &new_root, policy)
     } else {
         false
     };

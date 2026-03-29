@@ -553,9 +553,6 @@ mod tests {
 
     #[test]
     fn wrong_issuer_rejected() {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use base64::Engine;
-
         let config = test_config(3600);
 
         // Issue a valid token, then forge one with wrong issuer
