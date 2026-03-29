@@ -4,16 +4,9 @@
 [advisories]
 # Deny crates with known security vulnerabilities
 vulnerability = "deny"
-# Ignore wasmtime CVEs — Wasm engine is NOT on hot path (native fallback is default).
-# Upgrading wasmtime 29 → 41+ is a major breaking change. These CVEs affect
-# WASI guests, not the proxy itself. Will be addressed when Wasm is activated.
-ignore = [
-    "RUSTSEC-2026-0021",  # wasmtime: panic in wasi:http/types.fields
-    "RUSTSEC-2026-0020",  # wasmtime: guest-controlled resource exhaustion
-    "RUSTSEC-2025-0046",  # wasmtime: fd_renumber panic
-    "RUSTSEC-2026-0006",  # wasmtime: f64.copysign segfault
-    "RUSTSEC-2025-0118",  # wasmtime: unsound shared memory API
-]
+# wasmtime CVEs no longer need ignoring — wasmtime is behind --features wasm
+# (disabled by default) and not compiled into the default binary.
+ignore = []
 
 [licenses]
 allow = [

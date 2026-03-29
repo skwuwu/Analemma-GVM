@@ -80,12 +80,20 @@
 
 ### Code Quality (Code Review Feedback)
 
-**Wasm Engine** (`src/wasm_engine.rs`):
+**Wasm Engine** (`src/wasm_engine.rs`) — **Disabled by default** (`--features wasm`):
 - [x] `result_ptr` dealloc (memory leak fix)
 - [x] Unknown decision → Delay (Fail-Close)
 - [x] `MAX_RESPONSE_LEN` validation
+- [x] Moved behind `--features wasm` feature flag (default off). Removes ~10MB from binary and eliminates 5 wasmtime CVEs from default attack surface.
 - [ ] ABAC hot-path execution via Wasm engine (current request path uses native `policy.evaluate`)
 - [ ] Ed25519 module signature verification + hash pinning + fail-close required mode
+
+> **Wasm design rationale**: The Wasm sandbox is intended for a future scenario where
+> third-party policy modules need to be loaded without trusting the code (e.g., policy
+> marketplace). Current GVM policies are TOML-declarative and written by the operator
+> themselves, so Wasm memory isolation adds no practical security benefit today.
+> Native Rust evaluation is functionally identical and faster. When demand for pluggable
+> policy modules is confirmed, this feature will be completed and activated.
 
 **Policy Engine** (`src/policy.rs`):
 - [x] Regex pre-compile at load time

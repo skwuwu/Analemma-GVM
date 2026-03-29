@@ -9,6 +9,7 @@ use crate::registry::OperationRegistry;
 use crate::srr::NetworkSRR;
 use crate::types::*;
 use crate::vault::Vault;
+#[cfg(feature = "wasm")]
 use crate::wasm_engine::WasmEngine;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -54,7 +55,9 @@ pub struct AppState {
     pub ledger: Arc<Ledger>,
     pub vault: Arc<Vault>,
     pub rate_limiter: Arc<RateLimiter>,
-    /// Layer 1: Wasm governance engine (immutable policy sandbox)
+    /// Layer 1: Wasm governance engine (immutable policy sandbox).
+    /// Only available when compiled with --features wasm.
+    #[cfg(feature = "wasm")]
     pub wasm_engine: Arc<WasmEngine>,
     /// Checkpoint Merkle tree registry — tracks plaintext content hashes
     /// as leaves for O(log N) Merkle proof verification on restore.

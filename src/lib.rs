@@ -17,4 +17,5 @@ pub mod srr;
 pub mod tls_proxy;
 pub mod types;
 pub mod vault;
+#[cfg(feature = "wasm")]
 pub mod wasm_engine;

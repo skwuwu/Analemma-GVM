@@ -12,6 +12,7 @@ use gvm_proxy::rate_limiter::RateLimiter;
 use gvm_proxy::registry::OperationRegistry;
 use gvm_proxy::srr::NetworkSRR;
 use gvm_proxy::vault::Vault;
+#[cfg(feature = "wasm")]
 use gvm_proxy::wasm_engine::WasmEngine;
 use std::path::Path;
 use std::sync::Arc;
@@ -224,16 +225,24 @@ async fn main() {
     tracing::info!("Vault initialized");
 
     // 8.5. Initialize Wasm Governance Engine (Layer 1: Immutable Logic)
-    let wasm_engine = WasmEngine::load(Path::new("data/gvm_engine.wasm"))
-        .expect("Failed to initialize Wasm engine");
-    if wasm_engine.is_wasm() {
-        tracing::info!(
-            hash = %wasm_engine.module_hash.as_deref().unwrap_or("unknown"),
-            "Layer 1: Wasm governance engine ACTIVE (immutable sandbox)"
-        );
-    } else {
-        tracing::info!("Layer 1: Using native policy engine (Wasm module not loaded)");
-    }
+    // Wasm engine is behind --features wasm (disabled by default).
+    // Native Rust policy evaluation is used in default builds.
+    #[cfg(feature = "wasm")]
+    let wasm_engine = {
+        let engine = WasmEngine::load(Path::new("data/gvm_engine.wasm"))
+            .expect("Failed to initialize Wasm engine");
+        if engine.is_wasm() {
+            tracing::info!(
+                hash = %engine.module_hash.as_deref().unwrap_or("unknown"),
+                "Layer 1: Wasm governance engine ACTIVE (immutable sandbox)"
+            );
+        } else {
+            tracing::info!("Layer 1: Using native policy engine (Wasm module not loaded)");
+        }
+        engine
+    };
+    #[cfg(not(feature = "wasm"))]
+    tracing::info!("Layer 1: Native policy engine (Wasm disabled — enable with --features wasm)");
 
     // 9. Build HTTP client for upstream forwarding
     let http_client =
@@ -340,6 +349,7 @@ async fn main() {
         ledger,
         vault: Arc::new(vault),
         rate_limiter: Arc::new(RateLimiter::new()),
+        #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(wasm_engine),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
         on_block: config.enforcement.on_block.clone(),

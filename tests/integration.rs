@@ -705,6 +705,7 @@ milliseconds = 300
         ledger,
         vault,
         rate_limiter,
+        #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
         on_block: gvm_proxy::config::OnBlockConfig::default(),
@@ -1146,6 +1147,7 @@ token = "sk_test_proxy_injected_key"
         ledger: ledger.clone(),
         vault,
         rate_limiter,
+        #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
         on_block: gvm_proxy::config::OnBlockConfig::default(),
@@ -1322,6 +1324,7 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
         ledger,
         vault,
         rate_limiter,
+        #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
         on_block: gvm_proxy::config::OnBlockConfig::default(),
@@ -1514,6 +1517,7 @@ type = "Allow"
         ledger,
         vault,
         rate_limiter,
+        #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
         on_block: gvm_proxy::config::OnBlockConfig::default(),
@@ -1954,6 +1958,7 @@ async fn checkpoint_save_restore_merkle_verified() {
         ledger,
         vault,
         rate_limiter,
+        #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
         on_block: gvm_proxy::config::OnBlockConfig::default(),
@@ -2420,6 +2425,7 @@ type = "Allow"
         ledger,
         vault,
         rate_limiter: Arc::new(RateLimiter::new()),
+        #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
         on_block: gvm_proxy::config::OnBlockConfig::default(),
@@ -2575,6 +2581,7 @@ decision = { type = "Allow" }
         ledger,
         vault,
         rate_limiter: Arc::new(RateLimiter::new()),
+        #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
         on_block: gvm_proxy::config::OnBlockConfig::default(),
@@ -2695,6 +2702,7 @@ decision = { type = "Allow" }
         ledger,
         vault,
         rate_limiter: Arc::new(RateLimiter::new()),
+        #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
         on_block: gvm_proxy::config::OnBlockConfig::default(),
@@ -2819,6 +2827,7 @@ decision = { type = "Allow" }
         ledger,
         vault,
         rate_limiter: Arc::new(RateLimiter::new()),
+        #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
         on_block: gvm_proxy::config::OnBlockConfig::default(),
@@ -2911,6 +2920,7 @@ async fn ic3_self_approval_blocked_on_proxy_port() {
         ledger,
         vault,
         rate_limiter: Arc::new(RateLimiter::new()),
+        #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
         on_block: gvm_proxy::config::OnBlockConfig::default(),

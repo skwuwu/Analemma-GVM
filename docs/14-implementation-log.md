@@ -4,6 +4,35 @@
 
 ---
 
+## 2026-03-29: Wasm Engine Behind Feature Flag (Attack Surface Reduction)
+
+### What Changed
+
+wasmtime (29.0.1, 5 known CVEs) moved behind `--features wasm` (disabled by default).
+
+**Before**: wasmtime always compiled into the binary. Even though native policy evaluation was the default, placing `data/gvm_engine.wasm` would silently activate the vulnerable Wasm engine.
+
+**After**: Default binary does not contain wasmtime. `cargo build` produces a proxy with native-only policy evaluation. `cargo build --features wasm` opt-in enables Wasm support.
+
+**Impact**:
+- Binary size reduced ~10MB (wasmtime + cranelift + WASI)
+- 5 wasmtime CVEs eliminated from default attack surface
+- `deny.toml` ignores no longer needed (wasmtime not in dependency tree)
+- `wasm_engine` field in `AppState` is `#[cfg(feature = "wasm")]`
+
+**Design rationale documented in Cargo.toml and roadmap**: Wasm sandbox is for future third-party policy plugin scenario. Current TOML-declarative policies don't benefit from Wasm isolation.
+
+### Affected Files
+- `Cargo.toml` — wasmtime/wasmtime-wasi/gvm-engine → optional, `[features] wasm` added
+- `src/lib.rs` — `#[cfg(feature = "wasm")] pub mod wasm_engine`
+- `src/proxy.rs` — `#[cfg(feature = "wasm")]` on WasmEngine import + AppState field
+- `src/main.rs` — Wasm loading gated behind cfg
+- `tests/integration.rs` — `#[cfg(feature = "wasm")]` on wasm_engine AppState fields
+- `deny.toml` — wasmtime ignores removed
+- `docs/13-roadmap.md` — Wasm rationale + inactive status documented
+
+---
+
 ## 2026-03-29: Contained Mode E2E Tests (68-75)
 
 ### What Changed

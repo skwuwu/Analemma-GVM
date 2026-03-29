@@ -50,9 +50,9 @@ thiserror = "1"
 hex = "0.4"
 dashmap = "6"
 zeroize = { version = "1", features = ["derive"] }
-wasmtime = "29"
-wasmtime-wasi = "29"
-gvm-engine = { path = "crates/gvm-engine" }
+wasmtime = { version = "29", optional = true }
+wasmtime-wasi = { version = "29", optional = true }
+gvm-engine = { path = "crates/gvm-engine", optional = true }
 gvm-sandbox = { path = "crates/gvm-sandbox" }
 rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = "0.26"
@@ -62,6 +62,20 @@ moka = { version = "0.12", features = ["sync"] }
 rustls-pemfile = "2"
 webpki-roots = "0.26"
 time = "0.3"
+
+[features]
+default = []
+# Wasm policy engine: loads governance logic from a .wasm module for memory-isolated
+# evaluation. Disabled by default — native Rust evaluation is used instead.
+# Enable with: cargo build --features wasm
+#
+# Design rationale: Wasm isolation is intended for a future scenario where third-party
+# policy modules (e.g., policy marketplace) need to be loaded without trusting the code.
+# Current GVM policies are TOML-declarative and written by the operator, so Wasm isolation
+# adds no practical security benefit today. Keeping it behind a feature flag removes
+# ~10MB from the binary and eliminates 5 wasmtime CVEs from the default attack surface.
+# When demand for pluggable policy modules is confirmed, this feature will be completed.
+wasm = ["wasmtime", "wasmtime-wasi", "gvm-engine"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
