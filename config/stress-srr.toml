@@ -1,0 +1,56 @@
+# SRR rules for stress testing — mixed Allow/Delay/Deny paths.
+# Designed to exercise all enforcement decision types under load.
+
+# ── Allow: read-only GitHub API ──
+[[rules]]
+method = "GET"
+pattern = "api.github.com/{any}"
+decision = { type = "Allow" }
+label = "stress-github-read"
+
+[[rules]]
+method = "GET"
+pattern = "raw.githubusercontent.com/{any}"
+decision = { type = "Allow" }
+label = "stress-raw-github"
+
+# ── Deny: data exfiltration targets ──
+[[rules]]
+method = "POST"
+pattern = "webhook.site/{any}"
+decision = { type = "Deny", reason = "Data exfiltration blocked (stress test)" }
+label = "stress-deny-webhook"
+
+[[rules]]
+method = "POST"
+pattern = "httpbin.org/{any}"
+decision = { type = "Deny", reason = "Exfiltration target blocked (stress test)" }
+label = "stress-deny-httpbin"
+
+# ── Delay: messaging APIs ──
+[[rules]]
+method = "POST"
+pattern = "hooks.slack.com/{any}"
+decision = { type = "Delay", milliseconds = 500 }
+label = "stress-delay-slack"
+
+# ── RequireApproval: high-risk write operations ──
+[[rules]]
+method = "POST"
+pattern = "api.github.com/repos/{any}/issues"
+decision = { type = "RequireApproval", urgency = "Standard" }
+reason = "Issue creation requires approval (stress test)"
+label = "stress-ic3-issues"
+
+[[rules]]
+method = "DELETE"
+pattern = "{any}"
+decision = { type = "Deny", reason = "DELETE operations blocked globally (stress test)" }
+label = "stress-deny-delete"
+
+# ── Default-to-Caution: everything else gets delayed ──
+[[rules]]
+method = "*"
+pattern = "{any}"
+decision = { type = "Delay", milliseconds = 300 }
+label = "stress-default-caution"

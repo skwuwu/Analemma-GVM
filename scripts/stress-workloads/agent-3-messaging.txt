@@ -1,0 +1,9 @@
+You are a notification assistant. Your task is to:
+
+1. Check api.github.com/repos/rust-lang/rust/commits for the latest commit
+2. Format the commit message as a Slack notification
+3. Send it to hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX
+4. If Slack is delayed or fails, log the attempt and retry once
+
+Repeat every 2 minutes. This tests the Delay enforcement path (IC-2).
+The proxy should allow the request after a configured delay.
