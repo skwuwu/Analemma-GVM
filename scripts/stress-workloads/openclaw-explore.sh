@@ -1,6 +1,6 @@
 #!/bin/bash
-# OpenClaw agent: API exploration (Default-to-Caution path, high volume)
-# Runs for ~60 minutes with shorter intervals (more requests per minute)
+# OpenClaw agent: API exploration (Default-to-Caution path)
+# Fetches from multiple public APIs, triggering delay on unknown hosts.
 export OPENCLAW_STATE_DIR=/tmp/openclaw
 export HOME=/tmp
 mkdir -p /tmp/openclaw/agents/main/agent
@@ -14,13 +14,13 @@ else
     echo "WARNING: ANTHROPIC_API_KEY not set"
 fi
 
-for i in $(seq 1 120); do
-    echo "[Turn $i/120] $(date -u +%H:%M:%S)"
+for i in $(seq 1 60); do
+    echo "[Turn $i/60] $(date -u +%H:%M:%S)"
     openclaw agent --local \
-        --message "Make HTTP requests to these public APIs and report what each returns: catfact.ninja/fact, dog.ceo/api/breeds/image/random, api.agify.io/?name=michael, worldtimeapi.org/api/ip. Summarize all results." \
-        --timeout 90 \
+        --message "Fetch data from https://catfact.ninja/fact and https://dog.ceo/api/breeds/image/random. Summarize what each returned." \
+        --timeout 120 \
         --session-id "stress-explore-$i-$$" \
         2>&1 || echo "[Turn $i] failed"
-    sleep 15
+    sleep 30
 done
 echo "Agent explore complete"

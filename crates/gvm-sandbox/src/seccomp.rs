@@ -298,7 +298,10 @@ fn insert_base_syscalls(rules: &mut BTreeMap<i64, Vec<SeccompRule>>) {
         libc::SYS_mkdirat,
         libc::SYS_rmdir,
         libc::SYS_chdir,
-        libc::SYS_fchdir
+        libc::SYS_fchdir,
+        libc::SYS_chmod,
+        libc::SYS_fchmod,
+        libc::SYS_fchmodat
     );
 
     // Polling / event loop
