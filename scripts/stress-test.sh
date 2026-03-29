@@ -475,6 +475,62 @@ evaluate_results() {
         local event_count
         event_count=$(wc -l < "$RESULTS_DIR/audit-export.jsonl" 2>/dev/null || echo "0")
         echo "audit_export: $event_count events → audit-export.jsonl" >> "$SUMMARY"
+
+        # Extract decision breakdown from audit log
+        if [ "$event_count" -gt 0 ] 2>/dev/null && command -v jq >/dev/null 2>&1; then
+            echo "" >> "$SUMMARY"
+            echo "── Audit Breakdown ──" >> "$SUMMARY"
+
+            # Decision counts
+            local allow_n delay_n deny_n approval_n
+            allow_n=$(jq -r 'select(.decision | test("Allow")) | .decision' "$RESULTS_DIR/audit-export.jsonl" 2>/dev/null | wc -l)
+            delay_n=$(jq -r 'select(.decision | test("Delay")) | .decision' "$RESULTS_DIR/audit-export.jsonl" 2>/dev/null | wc -l)
+            deny_n=$(jq -r 'select(.decision | test("Deny")) | .decision' "$RESULTS_DIR/audit-export.jsonl" 2>/dev/null | wc -l)
+            approval_n=$(jq -r 'select(.decision | test("RequireApproval")) | .decision' "$RESULTS_DIR/audit-export.jsonl" 2>/dev/null | wc -l)
+            echo "  Allow: $allow_n  Delay: $delay_n  Deny: $deny_n  RequireApproval: $approval_n" >> "$SUMMARY"
+
+            # Decision ratio
+            if [ "$event_count" -gt 0 ]; then
+                local allow_pct deny_pct
+                allow_pct=$(echo "scale=1; $allow_n * 100 / $event_count" | bc 2>/dev/null || echo "?")
+                deny_pct=$(echo "scale=1; $deny_n * 100 / $event_count" | bc 2>/dev/null || echo "?")
+                echo "  Allow: ${allow_pct}%  Deny: ${deny_pct}%  (of $event_count total)" >> "$SUMMARY"
+            fi
+
+            # Audit gap detection: find 30+ second gaps in event timestamps
+            # (indicates WAL was not recording during chaos event)
+            echo "" >> "$SUMMARY"
+            local gaps
+            gaps=$(jq -r '.timestamp' "$RESULTS_DIR/audit-export.jsonl" 2>/dev/null \
+                | sort \
+                | awk 'NR>1 {
+                    cmd = "date -d \"" prev "\" +%s 2>/dev/null || date -j -f \"%Y-%m-%dT%H:%M:%S\" \"" prev "\" +%s 2>/dev/null"
+                    cmd | getline t1; close(cmd)
+                    cmd = "date -d \"" $0 "\" +%s 2>/dev/null || date -j -f \"%Y-%m-%dT%H:%M:%S\" \"" $0 "\" +%s 2>/dev/null"
+                    cmd | getline t2; close(cmd)
+                    gap = t2 - t1
+                    if (gap > 30) print prev " → " $0 " (" gap "s gap)"
+                } { prev = $0 }' 2>/dev/null || true)
+
+            if [ -n "$gaps" ]; then
+                echo "  ⚠ Audit gaps (>30s without events):" >> "$SUMMARY"
+                echo "$gaps" | while read -r line; do
+                    echo "    $line" >> "$SUMMARY"
+                done
+                echo "  (Gaps during chaos events are expected; gaps outside chaos indicate WAL issue)" >> "$SUMMARY"
+            else
+                echo "  ✓ No audit gaps >30s detected" >> "$SUMMARY"
+            fi
+        elif [ "$event_count" -gt 0 ] 2>/dev/null; then
+            # No jq — basic counts with grep
+            echo "" >> "$SUMMARY"
+            echo "── Audit Breakdown (jq not available, basic counts) ──" >> "$SUMMARY"
+            local allow_n deny_n delay_n
+            allow_n=$(grep -c '"Allow"' "$RESULTS_DIR/audit-export.jsonl" 2>/dev/null || echo "0")
+            deny_n=$(grep -c '"Deny"' "$RESULTS_DIR/audit-export.jsonl" 2>/dev/null || echo "0")
+            delay_n=$(grep -c '"Delay"' "$RESULTS_DIR/audit-export.jsonl" 2>/dev/null || echo "0")
+            echo "  Allow: ~$allow_n  Delay: ~$delay_n  Deny: ~$deny_n" >> "$SUMMARY"
+        fi
     fi
 
     # 7. Final verdict
