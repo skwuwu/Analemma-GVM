@@ -25,18 +25,38 @@ The agent runs on the host with `HTTP_PROXY`/`HTTPS_PROXY` environment variables
 | Channel | Governed? | Mechanism |
 |---------|-----------|-----------|
 | HTTP API calls | **Yes** | Routed through proxy via `HTTP_PROXY` |
-| HTTPS API calls | **Domain only** | CONNECT tunnel — proxy sees hostname, not path/body |
+| HTTPS API calls (Python) | **Yes** | Python `requests`/`httpx` respect `HTTPS_PROXY` → CONNECT tunnel |
+| HTTPS API calls (Node.js) | **No** | Node.js `https` module ignores `HTTPS_PROXY` by default |
 | File system | No | Agent has full host filesystem access |
 | Process execution | No | Agent can spawn any process |
 | Network (non-HTTP) | No | Agent can use UDP, raw sockets, etc. |
 
+### Runtime-specific HTTPS behavior
+
+| Runtime | HTTPS_PROXY respected? | Coverage |
+|---------|----------------------|----------|
+| Python (`requests`, `httpx`, `urllib3`) | **Yes** (automatic) | Full — CONNECT tunnel to proxy |
+| Python (`aiohttp`) | **Yes** (with `trust_env=True`) | Full |
+| Node.js (`https`, `fetch`) | **No** (ignores env var) | HTTP only |
+| Node.js (`undici` with `EnvHttpProxyAgent`) | Yes | Full |
+| Go (`net/http`) | **Yes** (automatic) | Full |
+| curl | **Yes** | Full |
+| Ruby (`net/http`) | **Yes** | Full |
+
+**GVM detects Node.js agents** in cooperative mode and warns:
+```
+⚠ Node.js agent detected in cooperative mode.
+  Node.js does not respect HTTPS_PROXY by default — HTTPS traffic may bypass the proxy.
+  Use --contained or --sandbox for full HTTPS coverage via DNAT.
+```
+
 ### Who this is for
 
-Developers testing policies locally. The agent cooperates because you trust the code — you just want visibility into what it calls and a basic safety net.
+Python agent developers testing policies locally. For Node.js/TypeScript agents (OpenClaw, custom Node.js), use `--contained` or `--sandbox`.
 
 ### Honest limitation
 
-The agent can bypass GVM by making direct HTTPS connections without the proxy. This mode is **observation + cooperative enforcement**, not a security boundary.
+Cooperative mode depends on the agent's HTTP library respecting proxy environment variables. Python does; Node.js doesn't. This is not a GVM limitation — it's a Node.js design choice. Use `--contained` or `--sandbox` for runtime-agnostic coverage.
 
 ---
 

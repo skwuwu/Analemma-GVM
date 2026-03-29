@@ -95,14 +95,16 @@ Unknown URLs → configurable: `delay` (dev), `require_approval` (prod), `deny` 
 
 ## Isolation Modes
 
-| Mode | Command | Enforcement | Platform |
-|------|---------|-------------|----------|
-| **Observe** | `gvm watch agent.py` | No blocking, visibility only | Any OS |
-| **Cooperative** | `gvm run agent.py` | Agent respects HTTP_PROXY | Any OS |
-| **Docker** | `gvm run --contained agent.py` | Docker isolation + HTTPS MITM | Any OS + Docker |
-| **Sandbox** | `gvm run --sandbox agent.py` | Kernel (namespace + seccomp + eBPF + overlayfs + cgroup) | Linux |
+| Mode | Command | HTTPS inspection | Platform |
+|------|---------|-----------------|----------|
+| **Observe** | `gvm watch agent.py` | None (observation only) | Any OS |
+| **Cooperative** | `gvm run agent.py` | Python: full (via HTTPS_PROXY). Node.js: HTTP only* | Any OS |
+| **Docker** | `gvm run --contained agent.py` | Full L7 — all runtimes (DNAT → MITM) | Any OS + Docker |
+| **Sandbox** | `gvm run --sandbox agent.py` | Full L7 — all runtimes (DNAT → MITM) | Linux |
 
-`--sandbox` governs network (iptables + eBPF TC + seccomp → proxy-only), filesystem (overlayfs Trust-on-Pattern), resources (cgroup v2), and processes (seccomp ~111 syscalls). [Detailed coverage →](docs/17-governance-coverage.md)
+> \* **Cooperative mode + Node.js**: Node.js `https` module ignores `HTTPS_PROXY` by default. HTTPS traffic bypasses the proxy. Use `--contained` or `--sandbox` for Node.js agents (OpenClaw, custom Node.js). Python agents (`requests`, `httpx`) respect `HTTPS_PROXY` automatically. GVM detects Node.js agents and warns in cooperative mode.
+
+`--contained` and `--sandbox` use DNAT to intercept all TCP 443 traffic at the network level — runtime-agnostic. [Detailed coverage →](docs/17-governance-coverage.md)
 
 ---
 

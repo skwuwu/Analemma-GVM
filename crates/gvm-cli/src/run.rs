@@ -50,8 +50,32 @@ pub async fn run_agent(
     } else if contained {
         run_contained(script, agent_id, proxy, image, memory, cpus, detach).await
     } else if is_binary_mode {
+        // Warn if Node.js agent detected in cooperative mode
+        let cmd_str = command.join(" ").to_lowercase();
+        if cmd_str.contains("node") || cmd_str.contains("openclaw") || cmd_str.contains("npx") {
+            eprintln!(
+                "  {YELLOW}\u{26a0} Node.js agent detected in cooperative mode.{RESET}"
+            );
+            eprintln!(
+                "  {DIM}Node.js does not respect HTTPS_PROXY by default — HTTPS traffic may bypass the proxy.{RESET}"
+            );
+            eprintln!(
+                "  {DIM}Use --contained or --sandbox for full HTTPS coverage via DNAT.{RESET}"
+            );
+            eprintln!();
+        }
         run_binary_local(command, agent_id, proxy, interactive).await
     } else {
+        // Warn for .js/.ts scripts
+        if script.ends_with(".js") || script.ends_with(".ts") {
+            eprintln!(
+                "  {YELLOW}\u{26a0} Node.js/TypeScript agent detected in cooperative mode.{RESET}"
+            );
+            eprintln!(
+                "  {DIM}HTTPS traffic may bypass the proxy. Use --contained or --sandbox for full coverage.{RESET}"
+            );
+            eprintln!();
+        }
         run_local(script, agent_id, proxy, interactive).await
     }
 }
@@ -1273,6 +1297,21 @@ async fn run_contained(
     }
     cmd.arg("-e")
         .arg(format!("GVM_PROXY_URL={}", container_proxy));
+
+    // Pass through LLM provider API keys if set in host environment.
+    // Most agent frameworks (OpenClaw, LangChain, CrewAI) need these to call LLM APIs.
+    // The keys are still governed: all HTTPS traffic goes through DNAT → MITM,
+    // so the proxy inspects every request regardless of whether the agent has the key.
+    for key in &[
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GEMINI_API_KEY",
+    ] {
+        if let Ok(val) = std::env::var(key) {
+            cmd.arg("-e").arg(format!("{}={}", key, val));
+        }
+    }
 
     cmd.arg("-v")
         .arg(format!("{}:/home/agent/workspace:ro", mount_dir));
