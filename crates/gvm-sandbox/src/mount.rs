@@ -48,7 +48,7 @@ pub fn resolve_dynload_libs(interpreter_path: &Path) -> Vec<PathBuf> {
             };
             for so_entry in so_entries.flatten() {
                 let path = so_entry.path();
-                if path.extension().map_or(true, |e| e != "so") {
+                if !path.extension().is_some_and(|e| e == "so") {
                     continue;
                 }
                 if let Ok(output) = std::process::Command::new("ldd").arg(&path).output() {

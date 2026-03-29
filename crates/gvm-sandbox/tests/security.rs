@@ -149,14 +149,13 @@ mod ebpf_tests {
     }
 
     #[test]
-    fn ebpf_attach_result_variants() {
-        let attached = EbpfAttachResult::Attached {
-            interface: "veth-gvm-h42".to_string(),
-        };
+    fn ebpf_attach_result_unavailable_variant() {
+        // EbpfAttachResult::Attached requires an EbpfGuard which can only be
+        // created by actually attaching to a real interface. We test the
+        // Unavailable variant and verify try_attach on a fake interface.
         let unavailable = EbpfAttachResult::Unavailable {
             reason: "kernel too old".to_string(),
         };
-        assert!(matches!(attached, EbpfAttachResult::Attached { .. }));
         assert!(matches!(unavailable, EbpfAttachResult::Unavailable { .. }));
     }
 
