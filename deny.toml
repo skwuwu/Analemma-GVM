@@ -1,0 +1,47 @@
+# cargo-deny configuration for Analemma-GVM
+# https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# Deny crates with known security vulnerabilities (CVE)
+vulnerability = "deny"
+# Warn on unmaintained crates
+unmaintained = "warn"
+# Warn on crates that have been yanked
+yanked = "warn"
+# Ignore specific advisories (add IDs here if needed for known false positives)
+ignore = []
+
+[licenses]
+# Allow only these licenses
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "OpenSSL",
+    "Zlib",
+    "BSL-1.0",          # Boost
+    "CC0-1.0",
+    "MPL-2.0",          # Some crypto crates
+    "WTFPL",
+    "0BSD",
+]
+# Confidence threshold for license detection
+confidence-threshold = 0.8
+
+[bans]
+# Warn on multiple versions of the same crate (dependency bloat)
+multiple-versions = "warn"
+# Deny specific dangerous crates
+deny = [
+    # No crates denied yet — add known-bad crates here
+]
+
+[sources]
+# Only allow crates from crates.io
+unknown-registry = "deny"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
