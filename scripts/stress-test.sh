@@ -29,10 +29,10 @@ MODE="sandbox"  # sandbox or contained
 # Agent stagger: 60s × 5 agents = T+4m. Baseline starts at T+8m.
 # First chaos at T+15m gives 7 minutes of stable baseline.
 STAGGER_SEC=60
-CHAOS_KILL_MIN=15
-CHAOS_NETWORK_MIN=25
-CHAOS_DISK_MIN=35
-CHAOS_DISK_RELEASE_MIN=40
+CHAOS_KILL_MIN=${CHAOS_KILL_MIN:-15}
+CHAOS_NETWORK_MIN=${CHAOS_NETWORK_MIN:-25}
+CHAOS_DISK_MIN=${CHAOS_DISK_MIN:-35}
+CHAOS_DISK_RELEASE_MIN=${CHAOS_DISK_RELEASE_MIN:-40}
 METRIC_INTERVAL=60
 MAX_MEM_INCREASE_MB=100
 MAX_FD_CONSECUTIVE_INCREASE=60
@@ -78,6 +78,9 @@ while [[ $# -gt 0 ]]; do
         --contained) MODE="contained"; shift ;;
         --duration) DURATION_MIN="$2"; shift 2 ;;
         --agents) NUM_AGENTS="$2"; shift 2 ;;
+        --chaos-kill) CHAOS_KILL_MIN="$2"; shift 2 ;;
+        --chaos-network) CHAOS_NETWORK_MIN="$2"; shift 2 ;;
+        --chaos-disk) CHAOS_DISK_MIN="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -109,6 +112,10 @@ setup() {
     # Backup current SRR, load stress rules
     cp "$REPO_DIR/config/srr_network.toml" "$REPO_DIR/config/srr_network.toml.stressbak"
     cp "$STRESS_SRR" "$REPO_DIR/config/srr_network.toml"
+
+    # Reset WAL for clean measurement (backup first)
+    cp "$REPO_DIR/data/wal.log" "$RESULTS_DIR/wal-pre-stress.log" 2>/dev/null || true
+    > "$REPO_DIR/data/wal.log"
 
     # Start proxy
     "$PROXY_BIN" --config "$REPO_DIR/config/proxy.toml" > "$RESULTS_DIR/proxy.log" 2>&1 &
@@ -206,21 +213,29 @@ launch_agent() {
 
     echo -e "  ${CYAN}Starting agent #$id ($session_id)${NC}"
 
-    # Use OpenClaw if available + API key set.
-    # NOTE: Node.js does not respect HTTPS_PROXY natively. In cooperative mode,
-    # OpenClaw's LLM calls bypass the proxy. The proxy still captures HTTP
-    # traffic (web_fetch via HTTP_PROXY). For full HTTPS enforcement, use
-    # sandbox or contained mode with DNAT.
+    # Run agent through GVM in the configured mode (sandbox/contained).
+    # In sandbox mode: DNAT forces all 443 traffic through MITM proxy,
+    # so even Node.js (which ignores HTTPS_PROXY) is governed.
+    # In contained mode: Docker DNAT does the same.
+    local gvm_mode_flag=""
+    if [ "$MODE" = "sandbox" ]; then
+        gvm_mode_flag="--sandbox"
+    elif [ "$MODE" = "contained" ]; then
+        gvm_mode_flag="--contained"
+    fi
+
     if command -v openclaw >/dev/null 2>&1 && [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-        HTTPS_PROXY="$PROXY_URL" HTTP_PROXY="$PROXY_URL" \
-        timeout $((DURATION_SEC + 120)) openclaw agent --local \
+        timeout $((DURATION_SEC + 120)) "$GVM_BIN" run $gvm_mode_flag \
+            --agent-id "$session_id" -- \
+            openclaw agent --local \
             --session-id "$session_id" \
             --message "$prompt" \
             --timeout $((DURATION_SEC + 60)) \
             > "$agent_log" 2>&1 &
     else
         # Fallback: Python script that makes HTTP requests through proxy
-        timeout $((DURATION_SEC + 120)) python3 -c "
+        timeout $((DURATION_SEC + 120)) "$GVM_BIN" run $gvm_mode_flag \
+            --agent-id "$session_id" -- python3 -c "
 import requests, time, os, random
 proxy = '$PROXY_URL'
 proxies = {'http': proxy, 'https': proxy}

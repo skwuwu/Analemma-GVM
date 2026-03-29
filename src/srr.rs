@@ -250,7 +250,12 @@ impl NetworkSRR {
         let mut matched: Option<String> = None;
 
         for rule in &self.rules {
-            if rule.is_catch_all || !match_host(&rule.host_pattern, &effective_host) {
+            // Skip catch-all rules AND rules with wildcard host patterns.
+            // CONNECT only has domain info (no method/path), so we only consider
+            // rules that target THIS specific domain. A "DELETE {any}" rule should
+            // NOT block CONNECT to api.anthropic.com — CONNECT might be for GET.
+            let is_wildcard_host = matches!(rule.host_pattern, HostPattern::Any);
+            if rule.is_catch_all || is_wildcard_host || !match_host(&rule.host_pattern, &effective_host) {
                 continue;
             }
             has_any = true;
