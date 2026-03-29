@@ -206,11 +206,19 @@ launch_agent() {
 
     echo -e "  ${CYAN}Starting agent #$id ($session_id)${NC}"
 
-    # Python HTTP agent through proxy.
-    # OpenClaw (Node.js) does not respect HTTPS_PROXY env var natively,
-    # so we use Python agents for reliable proxy integration.
-    # For OpenClaw stress testing, use gvm run --sandbox (DNAT forces proxy).
-    {
+    # Use OpenClaw if available + API key set.
+    # NOTE: Node.js does not respect HTTPS_PROXY natively. In cooperative mode,
+    # OpenClaw's LLM calls bypass the proxy. The proxy still captures HTTP
+    # traffic (web_fetch via HTTP_PROXY). For full HTTPS enforcement, use
+    # sandbox or contained mode with DNAT.
+    if command -v openclaw >/dev/null 2>&1 && [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+        HTTPS_PROXY="$PROXY_URL" HTTP_PROXY="$PROXY_URL" \
+        timeout $((DURATION_SEC + 120)) openclaw agent --local \
+            --session-id "$session_id" \
+            --message "$prompt" \
+            --timeout $((DURATION_SEC + 60)) \
+            > "$agent_log" 2>&1 &
+    else
         # Fallback: Python script that makes HTTP requests through proxy
         timeout $((DURATION_SEC + 120)) python3 -c "
 import requests, time, os, random
@@ -237,7 +245,7 @@ for i in range(200):
         print(f'[{i}] {method} {url} -> ERR: {e}')
     time.sleep(random.uniform(5, 20))
 " > "$agent_log" 2>&1 &
-    }
+    fi
 
     echo $! >> "$RESULTS_DIR/agent_pids.txt"
 }

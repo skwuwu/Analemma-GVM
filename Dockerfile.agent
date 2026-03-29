@@ -1,48 +1,56 @@
 # GVM Agent Container — Layer 3: OS-Level Containment
 #
-# This container isolates AI agents so they can ONLY communicate through
-# the GVM proxy. Direct API access is blocked by Docker network rules.
+# Multi-runtime agent image: Python 3.12 + Node.js 22 + OpenClaw.
+# Supports Python agents (requests, SDK) and TypeScript agents (OpenClaw).
 #
 # Security properties:
-# - Agent cannot reach external APIs directly (network isolation)
-# - Agent can only reach gvm-proxy on the gvm-internal network
+# - Agent cannot reach external APIs directly (Docker network isolation)
+# - Agent can only reach gvm-proxy via DNAT (443 → MITM listener)
 # - No host filesystem access (read-only root, tmpfs for /tmp)
 # - No privilege escalation (no-new-privileges, non-root user)
 # - Resource limits enforced by Docker (CPU, memory)
 #
 # Usage:
-#   gvm run --image my-agent:latest
-#   # or manually:
-#   docker run --network gvm-internal --env HTTP_PROXY=http://gvm-proxy:8080 my-agent
+#   gvm run --contained agent.py                    # Python agent
+#   gvm run --contained -- openclaw agent --local   # OpenClaw agent
+#   gvm run --contained -- node my_agent.js         # Node.js agent
 
 FROM python:3.12-slim
 
-# Install iptables (required for DNAT MITM TLS inspection) and
-# ca-certificates (for system trust store). Without iptables,
-# contained mode cannot redirect HTTPS to the MITM proxy.
+# Install system dependencies:
+# - iptables: required for DNAT MITM TLS inspection
+# - ca-certificates: system trust store for MITM CA injection
+# - curl: for Node.js installation and health checks
+# - gnupg: for NodeSource GPG key
 RUN apt-get update -qq && \
-    apt-get install -y --no-install-recommends iptables ca-certificates && \
+    apt-get install -y --no-install-recommends \
+        iptables ca-certificates curl gnupg && \
     rm -rf /var/lib/apt/lists/*
 
-# Create non-root user for agent execution
-RUN groupadd -r gvm-agent && useradd -r -g gvm-agent -d /home/agent -m agent
+# Install Node.js 22 LTS (required for OpenClaw)
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/* && \
+    node --version && npm --version
 
-# Install common Python packages used by agents.
-# requests: HTTP client (most agents need this)
-# GVM SDK: optional — uncomment if available
+# Install OpenClaw globally
+RUN npm install -g openclaw && \
+    openclaw --version && \
+    rm -rf /root/.npm/_cacache
+
+# Install Python packages
 RUN pip install --no-cache-dir requests && rm -rf /root/.cache/pip
-# COPY sdk/python/ /opt/gvm-sdk/
-# RUN pip install --no-cache-dir /opt/gvm-sdk/ && rm -rf /opt/gvm-sdk/
 
-# Proxy env vars are set by gvm run --contained at runtime (not baked in).
-# This allows the CLI to control proxy routing per-session.
+# Create non-root user
+RUN groupadd -r gvm-agent && useradd -r -g gvm-agent -d /home/agent -m agent
 
 # Agent workspace
 WORKDIR /home/agent/workspace
 
-# Switch to non-root user
-USER agent
+# Don't switch to non-root yet — entrypoint may need root for iptables DNAT.
+# The actual agent process drops privileges after setup.
 
-# Default: run the agent script mounted at /home/agent/workspace/agent.py
+# Default entrypoint: detect script type and run appropriate interpreter.
+# Overridden by gvm run --contained which passes explicit command.
 ENTRYPOINT ["python"]
 CMD ["agent.py"]
