@@ -342,14 +342,10 @@ fn insert_base_syscalls(rules: &mut BTreeMap<i64, Vec<SeccompRule>>) {
         libc::SYS_sysinfo,
         libc::SYS_prlimit64,
         libc::SYS_rseq,
-        // Node.js 22+ (libuv io_uring backend)
-        libc::SYS_io_uring_setup,
-        libc::SYS_io_uring_enter,
-        libc::SYS_io_uring_register,
-        // Node.js process management
+        // Node.js process management (low-risk syscalls).
+        // io_uring is NOT whitelisted (CVE history) — disabled via UV_USE_IO_URING=0 env var.
         libc::SYS_setpgid,
         libc::SYS_capget,
-        libc::SYS_capset,
         libc::SYS_timer_create,
         libc::SYS_timer_settime,
         libc::SYS_timer_delete,

@@ -431,6 +431,10 @@ fn child_entry(
     std::env::set_var("GVM_PROXY_URL", &proxy_url);
     std::env::set_var("HOME", "/workspace");
     std::env::set_var("TMPDIR", "/tmp");
+    // Disable io_uring in Node.js — forces epoll fallback.
+    // io_uring syscalls are not in seccomp whitelist (CVE history).
+    // Performance difference is negligible for agent workloads.
+    std::env::set_var("UV_USE_IO_URING", "0");
 
     // CA trust store env vars (for transparent MITM in sandbox)
     if ca_cert_pem.is_some() {
