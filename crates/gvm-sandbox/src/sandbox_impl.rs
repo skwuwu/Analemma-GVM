@@ -436,6 +436,11 @@ fn child_entry(
     // Performance difference is negligible for agent workloads.
     std::env::set_var("UV_USE_IO_URING", "0");
 
+    // NOTE: sandbox inherits ALL parent env vars via clone().
+    // If ANTHROPIC_API_KEY etc. are in the parent process, they're available in sandbox.
+    // sudo -E may NOT preserve env (sudoers env_reset). Use:
+    //   sudo env ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY gvm run --sandbox ...
+
     // CA trust store env vars (for transparent MITM in sandbox)
     if ca_cert_pem.is_some() {
         let ca_path = "/etc/ssl/certs/gvm-ca.crt";
