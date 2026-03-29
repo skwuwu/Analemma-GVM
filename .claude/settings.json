@@ -20,7 +20,11 @@
       "Bash(ssh -i \"C:\\\\Users\\\\gimgy\\\\Downloads\\\\Analemma-test.pem\" ubuntu@43.201.62.93 'tail -15 /home/ubuntu/stress-latest.log 2>/dev/null')",
       "Bash(ssh -i \"C:\\\\Users\\\\gimgy\\\\Downloads\\\\Analemma-test.pem\" ubuntu@43.201.62.93 ':*)",
       "Bash(export ANTHROPIC_API_KEY)",
-      "Bash(docker ps:*)"
+      "Bash(docker ps:*)",
+      "Bash(docker exec:*)",
+      "Bash(ssh -o ConnectTimeout=5 -i \"C:\\\\Users\\\\gimgy\\\\Downloads\\\\Analemma-test.pem\" ubuntu@43.201.62.93 ':*)",
+      "Bash(set -a)",
+      "Bash(set +a)"
     ]
   }
 }

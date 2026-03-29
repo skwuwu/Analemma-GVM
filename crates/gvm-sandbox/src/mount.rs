@@ -459,7 +459,22 @@ fn bind_mount_runtime_dirs(new_root: &Path, interpreter_path: &Path) -> Result<(
                 bind_mount_dir_readonly(new_root, src).ok();
             }
         }
-    } else if name.starts_with("ruby") {
+    }
+
+    // Always mount Node.js modules if they exist — many tools (openclaw, npx, etc.)
+    // are Node.js wrappers that don't have "node" in their binary name but still
+    // need /usr/lib/node_modules at runtime. The mount is read-only and harmless
+    // for non-Node.js interpreters.
+    if !name.starts_with("node") {
+        for dir in &["/usr/lib/node_modules", "/usr/share/nodejs"] {
+            let src = Path::new(dir);
+            if src.exists() {
+                bind_mount_dir_readonly(new_root, src).ok();
+            }
+        }
+    }
+
+    if name.starts_with("ruby") {
         for dir in &["/usr/lib/ruby", "/usr/share/rubygems-integration"] {
             let src = Path::new(dir);
             if src.exists() {
