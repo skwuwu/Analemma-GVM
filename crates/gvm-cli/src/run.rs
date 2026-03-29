@@ -23,6 +23,7 @@ pub async fn run_agent(
     contained: bool,
     sandbox: bool,
     interactive: bool,
+    no_mitm: bool,
 ) -> Result<()> {
     if command.is_empty() {
         anyhow::bail!(
@@ -42,13 +43,19 @@ pub async fn run_agent(
     if sandbox {
         let mem_limit = parse_memory_limit(memory);
         let cpu_limit = cpus.parse::<f64>().ok();
+        if no_mitm {
+            eprintln!("  {YELLOW}\u{26a0}{RESET} MITM disabled (--no-mitm). HTTPS uses CONNECT relay (domain-level only).");
+        }
         if is_binary_mode {
-            run_binary_sandboxed(command, agent_id, proxy, interactive, mem_limit, cpu_limit).await
+            run_binary_sandboxed(command, agent_id, proxy, interactive, mem_limit, cpu_limit, no_mitm).await
         } else {
-            run_sandboxed(script, agent_id, proxy, interactive, mem_limit, cpu_limit).await
+            run_sandboxed(script, agent_id, proxy, interactive, mem_limit, cpu_limit, no_mitm).await
         }
     } else if contained {
-        run_contained(script, agent_id, proxy, image, memory, cpus, detach).await
+        if no_mitm {
+            eprintln!("  {YELLOW}\u{26a0}{RESET} MITM disabled (--no-mitm). HTTPS uses CONNECT relay (domain-level only).");
+        }
+        run_contained(script, agent_id, proxy, image, memory, cpus, detach, no_mitm).await
     } else if is_binary_mode {
         // Warn if Node.js agent detected in cooperative mode
         let cmd_str = command.join(" ").to_lowercase();
@@ -252,6 +259,7 @@ async fn run_binary_sandboxed(
     _interactive: bool,
     memory_limit: Option<u64>,
     cpu_limit: Option<f64>,
+    no_mitm: bool,
 ) -> Result<()> {
     let binary = &command[0];
     let args = &command[1..];
@@ -278,8 +286,8 @@ async fn run_binary_sandboxed(
         .parse()
         .with_context(|| format!("Cannot parse proxy address: {}:{}", proxy_host, proxy_port))?;
 
-    // Download MITM CA cert from proxy (proxy holds private key; sandbox gets cert only)
-    let mitm_ca_cert = download_mitm_ca_cert(proxy).await;
+    // Download MITM CA cert from proxy (skip if --no-mitm)
+    let mitm_ca_cert = if no_mitm { None } else { download_mitm_ca_cert(proxy).await };
 
     let config = gvm_sandbox::SandboxConfig {
         script_path: binary_path.clone(),
@@ -659,6 +667,7 @@ async fn run_sandboxed(
     interactive: bool,
     memory_limit: Option<u64>,
     cpu_limit: Option<f64>,
+    no_mitm: bool,
 ) -> Result<()> {
     println!();
     println!("{BOLD}Analemma-GVM \u{2014} Linux-Native Sandbox (Layer 3){RESET}");
@@ -730,8 +739,8 @@ async fn run_sandboxed(
         .parse()
         .with_context(|| format!("Cannot parse proxy address: {}:{}", proxy_host, proxy_port))?;
 
-    // Download MITM CA cert from proxy (proxy holds private key; sandbox gets cert only)
-    let mitm_ca_cert = download_mitm_ca_cert(proxy).await;
+    // Download MITM CA cert from proxy (skip if --no-mitm)
+    let mitm_ca_cert = if no_mitm { None } else { download_mitm_ca_cert(proxy).await };
 
     let config = gvm_sandbox::SandboxConfig {
         script_path: abs_script.clone(),
@@ -1011,6 +1020,7 @@ async fn run_contained(
     memory: &str,
     cpus: &str,
     detach: bool,
+    no_mitm: bool,
 ) -> Result<()> {
     println!();
     println!("{BOLD}Analemma-GVM \u{2014} Agent Containment (Layer 3){RESET}");
@@ -1185,7 +1195,7 @@ async fn run_contained(
     let ca_pem_path = ca_temp_dir.path().join("gvm-ca.crt");
 
     let ca_url = format!("{}/gvm/ca.pem", proxy.trim_end_matches('/'));
-    let mitm_available = match reqwest::get(&ca_url).await {
+    let mitm_available = if no_mitm { false } else { match reqwest::get(&ca_url).await {
         Ok(resp) if resp.status().is_success() => match resp.bytes().await {
             Ok(bytes) if !bytes.is_empty() => {
                 std::fs::write(&ca_pem_path, &bytes).context("Failed to write CA PEM")?;
@@ -1204,7 +1214,7 @@ async fn run_contained(
             println!("  {YELLOW}MITM CA not available — HTTPS will use CONNECT relay (domain-level only){RESET}");
             false
         }
-    };
+    } };
 
     // Compute MITM listener address for DNAT (proxy port + 363 = TLS port)
     let proxy_port = proxy_url.port().unwrap_or(8080);

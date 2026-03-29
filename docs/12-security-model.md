@@ -673,3 +673,19 @@ This document will be updated as:
 - The threat model boundary expands (e.g., multi-tenant SaaS deployment)
 
 Each mitigation decision is driven by the deployment context — a local development tool has different security requirements than a production financial services proxy.
+
+---
+
+## MITM TLS Inspection — Known Limitations
+
+Use `--no-mitm` to disable MITM and fall back to CONNECT relay (domain-level only). All other sandbox/contained protections remain active.
+
+| Limitation | Impact | Mitigation |
+|-----------|--------|------------|
+| **mTLS (client certificates)** | MITM terminates TLS, cannot forward client certs to upstream | Use `--no-mitm`. Most AI APIs use API keys, not mTLS |
+| **WebSocket** | HTTP Upgrade to WebSocket not supported through MITM | Use `--no-mitm` or cooperative mode. MCP standard uses HTTP SSE (supported) |
+| **HTTP/2** | MITM forces ALPN to HTTP/1.1 | Transparent to agents — HTTP/1.1 is functionally equivalent for API calls |
+| **Certificate pinning** | Agents pinning expected certs will reject MITM-generated certs | Use `--no-mitm` |
+| **Windows Docker large responses** | Docker Desktop WSL2 network bridge may drop TCP >500KB | Use Linux for production. Windows works for small-medium responses |
+| **Content-Encoding (gzip/br)** | Compressed bodies not decompressed for payload inspection | URL-pattern SRR works regardless. Payload inspection requires uncompressed (future) |
+| **Timeout chaining** | MITM adds ~300ms overhead; agent timeout may fire first | Set agent timeouts > proxy upstream timeout (30s). Streaming SSE is unaffected (first chunk fast) |

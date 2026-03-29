@@ -804,6 +804,7 @@ pub async fn run_watch(
     with_rules: bool,
     sandbox: bool,
     contained: bool,
+    _no_mitm: bool,
     image: &str,
     memory: &str,
     cpus: &str,

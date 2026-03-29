@@ -111,6 +111,12 @@ enum Commands {
         #[arg(long, default_value = "1.0")]
         cpus: String,
 
+        /// Disable MITM TLS inspection. HTTPS uses CONNECT relay (domain-level only).
+        /// Sandbox/contained isolation, seccomp, WAL audit still active.
+        /// Use when: mTLS endpoints, certificate pinning, or policy prohibits MITM.
+        #[arg(long)]
+        no_mitm: bool,
+
         /// Run in background (only with --contained)
         #[arg(long)]
         detach: bool,
@@ -176,6 +182,10 @@ enum Commands {
         /// Use Docker containment for observation.
         #[arg(long)]
         contained: bool,
+
+        /// Disable MITM TLS inspection (domain-level only).
+        #[arg(long)]
+        no_mitm: bool,
 
         /// Docker image (only with --contained)
         #[arg(long, default_value = "gvm-agent:latest")]
@@ -388,6 +398,7 @@ async fn main() -> anyhow::Result<()> {
             interactive,
             sandbox,
             contained,
+            no_mitm,
             image,
             memory,
             cpus,
@@ -409,6 +420,7 @@ async fn main() -> anyhow::Result<()> {
                 contained,
                 sandbox,
                 interactive,
+                no_mitm,
             )
             .await?;
         }
@@ -428,14 +440,15 @@ async fn main() -> anyhow::Result<()> {
             with_rules,
             sandbox,
             contained,
+            no_mitm,
             image,
             memory,
             cpus,
             output,
         } => {
             watch::run_watch(
-                &command, &agent_id, &proxy, with_rules, sandbox, contained, &image, &memory,
-                &cpus, &output,
+                &command, &agent_id, &proxy, with_rules, sandbox, contained, no_mitm, &image,
+                &memory, &cpus, &output,
             )
             .await?;
         }
