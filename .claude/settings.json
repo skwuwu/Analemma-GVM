@@ -10,7 +10,11 @@
       "Bash(MSYS_NO_PATHCONV=1 docker run --rm --entrypoint sh --cap-add=NET_ADMIN --user root gvm-agent:latest -c \"setpriv --help 2>&1 | grep -A2 ''cap\\\\|inh\\\\|bounding''\")",
       "Bash(cd \"c:\\\\Users\\\\gimgy\\\\OneDrive\\\\바탕 화면\\\\Analemma-GVM\" for t in 68 69 70 72 74 75)",
       "Bash(cargo clippy:*)",
-      "Bash(cargo fmt:*)"
+      "Bash(cargo fmt:*)",
+      "Bash(rustc --version)",
+      "Bash(docker images:*)",
+      "Bash(powershell -ExecutionPolicy Bypass -File scripts/stress-test.ps1 -Duration 15 -Agents 3)",
+      "Bash(ssh -i \"C:\\\\Users\\\\gimgy\\\\Downloads\\\\Analemma-test.pem\" ubuntu@43.201.62.93 \":*)"
     ]
   }
 }

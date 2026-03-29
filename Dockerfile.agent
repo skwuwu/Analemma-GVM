@@ -27,7 +27,10 @@ RUN apt-get update -qq && \
 # Create non-root user for agent execution
 RUN groupadd -r gvm-agent && useradd -r -g gvm-agent -d /home/agent -m agent
 
-# Install GVM Python SDK if available (optional — base image works without it)
+# Install common Python packages used by agents.
+# requests: HTTP client (most agents need this)
+# GVM SDK: optional — uncomment if available
+RUN pip install --no-cache-dir requests && rm -rf /root/.cache/pip
 # COPY sdk/python/ /opt/gvm-sdk/
 # RUN pip install --no-cache-dir /opt/gvm-sdk/ && rm -rf /opt/gvm-sdk/
 

@@ -1,0 +1,37 @@
+[2m2026-03-29T07:26:50.292944Z[0m [32m INFO[0m [2mgvm_proxy[0m[2m:[0m Analemma GVM Proxy v0.1.0 starting...
+[2m2026-03-29T07:26:50.312110Z[0m [32m INFO[0m [2mgvm_proxy::config[0m[2m:[0m Configuration loaded [3mpath[0m[2m=[0mconfig/proxy.toml
+[2m2026-03-29T07:26:50.321085Z[0m [32m INFO[0m [2mgvm_proxy::registry[0m[2m:[0m Operation registry loaded and validated [3mcore[0m[2m=[0m10 [3mcustom[0m[2m=[0m2
+[2m2026-03-29T07:26:50.321598Z[0m [32m INFO[0m [2mgvm_proxy[0m[2m:[0m Operation registry loaded and validated
+[2m2026-03-29T07:26:50.329231Z[0m [32m INFO[0m [2mgvm_proxy::srr[0m[2m:[0m Network SRR rules compiled [3mrules[0m[2m=[0m74
+[2m2026-03-29T07:26:50.329684Z[0m [32m INFO[0m [2mgvm_proxy[0m[2m:[0m Network SRR rules loaded
+[2m2026-03-29T07:26:50.329953Z[0m [32m INFO[0m [2mgvm_proxy[0m[2m:[0m Default-to-Caution: Delay (unmatched URLs delayed then forwarded) [3mdelay_ms[0m[2m=[0m300
+[2m2026-03-29T07:26:50.330920Z[0m [31mERROR[0m [2mgvm_proxy::policy[0m[2m:[0m [ERROR] Contradictory decisions in Global: "global-critical-read-deny" (Deny) and "global-read-allow" (Allow) have overlapping conditions but opposite decisions. Priority 4 vs 50 — the lower-numbered priority wins.
+[2m2026-03-29T07:26:50.331060Z[0m [33m WARN[0m [2mgvm_proxy::policy[0m[2m:[0m [WARNING] Duplicate priority in Global: "global-read-allow" and "global-query-allow" both have priority 50. First loaded wins — consider adjusting priorities.
+[2m2026-03-29T07:26:50.331226Z[0m [33m WARN[0m [2mgvm_proxy::policy[0m[2m:[0m [WARNING] Duplicate priority in Global: "global-read-allow" and "global-status-allow" both have priority 50. First loaded wins — consider adjusting priorities.
+[2m2026-03-29T07:26:50.331348Z[0m [33m WARN[0m [2mgvm_proxy::policy[0m[2m:[0m [WARNING] Duplicate priority in Global: "global-read-allow" and "global-refund-lookup-allow" both have priority 50. First loaded wins — consider adjusting priorities.
+[2m2026-03-29T07:26:50.331474Z[0m [33m WARN[0m [2mgvm_proxy::policy[0m[2m:[0m [WARNING] Duplicate priority in Global: "global-query-allow" and "global-status-allow" both have priority 50. First loaded wins — consider adjusting priorities.
+[2m2026-03-29T07:26:50.331584Z[0m [33m WARN[0m [2mgvm_proxy::policy[0m[2m:[0m [WARNING] Duplicate priority in Global: "global-query-allow" and "global-refund-lookup-allow" both have priority 50. First loaded wins — consider adjusting priorities.
+[2m2026-03-29T07:26:50.331674Z[0m [33m WARN[0m [2mgvm_proxy::policy[0m[2m:[0m [WARNING] Duplicate priority in Global: "global-status-allow" and "global-refund-lookup-allow" both have priority 50. First loaded wins — consider adjusting priorities.
+[2m2026-03-29T07:26:50.331760Z[0m [33m WARN[0m [2mgvm_proxy::policy[0m[2m:[0m Policy conflict check complete — review warnings above [3mcount[0m[2m=[0m7
+[2m2026-03-29T07:26:50.331845Z[0m [32m INFO[0m [2mgvm_proxy::policy[0m[2m:[0m Policy engine loaded [3mglobal[0m[2m=[0m10 [3mtenants[0m[2m=[0m0 [3magents[0m[2m=[0m0
+[2m2026-03-29T07:26:50.331932Z[0m [32m INFO[0m [2mgvm_proxy[0m[2m:[0m ABAC policy engine loaded
+[2m2026-03-29T07:26:50.333122Z[0m [32m INFO[0m [2mgvm_proxy::api_keys[0m[2m:[0m Loaded 0 API credentials from config/secrets.toml
+[2m2026-03-29T07:26:50.333239Z[0m [33m WARN[0m [2mgvm_proxy[0m[2m:[0m No API keys configured. Running in passthrough mode. Layer 3 (API key isolation) is INACTIVE. Agents can bypass proxy by calling APIs directly. Run `gvm init` to configure API key isolation.
+[2m2026-03-29T07:26:50.335393Z[0m [32m INFO[0m [2mgvm_proxy::ledger[0m[2m:[0m WAL opened (group commit + merkle) [3mpath[0m[2m=[0mdata/wal.log
+[2m2026-03-29T07:26:50.336340Z[0m [32m INFO[0m [2mgvm_proxy::ledger[0m[2m:[0m Emergency WAL initialized [3mpath[0m[2m=[0mdata\wal_emergency.log
+[2m2026-03-29T07:26:50.336487Z[0m [32m INFO[0m [2mgvm_proxy::ledger[0m[2m:[0m NATS configured (connection deferred) [3murl[0m[2m=[0m"nats://localhost:4222" [3mstream[0m[2m=[0m"gvm-audit"
+[2m2026-03-29T07:26:50.344947Z[0m [32m INFO[0m [2mgvm_proxy::ledger[0m[2m:[0m WAL sequence initialized from existing events (monotonic across restarts) [3mevent_count[0m[2m=[0m54 [3mbatch_count[0m[2m=[0m54
+[2m2026-03-29T07:26:50.351584Z[0m [32m INFO[0m [2mgvm_proxy::ledger[0m[2m:[0m WAL recovery: resuming from high watermark [3mwatermark[0m[2m=[0m45134 [3mfile_len[0m[2m=[0m57921 [3mscan_bytes[0m[2m=[0m12787
+[2m2026-03-29T07:26:50.415602Z[0m [32m INFO[0m [2mgvm_proxy::ledger[0m[2m:[0m Recovery watermark persisted [3mwatermark[0m[2m=[0m57921
+[2m2026-03-29T07:26:50.415926Z[0m [33m WARN[0m [2mgvm_proxy::ledger[0m[2m:[0m WAL recovery complete — expired events require operator review [3mpending[0m[2m=[0m4 [3mexpired[0m[2m=[0m4
+[2m2026-03-29T07:26:50.416105Z[0m [33m WARN[0m [2mgvm_proxy[0m[2m:[0m WAL recovery: expired events found — operator review required [3mexpired[0m[2m=[0m4
+[2m2026-03-29T07:26:50.428703Z[0m [32m INFO[0m [2mgvm_proxy::ledger[0m[2m:[0m Config file hashes recorded in Merkle chain [3mfiles[0m[2m=[0m3
+[2m2026-03-29T07:26:50.428888Z[0m [33m WARN[0m [2mgvm_proxy::vault[0m[2m:[0m ⚠ GVM_VAULT_KEY not set — generating random ephemeral key. Data will NOT survive restart. NOT SAFE FOR PRODUCTION.
+[2m2026-03-29T07:26:50.429309Z[0m [32m INFO[0m [2mgvm_proxy[0m[2m:[0m Vault initialized
+[2m2026-03-29T07:26:50.436594Z[0m [32m INFO[0m [2mgvm_proxy::wasm_engine[0m[2m:[0m Loading Wasm governance engine [3mpath[0m[2m=[0mdata/gvm_engine.wasm [3mhash[0m[2m=[0m52e93a81a6195d1eb9eee5024b3f8d9256983efac35af19647b40111e6bba161 [3msize_bytes[0m[2m=[0m261427
+[2m2026-03-29T07:26:50.484630Z[0m [32m INFO[0m [2mgvm_proxy::wasm_engine[0m[2m:[0m Wasm governance engine loaded and verified
+[2m2026-03-29T07:26:50.484853Z[0m [32m INFO[0m [2mgvm_proxy[0m[2m:[0m Layer 1: Wasm governance engine ACTIVE (immutable sandbox) [3mhash[0m[2m=[0m52e93a81a6195d1eb9eee5024b3f8d9256983efac35af19647b40111e6bba161
+[2m2026-03-29T07:26:50.484978Z[0m [33m WARN[0m [2mgvm_proxy[0m[2m:[0m DEV MODE: host overrides active — do NOT use in production [3moverrides[0m[2m=[0m{"api.internal.dev": "127.0.0.1:9090", "api.bank.com": "127.0.0.1:9090", "gmail.googleapis.com": "127.0.0.1:9090", "evil-exfil.attacker.com": "127.0.0.1:9090", "webhook.external-dump.com": "127.0.0.1:9090"}
+[2m2026-03-29T07:26:50.485080Z[0m [32m INFO[0m [2mgvm_proxy[0m[2m:[0m JWT authentication DISABLED (no GVM_JWT_SECRET env var). Agent identity uses self-declared X-GVM-Agent-Id headers.
+[2m2026-03-29T07:26:50.486641Z[0m [32m INFO[0m [2mgvm_sandbox::ca[0m[2m:[0m Ephemeral CA generated (ECDSA P-256, in-memory only)
+[2m2026-03-29T07:26:50.486760Z[0m [32m INFO[0m [2mgvm_proxy[0m[2m:[0m Ephemeral MITM CA generated (shared between TLS listener and sandbox)

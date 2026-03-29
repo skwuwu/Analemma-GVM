@@ -206,13 +206,13 @@ launch_agent() {
 
     echo -e "  ${CYAN}Starting agent #$id ($session_id)${NC}"
 
-    # Use openclaw if available, otherwise Python HTTP fallback
-    if command -v openclaw >/dev/null 2>&1; then
-        timeout $((DURATION_SEC + 120)) openclaw gateway \
+    # Use openclaw if available + API key set, otherwise Python HTTP fallback
+    if command -v openclaw >/dev/null 2>&1 && [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+        HTTPS_PROXY="$PROXY_URL" HTTP_PROXY="$PROXY_URL" \
+        timeout $((DURATION_SEC + 120)) openclaw agent --local \
             --session-id "$session_id" \
-            --prompt "$prompt" \
-            --max-turns 100 \
-            --max-tokens 4096 \
+            --message "$prompt" \
+            --timeout $((DURATION_SEC + 60)) \
             > "$agent_log" 2>&1 &
     else
         # Fallback: Python script that makes HTTP requests through proxy
