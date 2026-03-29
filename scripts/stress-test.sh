@@ -29,7 +29,6 @@ MODE="sandbox"  # sandbox or contained
 # Agent stagger: 60s × 5 agents = T+4m. Baseline starts at T+8m.
 # First chaos at T+15m gives 7 minutes of stable baseline.
 STAGGER_SEC=60
-BASELINE_START_MIN=8
 CHAOS_KILL_MIN=15
 CHAOS_NETWORK_MIN=25
 CHAOS_DISK_MIN=35
@@ -37,9 +36,22 @@ CHAOS_DISK_RELEASE_MIN=40
 METRIC_INTERVAL=60
 MAX_MEM_INCREASE_MB=100
 MAX_FD_CONSECUTIVE_INCREASE=60
+# Chaos done flags (prevents re-triggering with -ge comparison)
+CHAOS_KILL_DONE=false
+CHAOS_NETWORK_DONE=false
+CHAOS_DISK_DONE=false
+CHAOS_DISK_RELEASED=false
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Load .env file if present (ANTHROPIC_API_KEY, etc.)
+if [ -f "$REPO_DIR/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$REPO_DIR/.env"
+    set +a
+fi
 GVM_BIN="$REPO_DIR/target/release/gvm"
 PROXY_BIN="$REPO_DIR/target/release/gvm-proxy"
 PROXY_URL="http://127.0.0.1:8080"
@@ -302,30 +314,31 @@ chaos_proxy_kill() {
 }
 
 chaos_network_partition() {
-    chaos_log "INJECT: network partition — 5000ms delay + 20% loss on proxy upstream"
-    # Apply tc netem ONLY to proxy's upstream connections, not the entire host.
-    # Use iptables mark to tag proxy-originated packets, then tc filter on that mark.
-    # This avoids disrupting metrics collection (curl to localhost) and agent→proxy traffic.
-    local proxy_pid
-    proxy_pid=$(cat "$RESULTS_DIR/proxy.pid" 2>/dev/null || echo "0")
+    chaos_log "INJECT: network partition — 5000ms delay + 20% loss on upstream ports"
     local iface
     iface=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' || echo "eth0")
 
-    # Mark packets from proxy process with fwmark 42
-    sudo iptables -t mangle -A OUTPUT -m owner --pid-owner "$proxy_pid" \
-        -p tcp --dport 443 -j MARK --set-mark 42 2>/dev/null || true
-    sudo iptables -t mangle -A OUTPUT -m owner --pid-owner "$proxy_pid" \
-        -p tcp --dport 80 -j MARK --set-mark 42 2>/dev/null || true
-
-    # Apply netem only to marked packets via tc handle/filter
+    # Strategy: tc prio qdisc with netem on band 3, iptables marks packets
+    # to upstream ports (80, 443) with fwmark → routed to the netem band.
+    # Localhost traffic (metrics, admin API) is unaffected (different interface/loopback).
+    # Using destination port (not --pid-owner) because tokio threads make PID matching unreliable.
     sudo tc qdisc add dev "$iface" root handle 1: prio 2>/dev/null || true
     sudo tc qdisc add dev "$iface" parent 1:3 handle 30: netem delay 5000ms loss 20% 2>/dev/null || {
-        chaos_log "WARN: tc qdisc failed — falling back to interface-wide netem"
+        chaos_log "WARN: tc prio+netem failed — falling back to interface-wide"
         sudo tc qdisc add dev "$iface" root netem delay 5000ms loss 20% 2>/dev/null || true
+        chaos_log "Network partition active (interface-wide fallback)"
+        return
     }
+
+    # Mark only outbound TCP to ports 80/443 (upstream API traffic)
+    # Exclude loopback and proxy port (8080/9090) so metrics collection works
+    sudo iptables -t mangle -A OUTPUT -p tcp --dport 443 ! -d 127.0.0.0/8 \
+        -j MARK --set-mark 42 2>/dev/null || true
+    sudo iptables -t mangle -A OUTPUT -p tcp --dport 80 ! -d 127.0.0.0/8 \
+        -j MARK --set-mark 42 2>/dev/null || true
     sudo tc filter add dev "$iface" parent 1:0 protocol ip handle 42 fw flowid 1:3 2>/dev/null || true
 
-    chaos_log "Network partition active on $iface (proxy PID $proxy_pid only) — monitoring FD count"
+    chaos_log "Network partition active on $iface (ports 80/443 only, loopback excluded)"
 }
 
 chaos_network_restore() {
@@ -333,28 +346,45 @@ chaos_network_restore() {
     local iface
     iface=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' || echo "eth0")
     sudo tc qdisc del dev "$iface" root 2>/dev/null || true
-    # Clean up iptables marks
-    local proxy_pid
-    proxy_pid=$(cat "$RESULTS_DIR/proxy.pid" 2>/dev/null || echo "0")
-    sudo iptables -t mangle -D OUTPUT -m owner --pid-owner "$proxy_pid" \
-        -p tcp --dport 443 -j MARK --set-mark 42 2>/dev/null || true
-    sudo iptables -t mangle -D OUTPUT -m owner --pid-owner "$proxy_pid" \
-        -p tcp --dport 80 -j MARK --set-mark 42 2>/dev/null || true
+    sudo iptables -t mangle -D OUTPUT -p tcp --dport 443 ! -d 127.0.0.0/8 \
+        -j MARK --set-mark 42 2>/dev/null || true
+    sudo iptables -t mangle -D OUTPUT -p tcp --dport 80 ! -d 127.0.0.0/8 \
+        -j MARK --set-mark 42 2>/dev/null || true
     chaos_log "Network partition removed"
 }
 
 chaos_disk_pressure() {
-    chaos_log "INJECT: disk pressure — filling WAL directory to 99%"
-    local wal_dir
-    wal_dir=$(dirname "$REPO_DIR/data/wal.log")
-    # Create a large file to fill disk
-    dd if=/dev/zero of="$wal_dir/stress-fill.dat" bs=1M count=100 2>/dev/null || true
-    chaos_log "Disk pressure active — WAL should trigger circuit breaker (503)"
+    chaos_log "INJECT: disk pressure — mounting 64KB tmpfs over WAL directory"
+    # Mount a tiny tmpfs over the WAL directory so writes fail with ENOSPC.
+    # This is more reliable than filling a large disk with dd.
+    # The proxy should trigger circuit breaker (503) and switch to emergency WAL.
+    local wal_dir="$REPO_DIR/data"
+    DISK_PRESSURE_TMPFS="$wal_dir"
+
+    # Save WAL before overwriting
+    cp "$wal_dir/wal.log" "$RESULTS_DIR/wal-before-chaos.log" 2>/dev/null || true
+
+    sudo mount -t tmpfs -o size=64k tmpfs "$wal_dir" 2>/dev/null || {
+        chaos_log "WARN: tmpfs mount failed — falling back to dd fill"
+        dd if=/dev/zero of="$wal_dir/stress-fill.dat" bs=1M count=100 2>/dev/null || true
+        DISK_PRESSURE_TMPFS=""
+        chaos_log "Disk pressure active (dd fallback)"
+        return
+    }
+    # Fill the tiny tmpfs immediately
+    dd if=/dev/zero of="$wal_dir/fill" bs=1k count=60 2>/dev/null || true
+    chaos_log "Disk pressure active (64KB tmpfs over WAL dir — ENOSPC on next write)"
 }
 
 chaos_disk_release() {
     chaos_log "RESTORE: releasing disk pressure"
-    rm -f "$REPO_DIR/data/stress-fill.dat"
+    if [ -n "${DISK_PRESSURE_TMPFS:-}" ]; then
+        sudo umount "$DISK_PRESSURE_TMPFS" 2>/dev/null || true
+        # Restore WAL from backup
+        cp "$RESULTS_DIR/wal-before-chaos.log" "$REPO_DIR/data/wal.log" 2>/dev/null || true
+    else
+        rm -f "$REPO_DIR/data/stress-fill.dat"
+    fi
     chaos_log "Disk pressure released — WAL should recover"
 }
 
@@ -362,6 +392,8 @@ chaos_disk_release() {
 chaos_scheduler() {
     local start_time=$1
 
+    # Use -ge (not -eq) to prevent missing the target minute due to sleep alignment.
+    # Done flags prevent re-triggering on subsequent loop iterations.
     while true; do
         local now elapsed_min
         now=$(date +%s)
@@ -369,27 +401,30 @@ chaos_scheduler() {
 
         [ $elapsed_min -ge "$DURATION_MIN" ] && break
 
-        # T+20: proxy kill
-        if [ $elapsed_min -eq "$CHAOS_KILL_MIN" ]; then
+        # T+15: proxy kill -9
+        if [ $elapsed_min -ge "$CHAOS_KILL_MIN" ] && ! $CHAOS_KILL_DONE; then
+            CHAOS_KILL_DONE=true
             chaos_proxy_kill
-            sleep 120  # skip to avoid re-triggering
-            continue
         fi
 
-        # T+30: network partition
-        if [ $elapsed_min -eq "$CHAOS_NETWORK_MIN" ]; then
+        # T+25: network partition (5 min duration)
+        if [ $elapsed_min -ge "$CHAOS_NETWORK_MIN" ] && ! $CHAOS_NETWORK_DONE; then
+            CHAOS_NETWORK_DONE=true
             chaos_network_partition
-            sleep 300  # 5 minutes of partition
-            chaos_network_restore
-            continue
+            # Schedule restore after 5 minutes (background)
+            (sleep 300 && chaos_network_restore) &
         fi
 
-        # T+40: disk pressure
-        if [ $elapsed_min -eq "$CHAOS_DISK_MIN" ]; then
+        # T+35: disk pressure
+        if [ $elapsed_min -ge "$CHAOS_DISK_MIN" ] && ! $CHAOS_DISK_DONE; then
+            CHAOS_DISK_DONE=true
             chaos_disk_pressure
-            sleep 300  # 5 minutes of disk pressure
+        fi
+
+        # T+40: disk release
+        if [ $elapsed_min -ge "$CHAOS_DISK_RELEASE_MIN" ] && ! $CHAOS_DISK_RELEASED; then
+            CHAOS_DISK_RELEASED=true
             chaos_disk_release
-            continue
         fi
 
         sleep 30
