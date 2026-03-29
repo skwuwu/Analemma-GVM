@@ -123,7 +123,10 @@ pub fn setup_host_network(config: &VethConfig) -> Result<()> {
     // Enable route_localnet so DNAT to 127.0.0.1 works on the veth interface.
     // Without this, packets DNATed to 127.0.0.1 are silently dropped as martians.
     std::fs::write(
-        format!("/proc/sys/net/ipv4/conf/{}/route_localnet", config.host_iface),
+        format!(
+            "/proc/sys/net/ipv4/conf/{}/route_localnet",
+            config.host_iface
+        ),
         "1",
     )
     .ok();
@@ -521,10 +524,7 @@ pub fn cleanup_host_network(config: &VethConfig) {
 /// packets arriving on veth with DNAT to 127.0.0.53 are silently dropped.
 fn resolve_host_dns() -> String {
     // Try systemd-resolved upstream config first (has real DNS, not stub)
-    for path in &[
-        "/run/systemd/resolve/resolv.conf",
-        "/etc/resolv.conf",
-    ] {
+    for path in &["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"] {
         if let Ok(content) = std::fs::read_to_string(path) {
             for line in content.lines() {
                 let line = line.trim();
@@ -600,7 +600,10 @@ pub fn record_network_state(config: &VethConfig) -> Result<()> {
     std::fs::write(STATE_FILE, serde_json::to_string_pretty(&state)?)
         .with_context(|| format!("Failed to write network state to {STATE_FILE}"))?;
 
-    tracing::debug!(path = STATE_FILE, "Network state recorded for orphan cleanup");
+    tracing::debug!(
+        path = STATE_FILE,
+        "Network state recorded for orphan cleanup"
+    );
     Ok(())
 }
 
@@ -621,13 +624,10 @@ pub fn cleanup_orphaned_network() -> Result<bool> {
         Err(_) => return Ok(false), // No state file — nothing to clean
     };
 
-    let state: serde_json::Value = serde_json::from_str(&content)
-        .context("Failed to parse orphan state file")?;
+    let state: serde_json::Value =
+        serde_json::from_str(&content).context("Failed to parse orphan state file")?;
 
-    let host_iface = state["veth_host"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
+    let host_iface = state["veth_host"].as_str().unwrap_or("").to_string();
 
     if host_iface.is_empty() {
         clear_network_state();
@@ -653,10 +653,7 @@ pub fn cleanup_orphaned_network() -> Result<bool> {
 
     let config = VethConfig {
         host_iface: host_iface.clone(),
-        sandbox_iface: state["veth_sandbox"]
-            .as_str()
-            .unwrap_or("")
-            .to_string(),
+        sandbox_iface: state["veth_sandbox"].as_str().unwrap_or("").to_string(),
         host_ip: state["host_ip"]
             .as_str()
             .unwrap_or("10.200.0.1")

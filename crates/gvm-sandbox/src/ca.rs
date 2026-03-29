@@ -169,13 +169,23 @@ mod tests {
         let leaf = ca.issue_leaf_cert("142.250.190.46");
         match leaf {
             Ok(cert) => {
-                assert!(cert.cert_pem.contains("BEGIN CERTIFICATE"), "IP SAN cert must have valid PEM");
-                assert!(cert.key_pem.contains("BEGIN PRIVATE KEY"), "IP SAN cert must have valid key");
+                assert!(
+                    cert.cert_pem.contains("BEGIN CERTIFICATE"),
+                    "IP SAN cert must have valid PEM"
+                );
+                assert!(
+                    cert.key_pem.contains("BEGIN PRIVATE KEY"),
+                    "IP SAN cert must have valid key"
+                );
             }
             Err(e) => {
                 // If rcgen doesn't support IP SANs, that's acceptable — just ensure
                 // the error message is meaningful, not a panic.
-                assert!(!e.to_string().is_empty(), "Error must have a message: {}", e);
+                assert!(
+                    !e.to_string().is_empty(),
+                    "Error must have a message: {}",
+                    e
+                );
             }
         }
     }

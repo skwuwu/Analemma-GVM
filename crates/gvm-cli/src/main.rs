@@ -434,16 +434,8 @@ async fn main() -> anyhow::Result<()> {
             output,
         } => {
             watch::run_watch(
-                &command,
-                &agent_id,
-                &proxy,
-                with_rules,
-                sandbox,
-                contained,
-                &image,
-                &memory,
-                &cpus,
-                &output,
+                &command, &agent_id, &proxy, with_rules, sandbox, contained, &image, &memory,
+                &cpus, &output,
             )
             .await?;
         }

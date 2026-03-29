@@ -210,7 +210,12 @@ pub async fn proxy_handler(
             tracing::error!("SRR lock poisoned — using poisoned state (fail-closed)");
             e.into_inner()
         });
-        let srr_result = srr.check(request.method().as_str(), &target.host, &target.path, body_for_srr);
+        let srr_result = srr.check(
+            request.method().as_str(),
+            &target.host,
+            &target.path,
+            body_for_srr,
+        );
         drop(srr);
 
         // Determine which layer won (max_strict picks the strictest)
@@ -244,7 +249,12 @@ pub async fn proxy_handler(
             tracing::error!("SRR lock poisoned — using poisoned state");
             e.into_inner()
         });
-        let srr_result = srr.check(request.method().as_str(), &target.host, &target.path, body_for_srr);
+        let srr_result = srr.check(
+            request.method().as_str(),
+            &target.host,
+            &target.path,
+            body_for_srr,
+        );
         drop(srr);
 
         let is_catch_all = srr_result.is_catch_all;
@@ -580,16 +590,19 @@ pub async fn proxy_handler(
             let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
 
             // Register pending approval with metadata for CLI/API display
-            state.pending_approvals.insert(event_id.clone(), PendingApproval {
-                sender: tx,
-                event_id: event_id.clone(),
-                operation: event.operation.clone(),
-                host: target.host.clone(),
-                path: target.path.clone(),
-                method: method_str,
-                agent_id: event.agent_id.clone(),
-                timestamp: event.timestamp,
-            });
+            state.pending_approvals.insert(
+                event_id.clone(),
+                PendingApproval {
+                    sender: tx,
+                    event_id: event_id.clone(),
+                    operation: event.operation.clone(),
+                    host: target.host.clone(),
+                    path: target.path.clone(),
+                    method: method_str,
+                    agent_id: event.agent_id.clone(),
+                    timestamp: event.timestamp,
+                },
+            );
 
             // Wait for approval decision or timeout
             let timeout_duration = std::time::Duration::from_secs(state.ic3_approval_timeout_secs);
@@ -638,7 +651,8 @@ pub async fn proxy_handler(
                             urgency
                         ),
                         mode: state.on_block.require_approval.clone(),
-                        next_action: "Request was not approved within the timeout window.".to_string(),
+                        next_action: "Request was not approved within the timeout window."
+                            .to_string(),
                         retry_after_secs: None,
                         rollback_hint: Some(event.trace_id.clone()),
                         matched_rule_id: classification.matched_rule_id.clone(),
@@ -1821,13 +1835,25 @@ async fn handle_connect_inner(
     // MITM for any non-loopback connection. Isolated environments (sandbox,
     // Docker) have the GVM CA injected, so MITM verification succeeds.
     // Only loopback (127.0.0.1) cooperative mode is excluded — no CA injection.
-    let is_isolated = peer_ip.map_or(false, |ip| !ip.is_loopback());
+    let is_isolated = peer_ip.is_some_and(|ip| !ip.is_loopback());
 
     let host_owned = host.to_string();
     let target_addr = format!("{}:{}", host, port);
-    let mitm_resolver = if is_isolated { state.mitm_resolver.clone() } else { None };
-    let mitm_sc = if is_isolated { state.mitm_server_config.clone() } else { None };
-    let mitm_cc = if is_isolated { state.mitm_client_config.clone() } else { None };
+    let mitm_resolver = if is_isolated {
+        state.mitm_resolver.clone()
+    } else {
+        None
+    };
+    let mitm_sc = if is_isolated {
+        state.mitm_server_config.clone()
+    } else {
+        None
+    };
+    let mitm_cc = if is_isolated {
+        state.mitm_client_config.clone()
+    } else {
+        None
+    };
     let connect_state = state.clone();
 
     tokio::task::spawn(async move {
@@ -1867,10 +1893,9 @@ async fn handle_connect_inner(
                 }
             };
 
-            if let Err(e) = crate::tls_proxy::handle_mitm_stream(
-                tls_stream, &host_owned, cc, &connect_state,
-            )
-            .await
+            if let Err(e) =
+                crate::tls_proxy::handle_mitm_stream(tls_stream, &host_owned, cc, &connect_state)
+                    .await
             {
                 tracing::debug!(host = %host_owned, error = %e, "CONNECT MITM: stream handling error");
             }

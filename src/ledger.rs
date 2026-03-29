@@ -213,11 +213,7 @@ async fn batch_loop(
     let mut batch: Vec<GroupCommitRequest> = Vec::with_capacity(config.max_batch_size);
     let mut batch_id: u64 = 0;
     let mut prev_batch_root: Option<String> = None;
-    let mut bytes_written: u64 = file
-        .metadata()
-        .await
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let mut bytes_written: u64 = file.metadata().await.map(|m| m.len()).unwrap_or(0);
 
     loop {
         // Phase 1: Wait for at least one request (blocks until work arrives)
@@ -720,7 +716,7 @@ impl Ledger {
             let count_reader = std::io::BufReader::new(count_file);
             let mut event_count: u64 = 0;
             let mut batch_count: u64 = 0;
-            for line in count_reader.lines().flatten() {
+            for line in count_reader.lines().map_while(Result::ok) {
                 if line.trim().is_empty() {
                     continue;
                 }
@@ -890,12 +886,7 @@ impl Ledger {
             // reference will let the batch task drain and exit.
             tracing::info!("WAL shutdown: waiting for batch task to flush remaining events...");
             // Give batch task a moment to process remaining items
-            match tokio::time::timeout(
-                Duration::from_secs(5),
-                handle,
-            )
-            .await
-            {
+            match tokio::time::timeout(Duration::from_secs(5), handle).await {
                 Ok(Ok(())) => {
                     tracing::info!("WAL shutdown: batch task completed cleanly");
                 }

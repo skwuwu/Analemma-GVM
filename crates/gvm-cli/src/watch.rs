@@ -30,7 +30,12 @@ impl OutputMode {
 /// Estimate cost in USD based on provider, model, and token usage.
 /// Prices are approximate as of 2025 — users needing precision should
 /// configure a pricing.toml (planned for a future release).
-fn estimate_cost(provider: &str, model: Option<&str>, prompt_tokens: u64, completion_tokens: u64) -> f64 {
+fn estimate_cost(
+    provider: &str,
+    model: Option<&str>,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) -> f64 {
     // Per-1M-token pricing (USD)
     let (input_rate, output_rate) = match provider {
         "openai" => match model {
@@ -78,7 +83,13 @@ impl AnomalyDetector {
     }
 
     /// Record a request and check for anomalies. Returns a warning if detected.
-    fn record_request(&mut self, method: &str, host: &str, path: &str, default_caution: bool) -> Option<String> {
+    fn record_request(
+        &mut self,
+        method: &str,
+        host: &str,
+        path: &str,
+        default_caution: bool,
+    ) -> Option<String> {
         let now = Instant::now();
 
         // --- Burst detection: >10 requests within 2 seconds ---
@@ -96,7 +107,7 @@ impl AnomalyDetector {
                 self.request_times.len()
             );
             // Only warn once per burst (suppress if already warned recently)
-            if !self.warnings.last().map_or(false, |w| w.starts_with("Burst")) {
+            if !self.warnings.last().is_some_and(|w| w.starts_with("Burst")) {
                 self.warnings.push(msg.clone());
                 return Some(msg);
             }
@@ -199,7 +210,10 @@ impl SessionStats {
         }
 
         // Status code
-        if let Some(code) = event.pointer("/transport/status_code").and_then(|v| v.as_u64()) {
+        if let Some(code) = event
+            .pointer("/transport/status_code")
+            .and_then(|v| v.as_u64())
+        {
             *self.status_codes.entry(code as u16).or_default() += 1;
         }
 
@@ -223,14 +237,21 @@ impl SessionStats {
         }
 
         // Default-to-Caution
-        if event.get("default_caution").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if event
+            .get("default_caution")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             self.default_caution_count += 1;
         }
 
         // LLM trace
         if let Some(trace) = event.get("llm_trace") {
             self.llm_calls += 1;
-            let provider = trace.get("provider").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let provider = trace
+                .get("provider")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             let model = trace.get("model").and_then(|v| v.as_str());
 
             self.providers_used.insert(provider.to_string());
@@ -245,8 +266,14 @@ impl SessionStats {
 
             // Token usage
             if let Some(usage) = trace.get("usage") {
-                let prompt = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                let completion = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                let prompt = usage
+                    .get("prompt_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let completion = usage
+                    .get("completion_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 let total = usage
                     .get("total_tokens")
                     .and_then(|v| v.as_u64())
@@ -467,10 +494,7 @@ fn print_live_event_text(event: &serde_json::Value, warning: Option<&str>) {
     let status_code = event
         .pointer("/transport/status_code")
         .and_then(|v| v.as_u64());
-    let decision = event
-        .get("decision")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let decision = event.get("decision").and_then(|v| v.as_str()).unwrap_or("");
 
     // Token usage (conditional)
     let token_info = event
@@ -480,9 +504,19 @@ fn print_live_event_text(event: &serde_json::Value, warning: Option<&str>) {
                 .get("total_tokens")
                 .and_then(|v| v.as_u64())
                 .or_else(|| {
-                    let p = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let c = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    if p > 0 || c > 0 { Some(p + c) } else { None }
+                    let p = usage
+                        .get("prompt_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let c = usage
+                        .get("completion_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    if p > 0 || c > 0 {
+                        Some(p + c)
+                    } else {
+                        None
+                    }
                 });
             total.map(|t| format!("[{} tokens]", format_number(t)))
         })
@@ -534,7 +568,10 @@ fn print_session_summary_text(stats: &SessionStats, anomaly: &AnomalyDetector) {
 
     let width = 60;
     eprintln!();
-    eprintln!("{BOLD}\u{2550}\u{2550}\u{2550} Session Summary {}{RESET}", "\u{2550}".repeat(width - 17));
+    eprintln!(
+        "{BOLD}\u{2550}\u{2550}\u{2550} Session Summary {}{RESET}",
+        "\u{2550}".repeat(width - 17)
+    );
     eprintln!(
         "  Duration: {DIM}{}{RESET}  |  {BOLD}{}{RESET} requests  |  {DIM}{:.2} req/s{RESET}",
         duration_str, stats.total_requests, rps
@@ -567,7 +604,14 @@ fn print_session_summary_text(stats: &SessionStats, anomaly: &AnomalyDetector) {
         eprintln!("  {BOLD}LLM Usage:{RESET}");
         if !stats.models_used.is_empty() {
             let models: Vec<_> = stats.models_used.iter().collect();
-            eprintln!("    Models: {CYAN}{}{RESET}", models.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+            eprintln!(
+                "    Models: {CYAN}{}{RESET}",
+                models
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
         eprintln!(
             "    Tokens: {BOLD}{}{RESET} total ({} prompt + {} completion)",
@@ -590,9 +634,24 @@ fn print_session_summary_text(stats: &SessionStats, anomaly: &AnomalyDetector) {
 
     // Status codes
     if !stats.status_codes.is_empty() {
-        let s2xx: u64 = stats.status_codes.iter().filter(|(k, _)| **k >= 200 && **k < 300).map(|(_, v)| v).sum();
-        let s4xx: u64 = stats.status_codes.iter().filter(|(k, _)| **k >= 400 && **k < 500).map(|(_, v)| v).sum();
-        let s5xx: u64 = stats.status_codes.iter().filter(|(k, _)| **k >= 500).map(|(_, v)| v).sum();
+        let s2xx: u64 = stats
+            .status_codes
+            .iter()
+            .filter(|(k, _)| **k >= 200 && **k < 300)
+            .map(|(_, v)| v)
+            .sum();
+        let s4xx: u64 = stats
+            .status_codes
+            .iter()
+            .filter(|(k, _)| **k >= 400 && **k < 500)
+            .map(|(_, v)| v)
+            .sum();
+        let s5xx: u64 = stats
+            .status_codes
+            .iter()
+            .filter(|(k, _)| **k >= 500)
+            .map(|(_, v)| v)
+            .sum();
         eprintln!(
             "  {BOLD}Status Codes:{RESET}  {GREEN}2xx: {}{RESET}  |  {YELLOW}4xx: {}{RESET}  |  {RED}5xx: {}{RESET}",
             s2xx, s4xx, s5xx
@@ -701,7 +760,10 @@ fn print_session_summary_json(stats: &SessionStats, anomaly: &AnomalyDetector) {
         "anomalies": real_warnings,
     });
 
-    println!("{}", serde_json::to_string_pretty(&summary).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&summary).unwrap_or_default()
+    );
 }
 
 // ─── Formatting helpers ───
@@ -791,10 +853,7 @@ pub async fn run_watch(
         }
         eprintln!();
         eprintln!("  {DIM}Agent ID:{RESET}     {CYAN}{}{RESET}", agent_id);
-        eprintln!(
-            "  {DIM}Command:{RESET}      {}",
-            command.join(" ")
-        );
+        eprintln!("  {DIM}Command:{RESET}      {}", command.join(" "));
         eprintln!("  {DIM}Proxy:{RESET}        {}", proxy);
         if with_rules {
             eprintln!("  {DIM}Mode:{RESET}         observe + enforce");
@@ -803,8 +862,8 @@ pub async fn run_watch(
         }
         eprintln!();
         eprintln!(
-            "  {DIM}{:<8}  {:<6} {:<30} {:<40} {:>3}  {}{RESET}",
-            "TIME", "METHOD", "HOST", "PATH", "ST", "TOKENS"
+            "  {DIM}{:<8}  {:<6} {:<30} {:<40} {:>3}  TOKENS{RESET}",
+            "TIME", "METHOD", "HOST", "PATH", "ST"
         );
         eprintln!("  {DIM}{}{RESET}", "\u{2500}".repeat(95));
     }
@@ -828,7 +887,18 @@ pub async fn run_watch(
     let memory_str = memory.to_string();
     let cpus_str = cpus.to_string();
     let agent_handle = tokio::spawn(async move {
-        run_agent_process(&cmd, &agent_id_str, &proxy_str, is_binary, sandbox, contained, &image_str, &memory_str, &cpus_str).await
+        run_agent_process(
+            &cmd,
+            &agent_id_str,
+            &proxy_str,
+            is_binary,
+            sandbox,
+            contained,
+            &image_str,
+            &memory_str,
+            &cpus_str,
+        )
+        .await
     });
 
     let watchdog_proxy = proxy.to_string();
@@ -924,6 +994,7 @@ pub async fn run_watch(
 }
 
 /// Run the agent process and return its exit code.
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_process(
     command: &[String],
     agent_id: &str,
@@ -953,18 +1024,33 @@ async fn run_agent_process(
         let proxy_addr: std::net::SocketAddr = format!("{}:{}", proxy_host, proxy_port).parse()?;
 
         let (interpreter, interpreter_args) = if is_binary_mode {
-            (binary_path.to_str().unwrap_or(binary).to_string(), args.iter().map(|s| s.to_string()).collect())
+            (
+                binary_path.to_str().unwrap_or(binary).to_string(),
+                args.iter().map(|s| s.to_string()).collect(),
+            )
         } else {
-            let ext = binary_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let ext = binary_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
             let interp = match ext {
                 "py" => "python",
                 "js" => "node",
                 "ts" => "npx",
                 "sh" | "bash" => "bash",
                 _ => "python",
-            }.to_string();
-            let name = binary_path.file_name().and_then(|f| f.to_str()).unwrap_or(binary).to_string();
-            let iargs = if ext == "ts" { vec!["ts-node".to_string(), name] } else { vec![name] };
+            }
+            .to_string();
+            let name = binary_path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or(binary)
+                .to_string();
+            let iargs = if ext == "ts" {
+                vec!["ts-node".to_string(), name]
+            } else {
+                vec![name]
+            };
             (interp, iargs)
         };
 
@@ -984,7 +1070,8 @@ async fn run_agent_process(
             mitm_ca_cert: None, // Watch mode: MITM CA not needed for observation
         };
 
-        let result = tokio::task::spawn_blocking(move || gvm_sandbox::launch_sandboxed(config)).await
+        let result = tokio::task::spawn_blocking(move || gvm_sandbox::launch_sandboxed(config))
+            .await
             .map_err(|e| anyhow::anyhow!("Sandbox task panicked: {}", e))?;
 
         match result {
@@ -1001,7 +1088,8 @@ async fn run_agent_process(
             (command[0].clone(), command[1..].to_vec())
         } else {
             let script = &command[0];
-            let abs = std::fs::canonicalize(script).with_context(|| format!("Script not found: {}", script))?;
+            let abs = std::fs::canonicalize(script)
+                .with_context(|| format!("Script not found: {}", script))?;
             let ext = abs.extension().and_then(|e| e.to_str()).unwrap_or("");
             let interp = match ext {
                 "py" => "python",
@@ -1011,7 +1099,10 @@ async fn run_agent_process(
                 _ => "python",
             };
             if ext == "ts" {
-                (interp.to_string(), vec!["ts-node".to_string(), abs.to_string_lossy().to_string()])
+                (
+                    interp.to_string(),
+                    vec!["ts-node".to_string(), abs.to_string_lossy().to_string()],
+                )
             } else {
                 (interp.to_string(), vec![abs.to_string_lossy().to_string()])
             }
@@ -1083,7 +1174,10 @@ mod tests {
     #[test]
     fn test_format_duration() {
         assert_eq!(format_duration(std::time::Duration::from_secs(45)), "45s");
-        assert_eq!(format_duration(std::time::Duration::from_secs(90)), "1m 30s");
+        assert_eq!(
+            format_duration(std::time::Duration::from_secs(90)),
+            "1m 30s"
+        );
         assert_eq!(
             format_duration(std::time::Duration::from_secs(3661)),
             "1h 1m 1s"
@@ -1099,7 +1193,12 @@ mod tests {
 
     #[test]
     fn test_estimate_cost_anthropic_sonnet() {
-        let cost = estimate_cost("anthropic", Some("claude-sonnet-4-20250514"), 1_000_000, 1_000_000);
+        let cost = estimate_cost(
+            "anthropic",
+            Some("claude-sonnet-4-20250514"),
+            1_000_000,
+            1_000_000,
+        );
         // input: $3.00, output: $15.00 → $18.00
         assert!((cost - 18.00).abs() < 0.01);
     }

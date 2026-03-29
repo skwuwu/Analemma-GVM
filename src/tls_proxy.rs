@@ -377,9 +377,8 @@ impl HttpRequest {
         };
 
         // Strip all agent-supplied auth headers (prevent credential smuggling)
-        self.headers.retain(|(name, _)| {
-            !AUTH_HEADERS.contains(&name.to_ascii_lowercase().as_str())
-        });
+        self.headers
+            .retain(|(name, _)| !AUTH_HEADERS.contains(&name.to_ascii_lowercase().as_str()));
 
         // Inject the configured credential
         match credential {
@@ -396,7 +395,8 @@ impl HttpRequest {
                 ));
             }
             crate::api_keys::Credential::ApiKey { header, value } => {
-                self.headers.push((header.clone(), value.clone().into_bytes()));
+                self.headers
+                    .push((header.clone(), value.clone().into_bytes()));
             }
         }
 
@@ -521,7 +521,8 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
         } else {
             format!("{}:80", local_addr)
         };
-        let mut upstream = tokio::net::TcpStream::connect(&addr).await
+        let mut upstream = tokio::net::TcpStream::connect(&addr)
+            .await
             .context("MITM: failed to connect to dev override")?;
 
         upstream.write_all(&req.raw_head).await?;
@@ -532,7 +533,9 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
         let mut buf = vec![0u8; 8192];
         loop {
             let n = upstream.read(&mut buf).await?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             tls_stream.write_all(&buf[..n]).await?;
         }
     } else {
@@ -540,11 +543,14 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
         let connector = tokio_rustls::TlsConnector::from(client_config);
         let upstream_addr = format!("{}:443", upstream_host);
 
-        let upstream_tcp = tokio::net::TcpStream::connect(&upstream_addr).await
+        let upstream_tcp = tokio::net::TcpStream::connect(&upstream_addr)
+            .await
             .context("MITM: failed to connect to upstream")?;
         let server_name = rustls::pki_types::ServerName::try_from(upstream_host.to_string())
             .map_err(|e| anyhow::anyhow!("MITM: invalid server name: {}", e))?;
-        let mut upstream_tls = connector.connect(server_name, upstream_tcp).await
+        let mut upstream_tls = connector
+            .connect(server_name, upstream_tcp)
+            .await
             .context("MITM: upstream TLS handshake failed")?;
 
         upstream_tls.write_all(&req.raw_head).await?;
@@ -555,7 +561,9 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
         let mut buf = vec![0u8; 8192];
         loop {
             let n = upstream_tls.read(&mut buf).await?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             tls_stream.write_all(&buf[..n]).await?;
         }
     }
@@ -671,8 +679,7 @@ pub async fn peek_sni(stream: &tokio::net::TcpStream) -> Option<String> {
         if ext_type == 0x0000 && pos + ext_data_len <= ext_end {
             // SNI extension: list_len(2) + type(1) + name_len(2) + name
             if ext_data_len >= 5 {
-                let name_len =
-                    u16::from_be_bytes([hs[pos + 3], hs[pos + 4]]) as usize;
+                let name_len = u16::from_be_bytes([hs[pos + 3], hs[pos + 4]]) as usize;
                 let name_start = pos + 5;
                 if name_start + name_len <= ext_end {
                     return std::str::from_utf8(&hs[name_start..name_start + name_len])

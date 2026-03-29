@@ -113,8 +113,13 @@ fn scan_dir_recursive(
 
         if path.is_dir() {
             scan_dir_recursive(
-                &path, upper_root, lower_root, policy,
-                auto_merged, needs_review, discarded,
+                &path,
+                upper_root,
+                lower_root,
+                policy,
+                auto_merged,
+                needs_review,
+                discarded,
             )?;
             continue;
         }
@@ -305,7 +310,10 @@ mod tests {
 
     #[test]
     fn glob_pycache() {
-        assert!(glob_match("__pycache__/*", "__pycache__/module.cpython-312.pyc"));
+        assert!(glob_match(
+            "__pycache__/*",
+            "__pycache__/module.cpython-312.pyc"
+        ));
     }
 
     #[test]

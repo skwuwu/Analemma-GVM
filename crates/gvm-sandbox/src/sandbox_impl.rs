@@ -56,8 +56,7 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     nix::mount::umount2(&sandbox_root, nix::mount::MntFlags::MNT_DETACH).ok();
     std::fs::remove_dir_all(&sandbox_root).ok();
     nix::mount::umount(&staging_ws).ok();
-    std::fs::create_dir_all(&staging_ws)
-        .context("Failed to create workspace staging directory")?;
+    std::fs::create_dir_all(&staging_ws).context("Failed to create workspace staging directory")?;
     nix::mount::mount(
         Some(&config.workspace_dir),
         &staging_ws,
@@ -65,10 +64,13 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         nix::mount::MsFlags::MS_BIND | nix::mount::MsFlags::MS_REC,
         None::<&str>,
     )
-    .with_context(|| format!(
-        "Failed to pre-mount workspace in parent: {} → {}",
-        config.workspace_dir.display(), staging_ws.display()
-    ))?;
+    .with_context(|| {
+        format!(
+            "Failed to pre-mount workspace in parent: {} → {}",
+            config.workspace_dir.display(),
+            staging_ws.display()
+        )
+    })?;
 
     // Create coordination pipe
     let (parent_fd, child_fd) = coordination_pipe()?;
@@ -262,11 +264,9 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
                                 }
                             }
                         }
-                        Err(_e) => {
-                            crate::tls_probe::PolicyDecision::Deny {
-                                reason: "uprobe: proxy unreachable — fail-closed".into(),
-                            }
-                        }
+                        Err(_e) => crate::tls_probe::PolicyDecision::Deny {
+                            reason: "uprobe: proxy unreachable — fail-closed".into(),
+                        },
                     }
                 })
             } else {
@@ -518,13 +518,15 @@ fn drop_all_capabilities() -> anyhow::Result<()> {
     // As of Linux 6.x, CAP_LAST_CAP is ~41. We iterate to 64 for future-proofing;
     // prctl returns EINVAL for non-existent caps, which we safely ignore.
     for cap in 0..64u64 {
-        let ret = unsafe {
-            libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0)
-        };
+        let ret = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) };
         if ret < 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() != Some(libc::EINVAL) {
-                return Err(anyhow::anyhow!("Failed to drop capability {}: {}", cap, err));
+                return Err(anyhow::anyhow!(
+                    "Failed to drop capability {}: {}",
+                    cap,
+                    err
+                ));
             }
             // EINVAL = capability doesn't exist — expected for cap > CAP_LAST_CAP
         }

@@ -68,10 +68,7 @@ impl CgroupGuard {
                     "Failed to set memory.max — memory limit not enforced"
                 );
             } else {
-                tracing::info!(
-                    limit_mb = bytes / (1024 * 1024),
-                    "cgroup: memory.max set"
-                );
+                tracing::info!(limit_mb = bytes / (1024 * 1024), "cgroup: memory.max set");
             }
         }
 
@@ -118,7 +115,9 @@ impl Drop for CgroupGuard {
             for line in content.lines() {
                 if let Ok(pid) = line.trim().parse::<i32>() {
                     if pid > 0 {
-                        unsafe { libc::kill(pid, libc::SIGKILL); }
+                        unsafe {
+                            libc::kill(pid, libc::SIGKILL);
+                        }
                     }
                 }
             }

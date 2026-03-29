@@ -109,7 +109,10 @@ async fn fetch_pending(client: &reqwest::Client, url: &str) -> Result<Vec<Pendin
         anyhow::bail!("Proxy returned {}", resp.status());
     }
 
-    let body: PendingResponse = resp.json().await.context("Failed to parse pending response")?;
+    let body: PendingResponse = resp
+        .json()
+        .await
+        .context("Failed to parse pending response")?;
     Ok(body.pending)
 }
 
@@ -139,9 +142,7 @@ async fn send_decision(
 
 /// Print the approval prompt for a pending request.
 fn print_approval_prompt(entry: &PendingEntry) {
-    eprintln!(
-        "  {YELLOW}{BOLD}\u{1f6e1}\u{fe0f}  IC-3 Approval Required{RESET}"
-    );
+    eprintln!("  {YELLOW}{BOLD}\u{1f6e1}\u{fe0f}  IC-3 Approval Required{RESET}");
     eprintln!("  {DIM}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{RESET}");
     eprintln!("  {DIM}Event:{RESET}      {CYAN}{}{RESET}", entry.event_id);
     eprintln!("  {DIM}Agent:{RESET}      {}", entry.agent_id);

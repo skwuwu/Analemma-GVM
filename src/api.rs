@@ -986,7 +986,10 @@ pub async fn approve_request(
         }
     };
 
-    let approved = body.get("approved").and_then(|v| v.as_bool()).unwrap_or(false);
+    let approved = body
+        .get("approved")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // Remove from pending map and deliver decision
     match state.pending_approvals.remove(&event_id) {
@@ -1006,15 +1009,13 @@ pub async fn approve_request(
                 }),
             )
         }
-        None => {
-            json_response(
-                StatusCode::NOT_FOUND,
-                &serde_json::json!({
-                    "error": "No pending approval for this event_id",
-                    "event_id": event_id,
-                }),
-            )
-        }
+        None => json_response(
+            StatusCode::NOT_FOUND,
+            &serde_json::json!({
+                "error": "No pending approval for this event_id",
+                "event_id": event_id,
+            }),
+        ),
     }
 }
 

@@ -27,7 +27,7 @@ pub fn suggest_rules_interactive(wal_path: &str, start_offset: u64, srr_file: &s
     // Seek past already-processed events instead of loading entire file.
     // Previous implementation used read_to_string (OOM risk on large WALs).
     let reader = if start_offset > 0 {
-        use std::io::{Read, Seek, SeekFrom};
+        use std::io::{Seek, SeekFrom};
         let mut file = file;
         if file.seek(SeekFrom::Start(start_offset)).is_err() {
             return;

@@ -280,7 +280,9 @@ async fn run_binary_sandboxed(
     eprintln!("      {DIM}\u{2022} Mount namespace: minimal rootfs{RESET}");
     eprintln!("      {DIM}\u{2022} Network namespace: veth pair, proxy-only routing{RESET}");
     eprintln!("      {DIM}\u{2022} Seccomp-BPF: syscall whitelist{RESET}");
-    eprintln!("      {DIM}\u{2022} Transparent MITM: ephemeral CA, full L7 HTTPS inspection{RESET}");
+    eprintln!(
+        "      {DIM}\u{2022} Transparent MITM: ephemeral CA, full L7 HTTPS inspection{RESET}"
+    );
     eprintln!();
     eprintln!("  {DIM}--- Output below ---{RESET}");
     eprintln!();
@@ -289,14 +291,14 @@ async fn run_binary_sandboxed(
     // Sandbox blocks on waitpid (sync) — wrap in spawn_blocking.
     // Watchdog polls /gvm/health and restarts proxy on crash.
     let proxy_url = proxy.to_string();
-    let sandbox_task = tokio::task::spawn_blocking(move || {
-        gvm_sandbox::launch_sandboxed(config)
-    });
+    let sandbox_task = tokio::task::spawn_blocking(move || gvm_sandbox::launch_sandboxed(config));
 
     let watchdog_handle = tokio::spawn(proxy_watchdog(proxy_url));
 
     // Wait for sandbox to finish (primary task)
-    let result = sandbox_task.await.unwrap_or_else(|e| Err(anyhow::anyhow!("Sandbox task panicked: {e}")));
+    let result = sandbox_task
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("Sandbox task panicked: {e}")));
 
     // Abort watchdog when sandbox exits
     watchdog_handle.abort();
@@ -374,14 +376,12 @@ pub(crate) async fn proxy_watchdog(proxy_url: String) {
             Ok(resp) if resp.status().is_success() => {
                 // Check if degraded
                 if let Ok(body) = resp.text().await {
-                    if body.contains("\"degraded\"") {
-                        if consecutive_failures == 0 {
-                            // Log once when entering degraded state
-                            eprintln!(
-                                "  \x1b[1;33mWATCHDOG\x1b[0m: proxy is degraded (WAL issue) — \
-                                 monitoring but NOT restarting"
-                            );
-                        }
+                    if body.contains("\"degraded\"") && consecutive_failures == 0 {
+                        // Log once when entering degraded state
+                        eprintln!(
+                            "  \x1b[1;33mWATCHDOG\x1b[0m: proxy is degraded (WAL issue) — \
+                             monitoring but NOT restarting"
+                        );
                     }
                 }
                 consecutive_failures = 0;
@@ -417,10 +417,7 @@ pub(crate) async fn proxy_watchdog(proxy_url: String) {
                             );
                         }
                         Err(e) => {
-                            eprintln!(
-                                "  \x1b[0;31mWATCHDOG\x1b[0m: proxy restart failed: {}",
-                                e
-                            );
+                            eprintln!("  \x1b[0;31mWATCHDOG\x1b[0m: proxy restart failed: {}", e);
                             restarts += 1;
                         }
                     }
@@ -631,7 +628,14 @@ async fn run_local(script: &str, agent_id: &str, proxy: &str, interactive: bool)
 
 /// Linux-native sandbox mode: run inside namespace + seccomp isolation.
 /// Production-recommended on Linux. No Docker required.
-async fn run_sandboxed(script: &str, agent_id: &str, proxy: &str, interactive: bool, memory_limit: Option<u64>, cpu_limit: Option<f64>) -> Result<()> {
+async fn run_sandboxed(
+    script: &str,
+    agent_id: &str,
+    proxy: &str,
+    interactive: bool,
+    memory_limit: Option<u64>,
+    cpu_limit: Option<f64>,
+) -> Result<()> {
     println!();
     println!("{BOLD}Analemma-GVM \u{2014} Linux-Native Sandbox (Layer 3){RESET}");
     println!(
@@ -723,7 +727,9 @@ async fn run_sandboxed(script: &str, agent_id: &str, proxy: &str, interactive: b
 
     // Clean up orphaned network from previous crash (if any)
     match gvm_sandbox::cleanup_orphaned_network() {
-        Ok(true) => eprintln!("  {YELLOW}Cleaned up orphaned sandbox network from previous crash{RESET}"),
+        Ok(true) => {
+            eprintln!("  {YELLOW}Cleaned up orphaned sandbox network from previous crash{RESET}")
+        }
         Ok(false) => {} // No orphans
         Err(e) => eprintln!("  {DIM}Orphan cleanup: {e}{RESET}"),
     }
@@ -1030,7 +1036,10 @@ async fn run_contained(
                     println!("  {GREEN}gvm-agent image built{RESET}");
                 } else {
                     let err = String::from_utf8_lossy(&build.stderr);
-                    println!("  {RED}Failed to build gvm-agent image: {}{RESET}", err.lines().last().unwrap_or(""));
+                    println!(
+                        "  {RED}Failed to build gvm-agent image: {}{RESET}",
+                        err.lines().last().unwrap_or("")
+                    );
                     println!("  {DIM}Build with: docker build -t gvm-agent:latest -f Dockerfile.agent .{RESET}");
                     return Ok(());
                 }
@@ -1148,26 +1157,25 @@ async fn run_contained(
     //   - DNAT 443→8443 routes HTTPS to the MITM listener
     //   - The MITM listener presents certs signed by this CA
     //   - The agent's TLS client trusts them (CA in trust store)
-    let ca_temp_dir = tempfile::tempdir()
-        .context("Failed to create temp dir for CA")?;
+    let ca_temp_dir = tempfile::tempdir().context("Failed to create temp dir for CA")?;
     let ca_pem_path = ca_temp_dir.path().join("gvm-ca.crt");
 
     let ca_url = format!("{}/gvm/ca.pem", proxy.trim_end_matches('/'));
     let mitm_available = match reqwest::get(&ca_url).await {
-        Ok(resp) if resp.status().is_success() => {
-            match resp.bytes().await {
-                Ok(bytes) if !bytes.is_empty() => {
-                    std::fs::write(&ca_pem_path, &bytes)
-                        .context("Failed to write CA PEM")?;
-                    println!("  {GREEN}\u{2713}{RESET} MITM CA downloaded ({} bytes)", bytes.len());
-                    true
-                }
-                _ => {
-                    println!("  {YELLOW}MITM CA empty — HTTPS inspection unavailable{RESET}");
-                    false
-                }
+        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+            Ok(bytes) if !bytes.is_empty() => {
+                std::fs::write(&ca_pem_path, &bytes).context("Failed to write CA PEM")?;
+                println!(
+                    "  {GREEN}\u{2713}{RESET} MITM CA downloaded ({} bytes)",
+                    bytes.len()
+                );
+                true
             }
-        }
+            _ => {
+                println!("  {YELLOW}MITM CA empty — HTTPS inspection unavailable{RESET}");
+                false
+            }
+        },
         _ => {
             println!("  {YELLOW}MITM CA not available — HTTPS will use CONNECT relay (domain-level only){RESET}");
             false
@@ -1266,8 +1274,7 @@ async fn run_contained(
     cmd.arg("-e")
         .arg(format!("GVM_PROXY_URL={}", container_proxy));
 
-    cmd
-        .arg("-v")
+    cmd.arg("-v")
         .arg(format!("{}:/home/agent/workspace:ro", mount_dir));
 
     // CA injection: mount CA PEM + /etc/ssl/certs as tmpfs for Go/system trust store
@@ -1288,19 +1295,29 @@ async fn run_contained(
         #[cfg(not(windows))]
         let ca_host_path = ca_host_path_raw.to_string();
         cmd.arg("-v")
-            .arg(format!("{}:/usr/local/share/ca-certificates/gvm-ca.crt:ro", ca_host_path))
+            .arg(format!(
+                "{}:/usr/local/share/ca-certificates/gvm-ca.crt:ro",
+                ca_host_path
+            ))
             .arg("-v")
             .arg(format!("{}:/etc/ssl/certs/gvm-ca.crt:ro", ca_host_path))
             .arg("-v")
-            .arg(format!("{}:/etc/ssl/certs/ca-certificates.crt:ro", ca_host_path))
+            .arg(format!(
+                "{}:/etc/ssl/certs/ca-certificates.crt:ro",
+                ca_host_path
+            ))
             .arg("-v")
             .arg(format!("{}:/etc/pki/tls/certs/gvm-ca.crt:ro", ca_host_path));
 
         // CA trust environment variables (covers Python requests, Node.js, curl)
-        cmd.arg("-e").arg("SSL_CERT_FILE=/etc/ssl/certs/gvm-ca.crt")
-            .arg("-e").arg("REQUESTS_CA_BUNDLE=/etc/ssl/certs/gvm-ca.crt")
-            .arg("-e").arg("NODE_EXTRA_CA_CERTS=/etc/ssl/certs/gvm-ca.crt")
-            .arg("-e").arg("CURL_CA_BUNDLE=/etc/ssl/certs/gvm-ca.crt");
+        cmd.arg("-e")
+            .arg("SSL_CERT_FILE=/etc/ssl/certs/gvm-ca.crt")
+            .arg("-e")
+            .arg("REQUESTS_CA_BUNDLE=/etc/ssl/certs/gvm-ca.crt")
+            .arg("-e")
+            .arg("NODE_EXTRA_CA_CERTS=/etc/ssl/certs/gvm-ca.crt")
+            .arg("-e")
+            .arg("CURL_CA_BUNDLE=/etc/ssl/certs/gvm-ca.crt");
 
         // NET_ADMIN capability for DNAT iptables rule inside container.
         // Trade-off: widens attack surface, but:
@@ -1309,8 +1326,7 @@ async fn run_contained(
         //   - DNAT is set in the entrypoint, then iptables is not needed further
         // NET_ADMIN + root required for iptables DNAT setup in entrypoint.
         // no-new-privileges prevents escalation from root.
-        cmd.arg("--cap-add=NET_ADMIN")
-            .arg("--user").arg("root");
+        cmd.arg("--cap-add=NET_ADMIN").arg("--user").arg("root");
     }
 
     if use_host_network {
@@ -1347,7 +1363,10 @@ async fn run_contained(
     println!("    {GREEN}\u{2713}{RESET} Layer 2: Enforcement Proxy (request interception)");
     println!("    {GREEN}\u{2713}{RESET} Layer 3: Docker Containment");
     if mitm_available {
-        println!("      {DIM}\u{2022} Transparent MITM: ephemeral CA injected, DNAT 443→{}{RESET}", tls_port);
+        println!(
+            "      {DIM}\u{2022} Transparent MITM: ephemeral CA injected, DNAT 443→{}{RESET}",
+            tls_port
+        );
     } else {
         println!("      {DIM}\u{2022} HTTPS: CONNECT relay (domain-level only){RESET}");
     }

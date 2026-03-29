@@ -1932,18 +1932,15 @@ async fn checkpoint_save_restore_merkle_verified() {
         NetworkSRR::load(&srr_path).expect("empty SRR must parse"),
     ));
     let policy = Arc::new(PolicyEngine::load(&policy_dir).expect("empty policy must parse"));
-    let registry = Arc::new(
-        OperationRegistry::load(&registry_path).expect("minimal registry must parse"),
-    );
-    let api_keys =
-        Arc::new(APIKeyStore::load(&secrets_path).expect("empty secrets must parse"));
+    let registry =
+        Arc::new(OperationRegistry::load(&registry_path).expect("minimal registry must parse"));
+    let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("empty secrets must parse"));
     let ledger = Arc::new(
         Ledger::new(&wal_path, "", "")
             .await
             .expect("ledger must init"),
     );
-    let vault =
-        Arc::new(Vault::new(ledger.clone()).expect("vault must init"));
+    let vault = Arc::new(Vault::new(ledger.clone()).expect("vault must init"));
     let rate_limiter = Arc::new(RateLimiter::new());
     let http_client =
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
@@ -2019,11 +2016,19 @@ async fn checkpoint_save_restore_merkle_verified() {
         );
     }
 
-    let save_body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let save_body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let save_json: serde_json::Value = serde_json::from_slice(&save_body).unwrap();
     assert_eq!(save_json["status"], "ok");
-    assert!(save_json["content_hash"].is_string(), "content_hash must be present");
-    assert!(save_json["merkle_root"].is_string(), "merkle_root must be present");
+    assert!(
+        save_json["content_hash"].is_string(),
+        "content_hash must be present"
+    );
+    assert!(
+        save_json["merkle_root"].is_string(),
+        "merkle_root must be present"
+    );
     let saved_hash = save_json["content_hash"].as_str().unwrap().to_string();
 
     // ── Step b: Read checkpoint back ──
@@ -2034,7 +2039,11 @@ async fn checkpoint_save_restore_merkle_verified() {
         .unwrap();
 
     let response = app.clone().oneshot(request).await.unwrap();
-    assert_eq!(response.status(), axum::http::StatusCode::OK, "Checkpoint read must succeed");
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::OK,
+        "Checkpoint read must succeed"
+    );
 
     // ── Step c: Verify Merkle integrity ──
     let merkle_verified = response
@@ -2055,7 +2064,9 @@ async fn checkpoint_save_restore_merkle_verified() {
     assert_eq!(checkpoint_step, "0");
 
     // Verify content matches original
-    let read_body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let read_body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     assert_eq!(
         read_body.as_ref(),
         body_bytes.as_slice(),
@@ -2072,10 +2083,15 @@ async fn checkpoint_save_restore_merkle_verified() {
     let response = app.clone().oneshot(request).await.unwrap();
     assert_eq!(response.status(), axum::http::StatusCode::OK);
 
-    let step3_body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let step3_body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
     let step3_json: serde_json::Value = serde_json::from_slice(&step3_body).unwrap();
     let step3_hash = step3_json["content_hash"].as_str().unwrap();
-    assert_ne!(step3_hash, saved_hash, "Different content must produce different hashes");
+    assert_ne!(
+        step3_hash, saved_hash,
+        "Different content must produce different hashes"
+    );
 
     // ── Step e: Read non-existent checkpoint → 404 ──
     let request = axum::http::Request::builder()
@@ -2097,7 +2113,11 @@ async fn checkpoint_save_restore_merkle_verified() {
         .body(axum::body::Body::empty())
         .unwrap();
     let response = app.clone().oneshot(request).await.unwrap();
-    assert_eq!(response.status(), axum::http::StatusCode::OK, "Checkpoint delete must succeed");
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::OK,
+        "Checkpoint delete must succeed"
+    );
 
     // Verify deleted checkpoint returns 404
     let request = axum::http::Request::builder()
@@ -2147,11 +2167,11 @@ fn llm_trace_openai_reasoning_extraction() {
         }
     });
 
-    let trace = gvm_proxy::llm_trace::extract_thinking_trace(
-        "openai",
-        body.to_string().as_bytes(),
+    let trace = gvm_proxy::llm_trace::extract_thinking_trace("openai", body.to_string().as_bytes());
+    assert!(
+        trace.is_some(),
+        "OpenAI reasoning_content must be extracted"
     );
-    assert!(trace.is_some(), "OpenAI reasoning_content must be extracted");
 
     let t = trace.unwrap();
     assert_eq!(t.provider, "openai");
@@ -2184,10 +2204,13 @@ fn llm_trace_openai_raw_opt_in() {
     let trace = gvm_proxy::llm_trace::extract_thinking_trace_with_privacy(
         "openai",
         body.to_string().as_bytes(),
-        true,  // store_raw ON → store raw thinking
+        true, // store_raw ON → store raw thinking
     );
     let t = trace.unwrap();
-    assert!(t.thinking.is_some(), "raw thinking must be stored when privacy is off");
+    assert!(
+        t.thinking.is_some(),
+        "raw thinking must be stored when privacy is off"
+    );
     assert!(
         t.thinking.as_ref().unwrap().contains("Internal reasoning"),
         "raw thinking content must match"
@@ -2222,7 +2245,10 @@ fn llm_trace_anthropic_thinking_block() {
         body.to_string().as_bytes(),
         false,
     );
-    assert!(trace.is_some(), "Anthropic thinking block must be extracted");
+    assert!(
+        trace.is_some(),
+        "Anthropic thinking block must be extracted"
+    );
 
     let t = trace.unwrap();
     assert_eq!(t.provider, "anthropic");
@@ -2299,10 +2325,8 @@ data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"o1
 data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"o1\",\"choices\":[{\"delta\":{\"content\":\"Done.\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n\
 data: [DONE]\n\n";
 
-    let trace = gvm_proxy::llm_trace::extract_thinking_trace_from_sse(
-        "openai",
-        sse_body.as_bytes(),
-    );
+    let trace =
+        gvm_proxy::llm_trace::extract_thinking_trace_from_sse("openai", sse_body.as_bytes());
     assert!(trace.is_some(), "SSE streaming trace must be extracted");
 
     let t = trace.unwrap();
@@ -2971,7 +2995,9 @@ fn max_strict_returns_correct_decision_variant() {
     // Allow vs Deny → must return Deny (not just strictness=5)
     let result = max_strict(
         EnforcementDecision::Allow,
-        EnforcementDecision::Deny { reason: "blocked".to_string() },
+        EnforcementDecision::Deny {
+            reason: "blocked".to_string(),
+        },
     );
     assert!(
         matches!(result, EnforcementDecision::Deny { .. }),
@@ -2981,7 +3007,9 @@ fn max_strict_returns_correct_decision_variant() {
 
     // Deny vs Allow → same result regardless of order
     let result = max_strict(
-        EnforcementDecision::Deny { reason: "blocked".to_string() },
+        EnforcementDecision::Deny {
+            reason: "blocked".to_string(),
+        },
         EnforcementDecision::Allow,
     );
     assert!(
@@ -3008,7 +3036,9 @@ fn max_strict_returns_correct_decision_variant() {
         EnforcementDecision::RequireApproval {
             urgency: gvm_types::ApprovalUrgency::Immediate,
         },
-        EnforcementDecision::Deny { reason: "policy".to_string() },
+        EnforcementDecision::Deny {
+            reason: "policy".to_string(),
+        },
     );
     assert!(
         matches!(result, EnforcementDecision::Deny { .. }),
@@ -3018,12 +3048,19 @@ fn max_strict_returns_correct_decision_variant() {
 
     // Same strictness level → first argument wins (stable ordering)
     let result = max_strict(
-        EnforcementDecision::Deny { reason: "first".to_string() },
-        EnforcementDecision::Deny { reason: "second".to_string() },
+        EnforcementDecision::Deny {
+            reason: "first".to_string(),
+        },
+        EnforcementDecision::Deny {
+            reason: "second".to_string(),
+        },
     );
     match &result {
         EnforcementDecision::Deny { reason } => {
-            assert_eq!(reason, "first", "Same strictness: first argument should win");
+            assert_eq!(
+                reason, "first",
+                "Same strictness: first argument should win"
+            );
         }
         _ => panic!("max_strict(Deny, Deny) must return Deny"),
     }

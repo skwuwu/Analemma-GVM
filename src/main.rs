@@ -105,7 +105,9 @@ async fn main() {
         .unwrap_or_else(|_| config.enforcement.default_unknown.clone());
     let default_unknown_decision = match default_unknown_setting.as_str() {
         "require_approval" => {
-            tracing::info!("Default-to-Caution: RequireApproval (unmatched URLs held for human approval)");
+            tracing::info!(
+                "Default-to-Caution: RequireApproval (unmatched URLs held for human approval)"
+            );
             gvm_types::EnforcementDecision::RequireApproval {
                 urgency: gvm_types::ApprovalUrgency::Standard,
             }
@@ -118,7 +120,10 @@ async fn main() {
         }
         _ => {
             let ms = config.enforcement.default_delay_ms;
-            tracing::info!(delay_ms = ms, "Default-to-Caution: Delay (unmatched URLs delayed then forwarded)");
+            tracing::info!(
+                delay_ms = ms,
+                "Default-to-Caution: Delay (unmatched URLs delayed then forwarded)"
+            );
             gvm_types::EnforcementDecision::Delay { milliseconds: ms }
         }
     };
@@ -300,8 +305,8 @@ async fn main() {
     //   - TLS MITM listener (port 8443) — uses it to terminate agent TLS
     //   - GET /gvm/ca.pem endpoint — sandbox downloads it for trust store injection
     // This ensures the CA injected into the sandbox matches the one used by the listener.
-    let mitm_ca = gvm_sandbox::ca::EphemeralCA::generate()
-        .expect("Failed to generate ephemeral MITM CA");
+    let mitm_ca =
+        gvm_sandbox::ca::EphemeralCA::generate().expect("Failed to generate ephemeral MITM CA");
     let mitm_ca_cert_pem = Arc::new(mitm_ca.ca_cert_pem().to_vec());
     let mitm_ca_key_pem = Arc::new(mitm_ca.ca_key_pem());
     tracing::info!("Ephemeral MITM CA generated (shared between TLS listener and sandbox)");
@@ -320,8 +325,7 @@ async fn main() {
             .expect("Failed to build MITM server config"),
     );
     let mitm_client_config = Arc::new(
-        gvm_proxy::tls_proxy::build_client_config()
-            .expect("Failed to build MITM client config"),
+        gvm_proxy::tls_proxy::build_client_config().expect("Failed to build MITM client config"),
     );
 
     // 10. Print startup policy summary
@@ -385,7 +389,10 @@ async fn main() {
     let app = Router::new()
         .route("/gvm/health", axum::routing::get(api::health))
         .route("/gvm/info", axum::routing::get(api::info))
-        .route("/gvm/reload", axum::routing::post(reload_srr_localhost_only))
+        .route(
+            "/gvm/reload",
+            axum::routing::post(reload_srr_localhost_only),
+        )
         .route("/gvm/check", axum::routing::post(api::check))
         .route("/gvm/intent", axum::routing::post(api::register_intent))
         .route("/gvm/ca.pem", axum::routing::get(serve_mitm_ca))
@@ -446,14 +453,14 @@ async fn main() {
                                 let app = app.clone();
                                 async move {
                                     Ok::<_, std::convert::Infallible>(
-                                        tower::ServiceExt::oneshot(app, req)
-                                            .await
-                                            .unwrap_or_else(|_| {
+                                        tower::ServiceExt::oneshot(app, req).await.unwrap_or_else(
+                                            |_| {
                                                 axum::http::Response::builder()
                                                     .status(500)
                                                     .body(axum::body::Body::from("Internal error"))
                                                     .unwrap_or_default()
-                                            }),
+                                            },
+                                        ),
                                     )
                                 }
                             });
@@ -490,7 +497,15 @@ async fn main() {
     let tls_ready = std::sync::Arc::new(tokio::sync::Notify::new());
     let tls_ready_tx = tls_ready.clone();
     tokio::spawn(async move {
-        if let Err(e) = start_tls_listener(&tls_port, tls_state, &tls_ca_cert, &tls_ca_key, tls_ready_tx).await {
+        if let Err(e) = start_tls_listener(
+            &tls_port,
+            tls_state,
+            &tls_ca_cert,
+            &tls_ca_key,
+            tls_ready_tx,
+        )
+        .await
+        {
             tracing::warn!(error = %e, "TLS MITM listener failed to start (sandbox HTTPS inspection unavailable)");
         }
     });
@@ -600,9 +615,9 @@ async fn main() {
         // Wait for all handles with timeout
         let drain_result = tokio::time::timeout(
             drain_timeout,
-            futures_util::future::join_all(
-                connection_handles.iter_mut().map(|h| async { h.await.ok(); }),
-            ),
+            futures_util::future::join_all(connection_handles.iter_mut().map(|h| async {
+                h.await.ok();
+            })),
         )
         .await;
 
@@ -614,7 +629,10 @@ async fn main() {
                 // Drain timeout exceeded — abort remaining connections.
                 // This drops their Arc<AppState> (which holds Arc<Ledger>),
                 // allowing try_unwrap to succeed for WAL shutdown flush.
-                let remaining = connection_handles.iter().filter(|h| !h.is_finished()).count();
+                let remaining = connection_handles
+                    .iter()
+                    .filter(|h| !h.is_finished())
+                    .count();
                 tracing::warn!(
                     remaining,
                     "Drain timeout reached — aborting {} remaining connections to release WAL",
@@ -675,9 +693,8 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("Failed to install SIGTERM handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler");
         tokio::select! {
             _ = ctrl_c => {}
             _ = sigterm.recv() => {}
@@ -699,7 +716,7 @@ async fn reload_srr_localhost_only(
     request: Request<Body>,
 ) -> Response<Body> {
     let peer_ip = request.extensions().get::<std::net::IpAddr>().copied();
-    let is_loopback = peer_ip.map_or(false, |ip| ip.is_loopback());
+    let is_loopback = peer_ip.is_some_and(|ip| ip.is_loopback());
 
     if !is_loopback {
         tracing::warn!(
@@ -788,7 +805,7 @@ const MAX_TLS_CONNECTIONS: usize = 1024;
 const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Upstream connect + relay timeout. Prevents zombie connections when upstream hangs.
-const UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const _UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// TLS MITM listener for sandbox HTTPS inspection.
 ///
@@ -803,11 +820,17 @@ async fn start_tls_listener(
 ) -> anyhow::Result<()> {
     // Reuse the shared MITM resolver/configs from AppState (initialized in main).
     // Single cert cache instance shared with CONNECT handler.
-    let resolver = state.mitm_resolver.clone()
+    let resolver = state
+        .mitm_resolver
+        .clone()
         .ok_or_else(|| anyhow::anyhow!("MITM resolver not initialized"))?;
-    let server_config = state.mitm_server_config.clone()
+    let server_config = state
+        .mitm_server_config
+        .clone()
         .ok_or_else(|| anyhow::anyhow!("MITM server config not initialized"))?;
-    let client_config = state.mitm_client_config.clone()
+    let client_config = state
+        .mitm_client_config
+        .clone()
         .ok_or_else(|| anyhow::anyhow!("MITM client config not initialized"))?;
 
     // Semaphore: bound concurrent TLS connections to prevent FD exhaustion.

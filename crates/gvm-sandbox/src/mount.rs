@@ -141,7 +141,11 @@ pub fn setup_mount_namespace(
         // by the parent process before clone(). Kernel 6.17+ blocks bind-mount of
         // host paths inside user namespaces, but inherits parent mounts.
         let staging_ws = Path::new("/tmp/gvm-sandbox-staging-ws");
-        let mount_src = if staging_ws.exists() { staging_ws } else { workspace_dir };
+        let mount_src = if staging_ws.exists() {
+            staging_ws
+        } else {
+            workspace_dir
+        };
         let ws_target = new_root.join("workspace");
         mount(
             Some(mount_src),
@@ -150,13 +154,15 @@ pub fn setup_mount_namespace(
             MsFlags::MS_BIND | MsFlags::MS_RDONLY,
             None::<&str>,
         )
-        .with_context(|| format!(
-            "Failed to bind-mount workspace: src={} dst={} exists_src={} exists_dst={}",
-            mount_src.display(),
-            ws_target.display(),
-            mount_src.exists(),
-            ws_target.exists(),
-        ))?;
+        .with_context(|| {
+            format!(
+                "Failed to bind-mount workspace: src={} dst={} exists_src={} exists_dst={}",
+                mount_src.display(),
+                ws_target.display(),
+                mount_src.exists(),
+                ws_target.exists(),
+            )
+        })?;
 
         // Remount as truly read-only (bind mount needs two-step)
         mount(
@@ -262,7 +268,11 @@ fn create_dev_nodes(new_root: &Path) -> Result<()> {
 }
 
 /// Resolve shared library dependencies and bind-mount them.
-fn bind_mount_interpreter(new_root: &Path, interpreter_path: &Path, extra_lib_paths: &[PathBuf]) -> Result<()> {
+fn bind_mount_interpreter(
+    new_root: &Path,
+    interpreter_path: &Path,
+    extra_lib_paths: &[PathBuf],
+) -> Result<()> {
     // Track mounted libraries to prevent duplicate bind mounts.
     // Mounting the same file twice (mount-on-mount) triggers a kernel panic on 6.17.0-1009-aws.
     let mut mounted: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -437,7 +447,10 @@ fn bind_mount_runtime_dirs(new_root: &Path, interpreter_path: &Path) -> Result<(
         // NOTE: lib-dynload shared library resolution is now done in the parent process
         // via resolve_dynload_libs() and passed as extra_lib_paths to avoid running
         // ldd from PID 1 of the new PID namespace (kernel panic on 6.17.0-1009-aws).
-        tracing::debug!(count = dirs_to_mount.len(), "Python runtime directories mounted");
+        tracing::debug!(
+            count = dirs_to_mount.len(),
+            "Python runtime directories mounted"
+        );
     } else if name.starts_with("node") || name.starts_with("deno") || name.starts_with("bun") {
         // Node.js runtime dirs
         for dir in &["/usr/lib/node_modules", "/usr/share/nodejs"] {
@@ -557,9 +570,7 @@ fn try_mount_overlayfs(
     }
 
     // Create upper + work dirs on the new tmpfs
-    if std::fs::create_dir_all(&upper_dir).is_err()
-        || std::fs::create_dir_all(&work_dir).is_err()
-    {
+    if std::fs::create_dir_all(&upper_dir).is_err() || std::fs::create_dir_all(&work_dir).is_err() {
         tracing::debug!("Failed to create overlay upper/work dirs — falling back");
         return false;
     }

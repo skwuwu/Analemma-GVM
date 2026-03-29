@@ -27,9 +27,7 @@ use std::time::{Duration, Instant};
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cert_generation_does_not_starve_tokio_workers() {
     let ca = gvm_proxy::tls_proxy::test_helpers::create_test_ca();
-    let resolver = Arc::new(
-        gvm_proxy::tls_proxy::GvmCertResolver::new(&ca.0, &ca.1).unwrap(),
-    );
+    let resolver = Arc::new(gvm_proxy::tls_proxy::GvmCertResolver::new(&ca.0, &ca.1).unwrap());
 
     // Canary: a lightweight async task that must complete within 100ms.
     // If tokio workers are starved by sync cert gen, this will time out.
@@ -49,9 +47,7 @@ async fn cert_generation_does_not_starve_tokio_workers() {
     for i in 0..200 {
         let r = resolver.clone();
         let domain = format!("{}.adversarial-starvation-test.invalid", i);
-        handles.push(tokio::spawn(async move {
-            r.ensure_cached(domain).await
-        }));
+        handles.push(tokio::spawn(async move { r.ensure_cached(domain).await }));
     }
 
     // Wait for all cert generations to complete
@@ -82,9 +78,7 @@ async fn cert_generation_does_not_starve_tokio_workers() {
 #[tokio::test]
 async fn ensure_cached_hot_path_is_zero_cost() {
     let ca = gvm_proxy::tls_proxy::test_helpers::create_test_ca();
-    let resolver = Arc::new(
-        gvm_proxy::tls_proxy::GvmCertResolver::new(&ca.0, &ca.1).unwrap(),
-    );
+    let resolver = Arc::new(gvm_proxy::tls_proxy::GvmCertResolver::new(&ca.0, &ca.1).unwrap());
 
     // Cold: first call generates cert
     resolver.ensure_cached("api.stripe.com".to_string()).await;
@@ -125,7 +119,8 @@ async fn eof_before_headers_returns_error_immediately() {
     drop(client);
 
     let start = Instant::now();
-    let result = gvm_proxy::tls_proxy::read_http_request(&mut tokio::io::BufReader::new(server)).await;
+    let result =
+        gvm_proxy::tls_proxy::read_http_request(&mut tokio::io::BufReader::new(server)).await;
 
     assert!(result.is_err(), "EOF must return error");
     // Must return in milliseconds (EOF is instant), not 30 seconds (timeout)
@@ -268,7 +263,10 @@ async fn smuggling_duplicate_cl_different_values_rejected() {
     let mut reader = tokio::io::BufReader::new(&mut cursor);
     let result = gvm_proxy::tls_proxy::read_http_request(&mut reader).await;
 
-    assert!(result.is_err(), "Duplicate CL with different values must be rejected");
+    assert!(
+        result.is_err(),
+        "Duplicate CL with different values must be rejected"
+    );
     assert!(
         format!("{}", result.err().unwrap()).contains("Content-Length"),
         "Error must identify duplicate CL",
@@ -289,7 +287,10 @@ async fn smuggling_duplicate_cl_same_value_accepted() {
     let mut reader = tokio::io::BufReader::new(&mut cursor);
     let result = gvm_proxy::tls_proxy::read_http_request(&mut reader).await;
 
-    assert!(result.is_ok(), "Duplicate CL with same value is RFC-compliant");
+    assert!(
+        result.is_ok(),
+        "Duplicate CL with same value is RFC-compliant"
+    );
     let req = result.unwrap();
     assert_eq!(req.method, "POST");
     assert_eq!(req.host, "safe.com");
@@ -366,9 +367,7 @@ fn alpn_rejects_h2_negotiation() {
         .ok();
 
     let ca = gvm_proxy::tls_proxy::test_helpers::create_test_ca();
-    let resolver = Arc::new(
-        gvm_proxy::tls_proxy::GvmCertResolver::new(&ca.0, &ca.1).unwrap(),
-    );
+    let resolver = Arc::new(gvm_proxy::tls_proxy::GvmCertResolver::new(&ca.0, &ca.1).unwrap());
     let config = gvm_proxy::tls_proxy::build_server_config(resolver).unwrap();
 
     // Only HTTP/1.1 is advertised
