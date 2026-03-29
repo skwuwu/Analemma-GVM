@@ -660,14 +660,32 @@ async fn relay_tls<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         upstream_tls.write_all(&req.body).await?;
     }
 
-    let mut buf = vec![0u8; 8192];
+    let mut buf = vec![0u8; 32768]; // 32KB buffer for large responses
+    let mut total_relayed: usize = 0;
     loop {
-        let n = upstream_tls.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
+        let n = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            upstream_tls.read(&mut buf),
+        )
+        .await
+        {
+            Ok(Ok(0)) => break,     // upstream closed
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, bytes_relayed = total_relayed, "MITM: upstream read error");
+                break;
+            }
+            Err(_) => {
+                tracing::debug!(bytes_relayed = total_relayed, "MITM: upstream read timeout (30s)");
+                break;
+            }
+        };
         tls_stream.write_all(&buf[..n]).await?;
         tls_stream.flush().await?;
+        total_relayed += n;
+    }
+    if total_relayed > 0 {
+        tracing::debug!(bytes = total_relayed, host = %upstream_host, "MITM: relay complete");
     }
     Ok(())
 }
