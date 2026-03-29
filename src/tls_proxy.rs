@@ -465,142 +465,210 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    // 1. Read plaintext HTTP from decrypted stream
-    let req = read_http_request(&mut tls_stream).await?;
-
-    let host = if req.host.is_empty() {
-        host_hint.to_string()
-    } else {
-        req.host.clone()
-    };
-
-    tracing::info!(
-        method = %req.method,
-        host = %host,
-        path = %req.path,
-        "MITM: inspecting HTTPS request"
-    );
-
-    // 2. SRR policy check (full: method + path + body)
-    let srr_result = {
-        let srr = state.srr.read().unwrap_or_else(|e| e.into_inner());
-        let body_ref = if req.body.is_empty() {
-            None
-        } else {
-            Some(req.body.as_slice())
+    // HTTP/1.1 keep-alive loop: handle multiple requests on the same TLS connection.
+    // OpenClaw and other agent frameworks reuse connections for multi-turn LLM calls
+    // (assistant → tool_use → tool_result → assistant). Without this loop, the second
+    // request on a keep-alive connection hangs forever (agent timeout).
+    //
+    // The loop exits when:
+    // - Client closes the connection (read returns 0 / EOF)
+    // - Read timeout expires (30s idle = client done sending)
+    // - Connection: close header is present
+    // - An error occurs
+    loop {
+        // 1. Read next HTTP request (with idle timeout for keep-alive)
+        let req = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            read_http_request(&mut tls_stream),
+        )
+        .await
+        {
+            Ok(Ok(req)) => req,
+            Ok(Err(_)) => break, // Parse error or connection closed
+            Err(_) => break,     // 30s idle timeout — client done
         };
-        srr.check(&req.method, &host, &req.path, body_ref)
-    };
 
-    let decision = &srr_result.decision;
-    tracing::info!(decision = ?decision, host = %host, path = %req.path, "MITM: SRR decision");
+        let host = if req.host.is_empty() {
+            host_hint.to_string()
+        } else {
+            req.host.clone()
+        };
 
-    // 3. Enforce decision
-    match decision {
-        gvm_types::EnforcementDecision::Deny { reason } => {
-            let event_id = uuid::Uuid::new_v4().to_string();
-            let trace_id = uuid::Uuid::new_v4().to_string();
-            let body = serde_json::json!({
-                "blocked": true,
-                "decision": "Deny",
-                "reason": reason,
-                "event_id": event_id,
-                "trace_id": trace_id,
-                "method": req.method,
-                "host": host,
-                "path": req.path,
-                "next_action": format!(
-                    "Blocked by SRR rule. To allow: add an Allow rule for {} {} in config/srr_network.toml and run POST /gvm/reload.",
-                    req.method, host
-                ),
-                "matched_rule": srr_result.matched_description.as_deref().unwrap_or(""),
+        let connection_close = req
+            .headers
+            .iter()
+            .any(|(k, v)| {
+                k.eq_ignore_ascii_case("connection")
+                    && std::str::from_utf8(v)
+                        .unwrap_or("")
+                        .eq_ignore_ascii_case("close")
             });
-            let body_str = body.to_string();
-            let response = format!(
-                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                body_str.len(), body_str
-            );
-            tls_stream.write_all(response.as_bytes()).await?;
-            tls_stream.shutdown().await?;
-            tracing::warn!(host = %host, path = %req.path, reason = %reason, "MITM: request DENIED");
-            return Ok(());
-        }
-        gvm_types::EnforcementDecision::Delay { milliseconds } => {
-            tokio::time::sleep(std::time::Duration::from_millis(*milliseconds)).await;
-        }
-        _ => {} // Allow, AuditOnly, etc.
-    }
 
-    // 4. API key injection (strip agent auth, inject proxy credentials)
-    let mut req = req;
-    if req.inject_credentials(&state.api_keys) {
-        tracing::info!(host = %host, "MITM: API key injected for upstream");
-    }
+        tracing::info!(
+            method = %req.method,
+            host = %host,
+            path = %req.path,
+            "MITM: inspecting HTTPS request"
+        );
 
-    // 5. Connect to upstream (TLS or HTTP via host_overrides for dev/mock)
-    let upstream_host = host.split(':').next().unwrap_or(&host);
-    let override_addr = state.host_overrides.get(upstream_host);
-
-    if let Some(local_addr) = override_addr {
-        // Dev mode: route to local mock server via HTTP (no TLS)
-        let addr = if local_addr.contains(':') {
-            local_addr.clone()
-        } else {
-            format!("{}:80", local_addr)
+        // 2. SRR policy check
+        let srr_result = {
+            let srr = state.srr.read().unwrap_or_else(|e| e.into_inner());
+            let body_ref = if req.body.is_empty() {
+                None
+            } else {
+                Some(req.body.as_slice())
+            };
+            srr.check(&req.method, &host, &req.path, body_ref)
         };
-        let mut upstream = tokio::net::TcpStream::connect(&addr)
-            .await
-            .context("MITM: failed to connect to dev override")?;
 
-        upstream.write_all(&req.raw_head).await?;
-        if !req.body.is_empty() {
-            upstream.write_all(&req.body).await?;
-        }
+        let decision = &srr_result.decision;
+        tracing::info!(decision = ?decision, host = %host, path = %req.path, "MITM: SRR decision");
 
-        let mut buf = vec![0u8; 8192];
-        loop {
-            let n = upstream.read(&mut buf).await?;
-            if n == 0 {
-                break;
+        // 3. Enforce decision
+        match decision {
+            gvm_types::EnforcementDecision::Deny { reason } => {
+                let event_id = uuid::Uuid::new_v4().to_string();
+                let trace_id = uuid::Uuid::new_v4().to_string();
+                let body = serde_json::json!({
+                    "blocked": true,
+                    "decision": "Deny",
+                    "reason": reason,
+                    "event_id": event_id,
+                    "trace_id": trace_id,
+                    "method": req.method,
+                    "host": host,
+                    "path": req.path,
+                    "next_action": format!(
+                        "Blocked by SRR rule. To allow: add an Allow rule for {} {} in config/srr_network.toml and run POST /gvm/reload.",
+                        req.method, host
+                    ),
+                    "matched_rule": srr_result.matched_description.as_deref().unwrap_or(""),
+                });
+                let body_str = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body_str.len(), body_str
+                );
+                tls_stream.write_all(response.as_bytes()).await?;
+                tls_stream.flush().await?;
+                tracing::warn!(host = %host, path = %req.path, reason = %reason, "MITM: request DENIED");
+                break; // Close connection on deny
             }
-            tls_stream.write_all(&buf[..n]).await?;
-            tls_stream.flush().await?;
-        }
-    } else {
-        // Production: connect upstream with TLS
-        let connector = tokio_rustls::TlsConnector::from(client_config);
-        let upstream_addr = format!("{}:443", upstream_host);
-
-        let upstream_tcp = tokio::net::TcpStream::connect(&upstream_addr)
-            .await
-            .context("MITM: failed to connect to upstream")?;
-        let server_name = rustls::pki_types::ServerName::try_from(upstream_host.to_string())
-            .map_err(|e| anyhow::anyhow!("MITM: invalid server name: {}", e))?;
-        let mut upstream_tls = connector
-            .connect(server_name, upstream_tcp)
-            .await
-            .context("MITM: upstream TLS handshake failed")?;
-
-        upstream_tls.write_all(&req.raw_head).await?;
-        if !req.body.is_empty() {
-            upstream_tls.write_all(&req.body).await?;
-        }
-
-        // Relay response: read from upstream, write to agent, flush after each chunk.
-        // flush() is critical for SSE/streaming — without it, small chunks stay in the
-        // TLS record buffer (up to 16KB) and never reach the agent, causing timeout.
-        let mut buf = vec![0u8; 8192];
-        loop {
-            let n = upstream_tls.read(&mut buf).await?;
-            if n == 0 {
-                break;
+            gvm_types::EnforcementDecision::Delay { milliseconds } => {
+                tokio::time::sleep(std::time::Duration::from_millis(*milliseconds)).await;
             }
-            tls_stream.write_all(&buf[..n]).await?;
-            tls_stream.flush().await?;
+            _ => {} // Allow, AuditOnly, etc.
+        }
+
+        // 4. API key injection
+        let mut req = req;
+        if req.inject_credentials(&state.api_keys) {
+            tracing::info!(host = %host, "MITM: API key injected for upstream");
+        }
+
+        // Force Connection: close on upstream request so the server closes the
+        // connection after sending the response. Without this, keep-alive upstreams
+        // leave the connection open and the relay loop blocks forever waiting for
+        // more data that never comes.
+        req.headers
+            .retain(|(k, _)| !k.eq_ignore_ascii_case("connection"));
+        req.headers
+            .push(("Connection".to_string(), b"close".to_vec()));
+        req.rebuild_raw_head();
+
+        // 5. Connect to upstream and relay (new connection per request)
+        let upstream_host = host.split(':').next().unwrap_or(&host);
+        let override_addr = state.host_overrides.get(upstream_host);
+
+        let relay_result = if let Some(local_addr) = override_addr {
+            let addr = if local_addr.contains(':') {
+                local_addr.clone()
+            } else {
+                format!("{}:80", local_addr)
+            };
+            relay_http(&mut tls_stream, &addr, &req).await
+        } else {
+            relay_tls(&mut tls_stream, upstream_host, &client_config, &req).await
+        };
+
+        if let Err(e) = relay_result {
+            tracing::debug!(error = %e, host = %host, "MITM: relay error");
+            break;
+        }
+
+        if connection_close {
+            break;
         }
     }
 
     tls_stream.shutdown().await.ok();
+    Ok(())
+}
+
+/// Relay a single request/response to an upstream HTTP server (dev mode).
+async fn relay_http<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    tls_stream: &mut tokio_rustls::server::TlsStream<S>,
+    addr: &str,
+    req: &HttpRequest,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut upstream = tokio::net::TcpStream::connect(addr)
+        .await
+        .context("MITM: failed to connect to dev override")?;
+
+    upstream.write_all(&req.raw_head).await?;
+    if !req.body.is_empty() {
+        upstream.write_all(&req.body).await?;
+    }
+
+    let mut buf = vec![0u8; 8192];
+    loop {
+        let n = upstream.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        tls_stream.write_all(&buf[..n]).await?;
+        tls_stream.flush().await?;
+    }
+    Ok(())
+}
+
+/// Relay a single request/response to an upstream TLS server (production).
+async fn relay_tls<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    tls_stream: &mut tokio_rustls::server::TlsStream<S>,
+    upstream_host: &str,
+    client_config: &std::sync::Arc<rustls::ClientConfig>,
+    req: &HttpRequest,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let connector = tokio_rustls::TlsConnector::from(client_config.clone());
+    let upstream_addr = format!("{}:443", upstream_host);
+
+    let upstream_tcp = tokio::net::TcpStream::connect(&upstream_addr)
+        .await
+        .context("MITM: failed to connect to upstream")?;
+    let server_name = rustls::pki_types::ServerName::try_from(upstream_host.to_string())
+        .map_err(|e| anyhow::anyhow!("MITM: invalid server name: {}", e))?;
+    let mut upstream_tls = connector
+        .connect(server_name, upstream_tcp)
+        .await
+        .context("MITM: upstream TLS handshake failed")?;
+
+    upstream_tls.write_all(&req.raw_head).await?;
+    if !req.body.is_empty() {
+        upstream_tls.write_all(&req.body).await?;
+    }
+
+    let mut buf = vec![0u8; 8192];
+    loop {
+        let n = upstream_tls.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        tls_stream.write_all(&buf[..n]).await?;
+        tls_stream.flush().await?;
+    }
     Ok(())
 }
 
