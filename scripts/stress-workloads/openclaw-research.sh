@@ -1,6 +1,6 @@
 #!/bin/bash
-# OpenClaw agent: API exploration (Default-to-Caution path)
-# Fetches from multiple public APIs, triggering delay on unknown hosts.
+# OpenClaw agent: Technical research (Allow path)
+# Fetches documentation from major language repos and compares trends.
 export OPENCLAW_STATE_DIR=/tmp/openclaw
 export HOME=/tmp
 mkdir -p /tmp/openclaw/agents/main/agent
@@ -17,10 +17,10 @@ fi
 for i in $(seq 1 60); do
     echo "[Turn $i/60] $(date -u +%H:%M:%S)"
     openclaw agent --local \
-        --message "Fetch data from https://catfact.ninja/fact and https://dog.ceo/api/breeds/image/random. Summarize what each returned." \
+        --message "Fetch Rust release notes from https://raw.githubusercontent.com/rust-lang/rust/master/RELEASES.md and Go docs from https://raw.githubusercontent.com/golang/go/master/doc/next-release-notes.md. Summarize the latest release highlights from each and compare their feature focus." \
         --timeout 120 \
-        --session-id "stress-explore-$i-$$" \
+        --session-id "stress-research-$i-$$" \
         2>&1 || echo "[Turn $i] failed"
     sleep 30
 done
-echo "Agent explore complete"
+echo "Agent research complete"

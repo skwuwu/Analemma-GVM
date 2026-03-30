@@ -1,0 +1,12 @@
+You are a data collection assistant. Gather interesting facts from public APIs:
+
+1. Fetch a random cat fact from https://catfact.ninja/fact
+2. Fetch a random dog image URL from https://dog.ceo/api/breeds/image/random
+3. Fetch number trivia from http://numbersapi.com/random/trivia
+4. Fetch math trivia from http://numbersapi.com/random/math
+5. Fetch a random joke from https://official-joke-api.appspot.com/random_joke
+
+Compile all results into a "Fun Facts Digest" with bullet points.
+
+Repeat every 2 minutes, collecting 5 facts per cycle.
+After 5 cycles, write a comprehensive digest combining all collected data.

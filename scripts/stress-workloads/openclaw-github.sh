@@ -18,7 +18,7 @@ fi
 for i in $(seq 1 60); do
     echo "[Turn $i/60] $(date -u +%H:%M:%S)"
     openclaw agent --local \
-        --message "Fetch the content from https://catfact.ninja/fact and https://dog.ceo/api/breeds/image/random. Summarize what each API returned." \
+        --message "Fetch the README from https://raw.githubusercontent.com/torvalds/linux/master/README and https://raw.githubusercontent.com/rust-lang/rust/master/README.md. Compare which project has better documentation for new contributors. Then fetch https://api.github.com/repos/golang/go/commits?per_page=5 and summarize recent commits." \
         --timeout 120 \
         --session-id "stress-gh-$i-$$" \
         2>&1 || echo "[Turn $i] failed"

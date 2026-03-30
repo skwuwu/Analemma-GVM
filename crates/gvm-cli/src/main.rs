@@ -204,6 +204,20 @@ enum Commands {
         output: String,
     },
 
+    /// Clean up orphaned sandbox resources (veth, iptables, mounts, cgroups).
+    ///
+    /// Scans for state files from previously crashed sandbox sessions and
+    /// removes all orphaned resources. Also removes any veth-gvm-* interfaces
+    /// without corresponding state files (defense-in-depth).
+    ///
+    ///   gvm cleanup                   # clean up and report
+    ///   gvm cleanup --dry-run         # show what would be cleaned
+    Cleanup {
+        /// Show what would be cleaned without actually cleaning.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Dry-run policy check without calling external APIs
     Check {
         /// Operation name (e.g. "gvm.payment.charge")
@@ -451,6 +465,64 @@ async fn main() -> anyhow::Result<()> {
                 &memory, &cpus, &output,
             )
             .await?;
+        }
+
+        Commands::Cleanup { dry_run } => {
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = dry_run;
+                eprintln!("Sandbox cleanup is only supported on Linux.");
+            }
+            #[cfg(target_os = "linux")]
+            {
+                if dry_run {
+                    eprintln!("Scanning for orphaned sandbox resources (dry run)...");
+                    let pattern = "/tmp/gvm-sandbox-*.state";
+                    let mut found = 0u32;
+                    for entry in
+                        glob::glob(pattern).unwrap_or_else(|_| glob::glob("").unwrap())
+                    {
+                        if let Ok(path) = entry {
+                            if let Ok(content) = std::fs::read_to_string(&path) {
+                                if let Ok(state) =
+                                    serde_json::from_str::<serde_json::Value>(&content)
+                                {
+                                    let pid = state["pid"].as_u64().unwrap_or(0) as u32;
+                                    let alive =
+                                        unsafe { libc::kill(pid as i32, 0) == 0 };
+                                    let status =
+                                        if alive { "ACTIVE" } else { "ORPHANED" };
+                                    eprintln!(
+                                        "  {} PID={} veth={} mounts={}",
+                                        status,
+                                        pid,
+                                        state["veth_host"].as_str().unwrap_or("?"),
+                                        state["mount_paths"]
+                                            .as_array()
+                                            .map(|a| a.len())
+                                            .unwrap_or(0),
+                                    );
+                                    if !alive {
+                                        found += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if found == 0 {
+                        eprintln!("No orphaned sandboxes found.");
+                    } else {
+                        eprintln!("{} orphaned sandbox(es) would be cleaned.", found);
+                    }
+                } else {
+                    eprintln!("Cleaning up orphaned sandbox resources...");
+                    match gvm_sandbox::cleanup_all_orphans() {
+                        Ok(0) => eprintln!("No orphaned sandboxes found."),
+                        Ok(n) => eprintln!("Cleaned up {} orphaned sandbox(es).", n),
+                        Err(e) => eprintln!("Cleanup error: {:#}", e),
+                    }
+                }
+            }
         }
 
         Commands::Check {

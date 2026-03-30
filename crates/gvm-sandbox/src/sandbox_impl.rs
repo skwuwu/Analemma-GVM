@@ -10,7 +10,7 @@ use crate::namespace::{
     coordination_pipe, sandbox_clone_flags, signal_child_ready, wait_for_parent, write_uid_map,
 };
 use crate::network::{
-    cleanup_host_network, clear_network_state, record_network_state, setup_host_network,
+    cleanup_host_network, clear_sandbox_state, record_sandbox_state, setup_host_network,
     setup_sandbox_network, VethConfig,
 };
 use crate::seccomp::{apply_seccomp_filter, count_seccomp_violations};
@@ -123,9 +123,12 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     if let Err(ref e) = network_result {
         tracing::warn!(error = %e, "Host network setup failed — sandbox will have no network");
     } else {
-        // Record network state for orphan cleanup on crash
-        if let Err(e) = record_network_state(&veth_config) {
-            tracing::debug!(error = %e, "Failed to record network state (orphan cleanup unavailable)");
+        // Record full sandbox state for orphan cleanup on crash.
+        // Includes network, mounts, and cgroup path — everything needed
+        // to deterministically clean up if this process is killed.
+        let mount_paths = vec![staging_ws.clone(), sandbox_root.clone()];
+        if let Err(e) = record_sandbox_state(&veth_config, &mount_paths, None) {
+            tracing::debug!(error = %e, "Failed to record sandbox state (orphan cleanup unavailable)");
         }
     }
     // 2.5. Attach eBPF TC ingress filter on host-side veth (unbypassable enforcement)
@@ -169,7 +172,22 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
             config.memory_limit,
             config.cpu_limit,
         ) {
-            Ok(guard) => guard,
+            Ok(guard) => {
+                // Update state file with cgroup path
+                if let Some(ref g) = guard {
+                    let mount_paths = vec![staging_ws.clone(), sandbox_root.clone()];
+                    let cgroup_path = format!(
+                        "/sys/fs/cgroup/gvm-agent-{}", child_pid.as_raw()
+                    );
+                    if let Err(e) = record_sandbox_state(
+                        &veth_config, &mount_paths, Some(&cgroup_path),
+                    ) {
+                        tracing::debug!(error = %e, "Failed to update state with cgroup");
+                    }
+                    let _ = g; // suppress unused warning
+                }
+                guard
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "cgroup setup failed — continuing without resource limits");
                 None
@@ -340,7 +358,7 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
 
     if network_result.is_ok() {
         cleanup_host_network(&veth_config);
-        clear_network_state();
+        clear_sandbox_state();
     }
 
     Ok(SandboxResult {

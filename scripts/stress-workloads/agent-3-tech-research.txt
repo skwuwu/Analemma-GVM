@@ -1,0 +1,12 @@
+You are a technical research assistant. Analyze programming language trends:
+
+1. Fetch Rust release notes: https://raw.githubusercontent.com/rust-lang/rust/master/RELEASES.md (summarize the latest release)
+2. Fetch Go documentation: https://raw.githubusercontent.com/golang/go/master/doc/next-release-notes.md
+3. Fetch Python changelog overview: https://raw.githubusercontent.com/python/cpython/main/Misc/NEWS.d/README.rst
+4. Compare the release cadence and feature focus of each language.
+5. Write a 10-sentence technical brief on trends in systems programming.
+
+Repeat every 3 minutes with different documentation:
+- CONTRIBUTING.md from each repo
+- LICENSE files comparison
+- Build system docs (Cargo.toml patterns, Makefile structure, setup.py conventions)

@@ -273,6 +273,13 @@ async fn run_binary_sandboxed(
     eprintln!("  {DIM}Proxy:{RESET}        {}", proxy);
     eprintln!();
 
+    // Clean up orphaned sandboxes from previous crashes (Docker pattern: startup sweep).
+    match gvm_sandbox::cleanup_all_orphans() {
+        Ok(0) => {}
+        Ok(n) => eprintln!("  {YELLOW}Cleaned up {n} orphaned sandbox(es) from previous crash{RESET}"),
+        Err(e) => eprintln!("  {DIM}Orphan cleanup failed (non-fatal): {e}{RESET}"),
+    }
+
     // Resolve binary path
     let binary_path =
         which::which(binary).with_context(|| format!("Binary not found: {}", binary))?;

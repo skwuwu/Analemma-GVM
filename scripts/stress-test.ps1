@@ -120,8 +120,8 @@ $InitialMem = [math]::Round((Get-Process -Id $ProxyPid).WorkingSet64 / 1MB, 1)
 $WorkloadDir = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "stress-workloads"
 $AgentScripts = @(
     (Join-Path $WorkloadDir "openclaw-github.sh"),
-    (Join-Path $WorkloadDir "openclaw-exfil.sh"),
-    (Join-Path $WorkloadDir "openclaw-explore.sh")
+    (Join-Path $WorkloadDir "openclaw-public-apis.sh"),
+    (Join-Path $WorkloadDir "openclaw-research.sh")
 )
 
 # ── Launch Agents ──
@@ -195,9 +195,9 @@ while ($true) {
         try {
             $check = Invoke-RestMethod -Uri "$ProxyUrl/gvm/check" -Method POST `
                 -ContentType "application/json" `
-                -Body '{"method":"POST","target_host":"webhook.site","target_path":"/test","operation":"test"}' -TimeoutSec 5
-            if ($check.decision -match "Deny") {
-                "[$ts] VERIFY: SRR loaded (webhook.site->Deny)" | Out-File -FilePath $ChaosLog -Encoding utf8 -Append
+                -Body '{"method":"GET","target_host":"api.github.com","target_path":"/repos/torvalds/linux/commits","operation":"test"}' -TimeoutSec 5
+            if ($check.decision -match "Allow") {
+                "[$ts] VERIFY: SRR loaded (api.github.com->Allow)" | Out-File -FilePath $ChaosLog -Encoding utf8 -Append
             } else {
                 "[$ts] FAIL: SRR NOT loaded — fail-open (got: $($check.decision))" | Out-File -FilePath $ChaosLog -Encoding utf8 -Append
             }

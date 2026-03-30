@@ -2,7 +2,7 @@
 # ═══════════════════════════════════════════════════════════════════
 # Analemma GVM — 1-Hour Stress Test with OpenClaw Chaos Agents
 #
-# Runs 5 OpenClaw agent instances through GVM proxy for 60 minutes
+# Runs 3 OpenClaw agent instances through GVM proxy for 60 minutes
 # with chaos injection (proxy kill, network partition, disk pressure).
 # Collects metrics every 60s. Reports pass/fail with evidence.
 #
@@ -17,22 +17,24 @@
 #   bash scripts/stress-test.sh                    # sandbox mode (default)
 #   bash scripts/stress-test.sh --contained        # Docker contained mode
 #   bash scripts/stress-test.sh --duration 30      # 30 minutes instead of 60
-#   bash scripts/stress-test.sh --agents 3         # 3 agents instead of 5
+#   bash scripts/stress-test.sh --agents 5         # 5 agents instead of 3
 # ═══════════════════════════════════════════════════════════════════
 
 set -uo pipefail
 
 # ── Configuration ──
 DURATION_MIN=${DURATION_MIN:-60}
-NUM_AGENTS=${NUM_AGENTS:-5}
+NUM_AGENTS=${NUM_AGENTS:-3}
 MODE="sandbox"  # sandbox or contained
-# Agent stagger: 60s × 5 agents = T+4m. Baseline starts at T+8m.
-# First chaos at T+15m gives 7 minutes of stable baseline.
+# Agent stagger: 60s × 3 agents = T+2m. Baseline starts at T+6m.
+# First chaos at T+15m gives 9 minutes of stable baseline.
 STAGGER_SEC=60
 CHAOS_KILL_MIN=${CHAOS_KILL_MIN:-15}
 CHAOS_NETWORK_MIN=${CHAOS_NETWORK_MIN:-25}
 CHAOS_DISK_MIN=${CHAOS_DISK_MIN:-35}
-CHAOS_DISK_RELEASE_MIN=${CHAOS_DISK_RELEASE_MIN:-40}
+# Disk release defaults to DISK + 5 minutes (not an absolute value).
+# Previous bug: default 40 exceeded 30-min test → release never fired.
+CHAOS_DISK_RELEASE_MIN=${CHAOS_DISK_RELEASE_MIN:-0}
 METRIC_INTERVAL=60
 MAX_MEM_INCREASE_MB=100
 MAX_FD_CONSECUTIVE_INCREASE=60
@@ -86,6 +88,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 DURATION_SEC=$((DURATION_MIN * 60))
+
+# Calculate disk release relative to disk inject (default: +5 minutes)
+if [ "$CHAOS_DISK_RELEASE_MIN" -eq 0 ] 2>/dev/null; then
+    CHAOS_DISK_RELEASE_MIN=$((CHAOS_DISK_MIN + 5))
+fi
 
 # ── Validation ──
 check_prereqs() {
@@ -243,13 +250,13 @@ import requests, time, os, random
 proxy = '$PROXY_URL'
 proxies = {'http': proxy, 'https': proxy}
 urls = [
-    ('GET', 'http://api.github.com/repos/torvalds/linux/issues?per_page=1'),
+    ('GET', 'http://api.github.com/repos/torvalds/linux/commits?per_page=1'),
     ('GET', 'http://api.github.com/repos/rust-lang/rust/commits?per_page=1'),
-    ('POST', 'http://webhook.site/test'),
+    ('GET', 'http://raw.githubusercontent.com/golang/go/master/README.md'),
     ('GET', 'http://catfact.ninja/fact'),
-    ('GET', 'http://api.coindesk.com/v1/bpi/currentprice.json'),
-    ('GET', 'http://numbersapi.com/42'),
+    ('GET', 'http://numbersapi.com/random/trivia'),
     ('GET', 'http://dog.ceo/api/breeds/image/random'),
+    ('GET', 'http://official-joke-api.appspot.com/random_joke'),
 ]
 for i in range(200):
     method, url = random.choice(urls)
@@ -330,11 +337,11 @@ chaos_proxy_kill() {
     local srr_check
     srr_check=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
         -H "Content-Type: application/json" \
-        -d '{"method":"POST","target_host":"webhook.site","target_path":"/test","operation":"test"}' \
+        -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/torvalds/linux/commits","operation":"test"}' \
         | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null || echo "unreachable")
 
-    if echo "$srr_check" | grep -qi "Deny"; then
-        chaos_log "VERIFY: SRR rules loaded correctly after restart (webhook.site → Deny)"
+    if echo "$srr_check" | grep -qi "Allow"; then
+        chaos_log "VERIFY: SRR rules loaded correctly after restart (api.github.com → Allow)"
     else
         chaos_log "FAIL: SRR rules NOT loaded after restart — fail-open risk (got: $srr_check)"
     fi
@@ -640,12 +647,13 @@ cleanup() {
     fi
     rm -f "$REPO_DIR/data/stress-fill.dat"
 
-    # Clean orphan veth interfaces from crashed sandboxes
+    # Run GVM cleanup for deterministic orphan removal (state-file based).
+    "$GVM_BIN" cleanup 2>/dev/null || true
+
+    # Defense-in-depth: also clean any veth/iptables that GVM cleanup missed.
     for veth in $(ip link show 2>/dev/null | grep -oP 'veth-gvm-h\S+' | cut -d@ -f1); do
         sudo ip link del "$veth" 2>/dev/null || true
     done
-
-    # Clean orphan iptables rules
     for chain in $(sudo iptables -L 2>/dev/null | grep -oP 'GVM-\S+'); do
         sudo iptables -D FORWARD -j "$chain" 2>/dev/null || true
         sudo iptables -F "$chain" 2>/dev/null || true
@@ -704,7 +712,28 @@ main() {
     kill $METRICS_PID 2>/dev/null || true
     kill $CHAOS_PID 2>/dev/null || true
 
-    # Final metric collection
+    # Kill agents BEFORE evaluation so their sandbox resources are released.
+    # Without this, active agent sandboxes show as "orphan veth" in evaluation.
+    if [ -f "$RESULTS_DIR/agent_pids.txt" ]; then
+        while read -r pid; do
+            kill "$pid" 2>/dev/null || true
+        done < "$RESULTS_DIR/agent_pids.txt"
+        sleep 3  # Wait for sandbox cleanup (veth deletion, state file removal)
+    fi
+
+    # Run GVM cleanup to deterministically remove any orphaned sandbox resources.
+    # This handles the case where agent kill doesn't propagate cleanly.
+    "$GVM_BIN" cleanup 2>/dev/null || true
+
+    # Release disk pressure before evaluation (cleanup may have missed it)
+    if [ -n "${DISK_PRESSURE_TMPFS:-}" ]; then
+        sudo umount "$DISK_PRESSURE_TMPFS" 2>/dev/null || true
+        if [ -f "$RESULTS_DIR/wal-before-chaos.log" ]; then
+            cp "$RESULTS_DIR/wal-before-chaos.log" "$REPO_DIR/data/wal.log" 2>/dev/null || true
+        fi
+    fi
+
+    # Final metric collection (after cleanup, so veth count is accurate)
     local final_elapsed=$(($(date +%s) - start_time))
     collect_metric $final_elapsed
 

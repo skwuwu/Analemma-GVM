@@ -4,6 +4,65 @@
 
 ---
 
+## 2026-03-30: Sandbox Auto-Cleanup (Docker Pattern) + seccomp Fix
+
+### What Changed
+
+**Sandbox auto-cleanup**: Replaced single-file state tracking (`/run/gvm/interfaces.json`) with per-PID state files (`/tmp/gvm-sandbox-{pid}.state`). Each sandbox writes a full resource manifest (veth, iptables, mounts, cgroups) at startup. On normal exit, cleanup + delete. On crash, next `gvm run --sandbox` detects stale files (PID dead) and auto-cleans orphan resources before proceeding.
+
+Added `gvm cleanup` CLI command for manual cleanup. Non-Linux platforms get a stub message.
+
+**seccomp fix**: Added `pwritev` (syscall 295), `preadv` (syscall 296), `socketpair` (syscall 53) to whitelist. Node.js libuv uses vectored I/O and worker IPC. Initial misidentification: dmesg showed `syscall=296` which was incorrectly mapped to `pwritev2` (328) — actually `pwritev` (296).
+
+### Why
+- 1024 stacked tmpfs mounts accumulated from stress test crashes (chaos_disk_pressure without cleanup)
+- Orphan veth interfaces, iptables rules leaked on sandbox SIGKILL
+- OpenClaw agents killed by SIGSYS (seccomp) in sandbox mode
+
+### Affected Files
+- `crates/gvm-sandbox/src/network.rs` — `SandboxState` struct, per-PID state files, `cleanup_all_orphans()`
+- `crates/gvm-sandbox/src/sandbox_impl.rs` — `record_sandbox_state()` with mounts + cgroup
+- `crates/gvm-sandbox/src/seccomp.rs` — pwritev, preadv, socketpair added to whitelist
+- `crates/gvm-sandbox/src/lib.rs` — export `cleanup_all_orphans()`
+- `crates/gvm-sandbox/Cargo.toml` — added `glob` dependency
+- `crates/gvm-cli/src/main.rs` — `gvm cleanup` command
+- `crates/gvm-cli/src/run.rs` — orphan sweep before sandbox launch
+- `crates/gvm-cli/Cargo.toml` — added `glob`, `libc` dependencies
+
+### Risk
+Medium. State file format change is backward-compatible (legacy `/run/gvm/interfaces.json` auto-migrated). Defense-in-depth: heuristic veth cleanup catches state file loss.
+
+---
+
+## 2026-03-30: Stress Test Workloads Rewrite (Benign Prompts)
+
+### What Changed
+
+Rewrote all stress test workload files to use legitimate, non-refusable prompts targeting public APIs and open-source repositories. Removed deny-trigger and exfiltration-testing workloads.
+
+**Workload files**:
+- `agent-1-github-read.txt` — rewritten: open-source repo comparison (GitHub raw + API)
+- `agent-2-public-apis.txt` — new (replaces `agent-2-exfiltration.txt`): catfact, dog.ceo, numbersapi, joke API
+- `agent-3-tech-research.txt` — new (replaces `agent-3-messaging.txt`, merges `agent-4-docs-reader.txt`): language release notes comparison
+- `agent-4-docs-reader.txt` — deleted (merged into agent-3)
+- `agent-5-unknown-hosts.txt` — deleted (was deny-testing)
+
+**OpenClaw scripts**:
+- `openclaw-github.sh` — updated prompt to match agent-1
+- `openclaw-public-apis.sh` — new (replaces `openclaw-exfil.sh`), uses agent-2 workload
+- `openclaw-research.sh` — new (replaces `openclaw-explore.sh`), uses agent-3 workload
+
+**stress-test.sh / stress-test.ps1**:
+- Python fallback URLs: removed webhook.site and coindesk, replaced with legitimate APIs (catfact, dog.ceo, numbersapi, official-joke-api, github raw)
+- SRR verification after chaos proxy kill: changed from webhook.site Deny check to api.github.com Allow check
+- Default agent count reduced from 5 to 3 (matching 3 workload files)
+
+**Affected files**: `scripts/stress-workloads/*`, `scripts/stress-test.sh`, `scripts/stress-test.ps1`
+
+**Risk**: Low. Stress test infrastructure only; no production code changes.
+
+---
+
 ## 2026-03-29: Wasm Engine Behind Feature Flag (Attack Surface Reduction)
 
 ### What Changed

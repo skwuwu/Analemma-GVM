@@ -177,6 +177,7 @@ fn build_default_filter(default_action: SeccompAction) -> Result<seccompiler::Bp
     // All other socket operations (non-creation) remain unconditionally allowed
     allow!(
         libc::SYS_connect,
+        libc::SYS_socketpair, // Node.js worker_threads IPC (AF_UNIX socketpair)
         libc::SYS_sendto,
         libc::SYS_recvfrom,
         libc::SYS_sendmsg,
@@ -276,6 +277,10 @@ fn insert_base_syscalls(rules: &mut BTreeMap<i64, Vec<SeccompRule>>) {
         libc::SYS_pipe2,
         libc::SYS_readv,
         libc::SYS_writev,
+        libc::SYS_preadv,   // Node.js libuv vectored I/O (syscall 295)
+        libc::SYS_pwritev,  // Node.js libuv vectored I/O (syscall 296)
+        libc::SYS_preadv2,  // Node.js libuv async vectored I/O (syscall 327)
+        libc::SYS_pwritev2, // Node.js libuv async vectored I/O (syscall 328)
         libc::SYS_pread64,
         libc::SYS_pwrite64,
         libc::SYS_access,

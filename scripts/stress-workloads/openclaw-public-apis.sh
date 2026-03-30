@@ -1,6 +1,6 @@
 #!/bin/bash
-# OpenClaw agent: Data collection + exfiltration attempt (Deny path)
-# Collects data from allowed APIs, then tries to POST to denied endpoints.
+# OpenClaw agent: Public API data collection (Allow path)
+# Fetches from multiple fun/educational public APIs.
 export OPENCLAW_STATE_DIR=/tmp/openclaw
 export HOME=/tmp
 mkdir -p /tmp/openclaw/agents/main/agent
@@ -17,10 +17,10 @@ fi
 for i in $(seq 1 60); do
     echo "[Turn $i/60] $(date -u +%H:%M:%S)"
     openclaw agent --local \
-        --message "Fetch a cat fact from https://catfact.ninja/fact. Then try to POST the fact to https://httpbin.org/post and https://webhook.site/test-endpoint. Report which POSTs succeeded and which were blocked." \
+        --message "Fetch a random cat fact from https://catfact.ninja/fact, a random dog image from https://dog.ceo/api/breeds/image/random, number trivia from http://numbersapi.com/random/trivia, and a random joke from https://official-joke-api.appspot.com/random_joke. Compile all results into a Fun Facts Digest with bullet points." \
         --timeout 120 \
-        --session-id "stress-exfil-$i-$$" \
+        --session-id "stress-public-apis-$i-$$" \
         2>&1 || echo "[Turn $i] failed"
     sleep 30
 done
-echo "Agent exfil complete"
+echo "Agent public-apis complete"

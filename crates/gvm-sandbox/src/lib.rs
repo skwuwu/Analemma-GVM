@@ -277,6 +277,20 @@ pub fn cleanup_orphaned_network() -> Result<bool> {
     Ok(false)
 }
 
+/// Scan for all orphaned sandbox resources (veth, mounts, cgroups, iptables)
+/// and clean them up. Returns the number of orphaned sandboxes cleaned.
+/// Used by `gvm cleanup` command and auto-cleanup on sandbox startup.
+#[cfg(target_os = "linux")]
+pub fn cleanup_all_orphans() -> Result<u32> {
+    network::cleanup_all_orphans()
+}
+
+/// Stub for non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+pub fn cleanup_all_orphans() -> Result<u32> {
+    Ok(0)
+}
+
 /// Run pre-flight checks to verify the system supports sandboxing.
 #[cfg(target_os = "linux")]
 pub fn preflight_check(config: &SandboxConfig) -> PreflightReport {

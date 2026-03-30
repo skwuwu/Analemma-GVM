@@ -36,7 +36,9 @@
 //! - AF_NETLINK sockets blocked by seccomp (cannot modify iptables)
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::Command;
 
 /// Network configuration for the sandbox.
@@ -572,116 +574,311 @@ fn run_iptables(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-// ─── Orphan Network Resource Tracking ───
+// ─── Per-PID Sandbox State Tracking (Docker pattern) ───
+//
+// Each sandbox writes a state file at startup listing all resources it created.
+// On normal exit, cleanup runs and the file is deleted.
+// On crash (SIGKILL, power loss), the file persists. The next `gvm run --sandbox`
+// scans for stale state files (PID dead) and auto-cleans orphan resources.
+// This is the same pattern Docker uses for container state management.
 
-const STATE_DIR: &str = "/run/gvm";
-const STATE_FILE: &str = "/run/gvm/interfaces.json";
+const STATE_DIR: &str = "/tmp";
+const STATE_PREFIX: &str = "gvm-sandbox-";
+const STATE_SUFFIX: &str = ".state";
+/// Legacy state file path (pre-v0.2). Cleaned up on first run.
+const LEGACY_STATE_FILE: &str = "/run/gvm/interfaces.json";
 
-/// Record a sandbox's network resources in the state file.
+/// Full resource manifest for a sandbox session.
+/// Serialized to `/tmp/gvm-sandbox-{pid}.state` on startup.
+/// All fields needed to deterministically clean up orphaned resources.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxState {
+    /// Schema version for forward compatibility.
+    pub version: u32,
+    /// PID of the parent GVM process (resource owner).
+    pub pid: u32,
+    /// Creation timestamp (ISO 8601).
+    pub created_at: String,
+    /// Host-side veth interface name.
+    pub veth_host: String,
+    /// Sandbox-side veth interface name.
+    pub veth_sandbox: String,
+    /// Host-side IP address.
+    pub host_ip: String,
+    /// Sandbox-side IP address.
+    pub sandbox_ip: String,
+    /// Proxy port for DNAT rules.
+    pub proxy_port: u16,
+    /// iptables FORWARD chain name (per-sandbox chain).
+    pub forward_chain: String,
+    /// Mount paths created for this sandbox.
+    pub mount_paths: Vec<String>,
+    /// Cgroup path (if resource limits were applied).
+    pub cgroup_path: Option<String>,
+}
+
+/// Get the state file path for a given PID.
+fn state_file_path(pid: u32) -> PathBuf {
+    PathBuf::from(format!(
+        "{}/{}{}{}", STATE_DIR, STATE_PREFIX, pid, STATE_SUFFIX
+    ))
+}
+
+/// Record a sandbox's full resource manifest to a per-PID state file.
 /// Called after host-side network setup succeeds.
-/// If the process crashes before cleanup, the next `gvm run` can read
-/// this file and clean up orphaned interfaces/rules.
-pub fn record_network_state(config: &VethConfig) -> Result<()> {
-    let state = serde_json::json!({
-        "veth_host": config.host_iface,
-        "veth_sandbox": config.sandbox_iface,
-        "host_ip": config.host_ip.to_string(),
-        "sandbox_ip": config.sandbox_ip.to_string(),
-        "proxy_port": config.proxy_addr.port(),
-        "pid": std::process::id(),
-        "created_at": time::OffsetDateTime::now_utc().to_string(),
-    });
+pub fn record_sandbox_state(
+    config: &VethConfig,
+    mount_paths: &[PathBuf],
+    cgroup_path: Option<&str>,
+) -> Result<()> {
+    let state = SandboxState {
+        version: 1,
+        pid: std::process::id(),
+        created_at: time::OffsetDateTime::now_utc().to_string(),
+        veth_host: config.host_iface.clone(),
+        veth_sandbox: config.sandbox_iface.clone(),
+        host_ip: config.host_ip.clone(),
+        sandbox_ip: config.sandbox_ip.clone(),
+        proxy_port: config.proxy_addr.port(),
+        forward_chain: format!("GVM-{}", config.host_iface),
+        mount_paths: mount_paths.iter().map(|p| p.display().to_string()).collect(),
+        cgroup_path: cgroup_path.map(|s| s.to_string()),
+    };
 
-    if let Err(e) = std::fs::create_dir_all(STATE_DIR) {
-        tracing::debug!(error = %e, "Cannot create {STATE_DIR} — orphan cleanup unavailable");
-        return Ok(()); // Non-fatal: /run may not be writable in some environments
-    }
-
-    std::fs::write(STATE_FILE, serde_json::to_string_pretty(&state)?)
-        .with_context(|| format!("Failed to write network state to {STATE_FILE}"))?;
+    let path = state_file_path(state.pid);
+    std::fs::write(&path, serde_json::to_string_pretty(&state)?)
+        .with_context(|| format!("Failed to write sandbox state to {}", path.display()))?;
 
     tracing::debug!(
-        path = STATE_FILE,
-        "Network state recorded for orphan cleanup"
+        path = %path.display(),
+        pid = state.pid,
+        "Sandbox state recorded for orphan cleanup"
     );
     Ok(())
 }
 
-/// Remove the state file after successful cleanup.
-pub fn clear_network_state() {
-    let _ = std::fs::remove_file(STATE_FILE);
+/// Remove the state file for the current process after successful cleanup.
+pub fn clear_sandbox_state() {
+    let path = state_file_path(std::process::id());
+    let _ = std::fs::remove_file(&path);
 }
 
-/// Clean up orphaned network resources from a previous crash.
-/// Reads `/run/gvm/interfaces.json`, reconstructs a VethConfig,
-/// calls `cleanup_host_network`, then removes the state file.
-///
-/// Returns Ok(true) if orphans were cleaned, Ok(false) if no state file,
-/// Err on I/O failure (non-fatal — logged and continued).
-pub fn cleanup_orphaned_network() -> Result<bool> {
-    let content = match std::fs::read_to_string(STATE_FILE) {
-        Ok(c) => c,
-        Err(_) => return Ok(false), // No state file — nothing to clean
-    };
+/// Check if a process is still running (signal 0 = liveness check).
+fn is_pid_alive(pid: u32) -> bool {
+    // kill(pid, 0) returns 0 if process exists, -1 with ESRCH if dead.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
 
-    let state: serde_json::Value =
-        serde_json::from_str(&content).context("Failed to parse orphan state file")?;
-
-    let host_iface = state["veth_host"].as_str().unwrap_or("").to_string();
-
-    if host_iface.is_empty() {
-        clear_network_state();
-        return Ok(false);
+/// Clean up all resources listed in a SandboxState.
+fn cleanup_state_resources(state: &SandboxState) {
+    // 1. Unmount sandbox mount paths (reverse order for nested mounts)
+    for mount_path in state.mount_paths.iter().rev() {
+        let path = std::path::Path::new(mount_path);
+        if path.exists() {
+            nix::mount::umount2(path, nix::mount::MntFlags::MNT_DETACH).ok();
+            std::fs::remove_dir_all(path).ok();
+            tracing::debug!(path = mount_path, "Unmounted orphan mount");
+        }
     }
 
-    // Check if the interface still exists
-    let exists = Command::new("ip")
-        .args(["link", "show", &host_iface])
+    // 2. Clean up cgroup
+    if let Some(ref cgroup) = state.cgroup_path {
+        let cg = std::path::Path::new(cgroup);
+        if cg.exists() {
+            // Kill any remaining processes in the cgroup
+            let procs_path = cg.join("cgroup.procs");
+            if let Ok(content) = std::fs::read_to_string(&procs_path) {
+                for line in content.lines() {
+                    if let Ok(pid) = line.trim().parse::<i32>() {
+                        unsafe { libc::kill(pid, libc::SIGKILL) };
+                    }
+                }
+            }
+            std::fs::remove_dir(cg).ok();
+            tracing::debug!(cgroup = cgroup, "Removed orphan cgroup");
+        }
+    }
+
+    // 3. Clean up network (veth + iptables + eBPF)
+    let veth_exists = Command::new("ip")
+        .args(["link", "show", &state.veth_host])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
 
-    if !exists {
-        // Interface already gone — just clean up state file
-        tracing::debug!(iface = %host_iface, "Orphan veth already removed");
-        clear_network_state();
-        return Ok(false);
+    if veth_exists {
+        let veth_config = VethConfig {
+            host_iface: state.veth_host.clone(),
+            sandbox_iface: state.veth_sandbox.clone(),
+            host_ip: state.host_ip.clone(),
+            sandbox_ip: state.sandbox_ip.clone(),
+            cidr: 30,
+            child_pid: state.pid,
+            proxy_addr: SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                state.proxy_port,
+            ),
+        };
+        cleanup_host_network(&veth_config);
+        crate::ebpf::detach_tc_filter(&state.veth_host);
+        tracing::debug!(iface = %state.veth_host, "Cleaned orphan veth + iptables");
+    }
+}
+
+/// Scan for stale state files and clean up orphaned sandbox resources.
+///
+/// Called at the start of every `gvm run --sandbox`. Finds state files
+/// whose owning PID is no longer running, cleans up all listed resources,
+/// and deletes the state files.
+///
+/// Also cleans up legacy single-file state from pre-v0.2 (`/run/gvm/interfaces.json`).
+///
+/// Returns the number of orphaned sandboxes cleaned up.
+pub fn cleanup_all_orphans() -> Result<u32> {
+    let mut cleaned = 0u32;
+
+    // 1. Scan per-PID state files
+    let pattern = format!("{}/{}*{}", STATE_DIR, STATE_PREFIX, STATE_SUFFIX);
+    for entry in glob::glob(&pattern).unwrap_or_else(|_| glob::glob("").unwrap()) {
+        let path = match entry {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+        };
+
+        let state: SandboxState = match serde_json::from_str(&content) {
+            Ok(s) => s,
+            Err(_) => {
+                tracing::warn!(path = %path.display(), "Corrupt state file — removing");
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+        };
+
+        // Skip if the owning process is still alive
+        if is_pid_alive(state.pid) {
+            continue;
+        }
+
+        tracing::info!(
+            pid = state.pid,
+            veth = %state.veth_host,
+            mounts = state.mount_paths.len(),
+            "Cleaning up orphaned sandbox (PID {} dead)",
+            state.pid
+        );
+
+        cleanup_state_resources(&state);
+        let _ = std::fs::remove_file(&path);
+        cleaned += 1;
     }
 
-    // Reconstruct VethConfig and clean up
-    let proxy_port = state["proxy_port"].as_u64().unwrap_or(8080) as u16;
+    // 2. Clean up legacy single-file state (pre-v0.2 backward compat)
+    if let Ok(content) = std::fs::read_to_string(LEGACY_STATE_FILE) {
+        if let Ok(legacy) = serde_json::from_str::<serde_json::Value>(&content) {
+            let pid = legacy["pid"].as_u64().unwrap_or(0) as u32;
+            if pid == 0 || !is_pid_alive(pid) {
+                let host_iface = legacy["veth_host"].as_str().unwrap_or("");
+                if !host_iface.is_empty() {
+                    let proxy_port = legacy["proxy_port"].as_u64().unwrap_or(8080) as u16;
+                    let config = VethConfig {
+                        host_iface: host_iface.to_string(),
+                        sandbox_iface: legacy["veth_sandbox"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string(),
+                        host_ip: legacy["host_ip"]
+                            .as_str()
+                            .unwrap_or("10.200.0.1")
+                            .to_string(),
+                        sandbox_ip: legacy["sandbox_ip"]
+                            .as_str()
+                            .unwrap_or("10.200.0.2")
+                            .to_string(),
+                        cidr: 30,
+                        child_pid: pid,
+                        proxy_addr: SocketAddr::new(
+                            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                            proxy_port,
+                        ),
+                    };
+                    cleanup_host_network(&config);
+                    crate::ebpf::detach_tc_filter(host_iface);
+                    tracing::info!("Cleaned up legacy state file");
+                }
+                let _ = std::fs::remove_file(LEGACY_STATE_FILE);
+                cleaned += 1;
+            }
+        }
+    }
 
-    let config = VethConfig {
-        host_iface: host_iface.clone(),
-        sandbox_iface: state["veth_sandbox"].as_str().unwrap_or("").to_string(),
-        host_ip: state["host_ip"]
-            .as_str()
-            .unwrap_or("10.200.0.1")
-            .to_string(),
-        sandbox_ip: state["sandbox_ip"]
-            .as_str()
-            .unwrap_or("10.200.0.2")
-            .to_string(),
-        cidr: 30,
-        child_pid: state["pid"].as_u64().unwrap_or(0) as u32,
-        proxy_addr: std::net::SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            proxy_port,
-        ),
-    };
+    // 3. Defense-in-depth: find veth-gvm-* interfaces with no state file
+    if let Ok(output) = Command::new("ip").args(["-o", "link", "show"]).output() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if let Some(iface) = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.strip_suffix(':'))
+            {
+                if iface.starts_with("veth-gvm-h") {
+                    // Check if any state file references this interface
+                    let has_state = glob::glob(&pattern)
+                        .ok()
+                        .map(|entries| {
+                            entries.filter_map(|e| e.ok()).any(|p| {
+                                std::fs::read_to_string(&p)
+                                    .ok()
+                                    .map(|c| c.contains(iface))
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .unwrap_or(false);
 
-    tracing::info!(
-        iface = %host_iface,
-        pid = state["pid"].as_u64().unwrap_or(0),
-        "Cleaning up orphaned sandbox network from previous crash"
-    );
+                    if !has_state {
+                        tracing::warn!(
+                            iface = iface,
+                            "Found orphan veth with no state file — cleaning up"
+                        );
+                        let _ = Command::new("ip")
+                            .args(["link", "del", iface])
+                            .output();
+                        cleaned += 1;
+                    }
+                }
+            }
+        }
+    }
 
-    cleanup_host_network(&config);
-    crate::ebpf::detach_tc_filter(&host_iface);
-    clear_network_state();
+    if cleaned > 0 {
+        tracing::info!(count = cleaned, "Orphan sandbox cleanup complete");
+    }
+    Ok(cleaned)
+}
 
-    tracing::info!("Orphaned network resources cleaned up");
-    Ok(true)
+// Backward-compatible aliases for existing callers during migration.
+
+/// Record network state (legacy alias — delegates to per-PID state).
+pub fn record_network_state(config: &VethConfig) -> Result<()> {
+    record_sandbox_state(config, &[], None)
+}
+
+/// Clear network state (legacy alias — delegates to per-PID clear).
+pub fn clear_network_state() {
+    clear_sandbox_state();
+}
+
+/// Clean up orphaned network (legacy alias — delegates to full orphan scan).
+pub fn cleanup_orphaned_network() -> Result<bool> {
+    let count = cleanup_all_orphans()?;
+    Ok(count > 0)
 }
 
 /// Run an `ip6tables` command, returning an error on failure.
