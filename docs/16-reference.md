@@ -275,6 +275,17 @@ gvm run -- openclaw gateway            # Arbitrary binary + args
 gvm run --sandbox -- openclaw gateway  # Binary in Linux sandbox
 ```
 
+### Sandbox Cleanup
+
+```bash
+gvm cleanup              # Remove orphaned sandbox resources
+gvm cleanup --dry-run    # Show what would be cleaned (no action)
+```
+
+Scans for per-PID state files (`/tmp/gvm-sandbox-{pid}.state`) from previously crashed sandbox sessions. If the owning PID is dead, cleans up all listed resources: veth interfaces, iptables DNAT/FORWARD rules, mount paths, and cgroup directories. Also removes any `veth-gvm-*` interfaces without corresponding state files (defense-in-depth).
+
+Auto-cleanup also runs at the start of every `gvm run --sandbox` — you only need `gvm cleanup` for manual recovery after abnormal termination without a subsequent sandbox launch.
+
 ### Binary Mode (`gvm run -- <command>`)
 
 When the argument after `--` is not a recognized script file (`.py`, `.js`, `.ts`, `.sh`, `.bash`) or when multiple arguments follow `--`, `gvm run` enters **binary mode**. The specified command is executed with `HTTP_PROXY` and `HTTPS_PROXY` set to route all outbound traffic through the GVM proxy.

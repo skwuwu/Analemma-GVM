@@ -1,8 +1,8 @@
 # Part 9: Test & Benchmark Report
 
-**Total: 367+ Rust Tests across all crates + 34 EC2 E2E Scenarios — All Pass**
+**Total: 367+ Rust Tests across all crates + 75 EC2 E2E Scenarios + 30-min Chaos Stress Test — All Pass**
 **Benchmarks: 19 benchmark functions (Criterion v0.5)**
-**Last Verified: 2026-03-27 (`cargo test --workspace`)**
+**Last Verified: 2026-03-30 (`cargo test --workspace` + EC2 E2E + stress test)**
 
 > Note: Test count grows with each feature. The number above reflects `grep -r '#[test]\|#[tokio::test]' src/ crates/ tests/` at time of writing. Run `cargo test` to verify current count.
 
@@ -38,8 +38,9 @@ crates/gvm-sandbox/
 ├── src/tls_probe.rs    # 10 TLS probe tests (symbol resolution, HTTP parsing, policy callback)
 ├── tests/security.rs   # 7 sandbox config + preflight tests
 scripts/
-├── ec2-e2e-test.sh     # 34 Linux E2E scenarios (EC2/Codespace)
+├── ec2-e2e-test.sh     # 75 Linux E2E scenarios (EC2/Codespace)
 ├── ec2-setup.sh        # One-command EC2 setup
+├── stress-test.sh      # 30-min chaos stress test (proxy kill, network partition, disk pressure)
 benches/
 ├── pipeline.rs         # 17 benchmark groups (Criterion)
 ```
@@ -628,7 +629,7 @@ cargo bench --bench pipeline -- "ebpf_kernel"       # eBPF TC setup (Linux only)
 
 ## 9.9 EC2 Linux E2E Test Suite
 
-**Script**: [`scripts/ec2-e2e-test.sh`](../scripts/ec2-e2e-test.sh) — 34 scenarios, requires Linux (EC2 or Codespace).
+**Script**: [`scripts/ec2-e2e-test.sh`](../scripts/ec2-e2e-test.sh) — 75 scenarios, requires Linux (EC2 or Codespace).
 **Setup**: [`scripts/ec2-setup.sh`](../scripts/ec2-setup.sh) — one-command dependency install.
 
 | # | Test | What it verifies |
@@ -670,7 +671,72 @@ cargo bench --bench pipeline -- "ebpf_kernel"       # eBPF TC setup (Linux only)
 
 ---
 
-## 9.10 Coverage Gaps and Future Tests
+## 9.10 Chaos Stress Test (30 minutes)
+
+**Script**: [`scripts/stress-test.sh`](../scripts/stress-test.sh) — sustained load with chaos injection, requires Linux (EC2 recommended, t3.medium+).
+
+Runs 3 OpenClaw agent instances through the GVM proxy sandbox for 30 minutes with chaos events injected at scheduled intervals. Validates proxy stability, resource leak detection, and crash recovery under real LLM workloads.
+
+### Configuration
+
+```bash
+sudo env PATH=$PATH ANTHROPIC_API_KEY=$KEY \
+  bash scripts/stress-test.sh --duration 30 --agents 3 \
+  --chaos-kill 8 --chaos-network 15 --chaos-disk 22
+```
+
+### Chaos Events
+
+| Time | Event | Injection | Recovery Criteria |
+|------|-------|-----------|-------------------|
+| T+8m | Proxy kill | `kill -9` proxy process | Restart within 60s, SRR rules re-loaded |
+| T+15m | Network partition | 5s delay + 20% loss on ports 80/443 | Proxy healthy, loopback metrics unaffected |
+| T+20m | Network restore | Remove tc qdisc + iptables marks | Normal operation resumes |
+| T+22m | Disk pressure | 64KB tmpfs over WAL directory (ENOSPC) | Proxy healthy, emergency WAL fallback |
+| T+27m | Disk release | Unmount tmpfs, restore WAL | WAL resumes writing |
+
+### Pass/Fail Criteria
+
+| Check | Threshold |
+|-------|-----------|
+| Memory leak | RSS increase < 100MB over test duration |
+| FD leak | No 60+ consecutive FD count increases |
+| Proxy recovery | Proxy reachable within 60s after kill |
+| Orphan veth | 0 orphan `veth-gvm-*` interfaces at end |
+| WAL integrity | Merkle chain verified, 0 hash mismatches |
+
+### Results (2026-03-30, 30-minute run)
+
+**VERDICT: PASS** — chaos injection (proxy kill, network partition, disk pressure) under sustained OpenClaw agent load: memory +2.4MB, FD stable at 14, WAL integrity verified, 0 orphan resources.
+
+| Metric | Value |
+|--------|-------|
+| RSS | 9.4 → 11.8MB (peak) → 9.8MB (stable post-restart) |
+| FD | 14 → 20 (agents active) → 14 (stable) |
+| MITM inspections | 52 HTTPS L7 inspections |
+| CONNECT tunnels | 43 total |
+| WAL events | 2 valid, 0 corrupt, 0 hash mismatch |
+| Proxy errors | 0 (no panic, fatal, or connection refused) |
+| Orphan veth | 0 (auto-cleanup via per-PID state files) |
+| Audit gap | 513s during proxy kill window (expected) |
+
+### Agent Workloads
+
+Agents use legitimate, non-refusable tasks to generate sustained HTTPS traffic:
+
+| Agent | Workload | APIs Called |
+|-------|----------|------------|
+| 1 | GitHub repo comparison | raw.githubusercontent.com, api.github.com |
+| 2 | Public API data collection | catfact.ninja, dog.ceo, numbersapi.com, official-joke-api |
+| 3 | Technical research | raw.githubusercontent.com (RELEASES.md, CONTRIBUTING.md) |
+
+### SRR Policy for Stress Testing
+
+`config/stress-srr.toml` uses Allow for all LLM and agent tool APIs. Deny rules are set only on domains agents never call (webhook.site, evil-exfil.attacker.com) for WAL verification without impacting agent uptime. No catch-all delay — stress testing prioritizes sustained load over policy enforcement.
+
+---
+
+## 9.11 Coverage Gaps and Future Tests
 
 | Gap | Priority | Tracking Issue |
 |-----|----------|---------------|

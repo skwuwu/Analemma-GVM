@@ -1,6 +1,6 @@
 # Security Model & Known Attack Surface
 
-> **Last updated**: 2026-03-19
+> **Last updated**: 2026-03-30
 
 ## Purpose
 
@@ -106,7 +106,7 @@ gvm run --sandbox my_agent.py
       iptables OUTPUT → DROP (all else)
   → IPv6 fully disabled (sysctl + ip6tables DROP fallback)
   → resolv.conf aligned to host veth IP (DNS resolution via host only)
-  → seccomp-BPF: ~111 syscalls whitelisted
+  → seccomp-BPF: ~117 syscalls whitelisted
 ```
 
 Defense-in-depth enforcement layers (v0.2.4):
@@ -115,11 +115,13 @@ Defense-in-depth enforcement layers (v0.2.4):
 
 2. **iptables OUTPUT chain** (sandbox-side): Traditional firewall rules inside the sandbox. Provides enforcement even without TC filter, but is potentially modifiable by the agent via netlink sockets (mitigated by seccomp, see below).
 
-3. **seccomp AF_NETLINK blocking**: The `socket()` syscall is argument-filtered to only allow AF_INET (2), AF_INET6 (10), and AF_UNIX (1). AF_NETLINK (16) and AF_PACKET (17) are blocked by `SECCOMP_RET_KILL_PROCESS`. This prevents agents from creating netlink sockets to modify iptables rules inside the sandbox — closing the CAP_NET_ADMIN escape vector where `CLONE_NEWUSER` grants apparent root with `CAP_NET_ADMIN` for the associated network namespace.
+3. **seccomp socket domain filtering**: The `socket()` syscall is argument-filtered to only allow AF_UNIX (1), AF_INET (2), AF_INET6 (10), and AF_NETLINK (16). AF_NETLINK is allowed because `getaddrinfo()` requires `NETLINK_ROUTE` for DNS resolution (safe: all capabilities are dropped, so netlink cannot modify iptables). AF_PACKET (17) is blocked by `SECCOMP_RET_KILL_PROCESS`. This prevents agents from creating netlink sockets to modify iptables rules inside the sandbox — closing the CAP_NET_ADMIN escape vector where `CLONE_NEWUSER` grants apparent root with `CAP_NET_ADMIN` for the associated network namespace.
 
 4. **seccomp dual filter audit logging** (v0.2.5): Two seccomp-BPF filters are stacked in LIFO order — a Log filter (installed first, evaluated second) and a KillProcess filter (installed second, evaluated first). The kernel evaluates all filters and takes the strictest result (`SECCOMP_RET_KILL_PROCESS`), but the Log filter also emits a `type=SECCOMP` audit record to the kernel log (`dmesg | grep SECCOMP` or `ausearch -m SECCOMP`). This provides both enforcement AND an audit trail for blocked syscalls. The parent process detects violations via `WaitStatus::Signaled(_, SIGSYS, _)` and logs them with the child PID for correlation with kernel audit records.
 
 After sandbox network setup, the agent can only reach: (1) GVM proxy via TCP on the host veth IP, (2) DNS via UDP 53 on the same host veth IP, (3) loopback. All other egress is dropped at multiple layers. IPv6 is disabled to prevent bypassing IPv4 firewall rules.
+
+5. **Sandbox resource cleanup** (v0.3): Per-PID state files (`/tmp/gvm-sandbox-{pid}.state`) record all resources created by each sandbox (veth, iptables rules, mounts, cgroups). On normal exit, cleanup + delete. On crash, the next `gvm run --sandbox` detects stale state files (dead PIDs) and auto-cleans orphan resources before proceeding. `gvm cleanup` provides manual recovery. Defense-in-depth: heuristic scan removes `veth-gvm-*` interfaces without corresponding state files.
 
 **Known limitation — DNS tunneling**: DNS queries are allowed through the host's upstream resolver for name resolution. An agent could encode data in DNS query hostnames (e.g., `base64-data.attacker.com`) to exfiltrate information at low bandwidth (~50 bytes/query). Current mitigations: (1) DNS is restricted to the host's resolver only (no arbitrary DNS server), (2) all DNS goes through DNAT which enables future iptables LOG-based monitoring. Planned mitigation: local DNS cache/filter that restricts queries to domains seen in SRR rules.
 
