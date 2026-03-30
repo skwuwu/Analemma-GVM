@@ -210,7 +210,7 @@
 - [x] seccomp dual filter stacking — Log + KillProcess for enforcement with kernel audit trail
 - [x] seccomp violation detection — parent detects SIGSYS/SIGKILL, logs with child PID for audit correlation
 - [x] TC ingress filter on host-side veth — unbypassable kernel-level proxy enforcement (eBPF-first, iptables fallback)
-- [x] Docker fallback mode (`gvm run --contained`)
+- [x] Docker fallback mode (`gvm run --contained`) — implemented, experimental (WSL2/iptables instability)
 - [x] Sandbox preflight gating for critical prerequisites (`CAP_NET_ADMIN`, `ip`, `iptables`, userns, seccomp, eBPF)
 - [x] Local proxy auto-start for `gvm run` when localhost target is unreachable
 - [ ] Mandatory-by-default interception profile (reject non-contained launch in production)

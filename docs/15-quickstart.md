@@ -48,10 +48,10 @@ That's it. `gvm run` auto-configures the proxy, routes all HTTP traffic through 
 ```bash
 gvm run my_agent.py              # Lite:  HTTP proxy only (dev/testing)
 gvm run --sandbox my_agent.py    # Hard:  + Linux namespaces + seccomp (production)
-gvm run --contained my_agent.py  # Full:  + Docker isolation (any OS)
+gvm run --contained my_agent.py  # Docker isolation (experimental — see note)
 ```
 
-> **Non-Linux?** `--sandbox` is Linux-only. Use `--contained` on Windows/macOS, or run without isolation — Layer 2 SRR still enforces governance on all HTTP traffic.
+> **Non-Linux?** `--sandbox` is Linux-only (production). `--contained` (Docker) is implemented but experimental — unstable on WSL2 and slim images. On Windows/macOS, run without isolation — Layer 2 SRR still enforces governance on all HTTP traffic.
 
 ---
 

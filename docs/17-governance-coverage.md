@@ -9,7 +9,7 @@
 | Mode | Command | Enforcement | Target |
 |------|---------|-------------|--------|
 | **Cooperative** | `gvm run agent.py` | Agent respects `HTTP_PROXY` | Development, any OS |
-| **Contained** | `gvm run --contained agent.py` | Docker network isolation + MITM | CI/CD, any OS |
+| **Contained** | `gvm run --contained agent.py` | Docker network isolation + MITM | **Experimental** — not production-ready |
 | **Sandbox** | `gvm run --sandbox agent.py` | Kernel-level (namespace + seccomp + TC + eBPF) | Production, Linux |
 
 All modes share the same SRR rules, ABAC policies, and config files. Policies built in development work identically in production.
@@ -61,6 +61,8 @@ Cooperative mode depends on the agent's HTTP library respecting proxy environmen
 ---
 
 ## Mode 2: Contained (`gvm run --contained`)
+
+> **Status: Experimental — not production-ready.** Contained mode is implemented but unstable due to Docker environment limitations: WSL2 network bridge issues with large responses, iptables unavailability in slim base images, `NET_ADMIN` capability constraints, and Windows path translation failures. Use `--sandbox` on Linux for production isolation. Contained mode stabilization is planned for a future release.
 
 The agent runs inside a Docker container with network-level isolation and transparent HTTPS MITM inspection.
 
@@ -239,7 +241,7 @@ These are architectural boundaries, not missing features:
 
 ## Mode comparison summary
 
-| Capability | Cooperative | Contained | Sandbox |
+| Capability | Cooperative | Contained (experimental) | Sandbox |
 |-----------|-------------|-----------|---------|
 | HTTP governance | Cooperative | Structural | Structural |
 | HTTPS L7 inspection | Domain only | Full (MITM) | Full (MITM) |
@@ -247,6 +249,7 @@ These are architectural boundaries, not missing features:
 | Network bypass prevention | None | Docker network | Kernel (TC + iptables + seccomp) |
 | Filesystem governance | None | Read-only root | overlayfs Trust-on-Pattern |
 | Resource limits | None | Docker limits | cgroup v2 |
-| Syscall filtering | None | Docker default | Custom seccomp (~111 allowed) |
+| Syscall filtering | None | Docker default | Custom seccomp (~117 allowed) |
 | IC-3 self-approval prevention | None | None | Admin port unreachable |
+| Stability | **Production** | **Experimental** | **Production** |
 | Platform | Any OS | Any OS + Docker | Linux (kernel ≥ 4.15, recommended ≥ 6.1) |

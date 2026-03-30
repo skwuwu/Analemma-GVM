@@ -42,8 +42,8 @@ Every API call displayed in real time. Session summary with host breakdown, toke
 ```bash
 gvm run my_agent.py --interactive       # discover rules from live traffic
 gvm run my_agent.py                     # enforce rules
-gvm run --contained my_agent.py         # + Docker isolation + HTTPS MITM
-gvm run --sandbox my_agent.py           # + kernel-level isolation (Linux)
+gvm run --sandbox my_agent.py           # + kernel-level isolation (Linux, production)
+gvm run --contained my_agent.py         # + Docker isolation (experimental)
 ```
 
 Workflow: **observe → discover → enforce.** Policies built in development work identically in production.
@@ -99,12 +99,12 @@ Unknown URLs → configurable: `delay` (dev), `require_approval` (prod), `deny` 
 |------|---------|-----------------|----------|
 | **Observe** | `gvm watch agent.py` | None (observation only) | Any OS |
 | **Cooperative** | `gvm run agent.py` | Python: full (via HTTPS_PROXY). Node.js: HTTP only* | Any OS |
-| **Docker** | `gvm run --contained agent.py` | Full L7 — all runtimes (DNAT → MITM) | Any OS + Docker |
-| **Sandbox** | `gvm run --sandbox agent.py` | Full L7 — all runtimes (DNAT → MITM) | Linux |
+| **Sandbox** | `gvm run --sandbox agent.py` | Full L7 — all runtimes (DNAT → MITM) | Linux (production) |
+| **Docker** | `gvm run --contained agent.py` | Full L7 — all runtimes (DNAT → MITM) | Any OS + Docker (**experimental**) |
 
-> \* **Cooperative mode + Node.js**: Node.js `https` module ignores `HTTPS_PROXY` by default. HTTPS traffic bypasses the proxy. Use `--contained` or `--sandbox` for Node.js agents (OpenClaw, custom Node.js). Python agents (`requests`, `httpx`) respect `HTTPS_PROXY` automatically. GVM detects Node.js agents and warns in cooperative mode.
+> \* **Cooperative mode + Node.js**: Node.js `https` module ignores `HTTPS_PROXY` by default. HTTPS traffic bypasses the proxy. Use `--sandbox` for Node.js agents (OpenClaw, custom Node.js). Python agents (`requests`, `httpx`) respect `HTTPS_PROXY` automatically. GVM detects Node.js agents and warns in cooperative mode.
 
-`--contained` and `--sandbox` use DNAT to intercept all TCP 443 traffic at the network level — runtime-agnostic. [Detailed coverage →](docs/17-governance-coverage.md)
+`--sandbox` uses DNAT to intercept all TCP 443 traffic at the network level — runtime-agnostic. `--contained` (Docker) is implemented but experimental due to WSL2 network limitations and iptables availability issues in slim images. [Detailed coverage →](docs/17-governance-coverage.md)
 
 ---
 

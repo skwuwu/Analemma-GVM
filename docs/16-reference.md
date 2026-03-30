@@ -398,9 +398,11 @@ When set (e.g., `"http://127.0.0.1:8080"`), the uprobe queries the proxy's `/gvm
 
 | Platform | Proxy | SDK | `--sandbox` | `--contained` |
 |----------|-------|-----|-------------|---------------|
-| Linux | Native | Native | Native | Docker |
-| Windows | Native | Native | Not supported | Docker Desktop |
-| macOS | Native | Native | Not supported | Docker Desktop |
+| Linux | Native | Native | **Production** | Experimental |
+| Windows | Native | Native | Not supported | Experimental (Docker Desktop) |
+| macOS | Native | Native | Not supported | Experimental (Docker Desktop) |
+
+> **`--contained` status**: Implemented but experimental. Known issues: WSL2 network bridge drops large TCP responses, `python:3.12-slim` lacks iptables, `NET_ADMIN` capability can be abused by agents, Windows path translation failures. Use `--sandbox` on Linux for production. Stabilization planned for a future release.
 
 ### Sandbox Prerequisites (Linux only)
 

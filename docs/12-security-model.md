@@ -84,7 +84,7 @@ If an attacker has root access to the host, GVM — like any userspace process �
 **Current (v1)**:
 - Cooperative default: SDK sets `HTTP_PROXY` via `GVMAgent.create_session()`.
 - **Enforced mode**: `gvm run --sandbox` (Linux namespace + veth + TC filter + iptables + seccomp). Three-layer defense-in-depth: (1) TC ingress filter on host-side veth (unbypassable), (2) iptables OUTPUT chain inside sandbox, (3) seccomp AF_NETLINK blocking prevents iptables modification.
-- Docker fallback: `gvm run --contained`.
+- Docker fallback: `gvm run --contained` (experimental — not production-ready, see Known Limitations).
 - Limitation: containment is opt-in and process-scoped. Processes not launched via `gvm run` still rely on cooperative proxy routing.
 
 `gvm run --sandbox` interception path (implemented):
@@ -131,7 +131,7 @@ After sandbox network setup, the agent can only reach: (1) GVM proxy via TCP on 
 |--------|-----------|----------|--------------------|-------------|
 | >= 4.15 | Active | Active | Active | Triple-layer (unbypassable) |
 | 3.17 - 4.14 | Fallback | Active | Active | Dual-layer (seccomp prevents iptables escape) |
-| < 3.17 | N/A | Active | N/A | iptables only (use `--contained` Docker mode) |
+| < 3.17 | N/A | Active | N/A | iptables only (`--contained` Docker mode is experimental) |
 
 **Roadmap (v2)**: Move from opt-in containment to deployment-level mandatory interception profiles (policy-enforced launch path + identity attestation).
 
