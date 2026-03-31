@@ -1010,77 +1010,20 @@ async fn run_agent_process(
     _cpus: &str,
 ) -> Result<i32> {
     if sandbox {
-        // Delegate to sandbox launch
-        let binary = &command[0];
-        let args = &command[1..];
-
-        let binary_path = if is_binary_mode {
-            which::which(binary).with_context(|| format!("Binary not found: {}", binary))?
-        } else {
-            let p = std::path::Path::new(binary);
-            std::fs::canonicalize(p).with_context(|| format!("Script not found: {}", binary))?
-        };
-
-        let proxy_url: url::Url = proxy.parse()?;
-        let proxy_host = proxy_url.host_str().unwrap_or("127.0.0.1");
-        let proxy_port = proxy_url.port().unwrap_or(8080);
-        let proxy_addr: std::net::SocketAddr = format!("{}:{}", proxy_host, proxy_port).parse()?;
-
-        let (interpreter, interpreter_args) = if is_binary_mode {
-            (
-                binary_path.to_str().unwrap_or(binary).to_string(),
-                args.iter().map(|s| s.to_string()).collect(),
-            )
-        } else {
-            let ext = binary_path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
-            let interp = match ext {
-                "py" => "python",
-                "js" => "node",
-                "ts" => "npx",
-                "sh" | "bash" => "bash",
-                _ => "python",
-            }
-            .to_string();
-            let name = binary_path
-                .file_name()
-                .and_then(|f| f.to_str())
-                .unwrap_or(binary)
-                .to_string();
-            let iargs = if ext == "ts" {
-                vec!["ts-node".to_string(), name]
-            } else {
-                vec![name]
-            };
-            (interp, iargs)
-        };
-
-        let config = gvm_sandbox::SandboxConfig {
-            script_path: binary_path,
-            workspace_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            interpreter,
-            interpreter_args,
-            proxy_addr,
-            agent_id: agent_id.to_string(),
-            seccomp_profile: None,
-            tls_probe_mode: gvm_sandbox::TlsProbeMode::Disabled,
-            proxy_url: Some(proxy.to_string()),
-            memory_limit: None,
-            cpu_limit: None,
-            fs_policy: Some(gvm_sandbox::FilesystemPolicy::default()),
-            mitm_ca_cert: if no_mitm { None } else { run::download_mitm_ca_cert(proxy).await },
-        };
-
-        let result = tokio::task::spawn_blocking(move || gvm_sandbox::launch_sandboxed(config))
-            .await
-            .map_err(|e| anyhow::anyhow!("Sandbox task panicked: {}", e))?;
-
-        match result {
-            Ok(sr) => Ok(sr.exit_code),
-            Err(e) => Err(e),
-        }
+        // Delegate to run.rs's full sandbox implementation.
+        // This ensures watch --sandbox has feature parity with gvm run --sandbox:
+        // MITM CA injection, orphan cleanup, preflight checks, resource limits, etc.
+        run::run_binary_sandboxed(
+            command,
+            agent_id,
+            proxy,
+            false, // interactive
+            None,  // memory_limit (watch doesn't need resource limits)
+            None,  // cpu_limit
+            no_mitm,
+        )
+        .await
+        .map(|_| 0)
     } else if contained {
         // For contained mode, delegate similarly
         // (simplified — full Docker logic is in run.rs)

@@ -252,7 +252,7 @@ async fn run_binary_local(
 /// Run an arbitrary binary inside Linux-native sandbox (Layer 2 + 3).
 ///
 /// Example: `gvm run --sandbox -- openclaw gateway`
-async fn run_binary_sandboxed(
+pub(crate) async fn run_binary_sandboxed(
     command: &[String],
     agent_id: &str,
     proxy: &str,
