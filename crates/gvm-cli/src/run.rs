@@ -587,26 +587,52 @@ pub(crate) async fn ensure_proxy_available(proxy: &str) -> Result<()> {
         );
     }
 
-    println!(
+    eprintln!(
         "  {YELLOW}Proxy not reachable at {}. Attempting auto-start...{RESET}",
         proxy
     );
 
     let workspace_root = workspace_root_for_proxy();
-    let mut child = tokio::process::Command::new("cargo")
-        .arg("run")
-        .arg("-p")
-        .arg("gvm-proxy")
-        .current_dir(workspace_root)
+
+    // Prefer release binary over `cargo run` — faster startup, no build step,
+    // and avoids cargo home directory issues under sudo.
+    let release_binary = workspace_root.join("target/release/gvm-proxy");
+    let (cmd_name, cmd_args): (std::path::PathBuf, Vec<String>) = if release_binary.exists() {
+        (release_binary, vec![])
+    } else {
+        let debug_binary = workspace_root.join("target/debug/gvm-proxy");
+        if debug_binary.exists() {
+            (debug_binary, vec![])
+        } else {
+            // Fallback: cargo run (dev mode only)
+            (
+                std::path::PathBuf::from("cargo"),
+                vec!["run".to_string(), "-p".to_string(), "gvm-proxy".to_string()],
+            )
+        }
+    };
+
+    eprintln!(
+        "  {DIM}Starting: {} {}{RESET}",
+        cmd_name.display(),
+        cmd_args.join(" ")
+    );
+
+    // Working directory = workspace root (where config/ and data/ live).
+    // This ensures WAL, SRR config, and secrets.toml are found at their
+    // expected relative paths regardless of where `gvm` CLI was invoked from.
+    let mut child = tokio::process::Command::new(&cmd_name)
+        .args(&cmd_args)
+        .current_dir(&workspace_root)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .context("Failed to spawn gvm-proxy with cargo")?;
+        .with_context(|| format!("Failed to spawn proxy: {}", cmd_name.display()))?;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
     loop {
         if proxy_healthy(proxy).await {
-            println!("  {GREEN}Proxy auto-started successfully.{RESET}");
+            eprintln!("  {GREEN}Proxy auto-started successfully.{RESET}");
             return Ok(());
         }
 
@@ -615,15 +641,17 @@ pub(crate) async fn ensure_proxy_available(proxy: &str) -> Result<()> {
             .context("Failed to poll auto-started proxy process")?
         {
             anyhow::bail!(
-                "Auto-started proxy exited early (status: {}). Start it manually with `cargo run -p gvm-proxy`.",
-                status
+                "Auto-started proxy exited early (status: {}). Start it manually: {}",
+                status,
+                cmd_name.display()
             );
         }
 
         if std::time::Instant::now() >= deadline {
             anyhow::bail!(
-                "Timed out waiting for proxy startup at {}. Start it manually with `cargo run -p gvm-proxy`.",
-                proxy
+                "Timed out waiting for proxy startup at {}. Start it manually: {}",
+                proxy,
+                cmd_name.display()
             );
         }
 
