@@ -52,6 +52,14 @@ v0.2 shipped: Shadow Mode + intent store, CONNECT tunnel, SRR hot-reload, eBPF u
 
 ## Implementation Log
 
+### 2026-03-31: Fuzzing CI Pipeline + 4 New Fuzz Targets
+
+Added 4 cargo-fuzz targets (fuzz_http_parse, fuzz_path_normalize, fuzz_llm_trace, fuzz_policy_eval) to the existing 2 (fuzz_srr, fuzz_wal_parse). GitHub Actions workflow runs all 6 targets daily (5 min each) with corpus caching and crash artifact upload.
+
+Why: Fuzzing CI was High priority on roadmap but unimplemented. SRR regex matching, HTTP parsing, and path normalization are highest-ROI targets for edge case discovery.
+
+Files: `fuzz/Cargo.toml`, `fuzz/fuzz_targets/fuzz_*.rs`, `.github/workflows/fuzz.yml`, `Cargo.toml` (workspace exclude) | Risk: Low (additive, no runtime changes)
+
 ### 2026-03-31: Security — CRLF Injection Defense + Fail-Close Consistency
 
 **CRLF injection in MITM credential injection**: `inject_credentials()` wrote credential values as raw bytes into `rebuild_raw_head()` without validating for `\r\n` or `\0`. A compromised `secrets.toml` token containing CRLF could cause HTTP response splitting. Added `contains_header_injection_chars()` validation — injection is rejected (returns false) if any credential field contains CR, LF, or NUL. The HTTP proxy path (`api_keys.rs::inject()`) was already safe via `HeaderValue::from_str()`.

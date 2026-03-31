@@ -43,7 +43,16 @@ scripts/
 ├── stress-test.sh      # 30-min chaos stress test (proxy kill, network partition, disk pressure)
 benches/
 ├── pipeline.rs         # 17 benchmark groups (Criterion)
+fuzz/fuzz_targets/
+├── fuzz_srr.rs         # SRR regex matching + pattern evaluation
+├── fuzz_wal_parse.rs   # WAL JSON event deserialization
+├── fuzz_http_parse.rs  # MITM HTTP request parsing (CL/TE, headers, body)
+├── fuzz_path_normalize.rs  # Path normalization chain (percent-decode, dot-segment, null-strip)
+├── fuzz_llm_trace.rs   # LLM thinking trace extraction (JSON + SSE, all providers)
+├── fuzz_policy_eval.rs # ABAC policy evaluation with arbitrary attributes
 ```
+
+**Fuzzing CI**: GitHub Actions daily run (`.github/workflows/fuzz.yml`), 5 min per target, corpus cached across runs.
 
 ---
 

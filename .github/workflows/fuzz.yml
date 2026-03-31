@@ -1,0 +1,88 @@
+# Continuous fuzzing: runs cargo-fuzz on all targets.
+# Schedule: daily at 03:00 UTC + manual trigger.
+# Each target runs for 5 minutes (300s) per invocation.
+
+name: Fuzz
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # Daily at 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Fuzz duration per target (seconds)'
+        required: false
+        default: '300'
+      target:
+        description: 'Specific target (empty = all)'
+        required: false
+        default: ''
+
+env:
+  CARGO_TERM_COLOR: always
+  FUZZ_DURATION: ${{ github.event.inputs.duration || '300' }}
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_srr
+          - fuzz_wal_parse
+          - fuzz_http_parse
+          - fuzz_path_normalize
+          - fuzz_llm_trace
+          - fuzz_policy_eval
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          key: fuzz-${{ matrix.target }}
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Skip if target filter set and doesn't match
+        if: github.event.inputs.target != '' && github.event.inputs.target != matrix.target
+        run: echo "Skipping ${{ matrix.target }} (filter: ${{ github.event.inputs.target }})" && exit 0
+
+      - name: Restore corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: Run fuzzer
+        if: github.event.inputs.target == '' || github.event.inputs.target == matrix.target
+        run: |
+          cd fuzz
+          cargo +nightly fuzz run ${{ matrix.target }} -- \
+            -max_total_time=${{ env.FUZZ_DURATION }} \
+            -max_len=65536
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Save corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: |
+            fuzz/artifacts/${{ matrix.target }}/*
+          retention-days: 30

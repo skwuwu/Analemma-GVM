@@ -13,6 +13,7 @@ gvm-proxy = { path = ".." }
 gvm-types = { path = "../crates/gvm-types" }
 serde_json = "1"
 tempfile = "3"
+tokio = { version = "1", features = ["rt", "io-util", "time", "macros"] }
 
 # SRR rule matching fuzzer: exercises regex compilation + pattern matching
 [[bin]]
@@ -24,4 +25,28 @@ doc = false
 [[bin]]
 name = "fuzz_wal_parse"
 path = "fuzz_targets/fuzz_wal_parse.rs"
+doc = false
+
+# MITM HTTP request parser fuzzer: exercises header parsing, CL/TE validation, body handling
+[[bin]]
+name = "fuzz_http_parse"
+path = "fuzz_targets/fuzz_http_parse.rs"
+doc = false
+
+# SRR path normalization fuzzer: percent-decode, null-strip, dot-segment, double-slash
+[[bin]]
+name = "fuzz_path_normalize"
+path = "fuzz_targets/fuzz_path_normalize.rs"
+doc = false
+
+# LLM thinking trace extraction fuzzer: JSON + SSE parsing for all providers
+[[bin]]
+name = "fuzz_llm_trace"
+path = "fuzz_targets/fuzz_llm_trace.rs"
+doc = false
+
+# ABAC policy evaluation fuzzer: arbitrary operation metadata + attribute combinations
+[[bin]]
+name = "fuzz_policy_eval"
+path = "fuzz_targets/fuzz_policy_eval.rs"
 doc = false
