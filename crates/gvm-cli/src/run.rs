@@ -621,11 +621,30 @@ pub(crate) async fn ensure_proxy_available(proxy: &str) -> Result<()> {
     // Working directory = workspace root (where config/ and data/ live).
     // This ensures WAL, SRR config, and secrets.toml are found at their
     // expected relative paths regardless of where `gvm` CLI was invoked from.
+    //
+    // Proxy logs go to data/proxy.log (not /dev/null) — essential for debugging
+    // MITM issues, SRR matching, WAL errors, and seccomp violations.
+    // Previous behavior (Stdio::null) silently discarded all proxy diagnostics.
+    let log_path = workspace_root.join("data/proxy.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .unwrap_or_else(|_| {
+            // Fallback: /dev/null if data/ doesn't exist yet
+            std::fs::File::open("/dev/null").expect("/dev/null")
+        });
+    let stderr_file = log_file.try_clone().unwrap_or_else(|_| {
+        std::fs::File::open("/dev/null").expect("/dev/null")
+    });
+
+    eprintln!("  {DIM}Proxy log: {}{RESET}", log_path.display());
+
     let mut child = tokio::process::Command::new(&cmd_name)
         .args(&cmd_args)
         .current_dir(&workspace_root)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log_file))
+        .stderr(std::process::Stdio::from(stderr_file))
         .spawn()
         .with_context(|| format!("Failed to spawn proxy: {}", cmd_name.display()))?;
 
