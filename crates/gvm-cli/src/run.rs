@@ -640,11 +640,38 @@ pub(crate) async fn ensure_proxy_available(proxy: &str) -> Result<()> {
 
     eprintln!("  {DIM}Proxy log: {}{RESET}", log_path.display());
 
-    let mut child = tokio::process::Command::new(&cmd_name)
-        .args(&cmd_args)
-        .current_dir(&workspace_root)
-        .stdout(std::process::Stdio::from(log_file))
-        .stderr(std::process::Stdio::from(stderr_file))
+    // Spawn proxy in a new process group (setsid) so it survives when the CLI
+    // process exits. Without this, the proxy is killed as a child of gvm run
+    // when sandbox timeout fires or the user Ctrl-C's.
+    #[cfg(unix)]
+    let mut child_builder = {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = tokio::process::Command::new(&cmd_name);
+        cmd.args(&cmd_args)
+            .current_dir(&workspace_root)
+            .stdout(std::process::Stdio::from(log_file))
+            .stderr(std::process::Stdio::from(stderr_file));
+        // SAFETY: pre_exec runs in forked child before exec.
+        // setsid() creates a new session so the proxy is independent.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        cmd
+    };
+    #[cfg(not(unix))]
+    let mut child_builder = {
+        let mut cmd = tokio::process::Command::new(&cmd_name);
+        cmd.args(&cmd_args)
+            .current_dir(&workspace_root)
+            .stdout(std::process::Stdio::from(log_file))
+            .stderr(std::process::Stdio::from(stderr_file));
+        cmd
+    };
+
+    let mut child = child_builder
         .spawn()
         .with_context(|| format!("Failed to spawn proxy: {}", cmd_name.display()))?;
 
