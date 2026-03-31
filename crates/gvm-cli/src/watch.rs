@@ -879,32 +879,48 @@ pub async fn run_watch(
 
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
 
-    // Spawn the agent and watchdog
-    let proxy_str = proxy.to_string();
-    let agent_id_str = agent_id.to_string();
-    let cmd = command.to_vec();
-    let image_str = image.to_string();
-    let memory_str = memory.to_string();
-    let cpus_str = cpus.to_string();
+    // Build pipeline config and run pre-launch + launch via pipeline.
+    // Watch uses pipeline directly (not run_agent) to avoid duplicate banners/audit.
+    let mode = if sandbox {
+        crate::pipeline::LaunchMode::Sandbox
+    } else if contained {
+        crate::pipeline::LaunchMode::Contained {
+            image: image.to_string(),
+            memory: memory.to_string(),
+            cpus: cpus.to_string(),
+            detach: false,
+        }
+    } else {
+        crate::pipeline::LaunchMode::Cooperative
+    };
+
+    let agent_config = crate::pipeline::AgentConfig {
+        command: command.to_vec(),
+        agent_id: agent_id.to_string(),
+        proxy: proxy.to_string(),
+        mode,
+        no_mitm,
+        memory_limit: None,
+        cpu_limit: None,
+        interactive: false,
+    };
+
+    // Pre-launch (ensure proxy, orphan cleanup, CA download)
+    let pre = crate::pipeline::pre_launch(&agent_config).await?;
+
+    // Spawn agent via pipeline::launch
+    let config_clone = agent_config.clone();
+    let mitm_ca = pre.mitm_ca.clone();
+    let is_binary = pre.is_binary_mode;
     let agent_handle = tokio::spawn(async move {
-        // Delegate entirely to run::run_agent — the single entry point for all
-        // agent execution modes (sandbox/contained/cooperative). Watch only adds
-        // SRR reload + WAL tailing around it.
-        run::run_agent(
-            &cmd,
-            &agent_id_str,
-            &proxy_str,
-            &image_str,
-            &memory_str,
-            &cpus_str,
-            false, // detach
-            contained,
-            sandbox,
-            false, // interactive
-            no_mitm,
-        )
-        .await
-        .map(|_| 0i32)
+        let pre_state = crate::pipeline::PreLaunchState {
+            mitm_ca,
+            wal_offset: 0, // watch manages its own WAL offset
+            is_binary_mode: is_binary,
+        };
+        crate::pipeline::launch(&config_clone, &pre_state)
+            .await
+            .map(|code| code)
     });
 
     let watchdog_proxy = proxy.to_string();

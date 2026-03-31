@@ -34,57 +34,51 @@ pub async fn run_agent(
         anyhow::bail!("Cannot use --sandbox and --contained together. Choose one isolation mode.");
     }
 
-    // Determine mode: script (single file) or binary (arbitrary command)
-    let is_binary_mode = command.len() > 1 || !looks_like_script(&command[0]);
-    let script = &command[0];
-
-    ensure_proxy_available(proxy).await?;
-
-    if sandbox {
-        let mem_limit = parse_memory_limit(memory);
-        let cpu_limit = cpus.parse::<f64>().ok();
-        if no_mitm {
-            eprintln!("  {YELLOW}\u{26a0}{RESET} MITM disabled (--no-mitm). HTTPS uses CONNECT relay (domain-level only).");
-        }
-        if is_binary_mode {
-            run_binary_sandboxed(command, agent_id, proxy, interactive, mem_limit, cpu_limit, no_mitm).await
-        } else {
-            run_sandboxed(script, agent_id, proxy, interactive, mem_limit, cpu_limit, no_mitm).await
-        }
+    let mode = if sandbox {
+        crate::pipeline::LaunchMode::Sandbox
     } else if contained {
-        if no_mitm {
-            eprintln!("  {YELLOW}\u{26a0}{RESET} MITM disabled (--no-mitm). HTTPS uses CONNECT relay (domain-level only).");
+        crate::pipeline::LaunchMode::Contained {
+            image: image.to_string(),
+            memory: memory.to_string(),
+            cpus: cpus.to_string(),
+            detach,
         }
-        run_contained(script, agent_id, proxy, image, memory, cpus, detach, no_mitm).await
-    } else if is_binary_mode {
-        // Warn if Node.js agent detected in cooperative mode
+    } else {
+        crate::pipeline::LaunchMode::Cooperative
+    };
+
+    if no_mitm && mode != crate::pipeline::LaunchMode::Cooperative {
+        eprintln!("  {YELLOW}\u{26a0}{RESET} MITM disabled (--no-mitm). HTTPS uses CONNECT relay (domain-level only).");
+    }
+
+    // Warn if Node.js in cooperative mode (HTTPS_PROXY not respected)
+    if mode == crate::pipeline::LaunchMode::Cooperative {
         let cmd_str = command.join(" ").to_lowercase();
-        if cmd_str.contains("node") || cmd_str.contains("openclaw") || cmd_str.contains("npx") {
+        if cmd_str.contains("node") || cmd_str.contains("openclaw") || cmd_str.contains("npx")
+            || command[0].ends_with(".js") || command[0].ends_with(".ts")
+        {
             eprintln!(
                 "  {YELLOW}\u{26a0} Node.js agent detected in cooperative mode.{RESET}"
             );
             eprintln!(
-                "  {DIM}Node.js does not respect HTTPS_PROXY by default — HTTPS traffic may bypass the proxy.{RESET}"
-            );
-            eprintln!(
-                "  {DIM}Use --contained or --sandbox for full HTTPS coverage via DNAT.{RESET}"
+                "  {DIM}Node.js does not respect HTTPS_PROXY. Use --sandbox for full HTTPS coverage.{RESET}"
             );
             eprintln!();
         }
-        run_binary_local(command, agent_id, proxy, interactive).await
-    } else {
-        // Warn for .js/.ts scripts
-        if script.ends_with(".js") || script.ends_with(".ts") {
-            eprintln!(
-                "  {YELLOW}\u{26a0} Node.js/TypeScript agent detected in cooperative mode.{RESET}"
-            );
-            eprintln!(
-                "  {DIM}HTTPS traffic may bypass the proxy. Use --contained or --sandbox for full coverage.{RESET}"
-            );
-            eprintln!();
-        }
-        run_local(script, agent_id, proxy, interactive).await
     }
+
+    let config = crate::pipeline::AgentConfig {
+        command: command.to_vec(),
+        agent_id: agent_id.to_string(),
+        proxy: proxy.to_string(),
+        mode,
+        no_mitm,
+        memory_limit: parse_memory_limit(memory),
+        cpu_limit: cpus.parse::<f64>().ok(),
+        interactive,
+    };
+
+    crate::pipeline::run_full(config).await
 }
 
 /// Check if the first argument looks like a script file (has a known extension).
@@ -888,7 +882,7 @@ async fn run_sandboxed(
 }
 
 /// Read WAL entries that were added during the agent run and display audit summary.
-fn print_wal_audit(wal_path: &str, start_offset: u64, agent_id: &str) {
+pub(crate) fn print_wal_audit(wal_path: &str, start_offset: u64, agent_id: &str) {
     let content = match std::fs::read_to_string(wal_path) {
         Ok(c) => c,
         Err(_) => {
@@ -1030,7 +1024,8 @@ fn print_wal_audit(wal_path: &str, start_offset: u64, agent_id: &str) {
 }
 
 /// Docker containment mode: run inside isolated container.
-async fn run_contained(
+/// Legacy function — pipeline.rs wraps this until full pipeline integration.
+pub(crate) async fn run_contained_legacy(
     script: &str,
     agent_id: &str,
     proxy: &str,

@@ -6,6 +6,7 @@ mod check;
 mod demo;
 mod events;
 mod init;
+mod pipeline;
 mod run;
 mod stats;
 mod suggest;
