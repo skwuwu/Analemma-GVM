@@ -686,10 +686,16 @@ pub async fn check(
     let (policy_decision, _matched_rule) = state.policy.evaluate(&operation);
 
     // Layer 2: Network SRR evaluation (use actual target_path for accurate matching)
-    let srr = state.srr.read().unwrap_or_else(|e| {
-        tracing::error!("SRR lock poisoned in /gvm/check");
-        e.into_inner()
-    });
+    let srr = match state.srr.read() {
+        Ok(guard) => guard,
+        Err(_) => {
+            tracing::error!("SRR lock poisoned in /gvm/check — denying request (fail-close)");
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({"error": "Internal governance error — request denied (fail-close)"}),
+            );
+        }
+    };
     let srr_result = srr.check(&body.method, &body.target_host, &body.target_path, None);
     drop(srr);
 

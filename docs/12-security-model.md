@@ -445,6 +445,8 @@ The following issues have been identified and **fixed** as they affect normal op
 | API key strip scope (only `Authorization`) | Also strip `X-API-Key`, `Cookie`, `ApiKey` headers when injecting credentials | Fixed |
 | Thread-unsafe `_gvm_header_setter` global | Replace with per-instance context variable approach | Fixed |
 | Mock server runs in production | Add `GVM_ENV` guard to prevent accidental production use | Fixed |
+| MITM credential CRLF injection | `contains_header_injection_chars()` rejects CR/LF/NUL in credential values before raw byte insertion into `rebuild_raw_head()` | Fixed |
+| SRR lock poison fail-open | All 5 `unwrap_or_else(e.into_inner())` sites replaced with immediate 500/deny on poison (consistent with rate_limiter) | Fixed |
 | SRR path traversal via encoding | Path normalization with percent-decode, null-byte strip, dot-segment resolution | Fixed (v0.2) |
 | Operation name header injection | Regex validation `[a-zA-Z0-9._-]+` on operation names | Fixed (v0.2) |
 | IC-1 Allow path sets Confirmed without checking upstream | Check `response.status().is_success()` before setting EventStatus | Fixed |

@@ -48,6 +48,12 @@ struct SecretsFile {
 }
 
 impl APIKeyStore {
+    /// Create a store from a pre-built credential map. Used in tests.
+    #[cfg(test)]
+    pub fn from_map(credentials: HashMap<String, Credential>) -> Self {
+        Self { credentials }
+    }
+
     /// Load credentials from a TOML secrets file.
     /// In production, this file should be encrypted (secrets.toml.enc).
     /// For MVP, we support plaintext TOML.

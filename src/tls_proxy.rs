@@ -377,6 +377,13 @@ const AUTH_HEADERS: &[&str] = &[
     "x-credentials",
 ];
 
+/// Check if a byte slice contains characters that would enable HTTP header injection.
+/// CR (\r), LF (\n), and NUL (\0) in header values allow response splitting attacks.
+#[inline]
+fn contains_header_injection_chars(bytes: &[u8]) -> bool {
+    bytes.iter().any(|&b| b == b'\r' || b == b'\n' || b == b'\0')
+}
+
 /// Parsed HTTP request from decrypted TLS stream.
 #[derive(Debug)]
 pub struct HttpRequest {
@@ -408,20 +415,49 @@ impl HttpRequest {
             .retain(|(name, _)| !AUTH_HEADERS.contains(&name.to_ascii_lowercase().as_str()));
 
         // Inject the configured credential
+        // Safety: validate all header values against CRLF injection before inserting
+        // as raw bytes. The HTTP proxy path uses HeaderValue::from_str() which rejects
+        // non-visible ASCII, but the MITM path writes raw bytes into rebuild_raw_head().
+        // A \r\n in a header value would cause HTTP response splitting.
         match credential {
             crate::api_keys::Credential::Bearer { token } => {
+                let value = format!("Bearer {}", token);
+                if contains_header_injection_chars(value.as_bytes()) {
+                    tracing::error!(
+                        host = %self.host,
+                        "Credential contains illegal characters (CR/LF/NUL) — rejecting injection to prevent HTTP response splitting"
+                    );
+                    return false;
+                }
                 self.headers.push((
                     "Authorization".to_string(),
-                    format!("Bearer {}", token).into_bytes(),
+                    value.into_bytes(),
                 ));
             }
             crate::api_keys::Credential::OAuth2 { access_token, .. } => {
+                let value = format!("Bearer {}", access_token);
+                if contains_header_injection_chars(value.as_bytes()) {
+                    tracing::error!(
+                        host = %self.host,
+                        "OAuth2 credential contains illegal characters (CR/LF/NUL) — rejecting injection"
+                    );
+                    return false;
+                }
                 self.headers.push((
                     "Authorization".to_string(),
-                    format!("Bearer {}", access_token).into_bytes(),
+                    value.into_bytes(),
                 ));
             }
             crate::api_keys::Credential::ApiKey { header, value } => {
+                if contains_header_injection_chars(header.as_bytes())
+                    || contains_header_injection_chars(value.as_bytes())
+                {
+                    tracing::error!(
+                        host = %self.host,
+                        "ApiKey credential contains illegal characters (CR/LF/NUL) — rejecting injection"
+                    );
+                    return false;
+                }
                 self.headers
                     .push((header.clone(), value.clone().into_bytes()));
             }
@@ -512,14 +548,35 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
         );
 
         // 2. SRR policy check
-        let srr_result = {
-            let srr = state.srr.read().unwrap_or_else(|e| e.into_inner());
-            let body_ref = if req.body.is_empty() {
-                None
-            } else {
-                Some(req.body.as_slice())
-            };
-            srr.check(&req.method, &host, &req.path, body_ref)
+        // RwLockReadGuard (and the Result containing its type) must not be held across .await.
+        // Compute the SRR result synchronously, then handle poison error after the guard is gone.
+        let srr_check_result = {
+            let guard = state.srr.read();
+            match guard {
+                Ok(srr) => {
+                    let body_ref = if req.body.is_empty() {
+                        None
+                    } else {
+                        Some(req.body.as_slice())
+                    };
+                    Ok(srr.check(&req.method, &host, &req.path, body_ref))
+                }
+                Err(_) => Err(()),
+            }
+        };
+        let srr_result = match srr_check_result {
+            Ok(result) => result,
+            Err(()) => {
+                tracing::error!("SRR lock poisoned in MITM handler — denying request (fail-close)");
+                let body_str = r#"{"blocked":true,"decision":"Deny","reason":"Internal governance error (fail-close)"}"#;
+                let response = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body_str.len(), body_str
+                );
+                tls_stream.write_all(response.as_bytes()).await?;
+                tls_stream.flush().await?;
+                break;
+            }
         };
 
         let decision = &srr_result.decision;
@@ -885,6 +942,147 @@ mod tests {
         assert_eq!(req.path, "/api/send");
         assert_eq!(req.host, "slack.com");
         assert_eq!(req.body, b"{\"text\":\"hi\"}");
+    }
+
+    // ── CRLF injection defense tests ──
+
+    #[test]
+    fn contains_header_injection_chars_detects_cr() {
+        assert!(contains_header_injection_chars(b"Bearer tok\r\nEvil: yes"));
+    }
+
+    #[test]
+    fn contains_header_injection_chars_detects_lf() {
+        assert!(contains_header_injection_chars(b"Bearer tok\nEvil: yes"));
+    }
+
+    #[test]
+    fn contains_header_injection_chars_detects_nul() {
+        assert!(contains_header_injection_chars(b"Bearer tok\0rest"));
+    }
+
+    #[test]
+    fn contains_header_injection_chars_allows_clean_value() {
+        assert!(!contains_header_injection_chars(b"Bearer sk-abc123XYZ"));
+    }
+
+    #[test]
+    fn inject_credentials_rejects_bearer_with_crlf() {
+        use std::collections::HashMap;
+        use crate::api_keys::{APIKeyStore, Credential};
+
+        // Build a store with a malicious Bearer token containing CRLF
+        let mut credentials = HashMap::new();
+        credentials.insert(
+            "evil.com".to_string(),
+            Credential::Bearer {
+                token: "sk-good\r\nX-Injected: pwned".to_string(),
+            },
+        );
+        let store = APIKeyStore::from_map(credentials);
+
+        let mut req = HttpRequest {
+            method: "GET".to_string(),
+            path: "/v1/chat".to_string(),
+            host: "evil.com".to_string(),
+            headers: vec![],
+            body: vec![],
+            raw_head: b"GET /v1/chat HTTP/1.1\r\nHost: evil.com\r\n\r\n".to_vec(),
+        };
+
+        // inject_credentials must return false (rejected) and NOT inject the header
+        let injected = req.inject_credentials(&store);
+        assert!(!injected, "CRLF-tainted credential must be rejected");
+        assert!(
+            req.headers.is_empty(),
+            "No headers should be added when credential is rejected"
+        );
+    }
+
+    #[test]
+    fn inject_credentials_rejects_apikey_with_crlf_in_value() {
+        use std::collections::HashMap;
+        use crate::api_keys::{APIKeyStore, Credential};
+
+        let mut credentials = HashMap::new();
+        credentials.insert(
+            "evil.com".to_string(),
+            Credential::ApiKey {
+                header: "X-Api-Key".to_string(),
+                value: "good-key\r\nX-Injected: pwned".to_string(),
+            },
+        );
+        let store = APIKeyStore::from_map(credentials);
+
+        let mut req = HttpRequest {
+            method: "GET".to_string(),
+            path: "/api".to_string(),
+            host: "evil.com".to_string(),
+            headers: vec![],
+            body: vec![],
+            raw_head: b"GET /api HTTP/1.1\r\nHost: evil.com\r\n\r\n".to_vec(),
+        };
+
+        let injected = req.inject_credentials(&store);
+        assert!(!injected, "CRLF-tainted ApiKey value must be rejected");
+    }
+
+    #[test]
+    fn inject_credentials_rejects_apikey_with_crlf_in_header_name() {
+        use std::collections::HashMap;
+        use crate::api_keys::{APIKeyStore, Credential};
+
+        let mut credentials = HashMap::new();
+        credentials.insert(
+            "evil.com".to_string(),
+            Credential::ApiKey {
+                header: "X-Api-Key\r\nX-Injected".to_string(),
+                value: "good-value".to_string(),
+            },
+        );
+        let store = APIKeyStore::from_map(credentials);
+
+        let mut req = HttpRequest {
+            method: "GET".to_string(),
+            path: "/api".to_string(),
+            host: "evil.com".to_string(),
+            headers: vec![],
+            body: vec![],
+            raw_head: b"GET /api HTTP/1.1\r\nHost: evil.com\r\n\r\n".to_vec(),
+        };
+
+        let injected = req.inject_credentials(&store);
+        assert!(!injected, "CRLF-tainted ApiKey header name must be rejected");
+    }
+
+    #[test]
+    fn inject_credentials_accepts_clean_bearer() {
+        use std::collections::HashMap;
+        use crate::api_keys::{APIKeyStore, Credential};
+
+        let mut credentials = HashMap::new();
+        credentials.insert(
+            "api.openai.com".to_string(),
+            Credential::Bearer {
+                token: "sk-proj-abc123".to_string(),
+            },
+        );
+        let store = APIKeyStore::from_map(credentials);
+
+        let mut req = HttpRequest {
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            host: "api.openai.com".to_string(),
+            headers: vec![],
+            body: vec![],
+            raw_head: b"POST /v1/chat/completions HTTP/1.1\r\nHost: api.openai.com\r\n\r\n".to_vec(),
+        };
+
+        let injected = req.inject_credentials(&store);
+        assert!(injected, "Clean credential must be accepted");
+        assert_eq!(req.headers.len(), 1);
+        assert_eq!(req.headers[0].0, "Authorization");
+        assert_eq!(req.headers[0].1, b"Bearer sk-proj-abc123");
     }
 }
 

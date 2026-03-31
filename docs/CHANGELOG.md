@@ -52,6 +52,14 @@ v0.2 shipped: Shadow Mode + intent store, CONNECT tunnel, SRR hot-reload, eBPF u
 
 ## Implementation Log
 
+### 2026-03-31: Security — CRLF Injection Defense + Fail-Close Consistency
+
+**CRLF injection in MITM credential injection**: `inject_credentials()` wrote credential values as raw bytes into `rebuild_raw_head()` without validating for `\r\n` or `\0`. A compromised `secrets.toml` token containing CRLF could cause HTTP response splitting. Added `contains_header_injection_chars()` validation — injection is rejected (returns false) if any credential field contains CR, LF, or NUL. The HTTP proxy path (`api_keys.rs::inject()`) was already safe via `HeaderValue::from_str()`.
+
+**SRR RwLock poison handling inconsistency**: `proxy.rs` and `tls_proxy.rs` used `unwrap_or_else(|e| e.into_inner())` on poisoned SRR locks, silently continuing with partial state (fail-open). This contradicted GVM_CODE_STANDARDS §1.2 (fail-close) and was inconsistent with `rate_limiter.rs` which correctly denied on poison. Fixed all 5 locations (`proxy.rs` ×3, `tls_proxy.rs` ×1, `api.rs` ×1) to return 500/deny immediately on poison.
+
+Files: `src/tls_proxy.rs`, `src/proxy.rs`, `src/api.rs`, `src/api_keys.rs` | Risk: Low (defense hardening, no behavior change on non-poisoned path)
+
 ### 2026-03-30: Sandbox Auto-Cleanup + seccomp Fix
 Per-PID state files for crash-resilient orphan cleanup; `gvm cleanup` CLI; pwritev/preadv/socketpair added to seccomp.
 Why: 1024 stacked tmpfs mounts from crashes; orphan veth/iptables on SIGKILL; OpenClaw SIGSYS.

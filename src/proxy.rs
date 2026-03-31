@@ -209,10 +209,16 @@ pub async fn proxy_handler(
         let (policy_decision, matched_rule) = state.policy.evaluate(&operation);
 
         // Also check network SRR (Deny in SRR overrides policy)
-        let srr = state.srr.read().unwrap_or_else(|e| {
-            tracing::error!("SRR lock poisoned — using poisoned state (fail-closed)");
-            e.into_inner()
-        });
+        let srr = match state.srr.read() {
+            Ok(guard) => guard,
+            Err(_) => {
+                tracing::error!("SRR lock poisoned — denying request (fail-close)");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal governance error — request denied (fail-close)",
+                );
+            }
+        };
         let srr_result = srr.check(
             request.method().as_str(),
             &target.host,
@@ -248,10 +254,16 @@ pub async fn proxy_handler(
         )
     } else {
         // Direct HTTP: Layer 2 Network SRR classification
-        let srr = state.srr.read().unwrap_or_else(|e| {
-            tracing::error!("SRR lock poisoned — using poisoned state");
-            e.into_inner()
-        });
+        let srr = match state.srr.read() {
+            Ok(guard) => guard,
+            Err(_) => {
+                tracing::error!("SRR lock poisoned — denying request (fail-close)");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal governance error — request denied (fail-close)",
+                );
+            }
+        };
         let srr_result = srr.check(
             request.method().as_str(),
             &target.host,
@@ -1717,7 +1729,16 @@ async fn handle_connect_inner(
     // If only Deny rules exist, Deny the tunnel.
     // If no rules at all, Default-to-Caution (Delay 300ms).
     let (srr_result_decision, srr_result_matched, srr_result_catch_all) = {
-        let srr = state.srr.read().unwrap_or_else(|e| e.into_inner());
+        let srr = match state.srr.read() {
+            Ok(guard) => guard,
+            Err(_) => {
+                tracing::error!("SRR lock poisoned in CONNECT handler — denying tunnel (fail-close)");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal governance error — request denied (fail-close)",
+                );
+            }
+        };
         let (decision, matched, catch_all) = srr.check_domain(host);
         (decision, matched, catch_all)
     };
