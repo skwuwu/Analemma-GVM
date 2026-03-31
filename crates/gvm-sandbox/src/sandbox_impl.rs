@@ -25,6 +25,14 @@ const CHILD_STACK_SIZE: usize = 2 * 1024 * 1024;
 pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     let start = std::time::Instant::now();
 
+    // Pre-flight: defensive cleanup of orphaned sandbox resources from previous runs.
+    // This prevents stale iptables FORWARD chains or veth interfaces from polluting
+    // the host network. Particularly important after SIGKILL'd sandboxes where RAII
+    // guards did not run.
+    if let Err(e) = crate::network::cleanup_all_orphans() {
+        tracing::debug!(error = %e, "Orphan cleanup failed (non-fatal)");
+    }
+
     // Pre-flight: resolve interpreter path
     let interpreter_path = which_interpreter(&config.interpreter)
         .with_context(|| format!("Interpreter '{}' not found in PATH", config.interpreter))?;
@@ -312,8 +320,36 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     #[cfg(not(feature = "uprobe"))]
     let _tls_probe_handle: Option<()> = None;
 
-    // 4. Wait for child to exit and detect seccomp violations
-    let wait_result = waitpid(child_pid, None);
+    // 4. Wait for child to exit with timeout.
+    // Without timeout, a hung child (e.g. Node.js deadlock) blocks the parent forever.
+    // If the external `timeout` command kills us (parent), child becomes orphan with
+    // iptables pollution. Polling with WNOHANG + sleep allows graceful SIGKILL on timeout.
+    let wait_timeout = std::time::Duration::from_secs(
+        std::env::var("GVM_SANDBOX_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3600), // Default: 1 hour
+    );
+    let wait_start = std::time::Instant::now();
+    let wait_result = loop {
+        match waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => {
+                if wait_start.elapsed() > wait_timeout {
+                    tracing::warn!(
+                        pid = child_pid.as_raw(),
+                        timeout_secs = wait_timeout.as_secs(),
+                        "Sandbox child timed out — sending SIGKILL"
+                    );
+                    nix::sys::signal::kill(child_pid, nix::sys::signal::SIGKILL).ok();
+                    // Final waitpid to reap zombie
+                    break waitpid(child_pid, None);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                continue;
+            }
+            result => break result,
+        }
+    };
     let seccomp_violations = match &wait_result {
         Ok(status) => count_seccomp_violations(status),
         Err(_) => 0,

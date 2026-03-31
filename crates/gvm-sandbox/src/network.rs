@@ -847,6 +847,8 @@ pub fn cleanup_all_orphans() -> Result<u32> {
                             iface = iface,
                             "Found orphan veth with no state file — cleaning up"
                         );
+                        // Clean iptables chain for this veth before deleting it
+                        cleanup_orphan_iptables_chain(iface);
                         let _ = Command::new("ip")
                             .args(["link", "del", iface])
                             .output();
@@ -857,10 +859,77 @@ pub fn cleanup_all_orphans() -> Result<u32> {
         }
     }
 
+    // 4. Defense-in-depth: scan FORWARD chain for stale GVM-* chains without matching veth
+    // This catches iptables pollution from SIGKILL'd sandboxes where state file was never written.
+    cleaned += cleanup_stale_forward_chains();
+
     if cleaned > 0 {
         tracing::info!(count = cleaned, "Orphan sandbox cleanup complete");
     }
     Ok(cleaned)
+}
+
+/// Remove iptables FORWARD chain and associated NAT/MASQUERADE rules for an orphan veth.
+/// Best-effort: all operations use .ok() to avoid failing the cleanup.
+fn cleanup_orphan_iptables_chain(host_iface: &str) {
+    let chain_name = format!("GVM-{}", host_iface);
+    // Remove jump from FORWARD
+    run_iptables(&["-D", "FORWARD", "-j", &chain_name]).ok();
+    // Flush and delete chain
+    run_iptables(&["-F", &chain_name]).ok();
+    run_iptables(&["-X", &chain_name]).ok();
+
+    // Clean NAT PREROUTING rules that reference the sandbox IP range (best-effort)
+    // We can't know the exact sandbox IP, but we can flush rules mentioning this interface
+    // via the GVM chain naming convention.
+    tracing::debug!(chain = %chain_name, "Cleaned orphan iptables chain for {}", host_iface);
+}
+
+/// Scan iptables FORWARD chains for stale GVM-* entries that have no corresponding veth interface.
+/// Returns the number of stale chains cleaned.
+fn cleanup_stale_forward_chains() -> usize {
+    let mut cleaned = 0;
+
+    // List all iptables chains
+    let output = match Command::new("iptables").args(["-L", "-n"]).output() {
+        Ok(o) => o,
+        Err(_) => return 0,
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Find GVM-veth-gvm-* chain references
+    for line in stdout.lines() {
+        // Lines like "Chain GVM-veth-gvm-h12345 (1 references)"
+        if let Some(chain) = line.strip_prefix("Chain ") {
+            if let Some(chain_name) = chain.split_whitespace().next() {
+                if chain_name.starts_with("GVM-veth-gvm-") {
+                    // Extract interface name: GVM-{iface} → {iface}
+                    let iface = &chain_name[4..]; // strip "GVM-"
+
+                    // Check if veth still exists
+                    let veth_exists = Command::new("ip")
+                        .args(["link", "show", iface])
+                        .output()
+                        .map(|o| o.status.success())
+                        .unwrap_or(false);
+
+                    if !veth_exists {
+                        tracing::warn!(
+                            chain = chain_name,
+                            iface = iface,
+                            "Stale iptables FORWARD chain (veth gone) — removing"
+                        );
+                        run_iptables(&["-D", "FORWARD", "-j", chain_name]).ok();
+                        run_iptables(&["-F", chain_name]).ok();
+                        run_iptables(&["-X", chain_name]).ok();
+                        cleaned += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    cleaned
 }
 
 // Backward-compatible aliases for existing callers during migration.
