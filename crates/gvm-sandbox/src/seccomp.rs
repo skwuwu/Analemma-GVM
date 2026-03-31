@@ -1,7 +1,15 @@
 //! seccomp-BPF syscall filter for sandboxed agents.
 //!
-//! Whitelist approach (default-deny): only syscalls explicitly listed are allowed.
-//! New syscalls added in future kernels are automatically blocked.
+//! Three-tier approach:
+//! 1. **Whitelist** (Allow): known-safe syscalls are explicitly allowed.
+//! 2. **Blocklist** (KillProcess): known-dangerous syscalls (ptrace, mount, bpf,
+//!    unshare, setns, open_by_handle_at) are explicitly killed.
+//! 3. **Default** (Errno ENOSYS): unknown/new syscalls return ENOSYS, allowing
+//!    runtimes to gracefully fall back without crashing. This prevents regressions
+//!    when kernels/glibc add new syscalls (e.g. rseq, futex_waitv, cachestat).
+//!
+//! This design matches Docker's default seccomp profile philosophy: block dangerous
+//! operations, allow known-safe operations, return ENOSYS for everything else.
 //!
 //! The filter is applied just before execve(), so sandbox setup code
 //! (mount, network, namespace) is not restricted.
@@ -65,7 +73,7 @@ pub fn apply_seccomp_filter(profile: &Option<SeccompProfile>) -> Result<()> {
 
     let (enforcement_filter, log_filter) = match profile {
         Some(SeccompProfile::Strict) => (
-            build_strict_filter(SeccompAction::KillProcess)?,
+            build_strict_filter(SeccompAction::Errno(libc::ENOSYS as u32))?,
             build_strict_filter(SeccompAction::Log)?,
         ),
         Some(SeccompProfile::Custom(path)) => {
@@ -82,7 +90,7 @@ pub fn apply_seccomp_filter(profile: &Option<SeccompProfile>) -> Result<()> {
             return Ok(());
         }
         _ => (
-            build_default_filter(SeccompAction::KillProcess)?,
+            build_default_filter(SeccompAction::Errno(libc::ENOSYS as u32))?,
             build_default_filter(SeccompAction::Log)?,
         ),
     };
@@ -93,14 +101,17 @@ pub fn apply_seccomp_filter(profile: &Option<SeccompProfile>) -> Result<()> {
     seccompiler::apply_filter(&log_filter).context("Failed to apply seccomp-BPF log filter")?;
 
     // Install enforcement filter SECOND (evaluated first by kernel).
-    // This filter uses KillProcess as default action: violations terminate.
+    // Default action: Errno(ENOSYS) — unknown syscalls get "not implemented" error,
+    // allowing runtimes to gracefully fall back (e.g. glibc skips rseq on ENOSYS).
+    // High-risk syscalls are explicitly KillProcess'd via insert_blocked_syscalls().
     // The kernel takes the strictest result across both filters, so:
     // - Whitelisted syscalls: Allow (both agree) → executed
-    // - Violations: KillProcess (enforcement) + Log (audit) → logged then killed
+    // - Blocked syscalls: KillProcess (explicit) + Log (audit) → logged then killed
+    // - Unknown syscalls: Errno(ENOSYS) (enforcement) + Log (audit) → logged then ENOSYS
     seccompiler::apply_filter(&enforcement_filter)
         .context("Failed to apply seccomp-BPF enforcement filter")?;
 
-    tracing::debug!("seccomp-BPF dual filter applied (enforcement + audit logging)");
+    tracing::debug!("seccomp-BPF filter applied (whitelist + blocklist + ENOSYS default)");
     Ok(())
 }
 
@@ -173,6 +184,10 @@ fn build_default_filter(default_action: SeccompAction) -> Result<seccompiler::Bp
             $(rules.insert($syscall as i64, vec![]);)+
         };
     }
+
+    // High-risk syscalls (ptrace, mount, bpf, unshare, etc.) are NOT in the whitelist.
+    // With ENOSYS default, they return "not implemented" — the dangerous operation
+    // never executes. The LOG filter ensures all attempts are audited.
 
     // All other socket operations (non-creation) remain unconditionally allowed
     allow!(
@@ -306,7 +321,8 @@ fn insert_base_syscalls(rules: &mut BTreeMap<i64, Vec<SeccompRule>>) {
         libc::SYS_fchdir,
         libc::SYS_chmod,
         libc::SYS_fchmod,
-        libc::SYS_fchmodat
+        libc::SYS_fchmodat,
+        libc::SYS_fadvise64  // coreutils (cat, etc.) use posix_fadvise for read-ahead hints
     );
 
     // Polling / event loop

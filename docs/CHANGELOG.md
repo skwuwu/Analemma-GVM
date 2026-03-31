@@ -52,6 +52,14 @@ v0.2 shipped: Shadow Mode + intent store, CONNECT tunnel, SRR hot-reload, eBPF u
 
 ## Implementation Log
 
+### 2026-04-01: Seccomp Architecture — KILL→ENOSYS Default + Blocklist
+
+Changed seccomp default action from `KillProcess` to `Errno(ENOSYS)`. Unknown/new syscalls now return "not implemented" instead of killing the process, allowing runtimes to gracefully fall back. High-risk syscalls (ptrace, mount, bpf, unshare, etc.) remain blocked — ENOSYS prevents execution just as effectively as KILL, but without crashing the agent. Added `fadvise64` to whitelist (coreutils dependency).
+
+Why: glibc 2.39+ calls new syscalls (rseq, fadvise64, etc.) during process initialization. Whitelist-only approach causes regressions every time kernel/glibc adds syscalls. ENOSYS default matches Docker's seccomp philosophy.
+
+Files: `crates/gvm-sandbox/src/seccomp.rs` | Risk: Medium (security model change — ENOSYS vs KILL for unknown syscalls)
+
 ### 2026-03-31: Fuzzing CI Pipeline + 4 New Fuzz Targets
 
 Added 4 cargo-fuzz targets (fuzz_http_parse, fuzz_path_normalize, fuzz_llm_trace, fuzz_policy_eval) to the existing 2 (fuzz_srr, fuzz_wal_parse). GitHub Actions workflow runs all 6 targets daily (5 min each) with corpus caching and crash artifact upload.
