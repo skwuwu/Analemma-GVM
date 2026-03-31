@@ -618,6 +618,51 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
             _ => {} // Allow, AuditOnly, etc.
         }
 
+        // 3.5. WAL audit record for MITM-inspected requests (sandbox observability).
+        // Without this, gvm watch --sandbox sees no events because MITM-intercepted
+        // traffic bypasses proxy_handler (which writes WAL). CONNECT tunnel setup
+        // IS logged by proxy_handler, but individual L7 requests inside the tunnel
+        // are only visible here.
+        {
+            let event_id = uuid::Uuid::new_v4().to_string();
+            let trace_id = uuid::Uuid::new_v4().to_string();
+            let decision_str = format!("{:?}", srr_result.decision);
+            let event = gvm_types::GVMEvent {
+                event_id,
+                trace_id,
+                parent_event_id: None,
+                agent_id: "mitm".to_string(),
+                tenant_id: None,
+                session_id: host.clone(),
+                timestamp: chrono::Utc::now(),
+                operation: format!("{} {}", req.method, req.path),
+                resource: gvm_types::ResourceDescriptor {
+                    service: host.clone(),
+                    identifier: Some(req.path.clone()),
+                    tier: gvm_types::ResourceTier::External,
+                    sensitivity: gvm_types::Sensitivity::Medium,
+                },
+                context: std::collections::HashMap::new(),
+                transport: Some(gvm_types::TransportInfo {
+                    method: req.method.clone(),
+                    host: host.clone(),
+                    path: req.path.clone(),
+                    status_code: None, // unknown until relay completes
+                }),
+                decision: decision_str,
+                decision_source: "SRR".to_string(),
+                matched_rule_id: srr_result.matched_description.clone(),
+                enforcement_point: "mitm".to_string(),
+                status: gvm_types::EventStatus::Pending,
+                payload: gvm_types::PayloadDescriptor::default(),
+                nats_sequence: None,
+                event_hash: None,
+                llm_trace: None,
+                default_caution: srr_result.is_catch_all,
+            };
+            state.ledger.append_async(event).await;
+        }
+
         // 4. API key injection
         let mut req = req;
         if req.inject_credentials(&state.api_keys) {
