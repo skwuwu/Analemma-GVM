@@ -820,7 +820,7 @@ pub async fn run_watch(
     }
 
     let output_mode = OutputMode::parse(output)?;
-    let is_binary_mode = command.len() > 1 || !run::looks_like_script(&command[0]);
+    // run::run_agent determines binary vs script mode internally
 
     // --- Allow-all config (default behavior: no enforcement) ---
     let config_dir = PathBuf::from("config");
@@ -883,24 +883,28 @@ pub async fn run_watch(
     let proxy_str = proxy.to_string();
     let agent_id_str = agent_id.to_string();
     let cmd = command.to_vec();
-    let is_binary = is_binary_mode;
     let image_str = image.to_string();
     let memory_str = memory.to_string();
     let cpus_str = cpus.to_string();
     let agent_handle = tokio::spawn(async move {
-        run_agent_process(
+        // Delegate entirely to run::run_agent — the single entry point for all
+        // agent execution modes (sandbox/contained/cooperative). Watch only adds
+        // SRR reload + WAL tailing around it.
+        run::run_agent(
             &cmd,
             &agent_id_str,
             &proxy_str,
-            is_binary,
-            sandbox,
-            contained,
-            no_mitm,
             &image_str,
             &memory_str,
             &cpus_str,
+            false, // detach
+            contained,
+            sandbox,
+            false, // interactive
+            no_mitm,
         )
         .await
+        .map(|_| 0i32)
     });
 
     let watchdog_proxy = proxy.to_string();
@@ -993,84 +997,6 @@ pub async fn run_watch(
     }
 
     Ok(())
-}
-
-/// Run the agent process and return its exit code.
-#[allow(clippy::too_many_arguments)]
-async fn run_agent_process(
-    command: &[String],
-    agent_id: &str,
-    proxy: &str,
-    is_binary_mode: bool,
-    sandbox: bool,
-    contained: bool,
-    no_mitm: bool,
-    _image: &str,
-    _memory: &str,
-    _cpus: &str,
-) -> Result<i32> {
-    if sandbox {
-        // Delegate to run.rs's full sandbox implementation.
-        // This ensures watch --sandbox has feature parity with gvm run --sandbox:
-        // MITM CA injection, orphan cleanup, preflight checks, resource limits, etc.
-        run::run_binary_sandboxed(
-            command,
-            agent_id,
-            proxy,
-            false, // interactive
-            None,  // memory_limit (watch doesn't need resource limits)
-            None,  // cpu_limit
-            no_mitm,
-        )
-        .await
-        .map(|_| 0)
-    } else if contained {
-        // For contained mode, delegate similarly
-        // (simplified — full Docker logic is in run.rs)
-        anyhow::bail!("Watch + --contained is not yet supported. Use gvm watch without --contained, or gvm watch --sandbox.");
-    } else {
-        // Local mode: spawn process with HTTP_PROXY
-        let (binary, args) = if is_binary_mode {
-            (command[0].clone(), command[1..].to_vec())
-        } else {
-            let script = &command[0];
-            let abs = std::fs::canonicalize(script)
-                .with_context(|| format!("Script not found: {}", script))?;
-            let ext = abs.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let interp = match ext {
-                "py" => "python",
-                "js" => "node",
-                "ts" => "npx",
-                "sh" | "bash" => "bash",
-                _ => "python",
-            };
-            if ext == "ts" {
-                (
-                    interp.to_string(),
-                    vec!["ts-node".to_string(), abs.to_string_lossy().to_string()],
-                )
-            } else {
-                (interp.to_string(), vec![abs.to_string_lossy().to_string()])
-            }
-        };
-
-        let status = tokio::process::Command::new(&binary)
-            .args(&args)
-            .env("HTTP_PROXY", proxy)
-            .env("HTTPS_PROXY", proxy)
-            .env("http_proxy", proxy)
-            .env("https_proxy", proxy)
-            .env("GVM_AGENT_ID", agent_id)
-            .env("GVM_PROXY_URL", proxy)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .status()
-            .await
-            .with_context(|| format!("Failed to execute: {}", binary))?;
-
-        Ok(status.code().unwrap_or(-1))
-    }
 }
 
 /// Reload proxy SRR rules via the /gvm/reload endpoint.

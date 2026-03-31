@@ -196,14 +196,10 @@ async fn run_binary_local(
         crate::approve::poll_and_prompt_background(&admin_url, approval_cancel_rx).await;
     });
 
-    let status = tokio::process::Command::new(binary)
-        .args(args)
-        .env("HTTP_PROXY", proxy)
-        .env("HTTPS_PROXY", proxy)
-        .env("http_proxy", proxy)
-        .env("https_proxy", proxy)
-        .env("GVM_AGENT_ID", agent_id)
-        .env("GVM_PROXY_URL", proxy)
+    let mut cmd = tokio::process::Command::new(binary);
+    cmd.args(args);
+    inject_proxy_env(&mut cmd, proxy, agent_id);
+    let status = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
@@ -252,6 +248,64 @@ async fn run_binary_local(
 /// Run an arbitrary binary inside Linux-native sandbox (Layer 2 + 3).
 ///
 /// Example: `gvm run --sandbox -- openclaw gateway`
+/// Build a SandboxConfig for a binary command.
+/// Shared between `gvm run --sandbox` and `gvm watch --sandbox`.
+/// Handles: orphan cleanup, binary resolution, proxy addr parsing, MITM CA download.
+pub(crate) async fn build_binary_sandbox_config(
+    command: &[String],
+    agent_id: &str,
+    proxy: &str,
+    memory_limit: Option<u64>,
+    cpu_limit: Option<f64>,
+    no_mitm: bool,
+) -> Result<gvm_sandbox::SandboxConfig> {
+    let binary = &command[0];
+    let args = &command[1..];
+
+    // Clean up orphaned sandboxes from previous crashes (Docker pattern: startup sweep).
+    match gvm_sandbox::cleanup_all_orphans() {
+        Ok(0) => {}
+        Ok(n) => eprintln!("  {YELLOW}Cleaned up {n} orphaned sandbox(es) from previous crash{RESET}"),
+        Err(e) => eprintln!("  {DIM}Orphan cleanup failed (non-fatal): {e}{RESET}"),
+    }
+
+    let binary_path =
+        which::which(binary).with_context(|| format!("Binary not found: {}", binary))?;
+    let proxy_addr = parse_proxy_addr(proxy)?;
+    let mitm_ca_cert = if no_mitm { None } else { download_mitm_ca_cert(proxy).await };
+
+    Ok(assemble_sandbox_config(
+        binary_path.clone(),
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        binary_path.to_str().unwrap_or(binary).to_string(),
+        args.iter().map(|s| s.to_string()).collect(),
+        proxy_addr,
+        agent_id,
+        proxy,
+        memory_limit,
+        cpu_limit,
+        mitm_ca_cert,
+    ))
+}
+
+/// Launch a sandbox with proxy watchdog. Returns the SandboxResult.
+/// Shared between `gvm run --sandbox` and `gvm watch --sandbox`.
+pub(crate) async fn launch_sandbox_with_watchdog(
+    config: gvm_sandbox::SandboxConfig,
+    proxy: &str,
+) -> Result<gvm_sandbox::SandboxResult> {
+    let proxy_url = proxy.to_string();
+    let sandbox_task = tokio::task::spawn_blocking(move || gvm_sandbox::launch_sandboxed(config));
+    let watchdog_handle = tokio::spawn(proxy_watchdog(proxy_url));
+
+    let result = sandbox_task
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("Sandbox task panicked: {e}")));
+
+    watchdog_handle.abort();
+    result
+}
+
 pub(crate) async fn run_binary_sandboxed(
     command: &[String],
     agent_id: &str,
@@ -273,44 +327,10 @@ pub(crate) async fn run_binary_sandboxed(
     eprintln!("  {DIM}Proxy:{RESET}        {}", proxy);
     eprintln!();
 
-    // Clean up orphaned sandboxes from previous crashes (Docker pattern: startup sweep).
-    match gvm_sandbox::cleanup_all_orphans() {
-        Ok(0) => {}
-        Ok(n) => eprintln!("  {YELLOW}Cleaned up {n} orphaned sandbox(es) from previous crash{RESET}"),
-        Err(e) => eprintln!("  {DIM}Orphan cleanup failed (non-fatal): {e}{RESET}"),
-    }
-
-    // Resolve binary path
-    let binary_path =
-        which::which(binary).with_context(|| format!("Binary not found: {}", binary))?;
-
-    let proxy_url: url::Url = proxy
-        .parse()
-        .with_context(|| format!("Invalid proxy URL: {}", proxy))?;
-    let proxy_host = proxy_url.host_str().unwrap_or("127.0.0.1");
-    let proxy_port = proxy_url.port().unwrap_or(8080);
-    let proxy_addr: std::net::SocketAddr = format!("{}:{}", proxy_host, proxy_port)
-        .parse()
-        .with_context(|| format!("Cannot parse proxy address: {}:{}", proxy_host, proxy_port))?;
-
-    // Download MITM CA cert from proxy (skip if --no-mitm)
-    let mitm_ca_cert = if no_mitm { None } else { download_mitm_ca_cert(proxy).await };
-
-    let config = gvm_sandbox::SandboxConfig {
-        script_path: binary_path.clone(),
-        workspace_dir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-        interpreter: binary_path.to_str().unwrap_or(binary).to_string(),
-        interpreter_args: args.iter().map(|s| s.to_string()).collect(),
-        proxy_addr,
-        agent_id: agent_id.to_string(),
-        seccomp_profile: None,
-        tls_probe_mode: gvm_sandbox::TlsProbeMode::Disabled,
-        proxy_url: Some(proxy.to_string()),
-        memory_limit,
-        cpu_limit,
-        fs_policy: Some(gvm_sandbox::FilesystemPolicy::default()),
-        mitm_ca_cert,
-    };
+    let config = build_binary_sandbox_config(
+        command, agent_id, proxy, memory_limit, cpu_limit, no_mitm,
+    )
+    .await?;
 
     eprintln!("  {BOLD}Security layers active:{RESET}");
     eprintln!("    {GREEN}\u{2713}{RESET} Layer 2: Enforcement Proxy");
@@ -326,21 +346,7 @@ pub(crate) async fn run_binary_sandboxed(
     eprintln!("  {DIM}--- Output below ---{RESET}");
     eprintln!();
 
-    // Run sandbox and proxy watchdog in parallel.
-    // Sandbox blocks on waitpid (sync) — wrap in spawn_blocking.
-    // Watchdog polls /gvm/health and restarts proxy on crash.
-    let proxy_url = proxy.to_string();
-    let sandbox_task = tokio::task::spawn_blocking(move || gvm_sandbox::launch_sandboxed(config));
-
-    let watchdog_handle = tokio::spawn(proxy_watchdog(proxy_url));
-
-    // Wait for sandbox to finish (primary task)
-    let result = sandbox_task
-        .await
-        .unwrap_or_else(|e| Err(anyhow::anyhow!("Sandbox task panicked: {e}")));
-
-    // Abort watchdog when sandbox exits
-    watchdog_handle.abort();
+    let result = launch_sandbox_with_watchdog(config, proxy).await;
 
     eprintln!();
     match result {
@@ -375,6 +381,108 @@ pub(crate) fn is_local_proxy_url(proxy: &str) -> bool {
     match url::Url::parse(proxy) {
         Ok(url) => matches!(url.host_str(), Some("127.0.0.1" | "localhost")),
         Err(_) => false,
+    }
+}
+
+// ─── Shared helpers (used by run, watch, demo) ───
+
+/// Parse a proxy URL into a SocketAddr. Used by sandbox modes for veth routing.
+pub(crate) fn parse_proxy_addr(proxy: &str) -> Result<std::net::SocketAddr> {
+    let proxy_url: url::Url = proxy
+        .parse()
+        .with_context(|| format!("Invalid proxy URL: {}", proxy))?;
+    let host = proxy_url.host_str().unwrap_or("127.0.0.1");
+    let port = proxy_url.port().unwrap_or(8080);
+    format!("{}:{}", host, port)
+        .parse()
+        .with_context(|| format!("Cannot parse proxy address: {}:{}", host, port))
+}
+
+/// Resolve a script path: verify existence and canonicalize.
+pub(crate) fn resolve_script(script: &str) -> Result<std::path::PathBuf> {
+    let path = std::path::Path::new(script);
+    if !path.exists() {
+        anyhow::bail!("Script not found: {}", script);
+    }
+    std::fs::canonicalize(path).with_context(|| format!("Cannot resolve path: {}", script))
+}
+
+/// Determine interpreter and arguments from a script file extension.
+/// `script_ref` is the path/name to pass as argument to the interpreter.
+pub(crate) fn detect_interpreter(ext: &str, script_ref: &str) -> (String, Vec<String>) {
+    let interpreter = match ext {
+        "py" => "python",
+        "js" => "node",
+        "ts" => "npx",
+        "sh" | "bash" => "bash",
+        _ => "python",
+    };
+    let args = if ext == "ts" {
+        vec!["ts-node".to_string(), script_ref.to_string()]
+    } else {
+        vec![script_ref.to_string()]
+    };
+    (interpreter.to_string(), args)
+}
+
+/// Inject standard GVM proxy environment variables into a Command.
+pub(crate) fn inject_proxy_env(
+    cmd: &mut tokio::process::Command,
+    proxy: &str,
+    agent_id: &str,
+) {
+    cmd.env("HTTP_PROXY", proxy)
+        .env("HTTPS_PROXY", proxy)
+        .env("http_proxy", proxy)
+        .env("https_proxy", proxy)
+        .env("GVM_AGENT_ID", agent_id)
+        .env("GVM_PROXY_URL", proxy);
+}
+
+/// Check proxy health with user-visible status output.
+/// Prints status to stdout and returns Err on failure.
+pub(crate) async fn check_proxy_health(proxy: &str) -> Result<()> {
+    print!("  {DIM}Checking proxy at {}...{RESET} ", proxy);
+    if proxy_healthy(proxy).await {
+        println!("{GREEN}OK{RESET}");
+        Ok(())
+    } else {
+        println!("{RED}FAILED{RESET}");
+        println!();
+        println!("  {RED}Proxy is not running.{RESET}");
+        println!("  Start it with: {CYAN}cargo run{RESET}");
+        anyhow::bail!("Proxy not reachable at {}", proxy)
+    }
+}
+
+/// Assemble a SandboxConfig from pre-resolved fields.
+/// Pure constructor — no I/O, no async.
+pub(crate) fn assemble_sandbox_config(
+    script_path: std::path::PathBuf,
+    workspace_dir: std::path::PathBuf,
+    interpreter: String,
+    interpreter_args: Vec<String>,
+    proxy_addr: std::net::SocketAddr,
+    agent_id: &str,
+    proxy: &str,
+    memory_limit: Option<u64>,
+    cpu_limit: Option<f64>,
+    mitm_ca_cert: Option<Vec<u8>>,
+) -> gvm_sandbox::SandboxConfig {
+    gvm_sandbox::SandboxConfig {
+        script_path,
+        workspace_dir,
+        interpreter,
+        interpreter_args,
+        proxy_addr,
+        agent_id: agent_id.to_string(),
+        seccomp_profile: None,
+        tls_probe_mode: gvm_sandbox::TlsProbeMode::Disabled,
+        proxy_url: Some(proxy.to_string()),
+        memory_limit,
+        cpu_limit,
+        fs_policy: Some(gvm_sandbox::FilesystemPolicy::default()),
+        mitm_ca_cert,
     }
 }
 
@@ -537,33 +645,9 @@ async fn run_local(script: &str, agent_id: &str, proxy: &str, interactive: bool)
     println!("{DIM}All HTTP traffic will be routed through GVM proxy for governance.{RESET}");
     println!();
 
-    // Check proxy health
-    print!("  {DIM}Checking proxy at {}...{RESET} ", proxy);
-    let health_url = format!("{}/gvm/health", proxy);
-    match reqwest::get(&health_url).await {
-        Ok(resp) if resp.status().is_success() => {
-            println!("{GREEN}OK{RESET}");
-        }
-        _ => {
-            println!("{RED}FAILED{RESET}");
-            println!();
-            println!("  {RED}Proxy is not running.{RESET}");
-            println!("  Start it with: {CYAN}cargo run{RESET}");
-            println!();
-            return Ok(());
-        }
-    }
+    check_proxy_health(proxy).await?;
 
-    // Resolve script path
-    let script_path = std::path::Path::new(script);
-    if !script_path.exists() {
-        println!("  {RED}Script not found: {}{RESET}", script);
-        println!();
-        return Ok(());
-    }
-
-    let abs_script = std::fs::canonicalize(script_path)
-        .with_context(|| format!("Cannot resolve path: {}", script))?;
+    let abs_script = resolve_script(script)?;
 
     println!("  {DIM}Agent ID:{RESET}     {CYAN}{}{RESET}", agent_id);
     println!("  {DIM}Script:{RESET}       {}", abs_script.display());
@@ -582,40 +666,21 @@ async fn run_local(script: &str, agent_id: &str, proxy: &str, interactive: bool)
     let wal_path = "data/wal.log";
     let wal_start_len = std::fs::metadata(wal_path).map(|m| m.len()).unwrap_or(0);
 
-    // Determine interpreter from extension
-    let ext = abs_script
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-    let (interpreter, script_arg) = match ext {
-        "py" => ("python", abs_script.to_str().unwrap_or(script)),
-        "js" => ("node", abs_script.to_str().unwrap_or(script)),
-        "ts" => ("npx", "ts-node"),
-        "sh" | "bash" => ("bash", abs_script.to_str().unwrap_or(script)),
-        _ => ("python", abs_script.to_str().unwrap_or(script)),
-    };
+    let ext = abs_script.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let (interpreter, interpreter_args) = detect_interpreter(ext, abs_script.to_str().unwrap_or(script));
 
     println!("  {DIM}--- Agent output below ---{RESET}");
     println!();
 
     let script_dir = abs_script.parent().unwrap_or(std::path::Path::new("."));
 
-    let mut cmd = tokio::process::Command::new(interpreter);
-    if ext == "ts" {
-        cmd.arg(script_arg)
-            .arg(abs_script.to_str().unwrap_or(script));
-    } else {
-        cmd.arg(script_arg);
+    let mut cmd = tokio::process::Command::new(&interpreter);
+    for arg in &interpreter_args {
+        cmd.arg(arg);
     }
-
-    cmd.current_dir(script_dir)
-        .env("HTTP_PROXY", proxy)
-        .env("HTTPS_PROXY", proxy)
-        .env("http_proxy", proxy)
-        .env("https_proxy", proxy)
-        .env("GVM_AGENT_ID", agent_id)
-        .env("GVM_PROXY_URL", proxy)
-        .stdin(std::process::Stdio::null())
+    cmd.current_dir(script_dir);
+    inject_proxy_env(&mut cmd, proxy, agent_id);
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
 
@@ -632,7 +697,7 @@ async fn run_local(script: &str, agent_id: &str, proxy: &str, interactive: bool)
     let status = cmd
         .status()
         .await
-        .with_context(|| format!("Failed to execute: {} {}", interpreter, script_arg))?;
+        .with_context(|| format!("Failed to execute: {}", interpreter))?;
 
     // Abort background tasks when agent exits
     watchdog_handle.abort();
@@ -683,33 +748,9 @@ async fn run_sandboxed(
     );
     println!();
 
-    // Check proxy health
-    print!("  {DIM}Checking proxy at {}...{RESET} ", proxy);
-    let health_url = format!("{}/gvm/health", proxy);
-    match reqwest::get(&health_url).await {
-        Ok(resp) if resp.status().is_success() => {
-            println!("{GREEN}OK{RESET}");
-        }
-        _ => {
-            println!("{RED}FAILED{RESET}");
-            println!();
-            println!("  {RED}Proxy is not running.{RESET}");
-            println!("  Start it with: {CYAN}cargo run{RESET}");
-            println!();
-            return Ok(());
-        }
-    }
+    check_proxy_health(proxy).await?;
 
-    // Resolve script path
-    let script_path = std::path::Path::new(script);
-    if !script_path.exists() {
-        println!("  {RED}Script not found: {}{RESET}", script);
-        println!();
-        return Ok(());
-    }
-
-    let abs_script = std::fs::canonicalize(script_path)
-        .with_context(|| format!("Cannot resolve path: {}", script))?;
+    let abs_script = resolve_script(script)?;
     let script_dir = abs_script.parent().unwrap_or(std::path::Path::new("."));
     let script_name = abs_script
         .file_name()
@@ -717,53 +758,23 @@ async fn run_sandboxed(
         .unwrap_or(script)
         .to_string();
 
-    // Determine interpreter from extension
-    let ext = abs_script
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-    let interpreter = match ext {
-        "py" => "python",
-        "js" => "node",
-        "ts" => "npx",
-        "sh" | "bash" => "bash",
-        _ => "python",
-    };
-
-    let interpreter_args = if ext == "ts" {
-        vec!["ts-node".to_string(), script_name.clone()]
-    } else {
-        vec![script_name.clone()]
-    };
-
-    // Parse proxy address for sandbox config
-    let proxy_url: url::Url = proxy
-        .parse()
-        .with_context(|| format!("Invalid proxy URL: {}", proxy))?;
-    let proxy_host = proxy_url.host_str().unwrap_or("127.0.0.1");
-    let proxy_port = proxy_url.port().unwrap_or(8080);
-    let proxy_addr: std::net::SocketAddr = format!("{}:{}", proxy_host, proxy_port)
-        .parse()
-        .with_context(|| format!("Cannot parse proxy address: {}:{}", proxy_host, proxy_port))?;
-
-    // Download MITM CA cert from proxy (skip if --no-mitm)
+    let ext = abs_script.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let (interpreter, interpreter_args) = detect_interpreter(ext, &script_name);
+    let proxy_addr = parse_proxy_addr(proxy)?;
     let mitm_ca_cert = if no_mitm { None } else { download_mitm_ca_cert(proxy).await };
 
-    let config = gvm_sandbox::SandboxConfig {
-        script_path: abs_script.clone(),
-        workspace_dir: script_dir.to_path_buf(),
-        interpreter: interpreter.to_string(),
+    let config = assemble_sandbox_config(
+        abs_script.clone(),
+        script_dir.to_path_buf(),
+        interpreter,
         interpreter_args,
         proxy_addr,
-        agent_id: agent_id.to_string(),
-        seccomp_profile: None,
-        tls_probe_mode: gvm_sandbox::TlsProbeMode::Disabled,
-        proxy_url: Some(proxy.to_string()),
+        agent_id,
+        proxy,
         memory_limit,
         cpu_limit,
-        fs_policy: Some(gvm_sandbox::FilesystemPolicy::default()),
         mitm_ca_cert,
-    };
+    );
 
     // Clean up orphaned network from previous crash (if any)
     match gvm_sandbox::cleanup_orphaned_network() {

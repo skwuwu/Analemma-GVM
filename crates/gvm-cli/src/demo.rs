@@ -55,22 +55,7 @@ async fn run_single_demo(proxy_url: &str, name: &str) -> Result<()> {
     }
     println!();
 
-    // Check proxy health
-    print!("  {DIM}Checking proxy at {}...{RESET} ", proxy_url);
-    let health_url = format!("{}/gvm/health", proxy_url);
-    match reqwest::get(&health_url).await {
-        Ok(resp) if resp.status().is_success() => {
-            println!("{GREEN}OK{RESET}");
-        }
-        _ => {
-            println!("{RED}FAILED{RESET}");
-            println!();
-            println!("  {RED}Proxy is not running.{RESET}");
-            println!("  Start it with: {CYAN}cargo run{RESET}");
-            println!();
-            return Ok(());
-        }
-    }
+    crate::run::check_proxy_health(proxy_url).await?;
     println!();
 
     // Resolve script path relative to the project root
@@ -122,22 +107,7 @@ async fn run_all_demos(proxy_url: &str) -> Result<()> {
     println!("{DIM}4 LLM-powered agents will run sequentially through GVM governance.{RESET}");
     println!();
 
-    // Check proxy health once
-    print!("  {DIM}Checking proxy at {}...{RESET} ", proxy_url);
-    let health_url = format!("{}/gvm/health", proxy_url);
-    match reqwest::get(&health_url).await {
-        Ok(resp) if resp.status().is_success() => {
-            println!("{GREEN}OK{RESET}");
-        }
-        _ => {
-            println!("{RED}FAILED{RESET}");
-            println!();
-            println!("  {RED}Proxy is not running.{RESET}");
-            println!("  Start it with: {CYAN}cargo run{RESET}");
-            println!();
-            return Ok(());
-        }
-    }
+    crate::run::check_proxy_health(proxy_url).await?;
     println!();
 
     let demos = ["finance", "assistant", "devops", "data"];
@@ -198,13 +168,9 @@ async fn launch_agent_script(
 
     let mut cmd = tokio::process::Command::new("python");
     cmd.arg(script_path.to_str().unwrap_or(""))
-        .current_dir(script_dir)
-        .env("HTTP_PROXY", proxy_url)
-        .env("HTTPS_PROXY", proxy_url)
-        .env("http_proxy", proxy_url)
-        .env("https_proxy", proxy_url)
-        .env("GVM_PROXY_URL", proxy_url)
-        .stdout(std::process::Stdio::inherit())
+        .current_dir(script_dir);
+    crate::run::inject_proxy_env(&mut cmd, proxy_url, "demo");
+    cmd.stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
 
     let status = cmd
