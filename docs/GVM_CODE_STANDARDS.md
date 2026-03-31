@@ -502,9 +502,64 @@ No performance claim in documentation without a benchmark that measures it.
 
 ---
 
-## 7. Documentation Standards
+## 7. Architecture Principles
 
-### 7.1 Code Documentation
+### 7.1 Single Execution Path (Pipeline Pattern)
+
+Every agent execution mode (cooperative/sandbox/contained) must go through the same pipeline:
+1. **Pre-launch**: proxy availability, orphan cleanup, CA download
+2. **Launch**: mode-specific execution (the ONLY branching point)
+3. **Post-exit**: cleanup, audit output
+
+```
+CORRECT:   watch calls pipeline::pre_launch() → pipeline::launch() → WAL tail
+INCORRECT: watch has its own sandbox logic that partially duplicates run.rs
+```
+
+Mode-specific logic belongs ONLY in Phase 2. If you find yourself writing proxy health checks, SandboxConfig construction, or interpreter detection outside of the shared helpers, you are creating drift.
+
+### 7.2 No Logic Duplication Across Modules
+
+If the same logic appears in more than one function, extract it. Common violations:
+- Proxy health check (must use `proxy_manager::ensure_available`)
+- SandboxConfig construction (must use `assemble_sandbox_config`)
+- Interpreter detection (must use `detect_interpreter`)
+- Proxy env injection (must use `inject_proxy_env`)
+
+When adding a feature to the agent execution path (e.g. new env var, new cleanup step), it must be added to the shared pipeline — not to individual mode functions. If your change requires touching `run_local`, `run_sandboxed`, AND `run_contained`, you are violating this principle.
+
+### 7.3 Process Lifecycle Separation
+
+Components with independent lifecycles must be managed by dedicated modules:
+- **Proxy**: `proxy_manager.rs` — daemon with PID file, survives CLI exit
+- **Sandbox**: `sandbox_impl.rs` — RAII guards, orphan cleanup on startup
+- **WAL**: `ledger.rs` — group commit, shutdown flush
+
+```
+CORRECT:   Proxy started via proxy_manager (setsid, PID file, log file)
+INCORRECT: Proxy spawned as child of CLI process (dies with parent)
+
+CORRECT:   Sandbox cleanup via RAII guard + orphan scan
+INCORRECT: Cleanup only in happy-path function exit
+```
+
+No process with an independent lifecycle should be spawned as a child of the CLI process without `setsid` or equivalent isolation. All long-lived processes must have PID files for reuse across invocations.
+
+### 7.4 Configuration Path Consistency
+
+All components must find config files and data directories from the same root:
+- `workspace_root_for_proxy()` is the canonical source
+- Relative paths (`data/wal.log`, `config/srr_network.toml`) are resolved from this root
+- Working directory for spawned processes must be set explicitly
+
+```
+CORRECT:   .current_dir(&workspace_root) when spawning proxy
+INCORRECT: Relying on whatever pwd the user ran gvm from
+```
+
+## 8. Documentation Standards
+
+### 8.1 Code Documentation
 
 Every public function must have a doc comment explaining:
 - What it does (one sentence)
@@ -512,7 +567,7 @@ Every public function must have a doc comment explaining:
 - Error conditions (when it returns Err)
 - Performance characteristics (if on hot path)
 
-### 7.2 Security Claims
+### 8.2 Security Claims
 
 Never claim more than what is implemented:
 
@@ -524,7 +579,7 @@ CORRECT:   "AES-GCM integrity verified"
 INCORRECT: "Merkle verified" (if Merkle verification is not actually performed)
 ```
 
-### 7.3 Known Limitations
+### 8.3 Known Limitations
 
 Every known limitation must be documented in `security-model.md` with:
 - Attack description
