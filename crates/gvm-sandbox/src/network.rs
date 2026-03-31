@@ -861,7 +861,7 @@ pub fn cleanup_all_orphans() -> Result<u32> {
 
     // 4. Defense-in-depth: scan FORWARD chain for stale GVM-* chains without matching veth
     // This catches iptables pollution from SIGKILL'd sandboxes where state file was never written.
-    cleaned += cleanup_stale_forward_chains();
+    cleaned += cleanup_stale_forward_chains() as u32;
 
     if cleaned > 0 {
         tracing::info!(count = cleaned, "Orphan sandbox cleanup complete");
