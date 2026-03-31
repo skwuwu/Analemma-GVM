@@ -660,7 +660,9 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                 llm_trace: None,
                 default_caution: srr_result.is_catch_all,
             };
-            state.ledger.append_async(event).await;
+            if let Err(e) = state.ledger.append_durable(&event).await {
+                tracing::debug!(error = %e, "MITM WAL append failed (non-fatal)");
+            }
         }
 
         // 4. API key injection
