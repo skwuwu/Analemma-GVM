@@ -199,7 +199,7 @@ Both paths pre-compile regex at config load time (fail-fast on invalid patterns)
 
 **Impact**: Agent state (checkpoints, conversation history) decrypted. Note: Vault does not store API credentials — those are in `APIKeyStore`.
 
-**Planned mitigation**: Apply PBKDF2 or Argon2id with configurable iteration count before using the key for AES-GCM. Not implemented in v1 because the Vault is a local-development feature and production deployments should use a proper secrets manager. See [Roadmap](13-roadmap.md) for full feature tracking.
+**Planned mitigation**: Apply PBKDF2 or Argon2id with configurable iteration count before using the key for AES-GCM. Not implemented in v1 because the Vault is a local-development feature and production deployments should use a proper secrets manager. See [Changelog](CHANGELOG.md) for full feature tracking.
 
 ---
 

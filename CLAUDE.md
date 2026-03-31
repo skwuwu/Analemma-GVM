@@ -13,7 +13,7 @@
 ## Documentation Policy
 
 - After any code modification, all related documentation must be updated immediately to reflect the changes.
-- When making significant code changes (refactoring, security fixes, architectural modifications), record the change in `docs/14-implementation-log.md` with: what changed, why, affected files, and risk assessment.
+- When making significant code changes (refactoring, security fixes, architectural modifications), record the change in `docs/CHANGELOG.md` under the Implementation Log section with: date, what changed, why, affected files, and risk.
 
 ## GVM Code Standards
 

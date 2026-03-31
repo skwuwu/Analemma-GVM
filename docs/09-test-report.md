@@ -753,4 +753,4 @@ Agents use legitimate, non-refusable tasks to generate sustained HTTPS traffic:
 
 ---
 
-[← Part 8: Memory & Runtime Security](08-memory-security.md) | [Part 10: Architecture Changes →](10-architecture-changes.md) | [Overview →](00-overview.md)
+[← Part 8: Memory & Runtime Security](08-memory-security.md) | [Changelog →](CHANGELOG.md) | [Overview →](00-overview.md)
