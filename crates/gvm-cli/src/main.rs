@@ -7,6 +7,7 @@ mod demo;
 mod events;
 mod init;
 mod pipeline;
+mod proxy_manager;
 mod run;
 mod stats;
 mod suggest;

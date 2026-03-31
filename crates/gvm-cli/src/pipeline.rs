@@ -52,8 +52,9 @@ pub struct PreLaunchState {
 pub async fn pre_launch(config: &AgentConfig) -> Result<PreLaunchState> {
     let is_binary_mode = config.command.len() > 1 || !run::looks_like_script(&config.command[0]);
 
-    // 1. Ensure proxy is running (auto-start if needed)
-    run::ensure_proxy_available(&config.proxy).await?;
+    // 1. Ensure proxy is running (auto-start as independent daemon if needed)
+    let workspace = run::workspace_root_for_proxy();
+    crate::proxy_manager::ensure_available(&config.proxy, &workspace).await?;
 
     // 2. Orphan cleanup (sandbox only — prevent stale iptables/veth)
     if config.mode == LaunchMode::Sandbox {
@@ -291,7 +292,8 @@ impl BackgroundTasks {
     /// Spawn watchdog and IC-3 approval poller.
     pub fn spawn(proxy: &str) -> Self {
         let proxy_url = proxy.to_string();
-        let watchdog = tokio::spawn(run::proxy_watchdog(proxy_url));
+        let workspace = run::workspace_root_for_proxy();
+        let watchdog = tokio::spawn(crate::proxy_manager::watchdog(proxy_url, workspace));
 
         let (approval_cancel, approval_rx) = tokio::sync::watch::channel(false);
         let admin_url = run::derive_admin_url(proxy);
