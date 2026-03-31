@@ -249,7 +249,7 @@ These are architectural boundaries, not missing features:
 | Network bypass prevention | None | Docker network | Kernel (TC + iptables + seccomp) |
 | Filesystem governance | None | Read-only root | overlayfs Trust-on-Pattern |
 | Resource limits | None | Docker limits | cgroup v2 |
-| Syscall filtering | None | Docker default | Custom seccomp (~117 allowed) |
+| Syscall filtering | None | Docker default | Custom seccomp (~130 allowed) |
 | IC-3 self-approval prevention | None | None | Admin port unreachable |
 | Stability | **Production** | **Experimental** | **Production** |
 | Platform | Any OS | Any OS + Docker | Linux (kernel ≥ 4.15, recommended ≥ 6.1) |

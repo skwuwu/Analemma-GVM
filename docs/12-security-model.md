@@ -106,7 +106,7 @@ gvm run --sandbox my_agent.py
       iptables OUTPUT → DROP (all else)
   → IPv6 fully disabled (sysctl + ip6tables DROP fallback)
   → resolv.conf aligned to host veth IP (DNS resolution via host only)
-  → seccomp-BPF: ~117 syscalls whitelisted
+  → seccomp-BPF: ~130 syscalls whitelisted
 ```
 
 Defense-in-depth enforcement layers (v0.2.4):
@@ -269,23 +269,34 @@ Both paths pre-compile regex at config load time (fail-fast on invalid patterns)
 
 - **Observability**: `Ledger::primary_failure_count()` and `Ledger::emergency_write_count()` expose metrics for monitoring. The circuit breaker decision is logged and included in the response as `CircuitBreakerOpen`.
 
-**Remaining gap**: Emergency WAL events must be reconciled with the primary WAL on recovery. This reconciliation is not yet automated — operator must review `wal_emergency.log` after a primary WAL outage.
+**Automated on restart**: Primary WAL recovery scans for Pending events and marks unresolved ones as Expired via watermark-based idempotent recovery (O(1) memory). **Remaining gap**: Emergency WAL events are not auto-merged back into primary WAL — operator should review `wal_emergency.log` after a primary WAL outage to verify no events were lost.
 
 ---
 
-### 14. WAL Single File / No Rotation
+### 14. WAL Rotation (Implemented)
 
-**Issue**: All events are appended to a single WAL file with no rotation or compaction. The file grows unbounded over time, increasing recovery time and disk usage.
+**Status: Fixed.** Size-based rotation is implemented with Merkle chain linking across segments.
 
-**Planned mitigation**: Size-based rotation with Merkle chain linking across segments. The inter-batch `prev_root` field already supports cross-segment chaining.
+- `max_wal_bytes` (default 100MB): triggers rotation when exceeded
+- `max_wal_segments` (default 10): prunes oldest segments beyond limit
+- Inter-batch `prev_root` carries over across rotation — Merkle chain integrity maintained across segment boundaries
+- Configurable via `[wal]` section in `proxy.toml`
+
+**Remaining gap**: No compaction (old events within a segment cannot be removed). Segment pruning is the current mitigation.
 
 ---
 
-### 15. WAL Sequence Number Persistence
+### 15. WAL Sequence Number Persistence (Implemented)
 
-**Issue**: `wal_sequence` is initialized to `AtomicU64::new(0)` on every proxy restart. This creates duplicate sequence numbers across restarts, which could confuse NATS consumers.
+**Status: Fixed.** `wal_sequence` is initialized from existing WAL event count on startup — monotonic across restarts.
 
-**Status**: Acknowledged in code as TODO. Will be fixed when NATS JetStream integration is implemented (v2) — recovery will initialize from last WAL event count.
+```rust
+// ledger.rs — recovery initializes from existing events
+self.wal_sequence.store(event_count, Ordering::SeqCst);
+// "WAL sequence initialized from existing events (monotonic across restarts)"
+```
+
+**Remaining gap**: NATS JetStream integration is stubbed — sequence numbers are local-only until JetStream is connected.
 
 ---
 

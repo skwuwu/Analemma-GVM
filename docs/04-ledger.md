@@ -100,6 +100,7 @@ async fn append(&self, event: &GVMEvent) -> Result<()> {
 - **Non-blocking drain** — `try_recv()` collects all queued events without timer overhead
 - **Bounded backpressure** — channel capacity 4096, max batch size 128
 - **Caller-parallel serialization** — event hash + JSON computed before channel send
+- **Size-based rotation** — `max_wal_bytes` (100MB default) triggers rotation to `wal.log.<N>`, `max_wal_segments` (10 default) prunes oldest segments. Merkle chain links across segments via `prev_root`
 - **Emergency WAL fallback** — if primary WAL fails, events go to `wal_emergency.log` (degraded mode, no Merkle)
 
 ### Global Merkle Chain Design
@@ -148,7 +149,7 @@ self.wal.append(event).await?;  // group commit: batched fsync + Merkle
 - Lock-free (`AtomicU64`) — zero performance impact
 - Monotonic — strictly increasing, no gaps within a process lifetime
 - SeqCst ordering — visible to all threads immediately
-- **Known limitation**: Resets to 0 on restart (v1.1 fix: initialize from WAL event count)
+- **Restart recovery**: Initialized from existing WAL event count on startup — monotonic across restarts
 
 ---
 

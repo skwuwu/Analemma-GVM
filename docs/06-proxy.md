@@ -143,11 +143,13 @@ Latency: configured delay (default 300ms) + WAL write (< 1ms).
 
 ### RequireApproval (IC-3)
 ```
-→ WAL append (fsync)
-→ Return HTTP 403: "IC-3: Administrator approval required"
-→ Event status: Pending (awaiting human decision)
+→ WAL append (fsync), event status: Pending
+→ Hold HTTP response (oneshot channel)
+→ Wait for POST /gvm/approve or timeout (default 300s)
+→ If approved: forward to upstream, return response
+→ If denied or timeout: return HTTP 403 (fail-close)
 ```
-The request is **never forwarded**. Human must approve via a separate channel.
+The proxy **holds the HTTP connection open** and waits for human approval via `POST /gvm/approve` (admin API port 9090) or `gvm approve` CLI. On timeout, the request is auto-denied (fail-close). The agent experiences the approval wait as a slow HTTP response, not an immediate 403.
 
 ### Deny
 ```
