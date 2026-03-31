@@ -804,7 +804,7 @@ pub async fn run_watch(
     with_rules: bool,
     sandbox: bool,
     contained: bool,
-    _no_mitm: bool,
+    no_mitm: bool,
     image: &str,
     memory: &str,
     cpus: &str,
@@ -895,6 +895,7 @@ pub async fn run_watch(
             is_binary,
             sandbox,
             contained,
+            no_mitm,
             &image_str,
             &memory_str,
             &cpus_str,
@@ -1003,6 +1004,7 @@ async fn run_agent_process(
     is_binary_mode: bool,
     sandbox: bool,
     contained: bool,
+    no_mitm: bool,
     _image: &str,
     _memory: &str,
     _cpus: &str,
@@ -1068,7 +1070,7 @@ async fn run_agent_process(
             memory_limit: None,
             cpu_limit: None,
             fs_policy: Some(gvm_sandbox::FilesystemPolicy::default()),
-            mitm_ca_cert: None, // Watch mode: MITM CA not needed for observation
+            mitm_ca_cert: if no_mitm { None } else { run::download_mitm_ca_cert(proxy).await },
         };
 
         let result = tokio::task::spawn_blocking(move || gvm_sandbox::launch_sandboxed(config))

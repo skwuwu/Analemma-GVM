@@ -114,7 +114,7 @@ pub(crate) fn derive_admin_url(proxy: &str) -> String {
 /// Download the MITM CA certificate from the proxy's admin API.
 /// The proxy generates the CA and holds the private key; we only get the public cert.
 /// This cert is injected into the sandbox trust store so TLS verification succeeds.
-async fn download_mitm_ca_cert(proxy: &str) -> Option<Vec<u8>> {
+pub(crate) async fn download_mitm_ca_cert(proxy: &str) -> Option<Vec<u8>> {
     let ca_url = format!("{}/gvm/ca.pem", proxy.trim_end_matches('/'));
     match reqwest::get(&ca_url).await {
         Ok(resp) if resp.status().is_success() => match resp.bytes().await {
