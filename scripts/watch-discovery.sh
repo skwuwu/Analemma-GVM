@@ -209,6 +209,9 @@ run_watch_agent() {
 
     echo -e "  ${CYAN}Starting [$label] (timeout: ${timeout}s, rules: $with_rules)${NC}"
 
+    # Set sandbox timeout slightly longer than agent timeout to allow cleanup
+    export GVM_SANDBOX_TIMEOUT=$((timeout + 30))
+
     # Build gvm watch command
     local watch_args=(watch --sandbox --output json --agent-id "$label")
     if [ "$with_rules" = "true" ]; then
