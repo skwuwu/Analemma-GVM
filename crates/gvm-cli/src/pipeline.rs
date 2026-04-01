@@ -211,21 +211,20 @@ async fn launch_sandbox(config: &AgentConfig, pre: &PreLaunchState) -> Result<i3
         anyhow::bail!("Sandbox pre-flight check failed");
     }
 
-    // Launch with watchdog
-    let result = run::launch_sandbox_with_watchdog(sandbox_config, &config.proxy).await;
+    // Phase 2: pure sandbox launch — no watchdog here.
+    // Watchdog runs in BackgroundTasks (spawned by run_full/watch),
+    // keeping Phase 2 as a single-responsibility launch step.
+    let result = tokio::task::spawn_blocking(move || gvm_sandbox::launch_sandboxed(sandbox_config))
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("Sandbox task panicked: {e}")))?;
 
-    match result {
-        Ok(sr) => {
-            if sr.seccomp_violations > 0 {
-                eprintln!(
-                    "  {RED}\u{26a0} {} seccomp violation(s) detected{RESET}",
-                    sr.seccomp_violations
-                );
-            }
-            Ok(sr.exit_code)
-        }
-        Err(e) => Err(e),
+    if result.seccomp_violations > 0 {
+        eprintln!(
+            "  {RED}\u{26a0} {} seccomp violation(s) detected{RESET}",
+            result.seccomp_violations
+        );
     }
+    Ok(result.exit_code)
 }
 
 async fn launch_contained_wrapper(config: &AgentConfig, _pre: &PreLaunchState) -> Result<i32> {
