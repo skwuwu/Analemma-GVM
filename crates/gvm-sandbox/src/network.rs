@@ -525,6 +525,12 @@ pub fn cleanup_host_network(config: &VethConfig) {
 /// Cannot use 127.0.0.53 (systemd-resolved stub) because it binds to `lo` only —
 /// packets arriving on veth with DNAT to 127.0.0.53 are silently dropped.
 fn resolve_host_dns() -> String {
+    // Allow explicit override via environment variable (useful for non-standard setups)
+    if let Ok(dns) = std::env::var("GVM_DNS_TARGET") {
+        tracing::info!(dns = %dns, "Using DNS target from GVM_DNS_TARGET");
+        return dns;
+    }
+
     // Try systemd-resolved upstream config first (has real DNS, not stub)
     for path in &["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"] {
         if let Ok(content) = std::fs::read_to_string(path) {

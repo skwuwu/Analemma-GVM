@@ -204,12 +204,22 @@ fn read_pid_file(path: &Path) -> Option<u32> {
         .ok()
 }
 
-/// Check if a process with given PID is alive.
+/// Check if a process with given PID is alive AND is actually gvm-proxy.
+/// Guards against PID reuse: if the OS recycled the PID for a different
+/// process (e.g., bash, sshd), we must not treat it as our proxy.
 fn is_process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        // kill(pid, 0) checks if process exists without sending a signal
-        unsafe { libc::kill(pid as i32, 0) == 0 }
+        // Step 1: signal 0 = liveness check (no actual signal sent)
+        if unsafe { libc::kill(pid as i32, 0) != 0 } {
+            return false;
+        }
+        // Step 2: verify /proc/{pid}/cmdline contains "gvm-proxy"
+        // This prevents false positives from PID reuse by unrelated processes.
+        match std::fs::read_to_string(format!("/proc/{pid}/cmdline")) {
+            Ok(cmdline) => cmdline.contains("gvm-proxy"),
+            Err(_) => false, // cannot read cmdline → treat as dead
+        }
     }
     #[cfg(not(unix))]
     {

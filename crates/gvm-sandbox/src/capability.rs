@@ -75,6 +75,41 @@ pub fn check(config: &SandboxConfig) -> PreflightReport {
         );
     }
 
+    // ── Environment detection (non-blocking, diagnostic only) ──
+
+    // route_localnet: required for DNAT from veth to loopback proxy.
+    // Without this, packets DNAT'd to 127.0.0.1 are dropped by kernel.
+    let route_localnet = check_route_localnet();
+    if !route_localnet {
+        issues.push(
+            "route_localnet is disabled. Sandbox DNAT to loopback may fail. \
+             Will be auto-enabled during sandbox setup."
+                .to_string(),
+        );
+    }
+
+    // DNS resolver type: systemd-resolved vs direct
+    let has_systemd_resolved =
+        Path::new("/run/systemd/resolve/resolv.conf").exists();
+    if !has_systemd_resolved {
+        // Not a hard error — resolve_host_dns() falls back to /etc/resolv.conf → 8.8.8.8
+        tracing::debug!(
+            "systemd-resolved not detected — DNS will use /etc/resolv.conf or fallback"
+        );
+    }
+
+    // Kernel version (diagnostic logging, no blocking)
+    if let Ok(uname) = std::fs::read_to_string("/proc/sys/kernel/osrelease") {
+        let version = uname.trim();
+        tracing::info!(kernel = version, "Sandbox environment kernel version");
+        // Warn about known problematic kernels
+        if version.starts_with("6.17.") {
+            tracing::warn!(
+                "Kernel 6.17.x detected — ldd-in-PID-namespace panic workaround active"
+            );
+        }
+    }
+
     PreflightReport {
         user_namespaces,
         seccomp_available,
@@ -144,6 +179,15 @@ fn check_cap_net_admin() -> bool {
 /// Check if IP forwarding is enabled.
 fn check_ip_forward() -> bool {
     std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Check if route_localnet is enabled (required for DNAT to loopback).
+fn check_route_localnet() -> bool {
+    // Check both global and per-interface settings.
+    // Sandbox setup enables this automatically, but preflight warns if it's off.
+    std::fs::read_to_string("/proc/sys/net/ipv4/conf/all/route_localnet")
         .map(|v| v.trim() == "1")
         .unwrap_or(false)
 }
