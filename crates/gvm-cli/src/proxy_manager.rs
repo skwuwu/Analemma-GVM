@@ -65,9 +65,10 @@ async fn start_daemon(proxy: &str, workspace: &Path) -> Result<()> {
         proxy
     );
 
-    // Ensure data/ directory exists
+    // Ensure data/ directory exists and is owned by the original user (not root)
     let data_dir = workspace.join("data");
     std::fs::create_dir_all(&data_dir).ok();
+    fix_data_dir_ownership(&data_dir);
 
     // Log file (append mode)
     let log_path = data_dir.join("proxy.log");
@@ -79,6 +80,8 @@ async fn start_daemon(proxy: &str, workspace: &Path) -> Result<()> {
     let stderr_file = log_file
         .try_clone()
         .with_context(|| "Cannot clone log file handle")?;
+    // Fix ownership of log file if created as root
+    fix_file_ownership(&log_path);
 
     eprintln!("  {DIM}Binary: {}{RESET}", binary.display());
     eprintln!("  {DIM}Log:    {}{RESET}", log_path.display());
@@ -133,12 +136,13 @@ async fn start_daemon(proxy: &str, workspace: &Path) -> Result<()> {
             .with_context(|| format!("Failed to spawn proxy: {}", binary.display()))?
     };
 
-    // Write PID file
+    // Write PID file and fix ownership
     let pid = child.id();
     let pid_path = workspace.join("data/proxy.pid");
     if let Err(e) = std::fs::write(&pid_path, pid.to_string()) {
         eprintln!("  {DIM}Warning: cannot write PID file: {e}{RESET}");
     }
+    fix_file_ownership(&pid_path);
 
     // Wait for proxy to become healthy
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -211,6 +215,40 @@ fn is_process_alive(pid: u32) -> bool {
     {
         let _ = pid;
         false
+    }
+}
+
+/// Fix ownership of a file to SUDO_UID:SUDO_GID if running as root via sudo.
+/// Prevents data/ files from being root-owned after sandbox execution.
+fn fix_file_ownership(path: &Path) {
+    #[cfg(unix)]
+    {
+        if let (Some(uid_str), Some(gid_str)) = (
+            std::env::var("SUDO_UID").ok(),
+            std::env::var("SUDO_GID").ok(),
+        ) {
+            if let (Ok(uid), Ok(gid)) = (uid_str.parse::<u32>(), gid_str.parse::<u32>()) {
+                unsafe {
+                    let c_path = std::ffi::CString::new(
+                        path.to_str().unwrap_or("")
+                    ).unwrap_or_default();
+                    libc::chown(c_path.as_ptr(), uid, gid);
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    { let _ = path; }
+}
+
+/// Fix ownership of data directory and common files inside it.
+fn fix_data_dir_ownership(data_dir: &Path) {
+    fix_file_ownership(data_dir);
+    for name in &["wal.log", "wal.log.watermark", "wal_emergency.log", "proxy.log", "proxy.pid"] {
+        let p = data_dir.join(name);
+        if p.exists() {
+            fix_file_ownership(&p);
+        }
     }
 }
 
