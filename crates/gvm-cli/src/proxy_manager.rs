@@ -96,8 +96,22 @@ async fn start_daemon(proxy: &str, workspace: &Path) -> Result<()> {
             .stdin(std::process::Stdio::null())
             .stdout(log_file)
             .stderr(stderr_file);
+
+        // If running as root via sudo, drop back to the original user.
+        // The proxy doesn't need root — only the sandbox does.
+        // This prevents data/ files from becoming root-owned.
+        if let (Some(uid_str), Some(gid_str)) = (
+            std::env::var("SUDO_UID").ok(),
+            std::env::var("SUDO_GID").ok(),
+        ) {
+            if let (Ok(uid), Ok(gid)) = (uid_str.parse::<u32>(), gid_str.parse::<u32>()) {
+                cmd.uid(uid).gid(gid);
+                eprintln!("  {DIM}Proxy will run as uid={uid} gid={gid} (original user){RESET}");
+            }
+        }
+
         // SAFETY: pre_exec runs in forked child before exec.
-        // setsid() + double-fork pattern for proper daemonization.
+        // setsid() creates a new session so the proxy is independent.
         unsafe {
             cmd.pre_exec(|| {
                 libc::setsid();
