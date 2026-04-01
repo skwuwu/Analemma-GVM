@@ -249,23 +249,26 @@ launch_agent() {
         # Use explicit node path — sandbox mounts /usr/lib/node_modules but not /usr/bin/openclaw symlink
         local OC_MJS="/usr/lib/node_modules/openclaw/openclaw.mjs"
         [ ! -f "$OC_MJS" ] && OC_MJS="$(readlink -f "$(which openclaw)" 2>/dev/null || echo "openclaw")"
-        # Run in a loop — each turn is a fresh sandbox + OpenClaw session.
-        # Single --message calls complete in 1-2 min; the loop ensures sustained
-        # load for the full test duration. Each turn gets a unique session-id.
-        # Run in a sustained loop — each turn is a fresh sandbox + OpenClaw session.
-        # Subshell inherits vars; no `local` (invalid outside functions in subshell).
+        # Each turn = fresh sandbox → OpenClaw call → sandbox cleanup.
+        # Independent turns ensure cleanup runs between calls (no orphan accumulation).
+        # 3 agents × ~90s/turn (60s call + 30s sleep) = sustained load for full duration.
         (
             TURN_TIMEOUT=120
+            START_TIME=$(date +%s)
             for turn in $(seq 1 999); do
+                # Stop if test duration exceeded
+                ELAPSED=$(( $(date +%s) - START_TIME ))
+                [ $ELAPSED -ge $DURATION_SEC ] && break
+
                 echo "[Turn $turn] $(date -u +%H:%M:%S)"
-                timeout $((TURN_TIMEOUT + 30)) "$GVM_BIN" run $gvm_mode_flag \
+                "$GVM_BIN" run $gvm_mode_flag \
                     --agent-id "${session_id}-t${turn}" -- \
                     node "$OC_MJS" agent --local \
                     --session-id "${session_id}-t${turn}" \
                     --message "$prompt" \
                     --timeout "$TURN_TIMEOUT" \
                     2>&1 || true
-                sleep 15
+                sleep 30
             done
         ) > "$agent_log" 2>&1 &
     else
