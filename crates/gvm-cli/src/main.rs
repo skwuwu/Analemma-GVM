@@ -242,11 +242,22 @@ enum Commands {
         decision: String,
     },
 
-    /// Dry-run policy check without calling external APIs
+    /// Dry-run policy check without calling external APIs.
+    ///
+    /// Tests what decision the proxy would make for a given request
+    /// without actually sending it. Shows decision path (ABAC + SRR → final).
+    ///
+    ///   gvm check --operation gvm.payment.charge --host api.bank.com
+    ///   gvm check --operation test --host api.github.com --method GET
+    ///   gvm check --agent-id finance-001 --operation gvm.payment.charge --host api.bank.com
     Check {
         /// Operation name (e.g. "gvm.payment.charge")
         #[arg(long)]
         operation: String,
+
+        /// Agent ID for ABAC policy evaluation (test agent-specific policies)
+        #[arg(long, default_value = "dry-run")]
+        agent_id: String,
 
         /// Resource service
         #[arg(long, default_value = "unknown")]
@@ -267,6 +278,10 @@ enum Commands {
         /// HTTP method for SRR check
         #[arg(long, default_value = "POST")]
         method: String,
+
+        /// Target path for SRR check
+        #[arg(long, default_value = "/")]
+        path: String,
 
         /// Proxy URL
         #[arg(long, default_value = "http://127.0.0.1:8080")]
@@ -559,21 +574,17 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Check {
             operation,
+            agent_id,
             service,
             tier,
             sensitivity,
             host,
             method,
+            path,
             proxy,
         } => {
             check::run_check(
-                &operation,
-                &service,
-                &tier,
-                &sensitivity,
-                &host,
-                &method,
-                &proxy,
+                &operation, &agent_id, &service, &tier, &sensitivity, &host, &path, &method, &proxy,
             )
             .await?;
         }

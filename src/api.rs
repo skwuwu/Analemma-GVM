@@ -640,6 +640,12 @@ pub struct CheckRequest {
     pub target_path: String,
     #[serde(default = "default_method")]
     pub method: String,
+    /// Agent ID for ABAC evaluation. Defaults to "dry-run".
+    #[serde(default = "default_agent_id")]
+    pub agent_id: String,
+}
+fn default_agent_id() -> String {
+    "dry-run".to_string()
 }
 
 fn default_service() -> Option<String> {
@@ -656,73 +662,87 @@ fn default_method() -> String {
 }
 
 /// POST /gvm/check — Dry-run policy evaluation. No forwarding, no WAL write, no API keys.
+///
+/// Uses the same `enforcement::classify()` function as proxy_handler and MITM,
+/// ensuring the check endpoint and real enforcement always produce identical decisions.
 pub async fn check(
     State(state): State<AppState>,
     Json(body): Json<CheckRequest>,
 ) -> Response<Body> {
     let t0 = std::time::Instant::now();
 
-    // Parse resource descriptor from JSON if provided
-    let resource: crate::types::ResourceDescriptor = body
-        .resource
-        .as_ref()
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-
-    // Layer 1: ABAC policy evaluation
-    let operation = crate::types::OperationMetadata {
-        operation: body.operation.clone(),
-        resource: resource.clone(),
-        subject: crate::types::SubjectDescriptor {
-            agent_id: "dry-run".to_string(),
+    // Build GVM headers for ABAC evaluation (if operation is meaningful)
+    let gvm_headers = if body.operation != "unknown" && body.operation != "test" {
+        Some(crate::types::GVMHeaders {
+            agent_id: body.agent_id.clone(),
+            trace_id: "dry-run".to_string(),
+            parent_event_id: None,
+            event_id: "dry-run".to_string(),
+            operation: body.operation.clone(),
+            resource: body
+                .resource
+                .as_ref()
+                .and_then(|v| serde_json::from_value(v.clone()).ok()),
+            context: Default::default(),
+            session_id: Some("dry-run".to_string()),
             tenant_id: None,
-            session_id: "dry-run".to_string(),
-        },
-        context: crate::types::OperationContext {
-            attributes: Default::default(),
-        },
-        payload: crate::types::PayloadDescriptor::default(),
-    };
-    let (policy_decision, _matched_rule) = match state.policy.read() {
-        Ok(p) => p.evaluate(&operation),
-        Err(_) => {
-            return json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &serde_json::json!({"error": "Policy lock poisoned"}),
-            );
-        }
-    };
-
-    // Layer 2: Network SRR evaluation (use actual target_path for accurate matching)
-    let srr = match state.srr.read() {
-        Ok(guard) => guard,
-        Err(_) => {
-            tracing::error!("SRR lock poisoned in /gvm/check — denying request (fail-close)");
-            return json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &serde_json::json!({"error": "Internal governance error — request denied (fail-close)"}),
-            );
-        }
-    };
-    let srr_result = srr.check(&body.method, &body.target_host, &body.target_path, None);
-    drop(srr);
-
-    // Combined decision (max_strict picks the strictest)
-    let srr_decision = srr_result.decision;
-    let combined = crate::types::max_strict(srr_decision.clone(), policy_decision.clone());
-    let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
-
-    // Use SRR decision for the primary response (MCP/Tier-1 perspective).
-    // ABAC is only meaningful when SDK provides operation context.
-    let decision = if body.operation == "unknown" || body.operation == "test" {
-        // No meaningful operation → SRR-only decision
-        srr_decision.clone()
+            rate_limit: None,
+        })
     } else {
-        // Operation provided → full cross-layer decision
-        combined.clone()
+        None
     };
 
-    let (decision_str, next_action) = match &decision {
+    // Unified classification via enforcement::classify() — same code path as
+    // proxy_handler and handle_mitm_stream. Guarantees check results match
+    // real enforcement decisions.
+    let input = crate::enforcement::ClassifyInput {
+        method: &body.method,
+        host: &body.target_host,
+        path: &body.target_path,
+        body: None, // dry-run has no body
+        gvm_headers: gvm_headers.as_ref(),
+    };
+
+    let output = match crate::enforcement::classify(&state, &input) {
+        Ok(o) => o,
+        Err(err) => {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({"error": err}),
+            );
+        }
+    };
+
+    let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
+    let decision = &output.classification.decision;
+    let source = &output.classification.source;
+
+    // Reconstruct per-layer decisions for decision path visualization
+    // (read locks are cheap — already released by classify())
+    let policy_decision_str = if gvm_headers.is_some() {
+        let gvm_h = gvm_headers.as_ref().unwrap();
+        let op = crate::types::OperationMetadata {
+            operation: gvm_h.operation.clone(),
+            resource: gvm_h.resource.clone().unwrap_or_default(),
+            subject: crate::types::SubjectDescriptor {
+                agent_id: gvm_h.agent_id.clone(),
+                tenant_id: None,
+                session_id: "dry-run".to_string(),
+            },
+            context: crate::types::OperationContext { attributes: Default::default() },
+            payload: crate::types::PayloadDescriptor::default(),
+        };
+        state.policy.read().ok()
+            .map(|p| format!("{:?}", p.evaluate(&op).0))
+            .unwrap_or_else(|| "error".to_string())
+    } else {
+        "N/A (no operation)".to_string()
+    };
+    let srr_decision_str = state.srr.read().ok()
+        .map(|s| format!("{:?}", s.check(&body.method, &body.target_host, &body.target_path, None).decision))
+        .unwrap_or_else(|| "error".to_string());
+
+    let (decision_str, next_action) = match decision {
         crate::types::EnforcementDecision::Allow => ("Allow".to_string(), None),
         crate::types::EnforcementDecision::Delay { milliseconds } => (
             format!("Delay {}ms", milliseconds),
@@ -735,21 +755,34 @@ pub async fn check(
             "RequireApproval".to_string(),
             Some("Administrator approval required before execution".to_string()),
         ),
-        crate::types::EnforcementDecision::Deny { .. } => (
+        crate::types::EnforcementDecision::Deny { reason } => (
             "Deny".to_string(),
-            Some("This operation is blocked by policy. Contact your administrator.".to_string()),
+            Some(format!("Blocked: {}", reason)),
         ),
         _ => (format!("{:?}", decision), None),
     };
 
+    // Decision path: shows how max_strict() combined the per-layer decisions.
+    let decision_path = format!(
+        "Policy({}) + SRR({}) → Final({})",
+        policy_decision_str, srr_decision_str, decision_str
+    );
+
     let mut resp = serde_json::json!({
         "decision": decision_str,
-        "srr_decision": format!("{:?}", srr_decision),
+        "decision_source": format!("{:?}", source),
+        "decision_path": decision_path,
+        "policy_decision": policy_decision_str,
+        "srr_decision": srr_decision_str,
+        "engine_us": (elapsed * 1000.0).round(), // microseconds for precision
         "engine_ms": (elapsed * 10.0).round() / 10.0,
         "operation": body.operation,
+        "agent_id": body.agent_id,
         "method": body.method,
         "target_host": body.target_host,
-        "matched_rule": srr_result.matched_description,
+        "target_path": body.target_path,
+        "matched_rule": output.classification.matched_rule_id,
+        "default_caution": output.is_default_caution,
         "dry_run": true,
     });
 

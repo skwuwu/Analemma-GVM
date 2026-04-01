@@ -458,6 +458,41 @@ Sandbox resources (veth, iptables, cgroups, mounts) are cleaned up automatically
 - **Manual**: `gvm cleanup` scans for orphaned resources
 - **ip_forward**: Restored to original value when last sandbox exits
 
+### Policy Check (`gvm check`)
+
+Dry-run policy evaluation — tests what decision the proxy would make without sending real requests. Uses the same `enforcement::classify()` code path as the live proxy, guaranteeing check results match real enforcement.
+
+```bash
+gvm check --operation gvm.payment.charge --host api.bank.com --method POST
+gvm check --agent-id finance-001 --operation gvm.storage.read --host s3.amazonaws.com
+gvm check --operation test --host api.github.com --method GET --path /repos
+```
+
+Output includes **decision path** (`Policy(Allow) + SRR(Deny) → Final(Deny)`), matched rule, and engine latency in microseconds.
+
+### CI/CD Policy Validation
+
+Run `gvm check` in CI pipelines to catch unintended permission changes before deployment:
+
+```yaml
+# GitHub Actions example
+- name: Validate governance policies
+  run: |
+    gvm-proxy &
+    sleep 2
+    # Verify critical endpoints are blocked
+    gvm check --operation gvm.payment.charge --host api.bank.com --method POST \
+      | grep -q "Deny" || (echo "FAIL: payment endpoint not blocked" && exit 1)
+    # Verify read access is allowed
+    gvm check --operation gvm.storage.read --host api.github.com --method GET \
+      | grep -q "Allow" || (echo "FAIL: read access blocked" && exit 1)
+    # Test agent-specific policies
+    gvm check --agent-id finance-001 --operation gvm.payment.charge --host api.bank.com \
+      | grep -q "RequireApproval" || (echo "FAIL: finance agent should require approval" && exit 1)
+```
+
+This catches policy regressions: adding a new SRR rule that accidentally opens access, or modifying ABAC that changes an agent's permission level.
+
 ---
 
 [← Quick Start](15-quickstart.md) | [Architecture Overview →](00-overview.md)

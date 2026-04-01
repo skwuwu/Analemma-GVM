@@ -1,4 +1,4 @@
-use crate::ui;
+use crate::ui::{BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
 use anyhow::{Context, Result};
 use std::time::Instant;
 
@@ -6,10 +6,12 @@ use std::time::Instant;
 /// No external API calls are made — only the policy engine evaluates the request.
 pub async fn run_check(
     operation: &str,
+    agent_id: &str,
     service: &str,
     tier: &str,
     sensitivity: &str,
     host: &str,
+    path: &str,
     method: &str,
     proxy_url: &str,
 ) -> Result<()> {
@@ -27,8 +29,10 @@ pub async fn run_check(
         .post(&check_url)
         .json(&serde_json::json!({
             "operation": operation,
+            "agent_id": agent_id,
             "resource": resource,
             "target_host": host,
+            "target_path": path,
             "method": method,
         }))
         .send()
@@ -39,25 +43,72 @@ pub async fn run_check(
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.unwrap_or_default();
 
-    let decision =
-        body["decision"]
-            .as_str()
-            .unwrap_or(if status.is_success() { "Allow" } else { "Deny" });
-    let event_id = body["event_id"].as_str();
-    let next_action = body["next_action"].as_str();
-
-    ui::print_check_result(
-        operation,
-        service,
-        tier,
-        sensitivity,
-        host,
-        method,
-        decision,
-        elapsed,
-        event_id,
-        next_action,
+    // Extract fields from response
+    let decision = body["decision"].as_str().unwrap_or(
+        if status.is_success() { "Allow" } else { "Deny" }
     );
+    let decision_path = body["decision_path"].as_str();
+    let policy_decision = body["policy_decision"].as_str();
+    let srr_decision = body["srr_decision"].as_str();
+    let decision_source = body["decision_source"].as_str();
+    let matched_rule = body["matched_rule"].as_str();
+    let engine_us = body["engine_us"].as_f64();
+    let next_action = body["next_action"].as_str();
+    let is_default_caution = body["default_caution"].as_bool().unwrap_or(false);
+
+    // ── Pretty print ──
+    eprintln!();
+    eprintln!("  {BOLD}GVM Policy Check (dry-run){RESET}");
+    eprintln!();
+    eprintln!("  {DIM}Operation:{RESET}    {CYAN}{operation}{RESET}");
+    eprintln!("  {DIM}Agent:{RESET}        {agent_id}");
+    eprintln!("  {DIM}Target:{RESET}       {method} {host}{path}");
+    eprintln!("  {DIM}Resource:{RESET}     {service} / {tier} / {sensitivity}");
+    eprintln!();
+
+    // Decision with color
+    let decision_color = match decision {
+        "Allow" => GREEN,
+        "Deny" => RED,
+        _ => YELLOW,
+    };
+    eprintln!("  {BOLD}Decision:{RESET}     {decision_color}{decision}{RESET}");
+
+    // Decision path
+    if let Some(dp) = decision_path {
+        eprintln!("  {DIM}Path:{RESET}         {dp}");
+    }
+
+    // Source
+    if let Some(src) = decision_source {
+        eprintln!("  {DIM}Source:{RESET}       {src}");
+    }
+
+    // Matched rule
+    if let Some(rule) = matched_rule {
+        eprintln!("  {DIM}Matched rule:{RESET} {rule}");
+    }
+
+    // Default caution warning
+    if is_default_caution {
+        eprintln!("  {YELLOW}⚠ Default-to-Caution{RESET} {DIM}(no explicit SRR rule — add one with `gvm suggest`){RESET}");
+    }
+
+    // Latency
+    if let Some(us) = engine_us {
+        if us < 1000.0 {
+            eprintln!("  {DIM}Latency:{RESET}      {us:.0}μs");
+        } else {
+            eprintln!("  {DIM}Latency:{RESET}      {:.1}ms", us / 1000.0);
+        }
+    }
+
+    // Next action
+    if let Some(action) = next_action {
+        eprintln!("  {DIM}Action:{RESET}       {action}");
+    }
+
+    eprintln!();
 
     Ok(())
 }
