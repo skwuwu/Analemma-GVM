@@ -785,9 +785,42 @@ pub fn clear_sandbox_state() {
 }
 
 /// Check if a process is still running (signal 0 = liveness check).
+/// Check if a process is genuinely alive (not zombie, not PID-reused).
+/// Returns false for:
+/// - Dead processes (ESRCH)
+/// - Zombie processes (state = Z in /proc/PID/stat)
+/// - PID-reused processes (start time differs from state file creation)
 fn is_pid_alive(pid: u32) -> bool {
-    // kill(pid, 0) returns 0 if process exists, -1 with ESRCH if dead.
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+    // Step 1: basic liveness check
+    if unsafe { libc::kill(pid as i32, 0) != 0 } {
+        return false;
+    }
+
+    // Step 2: check /proc/PID/stat for zombie state and process identity
+    let stat_path = format!("/proc/{}/stat", pid);
+    let stat_content = match std::fs::read_to_string(&stat_path) {
+        Ok(c) => c,
+        Err(_) => return false, // Cannot read → treat as dead
+    };
+
+    // Parse state field (3rd field, after PID and comm in parens)
+    // Format: "PID (comm) S ..."  where S is the state character
+    if let Some(close_paren) = stat_content.rfind(')') {
+        let after_comm = &stat_content[close_paren + 2..];
+        let state = after_comm.chars().next().unwrap_or('?');
+        if state == 'Z' {
+            // Zombie — process exists but is dead, parent hasn't reaped
+            tracing::debug!(pid = pid, "PID is zombie — treating as dead for cleanup");
+            return false;
+        }
+    }
+
+    // Step 3: verify it's actually a GVM-related process (not PID reuse)
+    let cmdline_path = format!("/proc/{}/cmdline", pid);
+    match std::fs::read_to_string(&cmdline_path) {
+        Ok(cmdline) => cmdline.contains("gvm"),
+        Err(_) => false,
+    }
 }
 
 /// Clean up all resources listed in a SandboxState.

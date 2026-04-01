@@ -333,10 +333,25 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     #[cfg(not(feature = "uprobe"))]
     let _tls_probe_handle: Option<()> = None;
 
-    // 4. Wait for child to exit with timeout.
-    // Without timeout, a hung child (e.g. Node.js deadlock) blocks the parent forever.
-    // If the external `timeout` command kills us (parent), child becomes orphan with
-    // iptables pollution. Polling with WNOHANG + sleep allows graceful SIGKILL on timeout.
+    // 4. Wait for child to exit with timeout + SIGTERM awareness.
+    //
+    // The WNOHANG polling loop serves three purposes:
+    // a) Timeout: kill child after GVM_SANDBOX_TIMEOUT
+    // b) SIGTERM: detect parent's pending termination via SIGTERM flag
+    // c) Cleanup guarantee: always reach cleanup code (step 5) even if
+    //    the tokio runtime is shutting down, because this runs in spawn_blocking
+    //
+    // SIGTERM detection: we install a signal flag that the polling loop checks.
+    // When SIGTERM is received (Ctrl+C, systemd stop, stress-test kill), we
+    // kill the child and proceed to cleanup — preventing orphan veths.
+    use std::sync::atomic::Ordering;
+
+    // Install SIGTERM handler (sets SIGTERM_FLAG atomic bool)
+    SIGTERM_FLAG.store(false, Ordering::Relaxed); // Reset for this sandbox run
+    unsafe {
+        libc::signal(libc::SIGTERM, sigterm_flag_handler as libc::sighandler_t);
+    }
+
     let wait_timeout = std::time::Duration::from_secs(
         std::env::var("GVM_SANDBOX_TIMEOUT")
             .ok()
@@ -347,6 +362,18 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     let wait_result = loop {
         match waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {
+                // Check SIGTERM — kill child gracefully and proceed to cleanup
+                if SIGTERM_FLAG.load(Ordering::Relaxed) {
+                    tracing::info!(
+                        pid = child_pid.as_raw(),
+                        "SIGTERM received — killing sandbox child for cleanup"
+                    );
+                    nix::sys::signal::kill(child_pid, nix::sys::signal::SIGTERM).ok();
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    nix::sys::signal::kill(child_pid, nix::sys::signal::SIGKILL).ok();
+                    break waitpid(child_pid, None);
+                }
+
                 if wait_start.elapsed() > wait_timeout {
                     tracing::warn!(
                         pid = child_pid.as_raw(),
@@ -354,7 +381,6 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
                         "Sandbox child timed out — sending SIGKILL"
                     );
                     nix::sys::signal::kill(child_pid, nix::sys::signal::SIGKILL).ok();
-                    // Final waitpid to reap zombie
                     break waitpid(child_pid, None);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
@@ -635,3 +661,20 @@ fn drop_all_capabilities() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// SIGTERM handler that sets an atomic flag.
+/// Async-signal-safe: only writes to an atomic bool.
+/// The waitpid polling loop checks this flag every 200ms.
+extern "C" fn sigterm_flag_handler(_sig: libc::c_int) {
+    use std::sync::atomic::Ordering;
+    // Access the static defined in launch(). Since it's a static AtomicBool,
+    // this is safe from a signal handler.
+    unsafe {
+        // Re-declare the same static as in launch() — Rust statics are global.
+        // We use a module-level static instead to avoid this issue.
+    }
+    SIGTERM_FLAG.store(true, Ordering::Relaxed);
+}
+
+/// Global SIGTERM flag — checked by sandbox waitpid loop.
+static SIGTERM_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
