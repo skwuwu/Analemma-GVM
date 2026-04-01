@@ -52,6 +52,18 @@ v0.2 shipped: Shadow Mode + intent store, CONNECT tunnel, SRR hot-reload, eBPF u
 
 ## Implementation Log
 
+### 2026-04-01: Agent Launch Pipeline + Proxy Lifecycle Manager
+
+**Pipeline architecture** (`pipeline.rs`): Single execution path for all modes. Mode branching only in Phase 2 (launch). Pre-launch (proxy, orphan cleanup, CA download) and post-exit (audit, cleanup) are shared.
+
+**Proxy lifecycle** (`proxy_manager.rs`): Independent daemon (setsid, PID file, log to data/proxy.log). Survives CLI exit. SUDO_UID/GID drop. Stale PID detection. Watchdog uses same daemon restart logic.
+
+**Sandbox fixes**: DNS DNAT target recorded in state file for deterministic cleanup (H2). ip_forward saved/restored on last sandbox exit (H4). MITM WAL uses append_durable instead of append_async. GVM_SANDBOX_TIMEOUT in watch-discovery.sh.
+
+**Code standards** (§7): Pipeline pattern, no logic duplication, process lifecycle separation, config path consistency.
+
+Files: `crates/gvm-cli/src/{pipeline,proxy_manager,run,watch}.rs`, `crates/gvm-sandbox/src/{network,sandbox_impl,seccomp}.rs`, `src/tls_proxy.rs`, `docs/GVM_CODE_STANDARDS.md` | Risk: Medium (structural refactoring)
+
 ### 2026-04-01: Seccomp Architecture — KILL→ENOSYS Default + Blocklist
 
 Changed seccomp default action from `KillProcess` to `Errno(ENOSYS)`. Unknown/new syscalls now return "not implemented" instead of killing the process, allowing runtimes to gracefully fall back. High-risk syscalls (ptrace, mount, bpf, unshare, etc.) remain blocked — ENOSYS prevents execution just as effectively as KILL, but without crashing the agent. Added `fadvise64` to whitelist (coreutils dependency).

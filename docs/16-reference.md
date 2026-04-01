@@ -426,4 +426,38 @@ See [`config/srr_network.toml`](../config/srr_network.toml) for the full rule se
 
 ---
 
+## Operational Notes
+
+### Proxy Lifecycle
+
+The proxy runs as an independent daemon managed by `proxy_manager`:
+- **Auto-start**: `gvm run` and `gvm watch` start the proxy automatically if not running
+- **PID file**: `data/proxy.pid` — enables reuse across CLI invocations
+- **Logs**: `data/proxy.log` (append mode)
+- **Survival**: Proxy survives CLI exit (setsid daemon). Kill explicitly with `kill $(cat data/proxy.pid)`
+- **Sudo**: When run via `sudo gvm run --sandbox`, the proxy drops to the original user (SUDO_UID)
+
+### WAL Management
+
+**Do NOT delete `data/wal.log` while the proxy is running.** The proxy holds an open file descriptor to the WAL. Deleting the file removes the directory entry but the proxy continues writing to the deleted inode — new data is lost.
+
+To reset the WAL:
+1. Stop the proxy: `kill $(cat data/proxy.pid)`
+2. Delete or truncate: `> data/wal.log`
+3. Restart: `gvm run ...` (auto-starts proxy)
+
+Or truncate in-place (proxy detects size decrease): `> data/wal.log`
+
+WAL rotation is automatic when `max_wal_bytes` is configured in `proxy.toml`.
+
+### Sandbox Cleanup
+
+Sandbox resources (veth, iptables, cgroups, mounts) are cleaned up automatically:
+- **Normal exit**: RAII guards in `sandbox_impl.rs`
+- **Crash/SIGKILL**: State file (`/tmp/gvm-sandbox-{pid}.state`) enables cleanup on next `gvm run --sandbox`
+- **Manual**: `gvm cleanup` scans for orphaned resources
+- **ip_forward**: Restored to original value when last sandbox exits
+
+---
+
 [← Quick Start](15-quickstart.md) | [Architecture Overview →](00-overview.md)
