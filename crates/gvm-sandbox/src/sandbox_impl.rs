@@ -133,14 +133,22 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     let veth_config = VethConfig::from_pid(child_pid.as_raw() as u32, config.proxy_addr);
     let network_result = setup_host_network(&veth_config);
 
-    if let Err(ref e) = network_result {
-        tracing::warn!(error = %e, "Host network setup failed — sandbox will have no network");
-    } else {
-        // Record full sandbox state for orphan cleanup on crash.
-        // Includes network, mounts, and cgroup path — everything needed
-        // to deterministically clean up if this process is killed.
+    // dns_target is recorded in state file for deterministic cleanup.
+    // If DNS changes between setup and cleanup (DHCP renewal), cleanup
+    // still deletes the exact DNAT rule that was created.
+    let dns_target = match &network_result {
+        Ok(dns) => Some(dns.clone()),
+        Err(e) => {
+            tracing::warn!(error = %e, "Host network setup failed — sandbox will have no network");
+            None
+        }
+    };
+
+    if network_result.is_ok() {
         let mount_paths = vec![staging_ws.clone(), sandbox_root.clone()];
-        if let Err(e) = record_sandbox_state(&veth_config, &mount_paths, None) {
+        if let Err(e) = record_sandbox_state(
+            &veth_config, &mount_paths, None, dns_target.as_deref(),
+        ) {
             tracing::debug!(error = %e, "Failed to record sandbox state (orphan cleanup unavailable)");
         }
     }
@@ -193,7 +201,7 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
                         "/sys/fs/cgroup/gvm-agent-{}", child_pid.as_raw()
                     );
                     if let Err(e) = record_sandbox_state(
-                        &veth_config, &mount_paths, Some(&cgroup_path),
+                        &veth_config, &mount_paths, Some(&cgroup_path), dns_target.as_deref(),
                     ) {
                         tracing::debug!(error = %e, "Failed to update state with cgroup");
                     }
@@ -398,7 +406,7 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     drop(_ebpf_guard);
 
     if network_result.is_ok() {
-        cleanup_host_network(&veth_config);
+        cleanup_host_network(&veth_config, dns_target.as_deref());
         clear_sandbox_state();
     }
 

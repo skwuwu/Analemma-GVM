@@ -289,8 +289,11 @@ pub(crate) async fn launch_sandbox_with_watchdog(
     proxy: &str,
 ) -> Result<gvm_sandbox::SandboxResult> {
     let proxy_url = proxy.to_string();
+    let workspace = workspace_root_for_proxy();
     let sandbox_task = tokio::task::spawn_blocking(move || gvm_sandbox::launch_sandboxed(config));
-    let watchdog_handle = tokio::spawn(proxy_watchdog(proxy_url));
+    let watchdog_handle = tokio::spawn(
+        crate::proxy_manager::watchdog(proxy_url, workspace)
+    );
 
     let result = sandbox_task
         .await

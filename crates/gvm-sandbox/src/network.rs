@@ -80,7 +80,8 @@ impl VethConfig {
 }
 
 /// Host-side network setup: create veth pair, move one end into sandbox, configure routing.
-pub fn setup_host_network(config: &VethConfig) -> Result<()> {
+/// Returns the DNS target used for DNAT (for deterministic cleanup).
+pub fn setup_host_network(config: &VethConfig) -> Result<String> {
     // 1. Create veth pair
     run_ip(&[
         "link",
@@ -115,6 +116,8 @@ pub fn setup_host_network(config: &VethConfig) -> Result<()> {
     // 4. Enable IP forwarding (global + per-interface).
     // Global forwarding is required for DNAT/MASQUERADE to work.
     // Per-interface forwarding alone is not sufficient.
+    // Save original value so cleanup can restore it if no other sandboxes are running.
+    let _ = save_ip_forward_state();
     std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")
         .context("Failed to enable global IP forwarding")?;
     std::fs::write(
@@ -276,7 +279,7 @@ pub fn setup_host_network(config: &VethConfig) -> Result<()> {
         "Host-side network configured (proxy-only, FORWARD DROP default)"
     );
 
-    Ok(())
+    Ok(dns_target)
 }
 
 /// Sandbox-side network setup: configure interface, routing, and firewall lockdown.
@@ -424,7 +427,9 @@ fn run_sysctl(key: &str, value: &str) -> Result<()> {
 }
 
 /// Clean up host-side network resources.
-pub fn cleanup_host_network(config: &VethConfig) {
+/// `dns_target_override`: if Some, use this DNS target for DNAT rule deletion
+/// instead of re-resolving (which may return a different value after DHCP renewal).
+pub fn cleanup_host_network(config: &VethConfig, dns_target_override: Option<&str>) {
     let proxy_port = config.proxy_addr.port();
 
     // Remove iptables rules (best-effort, reverse order)
@@ -470,8 +475,11 @@ pub fn cleanup_host_network(config: &VethConfig) {
     ])
     .ok();
 
-    // DNAT (DNS UDP)
-    let dns_target = resolve_host_dns();
+    // DNAT (DNS UDP) — use recorded dns_target to ensure exact rule match.
+    // Falling back to resolve_host_dns() only if state file didn't record it.
+    let dns_target = dns_target_override
+        .map(|s| s.to_string())
+        .unwrap_or_else(resolve_host_dns);
     run_iptables(&[
         "-t",
         "nat",
@@ -510,6 +518,9 @@ pub fn cleanup_host_network(config: &VethConfig) {
     // Remove veth pair (removing one end removes both)
     run_ip(&["link", "del", &config.host_iface]).ok();
 
+    // Restore ip_forward if this was the last sandbox
+    restore_ip_forward_state();
+
     tracing::debug!(
         host_iface = %config.host_iface,
         "Host network cleaned up"
@@ -524,6 +535,47 @@ pub fn cleanup_host_network(config: &VethConfig) {
 ///
 /// Cannot use 127.0.0.53 (systemd-resolved stub) because it binds to `lo` only —
 /// packets arriving on veth with DNAT to 127.0.0.53 are silently dropped.
+const IP_FORWARD_SAVED_PATH: &str = "/tmp/gvm-ip-forward-original";
+
+/// Save the original ip_forward state before enabling it.
+/// Only saves if the file doesn't already exist (first sandbox wins).
+fn save_ip_forward_state() {
+    if std::path::Path::new(IP_FORWARD_SAVED_PATH).exists() {
+        return; // Already saved by a previous sandbox
+    }
+    let original = std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+        .unwrap_or_else(|_| "0".to_string());
+    let _ = std::fs::write(IP_FORWARD_SAVED_PATH, original.trim());
+}
+
+/// Restore ip_forward to its original value, but only if no other
+/// sandboxes are running (checked via state file count).
+fn restore_ip_forward_state() {
+    // Count active sandbox state files
+    let pattern = format!("{}/*{}", STATE_DIR, STATE_SUFFIX);
+    let active_count = glob::glob(&pattern)
+        .ok()
+        .map(|entries| entries.filter_map(|e| e.ok()).count())
+        .unwrap_or(0);
+
+    if active_count > 0 {
+        tracing::debug!(
+            active = active_count,
+            "Other sandboxes still active — not restoring ip_forward"
+        );
+        return;
+    }
+
+    if let Ok(original) = std::fs::read_to_string(IP_FORWARD_SAVED_PATH) {
+        let val = original.trim();
+        if val == "0" {
+            std::fs::write("/proc/sys/net/ipv4/ip_forward", "0").ok();
+            tracing::debug!("Restored ip_forward to 0 (original state)");
+        }
+        let _ = std::fs::remove_file(IP_FORWARD_SAVED_PATH);
+    }
+}
+
 fn resolve_host_dns() -> String {
     // Allow explicit override via environment variable (useful for non-standard setups)
     if let Ok(dns) = std::env::var("GVM_DNS_TARGET") {
@@ -621,6 +673,11 @@ pub struct SandboxState {
     pub mount_paths: Vec<String>,
     /// Cgroup path (if resource limits were applied).
     pub cgroup_path: Option<String>,
+    /// DNS target used for DNAT (recorded at setup time).
+    /// Used by cleanup to delete the exact DNAT rule, even if
+    /// /run/systemd/resolve/resolv.conf has changed since setup.
+    #[serde(default)]
+    pub dns_target: Option<String>,
 }
 
 /// Get the state file path for a given PID.
@@ -636,6 +693,7 @@ pub fn record_sandbox_state(
     config: &VethConfig,
     mount_paths: &[PathBuf],
     cgroup_path: Option<&str>,
+    dns_target: Option<&str>,
 ) -> Result<()> {
     let state = SandboxState {
         version: 1,
@@ -649,6 +707,7 @@ pub fn record_sandbox_state(
         forward_chain: format!("GVM-{}", config.host_iface),
         mount_paths: mount_paths.iter().map(|p| p.display().to_string()).collect(),
         cgroup_path: cgroup_path.map(|s| s.to_string()),
+        dns_target: dns_target.map(|s| s.to_string()),
     };
 
     let path = state_file_path(state.pid);
@@ -725,7 +784,7 @@ fn cleanup_state_resources(state: &SandboxState) {
                 state.proxy_port,
             ),
         };
-        cleanup_host_network(&veth_config);
+        cleanup_host_network(&veth_config, state.dns_target.as_deref());
         crate::ebpf::detach_tc_filter(&state.veth_host);
         tracing::debug!(iface = %state.veth_host, "Cleaned orphan veth + iptables");
     }
@@ -815,7 +874,7 @@ pub fn cleanup_all_orphans() -> Result<u32> {
                             proxy_port,
                         ),
                     };
-                    cleanup_host_network(&config);
+                    cleanup_host_network(&config, None);
                     crate::ebpf::detach_tc_filter(host_iface);
                     tracing::info!("Cleaned up legacy state file");
                 }
@@ -942,7 +1001,7 @@ fn cleanup_stale_forward_chains() -> usize {
 
 /// Record network state (legacy alias — delegates to per-PID state).
 pub fn record_network_state(config: &VethConfig) -> Result<()> {
-    record_sandbox_state(config, &[], None)
+    record_sandbox_state(config, &[], None, None)
 }
 
 /// Clear network state (legacy alias — delegates to per-PID clear).
