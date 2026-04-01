@@ -220,6 +220,28 @@ enum Commands {
         dry_run: bool,
     },
 
+    /// Generate SRR rules from watch session JSON log.
+    ///
+    /// Reads a watch session log (--output json) and generates TOML rules
+    /// for all URLs that hit Default-to-Caution (no explicit SRR rule).
+    ///
+    ///   gvm suggest --from session.jsonl --output new-rules.toml
+    ///   gvm suggest --from session.jsonl --decision allow    # all Allow
+    ///   gvm suggest --from session.jsonl --decision delay    # all Delay(300ms)
+    Suggest {
+        /// Path to watch session JSON log file (one JSON event per line).
+        #[arg(long = "from")]
+        from_file: String,
+
+        /// Output TOML file for generated rules (default: stdout).
+        #[arg(long, short)]
+        output: Option<String>,
+
+        /// Default decision for all rules: allow, delay, deny (default: allow).
+        #[arg(long, default_value = "allow")]
+        decision: String,
+    },
+
     /// Dry-run policy check without calling external APIs
     Check {
         /// Operation name (e.g. "gvm.payment.charge")
@@ -525,6 +547,14 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+
+        Commands::Suggest {
+            from_file,
+            output,
+            decision,
+        } => {
+            suggest::suggest_rules_batch(&from_file, output.as_deref(), &decision);
         }
 
         Commands::Check {

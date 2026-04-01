@@ -49,8 +49,8 @@ const CIRCUIT_BREAKER_RETRY_SECS: u64 = 30;
 #[derive(Clone)]
 pub struct AppState {
     pub srr: Arc<std::sync::RwLock<NetworkSRR>>,
-    pub policy: Arc<PolicyEngine>,
-    pub registry: Arc<OperationRegistry>,
+    pub policy: Arc<std::sync::RwLock<PolicyEngine>>,
+    pub registry: Arc<std::sync::RwLock<OperationRegistry>>,
     pub api_keys: Arc<APIKeyStore>,
     pub ledger: Arc<Ledger>,
     pub vault: Arc<Vault>,
@@ -80,6 +80,10 @@ pub struct AppState {
     pub shadow_config: crate::intent_store::ShadowConfig,
     /// SRR config file path (for hot-reload).
     pub srr_config_path: String,
+    /// ABAC policy directory path (for hot-reload).
+    pub policy_dir: String,
+    /// Operation registry file path (for hot-reload).
+    pub registry_path: String,
     /// MITM CA certificate PEM (for sandbox trust store download via GET /gvm/ca.pem).
     /// None when TLS MITM is not active.
     pub mitm_ca_pem: Option<Arc<Vec<u8>>>,
@@ -206,7 +210,16 @@ pub async fn proxy_handler(
     let (mut classification, mut is_default_caution) = if let Some(ref headers) = gvm_headers {
         // SDK-routed: Layer 1 Semantic classification via ABAC policy engine
         let operation = build_operation_metadata(headers, &target);
-        let (policy_decision, matched_rule) = state.policy.evaluate(&operation);
+        let (policy_decision, matched_rule) = match state.policy.read() {
+            Ok(p) => p.evaluate(&operation),
+            Err(_) => {
+                tracing::error!("Policy lock poisoned — denying (fail-close)");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal governance error — request denied (fail-close)",
+                );
+            }
+        };
 
         // Also check network SRR (Deny in SRR overrides policy)
         let srr = match state.srr.read() {
@@ -330,7 +343,10 @@ pub async fn proxy_handler(
                     },
                     payload: PayloadDescriptor::default(),
                 };
-                let (abac_decision, abac_rule) = state.policy.evaluate(&shadow_op);
+                let (abac_decision, abac_rule) = match state.policy.read() {
+                    Ok(p) => p.evaluate(&shadow_op),
+                    Err(_) => (EnforcementDecision::Deny { reason: "Policy lock poisoned".into() }, None),
+                };
 
                 let combined = max_strict(classification.decision.clone(), abac_decision.clone());
                 if combined.strictness() > classification.decision.strictness() {

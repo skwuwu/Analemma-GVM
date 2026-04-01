@@ -22,6 +22,12 @@ max_age_days = 2555
 [redis]
 url = "redis://localhost:6379"
 
+[wal]
+# batch_window_ms = 2          # Group commit window (higher = more throughput, more latency)
+# max_batch_size = 128          # Max events per batch before forced flush
+# max_wal_bytes = 104857600     # 100MB — triggers rotation to wal.log.<N>
+# max_wal_segments = 10         # Keep N rotated segments, prune oldest
+
 [srr]
 network_file = "config/srr_network.toml"
 semantic_file = "config/srr_semantic.toml"

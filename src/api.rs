@@ -683,7 +683,15 @@ pub async fn check(
         },
         payload: crate::types::PayloadDescriptor::default(),
     };
-    let (policy_decision, _matched_rule) = state.policy.evaluate(&operation);
+    let (policy_decision, _matched_rule) = match state.policy.read() {
+        Ok(p) => p.evaluate(&operation),
+        Err(_) => {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({"error": "Policy lock poisoned"}),
+            );
+        }
+    };
 
     // Layer 2: Network SRR evaluation (use actual target_path for accurate matching)
     let srr = match state.srr.read() {
@@ -863,50 +871,100 @@ pub async fn register_intent(
 
 /// POST /gvm/reload — Reload SRR rules from config file without restarting.
 ///
-/// Atomically swaps the SRR rule set. If parsing fails, the existing rules
-/// are preserved and an error is returned. The proxy never goes down.
+/// Atomically reloads all governance components: SRR rules, ABAC policies,
+/// and operation registry. If any component fails to parse, ALL existing
+/// configurations are preserved (atomic: all-or-nothing).
 pub async fn reload_srr(State(state): State<AppState>) -> Response<Body> {
+    use crate::policy::PolicyEngine;
+    use crate::registry::OperationRegistry;
     use crate::srr::NetworkSRR;
     use std::path::Path;
 
-    let path = Path::new(&state.srr_config_path);
-    match NetworkSRR::load(path) {
-        Ok(new_srr) => {
-            let rule_count = new_srr.rule_count();
-            // Atomic swap: acquire write lock, replace, release
-            match state.srr.write() {
-                Ok(mut srr) => {
-                    *srr = new_srr;
-                    tracing::info!(rules = rule_count, "SRR rules hot-reloaded");
-                    json_response(
-                        StatusCode::OK,
-                        &serde_json::json!({
-                            "reloaded": true,
-                            "rules": rule_count,
-                        }),
-                    )
-                }
-                Err(_) => {
-                    tracing::error!("SRR write lock poisoned during reload");
-                    json_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &serde_json::json!({"error": "SRR lock poisoned"}),
-                    )
-                }
-            }
-        }
+    // Phase 1: Parse all configs BEFORE acquiring any locks.
+    // If any parse fails, we abort without touching state.
+    let new_srr = match NetworkSRR::load(Path::new(&state.srr_config_path)) {
+        Ok(s) => s,
         Err(e) => {
-            // Parse failed — keep existing rules (fail-safe)
-            tracing::error!(error = %e, "SRR reload failed — keeping existing rules");
-            json_response(
+            tracing::error!(error = %e, "SRR reload parse failed — all configs preserved");
+            return json_response(
                 StatusCode::BAD_REQUEST,
                 &serde_json::json!({
                     "reloaded": false,
-                    "error": format!("Parse failed: {}. Existing rules preserved.", e),
+                    "error": format!("SRR parse failed: {}. All configs preserved.", e),
                 }),
-            )
+            );
         }
-    }
+    };
+
+    let new_policy = match PolicyEngine::load(Path::new(&state.policy_dir)) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "Policy reload parse failed — all configs preserved");
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({
+                    "reloaded": false,
+                    "error": format!("Policy parse failed: {}. All configs preserved.", e),
+                }),
+            );
+        }
+    };
+
+    let new_registry = match OperationRegistry::load(Path::new(&state.registry_path)) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, "Registry reload parse failed — all configs preserved");
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({
+                    "reloaded": false,
+                    "error": format!("Registry parse failed: {}. All configs preserved.", e),
+                }),
+            );
+        }
+    };
+
+    // Phase 2: All parsed successfully. Acquire write locks and swap atomically.
+    let srr_count = new_srr.rule_count();
+
+    let lock_err = |name: &str| {
+        tracing::error!("{name} write lock poisoned during reload");
+        json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &serde_json::json!({"error": format!("{name} lock poisoned")}),
+        )
+    };
+
+    let mut srr_guard = match state.srr.write() {
+        Ok(g) => g,
+        Err(_) => return lock_err("SRR"),
+    };
+    let mut policy_guard = match state.policy.write() {
+        Ok(g) => g,
+        Err(_) => return lock_err("Policy"),
+    };
+    let mut registry_guard = match state.registry.write() {
+        Ok(g) => g,
+        Err(_) => return lock_err("Registry"),
+    };
+
+    *srr_guard = new_srr;
+    *policy_guard = new_policy;
+    *registry_guard = new_registry;
+
+    drop(srr_guard);
+    drop(policy_guard);
+    drop(registry_guard);
+
+    tracing::info!(srr_rules = srr_count, "Governance hot-reloaded (SRR + ABAC + Registry)");
+    json_response(
+        StatusCode::OK,
+        &serde_json::json!({
+            "reloaded": true,
+            "srr_rules": srr_count,
+            "components": ["srr", "policy", "registry"],
+        }),
+    )
 }
 
 // ─── Health / Admin Endpoints ───
@@ -1041,8 +1099,8 @@ pub async fn info(State(state): State<AppState>) -> Response<Body> {
                 "ledger": "active",
             },
             "registry": {
-                "core_operations": state.registry.core_count(),
-                "custom_operations": state.registry.custom_count(),
+                "core_operations": state.registry.read().map(|r| r.core_count()).unwrap_or(0),
+                "custom_operations": state.registry.read().map(|r| r.custom_count()).unwrap_or(0),
             },
             "shadow": {
                 "mode": format!("{:?}", state.shadow_config.mode),

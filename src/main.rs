@@ -343,8 +343,8 @@ async fn main() {
     // 11. Compose shared state
     let state = AppState {
         srr: Arc::new(std::sync::RwLock::new(srr)),
-        policy: Arc::new(policy),
-        registry: Arc::new(registry),
+        policy: Arc::new(std::sync::RwLock::new(policy)),
+        registry: Arc::new(std::sync::RwLock::new(registry)),
         api_keys: Arc::new(api_keys),
         ledger,
         vault: Arc::new(vault),
@@ -360,6 +360,8 @@ async fn main() {
             config.shadow.intent_ttl_secs,
         )),
         srr_config_path: config.srr.network_file.clone(),
+        policy_dir: config.policies.directory.clone(),
+        registry_path: config.operations.registry_file.clone(),
         mitm_ca_pem: Some(mitm_ca_cert_pem.clone()),
         payload_inspection: config.srr.payload_inspection,
         max_body_bytes: config.srr.max_body_bytes,
