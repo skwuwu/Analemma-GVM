@@ -102,6 +102,15 @@ Same `enforcement::classify()` function as the live proxy — check results alwa
 
 `--sandbox` isolates the agent in Linux namespaces with seccomp-BPF, intercepts all HTTPS via MITM, and injects credentials — the agent physically cannot bypass the proxy.
 
+### MCP (Claude Desktop / Cursor)
+
+GVM provides MCP tools for AI assistants. Claude Desktop can check policies, fetch URLs through governance, and browse audit logs — all governed by GVM.
+
+```bash
+# Start proxy, then configure Claude Desktop to use GVM MCP server
+# See: docs/15-quickstart.md#7-mcp-integration--claude-desktop--cursor
+```
+
 ---
 
 ## SDK (optional, zero required)

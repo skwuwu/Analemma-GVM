@@ -177,13 +177,102 @@ pip install -e sdk/python       # Install once
 
 ---
 
+## 7. MCP Integration — Claude Desktop / Cursor
+
+GVM provides MCP tools for AI assistants that support the Model Context Protocol. This lets Claude Desktop, Cursor, or any MCP-compatible client govern agent API calls through GVM.
+
+### Setup
+
+```bash
+# 1. Start GVM proxy
+cd Analemma-GVM && cargo run --release
+
+# 2. Clone MCP server
+git clone https://github.com/skwuwu/analemma-gvm-openclaw.git
+cd analemma-gvm-openclaw/mcp-server
+npm install && npm run build
+```
+
+### Claude Desktop Configuration
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "gvm": {
+      "command": "node",
+      "args": ["/path/to/analemma-gvm-openclaw/mcp-server/dist/index.js"],
+      "env": {
+        "GVM_PROXY_URL": "http://127.0.0.1:8080"
+      }
+    }
+  }
+}
+```
+
+### Available MCP Tools
+
+| Tool | What it does |
+|------|-------------|
+| `gvm_status` | Check proxy health and loaded rule count |
+| `gvm_policy_check` | Dry-run: "would this request be allowed?" |
+| `gvm_fetch` | Fetch a URL through GVM governance |
+| `gvm_select_rulesets` | Browse and apply pre-built rulesets (GitHub, Slack, etc.) |
+| `gvm_blocked_summary` | Summary of recently blocked requests |
+| `gvm_audit_log` | Query the Merkle-chained audit trail |
+| `gvm_declare_intent` | Register intent before making API calls (Shadow Mode) |
+
+### Shadow Mode
+
+Shadow Mode adds a 2-phase verification: the MCP tool declares what it's about to do (`gvm_declare_intent`), then the proxy verifies the actual request matches the declaration.
+
+```toml
+# config/proxy.toml
+[shadow]
+mode = "cautious"       # strict | cautious | permissive | disabled
+intent_ttl_secs = 30    # how long an intent stays valid
+cautious_delay_ms = 5000 # delay for unverified requests in cautious mode
+```
+
+| Mode | Unverified request behavior |
+|------|----------------------------|
+| `strict` | Deny (403) — safest for production |
+| `cautious` | Delay 5s + audit warning — good for testing |
+| `permissive` | Allow + audit warning — monitoring only |
+| `disabled` | No verification (default) |
+
+### Example: Claude Desktop with GVM
+
+```
+User: "Search GitHub for Rust async runtime projects"
+
+Claude → gvm_policy_check(host="api.github.com", method="GET")
+       → Allow ✓
+
+Claude → gvm_fetch("https://api.github.com/search/repositories?q=rust+async+runtime")
+       → Result: [{name: "tokio", stars: 24000}, ...]
+       → Governed, audited, rate-limited through GVM proxy
+
+User: "Delete the test repository"
+
+Claude → gvm_policy_check(host="api.github.com", method="DELETE")
+       → Deny ✗ (DELETE blocked by SRR rule)
+
+Claude: "I can't delete repositories — that operation is blocked by governance policy."
+```
+
+---
+
 ## Next Steps
 
 | Want to... | Go to |
 |-----------|-------|
 | Configure policies, SRR rules, secrets | [Reference Guide →](16-reference.md) |
 | Understand the 3-layer architecture | [Architecture Overview →](00-overview.md) |
+| Connect Claude Desktop / Cursor via MCP | [Section 7 above](#7-mcp-integration--claude-desktop--cursor) |
 | See the full SDK API (`@ic`, `GVMAgent`, errors) | [Python SDK →](07-sdk.md) |
 | Write custom SRR rules | [Network SRR →](03-srr.md) |
 | Write ABAC policies | [ABAC Policy →](02-policy.md) |
+| Validate policies in CI/CD | [CI/CD Guide →](16-reference.md#cicd-policy-validation) |
 | Run tests | `cargo test --workspace --all-targets` |
