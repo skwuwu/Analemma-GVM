@@ -143,7 +143,7 @@ setup() {
 
     # Verify proxy health
     local status
-    status=$(( curl -sf "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" ) 2>/dev/null || echo "dead")
+    status=$( (curl -sf "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])") 2>/dev/null) || status="dead"
     if [ "$status" != "healthy" ]; then
         echo -e "${RED}Proxy failed to start (status: $status)${NC}"
         exit 1
@@ -195,8 +195,8 @@ collect_metric() {
     fd=$(get_fd_count "$pid")
     wal=$(get_wal_bytes)
     veth=$(get_orphan_veth)
-    healthy=$(( curl -sf --connect-timeout 2 "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" ) 2>/dev/null || echo "dead")
-    pending=$(( curl -sf --connect-timeout 2 "$ADMIN_URL/gvm/pending" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(len(d.get('pending',[])))" ) 2>/dev/null || echo "0")
+    healthy=$( (curl -sf --connect-timeout 2 "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])") 2>/dev/null) || healthy="dead"
+    pending=$( (curl -sf --connect-timeout 2 "$ADMIN_URL/gvm/pending" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(len(d.get('pending',[])))") 2>/dev/null) || pending="0"
     agents=$(pgrep -c -f "openclaw\|stress-agent" 2>/dev/null || echo "0")
     batches=$(get_merkle_batches)
 
@@ -208,6 +208,9 @@ collect_metric() {
 
 # ── Metrics Loop (background) ──
 metrics_loop() {
+    # Disable pipefail in background function — failed curl|python3 pipes
+    # (e.g., proxy dead during chaos kill) must not kill the metrics loop.
+    set +o pipefail
     local start_time=$1
     while true; do
         local now elapsed
@@ -356,10 +359,10 @@ chaos_proxy_kill() {
     # Verify SRR rules are loaded after restart (fail-open prevention)
     sleep 2
     local srr_check
-    srr_check=$(( curl -sf -X POST "$PROXY_URL/gvm/check" \
+    srr_check=$( (curl -sf -X POST "$PROXY_URL/gvm/check" \
         -H "Content-Type: application/json" \
         -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/torvalds/linux/commits","operation":"test"}' \
-        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" ) 2>/dev/null || echo "unreachable")
+        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))") 2>/dev/null) || srr_check="unreachable"
 
     if echo "$srr_check" | grep -qi "Allow"; then
         chaos_log "VERIFY: SRR rules loaded correctly after restart (api.github.com → Allow)"
@@ -445,6 +448,7 @@ chaos_disk_release() {
 
 # ── Chaos Scheduler ──
 chaos_scheduler() {
+    set +o pipefail
     local start_time=$1
 
     # Use -ge (not -eq) to prevent missing the target minute due to sleep alignment.
