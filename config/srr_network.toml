@@ -446,3 +446,43 @@ pattern = "api.openai.com/v1/embeddings"
 method = "POST"
 decision = { type = "Allow" }
 reason = "OpenAI embeddings (AI-to-AI)"
+
+# -- Phase 1 Discovery (2026-04-01) --
+# Hosts discovered via gvm watch --sandbox with OpenClaw agents.
+# Previously hit Default-to-Caution (300ms delay).
+
+[[rules]]
+pattern = "raw.githubusercontent.com/{any}"
+method = "GET"
+decision = { type = "Allow" }
+reason = "GitHub raw content (README, CONTRIBUTING, docs)"
+
+[[rules]]
+pattern = "html.duckduckgo.com/{any}"
+method = "GET"
+decision = { type = "Allow" }
+reason = "DuckDuckGo search (agent web research)"
+
+[[rules]]
+pattern = "catfact.ninja/{any}"
+method = "GET"
+decision = { type = "Allow" }
+reason = "Public API — cat facts"
+
+[[rules]]
+pattern = "dog.ceo/{any}"
+method = "GET"
+decision = { type = "Allow" }
+reason = "Public API — dog images"
+
+[[rules]]
+pattern = "numbersapi.com/{any}"
+method = "GET"
+decision = { type = "Allow" }
+reason = "Public API — number trivia"
+
+[[rules]]
+pattern = "official-joke-api.appspot.com/{any}"
+method = "GET"
+decision = { type = "Allow" }
+reason = "Public API — jokes"
