@@ -113,18 +113,42 @@ pub fn setup_host_network(config: &VethConfig) -> Result<String> {
     ])?;
     run_ip(&["link", "set", &config.host_iface, "up"])?;
 
-    // 4. Enable IP forwarding (global + per-interface).
-    // Global forwarding is required for DNAT/MASQUERADE to work.
-    // Per-interface forwarding alone is not sufficient.
-    // Save original value so cleanup can restore it if no other sandboxes are running.
+    // 4. Enable IP forwarding.
+    //
+    // SECURITY: Global ip_forward=1 changes the kernel's packet processing for the
+    // entire host — on EC2, this can interact with source/dest checks and cause
+    // SSH connectivity loss. We enable per-interface forwarding on the veth pair
+    // and the default outbound interface, plus global forwarding (required by
+    // DNAT/MASQUERADE on most kernels).
+    //
+    // The FORWARD chain ESTABLISHED/RELATED protection rule (step 7) ensures
+    // existing connections (SSH) survive even with global forwarding enabled.
     let _ = save_ip_forward_state();
     std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")
         .context("Failed to enable global IP forwarding")?;
+    // Per-interface forwarding for the veth
     std::fs::write(
         format!("/proc/sys/net/ipv4/conf/{}/forwarding", config.host_iface),
         "1",
     )
     .ok();
+    // Also enable on the default outbound interface (e.g., ens5 on EC2)
+    // so that DNAT'd packets can be forwarded out.
+    if let Ok(output) = std::process::Command::new("ip")
+        .args(["route", "get", "8.8.8.8"])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(dev) = stdout.split_whitespace()
+            .position(|w| w == "dev")
+            .and_then(|i| stdout.split_whitespace().nth(i + 1))
+        {
+            std::fs::write(
+                format!("/proc/sys/net/ipv4/conf/{}/forwarding", dev),
+                "1",
+            ).ok();
+        }
+    }
     // Enable route_localnet so DNAT to 127.0.0.1 works on the veth interface.
     // Without this, packets DNATed to 127.0.0.1 are silently dropped as martians.
     std::fs::write(
@@ -211,8 +235,30 @@ pub fn setup_host_network(config: &VethConfig) -> Result<String> {
         "MASQUERADE",
     ])?;
 
-    // 7. Use a per-sandbox FORWARD chain to avoid stale rule accumulation.
-    // Previous sandbox crashes could leave DROP rules in FORWARD that block new runs.
+    // 7. FORWARD chain setup.
+    //
+    // CRITICAL: Protect existing host connections (SSH, etc.) BEFORE adding DROP rules.
+    // Without this, ip_forward=1 changes the kernel's packet processing path and
+    // GVM's per-sandbox DROP rules can block host SSH on EC2 (P0 security issue).
+    //
+    // The protection rule allows ESTABLISHED/RELATED packets through FORWARD
+    // regardless of GVM chains, ensuring existing connections survive.
+    // We use -C (check) first to avoid duplicate rules across multiple sandboxes.
+    let ssh_protect_args = [
+        "-I", "FORWARD", "1",
+        "-m", "state", "--state", "ESTABLISHED,RELATED",
+        "-j", "ACCEPT",
+    ];
+    if run_iptables(&[
+        "-C", "FORWARD",
+        "-m", "state", "--state", "ESTABLISHED,RELATED",
+        "-j", "ACCEPT",
+    ]).is_err() {
+        run_iptables(&ssh_protect_args)?;
+        tracing::debug!("FORWARD ESTABLISHED/RELATED protection rule added");
+    }
+
+    // Per-sandbox FORWARD chain to avoid stale rule accumulation.
     let chain_name = format!("GVM-{}", config.host_iface);
     // Remove any stale chain from previous crash
     run_iptables(&["-D", "FORWARD", "-j", &chain_name]).ok();
@@ -269,8 +315,10 @@ pub fn setup_host_network(config: &VethConfig) -> Result<String> {
     ])?;
     // DROP everything else from/to this veth (proxy bypass prevention)
     run_iptables(&["-A", &chain_name, "-i", &config.host_iface, "-j", "DROP"])?;
-    // Jump to per-sandbox chain from FORWARD (insert at top to avoid stale DROPs)
-    run_iptables(&["-I", "FORWARD", "1", "-j", &chain_name])?;
+    // Jump to per-sandbox chain from FORWARD.
+    // Insert at position 2 (after the ESTABLISHED/RELATED protection rule at position 1).
+    // This ensures existing SSH connections are never blocked by per-sandbox DROP rules.
+    run_iptables(&["-I", "FORWARD", "2", "-j", &chain_name])?;
 
     tracing::debug!(
         host_iface = %config.host_iface,
@@ -573,6 +621,14 @@ fn restore_ip_forward_state() {
             tracing::debug!("Restored ip_forward to 0 (original state)");
         }
         let _ = std::fs::remove_file(IP_FORWARD_SAVED_PATH);
+
+        // Remove FORWARD ESTABLISHED/RELATED protection rule (no more sandboxes need it)
+        run_iptables(&[
+            "-D", "FORWARD",
+            "-m", "state", "--state", "ESTABLISHED,RELATED",
+            "-j", "ACCEPT",
+        ]).ok();
+        tracing::debug!("Removed FORWARD ESTABLISHED/RELATED protection rule");
     }
 }
 
