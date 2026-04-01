@@ -366,14 +366,11 @@ fn insert_base_syscalls(rules: &mut BTreeMap<i64, Vec<SeccompRule>>) {
         libc::SYS_sysinfo,
         libc::SYS_prlimit64,
         libc::SYS_rseq,
-        // Node.js 22+ runtime requirements.
-        // io_uring: libuv calls io_uring_setup BEFORE reading UV_USE_IO_URING env var.
-        // Must be whitelisted for Node.js to start. Defense-in-depth: capabilities are
-        // dropped (no CAP_SYS_ADMIN for io_uring privilege escalation), and the sandbox
-        // namespace prevents escape even if io_uring is exploited.
-        libc::SYS_io_uring_setup,
-        libc::SYS_io_uring_enter,
-        libc::SYS_io_uring_register,
+        // Node.js 22+: libuv calls io_uring_setup before reading UV_USE_IO_URING.
+        // With ENOSYS default, io_uring calls return "not implemented" and libuv
+        // falls back to epoll. No need to whitelist — reduces attack surface
+        // (CVE-2023-2598, CVE-2023-25775, etc.) without breaking Node.js.
+        // UV_USE_IO_URING=0 is also set in sandbox_impl.rs as belt-and-suspenders.
         libc::SYS_setpgid,
         libc::SYS_capget,
         libc::SYS_timer_create,
