@@ -834,7 +834,8 @@ pub async fn run_watch(
     // Ensure cleanup on exit
     let _cleanup_guard = temp_config_dir.as_ref().map(|d| TempConfigGuard(d.clone()));
 
-    run::ensure_proxy_available(proxy).await?;
+    let workspace = run::workspace_root_for_proxy();
+    crate::proxy_manager::ensure_available(proxy, &workspace).await?;
 
     // If allow-all mode, reload proxy with our temp config via admin API
     let admin_url = run::derive_admin_url(proxy);
@@ -924,7 +925,8 @@ pub async fn run_watch(
     });
 
     let watchdog_proxy = proxy.to_string();
-    let watchdog_handle = tokio::spawn(run::proxy_watchdog(watchdog_proxy));
+    let watchdog_workspace = run::workspace_root_for_proxy();
+    let watchdog_handle = tokio::spawn(crate::proxy_manager::watchdog(watchdog_proxy, watchdog_workspace));
 
     // Give the agent a moment to start, then begin tailing
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
