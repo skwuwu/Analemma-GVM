@@ -530,8 +530,16 @@ fn normalize_path(path: &str) -> Option<String> {
         || working.ends_with("/..")
         || working.ends_with("/.");
 
+    // If query/fragment was stripped, we must return the stripped path
+    // even if no other normalization is needed. Otherwise the caller
+    // falls back to the original path (with query string).
+    let query_stripped = path_only.len() < path.len();
+
     if decoded.is_none() && !has_null && !has_double_slash && !has_dot_segment {
-        return None; // Already canonical
+        if query_stripped {
+            return Some(path_only.to_string());
+        }
+        return None; // Already canonical, no query/fragment present
     }
 
     // Step 4: Build canonical path
