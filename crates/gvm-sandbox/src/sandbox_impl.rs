@@ -551,17 +551,25 @@ fn child_entry(
     // This is equivalent to tini/dumb-init but without an external dependency.
     match unsafe { libc::fork() } {
         -1 => {
-            eprintln!("gvm-sandbox: fork() for init reaper failed");
+            // SAFETY: After fork(), only async-signal-safe functions are permitted.
+            // Use libc::write to fd 2 (stderr) instead of eprintln! (which allocates).
+            unsafe {
+                let msg = b"gvm-sandbox: fork() for init reaper failed\n";
+                libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+            }
             1
         }
         0 => {
             // ── Child: exec the agent ──
             match nix::unistd::execv(&c_bin, &c_args) {
                 Ok(_) => unreachable!(),
-                Err(e) => {
-                    eprintln!("gvm-sandbox: exec failed: {} (path: {})", e, bin_path);
-                    // _exit to avoid running destructors in forked child
-                    unsafe { libc::_exit(1) };
+                Err(_) => {
+                    // SAFETY: After fork(), only async-signal-safe.
+                    unsafe {
+                        let msg = b"gvm-sandbox: exec failed\n";
+                        libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+                        libc::_exit(1);
+                    }
                 }
             }
         }

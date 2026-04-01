@@ -840,9 +840,11 @@ fn cleanup_state_resources(state: &SandboxState) {
                 state.proxy_port,
             ),
         };
-        cleanup_host_network(&veth_config, state.dns_target.as_deref());
+        // TC filter must be detached BEFORE veth deletion (cleanup_host_network
+        // deletes the veth). Reversing this order makes detach a no-op.
         crate::ebpf::detach_tc_filter(&state.veth_host);
-        tracing::debug!(iface = %state.veth_host, "Cleaned orphan veth + iptables");
+        cleanup_host_network(&veth_config, state.dns_target.as_deref());
+        tracing::debug!(iface = %state.veth_host, "Cleaned orphan: TC filter + iptables + veth");
     }
 }
 
@@ -1000,10 +1002,25 @@ fn cleanup_orphan_iptables_chain(host_iface: &str) {
     run_iptables(&["-F", &chain_name]).ok();
     run_iptables(&["-X", &chain_name]).ok();
 
-    // Clean NAT PREROUTING rules that reference the sandbox IP range (best-effort)
-    // We can't know the exact sandbox IP, but we can flush rules mentioning this interface
-    // via the GVM chain naming convention.
-    tracing::debug!(chain = %chain_name, "Cleaned orphan iptables chain for {}", host_iface);
+    // Clean NAT rules that reference this interface (PREROUTING DNAT + POSTROUTING MASQUERADE).
+    // These rules use -i {host_iface} so we can identify them.
+    // Use iptables-save + grep to find and delete specific rules.
+    if let Ok(output) = Command::new("iptables-save").args(["-t", "nat"]).output() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            if line.contains(host_iface) && line.starts_with("-A ") {
+                // Convert "-A PREROUTING ..." to "-D PREROUTING ..." for deletion
+                let delete_rule = line.replacen("-A ", "-D ", 1);
+                let args: Vec<&str> = std::iter::once("-t")
+                    .chain(std::iter::once("nat"))
+                    .chain(delete_rule.split_whitespace())
+                    .collect();
+                run_iptables(&args).ok();
+            }
+        }
+    }
+
+    tracing::debug!(chain = %chain_name, "Cleaned orphan iptables chain + NAT rules for {}", host_iface);
 }
 
 /// Scan iptables FORWARD chains for stale GVM-* entries that have no corresponding veth interface.

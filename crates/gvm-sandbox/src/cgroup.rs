@@ -109,28 +109,44 @@ impl CgroupGuard {
 
 impl Drop for CgroupGuard {
     fn drop(&mut self) {
-        // Kill any remaining processes in the cgroup before removal
+        // Kill any remaining processes in the cgroup before removal.
+        // Retry up to 3 times — zombies may take time to be reaped.
         let procs_file = self.path.join("cgroup.procs");
-        if let Ok(content) = fs::read_to_string(&procs_file) {
-            for line in content.lines() {
-                if let Ok(pid) = line.trim().parse::<i32>() {
-                    if pid > 0 {
-                        unsafe {
-                            libc::kill(pid, libc::SIGKILL);
+        for attempt in 0..3 {
+            if let Ok(content) = fs::read_to_string(&procs_file) {
+                let mut killed = 0;
+                for line in content.lines() {
+                    if let Ok(pid) = line.trim().parse::<i32>() {
+                        if pid > 0 {
+                            unsafe { libc::kill(pid, libc::SIGKILL); }
+                            killed += 1;
                         }
                     }
                 }
+                if killed == 0 {
+                    break; // No more processes
+                }
             }
-            // Brief wait for processes to exit
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            // Wait for processes to exit (increasing backoff)
+            std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1) as u64));
         }
 
         // Remove the cgroup directory (must be empty of processes)
         if let Err(e) = fs::remove_dir(&self.path) {
+            // Last resort: try to move remaining procs to root cgroup
+            if let Ok(content) = fs::read_to_string(&procs_file) {
+                for line in content.lines() {
+                    if let Ok(pid) = line.trim().parse::<i32>() {
+                        fs::write("/sys/fs/cgroup/cgroup.procs", pid.to_string()).ok();
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                fs::remove_dir(&self.path).ok();
+            }
             tracing::debug!(
                 error = %e,
                 path = %self.path.display(),
-                "cgroup cleanup: remove_dir failed (processes may still be running)"
+                "cgroup cleanup: initial remove_dir failed, attempted process migration"
             );
         } else {
             tracing::debug!(path = %self.path.display(), "cgroup cleaned up");

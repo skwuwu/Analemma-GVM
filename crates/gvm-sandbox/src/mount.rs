@@ -88,6 +88,22 @@ pub fn setup_mount_namespace(
     fs_policy: Option<&crate::FilesystemPolicy>,
     extra_lib_paths: &[PathBuf],
 ) -> Result<()> {
+    // Safety guard: verify we're in a new mount namespace before making / private.
+    // If clone(CLONE_NEWNS) failed silently, this would destroy host mount propagation.
+    // Check that our mount namespace differs from PID 1's (init).
+    #[cfg(target_os = "linux")]
+    {
+        let my_ns = std::fs::read_link("/proc/self/ns/mnt").ok();
+        let init_ns = std::fs::read_link("/proc/1/ns/mnt").ok();
+        if my_ns.is_some() && my_ns == init_ns {
+            anyhow::bail!(
+                "BUG: setup_mount_namespace called in host mount namespace! \
+                 MS_PRIVATE would destroy systemd mount propagation. \
+                 This indicates clone(CLONE_NEWNS) did not take effect."
+            );
+        }
+    }
+
     // Make the entire mount tree private FIRST, before any new mounts.
     // pivot_root requires the new root to NOT be on a shared mount.
     // Doing this before all bind-mounts ensures they inherit private propagation.
@@ -640,8 +656,11 @@ fn try_mount_overlayfs(
                 "overlayfs mount failed (kernel < 5.11?) — falling back to legacy mode"
             );
             // Clean up: unmount the tmpfs we mounted on overlay_base
-            // to avoid leaving stale mounts that could interfere with legacy mode
-            nix::mount::umount(&overlay_base).ok();
+            // to avoid leaving stale mounts that could interfere with legacy mode.
+            // Retry with MNT_DETACH if normal umount fails (busy mount).
+            if nix::mount::umount(&overlay_base).is_err() {
+                nix::mount::umount2(&overlay_base, nix::mount::MntFlags::MNT_DETACH).ok();
+            }
             false
         }
     }
