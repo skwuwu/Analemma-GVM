@@ -5,6 +5,7 @@ pub mod api;
 pub mod api_keys;
 pub mod auth;
 pub mod config;
+pub mod enforcement;
 pub mod intent_store;
 pub mod ledger;
 pub mod llm_trace;

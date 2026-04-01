@@ -547,27 +547,24 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
             "MITM: inspecting HTTPS request"
         );
 
-        // 2. SRR policy check
-        // RwLockReadGuard (and the Result containing its type) must not be held across .await.
-        // Compute the SRR result synchronously, then handle poison error after the guard is gone.
-        let srr_check_result = {
-            let guard = state.srr.read();
-            match guard {
-                Ok(srr) => {
-                    let body_ref = if req.body.is_empty() {
-                        None
-                    } else {
-                        Some(req.body.as_slice())
-                    };
-                    Ok(srr.check(&req.method, &host, &req.path, body_ref))
-                }
-                Err(_) => Err(()),
-            }
+        // 2. Unified classification (ABAC + SRR via enforcement::classify).
+        // This ensures MITM path has the same enforcement logic as proxy_handler.
+        let body_ref = if req.body.is_empty() {
+            None
+        } else {
+            Some(req.body.as_slice())
         };
-        let srr_result = match srr_check_result {
-            Ok(result) => result,
-            Err(()) => {
-                tracing::error!("SRR lock poisoned in MITM handler — denying request (fail-close)");
+        let classify_input = crate::enforcement::ClassifyInput {
+            method: &req.method,
+            host: &host,
+            path: &req.path,
+            body: body_ref,
+            gvm_headers: None, // MITM traffic has no SDK headers
+        };
+        let classify_output = match crate::enforcement::classify(&state, &classify_input) {
+            Ok(o) => o,
+            Err(err_msg) => {
+                tracing::error!(error = %err_msg, "MITM classification failed — denying (fail-close)");
                 let body_str = r#"{"blocked":true,"decision":"Deny","reason":"Internal governance error (fail-close)"}"#;
                 let response = format!(
                     "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -579,7 +576,8 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
             }
         };
 
-        let decision = &srr_result.decision;
+        let decision = &classify_output.classification.decision;
+        let is_default_caution = classify_output.is_default_caution;
         tracing::info!(decision = ?decision, host = %host, path = %req.path, "MITM: SRR decision");
 
         // 3. Enforce decision
@@ -600,7 +598,7 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                         "Blocked by SRR rule. To allow: add an Allow rule for {} {} in config/srr_network.toml and run POST /gvm/reload.",
                         req.method, host
                     ),
-                    "matched_rule": srr_result.matched_description.as_deref().unwrap_or(""),
+                    "matched_rule": classify_output.classification.matched_rule_id.as_deref().unwrap_or(""),
                 });
                 let body_str = body.to_string();
                 let response = format!(
@@ -615,7 +613,34 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
             gvm_types::EnforcementDecision::Delay { milliseconds } => {
                 tokio::time::sleep(std::time::Duration::from_millis(*milliseconds)).await;
             }
-            _ => {} // Allow, AuditOnly, etc.
+            gvm_types::EnforcementDecision::RequireApproval { .. } => {
+                // IC-3 on MITM path: cannot hold TLS stream for approval without
+                // blocking the keep-alive loop. Treat as Deny with explanation.
+                tracing::warn!(host = %host, path = %req.path, "MITM: IC-3 RequireApproval → Deny (approval not supported on MITM path)");
+                let body_str = r#"{"blocked":true,"decision":"RequireApproval","reason":"IC-3 approval not supported on MITM TLS path. Use cooperative mode with SDK for IC-3."}"#;
+                let response = format!(
+                    "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body_str.len(), body_str
+                );
+                tls_stream.write_all(response.as_bytes()).await?;
+                tls_stream.flush().await?;
+                break;
+            }
+            gvm_types::EnforcementDecision::Throttle { max_per_minute } => {
+                // Rate limit check on MITM path
+                if !state.rate_limiter.check(&classify_output.agent_id, *max_per_minute) {
+                    let body_str = r#"{"blocked":true,"decision":"Throttle","reason":"Rate limit exceeded"}"#;
+                    let response = format!(
+                        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 60\r\n\r\n{}",
+                        body_str.len(), body_str
+                    );
+                    tls_stream.write_all(response.as_bytes()).await?;
+                    tls_stream.flush().await?;
+                    continue; // Don't break — allow next request in keep-alive
+                }
+                // Rate check passed — allow through
+            }
+            _ => {} // Allow, AuditOnly — pass through
         }
 
         // 3.5. WAL audit record for MITM-inspected requests (sandbox observability).
@@ -626,12 +651,13 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
         {
             let event_id = uuid::Uuid::new_v4().to_string();
             let trace_id = uuid::Uuid::new_v4().to_string();
-            let decision_str = format!("{:?}", srr_result.decision);
+            let decision_str = format!("{:?}", classify_output.classification.decision);
+            let source_str = format!("{:?}", classify_output.classification.source);
             let event = gvm_types::GVMEvent {
                 event_id,
                 trace_id,
                 parent_event_id: None,
-                agent_id: "mitm".to_string(),
+                agent_id: classify_output.agent_id.clone(),
                 tenant_id: None,
                 session_id: host.clone(),
                 timestamp: chrono::Utc::now(),
@@ -647,18 +673,18 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                     method: req.method.clone(),
                     host: host.clone(),
                     path: req.path.clone(),
-                    status_code: None, // unknown until relay completes
+                    status_code: None,
                 }),
                 decision: decision_str,
-                decision_source: "SRR".to_string(),
-                matched_rule_id: srr_result.matched_description.clone(),
+                decision_source: source_str,
+                matched_rule_id: classify_output.classification.matched_rule_id.clone(),
                 enforcement_point: "mitm".to_string(),
                 status: gvm_types::EventStatus::Pending,
                 payload: gvm_types::PayloadDescriptor::default(),
                 nats_sequence: None,
                 event_hash: None,
                 llm_trace: None,
-                default_caution: srr_result.is_catch_all,
+                default_caution: is_default_caution,
             };
             match state.ledger.append_durable(&event).await {
                 Ok(()) => tracing::info!(host = %host, path = %req.path, "MITM WAL event recorded"),
