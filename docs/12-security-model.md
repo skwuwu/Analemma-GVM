@@ -704,3 +704,6 @@ Use `--no-mitm` to disable MITM and fall back to CONNECT relay (domain-level onl
 | **Windows Docker large responses** | Docker Desktop WSL2 network bridge may drop TCP >500KB | Use Linux for production. Windows works for small-medium responses |
 | **Content-Encoding (gzip/br)** | Compressed bodies not decompressed for payload inspection | URL-pattern SRR works regardless. Payload inspection requires uncompressed (future) |
 | **Timeout chaining** | MITM adds ~300ms overhead; agent timeout may fire first | Set agent timeouts > proxy upstream timeout (30s). Streaming SSE is unaffected (first chunk fast) |
+| **LLM thinking trace** | MITM relay streams response chunks — cannot buffer full body for trace extraction | Thinking hash not captured on MITM path. Use cooperative mode with SDK for full trace capture |
+| **IC-3 RequireApproval** | MITM cannot hold TLS keep-alive stream for human approval | IC-3 treated as Deny on MITM path. Use cooperative mode with SDK for IC-3 approval flow |
+| **Shadow Mode** | MITM has no SDK headers for intent verification | Intent store claim/verify not supported on MITM path. SRR enforcement still active |

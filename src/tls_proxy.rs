@@ -547,6 +547,29 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
             "MITM: inspecting HTTPS request"
         );
 
+        // 1.5. Circuit breaker: if WAL is failing, reject non-Allow requests early.
+        // Without this, MITM continues accepting traffic when audit is broken,
+        // violating the fail-close principle.
+        const CIRCUIT_BREAKER_THRESHOLD: u64 = 5;
+        let wal_failures = state.ledger.primary_failure_count();
+        if wal_failures >= CIRCUIT_BREAKER_THRESHOLD {
+            tracing::error!(
+                failures = wal_failures,
+                "MITM: circuit breaker OPEN — WAL failures exceed threshold, rejecting request"
+            );
+            let body_str = format!(
+                r#"{{"blocked":true,"decision":"CircuitBreakerOpen","reason":"Audit subsystem degraded ({} consecutive WAL failures). Request rejected for safety.","retry_after_seconds":30}}"#,
+                wal_failures
+            );
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 30\r\nConnection: close\r\n\r\n{}",
+                body_str.len(), body_str
+            );
+            tls_stream.write_all(response.as_bytes()).await?;
+            tls_stream.flush().await?;
+            break;
+        }
+
         // 2. Unified classification (ABAC + SRR via enforcement::classify).
         // This ensures MITM path has the same enforcement logic as proxy_handler.
         let body_ref = if req.body.is_empty() {
@@ -724,7 +747,45 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
         };
 
         if let Err(e) = relay_result {
-            tracing::debug!(error = %e, host = %host, "MITM: relay error");
+            tracing::warn!(error = %e, host = %host, path = %req.path, "MITM: upstream relay failed");
+            // Record relay failure in WAL — without this, failed requests
+            // disappear from the audit trail (violates fail-close observability).
+            let fail_event = gvm_types::GVMEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                trace_id: uuid::Uuid::new_v4().to_string(),
+                parent_event_id: None,
+                agent_id: classify_output.agent_id.clone(),
+                tenant_id: None,
+                session_id: host.clone(),
+                timestamp: chrono::Utc::now(),
+                operation: format!("{} {}", req.method, req.path),
+                resource: gvm_types::ResourceDescriptor {
+                    service: host.clone(),
+                    identifier: Some(req.path.clone()),
+                    tier: gvm_types::ResourceTier::External,
+                    sensitivity: gvm_types::Sensitivity::Medium,
+                },
+                context: std::collections::HashMap::new(),
+                transport: Some(gvm_types::TransportInfo {
+                    method: req.method.clone(),
+                    host: host.clone(),
+                    path: req.path.clone(),
+                    status_code: None,
+                }),
+                decision: format!("{:?}", classify_output.classification.decision),
+                decision_source: format!("{:?}", classify_output.classification.source),
+                matched_rule_id: classify_output.classification.matched_rule_id.clone(),
+                enforcement_point: "mitm".to_string(),
+                status: gvm_types::EventStatus::Failed {
+                    reason: format!("Upstream relay failed: {}", e),
+                },
+                payload: gvm_types::PayloadDescriptor::default(),
+                nats_sequence: None,
+                event_hash: None,
+                llm_trace: None,
+                default_caution: is_default_caution,
+            };
+            state.ledger.append_durable(&fail_event).await.ok();
             break;
         }
 
