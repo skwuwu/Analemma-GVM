@@ -155,9 +155,17 @@ async fn start_daemon(proxy: &str, workspace: &Path) -> Result<()> {
         if std::time::Instant::now() >= deadline {
             // Check if process is still alive
             if !is_process_alive(pid) {
-                eprintln!("  {RED}Proxy exited immediately. Check {}{RESET}", log_path.display());
+                eprintln!("  {RED}Proxy exited immediately.{RESET}");
+                eprintln!("  Check log: {}", log_path.display());
+                eprintln!("  Common causes:");
+                eprintln!("    - Port 8080 already in use (another proxy or service)");
+                eprintln!("    - Missing config/proxy.toml (run from project root)");
+                eprintln!("    - data/ directory not writable (check permissions)");
                 anyhow::bail!("Proxy failed to start. See {}", log_path.display());
             }
+            eprintln!("  {RED}Proxy started but not responding to health checks.{RESET}");
+            eprintln!("  Check log: {}", log_path.display());
+            eprintln!("  Try: curl http://127.0.0.1:8080/gvm/health");
             anyhow::bail!(
                 "Proxy did not become healthy within 15s. Check {}",
                 log_path.display()

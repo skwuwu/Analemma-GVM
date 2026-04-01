@@ -440,6 +440,9 @@ fn child_entry(
     if let Err(e) = setup_sandbox_network(&veth_config) {
         // Network failure is non-fatal for debugging — agent just won't have connectivity
         eprintln!("gvm-sandbox: network setup failed (non-fatal): {}", e);
+        eprintln!("  Hint: ensure ip_forward=1 (sudo sysctl net.ipv4.ip_forward=1),");
+        eprintln!("  iptables installed, and running with sudo (CAP_NET_ADMIN required).");
+        eprintln!("  Agent will run without network connectivity.");
     }
 
     // Set up mount namespace (pivot_root)
@@ -453,19 +456,22 @@ fn child_entry(
         extra_lib_paths,
     ) {
         eprintln!("gvm-sandbox: mount namespace setup failed: {:#}", e);
+        eprintln!("  Hint: this usually means the interpreter binary or its shared");
+        eprintln!("  libraries cannot be bind-mounted. Check that '{}' exists", config.interpreter);
+        eprintln!("  and 'ldd {}' succeeds.", interpreter_path.display());
         return 1;
     }
 
     // Drop all capabilities from the bounding set.
-    // When running as root (CLONE_NEWUSER skipped), all caps are inherited.
-    // Without this, the agent can run iptables -F to remove firewall rules.
     if let Err(e) = drop_all_capabilities() {
         eprintln!("gvm-sandbox: capability drop failed: {}", e);
+        eprintln!("  Hint: this is unusual. Check kernel capabilities support.");
         return 1;
     }
     // Apply seccomp-BPF filter (must be last before exec)
     if let Err(e) = apply_seccomp_filter(&config.seccomp_profile) {
         eprintln!("gvm-sandbox: seccomp filter failed: {}", e);
+        eprintln!("  Hint: seccomp-BPF requires kernel 3.17+. Check 'grep SECCOMP /boot/config-$(uname -r)'.");
         return 1;
     }
     // Prepare environment variables

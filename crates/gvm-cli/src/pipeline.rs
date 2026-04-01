@@ -275,6 +275,26 @@ pub fn post_exit_audit(config: &AgentConfig, pre: &PreLaunchState, exit_code: i3
             pre.wal_offset,
             "config/srr_network.toml",
         );
+    } else {
+        // Non-interactive: count default-caution hits and suggest batch rule generation.
+        let caution_count = crate::suggest::count_default_caution_hits(
+            "data/wal.log",
+            pre.wal_offset,
+        );
+        if caution_count > 0 {
+            eprintln!(
+                "  {YELLOW}{} request(s) hit Default-to-Caution (no explicit rule).{RESET}",
+                caution_count
+            );
+            eprintln!(
+                "  {DIM}Generate rules: gvm suggest --from data/wal.log --output config/srr_network.toml{RESET}"
+            );
+            eprintln!(
+                "  {DIM}Or use interactive mode: gvm run -i {}{RESET}",
+                config.command.first().map(|s| s.as_str()).unwrap_or("agent.py")
+            );
+            eprintln!();
+        }
     }
 }
 

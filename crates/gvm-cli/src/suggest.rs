@@ -349,6 +349,46 @@ pub fn suggest_rules_batch(log_path: &str, output_path: Option<&str>, default_de
     }
 }
 
+/// Count how many WAL events hit default-to-caution (no explicit SRR rule).
+/// Used by pipeline.rs post_exit_audit to suggest batch rule generation.
+pub fn count_default_caution_hits(wal_path: &str, start_offset: u64) -> usize {
+    use std::io::BufRead;
+
+    let file = match std::fs::File::open(wal_path) {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+
+    let reader = if start_offset > 0 {
+        use std::io::{Seek, SeekFrom};
+        let mut file = file;
+        if file.seek(SeekFrom::Start(start_offset)).is_err() {
+            return 0;
+        }
+        std::io::BufReader::new(file)
+    } else {
+        std::io::BufReader::new(file)
+    };
+
+    let mut count = 0;
+    for line_result in reader.lines() {
+        let line = match line_result {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+            if event
+                .get("default_caution")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
 /// Generalize a specific path to a wildcard pattern.
 ///
 /// Heuristic: keep the first 2 path segments, wildcard the rest.
