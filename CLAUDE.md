@@ -64,6 +64,14 @@ Full specification: `docs/GVM_CODE_STANDARDS.md`
 - Every CLI query maps to WAL data — no separate data store required for basic observability.
 - Thinking content stored as SHA-256 hash by default (privacy). Raw storage is opt-in only.
 
+### Code Reuse & Anti-Fragmentation
+
+- **Single source of truth**: Before adding new logic, search for existing implementations of the same or similar functionality. Reuse and extend, never duplicate.
+- **Enforcement parity**: Any governance logic (ABAC, SRR, rate limiter, WAL audit, IC-3 approval) must be implemented in ONE shared function callable from all request paths (HTTP proxy, MITM TLS, future gRPC). Never copy enforcement code between handlers.
+- **Interpreter/config detection**: Use shared utility functions (e.g., `detect_interpreter()`, `resolve_host_dns()`). New call sites must call the existing function, not re-implement the logic.
+- **Pipeline pattern**: Agent launch flows (cooperative, sandbox, contained) should go through `pipeline.rs` (`pre_launch` → `launch` → `post_exit_audit`). Do not add new launch paths that bypass the pipeline.
+- **State file contract**: All sandbox resources (veth, mounts, iptables, cgroups, DNS target) must be recorded in the per-PID state file for deterministic cleanup. Never rely on re-resolving runtime state during cleanup.
+
 ### Testing & Docs
 
 - Every security claim needs a test. Every performance claim needs a benchmark.
