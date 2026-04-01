@@ -57,8 +57,13 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     // Kernel 6.17+ blocks bind-mount of host paths inside user namespaces.
     // By mounting in the parent (which has real root), the mount is visible
     // to the child's mount namespace via inheritance.
-    let staging_ws = std::path::PathBuf::from("/tmp/gvm-sandbox-staging-ws");
-    let sandbox_root = std::path::PathBuf::from("/tmp/gvm-sandbox-root");
+    // Use PID-based unique paths to prevent race conditions when multiple
+    // sandboxes start concurrently. Previous hardcoded paths caused mount
+    // collisions: sandbox A mounts → sandbox B umounts A's mount → A's child
+    // sees empty root.
+    let my_pid = std::process::id();
+    let staging_ws = std::path::PathBuf::from(format!("/tmp/gvm-sandbox-staging-ws-{}", my_pid));
+    let sandbox_root = std::path::PathBuf::from(format!("/tmp/gvm-sandbox-root-{}", my_pid));
     // Clean up any stale mounts from a previous crashed run.
     // umount2 with MNT_DETACH handles the recursive case (nested mounts).
     nix::mount::umount2(&sandbox_root, nix::mount::MntFlags::MNT_DETACH).ok();
@@ -513,6 +518,17 @@ fn child_entry(
     }
 
     // ── PID 1 init reaper ──
+    //
+    // SAFETY INVARIANT (fork + async-signal-safety):
+    // After fork(), both child and PID 1 parent MUST only call async-signal-safe
+    // functions until exec (child) or _exit (PID 1). This means:
+    // - NO Rust heap allocation (no Vec, String, Box, println!, format!)
+    // - NO tracing macros (tracing::info! etc. — these allocate)
+    // - NO mutex/lock acquisition
+    // - NO File I/O via Rust std (only libc::write to fd 2 is safe)
+    // Only libc functions listed in signal-safety(7) are permitted.
+    // Currently: eprintln! (before fork), waitpid/WIFEXITED/_exit (after fork).
+    // Adding any Rust runtime calls to the PID 1 loop WILL cause UB.
     //
     // We are PID 1 inside CLONE_NEWPID. If we exec directly, the agent
     // interpreter becomes PID 1 but does NOT reap orphaned children.

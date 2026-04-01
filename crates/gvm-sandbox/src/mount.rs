@@ -273,8 +273,10 @@ fn bind_mount_interpreter(
     interpreter_path: &Path,
     extra_lib_paths: &[PathBuf],
 ) -> Result<()> {
-    // Track mounted libraries to prevent duplicate bind mounts.
+    // Track mounted libraries by CANONICAL path to prevent duplicate bind mounts.
     // Mounting the same file twice (mount-on-mount) triggers a kernel panic on 6.17.0-1009-aws.
+    // Using canonicalize() resolves symlinks so that e.g. /usr/lib/libssl.so and
+    // /lib/x86_64-linux-gnu/libssl.so.3 (same inode via symlink) are detected as duplicates.
     let mut mounted: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     // Bind-mount the interpreter binary
@@ -302,7 +304,8 @@ fn bind_mount_interpreter(
             let stdout = String::from_utf8_lossy(&output.stdout);
             let libs: Vec<PathBuf> = parse_ldd_output(&stdout);
             for lib_path in libs {
-                if mounted.insert(lib_path.clone()) {
+                let canonical = lib_path.canonicalize().unwrap_or_else(|_| lib_path.clone());
+                if mounted.insert(canonical) {
                     bind_mount_library(new_root, &lib_path).ok();
                 }
             }
@@ -331,7 +334,8 @@ fn bind_mount_interpreter(
     // Skip any already mounted by interpreter's direct ldd (prevents mount-on-mount panic
     // on Linux 6.17.0-1009-aws — duplicate bind mounts trigger kernel panic).
     for lib_path in extra_lib_paths {
-        if mounted.insert(lib_path.clone()) {
+        let canonical = lib_path.canonicalize().unwrap_or_else(|_| lib_path.clone());
+        if mounted.insert(canonical) {
             bind_mount_library(new_root, lib_path).ok();
         }
     }
