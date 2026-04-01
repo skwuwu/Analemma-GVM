@@ -238,10 +238,11 @@ launch_agent() {
         # Run in a loop — each turn is a fresh sandbox + OpenClaw session.
         # Single --message calls complete in 1-2 min; the loop ensures sustained
         # load for the full test duration. Each turn gets a unique session-id.
-        local TURN_TIMEOUT=120
+        # Run in a sustained loop — each turn is a fresh sandbox + OpenClaw session.
+        # Subshell inherits vars; no `local` (invalid outside functions in subshell).
         (
+            TURN_TIMEOUT=120
             for turn in $(seq 1 999); do
-                local elapsed=$(($(date +%s) - $(date -d "now - ${DURATION_SEC} seconds" +%s 2>/dev/null || echo 0)))
                 echo "[Turn $turn] $(date -u +%H:%M:%S)"
                 timeout $((TURN_TIMEOUT + 30)) "$GVM_BIN" run $gvm_mode_flag \
                     --agent-id "${session_id}-t${turn}" -- \
@@ -249,7 +250,7 @@ launch_agent() {
                     --session-id "${session_id}-t${turn}" \
                     --message "$prompt" \
                     --timeout "$TURN_TIMEOUT" \
-                    2>&1 || echo "[Turn $turn] exited with $?"
+                    2>&1 || true
                 sleep 15
             done
         ) > "$agent_log" 2>&1 &
