@@ -20,7 +20,7 @@
 #   bash scripts/stress-test.sh --agents 5         # 5 agents instead of 3
 # ═══════════════════════════════════════════════════════════════════
 
-set -uo pipefail
+set -o pipefail
 
 # ── Configuration ──
 DURATION_MIN=${DURATION_MIN:-60}
@@ -235,13 +235,24 @@ launch_agent() {
         # Use explicit node path — sandbox mounts /usr/lib/node_modules but not /usr/bin/openclaw symlink
         local OC_MJS="/usr/lib/node_modules/openclaw/openclaw.mjs"
         [ ! -f "$OC_MJS" ] && OC_MJS="$(readlink -f "$(which openclaw)" 2>/dev/null || echo "openclaw")"
-        timeout $((DURATION_SEC + 120)) "$GVM_BIN" run $gvm_mode_flag \
-            --agent-id "$session_id" -- \
-            node "$OC_MJS" agent --local \
-            --session-id "$session_id" \
-            --message "$prompt" \
-            --timeout $((DURATION_SEC + 60)) \
-            > "$agent_log" 2>&1 &
+        # Run in a loop — each turn is a fresh sandbox + OpenClaw session.
+        # Single --message calls complete in 1-2 min; the loop ensures sustained
+        # load for the full test duration. Each turn gets a unique session-id.
+        local TURN_TIMEOUT=120
+        (
+            for turn in $(seq 1 999); do
+                local elapsed=$(($(date +%s) - $(date -d "now - ${DURATION_SEC} seconds" +%s 2>/dev/null || echo 0)))
+                echo "[Turn $turn] $(date -u +%H:%M:%S)"
+                timeout $((TURN_TIMEOUT + 30)) "$GVM_BIN" run $gvm_mode_flag \
+                    --agent-id "${session_id}-t${turn}" -- \
+                    node "$OC_MJS" agent --local \
+                    --session-id "${session_id}-t${turn}" \
+                    --message "$prompt" \
+                    --timeout "$TURN_TIMEOUT" \
+                    2>&1 || echo "[Turn $turn] exited with $?"
+                sleep 15
+            done
+        ) > "$agent_log" 2>&1 &
     else
         # Fallback: Python script that makes HTTP requests through proxy
         timeout $((DURATION_SEC + 120)) "$GVM_BIN" run $gvm_mode_flag \
