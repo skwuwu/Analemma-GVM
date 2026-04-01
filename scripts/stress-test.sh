@@ -124,15 +124,26 @@ setup() {
     cp "$REPO_DIR/data/wal.log" "$RESULTS_DIR/wal-pre-stress.log" 2>/dev/null || true
     > "$REPO_DIR/data/wal.log"
 
-    # Start proxy
-    "$PROXY_BIN" --config "$REPO_DIR/config/proxy.toml" > "$RESULTS_DIR/proxy.log" 2>&1 &
+    # Start proxy as independent daemon via proxy_manager pattern.
+    # Uses setsid + PID file so proxy survives script exit and chaos kill recovery.
+    # Kill any existing proxy first to ensure clean state with stress SRR.
+    if [ -f "$REPO_DIR/data/proxy.pid" ]; then
+        local old_pid
+        old_pid=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null || echo "0")
+        kill "$old_pid" 2>/dev/null || true
+        sleep 1
+    fi
+
+    cd "$REPO_DIR"
+    setsid "$PROXY_BIN" > "$REPO_DIR/data/proxy.log" 2>&1 &
     PROXY_PID=$!
+    echo "$PROXY_PID" > "$REPO_DIR/data/proxy.pid"
     echo "$PROXY_PID" > "$RESULTS_DIR/proxy.pid"
     sleep 3
 
     # Verify proxy health
     local status
-    status=$(curl -sf "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null || echo "dead")
+    status=$(( curl -sf "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" ) 2>/dev/null || echo "dead")
     if [ "$status" != "healthy" ]; then
         echo -e "${RED}Proxy failed to start (status: $status)${NC}"
         exit 1
@@ -140,7 +151,7 @@ setup() {
 
     # Reload with stress SRR
     curl -sf -X POST "$ADMIN_URL/gvm/reload" > /dev/null 2>&1
-    echo -e "  ${GREEN}Proxy started (PID $PROXY_PID)${NC}"
+    echo -e "  ${GREEN}Proxy started as daemon (PID $PROXY_PID)${NC}"
 
     # Record initial metrics
     INITIAL_RSS=$(get_rss $PROXY_PID)
@@ -177,15 +188,15 @@ get_merkle_batches() {
 collect_metric() {
     local elapsed=$1
     local pid
-    pid=$(cat "$RESULTS_DIR/proxy.pid" 2>/dev/null || echo "0")
+    pid=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null || cat "$RESULTS_DIR/proxy.pid" 2>/dev/null || echo "0")
 
     local rss fd wal veth healthy pending agents batches
     rss=$(get_rss "$pid")
     fd=$(get_fd_count "$pid")
     wal=$(get_wal_bytes)
     veth=$(get_orphan_veth)
-    healthy=$(curl -sf --connect-timeout 2 "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null || echo "dead")
-    pending=$(curl -sf --connect-timeout 2 "$ADMIN_URL/gvm/pending" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(len(d.get('pending',[])))" 2>/dev/null || echo "0")
+    healthy=$(( curl -sf --connect-timeout 2 "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" ) 2>/dev/null || echo "dead")
+    pending=$(( curl -sf --connect-timeout 2 "$ADMIN_URL/gvm/pending" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(len(d.get('pending',[])))" ) 2>/dev/null || echo "0")
     agents=$(pgrep -c -f "openclaw\|stress-agent" 2>/dev/null || echo "0")
     batches=$(get_merkle_batches)
 
@@ -311,18 +322,27 @@ chaos_log() {
 }
 
 chaos_proxy_kill() {
-    chaos_log "INJECT: kill -9 proxy (PID $(cat "$RESULTS_DIR/proxy.pid"))"
-    kill -9 "$(cat "$RESULTS_DIR/proxy.pid")" 2>/dev/null
+    local old_pid
+    old_pid=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null || cat "$RESULTS_DIR/proxy.pid" 2>/dev/null || echo "0")
+    chaos_log "INJECT: kill -9 proxy (PID $old_pid)"
+    kill -9 "$old_pid" 2>/dev/null
 
-    # Wait for watchdog restart (max 30s)
+    # Save WAL backup before restart (chaos recovery evidence)
+    cp "$REPO_DIR/data/wal.log" "$RESULTS_DIR/wal-before-chaos.log" 2>/dev/null || true
+
+    # Restart proxy as daemon (same pattern as setup)
+    sleep 2
+    cd "$REPO_DIR"
+    setsid "$PROXY_BIN" >> "$REPO_DIR/data/proxy.log" 2>&1 &
+    local new_pid=$!
+    echo "$new_pid" > "$REPO_DIR/data/proxy.pid"
+    echo "$new_pid" > "$RESULTS_DIR/proxy.pid"
+
+    # Wait for health (max 30s)
     local recovered=false
     for i in $(seq 1 30); do
         sleep 1
         if curl -sf --connect-timeout 2 "$PROXY_URL/gvm/health" > /dev/null 2>&1; then
-            # Proxy is back — update PID
-            local new_pid
-            new_pid=$(pgrep -f "gvm-proxy" | head -1 || echo "0")
-            echo "$new_pid" > "$RESULTS_DIR/proxy.pid"
             chaos_log "RECOVERED: proxy restarted (PID $new_pid) after ${i}s"
             recovered=true
             break
@@ -330,27 +350,16 @@ chaos_proxy_kill() {
     done
 
     if ! $recovered; then
-        chaos_log "Proxy did not auto-restart (expected — no watchdog in standalone mode). Restarting..."
-        cd "$REPO_DIR"
-        "$PROXY_BIN" > "$RESULTS_DIR/proxy-restart.log" 2>&1 &
-        local pid=$!
-        echo "$pid" > "$RESULTS_DIR/proxy.pid"
-        sleep 5
-        if curl -sf --connect-timeout 2 "$PROXY_URL/gvm/health" > /dev/null 2>&1; then
-            chaos_log "RECOVERED: proxy manually restarted (PID $pid)"
-            recovered=true
-        else
-            chaos_log "FAIL: proxy manual restart failed (PID $pid)"
-        fi
+        chaos_log "FAIL: proxy restart failed (PID $new_pid)"
     fi
 
     # Verify SRR rules are loaded after restart (fail-open prevention)
     sleep 2
     local srr_check
-    srr_check=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
+    srr_check=$(( curl -sf -X POST "$PROXY_URL/gvm/check" \
         -H "Content-Type: application/json" \
         -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/torvalds/linux/commits","operation":"test"}' \
-        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null || echo "unreachable")
+        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" ) 2>/dev/null || echo "unreachable")
 
     if echo "$srr_check" | grep -qi "Allow"; then
         chaos_log "VERIFY: SRR rules loaded correctly after restart (api.github.com → Allow)"
@@ -642,10 +651,12 @@ cleanup() {
         done < "$RESULTS_DIR/agent_pids.txt"
     fi
 
-    # Kill proxy
-    if [ -f "$RESULTS_DIR/proxy.pid" ]; then
-        kill "$(cat "$RESULTS_DIR/proxy.pid")" 2>/dev/null || true
-    fi
+    # Kill proxy (check both canonical PID file and results copy)
+    for pidfile in "$REPO_DIR/data/proxy.pid" "$RESULTS_DIR/proxy.pid"; do
+        if [ -f "$pidfile" ]; then
+            kill "$(cat "$pidfile")" 2>/dev/null || true
+        fi
+    done
 
     # Remove network chaos if active
     local iface
