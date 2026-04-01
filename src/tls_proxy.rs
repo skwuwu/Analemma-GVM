@@ -660,8 +660,9 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                 llm_trace: None,
                 default_caution: srr_result.is_catch_all,
             };
-            if let Err(e) = state.ledger.append_durable(&event).await {
-                tracing::debug!(error = %e, "MITM WAL append failed (non-fatal)");
+            match state.ledger.append_durable(&event).await {
+                Ok(()) => tracing::info!(host = %host, path = %req.path, "MITM WAL event recorded"),
+                Err(e) => tracing::error!(error = %e, "MITM WAL append FAILED"),
             }
         }
 
