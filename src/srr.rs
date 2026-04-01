@@ -508,9 +508,17 @@ fn match_path(pattern: &str, path: &str) -> bool {
 ///
 /// Returns None if the path is already in canonical form (avoids allocation).
 fn normalize_path(path: &str) -> Option<String> {
-    // Step 1: Percent-decode the path (only decode unreserved + path-safe chars)
-    let decoded = percent_decode_path(path);
-    let working = decoded.as_deref().unwrap_or(path);
+    // Step 0: Strip query string and fragment before any normalization.
+    // SRR rules match on path only — query params (?per_page=5) and
+    // fragments (#section) must not affect regex matching.
+    // Without this, path_regex = "^/repos/.../commits$" fails on
+    // "/repos/.../commits?per_page=5" because $ requires end-of-string.
+    let (path_only, _query) = path.split_once('?').unwrap_or((path, ""));
+    let (path_only, _fragment) = path_only.split_once('#').unwrap_or((path_only, ""));
+
+    // Step 1: Percent-decode the path (iterative — catches double encoding %2525 → %25 → %)
+    let decoded = percent_decode_path(path_only);
+    let working = decoded.as_deref().unwrap_or(path_only);
 
     // Step 2: Strip null bytes
     let has_null = working.contains('\0');
@@ -554,15 +562,38 @@ fn normalize_path(path: &str) -> Option<String> {
     Some(resolved)
 }
 
-/// Percent-decode path-relevant characters.
-/// Decodes %XX sequences to their byte values, focusing on characters that
-/// could be used to bypass path matching (/, ., alphanumerics).
+/// Percent-decode path-relevant characters, iteratively.
+/// Decodes %XX sequences to their byte values. Loops up to 3 times to
+/// catch double-encoding attacks (%2525 → %25 → %). Stops when no
+/// further decoding occurs (fixpoint).
 /// Returns None if no percent-encoded sequences are found.
 fn percent_decode_path(path: &str) -> Option<String> {
     if !path.contains('%') {
         return None;
     }
 
+    let mut current = path.to_string();
+    let mut changed = false;
+
+    for _ in 0..3 {
+        let decoded = percent_decode_once(&current);
+        match decoded {
+            Some(d) if d != current => {
+                changed = true;
+                current = d;
+                if !current.contains('%') {
+                    break; // No more percent sequences
+                }
+            }
+            _ => break, // No change or decode error → fixpoint reached
+        }
+    }
+
+    if changed { Some(current) } else { None }
+}
+
+/// Single pass of percent decoding.
+fn percent_decode_once(path: &str) -> Option<String> {
     let bytes = path.as_bytes();
     let mut result = Vec::with_capacity(bytes.len());
     let mut i = 0;
