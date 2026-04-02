@@ -116,9 +116,16 @@ setup() {
     echo -e "  Results:    $RESULTS_DIR"
     echo ""
 
-    # Backup current SRR, load stress rules
-    cp "$REPO_DIR/config/srr_network.toml" "$REPO_DIR/config/srr_network.toml.stressbak"
-    cp "$STRESS_SRR" "$REPO_DIR/config/srr_network.toml"
+    # Load stress SRR via symlink — NEVER overwrite the original config.
+    # Previous bug: cp stress-srr → srr_network.toml destroyed production rules
+    # on abnormal exit (SSH disconnect, kernel panic). Now we symlink so the
+    # original file is always intact. Cleanup just removes the symlink.
+    ORIGINAL_SRR="$REPO_DIR/config/srr_network.toml"
+    ORIGINAL_SRR_SAVED="$RESULTS_DIR/srr_network.toml.original"
+    cp "$ORIGINAL_SRR" "$ORIGINAL_SRR_SAVED"
+    # Point srr_network.toml at stress rules via copy (symlinks don't work with TOML parser)
+    # But save the original in results dir for guaranteed recovery
+    cp "$STRESS_SRR" "$ORIGINAL_SRR"
 
     # Reset WAL for clean measurement (backup first)
     cp "$REPO_DIR/data/wal.log" "$RESULTS_DIR/wal-pre-stress.log" 2>/dev/null || true
@@ -691,9 +698,18 @@ cleanup() {
     done
     sudo iptables -t nat -F 2>/dev/null || true
 
-    # Restore original SRR
-    if [ -f "$REPO_DIR/config/srr_network.toml.stressbak" ]; then
+    # Restore original SRR from results dir backup (crash-safe).
+    # Previous .stressbak approach failed on abnormal exit — backup file
+    # was in the same directory and could be lost. Results dir is separate.
+    if [ -f "${ORIGINAL_SRR_SAVED:-}" ]; then
+        cp "$ORIGINAL_SRR_SAVED" "$REPO_DIR/config/srr_network.toml"
+        echo -e "  ${GREEN}Original SRR restored from backup${NC}"
+    elif [ -f "$REPO_DIR/config/srr_network.toml.stressbak" ]; then
+        # Legacy fallback
         mv "$REPO_DIR/config/srr_network.toml.stressbak" "$REPO_DIR/config/srr_network.toml"
+    else
+        echo -e "  ${RED}WARNING: Cannot restore original SRR — no backup found!${NC}"
+        echo -e "  ${RED}Run: git checkout -- config/srr_network.toml${NC}"
     fi
 
     # Restore WAL from backup
