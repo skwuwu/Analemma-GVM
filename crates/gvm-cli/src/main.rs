@@ -129,6 +129,16 @@ enum Commands {
         #[arg(long)]
         fs_governance: bool,
 
+        /// Shadow Mode: verify agent intent before execution.
+        /// disabled = off (default), observe = log violations, strict = deny without intent.
+        #[arg(long, value_parser = ["disabled", "observe", "strict"])]
+        shadow_mode: Option<String>,
+
+        /// Sandbox execution timeout in seconds.
+        /// Agent is killed after this duration. Default: 3600 (1 hour).
+        #[arg(long)]
+        sandbox_timeout: Option<u64>,
+
         /// Run in background (only with --contained)
         #[arg(long)]
         detach: bool,
@@ -463,6 +473,8 @@ async fn main() -> anyhow::Result<()> {
             contained,
             no_mitm,
             fs_governance,
+            shadow_mode,
+            sandbox_timeout,
             image,
             memory,
             cpus,
@@ -482,6 +494,13 @@ async fn main() -> anyhow::Result<()> {
                 // Normal enforcement mode
                 if let Some(ref policy) = default_policy {
                     std::env::set_var("GVM_DEFAULT_UNKNOWN", policy);
+                }
+                // CLI flags → env vars (proxy reads from env at startup)
+                if let Some(ref mode) = shadow_mode {
+                    std::env::set_var("GVM_SHADOW_MODE", mode);
+                }
+                if let Some(timeout) = sandbox_timeout {
+                    std::env::set_var("GVM_SANDBOX_TIMEOUT", timeout.to_string());
                 }
                 run::run_agent(
                     &command,
