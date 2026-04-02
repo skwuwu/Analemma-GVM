@@ -53,7 +53,7 @@ gvm run my_agent.py
 gvm run --sandbox my_agent.py    # Linux: namespace + seccomp + MITM
 ```
 
-**That's it.** Watch → suggest → enforce. [Detailed guide →](docs/12-quickstart.md)
+**That's it.** Watch → suggest → enforce. [Quick Start →](docs/12-quickstart.md) | [Full User Guide →](docs/15-user-guide.md)
 
 ---
 
@@ -153,7 +153,8 @@ LLM safety says "don't generate harmful text." GVM says "don't call `DELETE /pro
 | Doc | What it covers |
 |-----|----------------|
 | [Quick Start](docs/12-quickstart.md) | First-time setup, isolation modes |
-| [Reference](docs/13-reference.md) | CLI, config, API, CI/CD integration |
+| **[User Guide](docs/15-user-guide.md)** | **CLI commands, policy writing, debugging, CI/CD, production** |
+| [Reference](docs/13-reference.md) | Config syntax, API endpoints, operational notes |
 | [SRR Rules](docs/03-srr.md) | URL/method/path matching syntax |
 | [Security Model](docs/11-security-model.md) | Threat model, known attack surface |
 | [Architecture](docs/00-overview.md) | 3-layer design, Merkle WAL, enforcement decisions |
