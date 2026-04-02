@@ -329,15 +329,18 @@ WAL events form a binary Merkle tree per batch (intra-batch O(log N) verificatio
 
 Core Wasm modules (`wasm32-wasip1`) require WASI preview1 imports. Fixed: `Store<WasiCtx>` → `Store<WasiP1Ctx>`, `.build()` → `.build_p1()`, `add_to_linker_sync` updated to preview1 variant.
 
-### Key Benchmarks (2026-03-15)
+### Key Benchmarks (2026-04-02, EC2 t3.medium)
 
 | Benchmark | Latency |
 |-----------|---------|
-| SRR only | 88 ns |
-| E2E native | 732 ns |
-| E2E Wasm | 6.37 us |
-| Vault fsync (1KB-256KB) | 2.06-2.50 ms |
-| Chunked 16x16KB | 32.79 ms (13x slower — fsync dominated) |
+| SRR only | 190 ns |
+| E2E native (ABAC+SRR+max_strict) | 750 ns |
+| E2E Wasm | 9.82 µs |
+| Classification (direct HTTP) | 270 ns |
+| WAL group commit (100 concurrent) | 7.99 ms (78x vs sequential) |
+| Vault fsync (1KB-256KB) | 6.2-8.5 ms |
+| Wasm cold start | 201 ms |
+| Wasm warm eval | 7.86 µs |
 
 ---
 

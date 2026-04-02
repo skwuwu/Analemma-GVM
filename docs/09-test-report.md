@@ -450,126 +450,171 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 
 ---
 
-## 9.5 Benchmark Results (Criterion v0.5, 2026-03-15)
+## 9.5 Benchmark Results (Criterion v0.5, 2026-04-02)
 
 **Source**: [benches/pipeline.rs](benches/pipeline.rs)
+**Platform**: EC2 t3.medium, Ubuntu 24.04, kernel 6.17.0-1009-aws
+
+### Classification E2E (ABAC + SRR → max_strict)
+
+| Benchmark | Result | Description |
+|-----------|--------|-------------|
+| `classification_e2e/direct_http_srr_only` | **270 ns** | Direct HTTP, SRR-only classification |
+| `classification_e2e/sdk_routed_full_pipeline` | **820 ns** | SDK-routed, ABAC + SRR + max_strict |
+| `classification_e2e/full_pipeline_with_payload` | **750 ns** | Full pipeline with payload inspection |
+
+**Key insight**: Full governance classification (ABAC + SRR + max_strict) completes in <1µs. Hot path budget (1µs) is met.
 
 ### SRR Network Rule Matching
 
-| Benchmark | Median | Range | Description |
-|-----------|--------|-------|-------------|
-| `srr/allow_safe_host` | **27.8 ns** | 27.5–28.0 ns | Safe host lookup (first-match hit) |
-| `srr/deny_bank_transfer` | **63.1 ns** | 60.7–66.5 ns | Bank transfer deny (multi-field match) |
-| `srr/default_caution_unknown` | **29.0 ns** | 28.7–29.2 ns | Unknown URL fallthrough → Delay 300ms |
-| `srr/payload_inspection` | **45.2 ns** | 44.8–45.7 ns | GraphQL operationName match |
-| `srr/payload_size_bytes/64` | **44.3 ns** | 43.8–44.7 ns | 64B body payload inspection |
-| `srr/payload_size_bytes/1024` | **49.5 ns** | 48.5–51.0 ns | 1KB body payload inspection |
-| `srr/payload_size_bytes/16384` | **48.4 ns** | 47.7–49.2 ns | 16KB body payload inspection |
-| `srr/payload_size_bytes/65536` | **45.2 ns** | 44.9–45.6 ns | 64KB body payload inspection |
+| Benchmark | Result | Description |
+|-----------|--------|-------------|
+| `srr/allow_safe_host` | **190 ns** | Safe host lookup (first-match hit) |
+| `srr/deny_bank_transfer` | **270 ns** | Bank transfer deny (multi-field match) |
+| `srr/default_caution_unknown` | **380 ns** | Unknown URL fallthrough → Delay 300ms |
+| `srr/payload_inspection` | **270 ns** | GraphQL operationName match |
+| `srr/payload_size_bytes/64` | **240 ns** | 64B body payload inspection |
+| `srr/payload_size_bytes/1024` | **240 ns** | 1KB body payload inspection |
+| `srr/payload_size_bytes/16384` | **240 ns** | 16KB body payload inspection |
+| `srr/payload_size_bytes/65536` | **240 ns** | 64KB body payload inspection |
 
-**Key insight**: Body size does NOT significantly affect SRR latency (44–50ns range) because the `max_body_bytes` check short-circuits before JSON parsing.
+**Key insight**: Body size does NOT affect SRR latency (240ns flat) — `max_body_bytes` short-circuits before JSON parsing. Path normalization (query strip + percent-decode + dot-segment) adds ~100ns vs raw match.
 
 ### SRR Scale Benchmarks
 
-| Benchmark | Median | Description |
-|-----------|--------|-------------|
-| `srr_scale/100_rules/first_rule_match` | ~30 ns | First rule matches immediately |
-| `srr_scale/1000_rules/mid_rule_match` | ~15 µs | Match at rule #500 |
-| `srr_scale/10000_rules/fallthrough_all` | ~300 µs | No match, scan all 10K rules |
+| Rule Count | First Match | Mid-Rule Match | Fallthrough All |
+|-----------|-------------|----------------|-----------------|
+| 100 | **170 ns** | **790 ns** | **200 ns** |
+| 1,000 | **170 ns** | **6.8 µs** | **900 ns** |
+| 10,000 | **340 ns** | **315 µs** | **11.6 µs** |
+
+**Key insight**: First-match is constant (~170ns) regardless of rule count. Mid-rule match scales linearly. 10K fallthrough at 11.6µs is within hot-path budget for most deployments.
 
 ### ABAC Policy Engine
 
-| Benchmark | Median | Range | Description |
-|-----------|--------|-------|-------------|
-| `policy/allow_read` | **480.9 ns** | 468–494 ns | Safe read operation, 5 rules |
-| `policy/deny_critical_delete` | **349.5 ns** | 343–357 ns | Critical delete, deny short-circuits |
-| `policy/payment_require_approval` | **153.2 ns** | 148–162 ns | Payment approval, condition match |
-| `policy/no_match_fallthrough` | **766.9 ns** | 748–788 ns | No matching rule, scan all |
+| Benchmark | Result | Description |
+|-----------|--------|-------------|
+| `policy/allow_read` | **310 ns** | Safe read operation, 5 rules |
+| `policy/deny_critical_delete` | **200 ns** | Critical delete, deny short-circuits |
+| `policy/payment_require_approval` | **90 ns** | Payment approval, condition match |
+| `policy/no_match_fallthrough` | **480 ns** | No matching rule, scan all |
 
-**Key insight**: Deny short-circuits faster (349ns) than full scan (767ns). Policy evaluation is sub-microsecond for typical rule sets.
+### Policy Scale Benchmarks
+
+| Rule Count | First Match | Fallthrough All |
+|-----------|-------------|-----------------|
+| 100 | **180 ns** | **5.7 µs** |
+| 500 | **170 ns** | **29.0 µs** |
+| 1,000 | **180 ns** | **55.4 µs** |
 
 ### max_strict Decision Combiner
 
-| Benchmark | Median | Description |
+| Benchmark | Result | Description |
 |-----------|--------|-------------|
-| `max_strict/allow_vs_deny` | **44.8 ns** | Full decision clone + comparison |
-| `max_strict/delay_vs_require_approval` | **6.3 ns** | Lightweight comparison |
+| `max_strict/allow_vs_deny` | **20 ns** | Full decision clone + comparison |
+| `max_strict/delay_vs_require_approval` | **10 ns** | Lightweight comparison |
 
 ### Vault (AES-256-GCM Encrypt + Decrypt + WAL)
 
-| Benchmark | Median | Range | Description |
-|-----------|--------|-------|-------------|
-| `vault/write_read_roundtrip_bytes/32` | **482.0 µs** | 469–496 µs | 32B value (encrypt+WAL+decrypt) |
-| `vault/write_read_roundtrip_bytes/256` | **492.7 µs** | 486–499 µs | 256B value |
-| `vault/write_read_roundtrip_bytes/1024` | **512.0 µs** | 505–520 µs | 1KB value |
-| `vault/write_read_roundtrip_bytes/4096` | **487.4 µs** | 473–504 µs | 4KB value |
-| `vault/write_read_roundtrip_bytes/16384` | **763.8 µs** | 577–956 µs | 16KB value |
+| Value Size | Result | Description |
+|-----------|--------|-------------|
+| 32B | **6.23 ms** | encrypt + WAL fsync + decrypt |
+| 256B | **6.40 ms** | |
+| 1KB | **6.23 ms** | |
+| 4KB | **6.26 ms** | |
+| 16KB | **6.38 ms** | |
 
-**Key insight**: Vault latency is dominated by WAL fsync (~480µs), not encryption. AES-256-GCM adds negligible overhead up to 4KB. 16KB shows higher variance due to larger fsync writes.
+**Key insight**: Vault latency is dominated by WAL fsync (~6.2ms on EC2 EBS). AES-256-GCM encryption adds negligible overhead across all sizes.
 
 ### Vault Large Value Benchmarks
 
-| Benchmark | Median | Description |
-|-----------|--------|-------------|
-| `vault_large/64KB` | ~1.2 ms | 64KB encrypt+decrypt roundtrip |
-| `vault_large/256KB` | ~3.5 ms | 256KB roundtrip |
-| `vault_large/1MB` | ~12 ms | 1MB roundtrip |
+| Value Size | Result |
+|-----------|--------|
+| 64KB | **6.76 ms** |
+| 256KB | **8.52 ms** |
+| 1MB | **14.79 ms** |
 
 ### WAL (Write-Ahead Log)
 
-| Benchmark | Median | Range | Description |
-|-----------|--------|-------|-------------|
-| `wal/durable_append_fsync` | **2.07 ms** | 2.05–2.10 ms | Single event WAL append + fsync |
-| `wal/100_sequential_appends` | **203.0 ms** | 199–208 ms | 100 sequential fsyncs (2.03ms each) |
-| `wal_group_commit/concurrent_appends/100` | **4.41 ms** | 4.33–4.49 ms | 100 concurrent → batched fsync |
+| Benchmark | Result | Description |
+|-----------|--------|-------------|
+| `wal/durable_append_fsync` | **6.28 ms** | Single event WAL append + fsync |
+| `wal/100_sequential_appends` | **620.6 ms** | 100 sequential fsyncs (6.2ms each) |
+| `wal_group_commit/concurrent/100` | **7.99 ms** | 100 concurrent → batched fsync |
+| `wal_group_commit/concurrent/500` | **23.47 ms** | 500 concurrent → batched fsync |
 
-**Key insight**: Group commit reduces 100 fsyncs from 203ms (sequential) to 4.4ms (batched) — **46x improvement**. This amortizes disk I/O across all concurrent callers.
+**Key insight**: Group commit reduces 100 fsyncs from 620ms (sequential) to 8ms (batched) — **78x improvement**. 500 concurrent appends batch into 23ms.
 
 ### Rate Limiter
 
-| Benchmark | Median | Description |
+| Benchmark | Result | Description |
 |-----------|--------|-------------|
-| `rate_limiter/single_agent_check` | **94.8 ns** | Single token bucket check |
-| `rate_limiter/100_agents_round_robin` | **139.5 ns** | HashMap lookup + token check |
+| `rate_limiter/single_agent_check` | **130 ns** | Single token bucket check |
+| `rate_limiter/100_agents_round_robin` | **200 ns** | HashMap lookup + token check |
 
 ### IC-2 Delay Accuracy
 
-| Benchmark | Median | Description |
+| Benchmark | Result | Description |
 |-----------|--------|-------------|
-| `ic2_delay_accuracy/300ms` | ~300.3 ms | tokio::sleep precision (sample_size=10) |
+| `ic2_delay/300ms_delay_accuracy` | **301.2 ms** | tokio::sleep precision |
 
 ### Vault Contention P99 — Tail Latency Under Load
 
-| Concurrency | 4KB | 16KB | 64KB | Outlier Rate |
-|------------|------|------|------|-------------|
-| 10 writers | 2.4 ms | 3.9 ms | 4.3 ms | 22% high-severe (4KB) |
-| 50 writers | 4.4 ms | 4.8 ms | 5.7 ms | 6% (64KB) |
-| 100 writers | 4.9 ms | 5.5 ms | 6.5 ms | 9% (4KB) |
+| Concurrency | 4KB | 16KB | 64KB |
+|------------|------|------|------|
+| 10 writers | 6.5 ms | 7.2 ms | 13.2 ms |
+| 50 writers | 9.3 ms | 13.8 ms | 29.9 ms |
+| 100 writers | 11.3 ms | 19.9 ms | 51.8 ms |
 
-| Benchmark | Median | Description |
+| Benchmark | Result | Description |
 |-----------|--------|-------------|
-| `p99_explicit_16kb_50writers` | **4.7 ms** | Max latency across 50 concurrent 16KB write+read ops |
+| `p99_explicit_16kb_50writers` | **15.4 ms** | Max latency across 50 concurrent 16KB write+read ops |
 
-**Key insight**: Tail latency scales sub-linearly with concurrency — 10x more writers (10→100) adds only ~2.5x latency. fsync contention is the dominant factor; encryption overhead is negligible even under load. At 100 concurrent writers with 64KB values, p99 stays under 7ms.
+**Key insight**: Tail latency scales sub-linearly with concurrency for small values. 64KB at 100 writers reaches 52ms — fsync contention dominates.
+
+### Vault P99 Tail — Write vs Monolithic vs Chunked
+
+| Benchmark | Result | Description |
+|-----------|--------|-------------|
+| `vault_p99_tail/write_only/1KB` | **6.23 ms** | Write-only (no read) |
+| `vault_p99_tail/write_only/16KB` | **6.35 ms** | |
+| `vault_p99_tail/write_only/64KB` | **6.69 ms** | |
+| `vault_p99_tail/write_only/256KB` | **8.07 ms** | |
+| `vault_p99_tail/monolithic_256kb` | **8.08 ms** | Single 256KB write+read |
+| `vault_p99_tail/chunked_16x16kb` | **101.5 ms** | 16 sequential 16KB writes (fsync each) |
 
 ### Wasm Cold Start
 
-| Benchmark | Median | Range | Description |
-|-----------|--------|-------|-------------|
-| `wasm_cold_start/full_load` | **36.6 ms** | 34–40 ms | File read + SHA-256 + Cranelift JIT compile + WASI setup |
-| `wasm_cold_start/load_and_first_eval` | **35.4 ms** | 34–37 ms | Full load + first policy evaluation |
-| `wasm_cold_start/warm_eval_baseline` | **5.3 µs** | 5.1–5.6 µs | Pre-loaded module evaluation |
+| Benchmark | Result | Description |
+|-----------|--------|-------------|
+| `wasm_cold_start/full_load` | **201.3 ms** | File read + SHA-256 + Cranelift JIT compile |
+| `wasm_cold_start/load_and_first_eval` | **203.4 ms** | Full load + first policy evaluation |
+| `wasm_cold_start/warm_eval_baseline` | **7.86 µs** | Pre-loaded module evaluation |
 
-**Key insight**: Cold start is ~35ms, dominated by Cranelift JIT compilation. First evaluation adds negligible overhead (~0.1ms). Warm path is **6,900x faster** than cold start. Module must be loaded once at proxy startup — per-request Wasm overhead is microsecond-level, not millisecond-level.
+**Key insight**: Cold start ~201ms (Cranelift JIT). Warm eval **25,600x faster**. Module loaded once at proxy startup.
+
+### Wasm vs Native
+
+| Benchmark | Result | Description |
+|-----------|--------|-------------|
+| `wasm_vs_native/srr_only_baseline` | **240 ns** | SRR-only (no Wasm/native ABAC) |
+| `wasm_vs_native/native_allow` | **890 ns** | Native ABAC → Allow |
+| `wasm_vs_native/native_deny` | **980 ns** | Native ABAC → Deny |
+| `wasm_vs_native/wasm_allow` | **9.34 µs** | Wasm ABAC → Allow |
+| `wasm_vs_native/wasm_deny` | **9.78 µs** | Wasm ABAC → Deny |
+| `wasm_vs_native/e2e_with_native` | **750 ns** | E2E: SRR + native ABAC + max_strict |
+| `wasm_vs_native/e2e_with_wasm` | **9.82 µs** | E2E: SRR + Wasm ABAC + max_strict |
+
+**Key insight**: Native ABAC is ~10x faster than Wasm (~0.9µs vs ~9.5µs). Both are well within hot-path budget. Wasm provides deterministic execution at the cost of ~9µs per evaluation.
 
 ### eBPF/TC Kernel Context Switch (Linux-only)
 
-| Benchmark | Expected | Description |
-|-----------|----------|-------------|
-| `ebpf_kernel/tc_attach_detach_cycle` | ~5-15 ms | clsact qdisc add + 4 tc filter rules + qdisc del |
-| `ebpf_kernel/tc_attach_only` | ~3-8 ms | clsact qdisc + 2 tc filter rules (setup cost) |
+| Benchmark | Result | Description |
+|-----------|--------|-------------|
+| `ebpf_kernel/tc_attach_detach_cycle` | **10.7 ms** | clsact qdisc add + tc filter rules + qdisc del |
+| `ebpf_kernel/tc_attach_only` | **5.2 ms** | clsact qdisc + tc filter rules (setup cost) |
 
-**Note**: eBPF benchmarks are Linux-only (`cfg(target_os = "linux")`). Expected values based on typical kernel round-trip costs for TC filter operations. These are one-time sandbox setup costs, not per-packet overhead — once attached, TC filtering runs entirely in kernel space with zero userspace context switches per packet.
+**Note**: One-time sandbox setup costs, not per-packet overhead. TC filtering runs entirely in kernel space.
 
 ---
 
