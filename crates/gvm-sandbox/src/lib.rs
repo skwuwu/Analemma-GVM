@@ -187,6 +187,9 @@ pub struct SandboxResult {
     pub setup_ms: u64,
     /// Whether seccomp violations were detected.
     pub seccomp_violations: u32,
+    /// Filesystem diff report (overlayfs upper layer scan).
+    /// None if overlayfs was not active or scan failed.
+    pub fs_diff: Option<filesystem::FsDiffReport>,
 }
 
 /// Pre-flight check results.

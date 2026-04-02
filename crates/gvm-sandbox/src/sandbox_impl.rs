@@ -419,7 +419,41 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         );
     }
 
-    // 5. Clean up host-side resources
+    // 5. Scan overlayfs upper layer BEFORE cleanup (tmpfs umount destroys it).
+    // This must happen while the overlay is still mounted so files are accessible.
+    let fs_diff = {
+        let upper_dir = sandbox_root.join("gvm-overlay/upper");
+        if upper_dir.exists() {
+            let policy = config.fs_policy.as_ref()
+                .cloned()
+                .unwrap_or_default();
+            match crate::filesystem::scan_upper_layer(&upper_dir, &config.workspace_dir, &policy) {
+                Ok(report) => {
+                    // Execute auto-merge (Created files only — Modified goes to ManualCommit)
+                    if !report.auto_merged.is_empty() {
+                        let merge_result = crate::filesystem::execute_merge(
+                            &report, &upper_dir, &config.workspace_dir,
+                        );
+                        tracing::info!(
+                            copied = merge_result.copied.len(),
+                            skipped = merge_result.skipped.len(),
+                            errors = merge_result.errors.len(),
+                            "Overlayfs auto-merge completed"
+                        );
+                    }
+                    Some(report)
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "Overlayfs scan failed (non-fatal)");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
+    // 6. Clean up host-side resources
     // Unmount sandbox root (lazy detach handles nested mounts from failed runs)
     nix::mount::umount2(&sandbox_root, nix::mount::MntFlags::MNT_DETACH).ok();
     std::fs::remove_dir_all(&sandbox_root).ok();
@@ -440,6 +474,7 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         exit_code,
         setup_ms,
         seccomp_violations,
+        fs_diff,
     })
 }
 

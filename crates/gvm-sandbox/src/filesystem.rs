@@ -3,9 +3,16 @@
 //!
 //! Analogous to SRR for network traffic: file glob patterns determine
 //! how agent-generated files are handled at session end.
+//!
+//! Safety principles:
+//! - Created files only: auto-merge only copies NEW files. Modified files
+//!   always require manual approval (protects existing workspace files).
+//! - Deleted (whiteout): never auto-executed. Requires --allow-delete opt-in.
+//! - Symlink defense: symlinks targeting outside upper_dir are rejected.
+//! - Path traversal defense: relative paths with `..` are rejected.
 
 use crate::FilesystemPolicy;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 /// Classification of a file change in the overlayfs upper layer.
@@ -110,39 +117,115 @@ fn scan_dir_recursive(
 
     for entry in entries.flatten() {
         let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        // ── Phase 0-B: Detect overlayfs whiteout files ──
+        // Overlayfs uses character device (0, 0) as whiteout markers for deleted files.
+        // Also detect opaque directory markers (.wh..wh..opq).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            if metadata.file_type().is_char_device() {
+                // Whiteout = file was deleted by agent in upper layer
+                let rel_path = path.strip_prefix(upper_root).unwrap_or(&path).to_path_buf();
+                // Strip .wh. prefix if present (overlayfs naming convention)
+                let display_path = rel_path.to_string_lossy()
+                    .replace(".wh.", "")
+                    .into();
+                needs_review.push(FileChange {
+                    path: display_path,
+                    kind: ChangeKind::Deleted,
+                    action: FileAction::ManualCommit, // Deletions always need approval
+                    size: 0,
+                    matched_pattern: "whiteout".to_string(),
+                });
+                continue;
+            }
+        }
 
         if path.is_dir() {
+            // Skip opaque directory markers
+            if path.file_name().map(|n| n.to_string_lossy().contains(".wh..wh..opq")).unwrap_or(false) {
+                continue;
+            }
             scan_dir_recursive(
-                &path,
-                upper_root,
-                lower_root,
-                policy,
-                auto_merged,
-                needs_review,
-                discarded,
+                &path, upper_root, lower_root, policy,
+                auto_merged, needs_review, discarded,
             )?;
             continue;
         }
 
         let rel_path = path.strip_prefix(upper_root).unwrap_or(&path).to_path_buf();
+
+        // ── Phase 0-C: Path traversal defense ──
+        // Reject relative paths containing ".." to prevent escape from workspace.
+        let rel_str = rel_path.to_string_lossy();
+        if rel_str.contains("..") {
+            discarded.push(FileChange {
+                path: rel_path,
+                kind: ChangeKind::Created,
+                action: FileAction::Discard,
+                size: 0,
+                matched_pattern: "path_traversal_blocked".to_string(),
+            });
+            continue;
+        }
+
+        // ── Phase 0-A: Symlink traversal defense ──
+        // Reject symlinks that point outside the upper directory.
+        // An agent could create a symlink → /etc/passwd, and auto-merge
+        // would copy that file to the host workspace.
+        if metadata.file_type().is_symlink() {
+            let target = std::fs::read_link(&path).unwrap_or_default();
+            let resolved = path.parent().unwrap_or(upper_root).join(&target);
+            let canonical = resolved.canonicalize().unwrap_or(resolved);
+            if !canonical.starts_with(upper_root) {
+                discarded.push(FileChange {
+                    path: rel_path,
+                    kind: ChangeKind::Created,
+                    action: FileAction::Discard,
+                    size: 0,
+                    matched_pattern: "symlink_escape_blocked".to_string(),
+                });
+                continue;
+            }
+        }
+
         let lower_path = lower_root.join(&rel_path);
 
+        // ── Phase 1-A: Created vs Modified classification ──
+        // Modified files are ALWAYS ManualCommit regardless of pattern.
+        // Only Created files can be auto-merged (new output, no overwrite risk).
         let kind = if lower_path.exists() {
             ChangeKind::Modified
         } else {
             ChangeKind::Created
         };
 
-        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        let size = metadata.len();
+        let (pattern_action, pattern) = classify_file(&rel_path, policy);
 
-        let (action, pattern) = classify_file(&rel_path, policy);
+        // Safety override: Modified → ManualCommit always (protects existing files)
+        let is_modified = matches!(kind, ChangeKind::Modified);
+        let action = if is_modified {
+            FileAction::ManualCommit
+        } else {
+            pattern_action
+        };
 
         let change = FileChange {
             path: rel_path,
             kind,
             action: action.clone(),
             size,
-            matched_pattern: pattern,
+            matched_pattern: if matches!(action, FileAction::ManualCommit) && is_modified {
+                "modified_file".to_string()
+            } else {
+                pattern
+            },
         };
 
         match action {
@@ -215,36 +298,79 @@ fn glob_match(pattern: &str, path: &str) -> bool {
     }
 }
 
-/// Auto-merge files: copy from upper layer to host workspace.
-pub fn auto_merge_files(
-    changes: &[FileChange],
+/// Auto-merge result statistics.
+pub struct MergeResult {
+    pub copied: Vec<PathBuf>,
+    pub skipped: Vec<(PathBuf, String)>, // (path, reason)
+    pub errors: Vec<(PathBuf, String)>,  // (path, error)
+}
+
+/// Execute auto-merge: copy Created+AutoMerge files from upper to host workspace.
+/// Modified files are NEVER copied here (safety: protect existing workspace files).
+/// Symlinks targeting outside upper_dir are rejected.
+pub fn execute_merge(
+    report: &FsDiffReport,
     upper_dir: &Path,
     host_workspace: &Path,
-) -> Vec<(PathBuf, Result<()>)> {
-    changes
-        .iter()
-        .map(|change| {
-            let src = upper_dir.join(&change.path);
-            let dst = host_workspace.join(&change.path);
-            let result = (|| -> Result<()> {
-                if let Some(parent) = dst.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::copy(&src, &dst)?;
-                Ok(())
-            })();
-            (change.path.clone(), result)
-        })
-        .collect()
+) -> MergeResult {
+    let mut result = MergeResult {
+        copied: Vec::new(),
+        skipped: Vec::new(),
+        errors: Vec::new(),
+    };
+
+    for change in &report.auto_merged {
+        // Safety: only copy Created files. Modified should not be in auto_merged
+        // (scan_dir_recursive enforces this), but double-check here.
+        if matches!(change.kind, ChangeKind::Modified) {
+            result.skipped.push((change.path.clone(), "modified file".into()));
+            continue;
+        }
+
+        let src = upper_dir.join(&change.path);
+        let dst = host_workspace.join(&change.path);
+
+        // Path traversal defense (belt-and-suspenders with scan)
+        let dst_canonical = dst.parent()
+            .and_then(|p| { std::fs::create_dir_all(p).ok(); p.canonicalize().ok() })
+            .unwrap_or_else(|| host_workspace.to_path_buf());
+        let ws_canonical = host_workspace.canonicalize()
+            .unwrap_or_else(|_| host_workspace.to_path_buf());
+        if !dst_canonical.starts_with(&ws_canonical) {
+            result.skipped.push((change.path.clone(), "path escape blocked".into()));
+            continue;
+        }
+
+        // Symlink defense: don't copy symlinks, copy their targets (if within upper)
+        if src.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+            result.skipped.push((change.path.clone(), "symlink rejected".into()));
+            continue;
+        }
+
+        match std::fs::copy(&src, &dst) {
+            Ok(_) => result.copied.push(change.path.clone()),
+            Err(e) => result.errors.push((change.path.clone(), e.to_string())),
+        }
+    }
+
+    result
 }
 
 /// Commit approved files: copy from upper layer to host workspace.
+/// Used for ManualCommit files after user approval.
 pub fn commit_files(
     changes: &[FileChange],
     upper_dir: &Path,
     host_workspace: &Path,
-) -> Vec<(PathBuf, Result<()>)> {
-    auto_merge_files(changes, upper_dir, host_workspace)
+) -> MergeResult {
+    // Create a temporary report with just these files as auto_merged
+    let report = FsDiffReport {
+        auto_merged: changes.to_vec(),
+        needs_review: Vec::new(),
+        discarded: Vec::new(),
+        overlayfs_active: true,
+    };
+    execute_merge(&report, upper_dir, host_workspace)
 }
 
 /// Generate a unified diff between the lower (original) and upper (modified) versions.
@@ -426,5 +552,160 @@ mod tests {
 
         let (action, _) = classify_file(Path::new("anything.xyz"), &policy);
         assert!(matches!(action, FileAction::Discard));
+    }
+
+    // ── Phase 0 + Phase 1 tests ──
+
+    /// Phase 0-A: Symlink targeting outside upper_dir is discarded.
+    #[test]
+    fn symlink_escape_is_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let upper = dir.path().join("upper");
+        let lower = dir.path().join("lower");
+        std::fs::create_dir_all(&upper).unwrap();
+        std::fs::create_dir_all(&lower).unwrap();
+
+        // Create symlink pointing outside upper
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/passwd", upper.join("escape.txt")).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            // Skip on non-Unix
+            return;
+        }
+
+        let policy = FilesystemPolicy::default();
+        let report = scan_upper_layer(&upper, &lower, &policy).unwrap();
+
+        assert_eq!(report.discarded.len(), 1, "symlink escape must be discarded");
+        assert_eq!(report.discarded[0].matched_pattern, "symlink_escape_blocked");
+        assert!(report.auto_merged.is_empty(), "no auto-merge for symlinks");
+    }
+
+    /// Phase 0-C: Path with `..` is discarded.
+    #[test]
+    fn path_traversal_is_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let upper = dir.path().join("upper");
+        let lower = dir.path().join("lower");
+        let sneaky_dir = upper.join("..sneaky");
+        std::fs::create_dir_all(&sneaky_dir).unwrap();
+        std::fs::create_dir_all(&lower).unwrap();
+
+        // File with ".." in parent dir name
+        std::fs::write(sneaky_dir.join("data.csv"), "evil").unwrap();
+
+        let policy = FilesystemPolicy::default();
+        let report = scan_upper_layer(&upper, &lower, &policy).unwrap();
+
+        // "..sneaky/data.csv" contains ".." → should be discarded
+        let has_traversal = report.discarded.iter()
+            .any(|f| f.matched_pattern == "path_traversal_blocked");
+        assert!(has_traversal, "path traversal must be discarded");
+    }
+
+    /// Phase 1-A: Modified files are always ManualCommit regardless of pattern.
+    #[test]
+    fn modified_file_forced_manual_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let upper = dir.path().join("upper");
+        let lower = dir.path().join("lower");
+        std::fs::create_dir_all(&upper).unwrap();
+        std::fs::create_dir_all(&lower).unwrap();
+
+        // Create same file in both (Modified)
+        std::fs::write(lower.join("data.csv"), "original").unwrap();
+        std::fs::write(upper.join("data.csv"), "modified").unwrap();
+
+        // Create new file in upper only (Created)
+        std::fs::write(upper.join("output.csv"), "new data").unwrap();
+
+        let policy = FilesystemPolicy::default();
+        let report = scan_upper_layer(&upper, &lower, &policy).unwrap();
+
+        // Modified *.csv → ManualCommit (not AutoMerge)
+        let modified = report.needs_review.iter()
+            .find(|f| f.path == Path::new("data.csv"));
+        assert!(modified.is_some(), "modified file must be in needs_review");
+        assert!(matches!(modified.unwrap().kind, ChangeKind::Modified));
+        assert_eq!(modified.unwrap().matched_pattern, "modified_file");
+
+        // Created *.csv → AutoMerge
+        let created = report.auto_merged.iter()
+            .find(|f| f.path == Path::new("output.csv"));
+        assert!(created.is_some(), "created csv must be auto-merged");
+        assert!(matches!(created.unwrap().kind, ChangeKind::Created));
+    }
+
+    /// Phase 1-B: execute_merge only copies Created files.
+    #[test]
+    fn execute_merge_only_copies_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let upper = dir.path().join("upper");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&upper).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        // Create a file in upper
+        std::fs::write(upper.join("output.csv"), "new data").unwrap();
+
+        let report = FsDiffReport {
+            auto_merged: vec![FileChange {
+                path: PathBuf::from("output.csv"),
+                kind: ChangeKind::Created,
+                action: FileAction::AutoMerge,
+                size: 8,
+                matched_pattern: "*.csv".into(),
+            }],
+            needs_review: vec![],
+            discarded: vec![],
+            overlayfs_active: true,
+        };
+
+        let result = execute_merge(&report, &upper, &workspace);
+        assert_eq!(result.copied.len(), 1);
+        assert!(result.errors.is_empty());
+
+        // Verify file was copied
+        let dst = workspace.join("output.csv");
+        assert!(dst.exists(), "auto-merged file must be copied to workspace");
+        assert_eq!(std::fs::read_to_string(&dst).unwrap(), "new data");
+    }
+
+    /// Phase 1-B: execute_merge rejects symlinks.
+    #[test]
+    fn execute_merge_rejects_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let upper = dir.path().join("upper");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&upper).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        // Create a symlink in upper
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/hostname", upper.join("link.txt")).unwrap();
+        }
+        #[cfg(not(unix))]
+        { return; }
+
+        let report = FsDiffReport {
+            auto_merged: vec![FileChange {
+                path: PathBuf::from("link.txt"),
+                kind: ChangeKind::Created,
+                action: FileAction::AutoMerge,
+                size: 0,
+                matched_pattern: "*.txt".into(),
+            }],
+            needs_review: vec![],
+            discarded: vec![],
+            overlayfs_active: true,
+        };
+
+        let result = execute_merge(&report, &upper, &workspace);
+        assert_eq!(result.skipped.len(), 1, "symlink must be skipped");
+        assert!(result.copied.is_empty(), "symlink must not be copied");
     }
 }

@@ -210,6 +210,7 @@ fn sandbox_result_fields() {
         exit_code: 0,
         setup_ms: 42,
         seccomp_violations: 0,
+        fs_diff: None,
     };
     assert_eq!(result.exit_code, 0);
     assert_eq!(result.setup_ms, 42);

@@ -224,6 +224,14 @@ async fn launch_sandbox(config: &AgentConfig, pre: &PreLaunchState) -> Result<i3
             result.seccomp_violations
         );
     }
+
+    // Display filesystem diff report (overlayfs Trust-on-Pattern)
+    if let Some(ref diff) = result.fs_diff {
+        if diff.overlayfs_active {
+            print_fs_diff_report(diff);
+        }
+    }
+
     Ok(result.exit_code)
 }
 
@@ -418,4 +426,77 @@ fn print_security_layers(config: &AgentConfig) {
     eprintln!();
     eprintln!("  {DIM}--- Output below ---{RESET}");
     eprintln!();
+}
+
+fn print_fs_diff_report(diff: &gvm_sandbox::filesystem::FsDiffReport) {
+    eprintln!();
+    eprintln!("  {BOLD}\u{2500}\u{2500} File Changes (Trust-on-Pattern) \u{2500}\u{2500}{RESET}");
+
+    if diff.auto_merged.is_empty() && diff.needs_review.is_empty() && diff.discarded.is_empty() {
+        eprintln!("    {DIM}No file changes detected.{RESET}");
+        return;
+    }
+
+    if !diff.auto_merged.is_empty() {
+        eprintln!(
+            "    {GREEN}\u{2713} auto-merged:{RESET} {} file(s)",
+            diff.auto_merged.len()
+        );
+        for f in &diff.auto_merged {
+            eprintln!("      {GREEN}+{RESET} {} {DIM}({}, {}){RESET}",
+                f.path.display(),
+                f.matched_pattern,
+                format_size(f.size),
+            );
+        }
+    }
+
+    if !diff.needs_review.is_empty() {
+        eprintln!(
+            "    {YELLOW}\u{26a0} needs review:{RESET} {} file(s)",
+            diff.needs_review.len()
+        );
+        for f in &diff.needs_review {
+            let kind_str = match f.kind {
+                gvm_sandbox::filesystem::ChangeKind::Created => "new",
+                gvm_sandbox::filesystem::ChangeKind::Modified => "modified",
+                gvm_sandbox::filesystem::ChangeKind::Deleted => "deleted",
+            };
+            eprintln!("      {YELLOW}?{RESET} {} {DIM}({}, {}, {}){RESET}",
+                f.path.display(),
+                kind_str,
+                f.matched_pattern,
+                format_size(f.size),
+            );
+        }
+
+        // TTY check: prompt for approval or print staging path
+        if atty::is(atty::Stream::Stdin) {
+            eprintln!();
+            eprintln!("    {DIM}Run with --interactive for file-by-file approval (TODO){RESET}");
+        } else {
+            eprintln!();
+            eprintln!("    {DIM}Non-interactive: review files manually, then run:{RESET}");
+            eprintln!("    {CYAN}gvm fs approve{RESET}");
+        }
+    }
+
+    if !diff.discarded.is_empty() {
+        eprintln!(
+            "    {DIM}\u{2717} discarded: {} file(s){RESET}",
+            diff.discarded.len()
+        );
+    }
+
+    eprintln!();
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{}B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+    }
 }
