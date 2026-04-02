@@ -24,6 +24,7 @@ pub async fn run_agent(
     sandbox: bool,
     interactive: bool,
     no_mitm: bool,
+    fs_governance: bool,
 ) -> Result<()> {
     if command.is_empty() {
         anyhow::bail!(
@@ -79,6 +80,7 @@ pub async fn run_agent(
         proxy: proxy.to_string(),
         mode,
         no_mitm,
+        fs_governance,
         memory_limit: parse_memory_limit(memory),
         cpu_limit: cpus.parse::<f64>().ok(),
         interactive,
@@ -263,7 +265,10 @@ pub(crate) fn assemble_sandbox_config(
         proxy_url: Some(proxy.to_string()),
         memory_limit,
         cpu_limit,
-        fs_policy: Some(gvm_sandbox::FilesystemPolicy::default()),
+        // fs_policy: None = legacy mode (workspace/output/ only, no overlayfs)
+        // fs_policy: Some = overlayfs Trust-on-Pattern governance
+        // Controlled by --fs-governance CLI flag.
+        fs_policy: None, // Caller sets this via pipeline based on fs_governance flag
         mitm_ca_cert,
     }
 }

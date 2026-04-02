@@ -901,6 +901,7 @@ pub async fn run_watch(
         proxy: proxy.to_string(),
         mode,
         no_mitm,
+        fs_governance: false, // Watch mode: legacy filesystem (observation only)
         memory_limit: None,
         cpu_limit: None,
         interactive: false,

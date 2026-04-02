@@ -23,6 +23,10 @@ pub struct AgentConfig {
     pub proxy: String,
     pub mode: LaunchMode,
     pub no_mitm: bool,
+    /// Enable overlayfs Trust-on-Pattern filesystem governance.
+    /// false (default) = legacy mode (workspace/output/ writable only).
+    /// true = overlayfs with auto-merge/ManualCommit at session end.
+    pub fs_governance: bool,
     pub memory_limit: Option<u64>,
     pub cpu_limit: Option<f64>,
     pub interactive: bool,
@@ -189,6 +193,14 @@ async fn launch_sandbox(config: &AgentConfig, pre: &PreLaunchState) -> Result<i3
             config.cpu_limit,
             pre.mitm_ca.clone(),
         )
+    };
+
+    // Set filesystem governance mode based on CLI flag
+    let mut sandbox_config = sandbox_config;
+    sandbox_config.fs_policy = if config.fs_governance {
+        Some(gvm_sandbox::FilesystemPolicy::default())
+    } else {
+        None // Legacy mode: workspace/output/ only
     };
 
     // Preflight check (sandbox only)

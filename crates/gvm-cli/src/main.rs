@@ -123,6 +123,12 @@ enum Commands {
         #[arg(long)]
         no_mitm: bool,
 
+        /// Enable filesystem governance (overlayfs Trust-on-Pattern).
+        /// Agent file changes are classified and reviewed at session end.
+        /// Without this flag, sandbox uses legacy mode (workspace/output/ writable only).
+        #[arg(long)]
+        fs_governance: bool,
+
         /// Run in background (only with --contained)
         #[arg(long)]
         detach: bool,
@@ -456,6 +462,7 @@ async fn main() -> anyhow::Result<()> {
             sandbox,
             contained,
             no_mitm,
+            fs_governance,
             image,
             memory,
             cpus,
@@ -488,6 +495,7 @@ async fn main() -> anyhow::Result<()> {
                     sandbox,
                     interactive,
                     no_mitm,
+                    fs_governance,
                 )
                 .await?;
             }

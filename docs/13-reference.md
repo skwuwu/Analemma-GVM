@@ -458,6 +458,77 @@ Sandbox resources (veth, iptables, cgroups, mounts) are cleaned up automatically
 - **Manual**: `gvm cleanup` scans for orphaned resources
 - **ip_forward**: Restored to original value when last sandbox exits
 
+### Filesystem Governance (Trust-on-Pattern)
+
+Two filesystem modes for sandbox:
+
+**Legacy mode** (default — no `--fs-governance`):
+```bash
+gvm run --sandbox agent.py
+```
+- Agent can only write to `workspace/output/` directory
+- All other paths are read-only
+- Simple and safe — no file review needed
+- Agent results are in `output/` immediately
+
+**Governance mode** (`--fs-governance`):
+```bash
+gvm run --sandbox --fs-governance agent.py
+```
+- Agent can write anywhere in workspace (overlayfs copy-on-write)
+- Writes are captured in an overlay layer, not applied directly
+- At session end, changes are classified by Trust-on-Pattern:
+
+| Change Type | Pattern Match | Action |
+|------------|---------------|--------|
+| **Created** file | `*.csv, *.pdf, *.txt, *.png` | **Auto-merge** → copied to workspace |
+| **Created** file | `*.sh, *.py, *.js, *.json` | **ManualCommit** → review prompt |
+| **Created** file | `*.log, __pycache__/*` | **Discarded** |
+| **Modified** file | (any pattern) | **ManualCommit** → always needs approval |
+| **Deleted** file | (any pattern) | **ManualCommit** → never auto-deleted |
+
+Safety principles:
+- **Created** files with safe extensions auto-merge (no overwrite risk)
+- **Modified** files always require approval (protects existing workspace)
+- **Deleted** files are never auto-executed (agent cannot delete host files)
+- **Symlinks** targeting outside workspace are rejected
+- **Path traversal** (`../`) is blocked
+
+**Interactive review** (TTY):
+When `--fs-governance` produces ManualCommit files and stdin is a terminal, a review prompt appears:
+```
+[1/2] analysis.py (Created, 2KB)
++#!/usr/bin/env python3
++import pandas as pd
+... (8 more lines)
+
+(a)ccept  (r)eject  (s)kip all →
+```
+
+**CI/CD** (non-TTY):
+ManualCommit files are staged to `data/sandbox-staging/{pid}/` with instructions to review later:
+```
+Files staged at: data/sandbox-staging/12345/
+Review and approve: gvm fs approve
+```
+
+**Configuration** (`proxy.toml`):
+```toml
+[sandbox]
+filesystem_governance = true   # Override CLI default (false)
+```
+CLI `--fs-governance` flag overrides config.
+
+**Custom patterns**:
+Default patterns can be overridden in `proxy.toml`:
+```toml
+[sandbox.filesystem_policy]
+auto_merge = ["*.csv", "*.pdf", "*.txt", "*.png", "*.xml", "*.md"]
+manual_commit = ["*.sh", "*.py", "*.js", "*.json", "*.toml", "*.yaml"]
+discard = ["/tmp/*", "*.log", "__pycache__/*", ".git/*"]
+default = "manual_commit"   # For files matching no pattern
+```
+
 ### Policy Check (`gvm check`)
 
 Dry-run policy evaluation — tests what decision the proxy would make without sending real requests. Uses the same `enforcement::classify()` code path as the live proxy, guaranteeing check results match real enforcement.
