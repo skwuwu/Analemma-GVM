@@ -168,10 +168,11 @@ Sandbox isolation is only as strong as its weakest mount/seccomp configuration.
 - After `pivot_root`, old root must be unmounted (`MNT_DETACH`) and directory removed
 
 **seccomp-BPF:**
-- Default-deny whitelist. New kernel syscalls are automatically blocked.
+- Default ENOSYS for unknown syscalls (graceful fallback). Whitelist for known-safe. No KILL for unknowns (prevents kernel/glibc upgrade regressions).
 - `socket()` must filter on `arg0` (domain): only AF_INET, AF_INET6, AF_UNIX allowed. AF_NETLINK allowed only if required for DNS. AF_PACKET blocked.
-- Dangerous syscalls killed, not just logged: `ptrace`, `process_vm_readv`, `mount`, `bpf`, `unshare`, `setns`, `open_by_handle_at`
+- Dangerous syscalls (ptrace, mount, bpf, unshare, setns, open_by_handle_at) get ENOSYS — the operation never executes.
 - `openat()` argument filtering: seccomp cannot enforce path boundaries (kernel limitation). Rely on mount namespace for path isolation. Do not add false-confidence seccomp path filters.
+- **seccomp must NEVER be disableable.** No `--seccomp off` flag, no `GVM_DEBUG_SECCOMP_DISABLE` env var, no runtime toggle. A sandbox without seccomp is not a sandbox — agents can call mount/ptrace/unshare to break all other isolation layers. If seccomp causes issues, debug with `dmesg | grep SECCOMP` and add the syscall to the whitelist, not disable the filter.
 
 **eBPF TC filter:**
 - TC filter must be attached to host-side veth BEFORE signaling child process ready. No packet escape window.
