@@ -37,6 +37,12 @@ pub async fn run_agent(
     let mode = if sandbox {
         crate::pipeline::LaunchMode::Sandbox
     } else if contained {
+        eprintln!();
+        eprintln!("  {YELLOW}\u{26a0} WARNING: --contained (Docker) is an unsupported experimental feature.{RESET}");
+        eprintln!("  {DIM}Known issues: WSL2 network instability, missing iptables in slim images,{RESET}");
+        eprintln!("  {DIM}NET_ADMIN capability abuse, Windows path failures.{RESET}");
+        eprintln!("  {DIM}Use --sandbox on Linux for production isolation.{RESET}");
+        eprintln!();
         crate::pipeline::LaunchMode::Contained {
             image: image.to_string(),
             memory: memory.to_string(),

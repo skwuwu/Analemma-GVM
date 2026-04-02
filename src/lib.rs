@@ -18,5 +18,9 @@ pub mod srr;
 pub mod tls_proxy;
 pub mod types;
 pub mod vault;
+/// Wasm policy engine — UNSUPPORTED EXPERIMENTAL FEATURE.
+/// Disabled by default. The native Rust policy engine handles all enforcement.
+/// Enabling adds ~10MB to binary + 5 wasmtime CVEs. For future third-party
+/// policy plugin scenarios only. Do not enable in production.
 #[cfg(feature = "wasm")]
 pub mod wasm_engine;

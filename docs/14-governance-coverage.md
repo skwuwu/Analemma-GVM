@@ -6,13 +6,21 @@
 
 ## Mode Overview
 
-| Mode | Command | Enforcement | Target |
-|------|---------|-------------|--------|
-| **Cooperative** | `gvm run agent.py` | Agent respects `HTTP_PROXY` | Development, any OS |
-| **Contained** | `gvm run --contained agent.py` | Docker network isolation + MITM | **Experimental** — not production-ready |
-| **Sandbox** | `gvm run --sandbox agent.py` | Kernel-level (namespace + seccomp + TC + eBPF) | Production, Linux |
+All agent execution uses `gvm run` with flags:
 
-All modes share the same SRR rules, ABAC policies, and config files. Policies built in development work identically in production.
+| Mode | Command | Enforcement | Status |
+|------|---------|-------------|--------|
+| **Observe** | `gvm run --watch agent.py` | Observation only (no blocking) | Production |
+| **Enforce** | `gvm run agent.py` | Agent respects `HTTP_PROXY` | Production |
+| **Discover** | `gvm run -i agent.py` | Enforce + suggest rules after exit | Production |
+| **Sandbox** | `gvm run --sandbox agent.py` | Kernel-level (namespace + seccomp + MITM) | Production, Linux |
+| **Contained** | `gvm run --contained agent.py` | Docker network isolation + MITM | **Unsupported** — experimental only |
+
+> **Contained mode (`--contained`)** is implemented as a proof-of-concept but is **not supported for production use**. Known issues: WSL2 network instability, iptables missing in slim images, `NET_ADMIN` capability abuse, Windows path failures. Use `--sandbox` on Linux. Contained mode may be stabilized in a future release.
+
+> **Wasm policy engine** (`--features wasm`) is disabled by default. The native Rust policy engine is used for all enforcement. Wasm support is an **unsupported experimental feature** for future third-party policy plugin scenarios. Enabling it adds ~10MB to the binary and includes 5 known wasmtime CVEs.
+
+All modes share the same SRR rules, ABAC policies, and config files.
 
 ---
 

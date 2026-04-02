@@ -105,6 +105,8 @@ Everything is `gvm run` with flags:
 
 `--sandbox` isolates the agent in Linux namespaces with seccomp-BPF, intercepts all HTTPS via MITM, and injects credentials — the agent physically cannot bypass the proxy.
 
+> **`--contained` (Docker)** and **Wasm policy engine** are unsupported experimental features. `--contained` has known stability issues (WSL2, iptables, NET_ADMIN). Wasm is disabled by default (`--features wasm`). Neither is recommended for use. [Details →](docs/14-governance-coverage.md)
+
 ### MCP (Claude Desktop / Cursor)
 
 GVM provides MCP tools for AI assistants. Claude Desktop can check policies, fetch URLs through governance, and browse audit logs — all governed by GVM.
