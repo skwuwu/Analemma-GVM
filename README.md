@@ -41,7 +41,7 @@ git clone https://github.com/skwuwu/Analemma-GVM.git && cd Analemma-GVM
 cargo build --release
 
 # Step 1: Observe — see what your agent calls
-gvm watch my_agent.py
+gvm run --watch my_agent.py
 
 # Step 2: Generate rules from what you observed
 gvm suggest --from session.jsonl --output config/srr_network.toml
@@ -92,11 +92,14 @@ Same `enforcement::classify()` function as the live proxy — check results alwa
 
 ## Isolation Modes
 
+Everything is `gvm run` with flags:
+
 | Mode | Command | HTTPS inspection | Platform |
 |------|---------|-----------------|----------|
-| **Observe** | `gvm watch agent.py` | None (observation only) | Any OS |
-| **Cooperative** | `gvm run agent.py` | Python: full. Node.js: HTTP only* | Any OS |
+| **Observe** | `gvm run --watch agent.py` | None (observation only) | Any OS |
+| **Enforce** | `gvm run agent.py` | Python: full. Node.js: HTTP only* | Any OS |
 | **Sandbox** | `gvm run --sandbox agent.py` | Full L7 (DNAT → MITM) | Linux (production) |
+| **Discover** | `gvm run -i agent.py` | Same as enforce + rule suggestions | Any OS |
 
 > \* Node.js ignores `HTTPS_PROXY`. Use `--sandbox` for Node.js agents. GVM warns when it detects Node.js in cooperative mode.
 

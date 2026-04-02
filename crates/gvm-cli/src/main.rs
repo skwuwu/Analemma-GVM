@@ -68,11 +68,12 @@ enum Commands {
 
     /// Run a command through GVM governance (proxy + audit trail).
     ///
-    /// Supports scripts and arbitrary binaries:
-    ///   gvm run agent.py                          # auto-detect interpreter
+    /// All agent execution goes through `gvm run`. Flags control behavior:
+    ///   gvm run agent.py                          # enforce rules
+    ///   gvm run --watch agent.py                  # observe only (no blocking)
+    ///   gvm run --sandbox -- openclaw gateway     # kernel isolation
+    ///   gvm run --interactive agent.py            # discover rules from live traffic
     ///   gvm run -- openclaw gateway               # arbitrary binary
-    ///   gvm run --sandbox -- openclaw gateway      # with kernel isolation
-    ///   gvm run --contained -- python agent.py     # with Docker
     Run {
         /// Command to run. Can be a script (auto-detects interpreter) or
         /// arbitrary binary args after `--` (e.g. `-- openclaw gateway`).
@@ -86,6 +87,11 @@ enum Commands {
         /// GVM proxy URL
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         proxy: String,
+
+        /// Watch mode: observe all API calls without enforcement.
+        /// Real-time stream + session summary. No rules applied unless --with-rules.
+        #[arg(long, short = 'w')]
+        watch: bool,
 
         /// Interactive mode: suggest SRR rules for unregistered URLs after the run.
         #[arg(long, short = 'i')]
@@ -114,8 +120,6 @@ enum Commands {
         cpus: String,
 
         /// Disable MITM TLS inspection. HTTPS uses CONNECT relay (domain-level only).
-        /// Sandbox/contained isolation, seccomp, WAL audit still active.
-        /// Use when: mTLS endpoints, certificate pinning, or policy prohibits MITM.
         #[arg(long)]
         no_mitm: bool,
 
@@ -123,11 +127,17 @@ enum Commands {
         #[arg(long)]
         detach: bool,
 
-        /// Override the default policy for unmatched URLs (overrides proxy.toml setting).
-        /// "delay" = allow after delay (dev), "require_approval" = hold for human (prod),
-        /// "deny" = block immediately (lockdown).
+        /// Override the default policy for unmatched URLs.
         #[arg(long)]
         default_policy: Option<String>,
+
+        /// (Watch mode) Apply existing SRR rules while observing.
+        #[arg(long)]
+        with_rules: bool,
+
+        /// (Watch mode) Output format: text (default) or json.
+        #[arg(long, default_value = "text")]
+        output: String,
     },
 
     /// Monitor and respond to pending IC-3 approval requests.
@@ -151,15 +161,8 @@ enum Commands {
         auto_deny: bool,
     },
 
-    /// Watch an agent's API calls in real-time (observation only, no enforcement).
-    ///
-    /// By default, all requests are allowed through (no blocking). Use --with-rules
-    /// to apply existing SRR rules while observing.
-    ///
-    ///   gvm watch agent.py                     # observe all API calls
-    ///   gvm watch -- node my_agent.js           # arbitrary binary
-    ///   gvm watch --with-rules agent.py         # observe with existing rules active
-    ///   gvm watch --output json agent.py        # JSON output for piping/CI
+    /// [Alias for `gvm run --watch`] Observe API calls without enforcement.
+    #[command(hide = true)]
     Watch {
         /// Command to run (same syntax as `gvm run`).
         #[arg(trailing_var_arg = true, required = true)]
@@ -448,6 +451,7 @@ async fn main() -> anyhow::Result<()> {
             command,
             agent_id,
             proxy,
+            watch,
             interactive,
             sandbox,
             contained,
@@ -457,25 +461,36 @@ async fn main() -> anyhow::Result<()> {
             cpus,
             detach,
             default_policy,
+            with_rules,
+            output,
         } => {
-            // Set env var for proxy to pick up (overrides proxy.toml default_unknown)
-            if let Some(ref policy) = default_policy {
-                std::env::set_var("GVM_DEFAULT_UNKNOWN", policy);
+            if watch {
+                // --watch mode: delegate to watch module (observation only)
+                watch::run_watch(
+                    &command, &agent_id, &proxy, with_rules, sandbox, contained, no_mitm,
+                    &image, &memory, &cpus, &output,
+                )
+                .await?;
+            } else {
+                // Normal enforcement mode
+                if let Some(ref policy) = default_policy {
+                    std::env::set_var("GVM_DEFAULT_UNKNOWN", policy);
+                }
+                run::run_agent(
+                    &command,
+                    &agent_id,
+                    &proxy,
+                    &image,
+                    &memory,
+                    &cpus,
+                    detach,
+                    contained,
+                    sandbox,
+                    interactive,
+                    no_mitm,
+                )
+                .await?;
             }
-            run::run_agent(
-                &command,
-                &agent_id,
-                &proxy,
-                &image,
-                &memory,
-                &cpus,
-                detach,
-                contained,
-                sandbox,
-                interactive,
-                no_mitm,
-            )
-            .await?;
         }
 
         Commands::Approve {
