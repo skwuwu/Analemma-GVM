@@ -17,6 +17,7 @@ use crate::seccomp::{apply_seccomp_filter, count_seccomp_violations};
 use crate::{SandboxConfig, SandboxResult};
 use anyhow::{Context, Result};
 use nix::sys::wait::{waitpid, WaitStatus};
+use std::path::PathBuf;
 
 /// Stack size for the cloned child process (2 MB).
 const CHILD_STACK_SIZE: usize = 2 * 1024 * 1024;
@@ -729,14 +730,9 @@ fn drop_all_capabilities() -> anyhow::Result<()> {
 /// Async-signal-safe: only writes to an atomic bool.
 /// The waitpid polling loop checks this flag every 200ms.
 extern "C" fn sigterm_flag_handler(_sig: libc::c_int) {
-    use std::sync::atomic::Ordering;
-    // Access the static defined in launch(). Since it's a static AtomicBool,
-    // this is safe from a signal handler.
-    unsafe {
-        // Re-declare the same static as in launch() — Rust statics are global.
-        // We use a module-level static instead to avoid this issue.
-    }
-    SIGTERM_FLAG.store(true, Ordering::Relaxed);
+    // Async-signal-safe: AtomicBool::store with Relaxed is safe from signal handlers.
+    // SIGTERM_FLAG is a module-level static checked by the waitpid polling loop.
+    SIGTERM_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Global SIGTERM flag — checked by sandbox waitpid loop.
