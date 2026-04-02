@@ -1924,7 +1924,11 @@ async fn handle_connect_inner(
             {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
-                    tracing::debug!(host = %host_owned, error = %e, "CONNECT MITM: TLS handshake failed");
+                    tracing::warn!(
+                        host = %host_owned, error = %e,
+                        "CONNECT MITM: TLS handshake failed — agent may use certificate pinning. \
+                         Try --no-mitm for CONNECT relay (domain-level governance only)."
+                    );
                     return;
                 }
                 Err(_) => {

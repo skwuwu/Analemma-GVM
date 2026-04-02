@@ -159,33 +159,24 @@ The demo runs 4 pre-scripted actions through the real proxy — read inbox (Allo
 
 ---
 
-## 6. Add the SDK (Optional — Unlocks Layer 1)
+## 6. Add the SDK (Experimental)
 
-**The proxy enforces governance without the SDK.** The SDK adds richer policy evaluation and checkpoint/rollback.
+> **The proxy enforces governance without the SDK.** URL blocking, credential injection, and audit trail all work at full strength with zero code changes. The SDK is an experimental add-on — not required for production governance.
+
+The SDK adds intent verification (`@ic` decorator) and checkpoint/rollback. These features are **not yet stabilized** — the proxy-only path is the recommended approach.
 
 ```python
-from gvm import GVMAgent, ic, Resource
+from gvm import ic, gvm_session
 
-class MyAgent(GVMAgent):
-    auto_checkpoint = "ic2+"    # Auto-save state before risky operations
-
-    @ic(operation="gvm.payment.charge",
-        resource=Resource(service="bank", tier="external", sensitivity="critical"))
-    def wire_transfer(self, to: str, amount: float):
-        session = self.create_session()
-        return session.post("http://api.bank.com/transfer/123",
-                           json={"to": to, "amount": amount}).json()
-
-agent = MyAgent(agent_id="finance-001")
-agent.wire_transfer("account-123", 50000.00)
-# → Denied by proxy. State auto-rolled back to last checkpoint.
-# → Agent resumes from safe state, not from scratch.
+@ic(operation="gvm.messaging.send")
+def send_email(to, subject, body):
+    return gvm_session().post("http://gmail.googleapis.com/...", json={...}).json()
 ```
 
 **Without SDK vs. With SDK:**
 
-- Without: URL blocking, key injection, audit trail — **all work at full strength**
-- With: + semantic policy (per-agent, per-tenant), + checkpoint/rollback, + 42% token savings on deny
+- Without: URL blocking, key injection, audit trail — **all work at full strength (recommended)**
+- With: + semantic intent verification, + checkpoint/rollback (experimental), + token savings on deny
 
 ```bash
 pip install -e sdk/python       # Install once

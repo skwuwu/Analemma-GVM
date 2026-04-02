@@ -152,9 +152,9 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
             tracing::debug!(error = %e, "Failed to record sandbox state (orphan cleanup unavailable)");
         }
     }
-    // 2.5. Attach eBPF TC ingress filter on host-side veth (unbypassable enforcement)
+    // 2.5. Attach TC ingress filter on host-side veth (unbypassable enforcement)
     //      This runs BEFORE signaling the child, so enforcement is active from first packet.
-    //      If eBPF is unavailable, iptables provides baseline enforcement and
+    //      If TC filter is unavailable, iptables provides baseline enforcement and
     //      seccomp AF_NETLINK blocking prevents iptables modification (defense-in-depth).
     // RAII guard: dropping this detaches the TC filter. Kept alive for sandbox duration.
     let _ebpf_guard = if network_result.is_ok() {
@@ -170,14 +170,14 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
             EbpfAttachResult::Attached { interface, guard } => {
                 tracing::info!(
                     interface = %interface,
-                    "eBPF TC filter ACTIVE — unbypassable proxy enforcement"
+                    "TC ingress filter ACTIVE — unbypassable proxy enforcement"
                 );
                 Some(guard)
             }
             EbpfAttachResult::Unavailable { reason } => {
                 tracing::warn!(
                     reason = %reason,
-                    "eBPF TC filter unavailable — using iptables with seccomp defense-in-depth"
+                    "TC ingress filter unavailable — using iptables with seccomp defense-in-depth"
                 );
                 None
             }
@@ -486,7 +486,7 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     nix::mount::umount(&staging_ws).ok();
     std::fs::remove_dir(&staging_ws).ok();
 
-    // Drop eBPF guard first — this detaches the TC filter via RAII Drop.
+    // Drop TC filter guard first — this detaches the filter via RAII Drop.
     // Must happen before cleanup_host_network which deletes the veth interface.
     drop(_ebpf_guard);
 

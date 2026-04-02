@@ -112,7 +112,7 @@ For stronger isolation, use `--sandbox`.
 
 ## Mode 3: Sandbox (`gvm run --sandbox`)
 
-The agent runs in isolated Linux namespaces (user, PID, mount, network) with seccomp-BPF syscall filtering, eBPF TC network enforcement, and overlayfs filesystem governance. This is the **production security boundary**.
+The agent runs in isolated Linux namespaces (user, PID, mount, network) with seccomp-BPF syscall filtering, TC ingress filter network enforcement (kernel-level, unbypassable), and overlayfs filesystem governance. This is the **production security boundary**.
 
 **Resource lifecycle**: Each sandbox writes a per-PID state file (`/tmp/gvm-sandbox-{pid}.state`) listing all created resources (veth, iptables rules, mounts, cgroups). On normal exit, cleanup + delete. On crash, the next `gvm run --sandbox` auto-cleans orphaned resources. Manual cleanup: `gvm cleanup`.
 
@@ -135,7 +135,7 @@ The agent runs in isolated Linux namespaces (user, PID, mount, network) with sec
 | Netlink (iptables modification) | **Blocked** | seccomp KILL + capabilities dropped |
 
 **Defense layers (from outermost):**
-1. **eBPF TC filter** on host-side veth — kernel-level, agent cannot touch
+1. **TC ingress filter** on host-side veth (tc u32 classifier) — kernel-level, agent cannot touch
 2. **iptables OUTPUT chain** — proxy TCP + DNS UDP only, all else DROP
 3. **seccomp-BPF** — AF_NETLINK/AF_PACKET killed, prevents firewall modification
 4. **Capability drop** — all capabilities removed after setup

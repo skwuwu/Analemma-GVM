@@ -1,6 +1,10 @@
-//! eBPF TC egress filter for unbypassable proxy enforcement.
+//! TC ingress filter for unbypassable proxy enforcement.
 //!
-//! Attaches a TC (Traffic Control) classifier to the HOST-side veth interface.
+//! Historically named `ebpf.rs` — the implementation uses **tc u32 classifiers**,
+//! not actual eBPF bytecode. No BPF verifier, clang/LLVM, or bpf() syscall involved.
+//! File retained as `ebpf.rs` to avoid breaking the import chain across the crate.
+//!
+//! Attaches a TC (Traffic Control) u32 classifier to the HOST-side veth interface.
 //! This filter runs in the host's network namespace, completely outside the
 //! agent's control — even with CAP_NET_ADMIN inside a user namespace, the
 //! agent cannot detach or modify programs on host-side interfaces.
@@ -12,10 +16,9 @@
 //!
 //! All other traffic is dropped at the kernel level (TC_ACT_SHOT).
 //!
-//! Fallback: if eBPF is unavailable (kernel < 4.15, missing bpf() capability,
-//! or no clsact qdisc support), the system falls back to iptables-only mode
-//! with a warning. The seccomp AF_NETLINK restriction provides defense-in-depth
-//! in this case.
+//! Fallback: if TC filter is unavailable (kernel < 4.15 or no clsact qdisc
+//! support), the system falls back to iptables-only mode with a warning.
+//! The seccomp AF_NETLINK restriction provides defense-in-depth in this case.
 //!
 //! Architecture:
 //! ```text
@@ -23,7 +26,7 @@
 //!   ┌──────────┐              ┌──────────────────────┐
 //!   │ veth-sb  │──────────────│ veth-host            │
 //!   │          │              │   ↓                  │
-//!   │ (any     │              │ [TC ingress eBPF]    │
+//!   │ (any     │              │ [TC ingress filter]  │
 //!   │  traffic)│              │   ↓ PASS/DROP        │
 //!   └──────────┘              │ [iptables NAT]       │
 //!                             │   ↓                  │
@@ -35,13 +38,13 @@ use anyhow::{Context, Result};
 use std::net::Ipv4Addr;
 use std::process::Command;
 
-/// Minimum kernel version for TC eBPF clsact support.
+/// Minimum kernel version for TC clsact qdisc support.
 const MIN_KERNEL_MAJOR: u32 = 4;
 const MIN_KERNEL_MINOR: u32 = 15;
 
-/// Result of eBPF attachment attempt.
+/// Result of TC filter attachment attempt.
 pub enum EbpfAttachResult {
-    /// eBPF TC filter attached successfully. Holds a guard that detaches on drop.
+    /// TC filter attached successfully. Holds a guard that detaches on drop.
     /// Caller must keep the guard alive for the sandbox duration and drop it on cleanup.
     Attached {
         /// Interface name the filter is attached to.
@@ -49,14 +52,14 @@ pub enum EbpfAttachResult {
         /// RAII guard — dropping this detaches the TC filter.
         guard: EbpfGuard,
     },
-    /// eBPF is unavailable; system should use iptables fallback.
+    /// TC filter is unavailable; system should use iptables fallback.
     Unavailable {
-        /// Reason eBPF could not be used.
+        /// Reason TC filter could not be used.
         reason: String,
     },
 }
 
-/// eBPF guard that detaches the filter on drop.
+/// TC filter guard that detaches the filter on drop.
 pub struct EbpfGuard {
     interface: String,
 }
@@ -67,7 +70,7 @@ impl Drop for EbpfGuard {
     }
 }
 
-/// Check if the current system supports eBPF TC filters.
+/// Check if the current system supports TC clsact filters.
 pub fn check_ebpf_support() -> Result<(), String> {
     // 1. Check kernel version
     let (major, minor) =
@@ -93,15 +96,11 @@ pub fn check_ebpf_support() -> Result<(), String> {
     Ok(())
 }
 
-/// Attach a TC eBPF egress filter to the host-side veth interface.
+/// Attach a TC u32 ingress filter to the host-side veth interface.
 ///
 /// Uses `tc` command to:
 /// 1. Add a clsact qdisc to the interface
-/// 2. Attach a BPF program as an ingress filter (ingress = traffic FROM sandbox)
-///
-/// Since we cannot embed a compiled eBPF .o in a cross-platform build,
-/// we use tc's built-in BPF bytecode mode with a hand-assembled filter
-/// that matches the logic of gvm_tc_filter.bpf.c.
+/// 2. Attach u32 match rules as an ingress filter (ingress = traffic FROM sandbox)
 ///
 /// Returns an EbpfGuard that removes the filter on drop.
 pub fn attach_tc_filter(interface: &str, proxy_ip: Ipv4Addr, proxy_port: u16) -> Result<EbpfGuard> {
@@ -121,9 +120,9 @@ pub fn attach_tc_filter(interface: &str, proxy_ip: Ipv4Addr, proxy_port: u16) ->
 
     // 2. Build and attach the BPF bytecode filter
     //
-    // We use tc u32 match filters as a portable alternative to compiled eBPF objects.
-    // This achieves the same kernel-level filtering without requiring clang/llvm
-    // or a pre-compiled .o file, while remaining on the HOST-side veth (unbypassable).
+    // tc u32 match filters provide kernel-level filtering without requiring
+    // clang/llvm or pre-compiled BPF objects, while remaining on the HOST-side
+    // veth (unbypassable by the agent).
     //
     // The filter structure:
     //   Priority 1: Allow TCP to proxy_ip:proxy_port
@@ -232,7 +231,7 @@ pub fn attach_tc_filter(interface: &str, proxy_ip: Ipv4Addr, proxy_port: u16) ->
     })
 }
 
-/// Attempt to attach eBPF filter, returning Unavailable on failure instead of error.
+/// Attempt to attach TC filter, returning Unavailable on failure instead of error.
 pub fn try_attach_tc_filter(
     interface: &str,
     proxy_ip: Ipv4Addr,

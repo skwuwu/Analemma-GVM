@@ -164,6 +164,39 @@ Output: decision, matched rule, decision path, engine latency. Use in CI to vali
 
 ## Level 3: Enterprise — Isolation and Compliance
 
+### Pre-flight Check
+
+Before using sandbox mode for the first time, verify your environment:
+
+```bash
+gvm preflight
+```
+
+Shows which kernel features, tools, and configs are available, and which GVM modes your machine supports. Example output on Linux:
+
+```
+  Environment Check
+
+  ✓ Proxy config              config/proxy.toml
+  ✓ SRR rules                 47 rules loaded
+  ✓ Credentials               3 hosts configured
+  ✓ User namespaces           enabled
+  ✓ seccomp-BPF               supported
+  ✓ CAP_NET_ADMIN             available (run with sudo)
+  ✓ iptables                  /usr/sbin/iptables
+  ✗ TC ingress filter         unavailable (iptables fallback active)
+
+  Available Modes
+  ✓ cooperative               gvm run agent.py
+  ✓ sandbox                   sudo gvm run --sandbox agent.py
+  ✓ sandbox + MITM            sudo gvm run --sandbox agent.py (HTTPS L7 inspection)
+  ✗ sandbox + TC filter       kernel upgrade needed (iptables fallback active)
+  ✓ watch                     gvm watch agent.py
+  ✓ MCP                       gvm_fetch / gvm_check tools
+```
+
+On non-Linux (Windows/macOS), sandbox modes show as unavailable — use cooperative mode instead.
+
 ### Sandbox Mode
 
 ```bash
@@ -181,9 +214,11 @@ Agent runs in an isolated environment where it cannot bypass the proxy. Linux on
 
 > **Note:** Node.js ignores `HTTPS_PROXY`. Sandbox mode solves this — all HTTPS is intercepted regardless of the agent's behavior.
 
-### ABAC Policies (`config/policies/`)
+### ABAC Policies (`config/policies/`) — Experimental
 
-Semantic rules evaluated with the SDK (`@ic` decorator). Goes beyond URL matching — evaluates operation type, data sensitivity, and agent identity.
+> Requires the Python SDK (`@ic` decorator), which is experimental. ABAC policies are evaluated only when the SDK injects operation metadata. For most use cases, SRR rules (Level 2) are sufficient.
+
+Semantic rules that go beyond URL matching — evaluates operation type, data sensitivity, and agent identity.
 
 ```toml
 # config/policies/global.toml
@@ -272,6 +307,7 @@ sudo gvm run --sandbox ...       # Sandbox needs sudo
 | `gvm events list` | Query audit trail |
 | `gvm audit verify` | Check WAL integrity |
 | `gvm stats tokens` | Token usage per agent |
+| `gvm preflight` | Check environment and available modes |
 | `gvm cleanup` | Remove orphaned sandbox resources |
 | `gvm init --industry I` | Initialize config templates |
 

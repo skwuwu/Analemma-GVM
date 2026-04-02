@@ -1,12 +1,14 @@
-# Part 7: Python SDK
+# Part 7: Python SDK (Experimental)
 
 **Source**: `sdk/python/gvm/`
+
+> **Experimental**: The Python SDK is not yet stabilized. Checkpoint/rollback, `GVMAgent`, and `@ic` decorator APIs may change. **GVM's core value is zero-code-change governance** — the proxy alone provides URL rules, credential injection, and audit trail without any SDK. Use the SDK only if you need intent verification or checkpoint/rollback, and expect breaking changes.
 
 ---
 
 ## 7.1 Overview
 
-The Python SDK provides an interface for AI agents to operate under GVM governance. **No inheritance required** — add `@ic()` decorator to functions and use `gvm_session()` for HTTP requests. For advanced features (checkpoint, rollback, encrypted state), optionally extend `GVMAgent`.
+The Python SDK provides an experimental interface for AI agents to operate under GVM governance. **No inheritance required** — add `@ic()` decorator to functions and use `gvm_session()` for HTTP requests. For advanced features (checkpoint, rollback, encrypted state), optionally extend `GVMAgent`.
 
 **Design principle**: Adding GVM to an existing agent requires `import` + `@ic` + `gvm_session()`. No class restructuring, no framework lock-in.
 
@@ -320,9 +322,11 @@ Demonstrates the full IC classification pipeline:
 
 ---
 
-## 7.10 Checkpoint/Rollback
+## 7.10 Checkpoint/Rollback (Experimental)
 
-The SDK provides automatic state checkpoint and rollback for IC-2+ operations. This is the primary value-add over proxy-only (Level 0) enforcement.
+> **Experimental**: Checkpoint/rollback is not stabilized. The API, storage format, and Merkle verification behavior may change. For production governance, the proxy-only path (URL rules + credential injection + audit trail) is recommended.
+
+The SDK provides automatic state checkpoint and rollback for IC-2+ operations.
 
 ### Auto-Checkpoint Modes
 

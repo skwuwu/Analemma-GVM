@@ -13,7 +13,7 @@ Agent (any framework) → GVM Proxy → External APIs
 
 Single binary (~17MB). Single process. Zero code changes required.
 
-**Status**: v0.4 pre-release. [Security Model →](docs/11-security-model.md) | [30-min chaos stress test PASS](docs/09-test-report.md#910-chaos-stress-test-30-minutes)
+**Status**: v0.4 pre-release. [Security Model →](docs/11-security-model.md) | [60-min chaos stress test PASS](docs/09-test-report.md#910-chaos-stress-test-60-minutes)
 
 ---
 
@@ -115,11 +115,11 @@ GVM provides MCP tools for AI assistants. Claude Desktop can check policies, fet
 
 ---
 
-## SDK (optional, zero required)
+## SDK (experimental, zero required)
 
-**Tier 1** — proxy only, no code changes: URL rules, credential injection, full audit trail.
+**The core value of GVM is zero-code-change governance.** The proxy alone provides URL rules, credential injection, and a full audit trail — no SDK needed.
 
-**Tier 2** — add Python SDK for intent verification:
+The Python SDK is an **experimental** add-on for intent verification and checkpoint/rollback. These features are not yet stabilized and may change.
 
 ```python
 from gvm import ic, gvm_session
@@ -130,6 +130,8 @@ def send_email(to, subject, body):
 ```
 
 The proxy cross-checks what the agent *says* it's doing (`@ic`) against what it *actually* requests (URL). `max_strict()` catches the mismatch. Works with CrewAI, AutoGen, LangChain, plain Python.
+
+> **Status**: SDK features (checkpoint/rollback, `GVMAgent`, `@ic` decorator) are experimental. The proxy-only path is the stable, recommended approach.
 
 ---
 

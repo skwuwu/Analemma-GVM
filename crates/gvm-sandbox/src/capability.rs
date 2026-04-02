@@ -66,10 +66,10 @@ pub fn check(config: &SandboxConfig) -> PreflightReport {
         );
     }
 
-    let ebpf_available = crate::ebpf::check_ebpf_support().is_ok();
-    if !ebpf_available {
+    let tc_filter_available = crate::ebpf::check_ebpf_support().is_ok();
+    if !tc_filter_available {
         issues.push(
-            "eBPF TC filter unavailable — falling back to iptables \
+            "TC ingress filter unavailable — falling back to iptables \
              (seccomp AF_NETLINK blocking provides defense-in-depth)."
                 .to_string(),
         );
@@ -118,7 +118,7 @@ pub fn check(config: &SandboxConfig) -> PreflightReport {
         ip_command_available,
         iptables_command_available,
         interpreter_found,
-        ebpf_available,
+        tc_filter_available,
         issues,
     }
 }

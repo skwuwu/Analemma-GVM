@@ -174,10 +174,10 @@ Sandbox isolation is only as strong as its weakest mount/seccomp configuration.
 - `openat()` argument filtering: seccomp cannot enforce path boundaries (kernel limitation). Rely on mount namespace for path isolation. Do not add false-confidence seccomp path filters.
 - **seccomp must NEVER be disableable.** No `--seccomp off` flag, no `GVM_DEBUG_SECCOMP_DISABLE` env var, no runtime toggle. A sandbox without seccomp is not a sandbox — agents can call mount/ptrace/unshare to break all other isolation layers. If seccomp causes issues, debug with `dmesg | grep SECCOMP` and add the syscall to the whitelist, not disable the filter.
 
-**eBPF TC filter:**
+**TC ingress filter** (implemented as tc u32 classifier in `ebpf.rs`)**:**
 - TC filter must be attached to host-side veth BEFORE signaling child process ready. No packet escape window.
 - Use RAII guard (`EbpfGuard`) for filter lifecycle. Drop detaches the filter. Never use `mem::forget`.
-- If eBPF is unavailable, fall back to iptables + seccomp AF_NETLINK blocking (defense-in-depth).
+- If TC filter is unavailable, fall back to iptables + seccomp AF_NETLINK blocking (defense-in-depth).
 
 **Certificate MITM:**
 - CA private key must NEVER enter the sandbox namespace (not on disk, not in env, not in /proc)

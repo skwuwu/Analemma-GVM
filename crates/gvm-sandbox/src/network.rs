@@ -16,7 +16,7 @@
 //!   ┌──────────────────┐      ┌──────────┐
 //!   │ veth-host        │──────│ veth-sb  │
 //!   │  ↓ TC ingress    │      │ 10.200.  │
-//!   │  ↓ eBPF filter   │      │ X.2/30   │
+//!   │  ↓ u32 filter    │      │ X.2/30   │
 //!   │ 10.200.X.1/30    │      └──────────┘
 //!   └────┬─────────────┘        OUTPUT:
 //!        │ DNAT                  proxy → ACCEPT
@@ -853,7 +853,7 @@ fn cleanup_state_resources(state: &SandboxState) {
         }
     }
 
-    // 3. Clean up network (veth + iptables + eBPF)
+    // 3. Clean up network (veth + iptables + TC filter)
     let veth_exists = Command::new("ip")
         .args(["link", "show", &state.veth_host])
         .output()

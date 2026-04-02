@@ -146,20 +146,20 @@ See [Part 8: Memory & Runtime Security](08-memory-security.md) for full analysis
 
 ---
 
-## Test Coverage: 367+ Tests
+## Test Coverage: 329 Tests (322 passing)
 
-| Category | Count | Source |
-|----------|-------|--------|
-| Core unit (SRR, Policy, Vault, Registry, Merkle, Wasm, LLM Trace, Proxy, Auth, IntentStore, TLS) | 137 | `src/*.rs` (embedded `#[cfg(test)]` modules) |
-| Integration (E2E) | 12 | `tests/integration.rs` |
-| Boundary | 32 | `tests/boundary.rs` |
-| Edge Cases | 17 | `tests/edge_cases.rs` |
-| Hostile Environment | 28 | `tests/hostile.rs` |
-| Stress | 12 | `tests/stress.rs` |
-| Merkle Tree | 12 | `tests/merkle.rs` |
-| Engine (gvm-engine) | 7 | `crates/gvm-engine/` |
-| CLI unit & integration (gvm-cli) | 18 | `crates/gvm-cli/` (14 unit + 4 integration) |
-| Sandbox (CA, eBPF, TLS probe, security) | 30 | `crates/gvm-sandbox/` |
-| **Total** | **305** | All passing |
+| Category | Count | Status | Source |
+|----------|-------|--------|--------|
+| Core unit (SRR, Policy, Vault, Registry, Merkle, Wasm, LLM Trace, Proxy, Auth, IntentStore, TLS) | 147 | PASS | `src/*.rs` |
+| Integration (E2E) | 26 | PASS | `tests/integration.rs` |
+| Boundary (cross-boundary security) | 25 | PASS | `tests/boundary.rs` (+7 wasm-gated) |
+| Hostile Environment | 28 | PASS | `tests/hostile.rs` |
+| Adversarial Infrastructure | 18 | PASS | `tests/adversarial_infra.rs` |
+| Edge Cases | 17 | PASS | `tests/edge_cases.rs` |
+| Stress | 12 | PASS | `tests/stress.rs` |
+| Merkle Tree | 12 | PASS | `tests/merkle.rs` |
+| GVM Engine (Wasm policy evaluation) | 7 | PASS | `crates/gvm-engine/` |
+| Sandbox (CA, TC filter, TLS probe, security, preflight) | 30 | PASS | `crates/gvm-sandbox/` |
+| **Passing Total** | **322** | | Verified 2026-04-03 |
 
-All tests pass. Zero failures.
+7 additional Wasm boundary tests available with `--features wasm`. EC2 E2E: 75 scenarios. Chaos stress test: 60-minute run, all pass.

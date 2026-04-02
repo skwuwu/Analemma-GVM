@@ -70,6 +70,17 @@ impl CgroupGuard {
             } else {
                 tracing::info!(limit_mb = bytes / (1024 * 1024), "cgroup: memory.max set");
             }
+
+            // Enable OOM group kill: when OOM triggers, kill ALL processes in
+            // the cgroup atomically. Without this, OOM killer picks individual
+            // processes and forked children may survive — escaping governance.
+            let oom_group = cgroup_path.join("memory.oom.group");
+            if let Err(e) = fs::write(&oom_group, "1") {
+                tracing::debug!(
+                    error = %e,
+                    "Failed to set memory.oom.group (kernel < 4.19?) — individual OOM kill"
+                );
+            }
         }
 
         // Set CPU limit

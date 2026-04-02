@@ -7,6 +7,7 @@ mod demo;
 mod events;
 mod init;
 mod pipeline;
+mod preflight;
 mod proxy_manager;
 mod run;
 mod stats;
@@ -237,6 +238,19 @@ enum Commands {
         /// Show what would be cleaned without actually cleaning.
         #[arg(long)]
         dry_run: bool,
+    },
+
+    /// Check environment capabilities and available execution modes.
+    ///
+    /// Verifies kernel features, tools, and config files, then shows which
+    /// GVM modes (cooperative, sandbox, watch, MCP) are available on this machine.
+    ///
+    ///   gvm preflight
+    ///   gvm preflight --config-dir /etc/gvm
+    Preflight {
+        /// Config directory to check (default: config/)
+        #[arg(long, default_value = "config")]
+        config_dir: String,
     },
 
     /// Generate SRR rules from watch session JSON log.
@@ -604,6 +618,10 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+
+        Commands::Preflight { config_dir } => {
+            preflight::run_preflight(&config_dir);
         }
 
         Commands::Suggest {

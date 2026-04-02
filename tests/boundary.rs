@@ -18,10 +18,12 @@ use std::sync::Arc;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // 1. Wasm <-> Rust Host Boundary
+//    Requires --features wasm (gvm-engine is an optional dependency)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // ── 1.1 Wasm engine native fallback: unknown decision string defaults to Delay (fail-close) ──
 
+#[cfg(feature = "wasm")]
 #[test]
 fn wasm_invalid_decision_string_maps_to_delay() {
     use gvm_proxy::wasm_engine::WasmEngine;
@@ -46,6 +48,7 @@ fn wasm_invalid_decision_string_maps_to_delay() {
 
 // ── 1.2 Wasm engine: malformed EvalResponse JSON handled gracefully ──
 
+#[cfg(feature = "wasm")]
 #[test]
 fn wasm_malformed_response_does_not_crash() {
     // Test that evaluate_json handles garbage input without panic
@@ -77,6 +80,7 @@ fn wasm_malformed_response_does_not_crash() {
 
 // ── 1.3 Wasm engine: oversized input serialization ──
 
+#[cfg(feature = "wasm")]
 #[test]
 fn wasm_oversized_input_handled_gracefully() {
     // 1MB operation name — should not crash or OOM
@@ -114,6 +118,7 @@ fn wasm_oversized_input_handled_gracefully() {
 
 // ── 1.4 Wasm engine: unicode boundary in operation names ──
 
+#[cfg(feature = "wasm")]
 #[test]
 fn wasm_unicode_boundary_operation_names() {
     let unicode_operations = vec![
@@ -155,6 +160,7 @@ fn wasm_unicode_boundary_operation_names() {
 
 // ── 1.5 Wasm engine: null in JSON string fields ──
 
+#[cfg(feature = "wasm")]
 #[test]
 fn wasm_null_bytes_in_string_fields() {
     let req = gvm_engine::EvalRequest {
@@ -197,6 +203,7 @@ fn wasm_null_bytes_in_string_fields() {
 
 // ── 1.6 Wasm engine: all decision types roundtrip correctly ──
 
+#[cfg(feature = "wasm")]
 #[test]
 fn wasm_all_decision_types_roundtrip() {
     use gvm_proxy::wasm_engine::WasmEngine;
@@ -243,6 +250,7 @@ fn wasm_all_decision_types_roundtrip() {
 
 // ── 1.7 Wasm engine: concurrent evaluations do not corrupt state ──
 
+#[cfg(feature = "wasm")]
 #[tokio::test]
 async fn wasm_concurrent_native_evaluations_no_corruption() {
     use gvm_proxy::wasm_engine::WasmEngine;

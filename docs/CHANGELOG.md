@@ -10,7 +10,7 @@
 
 ### Current (v1.0 MVP)
 
-HTTP enforcement proxy (Rust/axum/tower) with 3-layer architecture (ABAC + SRR + API key isolation), IC classification (Allow/Delay/RequireApproval/Deny), Merkle tree audit ledger with WAL group commit, AES-256-GCM encrypted state cache, Wasm runtime (optional, behind `--features wasm`), rate limiter, JWT agent identity, eBPF TC ingress filter, seccomp BPF sandbox with dual filter stacking. Python SDK with `@ic` decorators, checkpoint/rollback with Merkle verification, LangChain integration. 367+ tests, 19 benchmarks, 0 failures.
+HTTP enforcement proxy (Rust/axum/tower) with 3-layer architecture (ABAC + SRR + API key isolation), IC classification (Allow/Delay/RequireApproval/Deny), Merkle tree audit ledger with WAL group commit, AES-256-GCM encrypted state cache, Wasm runtime (optional, behind `--features wasm`), rate limiter, JWT agent identity, TC ingress filter (kernel-level proxy enforcement), seccomp BPF sandbox with dual filter stacking. Python SDK (experimental) with `@ic` decorators, checkpoint/rollback with Merkle verification, LangChain integration. 329 tests (322 passing + 7 wasm-gated), 19 benchmarks.
 
 v0.2 shipped: Shadow Mode + intent store, CONNECT tunnel, SRR hot-reload, eBPF uprobe TLS capture, transparent MITM (ephemeral CA, DNAT, per-domain leaf certs), `gvm run` binary mode, MCP integration, Telegram/Discord rulesets.
 
@@ -54,6 +54,22 @@ v0.2 shipped: Shadow Mode + intent store, CONNECT tunnel, SRR hot-reload, eBPF u
 ---
 
 ## Implementation Log
+
+### 2026-04-03: Security audit fixes + naming correction
+
+**eBPF → TC filter naming**: Renamed all user-facing references from "eBPF TC filter" to "TC ingress filter". The implementation uses `tc u32` classifiers, not eBPF bytecode — the old naming misrepresented the enforcement mechanism. `PreflightReport.ebpf_available` → `tc_filter_available`. File `ebpf.rs` retained to avoid import chain breakage; header comment explains the naming.
+
+**Cgroup OOM group kill** (`cgroup.rs`): Added `memory.oom.group = 1` when memory limits are configured. Without this, OOM killer selects individual processes — forked agent children could survive and escape governance. With group kill, the entire cgroup is terminated atomically.
+
+**TLS certificate pinning hint** (`main.rs`, `proxy.rs`): TLS handshake failures now log a warning suggesting `--no-mitm` when the agent may be using certificate pinning. Previously these were silent `debug!` logs.
+
+Files: `crates/gvm-sandbox/src/{ebpf,cgroup,capability,sandbox_impl,network,lib}.rs`, `crates/gvm-cli/src/preflight.rs`, `crates/gvm-sandbox/tests/security.rs`, `src/{main,proxy}.rs`, `docs/{14-governance-coverage,15-user-guide,GVM_CODE_STANDARDS}.md` | Risk: Low (naming + defensive hardening)
+
+### 2026-04-03: `gvm preflight` CLI command
+
+**New command**: `gvm preflight` checks environment capabilities and maps results to available execution modes. Runs `capability::check()` (Linux) or platform stub (non-Linux), plus config file detection (proxy.toml, srr_network.toml, secrets.toml). Output shows per-item pass/fail + "Available Modes" section so users know what they can run before attempting `--sandbox`.
+
+**Files**: `crates/gvm-cli/src/preflight.rs` (new), `crates/gvm-cli/src/main.rs` (Preflight command variant), `docs/15-user-guide.md` (pre-flight section + CLI reference).
 
 ### 2026-04-01: Agent Launch Pipeline + Proxy Lifecycle Manager
 

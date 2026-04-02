@@ -2,10 +2,10 @@
 //!
 //! Tests verify that:
 //! 1. seccomp AF_NETLINK blocking is correctly configured
-//! 2. eBPF TC filter configuration is correct
-//! 3. Fallback behavior works when eBPF is unavailable
+//! 2. TC ingress filter configuration is correct
+//! 3. Fallback behavior works when TC filter is unavailable
 //! 4. VethConfig generates correct addresses
-//! 5. PreflightReport includes eBPF availability
+//! 5. PreflightReport includes TC filter availability
 //!
 //! Note: Tests that require actual Linux namespaces or seccomp enforcement
 //! are marked with #[cfg(target_os = "linux")]. Cross-platform tests verify
@@ -84,7 +84,7 @@ fn veth_config_host_and_sandbox_in_same_subnet() {
 // ─── PreflightReport tests ───
 
 #[test]
-fn preflight_report_non_linux_has_ebpf_false() {
+fn preflight_report_non_linux_has_tc_filter_false() {
     // On non-Linux (including Windows CI), preflight returns all false
     #[cfg(not(target_os = "linux"))]
     {
@@ -105,8 +105,8 @@ fn preflight_report_non_linux_has_ebpf_false() {
         };
         let report = preflight_check(&config);
         assert!(
-            !report.ebpf_available,
-            "eBPF must be unavailable on non-Linux"
+            !report.tc_filter_available,
+            "TC filter must be unavailable on non-Linux"
         );
         assert!(!report.user_namespaces);
         assert!(!report.seccomp_available);
@@ -136,7 +136,7 @@ fn sandbox_config_clone() {
     assert_eq!(cloned.proxy_addr, config.proxy_addr);
 }
 
-// ─── eBPF module tests ───
+// ─── TC filter module tests (historically named ebpf.rs, uses tc u32 classifier) ───
 
 #[cfg(target_os = "linux")]
 mod ebpf_tests {
@@ -167,14 +167,14 @@ mod ebpf_tests {
             std::net::Ipv4Addr::new(10, 200, 0, 1),
             8080,
         );
-        // Either Unavailable (no eBPF support) or the attach will fail
+        // Either Unavailable (no TC filter support) or the attach will fail
         // Either way, it must NOT panic
         match result {
             EbpfAttachResult::Attached { .. } => {
                 detach_tc_filter("nonexistent-iface-12345");
                 panic!(
                     "TC filter attached to non-existent interface — this should never happen \
-                     and indicates a bug in the eBPF attachment logic"
+                     and indicates a bug in the TC filter attachment logic"
                 );
             }
             EbpfAttachResult::Unavailable { reason } => {
