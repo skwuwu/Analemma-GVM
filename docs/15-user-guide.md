@@ -1,82 +1,91 @@
 # GVM User Guide
 
----
+## Quick Start — 3 Steps
 
-## 1. Running Agents
-
-### Cooperative Mode
+You don't need to write rules. GVM learns from your agent's traffic and suggests them.
 
 ```bash
-gvm run my_agent.py                    # Python script
-gvm run -- node my_agent.js            # Node.js binary
-gvm run -- openclaw gateway            # Any binary + args
+# 1. Watch — see what your agent calls (no rules needed)
+gvm watch my_agent.py
+
+# 2. Suggest — auto-generate rules from observed traffic
+gvm suggest --from session.jsonl > config/srr_network.toml
+
+# 3. Run — enforce the generated rules
+gvm run my_agent.py
 ```
 
-Routes agent HTTP traffic through the governance proxy. No code changes needed.
+That's the entire workflow. Everything below is optional — use it when you need it.
 
-**Output:**
+---
+
+## Level 1: Basic — Run and Watch
+
+### `gvm run`
+
+```bash
+gvm run my_agent.py                    # Python
+gvm run -- node my_agent.js            # Node.js
+gvm run -- openclaw gateway            # Any binary
 ```
-  Agent ID:     agent-001
-  Security layers active:
-    ✓ Layer 2: Enforcement Proxy
-    ○ Layer 3: OS Containment (add --sandbox)
 
-  --- Agent output below ---
-  [agent runs here]
-
-  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Output:
+```
   GVM Audit Trail — 5 events
-  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     ✓ Allow    GET  api.github.com
     ⏱ Delay    POST slack.com
     ✗ Deny     POST api.bank.com
-
   3 allowed  1 delayed  1 blocked
 ```
 
-> **Note:** Node.js ignores `HTTPS_PROXY`. Use `--sandbox` for HTTPS visibility.
+If a URL has no matching rule, GVM applies **Default-to-Caution**: delays the request 300ms and logs it. Nothing is silently allowed.
 
-### Sandbox Mode
-
-```bash
-sudo gvm run --sandbox my_agent.py
-```
-
-Runs the agent in an isolated environment where it cannot bypass the proxy. Linux only, requires sudo.
+### `gvm watch`
 
 ```bash
---sandbox-timeout 300       # Kill after 5 minutes (default: 3600)
---no-mitm                   # Disable HTTPS inspection
---memory 256m               # Memory limit
---cpus 0.5                  # CPU limit
---fs-governance             # File change governance (see §6)
+gvm watch my_agent.py                  # Observe all traffic (no blocking)
+gvm watch --with-rules my_agent.py     # Observe with existing rules active
 ```
 
-### Watch Mode
+Shows every request in real-time:
+```
+  14:23:01  ✓ POST  api.anthropic.com   /v1/messages       200  [1,234 tokens]
+  14:23:05  ⏱ GET   catfact.ninja       /fact              200
+```
+
+At exit: host frequency, token cost estimate, unknown host warnings.
+
+### `gvm run -i` (Interactive)
 
 ```bash
-gvm watch my_agent.py                     # Allow all, observe traffic
-gvm watch --with-rules my_agent.py        # Apply existing rules while watching
-gvm watch --sandbox --output json \       # JSON output for piping
-  -- node agent.js
+gvm run -i my_agent.py
 ```
 
-Real-time traffic display:
+After the agent finishes, GVM shows each unknown URL and asks whether to Allow or Deny:
 ```
-  14:23:01  ✓ POST  api.anthropic.com    /v1/messages       200  [1,234 tokens]
-  14:23:05  ⏱ GET   raw.githubusercontent /torvalds/linux..  301
-  14:23:06  ✓ GET   api.github.com       /repos/torvalds..  200
+  Unknown host: catfact.ninja (3 requests, GET /fact)
+  (a)llow  (d)eny  (s)kip → a
+  ✓ Rule added: catfact.ninja GET → Allow
 ```
 
-Session summary at exit: host frequency, decisions, token cost estimate, anomaly warnings (burst, loop, unknown host).
+Rules are written directly to `srr_network.toml`. No manual editing needed.
+
+### `gvm suggest`
+
+```bash
+gvm watch --output json my_agent.py > session.jsonl
+gvm suggest --from session.jsonl --decision allow > new-rules.toml
+```
+
+Reads a watch session log and generates TOML rules for every URL that hit Default-to-Caution. Review the file, then merge into `config/srr_network.toml`.
 
 ---
 
-## 2. Policy Configuration
+## Level 2: Custom — Rules and Secrets
 
-### SRR Rules — URL Pattern Matching (`config/srr_network.toml`)
+### SRR Rules (`config/srr_network.toml`)
 
-Works without SDK. Applies to any agent in any language.
+URL pattern matching. No SDK needed.
 
 ```toml
 # Allow GitHub reads
@@ -85,7 +94,6 @@ pattern = "api.github.com"
 path_regex = "^/repos/[^/]+/[^/]+/commits$"
 method = "GET"
 decision = { type = "Allow" }
-reason = "List commits (read-only)"
 
 # Block wire transfers
 [[rules]]
@@ -93,66 +101,26 @@ pattern = "api.bank.com"
 path_regex = "/transfer/.*"
 method = "POST"
 decision = { type = "Deny", reason = "Wire transfers blocked" }
-
-# Default: delay and audit unmatched URLs
-[[rules]]
-pattern = "{any}"
-method = "*"
-decision = { type = "Delay", milliseconds = 300 }
 ```
 
-**Patterns:**
-- `"api.github.com"` — exact host
-- `"api.github.com/{any}"` — host + any path
-- `"{any}"` — catch-all (Default-to-Caution)
+**Patterns:** `"api.github.com"` (exact), `"api.github.com/{any}"` (host + any path), `"{any}"` (catch-all).
 
-**Decision types:**
-| Type | Behavior |
-|------|----------|
+**Decisions:**
+
+| Type | What happens |
+|------|-------------|
 | `Allow` | Pass immediately |
-| `Delay { milliseconds: N }` | Pause N ms then pass |
+| `Delay { milliseconds: 300 }` | Pause then pass |
 | `Deny { reason: "..." }` | Block with 403 |
-| `RequireApproval { urgency: "High" }` | Hold for human approval |
-| `Throttle { max_per_minute: N }` | Rate limit |
-| `AuditOnly { alert_level: "Medium" }` | Pass but flag for review |
+| `RequireApproval` | Hold for human approval |
+| `Throttle { max_per_minute: 10 }` | Rate limit |
+| `AuditOnly` | Pass but flag |
 
-**Hot-reload:** Edit the file, call `POST /gvm/reload`. No proxy restart needed.
+**Hot-reload:** Edit the file → `POST /gvm/reload`. No restart needed.
 
-**Query strings:** Automatically stripped before regex matching. `^/commits$` matches `/commits?per_page=5`.
+**Query strings:** Stripped automatically. `^/commits$` matches `/commits?per_page=5`.
 
-### ABAC Policies (`config/policies/`)
-
-Used with the SDK (`@ic` decorator).
-
-```toml
-# config/policies/global.toml
-
-[[rules]]
-id = "block-critical-delete"
-priority = 1
-layer = "Global"
-description = "Block critical data deletion"
-
-[rules.match]
-operation = { starts_with = "gvm.data.delete" }
-
-[rules.match.context]
-sensitivity = { equals = "Critical" }
-
-[rules.decision]
-type = "Deny"
-reason = "Critical data deletion is forbidden"
-```
-
-**Policy file structure:**
-```
-config/policies/
-  global.toml             # Applies to all agents
-  tenant-acme.toml        # Applies to "acme" tenant
-  agent-finance-001.toml  # Applies to specific agent
-```
-
-Lower layers can only be **stricter**, never more permissive.
+> **Tip:** Don't write rules by hand. Use `gvm watch` + `gvm suggest` to generate them, then edit as needed.
 
 ### Credential Injection (`config/secrets.toml`)
 
@@ -174,150 +142,63 @@ value = "SG.your_sendgrid_key"
 | Own auth header | No | Agent's key passes through |
 | No auth header | No | Sent without auth |
 
-> **Scope:** HTTP headers only. LLM SDKs (Anthropic, OpenAI) require keys at initialization — use `ANTHROPIC_API_KEY` env var. Credential injection applies to **tool API calls** the agent makes after LLM response.
+Existing agents with hardcoded keys work immediately — no code changes. When ready, move keys to `secrets.toml` for centralized management.
 
----
+> **Scope:** HTTP headers only. LLM SDKs require keys at initialization — use `ANTHROPIC_API_KEY` env var for that. Credential injection is for tool API calls (Stripe, Slack, GitHub, etc.).
 
-## 3. Troubleshooting
-
-### Agent Got Blocked (403 Deny)
-
-```bash
-# 1. Check what happened
-gvm events list --agent my-agent --since 5m
-
-# 2. Dry-run the same request
-gvm check --operation gvm.payment.charge --host api.bank.com --method POST
-
-# 3. Fix the policy (edit srr_network.toml → hot-reload)
-```
-
-### Agent Got Delayed (300ms)
-
-The URL didn't match any SRR rule — **Default-to-Caution** kicked in.
-
-```bash
-# Auto-discover patterns
-gvm watch --output json agent.py > session.jsonl
-gvm suggest --from session.jsonl --output new-rules.toml
-
-# Or add a rule manually in config/srr_network.toml:
-# [[rules]]
-# pattern = "catfact.ninja/{any}"
-# method = "GET"
-# decision = { type = "Allow" }
-```
-
-### Proxy Won't Start
-
-```bash
-# Check logs
-cat data/proxy.log | tail -20
-
-# Port conflict
-lsof -i :8080
-
-# Sandbox requires sudo
-sudo gvm run --sandbox agent.py
-```
-
----
-
-## 4. CLI Commands
-
-### `gvm run`
-
-```
-gvm run [FLAGS] [--] <command...>
-
---sandbox              Isolated environment (requires sudo)
---no-mitm              Disable HTTPS inspection
---fs-governance        Enable file governance
---shadow-mode <MODE>   disabled | observe | strict
---sandbox-timeout <N>  Seconds (default: 3600)
---memory <SIZE>        256m, 1g (default: 512m)
---cpus <N>             0.5, 1.0 (default: 1.0)
--i, --interactive      Suggest rules after run
---default-policy <P>   allow | delay | deny
---agent-id <ID>        Agent identifier
---proxy <URL>          Proxy address (default: http://127.0.0.1:8080)
-```
-
-### `gvm watch`
-
-```
-gvm watch [FLAGS] [--] <command...>
-
---with-rules           Apply existing rules while watching
---sandbox              Watch in sandbox
---output <FORMAT>      text (default) | json
-```
-
-### `gvm check`
-
-Dry-run policy evaluation.
+### `gvm check` — Dry-Run Policy Test
 
 ```bash
 gvm check --operation gvm.payment.charge --host api.bank.com --method POST
-gvm check --operation test --host api.github.com --method GET --path /repos
 ```
 
-Output: decision, matched rule, decision path, engine latency.
-
-### `gvm events`
-
-```bash
-gvm events list [--agent <ID>] [--since <DURATION>] [--format json]
-gvm events trace --trace-id <UUID>
-```
-
-### `gvm audit`
-
-```bash
-gvm audit verify [--wal data/wal.log]
-gvm audit export [--since 1h] [--format jsonl]
-```
-
-Output:
-```
-OK: WAL integrity verified. Events: 635, Batches: 42, Chain: intact
-```
-```
-TAMPER DETECTED: 2 event(s) have invalid hashes. Batch 7: merkle root mismatch
-```
-
-### `gvm stats`
-
-```bash
-gvm stats tokens [--agent <ID>] [--since 1h]
-gvm stats rollback-savings [--since 24h]
-```
-
-### `gvm suggest`
-
-```bash
-gvm suggest --from session.jsonl [--output rules.toml] [--decision allow]
-```
-
-Generates TOML rules from `gvm watch --output json` for URLs that hit Default-to-Caution.
-
-### `gvm cleanup`
-
-```bash
-gvm cleanup              # Clean up crashed sandbox remnants
-gvm cleanup --dry-run    # Show what would be cleaned
-```
-
-### `gvm init`
-
-```bash
-gvm init --industry saas          # SaaS template
-gvm init --industry healthcare    # HIPAA defaults
-```
+Output: decision, matched rule, decision path, engine latency. Use in CI to validate policy changes before deployment.
 
 ---
 
-## 5. Shadow Mode
+## Level 3: Enterprise — Isolation and Compliance
+
+### Sandbox Mode
+
+```bash
+sudo gvm run --sandbox my_agent.py
+```
+
+Agent runs in an isolated environment where it cannot bypass the proxy. Linux only, requires sudo.
+
+```bash
+--sandbox-timeout 300       # Kill after 5 minutes (default: 3600)
+--no-mitm                   # Disable HTTPS inspection
+--memory 256m               # Memory limit
+--cpus 0.5                  # CPU limit
+```
+
+> **Note:** Node.js ignores `HTTPS_PROXY`. Sandbox mode solves this — all HTTPS is intercepted regardless of the agent's behavior.
+
+### ABAC Policies (`config/policies/`)
+
+Semantic rules evaluated with the SDK (`@ic` decorator). Goes beyond URL matching — evaluates operation type, data sensitivity, and agent identity.
+
+```toml
+# config/policies/global.toml
+[[rules]]
+id = "block-critical-delete"
+priority = 1
+layer = "Global"
+
+[rules.match]
+operation = { starts_with = "gvm.data.delete" }
+[rules.match.context]
+sensitivity = { equals = "Critical" }
+
+[rules.decision]
+type = "Deny"
+reason = "Critical data deletion is forbidden"
+```
+
+Policy hierarchy: `global.toml` → `tenant-{name}.toml` → `agent-{id}.toml`. Lower layers can only be stricter.
+
+### Shadow Mode
 
 ```bash
 gvm run --shadow-mode strict -- node agent.js
@@ -329,80 +210,81 @@ gvm run --shadow-mode strict -- node agent.js
 | `observe` | Allow + audit warning | Testing |
 | `strict` | Deny (403) | Production |
 
-MCP integration: `gvm_declare_intent` tool registers intent before API calls. [MCP section →](12-quickstart.md#7-mcp-integration--claude-desktop--cursor)
-
----
-
-## 6. Filesystem Governance (Trust-on-Pattern)
+### Filesystem Governance
 
 ```bash
 sudo gvm run --sandbox --fs-governance my_agent.py
 ```
 
-Classifies and reviews agent file changes at session end.
+Agent file changes are classified at session end:
 
 | Change | Pattern | Action |
 |--------|---------|--------|
-| New file | `*.csv, *.pdf, *.txt` | Auto-merged to workspace |
-| New file | `*.sh, *.py, *.json` | Needs manual review |
+| New file | `*.csv, *.pdf, *.txt` | Auto-merged |
+| New file | `*.sh, *.py, *.json` | Review prompt |
 | New file | `*.log, __pycache__/*` | Discarded |
-| Modified file | (any) | Always needs review |
-| Deleted file | (any) | Always needs review |
+| Modified file | (any) | Review prompt |
+| Deleted file | (any) | Review prompt |
 
-**TTY:**
-```
-  ── File Changes ──
-    Created:  output.csv (12KB)  auto-merged → workspace/output.csv
-    Created:  analysis.py (2KB)  needs review (*.py)
-
-  [1/1] analysis.py (Created, 2KB)
-  +#!/usr/bin/env python3
-  +import pandas as pd
-
-  (a)ccept  (r)eject  (s)kip all → a
-  ✓ analysis.py → workspace/analysis.py
-```
-
-**CI/CD:** Files staged to `data/sandbox-staging/`. Use `gvm fs approve` later.
+TTY: interactive accept/reject per file. CI/CD: staged for `gvm fs approve`.
 
 ---
 
-## 7. CI/CD Integration
+## Troubleshooting
 
-```yaml
-# GitHub Actions
-- name: Validate governance policies
-  run: |
-    gvm-proxy &
-    sleep 2
-    gvm check --operation gvm.payment.charge --host api.bank.com --method POST \
-      | grep -q "Deny" || exit 1
-    gvm check --operation gvm.storage.read --host api.github.com --method GET \
-      | grep -q "Allow" || exit 1
-```
-
-### Pattern Discovery + Rule Generation
+### Agent Blocked (403)
 
 ```bash
-gvm watch --output json agent.py > session.jsonl
-gvm suggest --from session.jsonl --decision allow > new-rules.toml
+gvm events list --agent my-agent --since 5m      # What happened?
+gvm check --host api.bank.com --method POST       # Dry-run same request
+# Fix: edit config/srr_network.toml → hot-reload
+```
+
+### Agent Delayed (300ms)
+
+URL didn't match any rule — Default-to-Caution. Run `gvm watch` + `gvm suggest` to discover and add rules.
+
+### Proxy Won't Start
+
+```bash
+cat data/proxy.log | tail -20    # Check logs
+lsof -i :8080                    # Port conflict
+sudo gvm run --sandbox ...       # Sandbox needs sudo
 ```
 
 ---
 
-## 8. Production Checklist
+## CLI Reference
+
+| Command | Purpose |
+|---------|---------|
+| `gvm run [--sandbox] [--] <cmd>` | Run agent with governance |
+| `gvm watch [--with-rules] [--] <cmd>` | Observe traffic |
+| `gvm run -i <cmd>` | Interactive rule suggestion |
+| `gvm check --host H --method M` | Dry-run policy test |
+| `gvm suggest --from F` | Generate rules from watch log |
+| `gvm events list` | Query audit trail |
+| `gvm audit verify` | Check WAL integrity |
+| `gvm stats tokens` | Token usage per agent |
+| `gvm cleanup` | Remove orphaned sandbox resources |
+| `gvm init --industry I` | Initialize config templates |
+
+Full flags: `gvm <command> --help`
+
+---
+
+## Production Checklist
 
 - [ ] Remove `[dev] host_overrides` from proxy.toml
-- [ ] Set `GVM_SECRETS_KEY` (vault encryption)
-- [ ] Set `GVM_VAULT_KEY` (state encryption)
-- [ ] Configure NATS for WAL replication (`proxy.toml [nats]`)
+- [ ] Set `GVM_SECRETS_KEY` and `GVM_VAULT_KEY`
+- [ ] Configure NATS for WAL replication
 - [ ] Set credential policy to `Deny` (not Passthrough)
 - [ ] Enable `--shadow-mode strict`
 - [ ] `chmod 600 config/secrets.toml`
-- [ ] Review SRR rules: no catch-all Allow, Default-to-Caution is Delay
-- [ ] Set up monitoring: `gvm stats tokens` + `gvm audit verify` in cron
+- [ ] Review SRR: no catch-all Allow
+- [ ] Set up `gvm stats` + `gvm audit verify` in cron
 - [ ] Test with `gvm check` before deploying policy changes
 
 ---
 
-> **How it works under the hood:** [Architecture Overview](00-overview.md) | [SRR Design](03-srr.md) | [ABAC Policy Engine](02-policy.md) | [Merkle WAL](04-ledger.md) | [Security Model](11-security-model.md) | [Governance Coverage](14-governance-coverage.md)
+> **Under the hood:** [Architecture](00-overview.md) | [SRR Design](03-srr.md) | [ABAC Engine](02-policy.md) | [Merkle WAL](04-ledger.md) | [Security Model](11-security-model.md) | [Governance Coverage](14-governance-coverage.md)
