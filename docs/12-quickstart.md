@@ -83,6 +83,22 @@ What happens at runtime:
 
 The agent never sees the secret. Even if its memory is dumped, no credentials are exposed.
 
+**Both patterns work — no migration required:**
+
+| Agent code | secrets.toml has host? | What happens |
+|-----------|----------------------|--------------|
+| No auth header | Yes | Proxy injects managed key |
+| Has own auth header | Yes | Proxy **replaces** with managed key |
+| Has own auth header | No | Agent's key passes through unchanged |
+| No auth header | No | Request sent without auth (API rejects) |
+
+This means existing agents with hardcoded keys work immediately — just add them behind the proxy. When you're ready, move keys to `secrets.toml` for centralized management. No code changes needed either way.
+
+**Scope and limitations:**
+- Credential injection operates at the **HTTP layer** (headers). It cannot inject credentials into request bodies (e.g., GraphQL variables).
+- **LLM SDKs** (Anthropic, OpenAI) require API keys at **client initialization time** (before HTTP requests). The proxy cannot help with SDK initialization — agents must have the LLM key in their environment (`ANTHROPIC_API_KEY`). Credential injection is for **tool API calls** (Stripe, Slack, GitHub, etc.) that the agent makes via HTTP after receiving tool_use from the LLM.
+- For LLM keys, use the standard `ANTHROPIC_API_KEY` environment variable. The proxy governs what the agent *does* with LLM responses, not how it authenticates to the LLM.
+
 ---
 
 ## 4. Define What's Allowed

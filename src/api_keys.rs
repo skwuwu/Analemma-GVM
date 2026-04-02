@@ -194,3 +194,145 @@ impl APIKeyStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn test_store() -> APIKeyStore {
+        let mut credentials = HashMap::new();
+        credentials.insert(
+            "api.stripe.com".to_string(),
+            Credential::Bearer {
+                token: "sk_proxy_stripe_key".to_string(),
+            },
+        );
+        credentials.insert(
+            "api.sendgrid.com".to_string(),
+            Credential::ApiKey {
+                header: "x-api-key".to_string(),
+                value: "SG.proxy_sendgrid_key".to_string(),
+            },
+        );
+        APIKeyStore { credentials }
+    }
+
+    /// Agent has no key, proxy has key → proxy injects
+    #[test]
+    fn agent_no_key_proxy_injects() {
+        let store = test_store();
+        let mut headers = axum::http::HeaderMap::new();
+
+        store
+            .inject(&mut headers, "api.stripe.com", &MissingCredentialPolicy::Passthrough)
+            .unwrap();
+
+        assert_eq!(
+            headers.get("authorization").unwrap().to_str().unwrap(),
+            "Bearer sk_proxy_stripe_key"
+        );
+    }
+
+    /// Agent has its own key, proxy has key → proxy replaces agent's key
+    #[test]
+    fn agent_key_replaced_by_proxy() {
+        let store = test_store();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer agent-own-stripe-key"),
+        );
+
+        store
+            .inject(&mut headers, "api.stripe.com", &MissingCredentialPolicy::Passthrough)
+            .unwrap();
+
+        assert_eq!(
+            headers.get("authorization").unwrap().to_str().unwrap(),
+            "Bearer sk_proxy_stripe_key",
+            "Proxy key must replace agent's key"
+        );
+    }
+
+    /// Agent has key, proxy has NO key for this host → agent key preserved (passthrough)
+    #[test]
+    fn agent_key_preserved_when_no_proxy_credential() {
+        let store = test_store();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer agent-custom-api-key"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_static("agent-extra-key"),
+        );
+
+        // Host NOT in store → passthrough
+        store
+            .inject(&mut headers, "custom-api.example.com", &MissingCredentialPolicy::Passthrough)
+            .unwrap();
+
+        assert_eq!(
+            headers.get("authorization").unwrap().to_str().unwrap(),
+            "Bearer agent-custom-api-key",
+            "Agent's key must pass through when proxy has no credential"
+        );
+        assert_eq!(
+            headers.get("x-api-key").unwrap().to_str().unwrap(),
+            "agent-extra-key",
+            "Agent's extra headers must pass through"
+        );
+    }
+
+    /// Agent has key + extra auth headers, proxy has key → ALL agent auth headers stripped
+    #[test]
+    fn all_agent_auth_headers_stripped_on_injection() {
+        let store = test_store();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer agent-key"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_static("agent-api-key"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-auth-token"),
+            HeaderValue::from_static("agent-auth-token"),
+        );
+        headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_static("session=agent-session"),
+        );
+
+        store
+            .inject(&mut headers, "api.stripe.com", &MissingCredentialPolicy::Passthrough)
+            .unwrap();
+
+        // Proxy key injected
+        assert_eq!(
+            headers.get("authorization").unwrap().to_str().unwrap(),
+            "Bearer sk_proxy_stripe_key"
+        );
+        // All agent auth headers stripped
+        assert!(headers.get("x-api-key").is_none(), "x-api-key must be stripped");
+        assert!(headers.get("x-auth-token").is_none(), "x-auth-token must be stripped");
+        assert!(headers.get("cookie").is_none(), "cookie must be stripped");
+    }
+
+    /// No key anywhere (agent has nothing, proxy has nothing) → empty headers, no error
+    #[test]
+    fn no_key_anywhere_passthrough() {
+        let store = test_store();
+        let mut headers = axum::http::HeaderMap::new();
+
+        store
+            .inject(&mut headers, "unknown.example.com", &MissingCredentialPolicy::Passthrough)
+            .unwrap();
+
+        assert!(headers.is_empty(), "No headers should be added for unknown host");
+    }
+}
