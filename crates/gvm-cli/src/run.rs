@@ -61,12 +61,13 @@ pub async fn run_agent(
     // Warn if Node.js in cooperative mode (HTTPS_PROXY not respected)
     if mode == crate::pipeline::LaunchMode::Cooperative {
         let cmd_str = command.join(" ").to_lowercase();
-        if cmd_str.contains("node") || cmd_str.contains("openclaw") || cmd_str.contains("npx")
-            || command[0].ends_with(".js") || command[0].ends_with(".ts")
+        if cmd_str.contains("node")
+            || cmd_str.contains("openclaw")
+            || cmd_str.contains("npx")
+            || command[0].ends_with(".js")
+            || command[0].ends_with(".ts")
         {
-            eprintln!(
-                "  {YELLOW}\u{26a0} Node.js agent detected in cooperative mode.{RESET}"
-            );
+            eprintln!("  {YELLOW}\u{26a0} Node.js agent detected in cooperative mode.{RESET}");
             eprintln!(
                 "  {DIM}Node.js does not respect HTTPS_PROXY. Use --sandbox for full HTTPS coverage.{RESET}"
             );
@@ -210,11 +211,7 @@ pub(crate) fn detect_interpreter(ext: &str, script_ref: &str) -> (String, Vec<St
 }
 
 /// Inject standard GVM proxy environment variables into a Command.
-pub(crate) fn inject_proxy_env(
-    cmd: &mut tokio::process::Command,
-    proxy: &str,
-    agent_id: &str,
-) {
+pub(crate) fn inject_proxy_env(cmd: &mut tokio::process::Command, proxy: &str, agent_id: &str) {
     cmd.env("HTTP_PROXY", proxy)
         .env("HTTPS_PROXY", proxy)
         .env("http_proxy", proxy)
@@ -241,6 +238,7 @@ pub(crate) async fn check_proxy_health(proxy: &str) -> Result<()> {
 
 /// Assemble a SandboxConfig from pre-resolved fields.
 /// Pure constructor — no I/O, no async.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble_sandbox_config(
     script_path: std::path::PathBuf,
     workspace_dir: std::path::PathBuf,
@@ -429,6 +427,7 @@ pub(crate) fn print_wal_audit(wal_path: &str, start_offset: u64, agent_id: &str)
 
 /// Docker containment mode: run inside isolated container.
 /// Legacy function — pipeline.rs wraps this until full pipeline integration.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_contained_legacy(
     script: &str,
     agent_id: &str,
@@ -612,26 +611,30 @@ pub(crate) async fn run_contained_legacy(
     let ca_pem_path = ca_temp_dir.path().join("gvm-ca.crt");
 
     let ca_url = format!("{}/gvm/ca.pem", proxy.trim_end_matches('/'));
-    let mitm_available = if no_mitm { false } else { match reqwest::get(&ca_url).await {
-        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-            Ok(bytes) if !bytes.is_empty() => {
-                std::fs::write(&ca_pem_path, &bytes).context("Failed to write CA PEM")?;
-                println!(
-                    "  {GREEN}\u{2713}{RESET} MITM CA downloaded ({} bytes)",
-                    bytes.len()
-                );
-                true
-            }
+    let mitm_available = if no_mitm {
+        false
+    } else {
+        match reqwest::get(&ca_url).await {
+            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                Ok(bytes) if !bytes.is_empty() => {
+                    std::fs::write(&ca_pem_path, &bytes).context("Failed to write CA PEM")?;
+                    println!(
+                        "  {GREEN}\u{2713}{RESET} MITM CA downloaded ({} bytes)",
+                        bytes.len()
+                    );
+                    true
+                }
+                _ => {
+                    println!("  {YELLOW}MITM CA empty — HTTPS inspection unavailable{RESET}");
+                    false
+                }
+            },
             _ => {
-                println!("  {YELLOW}MITM CA empty — HTTPS inspection unavailable{RESET}");
+                println!("  {YELLOW}MITM CA not available — HTTPS will use CONNECT relay (domain-level only){RESET}");
                 false
             }
-        },
-        _ => {
-            println!("  {YELLOW}MITM CA not available — HTTPS will use CONNECT relay (domain-level only){RESET}");
-            false
         }
-    } };
+    };
 
     // Compute MITM listener address for DNAT (proxy port + 363 = TLS port)
     let proxy_port = proxy_url.port().unwrap_or(8080);

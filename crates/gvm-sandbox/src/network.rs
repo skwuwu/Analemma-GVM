@@ -139,14 +139,12 @@ pub fn setup_host_network(config: &VethConfig) -> Result<String> {
         .output()
     {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        if let Some(dev) = stdout.split_whitespace()
+        if let Some(dev) = stdout
+            .split_whitespace()
             .position(|w| w == "dev")
             .and_then(|i| stdout.split_whitespace().nth(i + 1))
         {
-            std::fs::write(
-                format!("/proc/sys/net/ipv4/conf/{}/forwarding", dev),
-                "1",
-            ).ok();
+            std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/forwarding", dev), "1").ok();
         }
     }
     // Enable route_localnet so DNAT to 127.0.0.1 works on the veth interface.
@@ -245,15 +243,28 @@ pub fn setup_host_network(config: &VethConfig) -> Result<String> {
     // regardless of GVM chains, ensuring existing connections survive.
     // We use -C (check) first to avoid duplicate rules across multiple sandboxes.
     let ssh_protect_args = [
-        "-I", "FORWARD", "1",
-        "-m", "state", "--state", "ESTABLISHED,RELATED",
-        "-j", "ACCEPT",
+        "-I",
+        "FORWARD",
+        "1",
+        "-m",
+        "state",
+        "--state",
+        "ESTABLISHED,RELATED",
+        "-j",
+        "ACCEPT",
     ];
     if run_iptables(&[
-        "-C", "FORWARD",
-        "-m", "state", "--state", "ESTABLISHED,RELATED",
-        "-j", "ACCEPT",
-    ]).is_err() {
+        "-C",
+        "FORWARD",
+        "-m",
+        "state",
+        "--state",
+        "ESTABLISHED,RELATED",
+        "-j",
+        "ACCEPT",
+    ])
+    .is_err()
+    {
         run_iptables(&ssh_protect_args)?;
         tracing::debug!("FORWARD ESTABLISHED/RELATED protection rule added");
     }
@@ -624,10 +635,16 @@ fn restore_ip_forward_state() {
 
         // Remove FORWARD ESTABLISHED/RELATED protection rule (no more sandboxes need it)
         run_iptables(&[
-            "-D", "FORWARD",
-            "-m", "state", "--state", "ESTABLISHED,RELATED",
-            "-j", "ACCEPT",
-        ]).ok();
+            "-D",
+            "FORWARD",
+            "-m",
+            "state",
+            "--state",
+            "ESTABLISHED,RELATED",
+            "-j",
+            "ACCEPT",
+        ])
+        .ok();
         tracing::debug!("Removed FORWARD ESTABLISHED/RELATED protection rule");
     }
 }
@@ -739,7 +756,8 @@ pub struct SandboxState {
 /// Get the state file path for a given PID.
 fn state_file_path(pid: u32) -> PathBuf {
     PathBuf::from(format!(
-        "{}/{}{}{}", STATE_DIR, STATE_PREFIX, pid, STATE_SUFFIX
+        "{}/{}{}{}",
+        STATE_DIR, STATE_PREFIX, pid, STATE_SUFFIX
     ))
 }
 
@@ -761,7 +779,10 @@ pub fn record_sandbox_state(
         sandbox_ip: config.sandbox_ip.clone(),
         proxy_port: config.proxy_addr.port(),
         forward_chain: format!("GVM-{}", config.host_iface),
-        mount_paths: mount_paths.iter().map(|p| p.display().to_string()).collect(),
+        mount_paths: mount_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect(),
         cgroup_path: cgroup_path.map(|s| s.to_string()),
         dns_target: dns_target.map(|s| s.to_string()),
     };
@@ -946,10 +967,7 @@ pub fn cleanup_all_orphans() -> Result<u32> {
                     let proxy_port = legacy["proxy_port"].as_u64().unwrap_or(8080) as u16;
                     let config = VethConfig {
                         host_iface: host_iface.to_string(),
-                        sandbox_iface: legacy["veth_sandbox"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string(),
+                        sandbox_iface: legacy["veth_sandbox"].as_str().unwrap_or("").to_string(),
                         host_ip: legacy["host_ip"]
                             .as_str()
                             .unwrap_or("10.200.0.1")
@@ -1005,9 +1023,7 @@ pub fn cleanup_all_orphans() -> Result<u32> {
                         );
                         // Clean iptables chain for this veth before deleting it
                         cleanup_orphan_iptables_chain(iface);
-                        let _ = Command::new("ip")
-                            .args(["link", "del", iface])
-                            .output();
+                        let _ = Command::new("ip").args(["link", "del", iface]).output();
                         cleaned += 1;
                     }
                 }

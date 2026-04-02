@@ -255,7 +255,10 @@ impl NetworkSRR {
             // rules that target THIS specific domain. A "DELETE {any}" rule should
             // NOT block CONNECT to api.anthropic.com — CONNECT might be for GET.
             let is_wildcard_host = matches!(rule.host_pattern, HostPattern::Any);
-            if rule.is_catch_all || is_wildcard_host || !match_host(&rule.host_pattern, &effective_host) {
+            if rule.is_catch_all
+                || is_wildcard_host
+                || !match_host(&rule.host_pattern, &effective_host)
+            {
                 continue;
             }
             has_any = true;
@@ -597,7 +600,11 @@ fn percent_decode_path(path: &str) -> Option<String> {
         }
     }
 
-    if changed { Some(current) } else { None }
+    if changed {
+        Some(current)
+    } else {
+        None
+    }
 }
 
 /// Single pass of percent decoding.

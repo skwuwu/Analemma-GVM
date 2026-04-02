@@ -4,6 +4,7 @@ use std::time::Instant;
 
 /// Dry-run policy check: sends a preflight request to the proxy's check endpoint.
 /// No external API calls are made — only the policy engine evaluates the request.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_check(
     operation: &str,
     agent_id: &str,
@@ -39,17 +40,18 @@ pub async fn run_check(
         .await
         .context("Failed to reach proxy — is it running?")?;
 
-    let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
+    let _elapsed = t0.elapsed().as_secs_f64() * 1000.0;
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.unwrap_or_default();
 
     // Extract fields from response
-    let decision = body["decision"].as_str().unwrap_or(
-        if status.is_success() { "Allow" } else { "Deny" }
-    );
+    let decision =
+        body["decision"]
+            .as_str()
+            .unwrap_or(if status.is_success() { "Allow" } else { "Deny" });
     let decision_path = body["decision_path"].as_str();
-    let policy_decision = body["policy_decision"].as_str();
-    let srr_decision = body["srr_decision"].as_str();
+    let _policy_decision = body["policy_decision"].as_str();
+    let _srr_decision = body["srr_decision"].as_str();
     let decision_source = body["decision_source"].as_str();
     let matched_rule = body["matched_rule"].as_str();
     let engine_us = body["engine_us"].as_f64();

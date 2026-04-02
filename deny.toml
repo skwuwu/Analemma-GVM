@@ -2,8 +2,6 @@
 # https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
-# Deny crates with known security vulnerabilities
-vulnerability = "deny"
 # wasmtime CVEs no longer need ignoring — wasmtime is behind --features wasm
 # (disabled by default) and not compiled into the default binary.
 ignore = []

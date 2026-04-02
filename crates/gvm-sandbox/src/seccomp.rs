@@ -322,7 +322,7 @@ fn insert_base_syscalls(rules: &mut BTreeMap<i64, Vec<SeccompRule>>) {
         libc::SYS_chmod,
         libc::SYS_fchmod,
         libc::SYS_fchmodat,
-        libc::SYS_fadvise64  // coreutils (cat, etc.) use posix_fadvise for read-ahead hints
+        libc::SYS_fadvise64 // coreutils (cat, etc.) use posix_fadvise for read-ahead hints
     );
 
     // Polling / event loop

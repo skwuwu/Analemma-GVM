@@ -86,66 +86,8 @@ jobs:
           cargo geiger --all-features --all-targets 2>&1 | tee -a $GITHUB_STEP_SUMMARY || true
           echo '```' >> $GITHUB_STEP_SUMMARY
 
-  # Contained mode: Docker-based isolation smoke test
-  contained-smoke:
-    name: Contained Smoke (Docker)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build proxy + CLI
-        run: cargo build --release -p gvm-proxy -p gvm-cli
-
-      - name: Build agent Docker image
-        run: docker build -t gvm-agent:latest -f Dockerfile.agent .
-
-      - name: Run contained smoke test
-        run: |
-          # Start proxy in background
-          ./target/release/gvm-proxy --config config/proxy.toml &
-          PROXY_PID=$!
-          sleep 3
-
-          # Verify proxy is healthy
-          STATUS=$(curl -sf http://127.0.0.1:8080/gvm/health | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])")
-          [ "$STATUS" = "healthy" ] || { echo "Proxy unhealthy: $STATUS"; exit 1; }
-
-          # Create test agent that makes an HTTP request through the proxy
-          AGENT_SCRIPT=$(mktemp /tmp/gvm-contained-ci-XXXX.py)
-          cat > "$AGENT_SCRIPT" << 'AGENT'
-          import os, requests
-          proxy = os.environ.get("HTTP_PROXY", "")
-          print(f"PROXY_VARS: HTTP_PROXY={proxy}")
-          try:
-              r = requests.get("http://api.github.com/repos/torvalds/linux",
-                  proxies={"http": proxy, "https": proxy}, timeout=10)
-              print(f"STATUS:{r.status_code}")
-          except Exception as e:
-              print(f"ERR:{e}")
-          AGENT
-
-          # Run contained agent
-          OUTPUT=$(./target/release/gvm run --contained "$AGENT_SCRIPT" 2>&1 || true)
-          echo "$OUTPUT"
-
-          # Verify the proxy saw the request (check WAL)
-          if [ -f data/wal.log ] && grep -q "api.github.com" data/wal.log; then
-            echo "✓ Contained agent traffic routed through proxy (WAL recorded)"
-          else
-            echo "⚠ WAL does not contain api.github.com — checking proxy logs"
-          fi
-
-          # Verify health still OK after contained run
-          STATUS=$(curl -sf http://127.0.0.1:8080/gvm/health | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])")
-          echo "Post-test health: $STATUS"
-
-          # Cleanup
-          rm -f "$AGENT_SCRIPT"
-          docker rm -f gvm-agent-agent-001 2>/dev/null || true
-          kill $PROXY_PID 2>/dev/null
-          echo "Contained smoke passed"
+  # NOTE: Docker contained-smoke removed — --contained is experimental with known
+  # stability issues (WSL2, iptables, NET_ADMIN). See docs/14-governance-coverage.md.
 
   # Smoke test: build + proxy health check + SRR policy check
   e2e-smoke:

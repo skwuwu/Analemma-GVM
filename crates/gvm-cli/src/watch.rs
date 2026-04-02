@@ -920,14 +920,15 @@ pub async fn run_watch(
             wal_offset: 0, // watch manages its own WAL offset
             is_binary_mode: is_binary,
         };
-        crate::pipeline::launch(&config_clone, &pre_state)
-            .await
-            .map(|code| code)
+        crate::pipeline::launch(&config_clone, &pre_state).await
     });
 
     let watchdog_proxy = proxy.to_string();
     let watchdog_workspace = run::workspace_root_for_proxy();
-    let watchdog_handle = tokio::spawn(crate::proxy_manager::watchdog(watchdog_proxy, watchdog_workspace));
+    let watchdog_handle = tokio::spawn(crate::proxy_manager::watchdog(
+        watchdog_proxy,
+        watchdog_workspace,
+    ));
 
     // Give the agent a moment to start, then begin tailing
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;

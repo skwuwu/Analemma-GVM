@@ -381,7 +381,9 @@ const AUTH_HEADERS: &[&str] = &[
 /// CR (\r), LF (\n), and NUL (\0) in header values allow response splitting attacks.
 #[inline]
 fn contains_header_injection_chars(bytes: &[u8]) -> bool {
-    bytes.iter().any(|&b| b == b'\r' || b == b'\n' || b == b'\0')
+    bytes
+        .iter()
+        .any(|&b| b == b'\r' || b == b'\n' || b == b'\0')
 }
 
 /// Parsed HTTP request from decrypted TLS stream.
@@ -429,10 +431,8 @@ impl HttpRequest {
                     );
                     return false;
                 }
-                self.headers.push((
-                    "Authorization".to_string(),
-                    value.into_bytes(),
-                ));
+                self.headers
+                    .push(("Authorization".to_string(), value.into_bytes()));
             }
             crate::api_keys::Credential::OAuth2 { access_token, .. } => {
                 let value = format!("Bearer {}", access_token);
@@ -443,10 +443,8 @@ impl HttpRequest {
                     );
                     return false;
                 }
-                self.headers.push((
-                    "Authorization".to_string(),
-                    value.into_bytes(),
-                ));
+                self.headers
+                    .push(("Authorization".to_string(), value.into_bytes()));
             }
             crate::api_keys::Credential::ApiKey { header, value } => {
                 if contains_header_injection_chars(header.as_bytes())
@@ -499,7 +497,7 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
     client_config: std::sync::Arc<rustls::ClientConfig>,
     state: &crate::proxy::AppState,
 ) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
     // HTTP/1.1 keep-alive loop: handle multiple requests on the same TLS connection.
     // OpenClaw and other agent frameworks reuse connections for multi-turn LLM calls
@@ -530,15 +528,12 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
             req.host.clone()
         };
 
-        let connection_close = req
-            .headers
-            .iter()
-            .any(|(k, v)| {
-                k.eq_ignore_ascii_case("connection")
-                    && std::str::from_utf8(v)
-                        .unwrap_or("")
-                        .eq_ignore_ascii_case("close")
-            });
+        let connection_close = req.headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("connection")
+                && std::str::from_utf8(v)
+                    .unwrap_or("")
+                    .eq_ignore_ascii_case("close")
+        });
 
         tracing::info!(
             method = %req.method,
@@ -584,7 +579,7 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
             body: body_ref,
             gvm_headers: None, // MITM traffic has no SDK headers
         };
-        let classify_output = match crate::enforcement::classify(&state, &classify_input) {
+        let classify_output = match crate::enforcement::classify(state, &classify_input) {
             Ok(o) => o,
             Err(err_msg) => {
                 tracing::error!(error = %err_msg, "MITM classification failed — denying (fail-close)");
@@ -651,8 +646,12 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
             }
             gvm_types::EnforcementDecision::Throttle { max_per_minute } => {
                 // Rate limit check on MITM path
-                if !state.rate_limiter.check(&classify_output.agent_id, *max_per_minute) {
-                    let body_str = r#"{"blocked":true,"decision":"Throttle","reason":"Rate limit exceeded"}"#;
+                if !state
+                    .rate_limiter
+                    .check(&classify_output.agent_id, *max_per_minute)
+                {
+                    let body_str =
+                        r#"{"blocked":true,"decision":"Throttle","reason":"Rate limit exceeded"}"#;
                     let response = format!(
                         "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 60\r\n\r\n{}",
                         body_str.len(), body_str
@@ -861,14 +860,17 @@ async fn relay_tls<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         )
         .await
         {
-            Ok(Ok(0)) => break,     // upstream closed
+            Ok(Ok(0)) => break, // upstream closed
             Ok(Ok(n)) => n,
             Ok(Err(e)) => {
                 tracing::debug!(error = %e, bytes_relayed = total_relayed, "MITM: upstream read error");
                 break;
             }
             Err(_) => {
-                tracing::debug!(bytes_relayed = total_relayed, "MITM: upstream read timeout (30s)");
+                tracing::debug!(
+                    bytes_relayed = total_relayed,
+                    "MITM: upstream read timeout (30s)"
+                );
                 break;
             }
         };
@@ -1103,8 +1105,8 @@ mod tests {
 
     #[test]
     fn inject_credentials_rejects_bearer_with_crlf() {
-        use std::collections::HashMap;
         use crate::api_keys::{APIKeyStore, Credential};
+        use std::collections::HashMap;
 
         // Build a store with a malicious Bearer token containing CRLF
         let mut credentials = HashMap::new();
@@ -1136,8 +1138,8 @@ mod tests {
 
     #[test]
     fn inject_credentials_rejects_apikey_with_crlf_in_value() {
-        use std::collections::HashMap;
         use crate::api_keys::{APIKeyStore, Credential};
+        use std::collections::HashMap;
 
         let mut credentials = HashMap::new();
         credentials.insert(
@@ -1164,8 +1166,8 @@ mod tests {
 
     #[test]
     fn inject_credentials_rejects_apikey_with_crlf_in_header_name() {
-        use std::collections::HashMap;
         use crate::api_keys::{APIKeyStore, Credential};
+        use std::collections::HashMap;
 
         let mut credentials = HashMap::new();
         credentials.insert(
@@ -1187,13 +1189,16 @@ mod tests {
         };
 
         let injected = req.inject_credentials(&store);
-        assert!(!injected, "CRLF-tainted ApiKey header name must be rejected");
+        assert!(
+            !injected,
+            "CRLF-tainted ApiKey header name must be rejected"
+        );
     }
 
     #[test]
     fn inject_credentials_accepts_clean_bearer() {
-        use std::collections::HashMap;
         use crate::api_keys::{APIKeyStore, Credential};
+        use std::collections::HashMap;
 
         let mut credentials = HashMap::new();
         credentials.insert(
@@ -1210,7 +1215,8 @@ mod tests {
             host: "api.openai.com".to_string(),
             headers: vec![],
             body: vec![],
-            raw_head: b"POST /v1/chat/completions HTTP/1.1\r\nHost: api.openai.com\r\n\r\n".to_vec(),
+            raw_head: b"POST /v1/chat/completions HTTP/1.1\r\nHost: api.openai.com\r\n\r\n"
+                .to_vec(),
         };
 
         let injected = req.inject_credentials(&store);

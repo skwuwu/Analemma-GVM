@@ -345,7 +345,12 @@ pub async fn proxy_handler(
                 };
                 let (abac_decision, abac_rule) = match state.policy.read() {
                     Ok(p) => p.evaluate(&shadow_op),
-                    Err(_) => (EnforcementDecision::Deny { reason: "Policy lock poisoned".into() }, None),
+                    Err(_) => (
+                        EnforcementDecision::Deny {
+                            reason: "Policy lock poisoned".into(),
+                        },
+                        None,
+                    ),
                 };
 
                 let combined = max_strict(classification.decision.clone(), abac_decision.clone());
@@ -1748,7 +1753,9 @@ async fn handle_connect_inner(
         let srr = match state.srr.read() {
             Ok(guard) => guard,
             Err(_) => {
-                tracing::error!("SRR lock poisoned in CONNECT handler — denying tunnel (fail-close)");
+                tracing::error!(
+                    "SRR lock poisoned in CONNECT handler — denying tunnel (fail-close)"
+                );
                 return error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Internal governance error — request denied (fail-close)",

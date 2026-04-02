@@ -879,7 +879,10 @@ async fn start_tls_listener(
             let _permit = permit; // held until task completes → auto-released on drop
             if let Err(e) = handle_tls_connection(stream, sc, cc, st, res).await {
                 let err_str = format!("{}", e);
-                if err_str.contains("handshake") || err_str.contains("AlertReceived") || err_str.contains("certificate") {
+                if err_str.contains("handshake")
+                    || err_str.contains("AlertReceived")
+                    || err_str.contains("certificate")
+                {
                     tracing::warn!(
                         error = %e, addr = %addr,
                         "MITM TLS handshake failed — agent may use certificate pinning. \

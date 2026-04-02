@@ -146,9 +146,9 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
 
     if network_result.is_ok() {
         let mount_paths = vec![staging_ws.clone(), sandbox_root.clone()];
-        if let Err(e) = record_sandbox_state(
-            &veth_config, &mount_paths, None, dns_target.as_deref(),
-        ) {
+        if let Err(e) =
+            record_sandbox_state(&veth_config, &mount_paths, None, dns_target.as_deref())
+        {
             tracing::debug!(error = %e, "Failed to record sandbox state (orphan cleanup unavailable)");
         }
     }
@@ -197,11 +197,12 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
                 // Update state file with cgroup path
                 if let Some(ref g) = guard {
                     let mount_paths = vec![staging_ws.clone(), sandbox_root.clone()];
-                    let cgroup_path = format!(
-                        "/sys/fs/cgroup/gvm-agent-{}", child_pid.as_raw()
-                    );
+                    let cgroup_path = format!("/sys/fs/cgroup/gvm-agent-{}", child_pid.as_raw());
                     if let Err(e) = record_sandbox_state(
-                        &veth_config, &mount_paths, Some(&cgroup_path), dns_target.as_deref(),
+                        &veth_config,
+                        &mount_paths,
+                        Some(&cgroup_path),
+                        dns_target.as_deref(),
                     ) {
                         tracing::debug!(error = %e, "Failed to update state with cgroup");
                     }
@@ -424,15 +425,15 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     let fs_diff = {
         let upper_dir = sandbox_root.join("gvm-overlay/upper");
         if upper_dir.exists() {
-            let policy = config.fs_policy.as_ref()
-                .cloned()
-                .unwrap_or_default();
+            let policy = config.fs_policy.as_ref().cloned().unwrap_or_default();
             match crate::filesystem::scan_upper_layer(&upper_dir, &config.workspace_dir, &policy) {
                 Ok(report) => {
                     // Execute auto-merge (Created files only — Modified goes to ManualCommit)
                     if !report.auto_merged.is_empty() {
                         let merge_result = crate::filesystem::execute_merge(
-                            &report, &upper_dir, &config.workspace_dir,
+                            &report,
+                            &upper_dir,
+                            &config.workspace_dir,
                         );
                         tracing::info!(
                             copied = merge_result.copied.len(),
@@ -446,9 +447,8 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
                     // The interactive review prompt runs in the CLI layer (pipeline.rs)
                     // AFTER sandbox cleanup, so files must be preserved outside tmpfs.
                     if !report.needs_review.is_empty() {
-                        let staging_dir = PathBuf::from(format!(
-                            "data/sandbox-staging/{}", std::process::id()
-                        ));
+                        let staging_dir =
+                            PathBuf::from(format!("data/sandbox-staging/{}", std::process::id()));
                         if std::fs::create_dir_all(&staging_dir).is_ok() {
                             for f in &report.needs_review {
                                 let src = upper_dir.join(&f.path);
@@ -543,7 +543,10 @@ fn child_entry(
     ) {
         eprintln!("gvm-sandbox: mount namespace setup failed: {:#}", e);
         eprintln!("  Hint: this usually means the interpreter binary or its shared");
-        eprintln!("  libraries cannot be bind-mounted. Check that '{}' exists", config.interpreter);
+        eprintln!(
+            "  libraries cannot be bind-mounted. Check that '{}' exists",
+            config.interpreter
+        );
         eprintln!("  and 'ldd {}' succeeds.", interpreter_path.display());
         return 1;
     }

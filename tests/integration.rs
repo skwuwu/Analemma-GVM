@@ -679,7 +679,9 @@ milliseconds = 300
     let srr = Arc::new(std::sync::RwLock::new(
         NetworkSRR::load(&srr_path).expect("valid SRR config must parse"),
     ));
-    let policy = Arc::new(std::sync::RwLock::new(PolicyEngine::load(&policy_dir).expect("valid policy files must parse")));
+    let policy = Arc::new(std::sync::RwLock::new(
+        PolicyEngine::load(&policy_dir).expect("valid policy files must parse"),
+    ));
     let registry = Arc::new(std::sync::RwLock::new(
         OperationRegistry::load(&registry_path).expect("valid registry config must parse"),
     ));
@@ -1119,9 +1121,12 @@ token = "sk_test_proxy_injected_key"
     let srr = Arc::new(std::sync::RwLock::new(
         NetworkSRR::load(&srr_path).expect("valid SRR config must parse"),
     ));
-    let policy = Arc::new(std::sync::RwLock::new(PolicyEngine::load(&policy_dir).expect("valid policy must parse")));
-    let registry =
-        Arc::new(std::sync::RwLock::new(OperationRegistry::load(&registry_path).expect("valid registry must parse")));
+    let policy = Arc::new(std::sync::RwLock::new(
+        PolicyEngine::load(&policy_dir).expect("valid policy must parse"),
+    ));
+    let registry = Arc::new(std::sync::RwLock::new(
+        OperationRegistry::load(&registry_path).expect("valid registry must parse"),
+    ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("valid secrets must parse"));
     let ledger = Arc::new(
         Ledger::new(&wal_path, "", "")
@@ -1305,9 +1310,12 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
     let srr = Arc::new(std::sync::RwLock::new(
         NetworkSRR::load(&srr_path).expect("valid SRR config must parse"),
     ));
-    let policy = Arc::new(std::sync::RwLock::new(PolicyEngine::load(&policy_dir).expect("valid policy must parse")));
-    let registry =
-        Arc::new(std::sync::RwLock::new(OperationRegistry::load(&registry_path).expect("valid registry must parse")));
+    let policy = Arc::new(std::sync::RwLock::new(
+        PolicyEngine::load(&policy_dir).expect("valid policy must parse"),
+    ));
+    let registry = Arc::new(std::sync::RwLock::new(
+        OperationRegistry::load(&registry_path).expect("valid registry must parse"),
+    ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("valid secrets must parse"));
     let ledger = Arc::new(
         Ledger::new(&wal_path, "", "")
@@ -1500,9 +1508,12 @@ type = "Allow"
     let srr = Arc::new(std::sync::RwLock::new(
         NetworkSRR::load(&srr_path).expect("valid SRR config must parse"),
     ));
-    let policy = Arc::new(std::sync::RwLock::new(PolicyEngine::load(&policy_dir).expect("valid policy must parse")));
-    let registry =
-        Arc::new(std::sync::RwLock::new(OperationRegistry::load(&registry_path).expect("valid registry must parse")));
+    let policy = Arc::new(std::sync::RwLock::new(
+        PolicyEngine::load(&policy_dir).expect("valid policy must parse"),
+    ));
+    let registry = Arc::new(std::sync::RwLock::new(
+        OperationRegistry::load(&registry_path).expect("valid registry must parse"),
+    ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("valid secrets must parse"));
     let ledger = Arc::new(
         Ledger::new(&wal_path, "", "")
@@ -1943,9 +1954,12 @@ async fn checkpoint_save_restore_merkle_verified() {
     let srr = Arc::new(std::sync::RwLock::new(
         NetworkSRR::load(&srr_path).expect("empty SRR must parse"),
     ));
-    let policy = Arc::new(std::sync::RwLock::new(PolicyEngine::load(&policy_dir).expect("empty policy must parse")));
-    let registry =
-        Arc::new(std::sync::RwLock::new(OperationRegistry::load(&registry_path).expect("minimal registry must parse")));
+    let policy = Arc::new(std::sync::RwLock::new(
+        PolicyEngine::load(&policy_dir).expect("empty policy must parse"),
+    ));
+    let registry = Arc::new(std::sync::RwLock::new(
+        OperationRegistry::load(&registry_path).expect("minimal registry must parse"),
+    ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("empty secrets must parse"));
     let ledger = Arc::new(
         Ledger::new(&wal_path, "", "")
@@ -2412,8 +2426,12 @@ type = "Allow"
     let srr = Arc::new(std::sync::RwLock::new(
         NetworkSRR::load(&srr_path).expect("SRR must parse"),
     ));
-    let policy = Arc::new(std::sync::RwLock::new(PolicyEngine::load(&policy_dir).expect("policy must parse")));
-    let registry = Arc::new(std::sync::RwLock::new(OperationRegistry::load(&registry_path).expect("registry must parse")));
+    let policy = Arc::new(std::sync::RwLock::new(
+        PolicyEngine::load(&policy_dir).expect("policy must parse"),
+    ));
+    let registry = Arc::new(std::sync::RwLock::new(
+        OperationRegistry::load(&registry_path).expect("registry must parse"),
+    ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("secrets must parse"));
     let ledger = Arc::new(
         Ledger::new(&wal_path, "", "")
@@ -2576,8 +2594,12 @@ decision = { type = "Allow" }
     let wal_path = dir.path().join("wal.log");
 
     let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).unwrap()));
-    let policy = Arc::new(std::sync::RwLock::new(PolicyEngine::load(&policy_dir).unwrap()));
-    let registry = Arc::new(std::sync::RwLock::new(OperationRegistry::load(&registry_path).unwrap()));
+    let policy = Arc::new(std::sync::RwLock::new(
+        PolicyEngine::load(&policy_dir).unwrap(),
+    ));
+    let registry = Arc::new(std::sync::RwLock::new(
+        OperationRegistry::load(&registry_path).unwrap(),
+    ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).unwrap());
     let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
     let vault = Arc::new(Vault::new(ledger.clone()).unwrap());
@@ -2699,8 +2721,12 @@ decision = { type = "Allow" }
     let wal_path = dir.path().join("wal.log");
 
     let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).unwrap()));
-    let policy = Arc::new(std::sync::RwLock::new(PolicyEngine::load(&policy_dir).unwrap()));
-    let registry = Arc::new(std::sync::RwLock::new(OperationRegistry::load(&registry_path).unwrap()));
+    let policy = Arc::new(std::sync::RwLock::new(
+        PolicyEngine::load(&policy_dir).unwrap(),
+    ));
+    let registry = Arc::new(std::sync::RwLock::new(
+        OperationRegistry::load(&registry_path).unwrap(),
+    ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).unwrap());
     let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
     let vault = Arc::new(Vault::new(ledger.clone()).unwrap());
@@ -2826,8 +2852,12 @@ decision = { type = "Allow" }
     let wal_path = dir.path().join("wal.log");
 
     let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).unwrap()));
-    let policy = Arc::new(std::sync::RwLock::new(PolicyEngine::load(&policy_dir).unwrap()));
-    let registry = Arc::new(std::sync::RwLock::new(OperationRegistry::load(&registry_path).unwrap()));
+    let policy = Arc::new(std::sync::RwLock::new(
+        PolicyEngine::load(&policy_dir).unwrap(),
+    ));
+    let registry = Arc::new(std::sync::RwLock::new(
+        OperationRegistry::load(&registry_path).unwrap(),
+    ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).unwrap());
     let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
     let vault = Arc::new(Vault::new(ledger.clone()).unwrap());
@@ -2921,8 +2951,12 @@ async fn ic3_self_approval_blocked_on_proxy_port() {
     let wal_path = dir.path().join("wal.log");
 
     let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).unwrap()));
-    let policy = Arc::new(std::sync::RwLock::new(PolicyEngine::load(&policy_dir).unwrap()));
-    let registry = Arc::new(std::sync::RwLock::new(OperationRegistry::load(&registry_path).unwrap()));
+    let policy = Arc::new(std::sync::RwLock::new(
+        PolicyEngine::load(&policy_dir).unwrap(),
+    ));
+    let registry = Arc::new(std::sync::RwLock::new(
+        OperationRegistry::load(&registry_path).unwrap(),
+    ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).unwrap());
     let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
     let vault = Arc::new(Vault::new(ledger.clone()).unwrap());

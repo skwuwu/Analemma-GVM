@@ -34,7 +34,7 @@ pub async fn ensure_available(proxy: &str, workspace: &Path) -> Result<()> {
             eprintln!("  {DIM}Proxy PID {pid} found, waiting for health...{RESET}");
             for _ in 0..10 {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                if proxy_healthy(&proxy).await {
+                if proxy_healthy(proxy).await {
                     return Ok(());
                 }
             }
@@ -147,7 +147,7 @@ async fn start_daemon(proxy: &str, workspace: &Path) -> Result<()> {
     // Wait for proxy to become healthy
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
-        if proxy_healthy(&proxy).await {
+        if proxy_healthy(proxy).await {
             eprintln!("  {GREEN}Proxy started (PID {pid}){RESET}");
             return Ok(());
         }
@@ -193,9 +193,7 @@ fn find_proxy_binary(workspace: &Path) -> Result<PathBuf> {
         return Ok(path);
     }
 
-    anyhow::bail!(
-        "gvm-proxy binary not found. Build with: cargo build --release -p gvm-proxy"
-    )
+    anyhow::bail!("gvm-proxy binary not found. Build with: cargo build --release -p gvm-proxy")
 }
 
 /// Check if a proxy URL is a local address.
@@ -205,11 +203,7 @@ fn is_local_proxy(proxy: &str) -> bool {
 
 /// Read PID from file, return None if file doesn't exist or is invalid.
 fn read_pid_file(path: &Path) -> Option<u32> {
-    std::fs::read_to_string(path)
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 /// Check if a process with given PID is alive AND is actually gvm-proxy.
@@ -247,22 +241,29 @@ fn fix_file_ownership(path: &Path) {
         ) {
             if let (Ok(uid), Ok(gid)) = (uid_str.parse::<u32>(), gid_str.parse::<u32>()) {
                 unsafe {
-                    let c_path = std::ffi::CString::new(
-                        path.to_str().unwrap_or("")
-                    ).unwrap_or_default();
+                    let c_path =
+                        std::ffi::CString::new(path.to_str().unwrap_or("")).unwrap_or_default();
                     libc::chown(c_path.as_ptr(), uid, gid);
                 }
             }
         }
     }
     #[cfg(not(unix))]
-    { let _ = path; }
+    {
+        let _ = path;
+    }
 }
 
 /// Fix ownership of data directory and common files inside it.
 fn fix_data_dir_ownership(data_dir: &Path) {
     fix_file_ownership(data_dir);
-    for name in &["wal.log", "wal.log.watermark", "wal_emergency.log", "proxy.log", "proxy.pid"] {
+    for name in &[
+        "wal.log",
+        "wal.log.watermark",
+        "wal_emergency.log",
+        "proxy.log",
+        "proxy.pid",
+    ] {
         let p = data_dir.join(name);
         if p.exists() {
             fix_file_ownership(&p);

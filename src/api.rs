@@ -719,8 +719,7 @@ pub async fn check(
 
     // Reconstruct per-layer decisions for decision path visualization
     // (read locks are cheap — already released by classify())
-    let policy_decision_str = if gvm_headers.is_some() {
-        let gvm_h = gvm_headers.as_ref().unwrap();
+    let policy_decision_str = if let Some(gvm_h) = gvm_headers.as_ref() {
         let op = crate::types::OperationMetadata {
             operation: gvm_h.operation.clone(),
             resource: gvm_h.resource.clone().unwrap_or_default(),
@@ -729,17 +728,31 @@ pub async fn check(
                 tenant_id: None,
                 session_id: "dry-run".to_string(),
             },
-            context: crate::types::OperationContext { attributes: Default::default() },
+            context: crate::types::OperationContext {
+                attributes: Default::default(),
+            },
             payload: crate::types::PayloadDescriptor::default(),
         };
-        state.policy.read().ok()
+        state
+            .policy
+            .read()
+            .ok()
             .map(|p| format!("{:?}", p.evaluate(&op).0))
             .unwrap_or_else(|| "error".to_string())
     } else {
         "N/A (no operation)".to_string()
     };
-    let srr_decision_str = state.srr.read().ok()
-        .map(|s| format!("{:?}", s.check(&body.method, &body.target_host, &body.target_path, None).decision))
+    let srr_decision_str = state
+        .srr
+        .read()
+        .ok()
+        .map(|s| {
+            format!(
+                "{:?}",
+                s.check(&body.method, &body.target_host, &body.target_path, None)
+                    .decision
+            )
+        })
         .unwrap_or_else(|| "error".to_string());
 
     let (decision_str, next_action) = match decision {
@@ -755,10 +768,9 @@ pub async fn check(
             "RequireApproval".to_string(),
             Some("Administrator approval required before execution".to_string()),
         ),
-        crate::types::EnforcementDecision::Deny { reason } => (
-            "Deny".to_string(),
-            Some(format!("Blocked: {}", reason)),
-        ),
+        crate::types::EnforcementDecision::Deny { reason } => {
+            ("Deny".to_string(), Some(format!("Blocked: {}", reason)))
+        }
         _ => (format!("{:?}", decision), None),
     };
 
@@ -989,7 +1001,10 @@ pub async fn reload_srr(State(state): State<AppState>) -> Response<Body> {
     drop(policy_guard);
     drop(registry_guard);
 
-    tracing::info!(srr_rules = srr_count, "Governance hot-reloaded (SRR + ABAC + Registry)");
+    tracing::info!(
+        srr_rules = srr_count,
+        "Governance hot-reloaded (SRR + ABAC + Registry)"
+    );
     json_response(
         StatusCode::OK,
         &serde_json::json!({

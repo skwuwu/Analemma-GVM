@@ -89,8 +89,7 @@ pub fn check(config: &SandboxConfig) -> PreflightReport {
     }
 
     // DNS resolver type: systemd-resolved vs direct
-    let has_systemd_resolved =
-        Path::new("/run/systemd/resolve/resolv.conf").exists();
+    let has_systemd_resolved = Path::new("/run/systemd/resolve/resolv.conf").exists();
     if !has_systemd_resolved {
         // Not a hard error — resolve_host_dns() falls back to /etc/resolv.conf → 8.8.8.8
         tracing::debug!(
@@ -104,9 +103,7 @@ pub fn check(config: &SandboxConfig) -> PreflightReport {
         tracing::info!(kernel = version, "Sandbox environment kernel version");
         // Warn about known problematic kernels
         if version.starts_with("6.17.") {
-            tracing::warn!(
-                "Kernel 6.17.x detected — ldd-in-PID-namespace panic workaround active"
-            );
+            tracing::warn!("Kernel 6.17.x detected — ldd-in-PID-namespace panic workaround active");
         }
     }
 

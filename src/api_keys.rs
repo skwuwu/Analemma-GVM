@@ -225,7 +225,11 @@ mod tests {
         let mut headers = axum::http::HeaderMap::new();
 
         store
-            .inject(&mut headers, "api.stripe.com", &MissingCredentialPolicy::Passthrough)
+            .inject(
+                &mut headers,
+                "api.stripe.com",
+                &MissingCredentialPolicy::Passthrough,
+            )
             .unwrap();
 
         assert_eq!(
@@ -245,7 +249,11 @@ mod tests {
         );
 
         store
-            .inject(&mut headers, "api.stripe.com", &MissingCredentialPolicy::Passthrough)
+            .inject(
+                &mut headers,
+                "api.stripe.com",
+                &MissingCredentialPolicy::Passthrough,
+            )
             .unwrap();
 
         assert_eq!(
@@ -271,7 +279,11 @@ mod tests {
 
         // Host NOT in store → passthrough
         store
-            .inject(&mut headers, "custom-api.example.com", &MissingCredentialPolicy::Passthrough)
+            .inject(
+                &mut headers,
+                "custom-api.example.com",
+                &MissingCredentialPolicy::Passthrough,
+            )
             .unwrap();
 
         assert_eq!(
@@ -309,7 +321,11 @@ mod tests {
         );
 
         store
-            .inject(&mut headers, "api.stripe.com", &MissingCredentialPolicy::Passthrough)
+            .inject(
+                &mut headers,
+                "api.stripe.com",
+                &MissingCredentialPolicy::Passthrough,
+            )
             .unwrap();
 
         // Proxy key injected
@@ -318,8 +334,14 @@ mod tests {
             "Bearer sk_proxy_stripe_key"
         );
         // All agent auth headers stripped
-        assert!(headers.get("x-api-key").is_none(), "x-api-key must be stripped");
-        assert!(headers.get("x-auth-token").is_none(), "x-auth-token must be stripped");
+        assert!(
+            headers.get("x-api-key").is_none(),
+            "x-api-key must be stripped"
+        );
+        assert!(
+            headers.get("x-auth-token").is_none(),
+            "x-auth-token must be stripped"
+        );
         assert!(headers.get("cookie").is_none(), "cookie must be stripped");
     }
 
@@ -330,9 +352,16 @@ mod tests {
         let mut headers = axum::http::HeaderMap::new();
 
         store
-            .inject(&mut headers, "unknown.example.com", &MissingCredentialPolicy::Passthrough)
+            .inject(
+                &mut headers,
+                "unknown.example.com",
+                &MissingCredentialPolicy::Passthrough,
+            )
             .unwrap();
 
-        assert!(headers.is_empty(), "No headers should be added for unknown host");
+        assert!(
+            headers.is_empty(),
+            "No headers should be added for unknown host"
+        );
     }
 }

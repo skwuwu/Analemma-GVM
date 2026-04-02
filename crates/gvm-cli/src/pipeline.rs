@@ -64,7 +64,9 @@ pub async fn pre_launch(config: &AgentConfig) -> Result<PreLaunchState> {
     if config.mode == LaunchMode::Sandbox {
         match gvm_sandbox::cleanup_all_orphans() {
             Ok(0) => {}
-            Ok(n) => eprintln!("  {YELLOW}Cleaned up {n} orphaned sandbox(es) from previous crash{RESET}"),
+            Ok(n) => eprintln!(
+                "  {YELLOW}Cleaned up {n} orphaned sandbox(es) from previous crash{RESET}"
+            ),
             Err(e) => eprintln!("  {DIM}Orphan cleanup failed (non-fatal): {e}{RESET}"),
         }
     }
@@ -128,7 +130,10 @@ async fn launch_cooperative_binary(config: &AgentConfig) -> Result<i32> {
 
 async fn launch_cooperative_script(config: &AgentConfig) -> Result<i32> {
     let abs_script = run::resolve_script(&config.command[0])?;
-    let ext = abs_script.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let ext = abs_script
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
     let (interpreter, interpreter_args) =
         run::detect_interpreter(ext, abs_script.to_str().unwrap_or(&config.command[0]));
     let script_dir = abs_script.parent().unwrap_or(std::path::Path::new("."));
@@ -178,7 +183,10 @@ async fn launch_sandbox(config: &AgentConfig, pre: &PreLaunchState) -> Result<i3
             .and_then(|f| f.to_str())
             .unwrap_or(&config.command[0])
             .to_string();
-        let ext = abs_script.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let ext = abs_script
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
         let (interpreter, interpreter_args) = run::detect_interpreter(ext, &script_name);
 
         run::assemble_sandbox_config(
@@ -298,10 +306,8 @@ pub fn post_exit_audit(config: &AgentConfig, pre: &PreLaunchState, exit_code: i3
         );
     } else {
         // Non-interactive: count default-caution hits and suggest batch rule generation.
-        let caution_count = crate::suggest::count_default_caution_hits(
-            "data/wal.log",
-            pre.wal_offset,
-        );
+        let caution_count =
+            crate::suggest::count_default_caution_hits("data/wal.log", pre.wal_offset);
         if caution_count > 0 {
             eprintln!(
                 "  {YELLOW}{} request(s) hit Default-to-Caution (no explicit rule).{RESET}",
@@ -312,7 +318,11 @@ pub fn post_exit_audit(config: &AgentConfig, pre: &PreLaunchState, exit_code: i3
             );
             eprintln!(
                 "  {DIM}Or use interactive mode: gvm run -i {}{RESET}",
-                config.command.first().map(|s| s.as_str()).unwrap_or("agent.py")
+                config
+                    .command
+                    .first()
+                    .map(|s| s.as_str())
+                    .unwrap_or("agent.py")
             );
             eprintln!();
         }
@@ -397,7 +407,9 @@ fn print_banner(config: &AgentConfig) {
                 eprintln!("{DIM}All outbound HTTP/HTTPS routed through GVM proxy.{RESET}");
             } else {
                 eprintln!("{BOLD}Analemma-GVM \u{2014} Agent Governance Monitor{RESET}");
-                eprintln!("{DIM}All HTTP traffic will be routed through GVM proxy for governance.{RESET}");
+                eprintln!(
+                    "{DIM}All HTTP traffic will be routed through GVM proxy for governance.{RESET}"
+                );
             }
         }
         LaunchMode::Sandbox => {
@@ -409,7 +421,10 @@ fn print_banner(config: &AgentConfig) {
         }
     }
     eprintln!();
-    eprintln!("  {DIM}Agent ID:{RESET}     {CYAN}{}{RESET}", config.agent_id);
+    eprintln!(
+        "  {DIM}Agent ID:{RESET}     {CYAN}{}{RESET}",
+        config.agent_id
+    );
     eprintln!("  {DIM}Command:{RESET}      {}", config.command.join(" "));
     eprintln!("  {DIM}Proxy:{RESET}        {}", config.proxy);
     eprintln!();
@@ -427,7 +442,9 @@ fn print_security_layers(config: &AgentConfig) {
             eprintln!("    {GREEN}\u{2713}{RESET} Layer 3: Linux Namespace Isolation");
             eprintln!("      {DIM}\u{2022} PID namespace: isolated process tree{RESET}");
             eprintln!("      {DIM}\u{2022} Mount namespace: minimal rootfs{RESET}");
-            eprintln!("      {DIM}\u{2022} Network namespace: veth pair, proxy-only routing{RESET}");
+            eprintln!(
+                "      {DIM}\u{2022} Network namespace: veth pair, proxy-only routing{RESET}"
+            );
             eprintln!("      {DIM}\u{2022} Seccomp-BPF: syscall whitelist{RESET}");
             eprintln!("      {DIM}\u{2022} Transparent MITM: ephemeral CA, full L7 HTTPS inspection{RESET}");
         }
@@ -455,8 +472,12 @@ fn print_fs_diff_report(diff: &gvm_sandbox::filesystem::FsDiffReport, workspace:
     // Auto-merged: quiet, one line each
     for f in &diff.auto_merged {
         let dst = workspace.join(&f.path);
-        eprintln!("    {GREEN}Created:{RESET}  {} ({})  {DIM}auto-merged \u{2192} {}{RESET}",
-            f.path.display(), format_size(f.size), dst.display());
+        eprintln!(
+            "    {GREEN}Created:{RESET}  {} ({})  {DIM}auto-merged \u{2192} {}{RESET}",
+            f.path.display(),
+            format_size(f.size),
+            dst.display()
+        );
     }
 
     // Needs review: show kind + reason
@@ -466,20 +487,26 @@ fn print_fs_diff_report(diff: &gvm_sandbox::filesystem::FsDiffReport, workspace:
             ChangeKind::Modified => "Modified",
             ChangeKind::Deleted => "Deleted",
         };
-        eprintln!("    {YELLOW}{kind_str}:{RESET}  {} ({})  {DIM}needs review ({}){RESET}",
-            f.path.display(), format_size(f.size), f.matched_pattern);
+        eprintln!(
+            "    {YELLOW}{kind_str}:{RESET}  {} ({})  {DIM}needs review ({}){RESET}",
+            f.path.display(),
+            format_size(f.size),
+            f.matched_pattern
+        );
     }
 
     // Discarded: summary only
     if !diff.discarded.is_empty() {
-        eprintln!("    {DIM}Discarded: {} file(s){RESET}", diff.discarded.len());
+        eprintln!(
+            "    {DIM}Discarded: {} file(s){RESET}",
+            diff.discarded.len()
+        );
     }
 
     // Interactive review for needs_review files (TTY only)
     if !diff.needs_review.is_empty() {
-        let staging_dir = std::path::PathBuf::from(format!(
-            "data/sandbox-staging/{}", std::process::id()
-        ));
+        let staging_dir =
+            std::path::PathBuf::from(format!("data/sandbox-staging/{}", std::process::id()));
 
         if atty::is(atty::Stream::Stdin) && staging_dir.exists() {
             eprintln!();
@@ -488,8 +515,10 @@ fn print_fs_diff_report(diff: &gvm_sandbox::filesystem::FsDiffReport, workspace:
 
             for (i, f) in diff.needs_review.iter().enumerate() {
                 let staged = staging_dir.join(&f.path);
-                eprintln!("  {BOLD}[{}/{}]{RESET} {} ({}, {})",
-                    i + 1, diff.needs_review.len(),
+                eprintln!(
+                    "  {BOLD}[{}/{}]{RESET} {} ({}, {})",
+                    i + 1,
+                    diff.needs_review.len(),
                     f.path.display(),
                     match f.kind {
                         ChangeKind::Created => "Created",
@@ -507,7 +536,10 @@ fn print_fs_diff_report(diff: &gvm_sandbox::filesystem::FsDiffReport, workspace:
                             eprintln!("  {GREEN}+{RESET}{}", line);
                         }
                         if content.lines().count() > 10 {
-                            eprintln!("  {DIM}... ({} more lines){RESET}", content.lines().count() - 10);
+                            eprintln!(
+                                "  {DIM}... ({} more lines){RESET}",
+                                content.lines().count() - 10
+                            );
                         }
                     } else {
                         eprintln!("  {DIM}(binary file){RESET}");
@@ -528,7 +560,11 @@ fn print_fs_diff_report(diff: &gvm_sandbox::filesystem::FsDiffReport, workspace:
                                 std::fs::create_dir_all(parent).ok();
                             }
                             if std::fs::copy(&staged, &dst).is_ok() {
-                                eprintln!("  {GREEN}\u{2713}{RESET} {} \u{2192} {}", f.path.display(), dst.display());
+                                eprintln!(
+                                    "  {GREEN}\u{2713}{RESET} {} \u{2192} {}",
+                                    f.path.display(),
+                                    dst.display()
+                                );
                                 accepted += 1;
                             } else {
                                 eprintln!("  {RED}\u{2717}{RESET} copy failed");
@@ -539,7 +575,10 @@ fn print_fs_diff_report(diff: &gvm_sandbox::filesystem::FsDiffReport, workspace:
                             break;
                         }
                         _ => {
-                            eprintln!("  {RED}\u{2717}{RESET} {} rejected (original preserved)", f.path.display());
+                            eprintln!(
+                                "  {RED}\u{2717}{RESET} {} rejected (original preserved)",
+                                f.path.display()
+                            );
                             rejected += 1;
                         }
                     }
@@ -547,8 +586,13 @@ fn print_fs_diff_report(diff: &gvm_sandbox::filesystem::FsDiffReport, workspace:
             }
 
             eprintln!();
-            eprintln!("  {BOLD}Summary:{RESET} {} merged, {} accepted, {} rejected, {} discarded",
-                diff.auto_merged.len(), accepted, rejected, diff.discarded.len());
+            eprintln!(
+                "  {BOLD}Summary:{RESET} {} merged, {} accepted, {} rejected, {} discarded",
+                diff.auto_merged.len(),
+                accepted,
+                rejected,
+                diff.discarded.len()
+            );
 
             // Clean up staging
             std::fs::remove_dir_all(&staging_dir).ok();
@@ -559,8 +603,10 @@ fn print_fs_diff_report(diff: &gvm_sandbox::filesystem::FsDiffReport, workspace:
                 eprintln!("  {DIM}Files staged at: {}{RESET}", staging_dir.display());
                 eprintln!("  {DIM}Review and approve: {CYAN}gvm fs approve{RESET}");
             } else {
-                eprintln!("  {DIM}{} file(s) need review but staging unavailable{RESET}",
-                    diff.needs_review.len());
+                eprintln!(
+                    "  {DIM}{} file(s) need review but staging unavailable{RESET}",
+                    diff.needs_review.len()
+                );
             }
         }
     }

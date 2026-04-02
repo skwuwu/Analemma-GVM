@@ -55,7 +55,8 @@ pub fn resolve_dynload_libs(interpreter_path: &Path) -> Vec<PathBuf> {
                     if output.status.success() {
                         let stdout = String::from_utf8_lossy(&output.stdout);
                         for lib_path in parse_ldd_output(&stdout) {
-                            let canonical = lib_path.canonicalize().unwrap_or_else(|_| lib_path.clone());
+                            let canonical =
+                                lib_path.canonicalize().unwrap_or_else(|_| lib_path.clone());
                             if seen.insert(canonical) {
                                 libs.push(lib_path);
                             }

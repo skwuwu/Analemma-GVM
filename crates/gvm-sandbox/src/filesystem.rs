@@ -12,7 +12,7 @@
 //! - Path traversal defense: relative paths with `..` are rejected.
 
 use crate::FilesystemPolicy;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 /// Classification of a file change in the overlayfs upper layer.
@@ -132,9 +132,7 @@ fn scan_dir_recursive(
                 // Whiteout = file was deleted by agent in upper layer
                 let rel_path = path.strip_prefix(upper_root).unwrap_or(&path).to_path_buf();
                 // Strip .wh. prefix if present (overlayfs naming convention)
-                let display_path = rel_path.to_string_lossy()
-                    .replace(".wh.", "")
-                    .into();
+                let display_path = rel_path.to_string_lossy().replace(".wh.", "").into();
                 needs_review.push(FileChange {
                     path: display_path,
                     kind: ChangeKind::Deleted,
@@ -148,12 +146,21 @@ fn scan_dir_recursive(
 
         if path.is_dir() {
             // Skip opaque directory markers
-            if path.file_name().map(|n| n.to_string_lossy().contains(".wh..wh..opq")).unwrap_or(false) {
+            if path
+                .file_name()
+                .map(|n| n.to_string_lossy().contains(".wh..wh..opq"))
+                .unwrap_or(false)
+            {
                 continue;
             }
             scan_dir_recursive(
-                &path, upper_root, lower_root, policy,
-                auto_merged, needs_review, discarded,
+                &path,
+                upper_root,
+                lower_root,
+                policy,
+                auto_merged,
+                needs_review,
+                discarded,
             )?;
             continue;
         }
@@ -323,7 +330,9 @@ pub fn execute_merge(
         // Safety: only copy Created files. Modified should not be in auto_merged
         // (scan_dir_recursive enforces this), but double-check here.
         if matches!(change.kind, ChangeKind::Modified) {
-            result.skipped.push((change.path.clone(), "modified file".into()));
+            result
+                .skipped
+                .push((change.path.clone(), "modified file".into()));
             continue;
         }
 
@@ -331,19 +340,32 @@ pub fn execute_merge(
         let dst = host_workspace.join(&change.path);
 
         // Path traversal defense (belt-and-suspenders with scan)
-        let dst_canonical = dst.parent()
-            .and_then(|p| { std::fs::create_dir_all(p).ok(); p.canonicalize().ok() })
+        let dst_canonical = dst
+            .parent()
+            .and_then(|p| {
+                std::fs::create_dir_all(p).ok();
+                p.canonicalize().ok()
+            })
             .unwrap_or_else(|| host_workspace.to_path_buf());
-        let ws_canonical = host_workspace.canonicalize()
+        let ws_canonical = host_workspace
+            .canonicalize()
             .unwrap_or_else(|_| host_workspace.to_path_buf());
         if !dst_canonical.starts_with(&ws_canonical) {
-            result.skipped.push((change.path.clone(), "path escape blocked".into()));
+            result
+                .skipped
+                .push((change.path.clone(), "path escape blocked".into()));
             continue;
         }
 
         // Symlink defense: don't copy symlinks, copy their targets (if within upper)
-        if src.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false) {
-            result.skipped.push((change.path.clone(), "symlink rejected".into()));
+        if src
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            result
+                .skipped
+                .push((change.path.clone(), "symlink rejected".into()));
             continue;
         }
 
@@ -579,8 +601,15 @@ mod tests {
         let policy = FilesystemPolicy::default();
         let report = scan_upper_layer(&upper, &lower, &policy).unwrap();
 
-        assert_eq!(report.discarded.len(), 1, "symlink escape must be discarded");
-        assert_eq!(report.discarded[0].matched_pattern, "symlink_escape_blocked");
+        assert_eq!(
+            report.discarded.len(),
+            1,
+            "symlink escape must be discarded"
+        );
+        assert_eq!(
+            report.discarded[0].matched_pattern,
+            "symlink_escape_blocked"
+        );
         assert!(report.auto_merged.is_empty(), "no auto-merge for symlinks");
     }
 
@@ -601,7 +630,9 @@ mod tests {
         let report = scan_upper_layer(&upper, &lower, &policy).unwrap();
 
         // "..sneaky/data.csv" contains ".." → should be discarded
-        let has_traversal = report.discarded.iter()
+        let has_traversal = report
+            .discarded
+            .iter()
             .any(|f| f.matched_pattern == "path_traversal_blocked");
         assert!(has_traversal, "path traversal must be discarded");
     }
@@ -626,14 +657,18 @@ mod tests {
         let report = scan_upper_layer(&upper, &lower, &policy).unwrap();
 
         // Modified *.csv → ManualCommit (not AutoMerge)
-        let modified = report.needs_review.iter()
+        let modified = report
+            .needs_review
+            .iter()
             .find(|f| f.path == Path::new("data.csv"));
         assert!(modified.is_some(), "modified file must be in needs_review");
         assert!(matches!(modified.unwrap().kind, ChangeKind::Modified));
         assert_eq!(modified.unwrap().matched_pattern, "modified_file");
 
         // Created *.csv → AutoMerge
-        let created = report.auto_merged.iter()
+        let created = report
+            .auto_merged
+            .iter()
             .find(|f| f.path == Path::new("output.csv"));
         assert!(created.is_some(), "created csv must be auto-merged");
         assert!(matches!(created.unwrap().kind, ChangeKind::Created));
@@ -689,7 +724,9 @@ mod tests {
             std::os::unix::fs::symlink("/etc/hostname", upper.join("link.txt")).unwrap();
         }
         #[cfg(not(unix))]
-        { return; }
+        {
+            return;
+        }
 
         let report = FsDiffReport {
             auto_merged: vec![FileChange {

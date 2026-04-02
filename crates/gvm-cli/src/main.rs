@@ -500,8 +500,8 @@ async fn main() -> anyhow::Result<()> {
             if watch {
                 // --watch mode: delegate to watch module (observation only)
                 watch::run_watch(
-                    &command, &agent_id, &proxy, with_rules, sandbox, contained, no_mitm,
-                    &image, &memory, &cpus, &output,
+                    &command, &agent_id, &proxy, with_rules, sandbox, contained, no_mitm, &image,
+                    &memory, &cpus, &output,
                 )
                 .await?;
             } else {
@@ -574,19 +574,15 @@ async fn main() -> anyhow::Result<()> {
                     eprintln!("Scanning for orphaned sandbox resources (dry run)...");
                     let pattern = "/tmp/gvm-sandbox-*.state";
                     let mut found = 0u32;
-                    for entry in
-                        glob::glob(pattern).unwrap_or_else(|_| glob::glob("").unwrap())
-                    {
+                    for entry in glob::glob(pattern).unwrap_or_else(|_| glob::glob("").unwrap()) {
                         if let Ok(path) = entry {
                             if let Ok(content) = std::fs::read_to_string(&path) {
                                 if let Ok(state) =
                                     serde_json::from_str::<serde_json::Value>(&content)
                                 {
                                     let pid = state["pid"].as_u64().unwrap_or(0) as u32;
-                                    let alive =
-                                        unsafe { libc::kill(pid as i32, 0) == 0 };
-                                    let status =
-                                        if alive { "ACTIVE" } else { "ORPHANED" };
+                                    let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+                                    let status = if alive { "ACTIVE" } else { "ORPHANED" };
                                     eprintln!(
                                         "  {} PID={} veth={} mounts={}",
                                         status,
@@ -644,7 +640,15 @@ async fn main() -> anyhow::Result<()> {
             proxy,
         } => {
             check::run_check(
-                &operation, &agent_id, &service, &tier, &sensitivity, &host, &path, &method, &proxy,
+                &operation,
+                &agent_id,
+                &service,
+                &tier,
+                &sensitivity,
+                &host,
+                &path,
+                &method,
+                &proxy,
             )
             .await?;
         }

@@ -277,9 +277,7 @@ pub fn suggest_rules_batch(log_path: &str, output_path: Option<&str>, default_de
     }
 
     if caution_targets.is_empty() {
-        eprintln!(
-            "{DIM}No Default-to-Caution hits found in {total_events} events.{RESET}"
-        );
+        eprintln!("{DIM}No Default-to-Caution hits found in {total_events} events.{RESET}");
         return;
     }
 
@@ -305,9 +303,7 @@ pub fn suggest_rules_batch(log_path: &str, output_path: Option<&str>, default_de
         let label = format!(
             "suggest-{}-{}",
             target.method.to_lowercase(),
-            target
-                .host
-                .replace('.', "-")
+            target.host.replace('.', "-")
         );
         toml_output.push_str(&format!(
             "[[rules]]\nmethod = \"{}\"\npattern = \"{}\"\ndecision = {}\n\
@@ -323,19 +319,17 @@ pub fn suggest_rules_batch(log_path: &str, output_path: Option<&str>, default_de
 
     // Output
     match output_path {
-        Some(path) => {
-            match std::fs::write(path, &toml_output) {
-                Ok(()) => {
-                    eprintln!(
-                        "{GREEN}{BOLD}{} rule(s){RESET} written to {CYAN}{path}{RESET} \
+        Some(path) => match std::fs::write(path, &toml_output) {
+            Ok(()) => {
+                eprintln!(
+                    "{GREEN}{BOLD}{} rule(s){RESET} written to {CYAN}{path}{RESET} \
                          {DIM}(from {total_events} events, {} caution hits){RESET}",
-                        caution_targets.len(),
-                        caution_targets.values().sum::<usize>(),
-                    );
-                }
-                Err(e) => eprintln!("{RED}Failed to write {path}: {e}{RESET}"),
+                    caution_targets.len(),
+                    caution_targets.values().sum::<usize>(),
+                );
             }
-        }
+            Err(e) => eprintln!("{RED}Failed to write {path}: {e}{RESET}"),
+        },
         None => {
             // stdout
             print!("{toml_output}");

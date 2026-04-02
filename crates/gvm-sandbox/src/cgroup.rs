@@ -129,7 +129,9 @@ impl Drop for CgroupGuard {
                 for line in content.lines() {
                     if let Ok(pid) = line.trim().parse::<i32>() {
                         if pid > 0 {
-                            unsafe { libc::kill(pid, libc::SIGKILL); }
+                            unsafe {
+                                libc::kill(pid, libc::SIGKILL);
+                            }
                             killed += 1;
                         }
                     }

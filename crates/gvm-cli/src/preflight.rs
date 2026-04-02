@@ -274,7 +274,7 @@ fn gather_sandbox_checks() -> SandboxCapabilities {
 }
 
 /// Determine available modes from check results.
-fn compute_modes(checks: &[Check], sandbox: &SandboxCapabilities) -> Vec<Mode> {
+fn compute_modes(_checks: &[Check], sandbox: &SandboxCapabilities) -> Vec<Mode> {
     // Cooperative mode: works on any OS
     let cooperative = Mode {
         available: true, // proxy is optional — gvm run works without config
@@ -387,10 +387,7 @@ fn count_credentials(path: &Path) -> usize {
 
 /// Labels that are optional (warning instead of error).
 fn is_optional(label: &str) -> bool {
-    matches!(
-        label,
-        "TC ingress filter" | "Credentials" | "Kernel"
-    )
+    matches!(label, "TC ingress filter" | "Credentials" | "Kernel")
 }
 
 /// Resolve a command to its path for display.
