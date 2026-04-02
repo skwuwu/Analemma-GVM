@@ -441,6 +441,31 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
                             "Overlayfs auto-merge completed"
                         );
                     }
+
+                    // Stage needs_review files to persistent storage (before umount).
+                    // The interactive review prompt runs in the CLI layer (pipeline.rs)
+                    // AFTER sandbox cleanup, so files must be preserved outside tmpfs.
+                    if !report.needs_review.is_empty() {
+                        let staging_dir = PathBuf::from(format!(
+                            "data/sandbox-staging/{}", std::process::id()
+                        ));
+                        if std::fs::create_dir_all(&staging_dir).is_ok() {
+                            for f in &report.needs_review {
+                                let src = upper_dir.join(&f.path);
+                                let dst = staging_dir.join(&f.path);
+                                if let Some(parent) = dst.parent() {
+                                    std::fs::create_dir_all(parent).ok();
+                                }
+                                std::fs::copy(&src, &dst).ok();
+                            }
+                            tracing::debug!(
+                                count = report.needs_review.len(),
+                                staging = %staging_dir.display(),
+                                "Staged needs_review files for interactive review"
+                            );
+                        }
+                    }
+
                     Some(report)
                 }
                 Err(e) => {

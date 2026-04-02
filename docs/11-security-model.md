@@ -707,3 +707,13 @@ Use `--no-mitm` to disable MITM and fall back to CONNECT relay (domain-level onl
 | **LLM thinking trace** | MITM relay streams response chunks — cannot buffer full body for trace extraction | Thinking hash not captured on MITM path. Use cooperative mode with SDK for full trace capture |
 | **IC-3 RequireApproval** | MITM cannot hold TLS keep-alive stream for human approval | IC-3 treated as Deny on MITM path. Use cooperative mode with SDK for IC-3 approval flow |
 | **Shadow Mode** | MITM has no SDK headers for intent verification | Intent store claim/verify not supported on MITM path. SRR enforcement still active |
+
+## Overlayfs Trust-on-Pattern — Known Limitations
+
+| Limitation | Impact | Mitigation |
+|-----------|--------|------------|
+| **Batch scan only** | File changes are scanned at session end, not during execution | Long-running agents may produce files that aren't visible until exit. Periodic scan planned for v0.3 |
+| **tmpfs volatility** | Upper layer lives in tmpfs — lost if sandbox crashes before scan | SIGTERM handler ensures scan+merge on graceful termination. SIGKILL = files lost. Staging fallback planned |
+| **No real-time governance** | Files are classified post-hoc, not at write time | inotify-based scan planned for v0.3. Current model is analogous to git commit review |
+| **Modified files never auto-merged** | Any modification to existing workspace files requires manual approval | By design — prevents agent from silently altering host files. Use ManualCommit review prompt |
+| **Deletions not executed** | Agent cannot delete host files through overlayfs | By design — whiteouts classified as ManualCommit. Future `--allow-delete` opt-in |

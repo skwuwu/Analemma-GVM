@@ -21,6 +21,9 @@ v0.2 shipped: Shadow Mode + intent store, CONNECT tunnel, SRR hot-reload, eBPF u
 - Chunked transfer body reassembly
 - Anomaly detection (low-and-slow exfiltration)
 - WebSocket proxy support
+- Overlayfs periodic scan (long-running agents): tokio timer → scan_upper_layer() at interval
+- `gvm fs` CLI: `approve`, `reject`, `diff`, `list` for staged ManualCommit files
+- Overlayfs inotify-based real-time scan (event-driven alternative to periodic)
 
 **v1.1 — Hardening**
 - ABAC hot-path execution via Wasm engine

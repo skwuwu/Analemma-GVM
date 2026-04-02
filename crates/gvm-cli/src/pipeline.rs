@@ -225,10 +225,11 @@ async fn launch_sandbox(config: &AgentConfig, pre: &PreLaunchState) -> Result<i3
         );
     }
 
-    // Display filesystem diff report (overlayfs Trust-on-Pattern)
+    // Display filesystem diff report + interactive review (overlayfs Trust-on-Pattern)
     if let Some(ref diff) = result.fs_diff {
         if diff.overlayfs_active {
-            print_fs_diff_report(diff);
+            let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            print_fs_diff_report(diff, &workspace);
         }
     }
 
@@ -428,64 +429,128 @@ fn print_security_layers(config: &AgentConfig) {
     eprintln!();
 }
 
-fn print_fs_diff_report(diff: &gvm_sandbox::filesystem::FsDiffReport) {
+fn print_fs_diff_report(diff: &gvm_sandbox::filesystem::FsDiffReport, workspace: &std::path::Path) {
+    use gvm_sandbox::filesystem::ChangeKind;
+
     eprintln!();
-    eprintln!("  {BOLD}\u{2500}\u{2500} File Changes (Trust-on-Pattern) \u{2500}\u{2500}{RESET}");
+    eprintln!("  {BOLD}\u{2500}\u{2500} File Changes \u{2500}\u{2500}{RESET}");
 
     if diff.auto_merged.is_empty() && diff.needs_review.is_empty() && diff.discarded.is_empty() {
         eprintln!("    {DIM}No file changes detected.{RESET}");
         return;
     }
 
-    if !diff.auto_merged.is_empty() {
-        eprintln!(
-            "    {GREEN}\u{2713} auto-merged:{RESET} {} file(s)",
-            diff.auto_merged.len()
-        );
-        for f in &diff.auto_merged {
-            eprintln!("      {GREEN}+{RESET} {} {DIM}({}, {}){RESET}",
-                f.path.display(),
-                f.matched_pattern,
-                format_size(f.size),
-            );
-        }
+    // Auto-merged: quiet, one line each
+    for f in &diff.auto_merged {
+        let dst = workspace.join(&f.path);
+        eprintln!("    {GREEN}Created:{RESET}  {} ({})  {DIM}auto-merged \u{2192} {}{RESET}",
+            f.path.display(), format_size(f.size), dst.display());
     }
 
-    if !diff.needs_review.is_empty() {
-        eprintln!(
-            "    {YELLOW}\u{26a0} needs review:{RESET} {} file(s)",
-            diff.needs_review.len()
-        );
-        for f in &diff.needs_review {
-            let kind_str = match f.kind {
-                gvm_sandbox::filesystem::ChangeKind::Created => "new",
-                gvm_sandbox::filesystem::ChangeKind::Modified => "modified",
-                gvm_sandbox::filesystem::ChangeKind::Deleted => "deleted",
-            };
-            eprintln!("      {YELLOW}?{RESET} {} {DIM}({}, {}, {}){RESET}",
-                f.path.display(),
-                kind_str,
-                f.matched_pattern,
-                format_size(f.size),
-            );
-        }
-
-        // TTY check: prompt for approval or print staging path
-        if atty::is(atty::Stream::Stdin) {
-            eprintln!();
-            eprintln!("    {DIM}Run with --interactive for file-by-file approval (TODO){RESET}");
-        } else {
-            eprintln!();
-            eprintln!("    {DIM}Non-interactive: review files manually, then run:{RESET}");
-            eprintln!("    {CYAN}gvm fs approve{RESET}");
-        }
+    // Needs review: show kind + reason
+    for f in &diff.needs_review {
+        let kind_str = match f.kind {
+            ChangeKind::Created => "Created",
+            ChangeKind::Modified => "Modified",
+            ChangeKind::Deleted => "Deleted",
+        };
+        eprintln!("    {YELLOW}{kind_str}:{RESET}  {} ({})  {DIM}needs review ({}){RESET}",
+            f.path.display(), format_size(f.size), f.matched_pattern);
     }
 
+    // Discarded: summary only
     if !diff.discarded.is_empty() {
-        eprintln!(
-            "    {DIM}\u{2717} discarded: {} file(s){RESET}",
-            diff.discarded.len()
-        );
+        eprintln!("    {DIM}Discarded: {} file(s){RESET}", diff.discarded.len());
+    }
+
+    // Interactive review for needs_review files (TTY only)
+    if !diff.needs_review.is_empty() {
+        let staging_dir = std::path::PathBuf::from(format!(
+            "data/sandbox-staging/{}", std::process::id()
+        ));
+
+        if atty::is(atty::Stream::Stdin) && staging_dir.exists() {
+            eprintln!();
+            let mut accepted = 0usize;
+            let mut rejected = 0usize;
+
+            for (i, f) in diff.needs_review.iter().enumerate() {
+                let staged = staging_dir.join(&f.path);
+                eprintln!("  {BOLD}[{}/{}]{RESET} {} ({}, {})",
+                    i + 1, diff.needs_review.len(),
+                    f.path.display(),
+                    match f.kind {
+                        ChangeKind::Created => "Created",
+                        ChangeKind::Modified => "Modified",
+                        ChangeKind::Deleted => "Deleted",
+                    },
+                    format_size(f.size),
+                );
+
+                // Show diff/content preview
+                if staged.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&staged) {
+                        let lines: Vec<&str> = content.lines().take(10).collect();
+                        for line in &lines {
+                            eprintln!("  {GREEN}+{RESET}{}", line);
+                        }
+                        if content.lines().count() > 10 {
+                            eprintln!("  {DIM}... ({} more lines){RESET}", content.lines().count() - 10);
+                        }
+                    } else {
+                        eprintln!("  {DIM}(binary file){RESET}");
+                    }
+                }
+
+                eprintln!();
+                eprint!("  ({GREEN}a{RESET})ccept  ({RED}r{RESET})eject  ({DIM}s{RESET})kip all \u{2192} ");
+
+                let mut input = String::new();
+                if std::io::stdin().read_line(&mut input).is_ok() {
+                    let choice = input.trim().to_lowercase();
+                    match choice.as_str() {
+                        "a" | "accept" | "y" | "yes" => {
+                            // Copy staged file to workspace
+                            let dst = workspace.join(&f.path);
+                            if let Some(parent) = dst.parent() {
+                                std::fs::create_dir_all(parent).ok();
+                            }
+                            if std::fs::copy(&staged, &dst).is_ok() {
+                                eprintln!("  {GREEN}\u{2713}{RESET} {} \u{2192} {}", f.path.display(), dst.display());
+                                accepted += 1;
+                            } else {
+                                eprintln!("  {RED}\u{2717}{RESET} copy failed");
+                            }
+                        }
+                        "s" | "skip" => {
+                            eprintln!("  {DIM}Skipping remaining files{RESET}");
+                            break;
+                        }
+                        _ => {
+                            eprintln!("  {RED}\u{2717}{RESET} {} rejected (original preserved)", f.path.display());
+                            rejected += 1;
+                        }
+                    }
+                }
+            }
+
+            eprintln!();
+            eprintln!("  {BOLD}Summary:{RESET} {} merged, {} accepted, {} rejected, {} discarded",
+                diff.auto_merged.len(), accepted, rejected, diff.discarded.len());
+
+            // Clean up staging
+            std::fs::remove_dir_all(&staging_dir).ok();
+        } else {
+            // Non-TTY: print staging path
+            eprintln!();
+            if staging_dir.exists() {
+                eprintln!("  {DIM}Files staged at: {}{RESET}", staging_dir.display());
+                eprintln!("  {DIM}Review and approve: {CYAN}gvm fs approve{RESET}");
+            } else {
+                eprintln!("  {DIM}{} file(s) need review but staging unavailable{RESET}",
+                    diff.needs_review.len());
+            }
+        }
     }
 
     eprintln!();
