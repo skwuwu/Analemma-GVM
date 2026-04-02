@@ -68,6 +68,34 @@ impl APIKeyStore {
             });
         }
 
+        // Security check: secrets file should not be readable by group/other.
+        // API keys in plaintext with 0644 permissions is a security risk.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(path) {
+                let mode = meta.permissions().mode();
+                if mode & 0o077 != 0 {
+                    tracing::warn!(
+                        path = %path.display(),
+                        mode = format!("{:04o}", mode & 0o777),
+                        "secrets.toml has insecure permissions — group/other can read API keys"
+                    );
+                    // Auto-fix to 0600
+                    match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+                        Ok(()) => tracing::info!(
+                            path = %path.display(),
+                            "Fixed secrets.toml permissions to 0600"
+                        ),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "Cannot fix secrets.toml permissions — ensure only the proxy user can read this file"
+                        ),
+                    }
+                }
+            }
+        }
+
         let content = std::fs::read_to_string(path)?;
         let file: SecretsFile = toml::from_str(&content)?;
 

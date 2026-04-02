@@ -1,8 +1,8 @@
 # Changelog
 
 > Architecture decisions, implementation history, and release planning.
-> For security model, see [12-security-model.md](12-security-model.md).
-> For configuration reference, see [16-reference.md](16-reference.md).
+> For security model, see [11-security-model.md](11-security-model.md).
+> For configuration reference, see [13-reference.md](13-reference.md).
 
 ---
 
@@ -202,13 +202,13 @@ Risk: Low
 ### 2026-03-23: Documentation Consistency Fix — MITM Status
 Fixed README and roadmap where MITM (implemented in v0.2) was still described as "planned v0.3". Renamed doc files 14→15, 15→16.
 Why: Multiple sections contradicted each other on MITM implementation status.
-Files: `README.md`, `docs/13-roadmap.md`, `docs/00-overview.md`, `docs/15-quickstart.md`, `docs/16-reference.md`
+Files: `README.md`, `docs/13-roadmap.md`, `docs/00-overview.md`, `docs/12-quickstart.md`, `docs/13-reference.md`
 Risk: Low (documentation only)
 
 ### 2026-03-23: Documentation Audit — 20 Issues Fixed
 Full cross-reference audit of 18 docs. Critical: seccomp count ~45→~111 (4 locations), Vault WAL claim fix, Tower middleware order fix, LLM trace Content-Length claim removed, uprobe→eBPF TC in examples.
 Why: Documentation diverged from implementation across multiple files.
-Files: `docs/00-overview.md`, `04-ledger.md`, `05-vault.md`, `06-proxy.md`, `07-sdk.md`, `08-memory-security.md`, `10-architecture-changes.md`, `11-competitive-analysis.md`, `12-security-model.md`, `13-roadmap.md`, `15-reference.md`, `README.md`
+Files: `docs/00-overview.md`, `04-ledger.md`, `05-vault.md`, `06-proxy.md`, `07-sdk.md`, `08-memory-security.md`, `10-architecture-changes.md`, `10-competitive-analysis.md`, `11-security-model.md`, `13-roadmap.md`, `15-reference.md`, `README.md`
 Risk: Low (documentation only)
 
 ### 2026-03-23: Security Hardening — WAL OOM, Rate Limiter, README Honesty
@@ -262,13 +262,13 @@ Risk: Low
 ### 2026-03-20: Config File Hash Recording in Merkle Chain
 SHA-256 hashes of config files recorded as `gvm.system.config_load` WAL event at proxy startup.
 Why: Policy file tampering between restarts was undetectable.
-Files: `src/ledger.rs`, `src/main.rs`, `tests/integration.rs`, `docs/04-ledger.md`, `docs/12-security-model.md`
+Files: `src/ledger.rs`, `src/main.rs`, `tests/integration.rs`, `docs/04-ledger.md`, `docs/11-security-model.md`
 Risk: Low
 
 ### 2026-03-20: Security Documentation Reframing
 Timing side-channel reframed as intentional design (rate limiter prevents statistical attacks). Fuzzing CI elevated to High priority. Constant-time SRR lowered to Low priority.
 Why: Previous framing implied GVM was pursuing constant-time but falling short; honest framing is that end-to-end timing difference is inherent to all proxy architectures.
-Files: `docs/08-memory-security.md`, `docs/12-security-model.md`
+Files: `docs/08-memory-security.md`, `docs/11-security-model.md`
 Risk: Low (documentation only)
 
 ### 2026-03-19: Vault Trait Abstraction (KeyProvider + VaultBackend)
@@ -343,7 +343,7 @@ Core Wasm modules (`wasm32-wasip1`) require WASI preview1 imports. Fixed: `Store
 
 ## Assessed & Closed
 
-Reported during security audit — determined non-vulnerabilities. See [12-security-model.md](12-security-model.md).
+Reported during security audit — determined non-vulnerabilities. See [11-security-model.md](11-security-model.md).
 
 | Issue | Assessment |
 |-------|-----------|

@@ -1,7 +1,7 @@
 # Reference Guide
 
 > Configuration, CLI commands, and advanced options.
-> For first-time setup, see [Quick Start →](15-quickstart.md).
+> For first-time setup, see [Quick Start →](12-quickstart.md).
 
 ---
 
@@ -495,4 +495,4 @@ This catches policy regressions: adding a new SRR rule that accidentally opens a
 
 ---
 
-[← Quick Start](15-quickstart.md) | [Architecture Overview →](00-overview.md)
+[← Quick Start](12-quickstart.md) | [Architecture Overview →](00-overview.md)

@@ -119,11 +119,11 @@ GVM's governance operates at two semantic levels. A third level (content semanti
 | 8 | [Memory & Runtime Security](08-memory-security.md) | (this whitepaper) |
 | 8.7 | [OS Isolation & MicroVM Assessment](08-memory-security.md) | `crates/gvm-sandbox/` |
 | 9 | [Test Coverage Report](09-test-report.md) | `tests/hostile.rs` |
-| 11 | [Competitive Positioning](11-competitive-analysis.md) | GVM vs LLM safety, prompt guards, OPA |
-| 12 | [Security Model & Known Attack Surface](12-security-model.md) | Threat model, attack vectors, mitigations |
-| 15 | [Quick Start](15-quickstart.md) | 1-minute launch, isolation levels, secret injection, policy basics |
-| 16 | [Reference Guide](16-reference.md) | Configuration, environment variables, CLI, SDK API, platform support |
-| 17 | [Governance Coverage](17-governance-coverage.md) | Per-mode enforcement matrix |
+| 10 | [Competitive Positioning](10-competitive-analysis.md) | GVM vs LLM safety, prompt guards, OPA |
+| 11 | [Security Model & Known Attack Surface](11-security-model.md) | Threat model, attack vectors, mitigations |
+| 12 | [Quick Start](12-quickstart.md) | 1-minute launch, isolation levels, secret injection, policy basics |
+| 13 | [Reference Guide](13-reference.md) | Configuration, environment variables, CLI, SDK API, platform support |
+| 14 | [Governance Coverage](14-governance-coverage.md) | Per-mode enforcement matrix |
 | — | [Changelog](CHANGELOG.md) | Roadmap, implementation log, architecture decisions |
 
 ---

@@ -13,7 +13,7 @@ Agent (any framework) → GVM Proxy → External APIs
 
 Single binary (~17MB). Single process. Zero code changes required.
 
-**Status**: v0.4 pre-release. [Security Model →](docs/12-security-model.md) | [30-min chaos stress test PASS](docs/09-test-report.md#910-chaos-stress-test-30-minutes)
+**Status**: v0.4 pre-release. [Security Model →](docs/11-security-model.md) | [30-min chaos stress test PASS](docs/09-test-report.md#910-chaos-stress-test-30-minutes)
 
 ---
 
@@ -53,7 +53,7 @@ gvm run my_agent.py
 gvm run --sandbox my_agent.py    # Linux: namespace + seccomp + MITM
 ```
 
-**That's it.** Watch → suggest → enforce. [Detailed guide →](docs/15-quickstart.md)
+**That's it.** Watch → suggest → enforce. [Detailed guide →](docs/12-quickstart.md)
 
 ---
 
@@ -108,7 +108,7 @@ GVM provides MCP tools for AI assistants. Claude Desktop can check policies, fet
 
 ```bash
 # Start proxy, then configure Claude Desktop to use GVM MCP server
-# See: docs/15-quickstart.md#7-mcp-integration--claude-desktop--cursor
+# See: docs/12-quickstart.md#7-mcp-integration--claude-desktop--cursor
 ```
 
 ---
@@ -139,7 +139,7 @@ The proxy cross-checks what the agent *says* it's doing (`@ic`) against what it 
 | **Enforcement** | Inside the model | Before/after model | **Between agent and APIs** |
 | **Audit** | Provider logs (you don't own) | Prompt logs | **Merkle WAL (you own)** |
 
-LLM safety says "don't generate harmful text." GVM says "don't call `DELETE /production`." [Full analysis →](docs/11-competitive-analysis.md)
+LLM safety says "don't generate harmful text." GVM says "don't call `DELETE /production`." [Full analysis →](docs/10-competitive-analysis.md)
 
 ---
 
@@ -147,13 +147,13 @@ LLM safety says "don't generate harmful text." GVM says "don't call `DELETE /pro
 
 | Doc | What it covers |
 |-----|----------------|
-| [Quick Start](docs/15-quickstart.md) | First-time setup, isolation modes |
-| [Reference](docs/16-reference.md) | CLI, config, API, CI/CD integration |
+| [Quick Start](docs/12-quickstart.md) | First-time setup, isolation modes |
+| [Reference](docs/13-reference.md) | CLI, config, API, CI/CD integration |
 | [SRR Rules](docs/03-srr.md) | URL/method/path matching syntax |
-| [Security Model](docs/12-security-model.md) | Threat model, known attack surface |
+| [Security Model](docs/11-security-model.md) | Threat model, known attack surface |
 | [Architecture](docs/00-overview.md) | 3-layer design, Merkle WAL, enforcement decisions |
-| [Governance Coverage](docs/17-governance-coverage.md) | Per-mode enforcement matrix |
-| [Competitive Analysis](docs/11-competitive-analysis.md) | vs Lakera, Prompt Armor, OPA, OpenAI safety |
+| [Governance Coverage](docs/14-governance-coverage.md) | Per-mode enforcement matrix |
+| [Competitive Analysis](docs/10-competitive-analysis.md) | vs Lakera, Prompt Armor, OPA, OpenAI safety |
 | [Changelog](docs/CHANGELOG.md) | Roadmap, implementation log |
 
 ---

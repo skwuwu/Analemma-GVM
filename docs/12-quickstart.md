@@ -268,11 +268,11 @@ Claude: "I can't delete repositories — that operation is blocked by governance
 
 | Want to... | Go to |
 |-----------|-------|
-| Configure policies, SRR rules, secrets | [Reference Guide →](16-reference.md) |
+| Configure policies, SRR rules, secrets | [Reference Guide →](13-reference.md) |
 | Understand the 3-layer architecture | [Architecture Overview →](00-overview.md) |
 | Connect Claude Desktop / Cursor via MCP | [Section 7 above](#7-mcp-integration--claude-desktop--cursor) |
 | See the full SDK API (`@ic`, `GVMAgent`, errors) | [Python SDK →](07-sdk.md) |
 | Write custom SRR rules | [Network SRR →](03-srr.md) |
 | Write ABAC policies | [ABAC Policy →](02-policy.md) |
-| Validate policies in CI/CD | [CI/CD Guide →](16-reference.md#cicd-policy-validation) |
+| Validate policies in CI/CD | [CI/CD Guide →](13-reference.md#cicd-policy-validation) |
 | Run tests | `cargo test --workspace --all-targets` |

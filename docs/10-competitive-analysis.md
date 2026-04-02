@@ -98,4 +98,4 @@ GVM occupies the **action governance** layer — between the agent runtime and e
 
 ---
 
-[← Security Model](12-security-model.md) | [Overview →](00-overview.md)
+[← Security Model](11-security-model.md) | [Overview →](00-overview.md)
