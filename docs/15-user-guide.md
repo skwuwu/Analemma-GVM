@@ -1,12 +1,10 @@
 # GVM User Guide
 
-Complete guide to using Analemma GVM — from first run to production deployment.
-
 ---
 
 ## 1. Running Agents
 
-### Basic (Cooperative Mode)
+### Cooperative Mode
 
 ```bash
 gvm run my_agent.py                    # Python script
@@ -14,79 +12,74 @@ gvm run -- node my_agent.js            # Node.js binary
 gvm run -- openclaw gateway            # Any binary + args
 ```
 
-The proxy sets `HTTP_PROXY` and `HTTPS_PROXY` so HTTP-based agents route through governance automatically. No code changes needed.
+에이전트의 HTTP 트래픽이 프록시를 통해 거버넌스됩니다. 코드 변경 불필요.
 
-**Output:**
+**출력:**
 ```
-  Analemma-GVM — Agent Governance Monitor
-
   Agent ID:     agent-001
   Security layers active:
     ✓ Layer 2: Enforcement Proxy
-    ○ Layer 3: OS Containment (add --sandbox or --contained)
+    ○ Layer 3: OS Containment (add --sandbox)
 
   --- Agent output below ---
   [agent runs here]
 
-  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  GVM Audit Trail — 5 events captured
-  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    ✓ gvm.data.read              Allow               GET api.github.com
-    ⏱ gvm.messaging.send         Delay { ms: 300 }   POST slack.com
-    ✗ gvm.payment.charge         Deny                POST api.bank.com
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  GVM Audit Trail — 5 events
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ✓ Allow    GET  api.github.com
+    ⏱ Delay    POST slack.com
+    ✗ Deny     POST api.bank.com
 
   3 allowed  1 delayed  1 blocked
 ```
 
-### Sandbox Mode (Linux — Full Isolation)
+> **참고:** Node.js는 `HTTPS_PROXY`를 무시합니다. HTTPS 관찰이 필요하면 `--sandbox`를 사용하세요.
+
+### Sandbox Mode
 
 ```bash
 sudo gvm run --sandbox my_agent.py
-sudo gvm run --sandbox -- node my_agent.js
 ```
 
-Adds kernel isolation: PID namespace, mount namespace, veth network, seccomp-BPF, eBPF TC filter. Agent cannot bypass the proxy — all HTTPS traffic is intercepted via DNAT + MITM.
+에이전트가 프록시를 우회할 수 없는 격리 환경에서 실행됩니다. Linux에서만 작동하며 sudo가 필요합니다.
 
-**Options:**
 ```bash
---sandbox-timeout 300       # Kill agent after 5 minutes (default: 3600)
---no-mitm                   # Disable HTTPS interception (CONNECT relay only)
---memory 256m               # cgroup memory limit
---cpus 0.5                  # cgroup CPU limit
---fs-governance             # Enable file change review (see §6)
+--sandbox-timeout 300       # 5분 후 강제 종료 (기본: 3600)
+--no-mitm                   # HTTPS 검사 비활성화
+--memory 256m               # 메모리 제한
+--cpus 0.5                  # CPU 제한
+--fs-governance             # 파일 변경 거버넌스 (§6 참고)
 ```
 
-### Watch Mode (Observation Only)
+### Watch Mode
 
 ```bash
-gvm watch my_agent.py                     # Allow-all, observe traffic
-gvm watch --with-rules my_agent.py        # Apply existing rules while watching
-gvm watch --sandbox --output json \       # Sandbox + JSON output for piping
+gvm watch my_agent.py                     # 모든 요청 허용, 트래픽 관찰
+gvm watch --with-rules my_agent.py        # 기존 룰 적용하면서 관찰
+gvm watch --sandbox --output json \       # JSON 출력
   -- node agent.js
 ```
 
-Watch mode temporarily sets all rules to Allow, runs the agent, and shows every HTTP request in real-time:
-
+실시간 트래픽 표시:
 ```
-  TIME      METHOD HOST                          PATH                     ST  TOKENS
-  ────────────────────────────────────────────────────────────────────────────────
-  14:23:01  ✓ POST   api.anthropic.com             /v1/messages             200  [1,234 tokens]
-  14:23:05  ⏱ GET    raw.githubusercontent.com     /torvalds/linux/master.. 301
-  14:23:06  ✓ GET    api.github.com                /repos/torvalds/linux/c.. 200
+  14:23:01  ✓ POST  api.anthropic.com    /v1/messages       200  [1,234 tokens]
+  14:23:05  ⏱ GET   raw.githubusercontent /torvalds/linux..  301
+  14:23:06  ✓ GET   api.github.com       /repos/torvalds..  200
 ```
 
-Session summary at exit shows host frequency, decisions, token cost estimate, and anomaly warnings (burst detection, loop detection, unknown hosts).
+종료 시 호스트 빈도, 결정 분포, 토큰 비용 추정, 이상 탐지(burst, loop, unknown host) 요약.
 
 ---
 
-## 2. Policy Configuration
+## 2. 정책 설정
 
-### SRR Rules — URL Pattern Matching (`config/srr_network.toml`)
+### SRR 룰 — URL 패턴 매칭 (`config/srr_network.toml`)
 
-SRR (Static Request Rules) match requests by host, path, and method. No SDK needed — works with any agent.
+SDK 없이 작동. 모든 언어의 에이전트에 적용됩니다.
 
 ```toml
-# Allow GitHub read operations
+# GitHub 읽기 허용
 [[rules]]
 pattern = "api.github.com"
 path_regex = "^/repos/[^/]+/[^/]+/commits$"
@@ -94,47 +87,49 @@ method = "GET"
 decision = { type = "Allow" }
 reason = "List commits (read-only)"
 
-# Block wire transfers
+# 송금 차단
 [[rules]]
 pattern = "api.bank.com"
 path_regex = "/transfer/.*"
 method = "POST"
 decision = { type = "Deny", reason = "Wire transfers blocked" }
 
-# Delay unknown APIs for audit
+# 나머지: 지연 후 허용 (감사 추적 보장)
 [[rules]]
 pattern = "{any}"
 method = "*"
 decision = { type = "Delay", milliseconds = 300 }
 ```
 
-**Pattern types:**
-- `pattern = "api.github.com"` — exact host match
-- `pattern = "api.github.com/{any}"` — host + any path
-- `pattern = "{any}"` — catch-all (Default-to-Caution)
+**패턴:**
+- `"api.github.com"` — 정확한 호스트
+- `"api.github.com/{any}"` — 호스트 + 모든 경로
+- `"{any}"` — 모든 요청 (Default-to-Caution)
 
-**Decision types:**
-- `Allow` — pass immediately
-- `Delay { milliseconds: N }` — pause then pass (audit trail guaranteed)
-- `Deny { reason: "..." }` — block with 403 + structured error
-- `RequireApproval { urgency: "High" }` — hold for human approval (IC-3)
-- `Throttle { max_per_minute: N }` — rate limit
-- `AuditOnly { alert_level: "Medium" }` — pass but flag for review
+**결정 유형:**
+| 유형 | 동작 |
+|------|------|
+| `Allow` | 즉시 통과 |
+| `Delay { milliseconds: N }` | N ms 지연 후 통과 |
+| `Deny { reason: "..." }` | 403으로 차단 |
+| `RequireApproval { urgency: "High" }` | 사람 승인 대기 |
+| `Throttle { max_per_minute: N }` | 분당 N회 제한 |
+| `AuditOnly { alert_level: "Medium" }` | 통과하되 경고 |
 
-**Hot-reload:** Edit the file, call `POST /gvm/reload` or wait for auto-detect. No proxy restart needed.
+**핫 리로드:** 파일 수정 후 `POST /gvm/reload` 호출. 프록시 재시작 불필요.
 
-**Query strings:** Automatically stripped before regex matching. `^/commits$` matches `/commits?per_page=5`.
+**쿼리 스트링:** 자동으로 분리됩니다. `^/commits$`가 `/commits?per_page=5`에 매칭됩니다.
 
-### ABAC Policies — Semantic Rules (`config/policies/`)
+### ABAC 정책 (`config/policies/`)
 
-ABAC (Attribute-Based Access Control) evaluates operation metadata from the SDK. Requires `@ic` decorator in Python or equivalent SDK headers.
+SDK(`@ic` 데코레이터)와 함께 사용합니다.
 
 ```toml
-# config/policies/global.toml — applies to ALL agents
+# config/policies/global.toml
 
 [[rules]]
 id = "block-critical-delete"
-priority = 1                    # Lower number = higher priority
+priority = 1
 layer = "Global"
 description = "Block critical data deletion"
 
@@ -149,15 +144,15 @@ type = "Deny"
 reason = "Critical data deletion is forbidden"
 ```
 
-**Hierarchy:** Global > Tenant > Agent. Lower layers can only be **stricter**, never more permissive. `Deny` at Global cannot be overridden to `Allow` by an agent policy.
-
-**Tenant/Agent policies:**
+**정책 파일 구조:**
 ```
 config/policies/
-  global.toml           # Applies to everyone
-  tenant-acme.toml      # Applies to tenant "acme" agents
-  agent-finance-001.toml  # Applies to specific agent
+  global.toml             # 모든 에이전트에 적용
+  tenant-acme.toml        # "acme" 테넌트에 적용
+  agent-finance-001.toml  # 특정 에이전트에 적용
 ```
+
+하위 레이어는 상위보다 **엄격해질 수만** 있고, 완화할 수 없습니다.
 
 ### Credential Injection (`config/secrets.toml`)
 
@@ -170,150 +165,107 @@ token = "sk_live_your_stripe_key"
 type = "ApiKey"
 header = "x-api-key"
 value = "SG.your_sendgrid_key"
-
-[credentials."api.github.com"]
-type = "OAuth2"
-access_token = "gho_your_github_token"
-refresh_token = "ghr_refresh"
-expires_at = "2027-01-01T00:00:00Z"
 ```
 
-**How it works:**
-| Agent sends | secrets.toml has host? | Result |
-|-------------|----------------------|--------|
-| No auth header | Yes | Proxy injects key |
-| Own auth header | Yes | Proxy **replaces** with managed key |
-| Own auth header | No | Agent's key passes through |
-| No auth header | No | No auth (API may reject) |
+| 에이전트 코드 | secrets.toml에 호스트 있음? | 결과 |
+|-------------|------------------------|------|
+| 키 없이 요청 | 있음 | 프록시가 키 주입 |
+| 자체 키로 요청 | 있음 | 프록시 키로 **교체** |
+| 자체 키로 요청 | 없음 | 에이전트 키 그대로 통과 |
+| 키 없이 요청 | 없음 | 인증 없이 전송 |
 
-**Scope:** HTTP headers only. LLM SDKs (Anthropic, OpenAI) require keys at initialization — use `ANTHROPIC_API_KEY` env var for that. Credential injection is for **tool API calls** the agent makes after LLM response.
+> **범위:** HTTP 헤더만. LLM SDK(Anthropic, OpenAI)는 초기화 시 키가 필요하므로 `ANTHROPIC_API_KEY` 환경변수를 사용하세요. Credential injection은 LLM 응답 후 에이전트가 하는 **도구 API 호출**에 적용됩니다.
 
 ---
 
-## 3. Debugging & Troubleshooting
+## 3. 트러블슈팅
 
-### Agent Got Blocked (403 Deny)
-
-1. **Check what happened:**
-   ```bash
-   gvm events list --agent my-agent --since 5m
-   ```
-
-2. **Dry-run the same request:**
-   ```bash
-   gvm check --operation gvm.payment.charge \
-     --host api.bank.com --method POST
-   ```
-   Output shows decision path: `Policy(Allow) + SRR(Deny) → Final(Deny)`, matched rule ID, and engine latency.
-
-3. **Fix the policy:**
-   - Edit `config/srr_network.toml` to change the rule
-   - Or add a more specific Allow rule with higher priority
-   - Rules hot-reload — no restart needed
-
-### Agent Got Delayed (300ms)
-
-This is **Default-to-Caution** — the URL didn't match any explicit SRR rule. The proxy delays and audits rather than silently allowing.
-
-1. **Find which hosts hit Default-to-Caution:**
-   ```bash
-   gvm events list --since 1h | grep "default_caution"
-   ```
-
-2. **Add an explicit rule:**
-   ```toml
-   [[rules]]
-   pattern = "catfact.ninja/{any}"
-   method = "GET"
-   decision = { type = "Allow" }
-   reason = "Public API — cat facts"
-   ```
-
-3. **Or discover all patterns automatically:**
-   ```bash
-   gvm watch --output json agent.py > session.jsonl
-   gvm suggest --from session.jsonl --output new-rules.toml
-   ```
-
-### Proxy Not Starting
+### 에이전트가 차단됨 (403 Deny)
 
 ```bash
-gvm run agent.py
-# "Proxy not reachable at http://127.0.0.1:8080. Starting..."
-# If it hangs: check data/proxy.log
+# 1. 무슨 일이 있었는지 확인
+gvm events list --agent my-agent --since 5m
+
+# 2. 같은 요청을 dry-run
+gvm check --operation gvm.payment.charge --host api.bank.com --method POST
+
+# 3. 정책 수정 (srr_network.toml 편집 → 핫 리로드)
+```
+
+### 에이전트가 지연됨 (300ms Delay)
+
+URL이 SRR 룰에 매칭되지 않아 **Default-to-Caution**이 작동한 것입니다.
+
+```bash
+# 패턴 자동 발견
+gvm watch --output json agent.py > session.jsonl
+gvm suggest --from session.jsonl --output new-rules.toml
+
+# 또는 직접 룰 추가
+# config/srr_network.toml에:
+# [[rules]]
+# pattern = "catfact.ninja/{any}"
+# method = "GET"
+# decision = { type = "Allow" }
+```
+
+### 프록시가 안 뜸
+
+```bash
+# 로그 확인
 cat data/proxy.log | tail -20
-```
 
-Common issues:
-- Port 8080 already in use: `lsof -i :8080`
-- Config error: check `config/proxy.toml` syntax
-- Permission: sandbox requires `sudo`
+# 포트 충돌
+lsof -i :8080
 
-### Sandbox SSH Blocked (EC2)
-
-If sandbox iptables blocks SSH on EC2:
-```bash
-# From AWS console, reboot the instance
-# iptables rules are cleared on reboot
-# GVM now has FORWARD ESTABLISHED/RELATED protection (K1 fix)
+# sandbox는 sudo 필요
+sudo gvm run --sandbox agent.py
 ```
 
 ---
 
-## 4. CLI Command Reference
+## 4. CLI 명령어
 
 ### `gvm run`
 
-Run an agent with governance.
-
-```bash
+```
 gvm run [FLAGS] [--] <command...>
 
-FLAGS:
-  --sandbox              Linux kernel isolation (requires sudo)
-  --contained            Docker isolation (experimental)
-  --no-mitm              Disable HTTPS MITM inspection
-  --fs-governance        Enable file change governance (overlayfs)
-  --shadow-mode <MODE>   Intent verification: disabled|observe|strict
-  --sandbox-timeout <N>  Kill agent after N seconds (default: 3600)
-  --memory <SIZE>        Memory limit: 256m, 1g (default: 512m)
-  --cpus <N>             CPU limit: 0.5, 1.0 (default: 1.0)
-  -i, --interactive      Interactive SRR rule suggestion after run
-  --default-policy <P>   Override unmatched URL policy: allow|delay|deny
-  --agent-id <ID>        Agent identifier for audit trail
-  --proxy <URL>          Proxy address (default: http://127.0.0.1:8080)
+--sandbox              격리 환경 (sudo 필요)
+--no-mitm              HTTPS 검사 비활성화
+--fs-governance        파일 거버넌스 활성화
+--shadow-mode <MODE>   disabled | observe | strict
+--sandbox-timeout <N>  초 (기본: 3600)
+--memory <SIZE>        256m, 1g (기본: 512m)
+--cpus <N>             0.5, 1.0 (기본: 1.0)
+-i, --interactive      실행 후 룰 제안
+--default-policy <P>   allow | delay | deny
+--agent-id <ID>        에이전트 식별자
+--proxy <URL>          프록시 주소 (기본: http://127.0.0.1:8080)
 ```
 
 ### `gvm watch`
 
-Observe agent API calls without enforcement.
-
-```bash
+```
 gvm watch [FLAGS] [--] <command...>
 
-FLAGS:
-  --with-rules           Apply existing SRR rules while watching
-  --sandbox              Run in sandbox (MITM for HTTPS visibility)
-  --output <FORMAT>      text (default) or json
+--with-rules           기존 룰 적용하면서 관찰
+--sandbox              sandbox에서 관찰
+--output <FORMAT>      text (기본) | json
 ```
 
 ### `gvm check`
 
-Dry-run policy evaluation — test what decision the proxy would make.
+정책 dry-run — 실제 요청 없이 결정 확인.
 
 ```bash
-gvm check --operation <OP> --host <HOST> --method <METHOD> [--path <PATH>]
-
-# Examples:
 gvm check --operation gvm.payment.charge --host api.bank.com --method POST
 gvm check --operation test --host api.github.com --method GET --path /repos
 ```
 
-Output: decision, matched rule, decision path (ABAC + SRR → max_strict), engine latency in microseconds.
+출력: 결정, 매칭된 룰, 결정 경로, 엔진 지연시간.
 
 ### `gvm events`
-
-Query the audit trail.
 
 ```bash
 gvm events list [--agent <ID>] [--since <DURATION>] [--format json]
@@ -322,122 +274,101 @@ gvm events trace --trace-id <UUID>
 
 ### `gvm audit`
 
-WAL integrity verification and export.
-
 ```bash
-gvm audit verify [--wal data/wal.log]     # Check Merkle chain integrity
-gvm audit export [--since 1h] [--format jsonl] [--wal data/wal.log]
+gvm audit verify [--wal data/wal.log]
+gvm audit export [--since 1h] [--format jsonl]
 ```
 
-`verify` output:
+출력 예시:
 ```
-OK: WAL integrity verified. No issues found.
-  Events: 635, Batches: 42, Chain: intact
+OK: WAL integrity verified. Events: 635, Batches: 42, Chain: intact
 ```
-Or on tampering:
 ```
-TAMPER DETECTED: 2 event(s) have invalid hashes.
-  Batch 7: merkle root mismatch
+TAMPER DETECTED: 2 event(s) have invalid hashes. Batch 7: merkle root mismatch
 ```
 
 ### `gvm stats`
 
-Agent usage statistics.
-
 ```bash
-gvm stats tokens [--agent <ID>] [--since 1h]    # Token usage per agent
-gvm stats rollback-savings [--since 24h]          # Tokens saved by governance
+gvm stats tokens [--agent <ID>] [--since 1h]
+gvm stats rollback-savings [--since 24h]
 ```
 
 ### `gvm suggest`
-
-Generate SRR rules from watch session.
 
 ```bash
 gvm suggest --from session.jsonl [--output rules.toml] [--decision allow]
 ```
 
-Reads a JSON session log (from `gvm watch --output json`) and generates TOML rules for all URLs that hit Default-to-Caution.
+`gvm watch --output json`의 결과에서 Default-to-Caution에 걸린 URL의 TOML 룰을 생성합니다.
 
 ### `gvm cleanup`
 
-Remove orphaned sandbox resources.
-
 ```bash
-gvm cleanup                # Clean up crashed sandbox remnants
-gvm cleanup --dry-run      # Show what would be cleaned
+gvm cleanup              # 이전 크래시의 잔여 리소스 정리
+gvm cleanup --dry-run    # 정리 대상만 표시
 ```
 
 ### `gvm init`
 
-Initialize configuration from industry templates.
-
 ```bash
-gvm init --industry saas          # SaaS template (Stripe, Slack, etc.)
-gvm init --industry healthcare    # HIPAA-aware defaults
+gvm init --industry saas          # SaaS 템플릿
+gvm init --industry healthcare    # HIPAA 기본값
 ```
 
 ---
 
-## 5. Shadow Mode (Intent Verification)
-
-Shadow Mode adds 2-phase verification: the agent declares what it's about to do, then the proxy verifies the actual request matches.
+## 5. Shadow Mode
 
 ```bash
 gvm run --shadow-mode strict -- node agent.js
 ```
 
-| Mode | Unmatched request | Use case |
-|------|------------------|----------|
-| `disabled` | Normal processing | Default |
-| `observe` | Allow + audit warning | Testing shadow mode |
-| `strict` | Deny (403) | Production — no undeclared API calls |
+| 모드 | 미선언 요청 | 용도 |
+|------|-----------|------|
+| `disabled` | 일반 처리 | 기본값 |
+| `observe` | 허용 + 감사 경고 | 테스트 |
+| `strict` | 거부 (403) | 프로덕션 |
 
-**MCP integration:** `gvm_declare_intent` tool registers intent before API calls. See [MCP section](12-quickstart.md#7-mcp-integration--claude-desktop--cursor).
+MCP 연동: `gvm_declare_intent` 도구로 intent 등록 후 API 호출. [MCP 섹션 →](12-quickstart.md#7-mcp-integration--claude-desktop--cursor)
 
 ---
 
-## 6. Filesystem Governance (Trust-on-Pattern)
-
-When using `--sandbox --fs-governance`, the agent's file changes are captured via overlayfs and reviewed at session end.
+## 6. 파일 거버넌스 (Trust-on-Pattern)
 
 ```bash
 sudo gvm run --sandbox --fs-governance my_agent.py
 ```
 
-**Classification:**
+에이전트의 파일 변경을 세션 종료 시 분류하고 검토합니다.
 
-| Change | Pattern | Action |
-|--------|---------|--------|
-| Created file | `*.csv, *.pdf, *.txt` | Auto-merged to workspace |
-| Created file | `*.sh, *.py, *.json` | Needs manual review |
-| Created file | `*.log, __pycache__/*` | Discarded |
-| Modified file | (any) | Always needs review |
-| Deleted file | (any) | Always needs review |
+| 변경 | 패턴 | 처리 |
+|------|------|------|
+| 새 파일 | `*.csv, *.pdf, *.txt` | 자동 복사 |
+| 새 파일 | `*.sh, *.py, *.json` | 수동 검토 |
+| 새 파일 | `*.log, __pycache__/*` | 폐기 |
+| 수정된 파일 | (모든 패턴) | 수동 검토 |
+| 삭제된 파일 | (모든 패턴) | 수동 검토 |
 
-**Interactive review (TTY):**
+**TTY:**
 ```
   ── File Changes ──
     Created:  output.csv (12KB)  auto-merged → workspace/output.csv
-    Created:  analysis.py (2KB)  needs review (manual_commit: *.py)
-    Discarded: 3 file(s)
+    Created:  analysis.py (2KB)  needs review (*.py)
 
   [1/1] analysis.py (Created, 2KB)
   +#!/usr/bin/env python3
   +import pandas as pd
-  +df = pd.read_csv('output.csv')
 
   (a)ccept  (r)eject  (s)kip all → a
   ✓ analysis.py → workspace/analysis.py
 ```
 
-**CI/CD (non-TTY):** Files staged to `data/sandbox-staging/`, printed path for later `gvm fs approve`.
+**CI/CD:** 파일이 `data/sandbox-staging/`에 보존됩니다. `gvm fs approve`로 나중에 처리.
 
 ---
 
-## 7. CI/CD Integration
-
-### Policy Validation in CI
+## 7. CI/CD 통합
 
 ```yaml
 # GitHub Actions
@@ -445,37 +376,34 @@ sudo gvm run --sandbox --fs-governance my_agent.py
   run: |
     gvm-proxy &
     sleep 2
-    # Critical endpoints must be blocked
     gvm check --operation gvm.payment.charge --host api.bank.com --method POST \
       | grep -q "Deny" || exit 1
-    # Read access must be allowed
     gvm check --operation gvm.storage.read --host api.github.com --method GET \
       | grep -q "Allow" || exit 1
 ```
 
-### Watch Mode for Pattern Discovery
+### 패턴 발견 + 룰 생성
 
 ```bash
 gvm watch --output json agent.py > session.jsonl
 gvm suggest --from session.jsonl --decision allow > new-rules.toml
-# Review new-rules.toml, merge into srr_network.toml
 ```
 
 ---
 
-## 8. Production Checklist
+## 8. 프로덕션 체크리스트
 
-- [ ] Remove `[dev] host_overrides` from proxy.toml
-- [ ] Set `GVM_SECRETS_KEY` for vault encryption
-- [ ] Set `GVM_VAULT_KEY` for state encryption
-- [ ] Configure NATS for WAL replication (proxy.toml `[nats]`)
-- [ ] Set credential policy to `Deny` (not Passthrough) in production
-- [ ] Enable `--shadow-mode strict` for intent verification
-- [ ] Set file permissions: `chmod 600 config/secrets.toml`
-- [ ] Review SRR rules: no catch-all Allow, Default-to-Caution is Delay
-- [ ] Set up monitoring: `gvm stats tokens` + `gvm audit verify` in cron
-- [ ] Test with `gvm check` before deploying policy changes
+- [ ] `proxy.toml`에서 `[dev] host_overrides` 제거
+- [ ] `GVM_SECRETS_KEY` 설정 (vault 암호화)
+- [ ] `GVM_VAULT_KEY` 설정 (state 암호화)
+- [ ] NATS WAL 복제 설정 (`proxy.toml [nats]`)
+- [ ] credential 정책을 `Deny`로 변경 (Passthrough 아님)
+- [ ] `--shadow-mode strict` 활성화
+- [ ] `chmod 600 config/secrets.toml`
+- [ ] SRR 룰 검토: catch-all Allow 없는지, Default-to-Caution이 Delay인지
+- [ ] 모니터링: `gvm stats tokens` + `gvm audit verify` 크론 설정
+- [ ] 배포 전 `gvm check`로 정책 검증
 
 ---
 
-[← Quick Start](12-quickstart.md) | [Reference](13-reference.md) | [Architecture](00-overview.md)
+> **내부 동작 원리**가 궁금하다면: [Architecture Overview](00-overview.md) | [SRR 설계](03-srr.md) | [ABAC 정책 엔진](02-policy.md) | [Merkle WAL](04-ledger.md) | [Security Model](11-security-model.md) | [Governance Coverage](14-governance-coverage.md)
