@@ -8,12 +8,14 @@ You don't need to write rules. GVM learns from your agent's traffic and suggests
 # 1. Watch — see what your agent calls (no rules needed)
 gvm watch my_agent.py
 
-# 2. Suggest — auto-generate rules from observed traffic
-gvm suggest --from session.jsonl > config/srr_network.toml
+# 2. Suggest — auto-generate rules from the audit log
+gvm suggest --from data/wal.log > config/srr_network.toml
 
 # 3. Run — enforce the generated rules
 gvm run my_agent.py
 ```
+
+Step 1 records every API call to the audit log (`data/wal.log`). Step 2 reads that log and generates Allow rules for every URL that was seen. Step 3 enforces those rules — anything not in the list gets delayed and flagged.
 
 That's the entire workflow. Everything below is optional — use it when you need it.
 
@@ -73,11 +75,15 @@ Rules are written directly to `srr_network.toml`. No manual editing needed.
 ### `gvm suggest`
 
 ```bash
+# After running gvm watch or gvm run, the audit log has all observed traffic:
+gvm suggest --from data/wal.log > new-rules.toml
+
+# Or from a JSON session log (for explicit capture):
 gvm watch --output json my_agent.py > session.jsonl
 gvm suggest --from session.jsonl --decision allow > new-rules.toml
 ```
 
-Reads a watch session log and generates TOML rules for every URL that hit Default-to-Caution. Review the file, then merge into `config/srr_network.toml`.
+Reads the audit log (or a watch JSON log) and generates TOML rules for every URL that hit Default-to-Caution. Review the file, then merge into `config/srr_network.toml`.
 
 ---
 
@@ -242,7 +248,7 @@ gvm check --host api.bank.com --method POST       # Dry-run same request
 
 ### Agent Delayed (300ms)
 
-URL didn't match any rule — Default-to-Caution. Run `gvm watch` + `gvm suggest` to discover and add rules.
+URL didn't match any rule — Default-to-Caution. Run `gvm watch` then `gvm suggest --from data/wal.log` to discover and add rules.
 
 ### Proxy Won't Start
 

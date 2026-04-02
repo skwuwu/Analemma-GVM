@@ -40,17 +40,14 @@ One architectural choice produces all of these: **govern actions at the network 
 git clone https://github.com/skwuwu/Analemma-GVM.git && cd Analemma-GVM
 cargo build --release
 
-# Step 1: Observe — see what your agent calls
-gvm run --watch my_agent.py
+# Step 1: Watch — see what your agent calls
+gvm watch my_agent.py
 
-# Step 2: Generate rules from what you observed
-gvm suggest --from session.jsonl --output config/srr_network.toml
+# Step 2: Generate rules from the audit log
+gvm suggest --from data/wal.log > config/srr_network.toml
 
 # Step 3: Enforce — block what you didn't approve
 gvm run my_agent.py
-
-# Step 4 (production): Kernel-level isolation
-gvm run --sandbox my_agent.py    # Linux: namespace + seccomp + MITM
 ```
 
 **That's it.** Watch → suggest → enforce. [Quick Start →](docs/12-quickstart.md) | [Full User Guide →](docs/15-user-guide.md)
