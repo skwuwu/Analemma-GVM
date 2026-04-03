@@ -285,106 +285,72 @@ fn create_dev_nodes(new_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Resolve shared library dependencies and bind-mount them.
+/// Mount host userland into sandbox: /usr, /lib, /lib64, /bin read-only.
+///
+/// This provides a complete runtime environment (shells, coreutils, SSL config,
+/// shared libraries, locale data) so agents work the same as outside the sandbox.
+/// Security is maintained by: read-only mount (agent can't modify), seccomp
+/// blocks mount/umount (can't remount rw), pivot_root removes old_root (no
+/// access to host paths outside /usr /lib /bin).
+///
+/// This matches Docker's approach: complete userland, restricted capabilities.
+/// Previously we mounted only the interpreter + ldd-resolved libraries, which
+/// broke agents that spawn subprocesses (bash ENOENT), use SSL config
+/// (openssl.cnf missing), or expect coreutils (cat, ls, grep).
 fn bind_mount_interpreter(
     new_root: &Path,
     interpreter_path: &Path,
-    extra_lib_paths: &[PathBuf],
+    _extra_lib_paths: &[PathBuf],
 ) -> Result<()> {
-    // Track mounted libraries by CANONICAL path to prevent duplicate bind mounts.
-    // Mounting the same file twice (mount-on-mount) triggers a kernel panic on 6.17.0-1009-aws.
-    // Using canonicalize() resolves symlinks so that e.g. /usr/lib/libssl.so and
-    // /lib/x86_64-linux-gnu/libssl.so.3 (same inode via symlink) are detected as duplicates.
-    let mut mounted: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-
-    // Bind-mount the interpreter binary
-    let interpreter_name = interpreter_path
-        .file_name()
-        .context("Invalid interpreter path")?;
-    let target_bin = new_root.join("bin").join(interpreter_name);
-    std::fs::write(&target_bin, "").context("Failed to create interpreter mount point")?;
-    mount(
-        Some(interpreter_path),
-        &target_bin,
-        None::<&str>,
-        MsFlags::MS_BIND | MsFlags::MS_RDONLY,
-        None::<&str>,
-    )
-    .context("Failed to bind-mount interpreter")?;
-
-    // Always bind-mount /bin/sh and /bin/bash (if they exist on host).
-    // Agent frameworks (OpenClaw, LangChain) spawn sub-processes via shell.
-    // Without these, exec("/bin/bash") fails with ENOENT inside sandbox.
-    // Read-only mount + seccomp ensures shell access is safe.
-    for shell in &["/bin/sh", "/bin/bash"] {
-        let src = Path::new(shell);
+    // Mount complete host directories read-only.
+    // /usr: binaries, libraries, Python/Node/Ruby stdlib, SSL certs, locale
+    // /lib, /lib64: shared libraries (libc, libssl, ld-linux)
+    // /bin: shells (bash, sh, dash), coreutils (cat, ls, grep, env)
+    for dir in &["/usr", "/lib", "/lib64", "/bin", "/sbin"] {
+        let src = Path::new(dir);
         if !src.exists() {
             continue;
         }
-        let name = src.file_name().unwrap_or_default();
-        let target = new_root.join("bin").join(name);
-        if target.exists() {
-            continue; // Already mounted (e.g., interpreter IS bash)
-        }
-        std::fs::write(&target, "").ok();
-        mount(
+        let dst = new_root.join(dir.trim_start_matches('/'));
+        std::fs::create_dir_all(&dst).ok();
+        if let Err(e) = mount(
             Some(src),
-            &target,
+            &dst,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+            None::<&str>,
+        ) {
+            tracing::warn!(dir = %src.display(), error = %e, "Failed to mount host directory");
+            continue;
+        }
+        // Two-step remount for read-only enforcement
+        mount(
+            None::<&str>,
+            &dst,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_RDONLY | MsFlags::MS_REMOUNT,
+            None::<&str>,
+        )
+        .ok();
+    }
+
+    // Ensure interpreter is accessible at /bin/<name> (may already be via /bin mount)
+    let interpreter_name = interpreter_path
+        .file_name()
+        .context("Invalid interpreter path")?;
+    let bin_path = new_root.join("bin").join(interpreter_name);
+    if !bin_path.exists() {
+        // Interpreter not in /bin (e.g., /usr/local/bin/python3) — add symlink-like mount
+        std::fs::write(&bin_path, "").ok();
+        mount(
+            Some(interpreter_path),
+            &bin_path,
             None::<&str>,
             MsFlags::MS_BIND | MsFlags::MS_RDONLY,
             None::<&str>,
         )
-        .ok(); // Best-effort — don't fail sandbox if shell mount fails
+        .ok();
     }
-
-    // Resolve shared libraries via ldd
-    let ldd_output = std::process::Command::new("ldd")
-        .arg(interpreter_path)
-        .output();
-
-    match ldd_output {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let libs: Vec<PathBuf> = parse_ldd_output(&stdout);
-            for lib_path in libs {
-                let canonical = lib_path.canonicalize().unwrap_or_else(|_| lib_path.clone());
-                if mounted.insert(canonical) {
-                    bind_mount_library(new_root, &lib_path).ok();
-                }
-            }
-        }
-        _ => {
-            // Fallback: bind-mount common library directories (less isolated but functional)
-            tracing::warn!("ldd failed — falling back to bind-mounting /usr and /lib");
-            for dir in &["/usr", "/lib", "/lib64"] {
-                let src = Path::new(dir);
-                if src.exists() {
-                    let dst = new_root.join(dir.trim_start_matches('/'));
-                    mount(
-                        Some(src),
-                        &dst,
-                        None::<&str>,
-                        MsFlags::MS_BIND | MsFlags::MS_RDONLY,
-                        None::<&str>,
-                    )
-                    .ok();
-                }
-            }
-        }
-    }
-
-    // Bind-mount extra libraries pre-resolved by the parent process.
-    // Skip any already mounted by interpreter's direct ldd (prevents mount-on-mount panic
-    // on Linux 6.17.0-1009-aws — duplicate bind mounts trigger kernel panic).
-    for lib_path in extra_lib_paths {
-        let canonical = lib_path.canonicalize().unwrap_or_else(|_| lib_path.clone());
-        if mounted.insert(canonical) {
-            bind_mount_library(new_root, lib_path).ok();
-        }
-    }
-
-    // Mount interpreter runtime directories (Python stdlib, etc.).
-    bind_mount_runtime_dirs(new_root, interpreter_path)?;
 
     Ok(())
 }
