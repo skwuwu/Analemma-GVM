@@ -596,7 +596,11 @@ fn child_entry(
     }
     std::env::set_var("GVM_AGENT_ID", &config.agent_id);
     std::env::set_var("GVM_PROXY_URL", &proxy_url);
-    std::env::set_var("HOME", "/workspace");
+    // HOME must be writable — agents (OpenClaw, npm, pip) create config/cache
+    // dirs under $HOME (.openclaw/, .npm/, .cache/, .config/). /workspace is
+    // read-only in legacy mode. /tmp is writable tmpfs (32MB) and all $HOME
+    // writes are temporary — cleaned up when sandbox exits.
+    std::env::set_var("HOME", "/tmp");
     std::env::set_var("TMPDIR", "/tmp");
     // Disable io_uring in Node.js — forces epoll fallback.
     // io_uring syscalls are not in seccomp whitelist (CVE history).
