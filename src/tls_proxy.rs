@@ -671,6 +671,120 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
             _ => {} // Allow, AuditOnly — pass through
         }
 
+        // 3.2. WebSocket Upgrade: if the request has Connection: Upgrade + Upgrade: websocket,
+        // SRR check was already done above. If allowed, relay the upgrade to upstream and switch
+        // to bidirectional blind relay (same as CONNECT). WebSocket frame content is not inspected
+        // — only the initial handshake host/path is governed.
+        let is_websocket_upgrade = req.headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("upgrade")
+                && std::str::from_utf8(v)
+                    .unwrap_or("")
+                    .eq_ignore_ascii_case("websocket")
+        });
+
+        if is_websocket_upgrade {
+            tracing::info!(
+                host = %host,
+                path = %req.path,
+                "MITM: WebSocket Upgrade detected — switching to bidirectional relay"
+            );
+
+            // WAL audit for the upgrade request
+            {
+                let event_id = uuid::Uuid::new_v4().to_string();
+                let trace_id = uuid::Uuid::new_v4().to_string();
+                let decision_str = format!("{:?}", classify_output.classification.decision);
+                let source_str = format!("{:?}", classify_output.classification.source);
+                let event = gvm_types::GVMEvent {
+                    event_id,
+                    trace_id,
+                    parent_event_id: None,
+                    agent_id: classify_output.agent_id.clone(),
+                    tenant_id: None,
+                    session_id: host.clone(),
+                    timestamp: chrono::Utc::now(),
+                    operation: format!("WS-UPGRADE {} {}", req.method, req.path),
+                    resource: gvm_types::ResourceDescriptor {
+                        service: host.clone(),
+                        identifier: Some(req.path.clone()),
+                        tier: gvm_types::ResourceTier::External,
+                        sensitivity: gvm_types::Sensitivity::Medium,
+                    },
+                    context: std::collections::HashMap::new(),
+                    transport: Some(gvm_types::TransportInfo {
+                        method: req.method.clone(),
+                        host: host.clone(),
+                        path: req.path.clone(),
+                        status_code: None,
+                    }),
+                    decision: decision_str,
+                    decision_source: source_str,
+                    matched_rule_id: classify_output.classification.matched_rule_id.clone(),
+                    enforcement_point: "mitm-ws-upgrade".to_string(),
+                    status: gvm_types::EventStatus::Pending,
+                    payload: gvm_types::PayloadDescriptor::default(),
+                    nats_sequence: None,
+                    event_hash: None,
+                    llm_trace: None,
+                    default_caution: is_default_caution,
+                };
+                state.ledger.append_durable(&event).await.ok();
+            }
+
+            // Connect to upstream and forward the original upgrade request
+            let upstream_host_str = host.split(':').next().unwrap_or(&host);
+            let connector = tokio_rustls::TlsConnector::from(client_config.clone());
+            let upstream_addr = format!("{}:443", upstream_host_str);
+            let upstream_tcp = match tokio::net::TcpStream::connect(&upstream_addr).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "MITM WebSocket: upstream connect failed"
+                    );
+                    break;
+                }
+            };
+            let server_name =
+                match rustls::pki_types::ServerName::try_from(upstream_host_str.to_string()) {
+                    Ok(sn) => sn,
+                    Err(_) => break,
+                };
+            let mut upstream_tls = match connector.connect(server_name, upstream_tcp).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "MITM WebSocket: upstream TLS failed"
+                    );
+                    break;
+                }
+            };
+
+            // Send original request (with Upgrade headers intact)
+            use tokio::io::AsyncWriteExt;
+            upstream_tls.write_all(&req.raw_head).await?;
+            if !req.body.is_empty() {
+                upstream_tls.write_all(&req.body).await?;
+            }
+
+            // Bidirectional relay (same as CONNECT blind_relay)
+            let (mut client_read, mut client_write) = tokio::io::split(tls_stream);
+            let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream_tls);
+            let c2u = tokio::io::copy(&mut client_read, &mut upstream_write);
+            let u2c = tokio::io::copy(&mut upstream_read, &mut client_write);
+            tokio::select! {
+                _ = c2u => {}
+                _ = u2c => {}
+            }
+
+            tracing::info!(
+                host = %host,
+                "MITM WebSocket: relay closed"
+            );
+            return Ok(());
+        }
+
         // 3.5. WAL audit record for MITM-inspected requests (sandbox observability).
         // Without this, gvm watch --sandbox sees no events because MITM-intercepted
         // traffic bypasses proxy_handler (which writes WAL). CONNECT tunnel setup
