@@ -77,3 +77,5 @@ Full specification: `docs/GVM_CODE_STANDARDS.md`
 - Every security claim needs a test. Every performance claim needs a benchmark.
 - Never claim more than implemented (e.g., "AES-GCM verified" not "Merkle verified" if Merkle isn't wired up).
 - Known limitations go in `security-model.md` with attack description + planned mitigation.
+- **Root cause first**: When a test or feature fails, always diagnose and fix the root cause. Never work around failures with superficial fixes (e.g., retry loops, mode switches, turn-based workarounds that mask the underlying issue). If sandbox mode fails, fix sandbox — don't fall back to cooperative mode and call it "tested".
+- **CLI-only testing**: Stress tests and E2E tests must interact with GVM exclusively through CLI commands (`gvm run`, `gvm check`, `gvm reload`, etc.) — never invoke proxy binaries directly, manipulate PID files, or call internal APIs. Tests should simulate real user workflows.
