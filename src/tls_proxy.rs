@@ -969,17 +969,25 @@ async fn relay_tls<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         upstream_tls.write_all(&req.body).await?;
     }
 
-    // Relay upstream response to client. SSE streaming (Anthropic /v1/messages
-    // with stream:true) sends chunks over minutes — LLM thinking can take 60s+
-    // between events. The idle timeout must be long enough to avoid killing
-    // active SSE streams. 5 minutes covers extended thinking + tool execution.
-    const UPSTREAM_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+    // Adaptive timeout for upstream relay:
+    // - Before first byte: 30s (detect upstream connect/response failure quickly)
+    // - After first byte:  5 min (SSE streaming — LLM thinking can take 60s+
+    //   between chunks, and killing an active stream wastes agent progress)
+    //
+    // This matches nginx proxy_read_timeout: fast failure detection for broken
+    // upstreams, but patience for slow-but-active streams.
+    const FIRST_BYTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    const STREAMING_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
     let mut buf = vec![0u8; 32768];
     let mut total_relayed: usize = 0;
     loop {
-        let n = match tokio::time::timeout(UPSTREAM_READ_TIMEOUT, upstream_tls.read(&mut buf)).await
-        {
+        let timeout = if total_relayed == 0 {
+            FIRST_BYTE_TIMEOUT
+        } else {
+            STREAMING_IDLE_TIMEOUT
+        };
+        let n = match tokio::time::timeout(timeout, upstream_tls.read(&mut buf)).await {
             Ok(Ok(0)) => break, // upstream closed
             Ok(Ok(n)) => n,
             Ok(Err(e)) => {
@@ -987,10 +995,14 @@ async fn relay_tls<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                 break;
             }
             Err(_) => {
-                tracing::debug!(
-                    bytes_relayed = total_relayed,
-                    "MITM: upstream read timeout (5m idle)"
-                );
+                if total_relayed == 0 {
+                    tracing::debug!("MITM: upstream first-byte timeout (30s)");
+                } else {
+                    tracing::debug!(
+                        bytes_relayed = total_relayed,
+                        "MITM: upstream streaming idle timeout (5m)"
+                    );
+                }
                 break;
             }
         };
