@@ -199,8 +199,9 @@ setup() {
 launch_agent() {
     local id=$1 prompt_file=$2 agent_id=$3
     local log="$RESULTS_DIR/agents/agent-${id}.log"
+    # Collapse multiline prompt to single line — shell splits args on newlines
     local prompt
-    prompt=$(cat "$prompt_file")
+    prompt=$(tr '\n' ' ' < "$prompt_file" | sed 's/  */ /g')
 
     local OC_MJS="/usr/lib/node_modules/openclaw/openclaw.mjs"
     [ ! -f "$OC_MJS" ] && OC_MJS="$(readlink -f "$(which openclaw)" 2>/dev/null || echo "openclaw")"
