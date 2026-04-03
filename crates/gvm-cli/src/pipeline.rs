@@ -11,6 +11,7 @@
 use crate::run;
 use crate::ui::{BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
 use anyhow::{Context, Result};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 // ─── Configuration ───
@@ -508,7 +509,7 @@ fn print_fs_diff_report(diff: &gvm_sandbox::filesystem::FsDiffReport, workspace:
         let staging_dir =
             std::path::PathBuf::from(format!("data/sandbox-staging/{}", std::process::id()));
 
-        if atty::is(atty::Stream::Stdin) && staging_dir.exists() {
+        if std::io::stdin().is_terminal() && staging_dir.exists() {
             eprintln!();
             let mut accepted = 0usize;
             let mut rejected = 0usize;

@@ -123,7 +123,7 @@ pub fn setup_host_network(config: &VethConfig) -> Result<String> {
     //
     // The FORWARD chain ESTABLISHED/RELATED protection rule (step 7) ensures
     // existing connections (SSH) survive even with global forwarding enabled.
-    let _ = save_ip_forward_state();
+    save_ip_forward_state();
     std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")
         .context("Failed to enable global IP forwarding")?;
     // Per-interface forwarding for the veth
@@ -1117,18 +1117,6 @@ fn cleanup_stale_forward_chains() -> usize {
     }
 
     cleaned
-}
-
-// Backward-compatible aliases for existing callers during migration.
-
-/// Record network state (legacy alias — delegates to per-PID state).
-pub fn record_network_state(config: &VethConfig) -> Result<()> {
-    record_sandbox_state(config, &[], None, None)
-}
-
-/// Clear network state (legacy alias — delegates to per-PID clear).
-pub fn clear_network_state() {
-    clear_sandbox_state();
 }
 
 /// Clean up orphaned network (legacy alias — delegates to full orphan scan).

@@ -351,7 +351,10 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     // Install SIGTERM handler (sets SIGTERM_FLAG atomic bool)
     SIGTERM_FLAG.store(false, Ordering::Relaxed); // Reset for this sandbox run
     unsafe {
-        libc::signal(libc::SIGTERM, sigterm_flag_handler as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            sigterm_flag_handler as *const () as libc::sighandler_t,
+        );
     }
 
     let wait_timeout = std::time::Duration::from_secs(
