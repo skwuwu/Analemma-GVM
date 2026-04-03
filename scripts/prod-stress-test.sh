@@ -212,10 +212,12 @@ launch_agent() {
     #   - proxy_manager starts proxy if not running
     #   - sandbox creates namespace, seccomp, veth
     #   - agent runs autonomously until done or timeout
+    local session_id="${agent_id}-$(date +%s)"
     GVM_SANDBOX_TIMEOUT=$((DURATION_SEC + 300)) \
     "$GVM_BIN" run --sandbox \
         --agent-id "$agent_id" \
         -- node "$OC_MJS" agent --local \
+        --session-id "$session_id" \
         --timeout "$DURATION_SEC" \
         --message "$prompt" \
         > "$log" 2>&1 &
