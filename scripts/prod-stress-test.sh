@@ -399,14 +399,15 @@ main_loop() {
         fi
         last_wal_size=$cur_wal_size
 
-        # ── All agents dead? ──
+        # ── All agents dead → early exit ──
         local alive=0
         for pid_file in "$RESULTS_DIR"/agents/agent-*.pid; do
             [ ! -f "$pid_file" ] && continue
             kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null && alive=$((alive + 1))
         done
-        if [ "$alive" -eq 0 ] && [ "$check_count" -gt 5 ]; then
-            log_health "INFO: all agents finished"
+        if [ "$alive" -eq 0 ] && [ "$check_count" -gt 2 ]; then
+            log_health "All agents finished — ending test early (no traffic to monitor)"
+            break
         fi
 
         # ── Chaos injection ──
