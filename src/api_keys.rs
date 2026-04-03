@@ -120,6 +120,11 @@ impl APIKeyStore {
         self.credentials.get(host)
     }
 
+    /// Return all configured host names. Used by MITM cert pre-warm.
+    pub fn known_hosts(&self) -> Vec<&str> {
+        self.credentials.keys().map(|s| s.as_str()).collect()
+    }
+
     /// Inject the appropriate credential into the request for the given host.
     /// This is Layer 3 (Capability Token) — the agent never has direct access to API keys.
     ///

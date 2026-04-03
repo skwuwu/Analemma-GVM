@@ -850,6 +850,39 @@ async fn start_tls_listener(
 
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     tracing::info!(address = %listen_addr, "GVM TLS MITM proxy listening");
+
+    // Pre-warm MITM cert cache for known domains (SRR hosts + secrets hosts).
+    // Without this, the first TLS connection to a new domain blocks on keygen
+    // (~1-5ms per cert) and fast-retrying clients (OpenClaw, Node.js) may
+    // timeout before the cert is ready — causing "connection error" on startup.
+    {
+        let srr_hosts = state
+            .srr
+            .read()
+            .map(|s| s.known_hosts())
+            .unwrap_or_default();
+        let secret_hosts: Vec<String> = state
+            .api_keys
+            .known_hosts()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut all_hosts: Vec<String> = srr_hosts;
+        all_hosts.extend(secret_hosts);
+        all_hosts.sort();
+        all_hosts.dedup();
+        if !all_hosts.is_empty() {
+            tracing::info!(
+                count = all_hosts.len(),
+                "Pre-warming MITM cert cache for known domains"
+            );
+            for host in &all_hosts {
+                resolver.ensure_cached(host.clone()).await;
+            }
+            tracing::info!("MITM cert cache pre-warmed");
+        }
+    }
+
     ready.notify_one();
 
     loop {

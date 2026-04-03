@@ -239,6 +239,22 @@ impl NetworkSRR {
         self.rules.len()
     }
 
+    /// Extract all exact-match host domains from loaded rules.
+    /// Used by MITM cert pre-warm to generate leaf certs at startup.
+    pub fn known_hosts(&self) -> Vec<String> {
+        let mut hosts: Vec<String> = self
+            .rules
+            .iter()
+            .filter_map(|r| match &r.host_pattern {
+                HostPattern::Exact(h) => Some(h.clone()),
+                _ => None,
+            })
+            .collect();
+        hosts.sort();
+        hosts.dedup();
+        hosts
+    }
+
     /// Domain-level check for CONNECT tunnels.
     /// If any non-catch-all rule exists for this host, Allow the tunnel.
     /// If only Deny rules exist, Deny. Otherwise Default-to-Caution.
