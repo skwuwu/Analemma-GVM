@@ -123,7 +123,13 @@ After sandbox network setup, the agent can only reach: (1) GVM proxy via TCP on 
 
 5. **Sandbox resource cleanup** (v0.3): Per-PID state files (`/tmp/gvm-sandbox-{pid}.state`) record all resources created by each sandbox (veth, iptables rules, mounts, cgroups). On normal exit, cleanup + delete. On crash, the next `gvm run --sandbox` detects stale state files (dead PIDs) and auto-cleans orphan resources before proceeding. `gvm cleanup` provides manual recovery. Defense-in-depth: heuristic scan removes `veth-gvm-*` interfaces without corresponding state files.
 
-**Known limitation — DNS tunneling**: DNS queries are allowed through the host's upstream resolver for name resolution. An agent could encode data in DNS query hostnames (e.g., `base64-data.attacker.com`) to exfiltrate information at low bandwidth (~50 bytes/query). Current mitigations: (1) DNS is restricted to the host's resolver only (no arbitrary DNS server), (2) all DNS goes through DNAT which enables future iptables LOG-based monitoring. Planned mitigation: local DNS cache/filter that restricts queries to domains seen in SRR rules.
+**Known limitation — DNS tunneling**: DNS queries are allowed through the host's upstream resolver for name resolution. An agent could encode data in DNS query hostnames (e.g., `base64-data.attacker.com`) to exfiltrate information at low bandwidth (~50 bytes/query).
+
+GVM's scope is HTTP action governance — what the agent calls, not how it might exfiltrate data through side channels. DNS-level exfiltration prevention is a DLP (Data Loss Prevention) concern and belongs to network-layer DNS security tools: Route 53 DNS Firewall, Cloudflare Gateway, Cisco Umbrella. These solutions have threat intelligence feeds, overkill detection, and false-positive management that a governance proxy should not replicate.
+
+Building a DNS filter into GVM would create more problems than it solves: SRR-allowlisted stub resolvers would need to handle CDN rotation, subdomain queries for legitimate APIs, mDNS, LLMNR — every false positive would halt the agent. That's not governance, that's an outage.
+
+**GVM's role**: all DNS queries go through DNAT to the host resolver, enabling WAL audit logging of DNS activity for forensic purposes. The infrastructure layer handles blocking. GVM and DNS security tools are complementary — the same way GVM and prompt guards (Lakera) are complementary.
 
 **Environment compatibility**:
 

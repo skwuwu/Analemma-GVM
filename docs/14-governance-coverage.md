@@ -126,7 +126,7 @@ The agent runs in isolated Linux namespaces (user, PID, mount, network) with sec
 | API key injection (HTTPS) | **Yes** | MITM strips + injects, agent never sees keys |
 | UDP (except DNS) | **Blocked** | iptables OUTPUT DROP |
 | DNS | **Allowed** | UDP 53 to host veth IP only |
-| DNS tunneling | **Partially open** | Host DNS server can relay encoded data |
+| DNS tunneling | **Out of scope** | Use DNS security (Route 53 DNS Firewall, Cloudflare Gateway). GVM logs DNS queries for audit. |
 | QUIC / HTTP3 (UDP 443) | **Blocked** | UDP DROP (browser falls back to TCP/TLS) |
 | ICMP | **Blocked** | iptables OUTPUT DROP |
 | WebRTC / P2P | **Blocked** | UDP DROP + no STUN server reachable |
@@ -240,7 +240,8 @@ These are architectural boundaries, not missing features:
 | Channel | Why not governed | Mitigation |
 |---------|-----------------|------------|
 | **Agent stdin/stdout** | Not network traffic | Agent spawned with `stdin(Stdio::null())` |
-| **DNS content** | DNS queries via host resolver, not through HTTP proxy | External DNS blocked (only host veth IP:53 allowed in sandbox) |
+| **DNS content** | DNS queries via host resolver, not through HTTP proxy | Use DNS security tools (Route 53 DNS Firewall, Cloudflare Gateway). GVM logs DNS queries to WAL for audit. |
+| **DNS tunneling** | DLP concern, not HTTP governance | DNS exfiltration prevention belongs to network-layer DNS security. GVM provides forensic visibility. |
 | **Prompt injection detection** | Requires semantic analysis (ML/LLM) | Use an LLM WAF upstream. GVM + LLM WAF are complementary. |
 | **Agent internal state** | SDK-only (agent must use `@ic()` decorator) | Tier 1 (proxy-only) governs actions; Tier 2 (SDK) adds intent verification |
 | **LLM response content** | Privacy — response bodies not stored by default | Thinking hash stored for forensics (SHA-256, opt-in raw) |

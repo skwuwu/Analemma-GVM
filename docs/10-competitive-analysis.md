@@ -92,9 +92,12 @@ GVM occupies the **action governance** layer — between the agent runtime and e
 | Control which APIs an agent can call | **GVM** |
 | Audit every action an agent takes | **GVM** |
 | Require human approval for high-risk actions | **GVM** |
+| Prevent DNS-based data exfiltration | Route 53 DNS Firewall, Cloudflare Gateway |
 | Service-to-service authorization | OPA + Envoy |
 
-**Use all layers together.** Prompt guards + provider safety + GVM = defense in depth. No single layer is sufficient for autonomous AI agents.
+**Use all layers together.** Prompt guards + provider safety + GVM + DNS security = defense in depth. No single layer is sufficient for autonomous AI agents.
+
+GVM governs what agents *do* (HTTP calls). LLM WAFs analyze what agents *say* (prompts/outputs). DNS firewalls prevent how agents *exfiltrate* (side channels). Each layer has a clear responsibility boundary.
 
 ---
 
