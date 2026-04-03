@@ -9,6 +9,7 @@ mod init;
 mod pipeline;
 mod preflight;
 mod proxy_manager;
+mod reload;
 mod run;
 mod stats;
 mod suggest;
@@ -316,6 +317,18 @@ enum Commands {
         #[arg(long, default_value = "/")]
         path: String,
 
+        /// Proxy URL
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        proxy: String,
+    },
+
+    /// Hot-reload SRR rules and ABAC policies from disk.
+    ///
+    /// After editing config/srr_network.toml or config/policies/,
+    /// run this command to apply changes without restarting the proxy.
+    ///
+    ///   gvm reload
+    Reload {
         /// Proxy URL
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         proxy: String,
@@ -650,6 +663,10 @@ async fn main() -> anyhow::Result<()> {
                 &proxy,
             )
             .await?;
+        }
+
+        Commands::Reload { proxy } => {
+            reload::run_reload(&proxy).await?;
         }
     }
 

@@ -122,7 +122,7 @@ decision = { type = "Deny", reason = "Wire transfers blocked" }
 | `Throttle { max_per_minute: 10 }` | Rate limit |
 | `AuditOnly` | Pass but flag |
 
-**Hot-reload:** Edit the file → `POST /gvm/reload`. No restart needed.
+**Hot-reload:** Edit the file → `gvm reload`. No restart needed.
 
 **Query strings:** Stripped automatically. `^/commits$` matches `/commits?per_page=5`.
 
@@ -307,6 +307,7 @@ sudo gvm run --sandbox ...       # Sandbox needs sudo
 | `gvm events list` | Query audit trail |
 | `gvm audit verify` | Check WAL integrity |
 | `gvm stats tokens` | Token usage per agent |
+| `gvm reload` | Hot-reload SRR rules and policies |
 | `gvm preflight` | Check environment and available modes |
 | `gvm cleanup` | Remove orphaned sandbox resources |
 | `gvm init --industry I` | Initialize config templates |
