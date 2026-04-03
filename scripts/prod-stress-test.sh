@@ -24,6 +24,7 @@
 # ═══════════════════════════════════════════════════════════════════
 
 set -o pipefail
+shopt -s nullglob  # empty glob → empty list (no literal "*.pid")
 
 # ── Configuration ──
 DURATION_MIN=${DURATION_MIN:-180}
@@ -151,7 +152,7 @@ check_health() {
 
     # 3. Agent processes
     local alive=0 total=0
-    for pid_file in "$RESULTS_DIR"/agents/agent-*.pid 2>/dev/null; do
+    for pid_file in "$RESULTS_DIR"/agents/agent-*.pid; do
         [ ! -f "$pid_file" ] && continue
         total=$((total + 1))
         local apid
@@ -417,7 +418,7 @@ main_loop() {
 
         # ── All agents dead? ──
         local alive=0
-        for pid_file in "$RESULTS_DIR"/agents/agent-*.pid 2>/dev/null; do
+        for pid_file in "$RESULTS_DIR"/agents/agent-*.pid; do
             [ ! -f "$pid_file" ] && continue
             kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null && alive=$((alive + 1))
         done
@@ -568,7 +569,7 @@ evaluate_results() {
 
     # 6. Agent completion
     local completed=0 total_agents=0
-    for pid_file in "$RESULTS_DIR"/agents/agent-*.pid 2>/dev/null; do
+    for pid_file in "$RESULTS_DIR"/agents/agent-*.pid; do
         [ ! -f "$pid_file" ] && continue
         total_agents=$((total_agents + 1))
         local apid
@@ -611,7 +612,7 @@ cleanup() {
     echo -e "\n${BOLD}Cleaning up...${NC}"
 
     # Kill agents
-    for pid_file in "$RESULTS_DIR"/agents/agent-*.pid 2>/dev/null; do
+    for pid_file in "$RESULTS_DIR"/agents/agent-*.pid; do
         [ ! -f "$pid_file" ] && continue
         local apid; apid=$(cat "$pid_file" 2>/dev/null || echo "0")
         kill "$apid" 2>/dev/null || true
