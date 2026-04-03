@@ -308,6 +308,12 @@ chaos_proxy_kill() {
     cp "$WAL" "$RESULTS_DIR/wal-before-kill.log" 2>/dev/null || true
     sleep 2
     restart_proxy
+    # Verify CLI works after recovery
+    sleep 3
+    run_checkpoint "post_kill_events" \
+        "$GVM_BIN" events list --last 5m --wal-file "$WAL" || true
+    run_checkpoint "post_kill_audit" \
+        "$GVM_BIN" audit verify --wal "$WAL" || true
 }
 
 chaos_network_partition() {
@@ -324,16 +330,6 @@ chaos_network_partition() {
     sudo iptables -t mangle -A OUTPUT -p tcp --dport 80 ! -d 127.0.0.0/8 -j MARK --set-mark 42 2>/dev/null || true
     sudo tc filter add dev "$iface" parent 1:0 protocol ip handle 42 fw flowid 1:3 2>/dev/null || true
     chaos_log "network partition active on $iface"
-}
-
-chaos_network_restore() {
-    chaos_log "RESTORE: removing network partition"
-    local iface
-    iface=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' || echo "eth0")
-    sudo tc qdisc del dev "$iface" root 2>/dev/null || true
-    sudo iptables -t mangle -D OUTPUT -p tcp --dport 443 ! -d 127.0.0.0/8 -j MARK --set-mark 42 2>/dev/null || true
-    sudo iptables -t mangle -D OUTPUT -p tcp --dport 80 ! -d 127.0.0.0/8 -j MARK --set-mark 42 2>/dev/null || true
-    chaos_log "network partition removed"
 }
 
 chaos_disk_pressure() {
@@ -357,6 +353,24 @@ chaos_disk_release() {
         cp "$RESULTS_DIR/wal-before-disk.log" "$WAL" 2>/dev/null || true
     fi
     chaos_log "disk pressure released"
+    # Verify WAL resumes after disk recovery
+    sleep 5
+    run_checkpoint "post_disk_audit" \
+        "$GVM_BIN" audit verify --wal "$WAL" || true
+}
+
+chaos_network_restore() {
+    chaos_log "RESTORE: removing network partition"
+    local iface
+    iface=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' || echo "eth0")
+    sudo tc qdisc del dev "$iface" root 2>/dev/null || true
+    sudo iptables -t mangle -D OUTPUT -p tcp --dport 443 ! -d 127.0.0.0/8 -j MARK --set-mark 42 2>/dev/null || true
+    sudo iptables -t mangle -D OUTPUT -p tcp --dport 80 ! -d 127.0.0.0/8 -j MARK --set-mark 42 2>/dev/null || true
+    chaos_log "network partition removed"
+    # Verify proxy works after network restore
+    sleep 5
+    run_checkpoint "post_network_events" \
+        "$GVM_BIN" events list --last 5m --wal-file "$WAL" || true
 }
 
 # ── CLI Checkpoint ──
@@ -436,16 +450,52 @@ main_loop() {
         fi
 
         # ── Periodic CLI checkpoints ──
-        # Every 10 minutes, run a CLI command to verify it works under load
+        # Every 10 minutes, rotate through CLI commands to verify they work under load.
+        # At T+25m, test SRR hot-reload. At T+30m, verify it took effect.
         if [ $((elapsed_min % 10)) -eq 0 ] && [ $elapsed_min -gt 0 ]; then
-            case $((elapsed_min % 30)) in
+            case $((elapsed_min % 50)) in
                 0)  run_checkpoint "T${elapsed_min}_events" \
                         "$GVM_BIN" events list --last 10m --wal-file "$WAL" || true ;;
                 10) run_checkpoint "T${elapsed_min}_audit" \
                         "$GVM_BIN" audit verify --wal "$WAL" || true ;;
                 20) run_checkpoint "T${elapsed_min}_tokens" \
                         "$GVM_BIN" stats tokens --wal-file "$WAL" || true ;;
+                30) run_checkpoint "T${elapsed_min}_check" \
+                        "$GVM_BIN" check --host api.github.com --method GET \
+                        --operation test --proxy "$PROXY_URL" || true ;;
+                40) run_checkpoint "T${elapsed_min}_preflight" \
+                        "$GVM_BIN" preflight || true ;;
             esac
+        fi
+
+        # ── Hot-reload test (once, at T+25m) ──
+        if [ $elapsed_min -ge 25 ] && [ "${HOTRELOAD_DONE:-false}" = "false" ]; then
+            HOTRELOAD_DONE=true
+            log_health "HOT-RELOAD: appending httpbin.org Delay rule"
+            local live_srr="$REPO_DIR/config/srr_network.toml"
+            cat >> "$live_srr" << 'HOTRELOAD_RULE'
+
+# Hot-reload test rule (appended by prod-stress-test.sh)
+[[rules]]
+method = "GET"
+pattern = "httpbin.org/{any}"
+decision = { type = "Delay", milliseconds = 500 }
+label = "prod-stress-hotreload"
+HOTRELOAD_RULE
+            run_checkpoint "T${elapsed_min}_reload" \
+                curl -sf -X POST "$ADMIN_URL/gvm/reload" || true
+            sleep 3
+            # Verify: gvm check should return Delay for httpbin.org
+            local check_out
+            check_out=$("$GVM_BIN" check --host httpbin.org --method GET \
+                --operation test --proxy "$PROXY_URL" 2>&1) || true
+            if echo "$check_out" | grep -qi "Delay"; then
+                log_health "HOT-RELOAD VERIFY: PASS (httpbin.org → Delay)"
+                echo "hotreload_verify|0|$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$CHECKPOINT_LOG"
+            else
+                log_health "HOT-RELOAD VERIFY: FAIL (expected Delay, got: $check_out)"
+                echo "hotreload_verify|1|$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$CHECKPOINT_LOG"
+            fi
         fi
 
         sleep "$HEALTH_INTERVAL"
