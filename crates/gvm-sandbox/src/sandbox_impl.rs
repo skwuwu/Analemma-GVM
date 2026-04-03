@@ -678,30 +678,52 @@ fn child_entry(
         }
         agent_pid => {
             // ── PID 1 (init reaper): wait for agent + reap orphans ──
+            //
+            // After the agent exits, its sub-processes (OpenClaw gateway workers,
+            // Node.js worker threads, detached children) may still be alive.
+            // Without killing them, waitpid(-1) blocks forever — the parent's
+            // WNOHANG loop never sees PID 1 exit, causing the sandbox to hang.
+            //
+            // Fix: once agent exits, SIGTERM → sleep → SIGKILL all remaining
+            // children, then continue reaping until ECHILD.
             let mut agent_exit_code: i32 = 1;
+            let mut agent_exited = false;
 
             loop {
                 let mut status: i32 = 0;
                 let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
                 if pid < 0 {
-                    // ECHILD: no more children — all reaped, agent is gone
+                    // ECHILD: no more children — all reaped
                     break;
                 }
                 if pid == agent_pid {
-                    // Agent exited — record its exit code
+                    // Agent exited — record exit code
                     if libc::WIFEXITED(status) {
                         agent_exit_code = libc::WEXITSTATUS(status);
                     } else if libc::WIFSIGNALED(status) {
                         agent_exit_code = 128 + libc::WTERMSIG(status);
                     }
-                    // Don't break yet — there may still be orphaned children
-                    // that need reaping. Continue until ECHILD.
+                    agent_exited = true;
+
+                    // Kill all remaining children in this PID namespace.
+                    // kill(-1, sig) sends to all processes except PID 1 (us).
+                    // SAFETY: async-signal-safe (kill, nanosleep, write are all safe).
+                    unsafe {
+                        libc::kill(-1, libc::SIGTERM);
+                        // Brief grace period for clean shutdown
+                        let ts = libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: 500_000_000, // 500ms
+                        };
+                        libc::nanosleep(&ts, std::ptr::null_mut());
+                        libc::kill(-1, libc::SIGKILL);
+                    }
+                    // Continue reaping until ECHILD
                 }
-                // Any other PID: orphaned child reaped (zombie cleaned up).
+                // Any other PID: orphaned/killed child reaped.
             }
 
             // Use _exit to avoid running Rust destructors in the clone'd process.
-            // The parent process (outside the namespace) handles cleanup.
             unsafe { libc::_exit(agent_exit_code) };
         }
     }
