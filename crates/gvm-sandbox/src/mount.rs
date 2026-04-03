@@ -312,6 +312,31 @@ fn bind_mount_interpreter(
     )
     .context("Failed to bind-mount interpreter")?;
 
+    // Always bind-mount /bin/sh and /bin/bash (if they exist on host).
+    // Agent frameworks (OpenClaw, LangChain) spawn sub-processes via shell.
+    // Without these, exec("/bin/bash") fails with ENOENT inside sandbox.
+    // Read-only mount + seccomp ensures shell access is safe.
+    for shell in &["/bin/sh", "/bin/bash"] {
+        let src = Path::new(shell);
+        if !src.exists() {
+            continue;
+        }
+        let name = src.file_name().unwrap_or_default();
+        let target = new_root.join("bin").join(name);
+        if target.exists() {
+            continue; // Already mounted (e.g., interpreter IS bash)
+        }
+        std::fs::write(&target, "").ok();
+        mount(
+            Some(src),
+            &target,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+            None::<&str>,
+        )
+        .ok(); // Best-effort — don't fail sandbox if shell mount fails
+    }
+
     // Resolve shared libraries via ldd
     let ldd_output = std::process::Command::new("ldd")
         .arg(interpreter_path)
