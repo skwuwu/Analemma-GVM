@@ -969,14 +969,16 @@ async fn relay_tls<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         upstream_tls.write_all(&req.body).await?;
     }
 
-    let mut buf = vec![0u8; 32768]; // 32KB buffer for large responses
+    // Relay upstream response to client. SSE streaming (Anthropic /v1/messages
+    // with stream:true) sends chunks over minutes — LLM thinking can take 60s+
+    // between events. The idle timeout must be long enough to avoid killing
+    // active SSE streams. 5 minutes covers extended thinking + tool execution.
+    const UPSTREAM_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+    let mut buf = vec![0u8; 32768];
     let mut total_relayed: usize = 0;
     loop {
-        let n = match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            upstream_tls.read(&mut buf),
-        )
-        .await
+        let n = match tokio::time::timeout(UPSTREAM_READ_TIMEOUT, upstream_tls.read(&mut buf)).await
         {
             Ok(Ok(0)) => break, // upstream closed
             Ok(Ok(n)) => n,
@@ -987,7 +989,7 @@ async fn relay_tls<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
             Err(_) => {
                 tracing::debug!(
                     bytes_relayed = total_relayed,
-                    "MITM: upstream read timeout (30s)"
+                    "MITM: upstream read timeout (5m idle)"
                 );
                 break;
             }
