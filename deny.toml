@@ -2,15 +2,9 @@
 # https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
-# wasmtime is behind --features wasm (disabled by default, not compiled into
-# the default binary). Ignore its CVEs until we upgrade or remove it.
+# rustls-pemfile: unmaintained but functional, migration to rustls-pki-types planned.
 ignore = [
-    "RUSTSEC-2025-0046",  # wasmtime: fd_renumber panic (optional dep)
-    "RUSTSEC-2025-0118",  # wasmtime: shared memory unsoundness (optional dep)
-    "RUSTSEC-2026-0006",  # wasmtime: f64.copysign segfault (optional dep)
-    "RUSTSEC-2026-0020",  # wasmtime: WASI resource exhaustion (optional dep)
-    "RUSTSEC-2026-0021",  # wasmtime: fields instance panic (optional dep)
-    "RUSTSEC-2025-0134",  # rustls-pemfile: unmaintained (migration planned)
+    "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained
 ]
 
 [licenses]
@@ -26,6 +20,7 @@ allow = [
     "CC0-1.0",
     "MPL-2.0",
     "0BSD",
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 

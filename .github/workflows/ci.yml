@@ -57,7 +57,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo install cargo-audit --locked || true
-      - run: cargo audit
+      - name: Run cargo audit
+        run: |
+          cargo audit \
+            --ignore RUSTSEC-2025-0046 \
+            --ignore RUSTSEC-2025-0118 \
+            --ignore RUSTSEC-2026-0006 \
+            --ignore RUSTSEC-2026-0020 \
+            --ignore RUSTSEC-2026-0021
 
   # Security: license compliance + banned crates + duplicate deps
   deny:
