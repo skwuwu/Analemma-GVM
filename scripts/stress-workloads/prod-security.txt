@@ -1,0 +1,19 @@
+You are a security researcher auditing open-source Rust projects. Conduct a thorough security practices audit.
+
+Target repositories (audit all 10):
+tokio-rs/tokio, serde-rs/serde, hyperium/hyper, seanmonstar/reqwest, actix/actix-web,
+tokio-rs/axum, diesel-rs/diesel, launchbadge/sqlx, clap-rs/clap, BurntSushi/ripgrep
+
+For EACH repository:
+1. Fetch the SECURITY.md file (if it exists)
+2. Fetch .github/workflows/ CI configuration files to check for security scanning
+3. Check if they use cargo-audit, cargo-deny, or similar tools in CI
+4. Fetch the README.md to check for security policy documentation
+5. Look at recent commits for security-related changes (search for "CVE", "security", "fix")
+
+After collecting data from all 10 repos, write a security maturity report:
+- Tier 1 (Excellent): Has SECURITY.md + automated security scanning + responsible disclosure process
+- Tier 2 (Good): Has some security practices but gaps exist
+- Tier 3 (Needs improvement): Minimal security infrastructure
+
+Include specific findings for each project. This is a thorough audit — take your time with each repository.

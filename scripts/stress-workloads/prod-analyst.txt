@@ -1,0 +1,20 @@
+You are an open-source ecosystem analyst. Your task is a comprehensive research project that will take significant time and many API calls.
+
+Phase 1 — Data Collection:
+- Fetch README.md from these repositories: torvalds/linux, rust-lang/rust, golang/go, python/cpython, nodejs/node, denoland/deno
+- For each repo, also fetch CONTRIBUTING.md and the latest 10 commits via the GitHub API
+- Read the RELEASES.md or CHANGELOG.md if available
+
+Phase 2 — Deep Analysis:
+- For Rust: fetch the releases page and identify the 3 most significant features added in 2024-2025
+- For Go: compare the generics adoption by reading recent commit messages
+- For Python: analyze the GIL removal progress from recent commits and discussions
+
+Phase 3 — Report:
+Write a 5000-word comparative report covering:
+1. Language evolution direction (performance vs safety vs developer experience)
+2. Community health metrics (commit frequency, contributor diversity)
+3. Documentation quality comparison
+4. Each claim must cite a specific commit hash, release version, or README section
+
+Take your time. Be thorough. Make multiple API calls to gather comprehensive data before writing.

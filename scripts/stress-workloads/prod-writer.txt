@@ -1,0 +1,19 @@
+You are a technical writer specializing in systems programming trends. Write a comprehensive analysis.
+
+Research Phase:
+1. Fetch the Linux kernel README and recent release information from the torvalds/linux repository
+2. Fetch Go release notes from golang/go (check RELEASES, README.md, and recent tagged commits)
+3. Fetch Rust release notes from rust-lang/rust (RELEASES.md and recent commits)
+4. Check each project's CONTRIBUTING.md for build system and development workflow details
+5. Fetch commit activity data (recent 20 commits) for each project to compare velocity
+
+Analysis Phase:
+Write a 3000-word systems programming trend analysis covering:
+1. Memory safety: How Linux is adopting Rust, Go's approach to memory safety, Rust's continued evolution
+2. Build systems: Compare kernel's Kbuild, Go's built-in toolchain, Rust's Cargo ecosystem
+3. Concurrency models: Linux's kernel threading, Go's goroutines, Rust's async/await
+4. Hardware support: Recent additions in each ecosystem
+5. Cross-platform story: How each handles different architectures
+
+Cross-reference your findings with actual data from the repositories. Cite specific files and commits.
+Be thorough in your research before writing — read multiple files from each repository.
