@@ -840,14 +840,12 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
             tracing::info!(host = %host, "MITM: API key injected for upstream");
         }
 
-        // Force Connection: close on upstream request so the server closes the
-        // connection after sending the response. Without this, keep-alive upstreams
-        // leave the connection open and the relay loop blocks forever waiting for
-        // more data that never comes.
-        req.headers
-            .retain(|(k, _)| !k.eq_ignore_ascii_case("connection"));
-        req.headers
-            .push(("Connection".to_string(), b"close".to_vec()));
+        // Preserve the original Connection header. Previously we forced Connection: close
+        // to ensure upstream closes after response, but this breaks SSE (Server-Sent Events)
+        // streaming — upstream closes the connection after the first chunk, killing the stream.
+        // Anthropic API /v1/messages with stream:true uses chunked SSE that requires the
+        // connection to stay open. The relay loop already handles EOF from upstream (read returns 0)
+        // and has a 30s idle timeout, so keep-alive connections will terminate naturally.
         req.rebuild_raw_head();
 
         // 5. Connect to upstream and relay (new connection per request)
