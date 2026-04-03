@@ -37,6 +37,11 @@ const MAX_CERT_CACHE_SIZE: u64 = 10_000;
 /// Time-to-idle for cached certificates. Unused certs are evicted after this.
 const CERT_CACHE_TTI_SECS: u64 = 3600;
 
+/// Time-to-live for cached certificates. Certs are regenerated after this,
+/// regardless of usage. Must be shorter than cert validity (24h) to ensure
+/// certs are refreshed before expiry. 23h = 1 hour safety margin.
+const CERT_CACHE_TTL_SECS: u64 = 23 * 3600;
+
 /// Dynamic certificate resolver — generates per-domain leaf certs on demand.
 pub struct GvmCertResolver {
     /// CA certificate for signing.
@@ -110,6 +115,7 @@ impl GvmCertResolver {
             cache: Cache::builder()
                 .max_capacity(MAX_CERT_CACHE_SIZE)
                 .time_to_idle(Duration::from_secs(CERT_CACHE_TTI_SECS))
+                .time_to_live(Duration::from_secs(CERT_CACHE_TTL_SECS))
                 .build(),
         })
     }
