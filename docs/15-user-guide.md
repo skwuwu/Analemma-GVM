@@ -307,6 +307,7 @@ sudo gvm run --sandbox ...       # Sandbox needs sudo
 | `gvm events list` | Query audit trail |
 | `gvm audit verify` | Check WAL integrity |
 | `gvm stats tokens` | Token usage per agent |
+| `gvm status` | Show proxy health, SRR rules, WAL state |
 | `gvm reload` | Hot-reload SRR rules and policies |
 | `gvm preflight` | Check environment and available modes |
 | `gvm cleanup` | Remove orphaned sandbox resources |

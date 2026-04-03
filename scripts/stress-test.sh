@@ -665,12 +665,9 @@ cleanup() {
         done < "$RESULTS_DIR/agent_pids.txt"
     fi
 
-    # Kill proxy (check both canonical PID file and results copy)
-    for pidfile in "$REPO_DIR/data/proxy.pid" "$RESULTS_DIR/proxy.pid"; do
-        if [ -f "$pidfile" ]; then
-            kill "$(cat "$pidfile")" 2>/dev/null || true
-        fi
-    done
+    # Kill ALL gvm-proxy processes (not just PID file — setsid daemons may outlive PID file)
+    pkill -f gvm-proxy 2>/dev/null || true
+    rm -f "$REPO_DIR/data/proxy.pid" "$RESULTS_DIR/proxy.pid" 2>/dev/null
 
     # Remove network chaos if active
     local iface

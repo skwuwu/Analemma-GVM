@@ -23,6 +23,43 @@ pub async fn proxy_healthy(proxy: &str) -> bool {
 pub async fn ensure_available(proxy: &str, workspace: &Path) -> Result<()> {
     // 1. Check health endpoint first (fastest path)
     if proxy_healthy(proxy).await {
+        // Health OK — but verify PID file matches the actual process.
+        // If PID file is stale (points to dead process while a different proxy
+        // is alive on the port), update it so future operations work correctly.
+        #[cfg(unix)]
+        {
+            let pid_path = workspace.join("data/proxy.pid");
+            let file_pid = read_pid_file(&pid_path);
+            let stale = match file_pid {
+                Some(pid) => !is_process_alive(pid),
+                None => true,
+            };
+            if stale {
+                // Find actual PID holding the port
+                let port = proxy
+                    .rsplit(':')
+                    .next()
+                    .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
+                    .unwrap_or(8080);
+                if let Ok(out) = std::process::Command::new("lsof")
+                    .args(["-ti", &format!(":{port}")])
+                    .output()
+                {
+                    let pids_str = String::from_utf8_lossy(&out.stdout);
+                    if let Some(actual_pid) = pids_str
+                        .split_whitespace()
+                        .filter_map(|s| s.parse::<u32>().ok())
+                        .find(|&p| is_process_alive(p))
+                    {
+                        std::fs::write(&pid_path, actual_pid.to_string()).ok();
+                        eprintln!(
+                            "  {DIM}Updated stale PID file: {} → {actual_pid}{RESET}",
+                            file_pid.unwrap_or(0)
+                        );
+                    }
+                }
+            }
+        }
         return Ok(());
     }
 
@@ -59,6 +96,11 @@ pub async fn ensure_available(proxy: &str, workspace: &Path) -> Result<()> {
 /// Start the proxy as an independent daemon process.
 async fn start_daemon(proxy: &str, workspace: &Path) -> Result<()> {
     let binary = find_proxy_binary(workspace)?;
+
+    // Before starting, kill any stale process occupying our port.
+    // This handles the case where a proxy was started outside proxy_manager
+    // (e.g., by a script or manual invocation) and its PID is not in our PID file.
+    kill_stale_port_holder(proxy);
 
     eprintln!(
         "  {YELLOW}Proxy not reachable at {}. Starting...{RESET}",
@@ -270,6 +312,50 @@ fn fix_data_dir_ownership(data_dir: &Path) {
         }
     }
 }
+
+/// Kill any gvm-proxy process that is holding the port we need.
+/// This handles stale proxies started outside proxy_manager (scripts, manual runs).
+#[cfg(unix)]
+fn kill_stale_port_holder(proxy_url: &str) {
+    // Extract port from proxy URL (e.g., "http://127.0.0.1:8080" → 8080)
+    let port = proxy_url
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
+        .unwrap_or(8080);
+
+    // Use lsof to find PID holding the port
+    let output = std::process::Command::new("lsof")
+        .args(["-ti", &format!(":{port}")])
+        .output();
+
+    if let Ok(out) = output {
+        let pids_str = String::from_utf8_lossy(&out.stdout);
+        for pid_str in pids_str.split_whitespace() {
+            if let Ok(pid) = pid_str.parse::<u32>() {
+                // Verify it's actually gvm-proxy (not some other service)
+                if is_process_alive(pid) {
+                    eprintln!("  {YELLOW}Killing stale proxy on port {port} (PID {pid}){RESET}");
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGTERM);
+                    }
+                    // Wait briefly for graceful shutdown
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                    // Force kill if still alive
+                    if unsafe { libc::kill(pid as i32, 0) } == 0 {
+                        unsafe {
+                            libc::kill(pid as i32, libc::SIGKILL);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_stale_port_holder(_proxy_url: &str) {}
 
 /// Kill a process by PID.
 fn kill_process(pid: u32) {

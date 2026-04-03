@@ -93,25 +93,27 @@ log_health() {
     echo -e "  ${DIM}[$ts] $msg${NC}"
 }
 
-# Health check via CLI only — no curl, no direct PID inspection.
-# Uses `gvm check` as a proxy health probe: if the proxy is alive and
-# SRR rules are loaded, this returns exit 0 with a decision.
-proxy_healthy_via_cli() {
-    "$GVM_BIN" check --host api.github.com --method GET \
-        --operation health-probe --proxy "$PROXY_URL" \
-        > /dev/null 2>&1
-}
-
 # ── Health & Hang Detection ──
+#
+# Uses `gvm status` for proxy health (exit 1 = not reachable).
+# Supplements with kernel panic detection and agent liveness.
+#
 check_health() {
     local issues=0
 
-    # 1. Proxy alive (via CLI dry-run check)
-    if proxy_healthy_via_cli; then
-        log_health "OK: proxy responding to gvm check"
-    else
-        log_health "ALERT: proxy not responding to gvm check"
+    # 1. Proxy status via CLI
+    local status_out
+    status_out=$("$GVM_BIN" status --proxy "$PROXY_URL" 2>&1) || true
+    if echo "$status_out" | grep -q "not reachable"; then
+        log_health "ALERT: proxy not reachable (gvm status failed)"
         issues=$((issues + 1))
+    elif echo "$status_out" | grep -q "degraded"; then
+        log_health "WARN: proxy degraded (WAL issue)"
+    else
+        # Extract SRR rule count from status output
+        local srr_count
+        srr_count=$(echo "$status_out" | grep -oP 'SRR rules:\s+\K[0-9]+' || echo "?")
+        log_health "OK: proxy healthy, SRR rules: $srr_count"
     fi
 
     # 2. Kernel panic / oops detection
@@ -175,14 +177,22 @@ setup() {
     pre_wal_size=$(stat -c%s "$WAL" 2>/dev/null || echo "0")
     echo "pre_wal_bytes=$pre_wal_size" >> "$SUMMARY"
 
-    # Kill any existing proxy so it restarts with stress SRR.
-    # proxy_manager will auto-start a fresh one on first `gvm run`.
-    if [ -f "$REPO_DIR/data/proxy.pid" ]; then
-        local old_pid
-        old_pid=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null || echo "0")
-        kill "$old_pid" 2>/dev/null || true
-        sleep 2
+    # Kill ALL gvm-proxy processes — not just the PID file one.
+    # Previous tests may leave stale proxies (setsid daemon, PID file desync).
+    # Using pkill ensures no stale proxy holds port 8080 with old SRR rules.
+    echo -e "  ${DIM}Killing any existing gvm-proxy processes...${NC}"
+    pkill -f gvm-proxy 2>/dev/null || true
+    sleep 2
+    # Verify port is actually free
+    if lsof -ti :8080 > /dev/null 2>&1; then
+        local blocker
+        blocker=$(lsof -ti :8080 | head -1)
+        echo -e "${RED}Port 8080 still occupied by PID $blocker after pkill${NC}"
+        echo -e "${RED}$(ps -p "$blocker" -o cmd= 2>/dev/null)${NC}"
+        kill -9 "$blocker" 2>/dev/null || true
+        sleep 1
     fi
+    rm -f "$REPO_DIR/data/proxy.pid"
 
     echo "# Health log" > "$HEALTH_LOG"
     echo "# Chaos log" > "$CHAOS_LOG"
@@ -235,8 +245,43 @@ launch_all_agents() {
         local idx=$(( (i - 1) % ${#workloads[@]} ))
         launch_agent "$i" "${workloads[$idx]}" "prod-agent-$i"
         sleep 30
+
+        # After first agent, verify proxy started correctly with stress SRR
+        if [ "$i" -eq 1 ]; then
+            sleep 5
+            local status_out
+            status_out=$("$GVM_BIN" status --proxy "$PROXY_URL" 2>&1) || true
+            if echo "$status_out" | grep -q "not reachable"; then
+                echo -e "${RED}FATAL: proxy not responding after first agent launch${NC}"
+                echo -e "${RED}Run: gvm status --proxy $PROXY_URL${NC}"
+                exit 1
+            fi
+            # Force reload to ensure stress SRR is active
+            "$GVM_BIN" reload --proxy "$PROXY_URL" > /dev/null 2>&1 || true
+            echo -e "  ${GREEN}Proxy verified via gvm status + SRR reloaded${NC}"
+        fi
     done
     echo -e "  ${GREEN}All $NUM_AGENTS agents launched${NC}"
+
+    # Wait 15s then verify at least 1 agent is still alive.
+    # If all died immediately, something is fundamentally broken (wrong args,
+    # sandbox failure, OpenClaw crash) — no point running a 1-hour monitor.
+    sleep 15
+    local alive=0
+    for pid_file in "$RESULTS_DIR"/agents/agent-*.pid; do
+        [ ! -f "$pid_file" ] && continue
+        kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null && alive=$((alive + 1))
+    done
+    if [ "$alive" -eq 0 ]; then
+        echo -e "${RED}FATAL: all agents died within 15s of launch${NC}"
+        echo -e "${RED}Agent logs:${NC}"
+        for log in "$RESULTS_DIR"/agents/agent-*.log; do
+            echo -e "  ${YELLOW}$(basename "$log"):${NC}"
+            tail -3 "$log" 2>/dev/null | sed 's/^/    /'
+        done
+        exit 1
+    fi
+    echo -e "  ${GREEN}Post-launch check: $alive/$NUM_AGENTS agents alive${NC}"
 }
 
 # ── CLI Checkpoint ──
@@ -270,12 +315,10 @@ chaos_proxy_kill() {
     chaos_log "INJECT: kill -9 proxy (PID $pid)"
     kill -9 "$pid" 2>/dev/null || true
 
-    # Wait, then verify recovery via CLI (proxy_manager in next gvm run restarts it)
+    # Verify recovery via gvm status (proxy_manager restarts on next gvm run)
     sleep 5
-    # Trigger proxy restart by running a lightweight CLI command that needs the proxy
-    run_checkpoint "post_kill_check" \
-        "$GVM_BIN" check --host api.github.com --method GET \
-        --operation post-kill-verify --proxy "$PROXY_URL" || true
+    run_checkpoint "post_kill_status" \
+        "$GVM_BIN" status --proxy "$PROXY_URL" || true
 }
 
 chaos_network_partition() {
@@ -303,9 +346,8 @@ chaos_network_restore() {
     sudo iptables -t mangle -D OUTPUT -p tcp --dport 80 ! -d 127.0.0.0/8 -j MARK --set-mark 42 2>/dev/null || true
     chaos_log "network partition removed"
     sleep 3
-    run_checkpoint "post_network_check" \
-        "$GVM_BIN" check --host api.github.com --method GET \
-        --operation post-network-verify --proxy "$PROXY_URL" || true
+    run_checkpoint "post_network_status" \
+        "$GVM_BIN" status --proxy "$PROXY_URL" || true
 }
 
 chaos_disk_pressure() {
@@ -328,8 +370,8 @@ chaos_disk_release() {
     fi
     chaos_log "disk pressure released"
     sleep 3
-    run_checkpoint "post_disk_audit" \
-        "$GVM_BIN" audit verify --wal "$WAL" || true
+    run_checkpoint "post_disk_status" \
+        "$GVM_BIN" status --proxy "$PROXY_URL" || true
 }
 
 # ── Main Loop ──
@@ -456,8 +498,8 @@ evaluate_results() {
 
     # 2. Proxy recovery after chaos kill
     if $CHAOS_ENABLED && grep -q "INJECT.*kill" "$CHAOS_LOG" 2>/dev/null; then
-        if grep -q "post_kill_check|0" "$CHECKPOINT_LOG" 2>/dev/null; then
-            echo "PASS: proxy recovered after kill (gvm check succeeded)" >> "$SUMMARY"
+        if grep -q "post_kill_status|0" "$CHECKPOINT_LOG" 2>/dev/null; then
+            echo "PASS: proxy recovered after kill (gvm status succeeded)" >> "$SUMMARY"
         else
             echo "FAIL: proxy did not recover after kill" >> "$SUMMARY"; pass=false
         fi

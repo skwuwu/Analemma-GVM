@@ -1029,6 +1029,8 @@ pub async fn reload_srr(State(state): State<AppState>) -> Response<Body> {
 pub async fn health(State(state): State<AppState>) -> Response<Body> {
     let wal_failures = state.ledger.primary_failure_count();
     let emergency_writes = state.ledger.emergency_write_count();
+    let srr_rules = state.srr.read().map(|s| s.rule_count()).unwrap_or(0);
+    let pending = state.pending_approvals.len();
 
     let (status, wal_status) = if wal_failures > 5 {
         ("degraded", "primary_failed")
@@ -1041,9 +1043,11 @@ pub async fn health(State(state): State<AppState>) -> Response<Body> {
         &serde_json::json!({
             "status": status,
             "version": "0.1.0",
+            "srr_rules": srr_rules,
             "wal": wal_status,
             "wal_failures": wal_failures,
             "emergency_writes": emergency_writes,
+            "pending_approvals": pending,
         }),
     )
 }

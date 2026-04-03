@@ -12,6 +12,7 @@ mod proxy_manager;
 mod reload;
 mod run;
 mod stats;
+mod status;
 mod suggest;
 mod ui;
 mod watch;
@@ -329,6 +330,15 @@ enum Commands {
     ///
     ///   gvm reload
     Reload {
+        /// Proxy URL
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        proxy: String,
+    },
+
+    /// Show proxy status: health, SRR rules, WAL state.
+    ///
+    ///   gvm status
+    Status {
         /// Proxy URL
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         proxy: String,
@@ -667,6 +677,10 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Reload { proxy } => {
             reload::run_reload(&proxy).await?;
+        }
+
+        Commands::Status { proxy } => {
+            status::run_status(&proxy).await?;
         }
     }
 
