@@ -574,28 +574,27 @@ async fn main() -> anyhow::Result<()> {
                     eprintln!("Scanning for orphaned sandbox resources (dry run)...");
                     let pattern = "/tmp/gvm-sandbox-*.state";
                     let mut found = 0u32;
-                    for entry in glob::glob(pattern).unwrap_or_else(|_| glob::glob("").unwrap()) {
-                        if let Ok(path) = entry {
-                            if let Ok(content) = std::fs::read_to_string(&path) {
-                                if let Ok(state) =
-                                    serde_json::from_str::<serde_json::Value>(&content)
-                                {
-                                    let pid = state["pid"].as_u64().unwrap_or(0) as u32;
-                                    let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
-                                    let status = if alive { "ACTIVE" } else { "ORPHANED" };
-                                    eprintln!(
-                                        "  {} PID={} veth={} mounts={}",
-                                        status,
-                                        pid,
-                                        state["veth_host"].as_str().unwrap_or("?"),
-                                        state["mount_paths"]
-                                            .as_array()
-                                            .map(|a| a.len())
-                                            .unwrap_or(0),
-                                    );
-                                    if !alive {
-                                        found += 1;
-                                    }
+                    for path in glob::glob(pattern)
+                        .unwrap_or_else(|_| glob::glob("").unwrap())
+                        .flatten()
+                    {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            if let Ok(state) = serde_json::from_str::<serde_json::Value>(&content) {
+                                let pid = state["pid"].as_u64().unwrap_or(0) as u32;
+                                let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+                                let status = if alive { "ACTIVE" } else { "ORPHANED" };
+                                eprintln!(
+                                    "  {} PID={} veth={} mounts={}",
+                                    status,
+                                    pid,
+                                    state["veth_host"].as_str().unwrap_or("?"),
+                                    state["mount_paths"]
+                                        .as_array()
+                                        .map(|a| a.len())
+                                        .unwrap_or(0),
+                                );
+                                if !alive {
+                                    found += 1;
                                 }
                             }
                         }
