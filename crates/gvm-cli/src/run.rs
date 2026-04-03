@@ -303,7 +303,8 @@ pub(crate) fn print_wal_audit(wal_path: &str, start_offset: u64, agent_id: &str)
 
     let events: Vec<serde_json::Value> = new_content
         .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(is_governance_event)
         .collect();
 
     if events.is_empty() {
@@ -327,12 +328,13 @@ pub(crate) fn print_wal_audit(wal_path: &str, start_offset: u64, agent_id: &str)
     let mut blocked = 0usize;
 
     for event in &events {
-        let operation = event
-            .get("operation")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
+        // Events are pre-filtered by is_governance_event() above.
         let decision = event
             .get("decision")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let operation = event
+            .get("operation")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
         let event_id = event.get("event_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -423,6 +425,24 @@ pub(crate) fn print_wal_audit(wal_path: &str, start_offset: u64, agent_id: &str)
         );
         println!();
     }
+}
+
+/// Check if a WAL JSON record is a governance event (not batch metadata or system event).
+/// Shared filter: batch records (merkle_root, batch_id) and system events (gvm.system.*)
+/// are WAL infrastructure — not agent governance decisions.
+fn is_governance_event(event: &serde_json::Value) -> bool {
+    // Batch records: WAL integrity metadata
+    if event.get("batch_id").is_some() || event.get("merkle_root").is_some() {
+        return false;
+    }
+    // System events: proxy startup, config load, etc.
+    if let Some(op) = event.get("operation").and_then(|v| v.as_str()) {
+        if op.starts_with("gvm.system.") {
+            return false;
+        }
+    }
+    // Must have a decision field to be a governance event
+    event.get("decision").is_some()
 }
 
 /// Docker containment mode: run inside isolated container.
