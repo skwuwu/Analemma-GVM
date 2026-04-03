@@ -81,7 +81,8 @@
       "Bash(ssh -i \"C:\\\\Users\\\\gimgy\\\\Downloads\\\\Analemma-test.pem\" ubuntu@43.201.62.93 'tail -15 ~/Analemma-GVM/results/prod-latest.log')",
       "Bash(ssh -i \"C:\\\\Users\\\\gimgy\\\\Downloads\\\\Analemma-test.pem\" ubuntu@43.201.62.93 'tail -25 ~/Analemma-GVM/results/prod-latest.log')",
       "Bash(ssh -i \"C:\\\\Users\\\\gimgy\\\\Downloads\\\\Analemma-test.pem\" ubuntu@43.201.62.93 'cd ~/Analemma-GVM && sed \"\"s/\\\\x1b\\\\[[0-9;]*m//g\"\" results/prod-20260403T081941/agents/agent-1.log | grep -E \"\"✗|Blocked|blocked|Deny|unknown\"\" | head -20')",
-      "Bash(ssh -i \"C:\\\\Users\\\\gimgy\\\\Downloads\\\\Analemma-test.pem\" ubuntu@43.201.62.93 'tail -30 ~/Analemma-GVM/results/prod-latest.log')"
+      "Bash(ssh -i \"C:\\\\Users\\\\gimgy\\\\Downloads\\\\Analemma-test.pem\" ubuntu@43.201.62.93 'tail -30 ~/Analemma-GVM/results/prod-latest.log')",
+      "Bash(ssh -i \"C:\\\\Users\\\\gimgy\\\\Downloads\\\\Analemma-test.pem\" ubuntu@43.201.62.93 'sudo pkill -9 -f \"\"gvm-proxy\\\\|openclaw\\\\|debug-long\\\\|prod-stress\"\" 2>/dev/null; sleep 2; echo \"\"clean\"\"')"
     ]
   }
 }

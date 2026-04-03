@@ -291,12 +291,31 @@ async fn launch_contained_wrapper(config: &AgentConfig, _pre: &PreLaunchState) -
 // ─── Phase 3: Post-exit (shared) ───
 
 /// Standard post-exit: print audit summary.
-pub fn post_exit_audit(config: &AgentConfig, pre: &PreLaunchState, exit_code: i32) {
+pub fn post_exit_audit(
+    config: &AgentConfig,
+    pre: &PreLaunchState,
+    exit_code: i32,
+    runtime_secs: u64,
+) {
     eprintln!();
     if exit_code == 0 {
         eprintln!("  {GREEN}Process completed successfully{RESET}");
     } else {
         eprintln!("  {YELLOW}Process exited with code: {}{RESET}", exit_code);
+    }
+
+    // Fast exit warning: agent died very quickly, likely a startup failure.
+    // Common causes: missing API key, bad arguments, sandbox fs/network issue.
+    if runtime_secs < 10 && exit_code != 0 {
+        eprintln!(
+            "  {RED}\u{26a0} Agent exited in {}s with code {} — possible startup failure.{RESET}",
+            runtime_secs, exit_code
+        );
+        if config.mode == LaunchMode::Sandbox {
+            eprintln!(
+                "  {DIM}Try running without --sandbox to see the agent's error output.{RESET}"
+            );
+        }
     }
     eprintln!();
 
@@ -388,16 +407,18 @@ pub async fn run_full(config: AgentConfig) -> Result<()> {
     let tasks = BackgroundTasks::spawn(&config.proxy);
 
     // Phase 2
+    let launch_start = std::time::Instant::now();
     let exit_code = launch(&config, &pre).await.unwrap_or_else(|e| {
         eprintln!("  {RED}Execution failed: {e}{RESET}");
         1
     });
+    let runtime_secs = launch_start.elapsed().as_secs();
 
     // Stop background tasks
     tasks.abort();
 
     // Phase 3
-    post_exit_audit(&config, &pre, exit_code);
+    post_exit_audit(&config, &pre, exit_code, runtime_secs);
 
     Ok(())
 }
