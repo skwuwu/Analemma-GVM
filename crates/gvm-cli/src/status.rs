@@ -27,6 +27,7 @@ pub async fn run_status(proxy_url: &str) -> Result<()> {
     let wal_failures = body["wal_failures"].as_u64().unwrap_or(0);
     let emergency = body["emergency_writes"].as_u64().unwrap_or(0);
     let pending = body["pending_approvals"].as_u64().unwrap_or(0);
+    let tls_ready = body["tls_ready"].as_bool().unwrap_or(false);
 
     let status_color = match status {
         "healthy" => GREEN,
@@ -44,6 +45,11 @@ pub async fn run_status(proxy_url: &str) -> Result<()> {
     eprintln!("  {status_color}{status_icon}{RESET} {BOLD}{status}{RESET}  {DIM}v{version}{RESET}");
     eprintln!("  {DIM}Listen:{RESET}       {CYAN}{proxy_url}{RESET}");
     eprintln!("  {DIM}SRR rules:{RESET}    {srr_rules}");
+    if tls_ready {
+        eprintln!("  {DIM}TLS MITM:{RESET}     ready");
+    } else {
+        eprintln!("  {YELLOW}TLS MITM:{RESET}     warming up");
+    }
     eprintln!("  {DIM}WAL:{RESET}          {wal_status}");
     if wal_failures > 0 {
         eprintln!("  {YELLOW}WAL failures:{RESET} {wal_failures}");

@@ -835,7 +835,7 @@ pub async fn run_watch(
     let _cleanup_guard = temp_config_dir.as_ref().map(|d| TempConfigGuard(d.clone()));
 
     let workspace = run::workspace_root_for_proxy();
-    crate::proxy_manager::ensure_available(proxy, &workspace).await?;
+    crate::proxy_manager::ensure_available(proxy, &workspace, false).await?;
 
     // If allow-all mode, reload proxy with our temp config via admin API
     let admin_url = run::derive_admin_url(proxy);

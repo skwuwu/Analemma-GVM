@@ -78,7 +78,10 @@
       "Bash(ssh -i \"C:\\\\Users\\\\gimgy\\\\Downloads\\\\Analemma-test.pem\" -o StrictHostKeyChecking=no ubuntu@43.201.62.93 'cd ~/Analemma-GVM/results/stress-20260401T125504 && echo \"\"=== Files ===\"\" && ls -la && echo \"\"=== Agent PIDs ===\"\" && cat agent_pids.txt 2>/dev/null && echo \"\"=== Agent 1 log ===\"\" && head -5 agents/agent-1.log 2>/dev/null && tail -5 agents/agent-1.log 2>/dev/null && echo \"\"=== Proxy log last 5 ===\"\" && tail -5 proxy.log 2>/dev/null')",
       "Bash(ssh -i \"C:\\\\Users\\\\gimgy\\\\Downloads\\\\Analemma-test.pem\" -o ConnectTimeout=15 -o StrictHostKeyChecking=no ubuntu@43.201.62.93 'echo ALIVE; uptime; uname -r')",
       "Bash(ssh -i \"C:\\\\Users\\\\gimgy\\\\Downloads\\\\Analemma-test.pem\" -o StrictHostKeyChecking=no ubuntu@43.201.62.93 'cd ~/Analemma-GVM && for f in $\\(find target/criterion -name \"\"estimates.json\"\" -path \"\"*/new/*\"\" 2>/dev/null\\); do dir=$\\(dirname $\\(dirname $f\\)\\); name=$\\(echo $dir | sed \"\"s|target/criterion/||\"\"\\); mean=$\\(python3 -c \"\"import json; d=json.load\\(open\\(\\\\\"\"$f\\\\\"\"\\)\\); print\\(f\\\\\"\"{d[\\\\\"\"mean\\\\\"\"][\\\\\"\"point_estimate\\\\\"\"]:.1f}\\\\\"\"\\)\"\" 2>/dev/null\\); unit=\"\"ns\"\"; echo \"\"$name: ${mean} ${unit}\"\"; done | sort')",
-      "Bash(ssh -i \"C:\\\\Users\\\\gimgy\\\\Downloads\\\\Analemma-test.pem\" ubuntu@43.201.62.93 'tail -15 ~/Analemma-GVM/results/prod-latest.log')"
+      "Bash(ssh -i \"C:\\\\Users\\\\gimgy\\\\Downloads\\\\Analemma-test.pem\" ubuntu@43.201.62.93 'tail -15 ~/Analemma-GVM/results/prod-latest.log')",
+      "Bash(ssh -i \"C:\\\\Users\\\\gimgy\\\\Downloads\\\\Analemma-test.pem\" ubuntu@43.201.62.93 'tail -25 ~/Analemma-GVM/results/prod-latest.log')",
+      "Bash(ssh -i \"C:\\\\Users\\\\gimgy\\\\Downloads\\\\Analemma-test.pem\" ubuntu@43.201.62.93 'cd ~/Analemma-GVM && sed \"\"s/\\\\x1b\\\\[[0-9;]*m//g\"\" results/prod-20260403T081941/agents/agent-1.log | grep -E \"\"✗|Blocked|blocked|Deny|unknown\"\" | head -20')",
+      "Bash(ssh -i \"C:\\\\Users\\\\gimgy\\\\Downloads\\\\Analemma-test.pem\" ubuntu@43.201.62.93 'tail -30 ~/Analemma-GVM/results/prod-latest.log')"
     ]
   }
 }

@@ -381,6 +381,7 @@ async fn main() {
             }
             sc
         },
+        tls_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     // Clone state for CONNECT handler before moving into axum router
@@ -881,6 +882,9 @@ async fn start_tls_listener(
             }
             tracing::info!("MITM cert cache pre-warmed");
         }
+        state
+            .tls_ready
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     ready.notify_one();

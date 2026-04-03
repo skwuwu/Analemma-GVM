@@ -14,15 +14,35 @@ use std::path::{Path, PathBuf};
 
 /// Check if the proxy is reachable and healthy.
 pub async fn proxy_healthy(proxy: &str) -> bool {
+    proxy_healthy_with_tls(proxy, false).await
+}
+
+/// Check if the proxy is reachable, healthy, and TLS MITM cert cache is warm.
+/// `require_tls` = true blocks until tls_ready is true (for sandbox mode).
+pub async fn proxy_healthy_with_tls(proxy: &str, require_tls: bool) -> bool {
     let health_url = format!("{}/gvm/health", proxy.trim_end_matches('/'));
-    matches!(reqwest::get(&health_url).await, Ok(resp) if resp.status().is_success())
+    match reqwest::get(&health_url).await {
+        Ok(resp) if resp.status().is_success() => {
+            if !require_tls {
+                return true;
+            }
+            // Parse tls_ready from health response
+            match resp.json::<serde_json::Value>().await {
+                Ok(body) => body["tls_ready"].as_bool().unwrap_or(false),
+                Err(_) => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Ensure the proxy is available. If not running, start it as an independent daemon.
 /// If already running (checked via health endpoint + PID file), reuse it.
-pub async fn ensure_available(proxy: &str, workspace: &Path) -> Result<()> {
+/// `require_tls`: if true, waits for MITM cert pre-warm to complete before returning.
+/// Set to true for sandbox mode (agents need warm cert cache), false for cooperative.
+pub async fn ensure_available(proxy: &str, workspace: &Path, require_tls: bool) -> Result<()> {
     // 1. Check health endpoint first (fastest path)
-    if proxy_healthy(proxy).await {
+    if proxy_healthy_with_tls(proxy, require_tls).await {
         // Health OK — but verify PID file matches the actual process.
         // If PID file is stale (points to dead process while a different proxy
         // is alive on the port), update it so future operations work correctly.
@@ -71,7 +91,7 @@ pub async fn ensure_available(proxy: &str, workspace: &Path) -> Result<()> {
             eprintln!("  {DIM}Proxy PID {pid} found, waiting for health...{RESET}");
             for _ in 0..10 {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                if proxy_healthy(proxy).await {
+                if proxy_healthy_with_tls(proxy, require_tls).await {
                     return Ok(());
                 }
             }
@@ -90,11 +110,11 @@ pub async fn ensure_available(proxy: &str, workspace: &Path) -> Result<()> {
         );
     }
 
-    start_daemon(proxy, workspace).await
+    start_daemon(proxy, workspace, require_tls).await
 }
 
 /// Start the proxy as an independent daemon process.
-async fn start_daemon(proxy: &str, workspace: &Path) -> Result<()> {
+async fn start_daemon(proxy: &str, workspace: &Path, require_tls: bool) -> Result<()> {
     let binary = find_proxy_binary(workspace)?;
 
     // Before starting, kill any stale process occupying our port.
@@ -186,10 +206,10 @@ async fn start_daemon(proxy: &str, workspace: &Path) -> Result<()> {
     }
     fix_file_ownership(&pid_path);
 
-    // Wait for proxy to become healthy
+    // Wait for proxy to become healthy (and TLS ready if required)
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
-        if proxy_healthy(proxy).await {
+        if proxy_healthy_with_tls(proxy, require_tls).await {
             eprintln!("  {GREEN}Proxy started (PID {pid}){RESET}");
             return Ok(());
         }
@@ -411,7 +431,7 @@ pub async fn watchdog(proxy: String, workspace: PathBuf) {
             MAX_RESTARTS
         );
 
-        match start_daemon(&proxy, &workspace).await {
+        match start_daemon(&proxy, &workspace, false).await {
             Ok(()) => {
                 restarts += 1;
                 consecutive_failures = 0;

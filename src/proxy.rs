@@ -105,6 +105,10 @@ pub struct AppState {
     pub mitm_server_config: Option<std::sync::Arc<rustls::ServerConfig>>,
     /// Pre-built rustls ClientConfig for upstream TLS connections.
     pub mitm_client_config: Option<std::sync::Arc<rustls::ClientConfig>>,
+    /// TLS MITM cert cache pre-warm complete. False until all known domain
+    /// certs are generated. Health endpoint includes this so proxy_manager
+    /// can wait for TLS readiness before starting sandbox agents.
+    pub tls_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Derive event status from upstream HTTP response.

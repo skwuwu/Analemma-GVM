@@ -58,8 +58,11 @@ pub async fn pre_launch(config: &AgentConfig) -> Result<PreLaunchState> {
     let is_binary_mode = config.command.len() > 1 || !run::looks_like_script(&config.command[0]);
 
     // 1. Ensure proxy is running (auto-start as independent daemon if needed)
+    //    Sandbox mode: wait for TLS cert pre-warm (tls_ready=true) so agents
+    //    don't hit cold MITM cert cache on their first HTTPS request.
     let workspace = run::workspace_root_for_proxy();
-    crate::proxy_manager::ensure_available(&config.proxy, &workspace).await?;
+    let require_tls = config.mode == LaunchMode::Sandbox;
+    crate::proxy_manager::ensure_available(&config.proxy, &workspace, require_tls).await?;
 
     // 2. Orphan cleanup (sandbox only — prevent stale iptables/veth)
     if config.mode == LaunchMode::Sandbox {
