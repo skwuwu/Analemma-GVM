@@ -221,14 +221,17 @@ launch_agent() {
     # gvm run --sandbox handles everything:
     #   - proxy_manager starts proxy if not running
     #   - sandbox creates namespace, seccomp, veth
-    #   - agent runs autonomously until done or timeout
+    #   - agent runs autonomously until done
+    #
+    # No OpenClaw --timeout: let the agent finish its task naturally.
+    # GVM_SANDBOX_TIMEOUT is the only safety net (test duration + 30 min buffer).
+    # If the agent needs more time, it gets it — this is autonomous agent testing.
     local session_id="${agent_id}-$(date +%s)"
-    GVM_SANDBOX_TIMEOUT=$((DURATION_SEC + 300)) \
+    GVM_SANDBOX_TIMEOUT=$((DURATION_SEC + 1800)) \
     "$GVM_BIN" run --sandbox \
         --agent-id "$agent_id" \
         -- node "$OC_MJS" agent --local \
         --session-id "$session_id" \
-        --timeout "$DURATION_SEC" \
         --message "$prompt" \
         > "$log" 2>&1 &
 
