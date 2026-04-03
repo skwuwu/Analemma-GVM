@@ -1,141 +1,104 @@
 # Analemma-GVM
 
-**Your AI agent just called `DELETE /production/users`. Did you approve that?**
+I wanted to run multiple OpenClaw agents for my startup. But every time I let an agent autonomously call external APIs, the same question stopped me: *what if it calls something it shouldn't?*
 
-GVM is the enforcement layer between your AI agent and the internet. It sees every API call, blocks what you haven't approved, and logs everything in a tamper-evident chain — before the request ever reaches the upstream server.
+Existing answers required Kubernetes, Envoy sidecars, or trusting the agent to behave. I needed something I could `cargo build` and run in front of any agent, on a single machine, with no infrastructure team.
+
+So I built GVM — an HTTP proxy that sits between your agent and the internet. It doesn't trust the agent. It watches every API call, blocks what you haven't approved, and keeps a tamper-evident log of everything.
 
 ```
 Agent (any framework) → GVM Proxy → External APIs
                           ↓
                     See it. Block it.
-                    Audit it. Roll back.
+                    Audit it.
 ```
 
-Single binary (~17MB). Single process. Zero code changes required.
-
-**Status**: v0.4 pre-release. [Security Model →](docs/11-security-model.md) | [60-min chaos stress test PASS](docs/09-test-report.md#910-chaos-stress-test-60-minutes)
+Single binary. Single process. No Docker, no K8s, no GPU.
 
 ---
 
-## Why
+## Who needs this
 
-AI agents call APIs autonomously. When something goes wrong:
+- **Solo devs / small teams** running AI agents in production without a dedicated security team
+- **Anyone who's nervous** about giving an agent access to Stripe, Slack, Gmail, or a database API
+- **Startups** that need governance and audit trails but can't adopt enterprise infra (OPA, Envoy, NVIDIA OpenShell)
+- **Agent framework users** (OpenClaw, CrewAI, LangChain, AutoGen) who want a safety layer that doesn't require code changes
 
-| Problem | Without GVM | With GVM |
-|---------|------------|----------|
-| Agent calls production API by mistake | Incident. Manual rollback. | **Denied by URL rule. Never reaches production.** |
-| Agent loops 200 identical requests | $500 bill. Discovered next morning. | **Rate limited. Blocked after 10. Alerted immediately.** |
-| Prompt injection makes agent misuse a tool | Agent had API keys. Data exfiltrated. | **Agent never holds keys. GVM injects post-enforcement.** |
-| "What happened?" during incident review | Scattered logs across 5 services. | **Merkle-chained audit trail. Every request. Tamper-evident.** |
-| New agent needs access to Stripe | Copy-paste API keys into env vars. | **`gvm check --agent-id new-agent --host api.stripe.com` → verify before deploy.** |
-
-One architectural choice produces all of these: **govern actions at the network boundary, not inside the agent.**
+If you have a Kubernetes cluster and a platform team, you probably don't need this. If you're one person running agents on an EC2 instance, this is for you.
 
 ---
 
-## Quick Start (3 minutes)
+## Quick Start
 
 ```bash
-# Build
 git clone https://github.com/skwuwu/Analemma-GVM.git && cd Analemma-GVM
 cargo build --release
 
-# Step 1: Watch — see what your agent calls
-gvm watch my_agent.py
+# Watch what your agent calls (no blocking)
+gvm run --watch my_agent.py
 
-# Step 2: Generate rules from the audit log
+# Generate rules from what you saw
 gvm suggest --from data/wal.log > config/srr_network.toml
 
-# Step 3: Enforce — block what you didn't approve
+# Enforce those rules
 gvm run my_agent.py
+
+# Production: kernel-level isolation (Linux)
+gvm run --sandbox my_agent.py
 ```
 
-**That's it.** Watch → suggest → enforce. [Quick Start →](docs/12-quickstart.md) | [Full User Guide →](docs/15-user-guide.md)
+Everything is `gvm run` with flags. Watch → suggest → enforce. [Quick Start →](docs/12-quickstart.md)
 
 ---
 
-## How It Works
+## What it does
 
-```
-┌─────────────┐     ┌───────────────────────────┐     ┌──────────────┐
-│  AI Agent    │────>│  GVM Proxy                │────>│ Stripe API   │
-│  (any framework)   │  1. Match URL rules (SRR) │     │ Slack API    │
-│              │     │  2. Check agent policy     │     │ Gmail API    │
-│              │     │  3. Inject API keys        │     │ ...          │
-│              │     │  4. Log to audit chain     │     │              │
-└──────────────┘     └───────────────────────────┘     └──────────────┘
-```
+GVM is the enforcement layer, not a filter. It doesn't read prompts or classify outputs — it intercepts the HTTP calls the agent actually makes.
 
 | Decision | What happens | Example |
 |----------|-------------|---------|
 | **Allow** | Pass through, async audit | `GET api.github.com/repos` |
-| **Delay** | Audit first, then forward (safety buffer) | Unknown host, first time seen |
-| **RequireApproval** | Hold request until human approves (`gvm approve`) | `POST api.stripe.com/charges` |
+| **Delay** | Audit first, then forward | Unknown host, first time seen |
+| **RequireApproval** | Hold until human approves | `POST api.stripe.com/charges` |
 | **Deny** | Block immediately | `DELETE production-db/users` |
 
-### Dry-run before deployment
+The agent never holds API keys. GVM strips whatever the agent sends and injects the real credentials from `config/secrets.toml` — post-enforcement.
+
+### Verify before deployment
 
 ```bash
-gvm check --agent-id finance-bot --operation gvm.payment.charge --host api.stripe.com
+gvm check --agent-id finance-bot --host api.stripe.com --method POST
 #  Decision:     RequireApproval
 #  Path:         Policy(Allow) + SRR(RequireApproval) → Final(RequireApproval)
-#  Matched rule: stripe-charges-approval-required
 #  Latency:      38μs
 ```
 
-Same `enforcement::classify()` function as the live proxy — check results always match real enforcement.
+Same classification function as the live proxy. Check results always match real enforcement.
 
 ---
 
-## Isolation Modes
+## Modes
 
-Everything is `gvm run` with flags:
+| Mode | Command | What it does |
+|------|---------|-------------|
+| **Watch** | `gvm run --watch agent.py` | See every API call. No blocking. |
+| **Enforce** | `gvm run agent.py` | Apply URL rules + audit trail |
+| **Discover** | `gvm run -i agent.py` | Enforce + suggest new rules after exit |
+| **Sandbox** | `gvm run --sandbox agent.py` | Kernel isolation (namespace + seccomp + MITM) |
 
-| Mode | Command | HTTPS inspection | Platform |
-|------|---------|-----------------|----------|
-| **Observe** | `gvm run --watch agent.py` | None (observation only) | Any OS |
-| **Enforce** | `gvm run agent.py` | Python: full. Node.js: HTTP only* | Any OS |
-| **Sandbox** | `gvm run --sandbox agent.py` | Full L7 (DNAT → MITM) | Linux (production) |
-| **Discover** | `gvm run -i agent.py` | Same as enforce + rule suggestions | Any OS |
-
-> \* Node.js ignores `HTTPS_PROXY`. Use `--sandbox` for Node.js agents. GVM warns when it detects Node.js in cooperative mode.
-
-`--sandbox` isolates the agent in Linux namespaces with seccomp-BPF, intercepts all HTTPS via MITM, and injects credentials — the agent physically cannot bypass the proxy.
-
-> **`--contained` (Docker)** and **Wasm policy engine** are unsupported experimental features. `--contained` has known stability issues (WSL2, iptables, NET_ADMIN). Wasm is disabled by default (`--features wasm`). Neither is recommended for use. [Details →](docs/14-governance-coverage.md)
+Sandbox mode intercepts all HTTPS at the network level — the agent physically cannot bypass the proxy. Works with any runtime (Python, Node.js, Go, binaries).
 
 ### MCP (Claude Desktop / Cursor)
 
-GVM provides MCP tools for AI assistants. Claude Desktop can check policies, fetch URLs through governance, and browse audit logs — all governed by GVM.
-
-```bash
-# Start proxy, then configure Claude Desktop to use GVM MCP server
-# See: docs/12-quickstart.md#7-mcp-integration--claude-desktop--cursor
-```
+GVM provides MCP tools for AI assistants. [Setup guide →](docs/12-quickstart.md#7-mcp-integration--claude-desktop--cursor)
 
 ---
 
-## SDK (experimental, zero required)
+## What it's not
 
-**The core value of GVM is zero-code-change governance.** The proxy alone provides URL rules, credential injection, and a full audit trail — no SDK needed.
-
-The Python SDK is an **experimental** add-on for intent verification and checkpoint/rollback. These features are not yet stabilized and may change.
-
-```python
-from gvm import ic, gvm_session
-
-@ic(operation="gvm.messaging.send")
-def send_email(to, subject, body):
-    return gvm_session().post("http://gmail.googleapis.com/...", json={...}).json()
-```
-
-The proxy cross-checks what the agent *says* it's doing (`@ic`) against what it *actually* requests (URL). `max_strict()` catches the mismatch. Works with CrewAI, AutoGen, LangChain, plain Python.
-
-> **Status**: SDK features (checkpoint/rollback, `GVMAgent`, `@ic` decorator) are experimental. The proxy-only path is the stable, recommended approach.
-
----
-
-## Competitive Position
+- **Not a prompt filter.** Use Lakera or provider safety for that. GVM governs actions, not words.
+- **Not enterprise infra.** No multi-node, no Kubernetes operator, no dashboard. Single binary, single machine.
+- **Not a replacement for OPA.** OPA governs service-to-service. GVM governs agent-to-world.
 
 | | LLM Provider Safety | Prompt Guards (Lakera) | **GVM** |
 |---|---|---|---|
@@ -143,7 +106,18 @@ The proxy cross-checks what the agent *says* it's doing (`@ic`) against what it 
 | **Enforcement** | Inside the model | Before/after model | **Between agent and APIs** |
 | **Audit** | Provider logs (you don't own) | Prompt logs | **Merkle WAL (you own)** |
 
-LLM safety says "don't generate harmful text." GVM says "don't call `DELETE /production`." [Full analysis →](docs/10-competitive-analysis.md)
+[Full analysis →](docs/10-competitive-analysis.md)
+
+---
+
+## Technical facts
+
+- Rust, ~17MB release binary, ~10MB RSS at idle
+- Policy evaluation < 1μs (SRR + ABAC, no heap allocation on hot path)
+- WAL with Merkle chain, size-based rotation (100MB default), watermark crash recovery
+- 367+ tests, 30-min chaos stress test (proxy kill, network partition, disk pressure) — [PASS](docs/09-test-report.md#910-chaos-stress-test-30-minutes)
+- seccomp-BPF with ~130 whitelisted syscalls, ENOSYS default for unknown
+- Sandbox auto-cleanup via per-PID state files (Docker pattern)
 
 ---
 
@@ -151,16 +125,14 @@ LLM safety says "don't generate harmful text." GVM says "don't call `DELETE /pro
 
 | Doc | What it covers |
 |-----|----------------|
-| [Quick Start](docs/12-quickstart.md) | First-time setup, isolation modes |
-| **[User Guide](docs/15-user-guide.md)** | **CLI commands, policy writing, debugging, CI/CD, production** |
-| [Reference](docs/13-reference.md) | Config syntax, API endpoints, operational notes |
-| [SRR Rules](docs/03-srr.md) | URL/method/path matching syntax |
+| [Quick Start](docs/12-quickstart.md) | Build, run, isolate, MCP setup |
+| [Reference](docs/13-reference.md) | Config, CLI, API, CI/CD |
 | [Security Model](docs/11-security-model.md) | Threat model, known attack surface |
-| [Architecture](docs/00-overview.md) | 3-layer design, Merkle WAL, enforcement decisions |
 | [Governance Coverage](docs/14-governance-coverage.md) | Per-mode enforcement matrix |
-| [Competitive Analysis](docs/10-competitive-analysis.md) | vs Lakera, Prompt Armor, OPA, OpenAI safety |
 | [Changelog](docs/CHANGELOG.md) | Roadmap, implementation log |
 
 ---
 
-Apache 2.0. Contributions and feedback welcome — [issues](https://github.com/skwuwu/Analemma-GVM/issues).
+**Status**: v0.4 pre-release. Not externally audited. [Security Model →](docs/11-security-model.md)
+
+Apache 2.0. [Issues →](https://github.com/skwuwu/Analemma-GVM/issues)
