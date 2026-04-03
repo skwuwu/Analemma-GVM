@@ -8,9 +8,6 @@ So I built GVM — an HTTP proxy that sits between your agent and the internet. 
 
 ```
 Agent (any framework) → GVM Proxy → External APIs
-                          ↓
-                    See it. Block it.
-                    Audit it.
 ```
 
 Single binary. Single process. No Docker, no K8s, no GPU.
@@ -31,9 +28,15 @@ If you have a Kubernetes cluster and a platform team, you probably don't need th
 ## Quick Start
 
 ```bash
+# Option 1: Pre-built binary (Linux x86_64)
+curl -L https://github.com/skwuwu/Analemma-GVM/releases/latest/download/gvm-linux-x86_64.tar.gz | tar xz
+
+# Option 2: Build from source
 git clone https://github.com/skwuwu/Analemma-GVM.git && cd Analemma-GVM
 cargo build --release
+```
 
+```bash
 # Watch what your agent calls (no blocking)
 gvm run --watch my_agent.py
 
@@ -115,7 +118,7 @@ GVM provides MCP tools for AI assistants. [Setup guide →](docs/12-quickstart.m
 - Rust, ~17MB release binary, ~10MB RSS at idle
 - Policy evaluation < 1μs (SRR + ABAC, no heap allocation on hot path)
 - WAL with Merkle chain, size-based rotation (100MB default), watermark crash recovery
-- 367+ tests, 30-min chaos stress test (proxy kill, network partition, disk pressure) — [PASS](docs/09-test-report.md#910-chaos-stress-test-30-minutes)
+- 329 tests, 60-min chaos stress test (proxy kill, network partition, disk pressure) — [PASS](docs/09-test-report.md#910-chaos-stress-test-60-minutes)
 - seccomp-BPF with ~130 whitelisted syscalls, ENOSYS default for unknown
 - Sandbox auto-cleanup via per-PID state files (Docker pattern)
 
@@ -133,6 +136,6 @@ GVM provides MCP tools for AI assistants. [Setup guide →](docs/12-quickstart.m
 
 ---
 
-**Status**: v0.4 pre-release. Not externally audited. [Security Model →](docs/11-security-model.md)
+v0.4 pre-release. [Security model →](docs/11-security-model.md) (not externally audited).
 
 Apache 2.0. [Issues →](https://github.com/skwuwu/Analemma-GVM/issues)
