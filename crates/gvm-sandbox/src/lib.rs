@@ -77,11 +77,6 @@ pub struct SandboxConfig {
     /// Sandbox filesystem profile. Controls how much of the host userland is
     /// exposed inside the sandbox.
     pub sandbox_profile: SandboxProfile,
-    /// Host ports to expose inside sandbox. For each port, sandbox's
-    /// localhost:<port> is DNAT'd to host's localhost:<port>.
-    /// Enables agents to reach host services (Ollama, DB, OpenClaw gateway).
-    /// Ports 80 and 443 are rejected to prevent MITM bypass.
-    pub host_ports: Vec<u16>,
 }
 
 /// Sandbox filesystem profile — controls the trade-off between isolation and compatibility.

@@ -165,7 +165,6 @@ fn gather_sandbox_checks() -> SandboxCapabilities {
             fs_policy: None,
             mitm_ca_cert: None,
             sandbox_profile: gvm_sandbox::SandboxProfile::default(),
-            host_ports: vec![],
         };
 
         let report = gvm_sandbox::preflight_check(&dummy_config);

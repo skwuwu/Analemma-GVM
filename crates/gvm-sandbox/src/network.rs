@@ -81,7 +81,7 @@ impl VethConfig {
 
 /// Host-side network setup: create veth pair, move one end into sandbox, configure routing.
 /// Returns the DNS target used for DNAT (for deterministic cleanup).
-pub fn setup_host_network(config: &VethConfig, host_ports: &[u16]) -> Result<String> {
+pub fn setup_host_network(config: &VethConfig) -> Result<String> {
     // 1. Create veth pair
     run_ip(&[
         "link",
@@ -338,29 +338,6 @@ pub fn setup_host_network(config: &VethConfig, host_ports: &[u16]) -> Result<Str
         "Host-side network configured (proxy-only, FORWARD DROP default)"
     );
 
-    // Host port forwarding: PREROUTING on host veth to forward sandbox
-    // traffic to host's actual localhost. Pairs with sandbox-side OUTPUT DNAT.
-    for port in host_ports {
-        let port_str = port.to_string();
-        run_iptables(&[
-            "-t",
-            "nat",
-            "-A",
-            "PREROUTING",
-            "-i",
-            &config.host_iface,
-            "-p",
-            "tcp",
-            "--dport",
-            &port_str,
-            "-j",
-            "DNAT",
-            "--to-destination",
-            &format!("127.0.0.1:{}", port),
-        ])?;
-        tracing::info!(port = port, "Host port PREROUTING: veth → localhost");
-    }
-
     Ok(dns_target)
 }
 
@@ -373,7 +350,7 @@ pub fn setup_host_network(config: &VethConfig, host_ports: &[u16]) -> Result<Str
 /// - loopback (127.0.0.1)
 ///
 /// All other outbound traffic is dropped.
-pub fn setup_sandbox_network(config: &VethConfig, host_ports: &[u16]) -> Result<()> {
+pub fn setup_sandbox_network(config: &VethConfig) -> Result<()> {
     // 1. Bring up loopback
     run_ip(&["link", "set", "lo", "up"])?;
 
@@ -473,44 +450,6 @@ pub fn setup_sandbox_network(config: &VethConfig, host_ports: &[u16]) -> Result<
         "-j",
         "ACCEPT",
     ])?;
-
-    // Host port forwarding: DNAT sandbox localhost:<port> → host veth:<port>
-    // Then host-side PREROUTING forwards to host's actual localhost.
-    // This lets agents reach host services (Ollama, DB, OpenClaw gateway).
-    for port in host_ports {
-        let port_str = port.to_string();
-        // NAT: redirect localhost:<port> → host veth IP:<port>
-        run_iptables(&[
-            "-t",
-            "nat",
-            "-A",
-            "OUTPUT",
-            "-p",
-            "tcp",
-            "-d",
-            "127.0.0.1",
-            "--dport",
-            &port_str,
-            "-j",
-            "DNAT",
-            "--to-destination",
-            &format!("{}:{}", config.host_ip, port),
-        ])?;
-        // Allow the forwarded traffic in OUTPUT
-        run_iptables(&[
-            "-A",
-            "OUTPUT",
-            "-p",
-            "tcp",
-            "-d",
-            &config.host_ip,
-            "--dport",
-            &port_str,
-            "-j",
-            "ACCEPT",
-        ])?;
-        tracing::info!(port = port, host_ip = %config.host_ip, "Host port forwarded in sandbox");
-    }
 
     // DROP everything else — this is the core proxy bypass prevention
     run_iptables(&["-A", "OUTPUT", "-j", "DROP"])?;
