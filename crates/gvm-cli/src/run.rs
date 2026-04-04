@@ -224,6 +224,8 @@ pub(crate) fn inject_proxy_env(cmd: &mut tokio::process::Command, proxy: &str, a
         .env("HTTPS_PROXY", proxy)
         .env("http_proxy", proxy)
         .env("https_proxy", proxy)
+        .env("NO_PROXY", "127.0.0.1,localhost,::1")
+        .env("no_proxy", "127.0.0.1,localhost,::1")
         .env("GVM_AGENT_ID", agent_id)
         .env("GVM_PROXY_URL", proxy);
 }
@@ -755,7 +757,11 @@ pub(crate) async fn run_contained_legacy(
             .arg(format!("https_proxy={}", container_proxy));
     }
     cmd.arg("-e")
-        .arg(format!("GVM_PROXY_URL={}", container_proxy));
+        .arg(format!("GVM_PROXY_URL={}", container_proxy))
+        .arg("-e")
+        .arg("NO_PROXY=127.0.0.1,localhost,::1")
+        .arg("-e")
+        .arg("no_proxy=127.0.0.1,localhost,::1");
 
     // Pass through LLM provider API keys if set in host environment.
     // Most agent frameworks (OpenClaw, LangChain, CrewAI) need these to call LLM APIs.

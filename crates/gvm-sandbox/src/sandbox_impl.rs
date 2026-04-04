@@ -633,6 +633,12 @@ fn child_entry(
         std::env::set_var("HTTPS_PROXY", &proxy_url);
         std::env::set_var("https_proxy", &proxy_url);
     }
+    // Localhost traffic must bypass the proxy. Agents use loopback for
+    // internal services (OpenClaw gateway on :18789, Ollama, local DBs).
+    // Without NO_PROXY, HTTP clients send CONNECT 127.0.0.1:443 to the
+    // proxy, which fails on MITM (localhost has no valid cert/SNI).
+    std::env::set_var("NO_PROXY", "127.0.0.1,localhost,::1");
+    std::env::set_var("no_proxy", "127.0.0.1,localhost,::1");
     std::env::set_var("GVM_AGENT_ID", &config.agent_id);
     std::env::set_var("GVM_PROXY_URL", &proxy_url);
     // HOME points to the overlayfs-merged home directory.
