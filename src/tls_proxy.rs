@@ -969,40 +969,22 @@ async fn relay_tls<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         upstream_tls.write_all(&req.body).await?;
     }
 
-    // Adaptive timeout for upstream relay:
-    // - Before first byte: 30s (detect upstream connect/response failure quickly)
-    // - After first byte:  5 min (SSE streaming — LLM thinking can take 60s+
-    //   between chunks, and killing an active stream wastes agent progress)
+    // No upstream read timeout. Upstream (api.anthropic.com etc.) is a trusted
+    // server that GVM connects to directly. If the TCP connection is alive, the
+    // server is processing — LLM thinking can take minutes (extended thinking,
+    // o1/o3 reasoning, API queue delays). A timeout here kills valid requests.
     //
-    // This matches nginx proxy_read_timeout: fast failure detection for broken
-    // upstreams, but patience for slow-but-active streams.
-    const FIRST_BYTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-    const STREAMING_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-
+    // Dead connection detection is handled by TCP keepalive at the OS level.
+    // Slowloris defense is only needed on the client side (agent → proxy),
+    // not upstream (proxy → API server).
     let mut buf = vec![0u8; 32768];
     let mut total_relayed: usize = 0;
     loop {
-        let timeout = if total_relayed == 0 {
-            FIRST_BYTE_TIMEOUT
-        } else {
-            STREAMING_IDLE_TIMEOUT
-        };
-        let n = match tokio::time::timeout(timeout, upstream_tls.read(&mut buf)).await {
-            Ok(Ok(0)) => break, // upstream closed
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => {
+        let n = match upstream_tls.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
                 tracing::debug!(error = %e, bytes_relayed = total_relayed, "MITM: upstream read error");
-                break;
-            }
-            Err(_) => {
-                if total_relayed == 0 {
-                    tracing::debug!("MITM: upstream first-byte timeout (30s)");
-                } else {
-                    tracing::debug!(
-                        bytes_relayed = total_relayed,
-                        "MITM: upstream streaming idle timeout (5m)"
-                    );
-                }
                 break;
             }
         };
