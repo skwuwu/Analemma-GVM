@@ -309,16 +309,15 @@ async fn main() {
         }
     };
 
-    // 9.9. Generate ephemeral CA for MITM TLS inspection.
-    // Single CA shared between:
-    //   - TLS MITM listener (port 8443) — uses it to terminate agent TLS
-    //   - GET /gvm/ca.pem endpoint — sandbox downloads it for trust store injection
-    // This ensures the CA injected into the sandbox matches the one used by the listener.
-    let mitm_ca =
-        gvm_sandbox::ca::EphemeralCA::generate().expect("Failed to generate ephemeral MITM CA");
+    // 9.9. Load or generate persistent CA for MITM TLS inspection.
+    // CA is saved to data/mitm-ca.pem + data/mitm-ca-key.pem and reused across
+    // proxy restarts. This ensures running sandboxes (which have the CA in their
+    // trust store) remain valid when the proxy is restarted.
+    // Pattern matches mitmproxy, Burp Suite, Charles Proxy.
+    let mitm_ca = gvm_sandbox::ca::EphemeralCA::load_or_generate()
+        .expect("Failed to load or generate MITM CA");
     let mitm_ca_cert_pem = Arc::new(mitm_ca.ca_cert_pem().to_vec());
     let mitm_ca_key_pem = Arc::new(mitm_ca.ca_key_pem());
-    tracing::info!("Ephemeral MITM CA generated (shared between TLS listener and sandbox)");
 
     // 9.10. Pre-build MITM TLS state (shared between port-8443 listener and CONNECT handler).
     // Single GvmCertResolver instance → single cert cache → no duplicate keygen.

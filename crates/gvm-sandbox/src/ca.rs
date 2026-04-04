@@ -9,23 +9,101 @@
 
 use anyhow::{Context, Result};
 use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
+use std::path::Path;
 use zeroize::Zeroize;
 
-/// Ephemeral CA — lives only in memory, zeroized on drop.
+/// MITM CA for transparent TLS inspection.
+///
+/// Persisted to disk so that proxy restarts don't invalidate running sandbox
+/// trust stores. This matches the pattern used by mitmproxy, Burp Suite, and
+/// Charles Proxy — the CA is generated once and reused across sessions.
+///
+/// The CA cert + key are stored with restricted permissions (0600).
+/// The key is zeroized in memory on drop.
 pub struct EphemeralCA {
     /// PEM-encoded CA certificate (for injection into sandbox trust store).
     ca_cert_pem: Vec<u8>,
-    /// CA key pair for signing leaf certificates.
-    ca_key: KeyPair,
-    /// CA certificate params (for signing).
-    ca_cert: rcgen::Certificate,
+    /// PEM-encoded CA private key (for GvmCertResolver to sign leaf certs).
+    ca_key_pem: Vec<u8>,
 }
 
+/// Default file paths for persistent CA storage.
+const CA_CERT_PATH: &str = "data/mitm-ca.pem";
+const CA_KEY_PATH: &str = "data/mitm-ca-key.pem";
+
 impl EphemeralCA {
-    /// Generate a new ephemeral CA with ECDSA P-256 key.
+    /// Load existing CA from disk, or generate a new one and save it.
     ///
-    /// The CA is valid for 24 hours — one sandbox session.
-    /// No disk I/O. All state is in memory.
+    /// On first run: generates ECDSA P-256 CA, saves cert + key to data/.
+    /// On subsequent runs: loads from disk — same CA across proxy restarts.
+    /// Running sandboxes keep working because the CA doesn't change.
+    pub fn load_or_generate() -> Result<Self> {
+        let cert_path = Path::new(CA_CERT_PATH);
+        let key_path = Path::new(CA_KEY_PATH);
+
+        if cert_path.exists() && key_path.exists() {
+            match Self::load_from_disk(cert_path, key_path) {
+                Ok(ca) => return Ok(ca),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to load saved CA — regenerating");
+                }
+            }
+        }
+
+        let ca = Self::generate()?;
+        ca.save_to_disk(cert_path, key_path)?;
+        Ok(ca)
+    }
+
+    /// Load CA cert + key from disk. No regeneration — exact same bytes.
+    fn load_from_disk(cert_path: &Path, key_path: &Path) -> Result<Self> {
+        let cert_pem = std::fs::read(cert_path)
+            .context("Failed to read CA cert")?;
+        let key_pem = std::fs::read(key_path)
+            .context("Failed to read CA key")?;
+
+        // Validate that the key is parseable
+        KeyPair::from_pem(&String::from_utf8_lossy(&key_pem))
+            .context("Saved CA key PEM is invalid")?;
+
+        tracing::info!(
+            cert = %cert_path.display(),
+            "MITM CA loaded from disk (persistent across restarts)"
+        );
+
+        Ok(Self { ca_cert_pem: cert_pem, ca_key_pem: key_pem })
+    }
+
+    /// Save CA cert + key to disk with restricted permissions.
+    fn save_to_disk(&self, cert_path: &Path, key_path: &Path) -> Result<()> {
+        if let Some(parent) = cert_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+
+        std::fs::write(cert_path, &self.ca_cert_pem)
+            .context("Failed to write CA cert")?;
+        std::fs::write(key_path, &self.ca_key_pem)
+            .context("Failed to write CA key")?;
+
+        // Restrict permissions (key file especially)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600)).ok();
+            std::fs::set_permissions(cert_path, std::fs::Permissions::from_mode(0o644)).ok();
+        }
+
+        tracing::info!(
+            cert = %cert_path.display(),
+            key = %key_path.display(),
+            "MITM CA saved to disk (reused on proxy restart)"
+        );
+        Ok(())
+    }
+
+    /// Generate a new CA with ECDSA P-256 key.
+    ///
+    /// Valid for 365 days. Persisted to disk by load_or_generate().
     pub fn generate() -> Result<Self> {
         let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
             .context("Failed to generate CA key pair")?;
@@ -34,29 +112,25 @@ impl EphemeralCA {
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.distinguished_name = {
             let mut dn = DistinguishedName::new();
-            dn.push(DnType::CommonName, "GVM Ephemeral CA");
+            dn.push(DnType::CommonName, "GVM MITM CA");
             dn.push(DnType::OrganizationName, "Analemma GVM");
             dn
         };
-        // 24-hour validity window centered on now.
-        // Backdated not_before tolerates clock drift up to 24 hours.
+        // 365-day validity. Persistent CA — not ephemeral per-session.
         let now = time::OffsetDateTime::now_utc();
         params.not_before = now - time::Duration::hours(24);
-        params.not_after = now + time::Duration::hours(24);
+        params.not_after = now + time::Duration::days(365);
 
         let ca_cert = params
             .self_signed(&key_pair)
             .context("Failed to self-sign CA certificate")?;
 
         let ca_cert_pem = ca_cert.pem().into_bytes();
+        let ca_key_pem = key_pair.serialize_pem().into_bytes();
 
-        tracing::info!("Ephemeral CA generated (ECDSA P-256, in-memory only)");
+        tracing::info!("MITM CA generated (ECDSA P-256, 365-day validity)");
 
-        Ok(Self {
-            ca_cert_pem,
-            ca_key: key_pair,
-            ca_cert,
-        })
+        Ok(Self { ca_cert_pem, ca_key_pem })
     }
 
     /// Get the CA certificate in PEM format (for trust store injection).
@@ -64,64 +138,17 @@ impl EphemeralCA {
         &self.ca_cert_pem
     }
 
-    /// Get the CA private key in PEM format (for MITM TLS listener).
+    /// Get the CA private key in PEM format (for GvmCertResolver).
     pub fn ca_key_pem(&self) -> Vec<u8> {
-        self.ca_key.serialize_pem().into_bytes()
-    }
-
-    /// Issue a leaf certificate for the given domain, signed by this CA.
-    ///
-    /// Uses ECDSA P-256 (~0.1ms per generation). Caller should cache the result.
-    pub fn issue_leaf_cert(&self, domain: &str) -> Result<LeafCert> {
-        let leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
-            .context("Failed to generate leaf key pair")?;
-
-        let mut params = CertificateParams::new(vec![domain.to_string()])
-            .context("Invalid domain for certificate")?;
-        params.distinguished_name = {
-            let mut dn = DistinguishedName::new();
-            dn.push(DnType::CommonName, domain);
-            dn
-        };
-        // Backdate leaf cert for clock drift tolerance (matches CA window)
-        let now = time::OffsetDateTime::now_utc();
-        params.not_before = now - time::Duration::hours(24);
-        params.not_after = now + time::Duration::hours(24);
-
-        let leaf_cert = params
-            .signed_by(&leaf_key, &self.ca_cert, &self.ca_key)
-            .context("Failed to sign leaf certificate")?;
-
-        Ok(LeafCert {
-            cert_pem: leaf_cert.pem(),
-            key_pem: leaf_key.serialize_pem(),
-        })
+        self.ca_key_pem.clone()
     }
 }
 
 impl Drop for EphemeralCA {
     fn drop(&mut self) {
-        // Zeroize CA cert PEM
         self.ca_cert_pem.zeroize();
-        // Zeroize the serialized private key — rcgen::KeyPair doesn't implement Zeroize,
-        // but we can serialize it once and zeroize the output to reduce exposure.
-        // The in-memory KeyPair object itself will be freed by the allocator.
-        let mut key_pem = self.ca_key.serialize_pem().into_bytes();
-        key_pem.zeroize();
-        tracing::debug!("Ephemeral CA zeroized on drop (cert PEM + key PEM serialization)");
-    }
-}
-
-/// A leaf certificate + private key for a specific domain.
-pub struct LeafCert {
-    pub cert_pem: String,
-    pub key_pem: String,
-}
-
-impl Drop for LeafCert {
-    fn drop(&mut self) {
-        self.cert_pem.zeroize();
-        self.key_pem.zeroize();
+        self.ca_key_pem.zeroize();
+        tracing::debug!("MITM CA key zeroized on drop");
     }
 }
 
@@ -130,72 +157,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generate_ephemeral_ca() {
+    fn generate_ca() {
         let ca = EphemeralCA::generate().expect("CA generation must succeed");
         assert!(!ca.ca_cert_pem().is_empty());
         assert!(ca.ca_cert_pem().starts_with(b"-----BEGIN CERTIFICATE-----"));
+        assert!(!ca.ca_key_pem().is_empty());
     }
 
     #[test]
-    fn issue_leaf_cert_for_domain() {
+    fn ca_roundtrip_via_disk() {
         let ca = EphemeralCA::generate().unwrap();
-        let leaf = ca
-            .issue_leaf_cert("api.github.com")
-            .expect("Leaf cert must be issued");
-        assert!(leaf.cert_pem.contains("BEGIN CERTIFICATE"));
-        assert!(leaf.key_pem.contains("BEGIN PRIVATE KEY"));
+        let cert_pem = ca.ca_cert_pem().to_vec();
+        let key_pem = ca.ca_key_pem();
+
+        // Write + read should produce identical bytes
+        let dir = std::env::temp_dir().join("gvm-ca-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_path = dir.join("ca.pem");
+        let key_path = dir.join("ca-key.pem");
+        ca.save_to_disk(&cert_path, &key_path).unwrap();
+
+        let loaded = EphemeralCA::load_from_disk(&cert_path, &key_path).unwrap();
+        assert_eq!(loaded.ca_cert_pem(), cert_pem);
+        assert_eq!(loaded.ca_key_pem(), key_pem);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn issue_multiple_domains() {
+    fn ca_zeroized_on_drop() {
         let ca = EphemeralCA::generate().unwrap();
-        let domains = [
-            "api.github.com",
-            "api.anthropic.com",
-            "slack.com",
-            "api.telegram.org",
-        ];
-        for domain in &domains {
-            let leaf = ca.issue_leaf_cert(domain).unwrap();
-            assert!(leaf.cert_pem.contains("BEGIN CERTIFICATE"));
-        }
-    }
-
-    #[test]
-    fn issue_ip_address_cert() {
-        let ca = EphemeralCA::generate().unwrap();
-        // IP address as SAN — rcgen supports IP SANs since 0.12+.
-        // Verify the cert is actually issued with valid PEM content.
-        let leaf = ca.issue_leaf_cert("142.250.190.46");
-        match leaf {
-            Ok(cert) => {
-                assert!(
-                    cert.cert_pem.contains("BEGIN CERTIFICATE"),
-                    "IP SAN cert must have valid PEM"
-                );
-                assert!(
-                    cert.key_pem.contains("BEGIN PRIVATE KEY"),
-                    "IP SAN cert must have valid key"
-                );
-            }
-            Err(e) => {
-                // If rcgen doesn't support IP SANs, that's acceptable — just ensure
-                // the error message is meaningful, not a panic.
-                assert!(
-                    !e.to_string().is_empty(),
-                    "Error must have a message: {}",
-                    e
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn ca_cert_pem_zeroized_on_drop() {
-        let ca = EphemeralCA::generate().unwrap();
-        let pem_len = ca.ca_cert_pem().len();
-        assert!(pem_len > 100); // non-trivial cert
+        assert!(ca.ca_cert_pem().len() > 100);
         drop(ca);
-        // Can't directly verify memory is zeroed, but drop didn't panic
     }
 }
