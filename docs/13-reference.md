@@ -244,14 +244,16 @@ gvm init --industry finance --config-dir config    # Scaffold from template
 ### Agent Observation
 
 ```bash
-gvm watch agent.py                   # Observe all API calls (no enforcement)
-gvm watch -- node my_agent.js        # Binary mode observation
-gvm watch --with-rules agent.py      # Observe with existing SRR rules active
-gvm watch --output json agent.py     # JSON output for CI/CD piping
-gvm watch --sandbox agent.py         # Observe inside Linux sandbox
+gvm run --watch agent.py                   # Observe all API calls (no enforcement)
+gvm run --watch -- node my_agent.js        # Binary mode observation
+gvm run --watch --with-rules agent.py      # Observe with existing SRR rules active
+gvm run --watch --output json agent.py     # JSON output for CI/CD piping
+gvm run --watch --sandbox agent.py         # Observe inside Linux sandbox
 ```
 
-`gvm watch` runs the agent with all requests allowed through (default). No SRR rules are enforced unless `--with-rules` is set. Provides:
+> `gvm watch` is a hidden alias for `gvm run --watch`. Both are identical. All agent execution uses `gvm run` with flags.
+
+Watch mode runs the agent with all requests allowed through (default). No SRR rules are enforced unless `--with-rules` is set. Provides:
 - **Real-time stream**: every HTTP request displayed as it happens (method, host, path, status, token usage)
 - **Session summary**: host breakdown, LLM token/cost stats, status code distribution, anomaly warnings
 - **Anomaly detection**: burst patterns (>10 req/2s), request loops (same URL >5x/10s), unknown hosts
@@ -563,6 +565,36 @@ Run `gvm check` in CI pipelines to catch unintended permission changes before de
 ```
 
 This catches policy regressions: adding a new SRR rule that accidentally opens access, or modifying ABAC that changes an agent's permission level.
+
+### Proxy Status
+
+```bash
+gvm status                          # Show proxy health, rules, WAL state
+gvm status --proxy http://host:8080 # Custom proxy URL
+```
+
+Returns proxy health, SRR rule count, WAL status, emergency write count, and Shadow Mode state.
+
+### Sandbox Options
+
+| Flag | Description |
+|------|-------------|
+| `--sandbox` | Linux namespace + seccomp + MITM isolation |
+| `--no-mitm` | Disable MITM TLS inspection. HTTPS uses CONNECT relay (domain-level only). Use for mTLS endpoints or certificate pinning. |
+| `--sandbox-timeout N` | Kill agent after N seconds (default: 3600) |
+| `--fs-governance` | Enable overlayfs Trust-on-Pattern file governance |
+| `--shadow-mode MODE` | `disabled` (default), `observe`, or `strict` |
+| `--memory 512m` | cgroup v2 memory limit |
+| `--cpus 1.0` | cgroup v2 CPU limit |
+
+### Secrets File Security
+
+On startup, GVM checks `config/secrets.toml` file permissions (Unix only). If group or other users have read access (`mode & 0o077 != 0`), GVM:
+1. Logs a warning: `secrets.toml has insecure permissions`
+2. Attempts auto-fix to `0600` (owner read/write only)
+3. If fix fails, continues with a warning (does not block startup)
+
+Best practice: `chmod 600 config/secrets.toml` before first use.
 
 ---
 

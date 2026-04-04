@@ -262,3 +262,7 @@ These are architectural boundaries, not missing features:
 | IC-3 self-approval prevention | None | None | Admin port unreachable |
 | Stability | **Production** | **Experimental** | **Production** |
 | Platform | Any OS | Any OS + Docker | Linux (kernel ≥ 4.15, recommended ≥ 6.1) |
+
+---
+
+[← Reference](13-reference.md) | [Security Model →](11-security-model.md) | [Overview →](00-overview.md)
