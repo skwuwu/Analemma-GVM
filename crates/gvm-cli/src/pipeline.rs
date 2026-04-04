@@ -28,6 +28,7 @@ pub struct AgentConfig {
     /// false (default) = legacy mode (workspace/output/ writable only).
     /// true = overlayfs with auto-merge/ManualCommit at session end.
     pub fs_governance: bool,
+    pub sandbox_profile: gvm_sandbox::SandboxProfile,
     pub memory_limit: Option<u64>,
     pub cpu_limit: Option<f64>,
     pub interactive: bool,
@@ -207,13 +208,14 @@ async fn launch_sandbox(config: &AgentConfig, pre: &PreLaunchState) -> Result<i3
         )
     };
 
-    // Set filesystem governance mode based on CLI flag
+    // Set filesystem governance mode and sandbox profile based on CLI flags
     let mut sandbox_config = sandbox_config;
     sandbox_config.fs_policy = if config.fs_governance {
         Some(gvm_sandbox::FilesystemPolicy::default())
     } else {
         None // Legacy mode: workspace/output/ only
     };
+    sandbox_config.sandbox_profile = config.sandbox_profile.clone();
 
     // Preflight check (sandbox only)
     let preflight = gvm_sandbox::preflight_check(&sandbox_config);

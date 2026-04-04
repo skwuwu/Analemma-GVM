@@ -164,6 +164,7 @@ fn gather_sandbox_checks() -> SandboxCapabilities {
             cpu_limit: None,
             fs_policy: None,
             mitm_ca_cert: None,
+            sandbox_profile: gvm_sandbox::SandboxProfile::default(),
         };
 
         let report = gvm_sandbox::preflight_check(&dummy_config);

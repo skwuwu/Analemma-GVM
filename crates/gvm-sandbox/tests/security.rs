@@ -102,6 +102,7 @@ fn preflight_report_non_linux_has_tc_filter_false() {
             cpu_limit: None,
             fs_policy: None,
             mitm_ca_cert: None,
+            sandbox_profile: gvm_sandbox::SandboxProfile::default(),
         };
         let report = preflight_check(&config);
         assert!(

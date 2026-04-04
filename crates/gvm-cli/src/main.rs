@@ -132,6 +132,13 @@ enum Commands {
         #[arg(long)]
         fs_governance: bool,
 
+        /// Sandbox filesystem profile.
+        /// minimal: interpreter + ldd libraries only (maximum isolation).
+        /// standard: /usr, /lib, /bin read-only (default, Docker-like).
+        /// full: host root read-only (maximum compatibility).
+        #[arg(long, value_parser = ["minimal", "standard", "full"], default_value = "standard")]
+        sandbox_profile: String,
+
         /// Shadow Mode: verify agent intent before execution.
         /// disabled = off (default), observe = log violations, strict = deny without intent.
         #[arg(long, value_parser = ["disabled", "observe", "strict"])]
@@ -510,6 +517,7 @@ async fn main() -> anyhow::Result<()> {
             contained,
             no_mitm,
             fs_governance,
+            sandbox_profile,
             shadow_mode,
             sandbox_timeout,
             image,
@@ -552,6 +560,7 @@ async fn main() -> anyhow::Result<()> {
                     interactive,
                     no_mitm,
                     fs_governance,
+                    &sandbox_profile,
                 )
                 .await?;
             }

@@ -25,6 +25,7 @@ pub async fn run_agent(
     interactive: bool,
     no_mitm: bool,
     fs_governance: bool,
+    sandbox_profile: &str,
 ) -> Result<()> {
     if command.is_empty() {
         anyhow::bail!(
@@ -75,6 +76,12 @@ pub async fn run_agent(
         }
     }
 
+    let profile = match sandbox_profile {
+        "minimal" => gvm_sandbox::SandboxProfile::Minimal,
+        "full" => gvm_sandbox::SandboxProfile::Full,
+        _ => gvm_sandbox::SandboxProfile::Standard,
+    };
+
     let config = crate::pipeline::AgentConfig {
         command: command.to_vec(),
         agent_id: agent_id.to_string(),
@@ -82,6 +89,7 @@ pub async fn run_agent(
         mode,
         no_mitm,
         fs_governance,
+        sandbox_profile: profile,
         memory_limit: parse_memory_limit(memory),
         cpu_limit: cpus.parse::<f64>().ok(),
         interactive,
@@ -268,6 +276,7 @@ pub(crate) fn assemble_sandbox_config(
         // Controlled by --fs-governance CLI flag.
         fs_policy: None, // Caller sets this via pipeline based on fs_governance flag
         mitm_ca_cert,
+        sandbox_profile: gvm_sandbox::SandboxProfile::default(),
     }
 }
 

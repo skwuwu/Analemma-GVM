@@ -88,6 +88,7 @@ pub fn setup_mount_namespace(
     ca_cert_pem: Option<&[u8]>,
     fs_policy: Option<&crate::FilesystemPolicy>,
     extra_lib_paths: &[PathBuf],
+    profile: &crate::SandboxProfile,
 ) -> Result<()> {
     // Safety guard: verify we're in a new mount namespace before making / private.
     // If clone(CLONE_NEWNS) failed silently, this would destroy host mount propagation.
@@ -234,7 +235,7 @@ pub fn setup_mount_namespace(
     create_dev_nodes(&new_root)?;
 
     // Bind-mount interpreter and shared libraries
-    bind_mount_interpreter(&new_root, interpreter_path, extra_lib_paths)?;
+    bind_mount_interpreter(&new_root, interpreter_path, extra_lib_paths, profile)?;
 
     // Create minimal /etc files (DNS points to veth host IP)
     create_minimal_etc(&new_root, dns_server)?;
@@ -285,62 +286,144 @@ fn create_dev_nodes(new_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Mount host userland into sandbox: /usr, /lib, /lib64, /bin read-only.
+/// Mount host filesystem into sandbox based on the selected profile.
 ///
-/// This provides a complete runtime environment (shells, coreutils, SSL config,
-/// shared libraries, locale data) so agents work the same as outside the sandbox.
-/// Security is maintained by: read-only mount (agent can't modify), seccomp
-/// blocks mount/umount (can't remount rw), pivot_root removes old_root (no
-/// access to host paths outside /usr /lib /bin).
-///
-/// This matches Docker's approach: complete userland, restricted capabilities.
-/// Previously we mounted only the interpreter + ldd-resolved libraries, which
-/// broke agents that spawn subprocesses (bash ENOENT), use SSL config
-/// (openssl.cnf missing), or expect coreutils (cat, ls, grep).
+/// Security is maintained across all profiles by: read-only mounts, seccomp
+/// blocking mount/umount, and pivot_root removing old_root.
 fn bind_mount_interpreter(
     new_root: &Path,
     interpreter_path: &Path,
-    _extra_lib_paths: &[PathBuf],
+    extra_lib_paths: &[PathBuf],
+    profile: &crate::SandboxProfile,
 ) -> Result<()> {
-    // Mount complete host directories read-only.
-    // /usr: binaries, libraries, Python/Node/Ruby stdlib, SSL certs, locale
-    // /lib, /lib64: shared libraries (libc, libssl, ld-linux)
-    // /bin: shells (bash, sh, dash), coreutils (cat, ls, grep, env)
-    for dir in &["/usr", "/lib", "/lib64", "/bin", "/sbin"] {
-        let src = Path::new(dir);
-        if !src.exists() {
-            continue;
+    match profile {
+        crate::SandboxProfile::Minimal => {
+            mount_minimal(new_root, interpreter_path, extra_lib_paths)?;
         }
-        let dst = new_root.join(dir.trim_start_matches('/'));
-        std::fs::create_dir_all(&dst).ok();
-        if let Err(e) = mount(
-            Some(src),
-            &dst,
-            None::<&str>,
-            MsFlags::MS_BIND | MsFlags::MS_RDONLY,
-            None::<&str>,
-        ) {
-            tracing::warn!(dir = %src.display(), error = %e, "Failed to mount host directory");
-            continue;
+        crate::SandboxProfile::Standard => {
+            mount_standard(new_root, interpreter_path)?;
         }
-        // Two-step remount for read-only enforcement
-        mount(
-            None::<&str>,
-            &dst,
-            None::<&str>,
-            MsFlags::MS_BIND | MsFlags::MS_RDONLY | MsFlags::MS_REMOUNT,
-            None::<&str>,
-        )
-        .ok();
+        crate::SandboxProfile::Full => {
+            mount_full(new_root, interpreter_path)?;
+        }
     }
+    Ok(())
+}
 
-    // Ensure interpreter is accessible at /bin/<name> (may already be via /bin mount)
+/// Minimal profile: interpreter binary + ldd-resolved libraries only.
+/// Maximum isolation. Agents that need bash, coreutils, or SSL config will fail.
+fn mount_minimal(
+    new_root: &Path,
+    interpreter_path: &Path,
+    extra_lib_paths: &[PathBuf],
+) -> Result<()> {
+    let mut mounted: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
+    // Bind-mount the interpreter binary
     let interpreter_name = interpreter_path
         .file_name()
         .context("Invalid interpreter path")?;
-    let bin_path = new_root.join("bin").join(interpreter_name);
+    let target_bin = new_root.join("bin").join(interpreter_name);
+    std::fs::write(&target_bin, "").context("Failed to create interpreter mount point")?;
+    mount(
+        Some(interpreter_path),
+        &target_bin,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+        None::<&str>,
+    )
+    .context("Failed to bind-mount interpreter")?;
+
+    // Resolve shared libraries via ldd
+    if let Ok(output) = std::process::Command::new("ldd")
+        .arg(interpreter_path)
+        .output()
+    {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for lib_path in parse_ldd_output(&stdout) {
+                let canonical = lib_path.canonicalize().unwrap_or_else(|_| lib_path.clone());
+                if mounted.insert(canonical) {
+                    bind_mount_library(new_root, &lib_path).ok();
+                }
+            }
+        }
+    }
+
+    // Extra libraries pre-resolved by parent process
+    for lib_path in extra_lib_paths {
+        let canonical = lib_path.canonicalize().unwrap_or_else(|_| lib_path.clone());
+        if mounted.insert(canonical) {
+            bind_mount_library(new_root, lib_path).ok();
+        }
+    }
+
+    // Mount interpreter runtime directories (Python stdlib, Node modules)
+    bind_mount_runtime_dirs(new_root, interpreter_path)?;
+
+    Ok(())
+}
+
+/// Standard profile (default): /usr, /lib, /lib64, /bin, /sbin read-only.
+/// Complete runtime environment matching Docker's approach.
+fn mount_standard(new_root: &Path, interpreter_path: &Path) -> Result<()> {
+    for dir in &["/usr", "/lib", "/lib64", "/bin", "/sbin"] {
+        mount_host_dir_readonly(new_root, dir);
+    }
+    ensure_interpreter_in_bin(new_root, interpreter_path);
+    Ok(())
+}
+
+/// Full profile: mount all top-level host directories read-only.
+/// Maximum compatibility for complex agents.
+fn mount_full(new_root: &Path, interpreter_path: &Path) -> Result<()> {
+    // Mount everything except dirs that are handled separately or shouldn't be shared
+    for dir in &[
+        "/usr", "/lib", "/lib64", "/bin", "/sbin", "/opt", "/var/lib", "/etc",
+    ] {
+        mount_host_dir_readonly(new_root, dir);
+    }
+    ensure_interpreter_in_bin(new_root, interpreter_path);
+    Ok(())
+}
+
+/// Mount a host directory read-only into the sandbox. Best-effort.
+fn mount_host_dir_readonly(new_root: &Path, dir: &str) {
+    let src = Path::new(dir);
+    if !src.exists() {
+        return;
+    }
+    let dst = new_root.join(dir.trim_start_matches('/'));
+    std::fs::create_dir_all(&dst).ok();
+    if let Err(e) = mount(
+        Some(src),
+        &dst,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+        None::<&str>,
+    ) {
+        tracing::warn!(dir = %src.display(), error = %e, "Failed to mount host directory");
+        return;
+    }
+    // Two-step remount for read-only enforcement
+    mount(
+        None::<&str>,
+        &dst,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_RDONLY | MsFlags::MS_REMOUNT,
+        None::<&str>,
+    )
+    .ok();
+}
+
+/// Ensure interpreter is accessible at /bin/<name> (may already be via /bin mount).
+fn ensure_interpreter_in_bin(new_root: &Path, interpreter_path: &Path) {
+    let name = match interpreter_path.file_name() {
+        Some(n) => n,
+        None => return,
+    };
+    let bin_path = new_root.join("bin").join(name);
     if !bin_path.exists() {
-        // Interpreter not in /bin (e.g., /usr/local/bin/python3) — add symlink-like mount
         std::fs::write(&bin_path, "").ok();
         mount(
             Some(interpreter_path),
@@ -351,8 +434,6 @@ fn bind_mount_interpreter(
         )
         .ok();
     }
-
-    Ok(())
 }
 
 /// Parse ldd output to extract library paths.

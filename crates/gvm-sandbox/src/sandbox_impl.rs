@@ -544,6 +544,7 @@ fn child_entry(
         ca_cert_pem,
         config.fs_policy.as_ref(),
         extra_lib_paths,
+        &config.sandbox_profile,
     ) {
         eprintln!("gvm-sandbox: mount namespace setup failed: {:#}", e);
         eprintln!("  Hint: this usually means the interpreter binary or its shared");

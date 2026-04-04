@@ -74,6 +74,26 @@ pub struct SandboxConfig {
     /// the CA injected into the sandbox matches the one used by the TLS MITM listener.
     /// None = HTTPS MITM disabled (no CA injection into sandbox).
     pub mitm_ca_cert: Option<Vec<u8>>,
+    /// Sandbox filesystem profile. Controls how much of the host userland is
+    /// exposed inside the sandbox.
+    pub sandbox_profile: SandboxProfile,
+}
+
+/// Sandbox filesystem profile — controls the trade-off between isolation and compatibility.
+#[derive(Debug, Clone, Default)]
+pub enum SandboxProfile {
+    /// Interpreter binary + ldd-resolved libraries only. Maximum isolation,
+    /// but agents that spawn subprocesses (bash), use SSL config, or expect
+    /// coreutils will fail. Use for trusted, simple scripts.
+    Minimal,
+    /// /usr, /lib, /lib64, /bin, /sbin read-only. Complete runtime environment
+    /// matching Docker's approach. Agents work the same as outside the sandbox.
+    /// Security maintained by read-only + seccomp + pivot_root.
+    #[default]
+    Standard,
+    /// Entire host root filesystem read-only (excluding /proc, /sys, /dev which
+    /// are mounted separately). Maximum compatibility for complex agents.
+    Full,
 }
 
 /// Trust-on-Pattern filesystem governance policy.

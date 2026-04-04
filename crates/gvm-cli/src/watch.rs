@@ -902,6 +902,7 @@ pub async fn run_watch(
         mode,
         no_mitm,
         fs_governance: false, // Watch mode: legacy filesystem (observation only)
+        sandbox_profile: gvm_sandbox::SandboxProfile::Standard,
         memory_limit: None,
         cpu_limit: None,
         interactive: false,
