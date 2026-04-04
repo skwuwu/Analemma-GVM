@@ -86,6 +86,36 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         )
     })?;
 
+    // Pre-stage home config in parent (same pattern as workspace staging).
+    // Copy user's agent config dirs to a staging tmpfs before clone().
+    // Child mounts this staging path into /home/agent/.openclaw etc.
+    let staging_home = PathBuf::from(format!("/tmp/gvm-sandbox-staging-home-{}", my_pid));
+    std::fs::remove_dir_all(&staging_home).ok();
+    {
+        let user_home = std::env::var("SUDO_USER")
+            .ok()
+            .and_then(|user| {
+                std::process::Command::new("getent")
+                    .args(["passwd", &user])
+                    .output()
+                    .ok()
+                    .and_then(|o| {
+                        let s = String::from_utf8_lossy(&o.stdout);
+                        s.split(':').nth(5).map(|h| PathBuf::from(h.trim()))
+                    })
+            })
+            .unwrap_or_else(|| PathBuf::from("/root"));
+
+        // Copy .openclaw config to staging (parent has access, child may not)
+        let oc_src = user_home.join(".openclaw");
+        if oc_src.exists() {
+            let oc_dst = staging_home.join(".openclaw");
+            std::fs::create_dir_all(&oc_dst).ok();
+            crate::mount::copy_dir_contents(&oc_src, &oc_dst);
+            tracing::debug!(src = %oc_src.display(), dst = %oc_dst.display(), "Staged .openclaw config");
+        }
+    }
+
     // Create coordination pipe
     let (parent_fd, child_fd) = coordination_pipe()?;
 
@@ -491,6 +521,8 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     // Unmount the staging workspace (pre-mounted before clone for kernel 6.17+ compat)
     nix::mount::umount(&staging_ws).ok();
     std::fs::remove_dir(&staging_ws).ok();
+    // Clean up home config staging
+    std::fs::remove_dir_all(&staging_home).ok();
 
     // Drop TC filter guard first — this detaches the filter via RAII Drop.
     // Must happen before cleanup_host_network which deletes the veth interface.

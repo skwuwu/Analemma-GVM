@@ -407,12 +407,15 @@ fn mount_home_directory(new_root: &Path) {
         .ok();
     }
 
-    // .openclaw needs read (config from host) + write (sessions/state)
-    // Copy host config to a tmpfs overlay so agent can read config but writes are ephemeral
-    let oc_host = home.join(".openclaw");
+    // .openclaw: writable tmpfs populated from parent-staged config.
+    // Parent pre-copied host's ~/.openclaw/ to /tmp/gvm-sandbox-staging-home-{pid}/.openclaw/
+    // before clone(). Mount tmpfs over .openclaw and copy from staging.
+    let my_pid = std::process::id();
+    let staging = PathBuf::from(format!("/tmp/gvm-sandbox-staging-home-{}", my_pid));
+    let oc_staging = staging.join(".openclaw");
     let oc_sandbox = merged.join(".openclaw");
-    if oc_host.exists() {
-        // Mount writable tmpfs over .openclaw
+    if oc_staging.exists() {
+        std::fs::create_dir_all(&oc_sandbox).ok();
         mount(
             Some("tmpfs"),
             &oc_sandbox,
@@ -421,8 +424,8 @@ fn mount_home_directory(new_root: &Path) {
             Some("size=64m"),
         )
         .ok();
-        // Copy host config files into the writable tmpfs
-        copy_dir_contents(&oc_host, &oc_sandbox);
+        copy_dir_contents(&oc_staging, &oc_sandbox);
+        tracing::debug!("Copied staged .openclaw config into sandbox");
     }
 
     tracing::info!(
@@ -433,7 +436,7 @@ fn mount_home_directory(new_root: &Path) {
 }
 
 /// Recursively copy directory contents (best-effort, for config bootstrapping).
-fn copy_dir_contents(src: &Path, dst: &Path) {
+pub fn copy_dir_contents(src: &Path, dst: &Path) {
     let Ok(entries) = std::fs::read_dir(src) else {
         return;
     };
