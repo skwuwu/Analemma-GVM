@@ -132,7 +132,7 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
 
     // 2. Set up veth network pair
     let veth_config = VethConfig::from_pid(child_pid.as_raw() as u32, config.proxy_addr);
-    let network_result = setup_host_network(&veth_config);
+    let network_result = setup_host_network(&veth_config, &config.host_ports);
 
     // dns_target is recorded in state file for deterministic cleanup.
     // If DNS changes between setup and cleanup (DHCP renewal), cleanup
@@ -527,7 +527,7 @@ fn child_entry(
     let veth_config = VethConfig::from_pid(network_seed, config.proxy_addr);
 
     // Set up network inside the sandbox
-    if let Err(e) = setup_sandbox_network(&veth_config) {
+    if let Err(e) = setup_sandbox_network(&veth_config, &config.host_ports) {
         // Network failure is non-fatal for debugging — agent just won't have connectivity
         eprintln!("gvm-sandbox: network setup failed (non-fatal): {}", e);
         eprintln!("  Hint: ensure ip_forward=1 (sudo sysctl net.ipv4.ip_forward=1),");

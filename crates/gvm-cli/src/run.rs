@@ -26,6 +26,7 @@ pub async fn run_agent(
     no_mitm: bool,
     fs_governance: bool,
     sandbox_profile: &str,
+    host_ports: &[u16],
 ) -> Result<()> {
     if command.is_empty() {
         anyhow::bail!(
@@ -82,6 +83,16 @@ pub async fn run_agent(
         _ => gvm_sandbox::SandboxProfile::Standard,
     };
 
+    // Reject ports that would bypass MITM governance
+    for port in host_ports {
+        if *port == 80 || *port == 443 {
+            anyhow::bail!(
+                "--host-port {} rejected: forwarding HTTP/HTTPS ports bypasses proxy governance",
+                port
+            );
+        }
+    }
+
     let config = crate::pipeline::AgentConfig {
         command: command.to_vec(),
         agent_id: agent_id.to_string(),
@@ -90,6 +101,7 @@ pub async fn run_agent(
         no_mitm,
         fs_governance,
         sandbox_profile: profile,
+        host_ports: host_ports.to_vec(),
         memory_limit: parse_memory_limit(memory),
         cpu_limit: cpus.parse::<f64>().ok(),
         interactive,
@@ -277,6 +289,7 @@ pub(crate) fn assemble_sandbox_config(
         fs_policy: None, // Caller sets this via pipeline based on fs_governance flag
         mitm_ca_cert,
         sandbox_profile: gvm_sandbox::SandboxProfile::default(),
+        host_ports: vec![],
     }
 }
 

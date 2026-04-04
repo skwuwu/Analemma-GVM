@@ -103,6 +103,7 @@ fn preflight_report_non_linux_has_tc_filter_false() {
             fs_policy: None,
             mitm_ca_cert: None,
             sandbox_profile: gvm_sandbox::SandboxProfile::default(),
+            host_ports: vec![],
         };
         let report = preflight_check(&config);
         assert!(

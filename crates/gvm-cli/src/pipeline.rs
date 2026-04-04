@@ -29,6 +29,7 @@ pub struct AgentConfig {
     /// true = overlayfs with auto-merge/ManualCommit at session end.
     pub fs_governance: bool,
     pub sandbox_profile: gvm_sandbox::SandboxProfile,
+    pub host_ports: Vec<u16>,
     pub memory_limit: Option<u64>,
     pub cpu_limit: Option<f64>,
     pub interactive: bool,
@@ -216,6 +217,7 @@ async fn launch_sandbox(config: &AgentConfig, pre: &PreLaunchState) -> Result<i3
         None // Legacy mode: workspace/output/ only
     };
     sandbox_config.sandbox_profile = config.sandbox_profile.clone();
+    sandbox_config.host_ports = config.host_ports.clone();
 
     // Preflight check (sandbox only)
     let preflight = gvm_sandbox::preflight_check(&sandbox_config);

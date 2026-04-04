@@ -139,6 +139,13 @@ enum Commands {
         #[arg(long, value_parser = ["minimal", "standard", "full"], default_value = "standard")]
         sandbox_profile: String,
 
+        /// Expose host localhost ports inside sandbox (container→host forwarding).
+        /// Agent's localhost:<port> is DNAT'd to host's localhost:<port>.
+        /// Use for host services: Ollama (11434), databases, OpenClaw gateway (18789).
+        /// Ports 80/443 rejected (would bypass MITM governance).
+        #[arg(long = "host-port", value_name = "PORT")]
+        host_ports: Vec<u16>,
+
         /// Shadow Mode: verify agent intent before execution.
         /// disabled = off (default), observe = log violations, strict = deny without intent.
         #[arg(long, value_parser = ["disabled", "observe", "strict"])]
@@ -518,6 +525,7 @@ async fn main() -> anyhow::Result<()> {
             no_mitm,
             fs_governance,
             sandbox_profile,
+            host_ports,
             shadow_mode,
             sandbox_timeout,
             image,
@@ -561,6 +569,7 @@ async fn main() -> anyhow::Result<()> {
                     no_mitm,
                     fs_governance,
                     &sandbox_profile,
+                    &host_ports,
                 )
                 .await?;
             }
