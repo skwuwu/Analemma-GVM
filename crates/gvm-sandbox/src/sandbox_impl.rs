@@ -379,7 +379,9 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
                     break waitpid(child_pid, None);
                 }
 
-                if wait_start.elapsed() > wait_timeout {
+                // timeout=0 means no timeout (persistent sandbox).
+                // Agent runs until it exits or SIGTERM is received.
+                if wait_timeout.as_secs() > 0 && wait_start.elapsed() > wait_timeout {
                     tracing::warn!(
                         pid = child_pid.as_raw(),
                         timeout_secs = wait_timeout.as_secs(),
