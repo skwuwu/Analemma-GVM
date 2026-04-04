@@ -207,9 +207,20 @@ Agent runs in an isolated environment where it cannot bypass the proxy. Linux on
 
 ```bash
 --sandbox-timeout 300       # Kill after 5 minutes (default: 3600)
+--sandbox-timeout 0         # No timeout (persistent agent)
 --no-mitm                   # Disable HTTPS inspection
---memory 256m               # Memory limit
---cpus 0.5                  # CPU limit
+--memory 1g                 # Memory limit via cgroup v2 (omit = unlimited)
+--cpus 0.5                  # CPU limit via cgroup v2 (omit = unlimited)
+```
+
+Resource limits are **opt-in**. Without `--memory` or `--cpus`, the agent runs with no cgroup restrictions (Docker-equivalent behavior). Use limits when running untrusted agents or enforcing resource budgets:
+
+```bash
+# Unlimited (default) — agent uses all available memory
+gvm run --sandbox -- node agent.js
+
+# Restrict to 1GB memory and half a CPU
+gvm run --sandbox --memory 1g --cpus 0.5 -- node agent.js
 ```
 
 > **Note:** Node.js ignores `HTTPS_PROXY`. Sandbox mode solves this — all HTTPS is intercepted regardless of the agent's behavior.

@@ -55,6 +55,22 @@ v0.2 shipped: Shadow Mode + intent store, CONNECT tunnel, SRR hot-reload, eBPF u
 
 ## Implementation Log
 
+### 2026-04-05: Sandbox $HOME overlay + MITM relay fix + resource limits opt-in
+
+**$HOME overlayfs mount**: Parent (real root) mounts overlayfs with lower=$HOME, upper=tmpfs. Child bind-mounts merged dir to /home/agent. Sensitive dirs (.ssh/.aws/.gnupg) masked with empty tmpfs. Writes go to tmpfs upper layer — host $HOME is never modified. No copy, no chmod, instant mount regardless of $HOME size.
+
+**DAC capability retention**: Keep CAP_DAC_OVERRIDE, CAP_DAC_READ_SEARCH, CAP_FOWNER, CAP_CHOWN after setup. Agent can read all files in sandbox filesystem (Docker-equivalent security model). Security boundary is file exposure (overlayfs + blocklist), not DAC permissions.
+
+**CA trust store fix**: Merge host system CA bundle with GVM MITM CA. Previously overwrote ca-certificates.crt with MITM CA only, causing "self-signed certificate in certificate chain" for direct HTTPS connections.
+
+**MITM relay HTTP framing**: relay_tls() now parses Content-Length and Transfer-Encoding: chunked to detect response boundaries. Previously did blind byte forwarding — HTTP/1.1 keep-alive connections never sent EOF, causing Telegram long-poll (getUpdates) to stall indefinitely.
+
+**NO_PROXY for localhost**: Set NO_PROXY=127.0.0.1,localhost,::1 in all launch modes (sandbox/cooperative/contained). Prevents internal agent traffic (OpenClaw gateway :18789, Ollama, local DBs) from being routed through the proxy.
+
+**Resource limits opt-in**: `--memory` and `--cpus` are now opt-in (default: unlimited). Previously defaulted to 512MB/1CPU, causing OOM kills for memory-intensive agents. Users explicitly set limits when needed: `gvm run --sandbox --memory 1g --cpus 0.5`.
+
+Files: `crates/gvm-sandbox/src/{mount,sandbox_impl}.rs`, `crates/gvm-cli/src/{main,run}.rs`, `src/tls_proxy.rs`, `docs/{14-governance-coverage,15-user-guide}.md` | Risk: Medium (capability model change, relay protocol change)
+
 ### 2026-04-03: Security audit fixes + naming correction
 
 **eBPF → TC filter naming**: Renamed all user-facing references from "eBPF TC filter" to "TC ingress filter". The implementation uses `tc u32` classifiers, not eBPF bytecode — the old naming misrepresented the enforcement mechanism. `PreflightReport.ebpf_available` → `tc_filter_available`. File `ebpf.rs` retained to avoid import chain breakage; header comment explains the naming.

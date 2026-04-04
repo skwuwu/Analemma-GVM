@@ -196,8 +196,8 @@ Requires kernel 5.11+ (overlayfs in user namespace). Falls back to legacy mode o
 
 | Resource | Mechanism | Configuration |
 |----------|-----------|---------------|
-| Memory | cgroup v2 `memory.max` | `--memory 512m` |
-| CPU | cgroup v2 `cpu.max` | `--cpus 0.5` |
+| Memory | cgroup v2 `memory.max` | `--memory 1g` (omit = unlimited) |
+| CPU | cgroup v2 `cpu.max` | `--cpus 0.5` (omit = unlimited) |
 | Filesystem | overlayfs upper tmpfs size | `upper_size_mb = 256` in fs_policy |
 | `/tmp` | tmpfs size limit | 32MB (hardcoded) |
 | Network connections | TC filter + iptables | Proxy-only TCP |

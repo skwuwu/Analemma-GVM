@@ -112,14 +112,14 @@ enum Commands {
         #[arg(long, default_value = "gvm-agent:latest")]
         image: String,
 
-        /// Memory limit (--contained: Docker limit; --sandbox: cgroup v2 limit).
-        /// Format: "512m", "1g", "2048m". Default: 512m.
-        #[arg(long, default_value = "512m")]
+        /// Memory limit (--sandbox: cgroup v2 limit; --contained: Docker limit).
+        /// Format: "512m", "1g", "2048m". Omit for unlimited (no cgroup).
+        #[arg(long, default_value = "")]
         memory: String,
 
-        /// CPU limit (--contained: Docker CPU quota; --sandbox: cgroup v2 cpu.max).
-        /// Format: fraction of one CPU (e.g. "1.0" = 1 CPU, "0.5" = half). Default: 1.0.
-        #[arg(long, default_value = "1.0")]
+        /// CPU limit (--sandbox: cgroup v2 cpu.max; --contained: Docker CPU quota).
+        /// Format: fraction of one CPU (e.g. "1.0" = 1 CPU, "0.5" = half). Omit for unlimited.
+        #[arg(long, default_value = "")]
         cpus: String,
 
         /// Disable MITM TLS inspection. HTTPS uses CONNECT relay (domain-level only).
@@ -222,12 +222,13 @@ enum Commands {
         #[arg(long, default_value = "gvm-agent:latest")]
         image: String,
 
-        /// Docker memory limit (only with --contained)
-        #[arg(long, default_value = "512m")]
+        /// Docker memory limit (only with --contained).
+        /// Format: "512m", "1g". Omit for Docker default (unlimited).
+        #[arg(long, default_value = "")]
         memory: String,
 
-        /// Docker CPU limit (only with --contained)
-        #[arg(long, default_value = "1.0")]
+        /// Docker CPU limit (only with --contained). Omit for unlimited.
+        #[arg(long, default_value = "")]
         cpus: String,
 
         /// Output format: text (default) or json
