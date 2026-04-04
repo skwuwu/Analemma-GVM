@@ -512,13 +512,22 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
     //
     // The loop exits when:
     // - Client closes the connection (read returns 0 / EOF)
-    // - Read timeout expires (30s idle = client done sending)
+    // - Read timeout expires (300s idle = client done sending)
     // - Connection: close header is present
     // - An error occurs
+    //
+    // 300s idle timeout covers the agent work cycle: LLM response (~20s) → tool
+    // execution (30-120s) → next LLM request. 30s was too short — sub-agents that
+    // process results before sending the next request hit the timeout, causing
+    // "Connection error" on the reused keep-alive connection.
+    //
+    // Slowloris defense is separate: read_http_request() has its own timeout for
+    // slow header delivery. This idle timeout only applies to already-authenticated
+    // TLS connections between requests.
     loop {
         // 1. Read next HTTP request (with idle timeout for keep-alive)
         let req = match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(300),
             read_http_request(&mut tls_stream),
         )
         .await
