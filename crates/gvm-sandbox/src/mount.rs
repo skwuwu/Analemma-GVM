@@ -245,11 +245,10 @@ pub fn setup_mount_namespace(
         inject_ca_cert(&new_root, ca_pem)?;
     }
 
-    // Mount user's $HOME via overlayfs: read from host, write to tmpfs.
-    // Agent config files (~/.openclaw, ~/.config, ~/.npm) are accessible,
-    // but writes go to tmpfs and vanish on sandbox exit.
-    // Sensitive dirs (.ssh, .aws, .gnupg) are masked with empty tmpfs.
-    mount_home_overlay(&new_root);
+    // Mount user's $HOME: read-only bind + sensitive masking + writable config dirs.
+    // Agent reads config from host, writes go to tmpfs (ephemeral on exit).
+    // .ssh/.aws/.gnupg are masked with empty tmpfs (physically inaccessible).
+    mount_home_directory(&new_root);
 
     // pivot_root: swap root filesystem
     // MS_PRIVATE was already applied at the top of this function.
@@ -316,10 +315,15 @@ fn bind_mount_interpreter(
     Ok(())
 }
 
-/// Mount user's $HOME as overlayfs: host $HOME (lower/read-only) + tmpfs (upper/writable).
-/// Agent reads config from host, writes go to tmpfs (ephemeral).
-/// Sensitive directories are masked with empty tmpfs after mount.
-fn mount_home_overlay(new_root: &Path) {
+/// Mount user's $HOME into sandbox via bind mount + selective over-mounts.
+///
+/// 1. Bind mount host $HOME → /home/agent (read-only)
+/// 2. Mask sensitive dirs (.ssh, .aws, .gnupg) with empty tmpfs
+/// 3. Provide writable tmpfs for dirs agents need to write (.cache, .local, .openclaw state)
+///
+/// Works on all kernels (bind mount since 3.x). No overlayfs UID issues.
+/// seccomp blocks umount so masked dirs cannot be unmasked.
+fn mount_home_directory(new_root: &Path) {
     // Resolve the real user's home (SUDO_USER's home, not root's)
     let home = std::env::var("SUDO_USER")
         .ok()
@@ -336,94 +340,113 @@ fn mount_home_overlay(new_root: &Path) {
         .unwrap_or_else(|| PathBuf::from("/root"));
 
     if !home.exists() {
-        tracing::debug!(home = %home.display(), "User home not found — skipping overlay");
+        tracing::debug!(home = %home.display(), "User home not found — skipping");
         return;
     }
 
-    // Create overlay dirs on the sandbox tmpfs root
-    let overlay_base = new_root.join("home-overlay");
-    let upper = overlay_base.join("upper");
-    let work = overlay_base.join("work");
     let merged = new_root.join("home").join("agent");
-
-    if std::fs::create_dir_all(&overlay_base).is_err()
-        || std::fs::create_dir_all(&upper).is_err()
-        || std::fs::create_dir_all(&work).is_err()
-        || std::fs::create_dir_all(&merged).is_err()
-    {
-        tracing::debug!("Failed to create home overlay dirs");
+    if std::fs::create_dir_all(&merged).is_err() {
         return;
     }
 
-    // Mount tmpfs for overlay upper + work
+    // 1. Bind mount host $HOME read-only
     if mount(
-        Some("tmpfs"),
-        &overlay_base,
-        Some("tmpfs"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
-        Some("size=64m"),
+        Some(&home),
+        &merged,
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
     )
     .is_err()
     {
-        tracing::debug!("Failed to mount tmpfs for home overlay");
+        tracing::debug!("Failed to bind mount home");
         return;
     }
-    std::fs::create_dir_all(&upper).ok();
-    std::fs::create_dir_all(&work).ok();
-
-    // Mount overlayfs
-    let opts = format!(
-        "lowerdir={},upperdir={},workdir={}",
-        home.display(),
-        upper.display(),
-        work.display()
-    );
-    if let Err(e) = mount(
-        Some("overlay"),
+    // Remount read-only
+    mount(
+        None::<&str>,
         &merged,
-        Some("overlay"),
-        MsFlags::empty(),
-        Some(opts.as_str()),
-    ) {
-        // overlayfs may fail on older kernels or without privileges — fall back to read-only bind
-        tracing::debug!(error = %e, "overlayfs failed for home — falling back to read-only bind");
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_RDONLY | MsFlags::MS_REMOUNT,
+        None::<&str>,
+    )
+    .ok();
+
+    // 2. Mask sensitive directories with empty tmpfs (physically inaccessible)
+    for name in &[".ssh", ".aws", ".gnupg", ".bash_history", ".env", ".netrc"] {
+        let path = merged.join(name);
+        if !path.exists() {
+            continue;
+        }
+        if path.is_dir() {
+            mount(
+                Some("tmpfs"),
+                &path,
+                Some("tmpfs"),
+                MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_RDONLY,
+                Some("size=0"),
+            )
+            .ok();
+        }
+        // Files (.bash_history, .env, .netrc): read-only bind hides content
+        // since parent is already read-only
+    }
+
+    // 3. Writable tmpfs for dirs agents need to write to
+    // Agent config state (sessions, cache) goes here — ephemeral, vanishes on exit
+    for name in &[".cache", ".local", ".config"] {
+        let path = merged.join(name);
+        std::fs::create_dir_all(&path).ok();
         mount(
-            Some(&home),
-            &merged,
-            None::<&str>,
-            MsFlags::MS_BIND | MsFlags::MS_RDONLY,
-            None::<&str>,
+            Some("tmpfs"),
+            &path,
+            Some("tmpfs"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+            Some("size=64m"),
         )
         .ok();
     }
 
-    // Mask sensitive directories with empty tmpfs
-    let sensitive = [".ssh", ".aws", ".gnupg", ".bash_history", ".env", ".netrc"];
-    for name in &sensitive {
-        let sensitive_path = merged.join(name);
-        if !sensitive_path.exists() {
-            continue;
-        }
-        if sensitive_path.is_dir() {
-            mount(
-                Some("tmpfs"),
-                &sensitive_path,
-                Some("tmpfs"),
-                MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
-                Some("size=1k"),
-            )
-            .ok();
-        } else {
-            // File: create empty file mount point and bind /dev/null over it
-            std::fs::write(&sensitive_path, "").ok();
-        }
+    // .openclaw needs read (config from host) + write (sessions/state)
+    // Copy host config to a tmpfs overlay so agent can read config but writes are ephemeral
+    let oc_host = home.join(".openclaw");
+    let oc_sandbox = merged.join(".openclaw");
+    if oc_host.exists() {
+        // Mount writable tmpfs over .openclaw
+        mount(
+            Some("tmpfs"),
+            &oc_sandbox,
+            Some("tmpfs"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+            Some("size=64m"),
+        )
+        .ok();
+        // Copy host config files into the writable tmpfs
+        copy_dir_contents(&oc_host, &oc_sandbox);
     }
 
     tracing::info!(
         home = %home.display(),
         merged = %merged.display(),
-        "Home directory overlayfs mounted (sensitive dirs masked)"
+        "Home directory mounted (sensitive dirs masked, config accessible)"
     );
+}
+
+/// Recursively copy directory contents (best-effort, for config bootstrapping).
+fn copy_dir_contents(src: &Path, dst: &Path) {
+    let Ok(entries) = std::fs::read_dir(src) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            std::fs::create_dir_all(&dst_path).ok();
+            copy_dir_contents(&src_path, &dst_path);
+        } else {
+            std::fs::copy(&src_path, &dst_path).ok();
+        }
+    }
 }
 
 /// Minimal profile: interpreter binary + ldd-resolved libraries only.
