@@ -969,31 +969,213 @@ async fn relay_tls<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         upstream_tls.write_all(&req.body).await?;
     }
 
-    // No upstream read timeout. Upstream (api.anthropic.com etc.) is a trusted
-    // server that GVM connects to directly. If the TCP connection is alive, the
-    // server is processing — LLM thinking can take minutes (extended thinking,
-    // o1/o3 reasoning, API queue delays). A timeout here kills valid requests.
+    // Relay upstream response to client, respecting HTTP/1.1 message framing.
     //
-    // Dead connection detection is handled by TCP keepalive at the OS level.
-    // Slowloris defense is only needed on the client side (agent → proxy),
-    // not upstream (proxy → API server).
+    // We must parse the response to detect where it ends, because the upstream
+    // may keep the TCP connection alive (HTTP/1.1 keep-alive). Without framing
+    // awareness, read() blocks indefinitely waiting for EOF that never comes.
+    // This caused Telegram long-poll getUpdates to stall: the 30s poll response
+    // arrived but relay_tls never returned because upstream kept the connection open.
     let mut buf = vec![0u8; 32768];
     let mut total_relayed: usize = 0;
+
+    // Phase 1: Read and relay response headers
+    let mut header_buf = Vec::with_capacity(8192);
+    let content_length: Option<usize>;
+    let is_chunked: bool;
     loop {
         let n = match upstream_tls.read(&mut buf).await {
+            Ok(0) => {
+                // EOF before headers complete — relay what we have
+                if !header_buf.is_empty() {
+                    tls_stream.write_all(&header_buf).await?;
+                    tls_stream.flush().await?;
+                    total_relayed += header_buf.len();
+                }
+                return Ok(());
+            }
+            Ok(n) => n,
+            Err(e) => {
+                tracing::debug!(error = %e, "MITM: upstream read error during headers");
+                return Ok(());
+            }
+        };
+        header_buf.extend_from_slice(&buf[..n]);
+
+        // Check for end of headers (\r\n\r\n)
+        if let Some(header_end) = find_header_end(&header_buf) {
+            let headers_slice = &header_buf[..header_end];
+            content_length = parse_content_length(headers_slice);
+            is_chunked = is_transfer_encoding_chunked(headers_slice);
+
+            // Relay entire header_buf (headers + any body bytes already read)
+            tls_stream.write_all(&header_buf).await?;
+            tls_stream.flush().await?;
+            total_relayed += header_buf.len();
+
+            // Calculate how many body bytes we already have
+            let body_bytes_read = header_buf.len() - header_end;
+
+            if let Some(cl) = content_length {
+                // Content-Length framing: relay remaining body bytes
+                let remaining = cl.saturating_sub(body_bytes_read);
+                relay_exact_bytes(&mut upstream_tls, tls_stream, remaining, &mut total_relayed).await?;
+            } else if is_chunked {
+                // Chunked framing: relay until final chunk (0\r\n\r\n)
+                relay_chunked(&mut upstream_tls, tls_stream, &header_buf[header_end..], &mut total_relayed).await?;
+            } else {
+                // No framing info — read until EOF (Connection: close or HTTP/1.0)
+                relay_until_eof(&mut upstream_tls, tls_stream, &mut total_relayed).await?;
+            }
+            break;
+        }
+
+        // Headers too large (> 64KB) — abort
+        if header_buf.len() > 65536 {
+            tls_stream.write_all(&header_buf).await?;
+            tls_stream.flush().await?;
+            return Ok(());
+        }
+    }
+
+    if total_relayed > 0 {
+        tracing::debug!(bytes = total_relayed, host = %upstream_host, "MITM: relay complete");
+    }
+    Ok(())
+}
+
+/// Find the end of HTTP headers (position after \r\n\r\n).
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+}
+
+/// Parse Content-Length from raw HTTP headers.
+fn parse_content_length(headers: &[u8]) -> Option<usize> {
+    let s = std::str::from_utf8(headers).ok()?;
+    for line in s.lines() {
+        if let Some(val) = line.strip_prefix("Content-Length:").or_else(|| line.strip_prefix("content-length:")) {
+            return val.trim().parse().ok();
+        }
+        // Case-insensitive match for other capitalizations
+        if line.len() > 15 && line[..15].eq_ignore_ascii_case("content-length:") {
+            return line[15..].trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// Check if Transfer-Encoding is chunked.
+fn is_transfer_encoding_chunked(headers: &[u8]) -> bool {
+    let Ok(s) = std::str::from_utf8(headers) else { return false };
+    for line in s.lines() {
+        if line.len() > 18 && line[..18].eq_ignore_ascii_case("transfer-encoding:") {
+            return line[18..].trim().eq_ignore_ascii_case("chunked");
+        }
+    }
+    false
+}
+
+/// Relay exactly `remaining` bytes from upstream to client.
+async fn relay_exact_bytes<R, W>(
+    upstream: &mut R,
+    client: &mut W,
+    mut remaining: usize,
+    total: &mut usize,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = vec![0u8; 32768];
+    while remaining > 0 {
+        let to_read = remaining.min(buf.len());
+        let n = match upstream.read(&mut buf[..to_read]).await {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => {
-                tracing::debug!(error = %e, bytes_relayed = total_relayed, "MITM: upstream read error");
+                tracing::debug!(error = %e, "MITM: upstream read error during body relay");
                 break;
             }
         };
-        tls_stream.write_all(&buf[..n]).await?;
-        tls_stream.flush().await?;
-        total_relayed += n;
+        client.write_all(&buf[..n]).await?;
+        client.flush().await?;
+        remaining -= n;
+        *total += n;
     }
-    if total_relayed > 0 {
-        tracing::debug!(bytes = total_relayed, host = %upstream_host, "MITM: relay complete");
+    Ok(())
+}
+
+/// Relay chunked transfer encoding until the final chunk (0\r\n\r\n).
+/// `initial_body` contains body bytes already read with the headers.
+async fn relay_chunked<R, W>(
+    upstream: &mut R,
+    client: &mut W,
+    initial_body: &[u8],
+    total: &mut usize,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Simple approach: relay bytes and detect the terminator pattern
+    // The final chunk is "0\r\n\r\n" (or "0\r\n" + trailers + "\r\n")
+    let mut buf = vec![0u8; 32768];
+    let mut tail = Vec::from(initial_body);
+    loop {
+        let n = match upstream.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                tracing::debug!(error = %e, "MITM: upstream read error during chunked relay");
+                break;
+            }
+        };
+        client.write_all(&buf[..n]).await?;
+        client.flush().await?;
+        *total += n;
+
+        // Track last few bytes to detect end of chunked stream
+        tail.extend_from_slice(&buf[..n]);
+        if tail.len() > 16 {
+            let start = tail.len() - 16;
+            tail = tail[start..].to_vec();
+        }
+        // Final chunk ends with \r\n0\r\n\r\n
+        if tail.windows(5).any(|w| w == b"0\r\n\r\n") {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Relay until EOF (for responses without Content-Length or chunked).
+async fn relay_until_eof<R, W>(
+    upstream: &mut R,
+    client: &mut W,
+    total: &mut usize,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = vec![0u8; 32768];
+    loop {
+        let n = match upstream.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                tracing::debug!(error = %e, "MITM: upstream read error during EOF relay");
+                break;
+            }
+        };
+        client.write_all(&buf[..n]).await?;
+        client.flush().await?;
+        *total += n;
     }
     Ok(())
 }
