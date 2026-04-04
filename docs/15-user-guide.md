@@ -225,6 +225,12 @@ gvm run --sandbox --memory 1g --cpus 0.5 -- node agent.js
 
 > **Note:** Node.js ignores `HTTPS_PROXY`. Sandbox mode solves this — all HTTPS is intercepted regardless of the agent's behavior.
 
+> **Proxy restart recovery:** The MITM CA is persisted to `data/mitm-ca.pem` and reused across proxy restarts, so TLS trust is preserved. However, if the proxy crashes or is restarted, running sandboxes may lose their TCP connections. The agent's HTTP client may not recover automatically. Restart the sandbox:
+> ```bash
+> gvm cleanup        # remove orphaned veth/iptables from crashed sandbox
+> gvm run --sandbox --sandbox-timeout 0 -- node agent.js   # fresh start
+> ```
+
 ### ABAC Policies (`config/policies/`) — Experimental
 
 > Requires the Python SDK (`@ic` decorator), which is experimental. ABAC policies are evaluated only when the SDK injects operation metadata. For most use cases, SRR rules (Level 2) are sufficient.
