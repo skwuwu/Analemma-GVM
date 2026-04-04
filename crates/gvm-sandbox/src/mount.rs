@@ -89,6 +89,7 @@ pub fn setup_mount_namespace(
     fs_policy: Option<&crate::FilesystemPolicy>,
     extra_lib_paths: &[PathBuf],
     profile: &crate::SandboxProfile,
+    home_overlay_merged: Option<&Path>,
 ) -> Result<()> {
     // Safety guard: verify we're in a new mount namespace before making / private.
     // If clone(CLONE_NEWNS) failed silently, this would destroy host mount propagation.
@@ -245,10 +246,10 @@ pub fn setup_mount_namespace(
         inject_ca_cert(&new_root, ca_pem)?;
     }
 
-    // Mount user's $HOME: read-only bind + sensitive masking + writable config dirs.
-    // Agent reads config from host, writes go to tmpfs (ephemeral on exit).
-    // .ssh/.aws/.gnupg are masked with empty tmpfs (physically inaccessible).
-    mount_home_directory(&new_root);
+    // Mount user's $HOME via parent-prepared overlayfs.
+    // Parent mounted overlayfs (lower=host $HOME, upper=tmpfs) as real root.
+    // Child bind-mounts the merged dir and masks .ssh/.aws/.gnupg with tmpfs.
+    mount_home_directory(&new_root, home_overlay_merged);
 
     // pivot_root: swap root filesystem
     // MS_PRIVATE was already applied at the top of this function.
@@ -315,64 +316,125 @@ fn bind_mount_interpreter(
     Ok(())
 }
 
-/// Mount user's $HOME into sandbox via bind mount + selective over-mounts.
+/// Mount overlayfs for $HOME in the PARENT process (real root).
 ///
-/// 1. Bind mount host $HOME → /home/agent (read-only)
-/// 2. Mask sensitive dirs (.ssh, .aws, .gnupg) with empty tmpfs
-/// 3. Provide writable tmpfs for dirs agents need to write (.cache, .local, .openclaw state)
+/// Creates overlayfs: lower=$HOME, upper=tmpfs, merged at staging path.
+/// Parent mounts this because:
+/// - Real root has no UID restrictions on overlayfs (unlike user namespace)
+/// - Child inherits the mount via clone() and bind-mounts merged → /home/agent
+/// - Upper layer is tmpfs — writes are ephemeral, host $HOME is never modified
 ///
-/// Works on all kernels (bind mount since 3.x). No overlayfs UID issues.
-/// seccomp blocks umount so masked dirs cannot be unmasked.
-fn mount_home_directory(new_root: &Path) {
-    // Resolve the real user's home (SUDO_USER's home, not root's)
-    let home = std::env::var("SUDO_USER")
-        .ok()
-        .and_then(|user| {
-            std::process::Command::new("getent")
-                .args(["passwd", &user])
-                .output()
-                .ok()
-                .and_then(|o| {
-                    let s = String::from_utf8_lossy(&o.stdout);
-                    s.split(':').nth(5).map(|h| PathBuf::from(h.trim()))
-                })
-        })
-        .unwrap_or_else(|| PathBuf::from("/root"));
+/// Returns the merged path on success, None on failure.
+/// Caller must unmount merged + upper_base on cleanup.
+pub fn mount_home_overlay(
+    host_home: &Path,
+    pid: u32,
+) -> Option<PathBuf> {
+    let merged = PathBuf::from(format!("/tmp/gvm-home-merged-{}", pid));
+    let upper_base = PathBuf::from(format!("/tmp/gvm-home-overlay-{}", pid));
+    let upper_dir = upper_base.join("upper");
+    let work_dir = upper_base.join("work");
 
-    if !home.exists() {
-        tracing::debug!(home = %home.display(), "User home not found — skipping");
-        return;
+    // Clean up stale mounts
+    nix::mount::umount2(&merged, nix::mount::MntFlags::MNT_DETACH).ok();
+    nix::mount::umount(&upper_base).ok();
+    std::fs::remove_dir_all(&upper_base).ok();
+    std::fs::remove_dir_all(&merged).ok();
+
+    std::fs::create_dir_all(&merged).ok()?;
+    std::fs::create_dir_all(&upper_base).ok()?;
+
+    // Mount tmpfs for upper + work (ephemeral writes)
+    if mount(
+        Some("tmpfs"),
+        &upper_base,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        Some("size=128m"),
+    )
+    .is_err()
+    {
+        return None;
     }
+
+    std::fs::create_dir_all(&upper_dir).ok()?;
+    std::fs::create_dir_all(&work_dir).ok()?;
+
+    let mount_opts = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        host_home.display(),
+        upper_dir.display(),
+        work_dir.display(),
+    );
+
+    if let Err(e) = mount(
+        Some("overlay"),
+        &merged,
+        Some("overlay"),
+        MsFlags::empty(),
+        Some(mount_opts.as_str()),
+    ) {
+        tracing::warn!(error = %e, "overlayfs home mount failed");
+        nix::mount::umount(&upper_base).ok();
+        std::fs::remove_dir_all(&upper_base).ok();
+        std::fs::remove_dir_all(&merged).ok();
+        return None;
+    }
+
+    tracing::info!(
+        lower = %host_home.display(),
+        merged = %merged.display(),
+        "Home overlayfs mounted by parent"
+    );
+    Some(merged)
+}
+
+/// Cleanup home overlay mounts (called by parent after sandbox exit).
+pub fn cleanup_home_overlay(pid: u32) {
+    let merged = PathBuf::from(format!("/tmp/gvm-home-merged-{}", pid));
+    let upper_base = PathBuf::from(format!("/tmp/gvm-home-overlay-{}", pid));
+    nix::mount::umount2(&merged, nix::mount::MntFlags::MNT_DETACH).ok();
+    nix::mount::umount(&upper_base).ok();
+    std::fs::remove_dir_all(&upper_base).ok();
+    std::fs::remove_dir_all(&merged).ok();
+}
+
+/// Mount user's $HOME into sandbox via parent-prepared overlayfs + blocklist.
+///
+/// The parent already created overlayfs (lower=$HOME, upper=tmpfs) at
+/// home_overlay_merged. The child bind-mounts this into /home/agent
+/// and masks sensitive directories with empty tmpfs.
+///
+/// Since parent (real root) mounted the overlay, there are no UID issues.
+/// The agent sees all $HOME content — writes go to tmpfs upper layer.
+/// .ssh/.aws/.gnupg are masked with empty tmpfs (seccomp blocks umount).
+fn mount_home_directory(new_root: &Path, home_overlay_merged: Option<&Path>) {
+    let overlay_path = match home_overlay_merged {
+        Some(p) if p.exists() => p,
+        _ => {
+            tracing::debug!("No home overlay — skipping home mount");
+            return;
+        }
+    };
 
     let merged = new_root.join("home").join("agent");
     if std::fs::create_dir_all(&merged).is_err() {
         return;
     }
 
-    // 1. Bind mount host $HOME read-only
-    if mount(
-        Some(&home),
+    // Bind mount the parent-prepared overlayfs merged dir
+    if let Err(e) = mount(
+        Some(overlay_path),
         &merged,
         None::<&str>,
         MsFlags::MS_BIND,
         None::<&str>,
-    )
-    .is_err()
-    {
-        tracing::debug!("Failed to bind mount home");
+    ) {
+        tracing::warn!(error = %e, "Bind mount home overlay failed");
         return;
     }
-    // Remount read-only
-    mount(
-        None::<&str>,
-        &merged,
-        None::<&str>,
-        MsFlags::MS_BIND | MsFlags::MS_RDONLY | MsFlags::MS_REMOUNT,
-        None::<&str>,
-    )
-    .ok();
 
-    // 2. Mask sensitive directories with empty tmpfs (physically inaccessible)
+    // Mask sensitive directories with empty read-only tmpfs
     for name in &[".ssh", ".aws", ".gnupg", ".bash_history", ".env", ".netrc"] {
         let path = merged.join(name);
         if !path.exists() {
@@ -388,50 +450,12 @@ fn mount_home_directory(new_root: &Path) {
             )
             .ok();
         }
-        // Files (.bash_history, .env, .netrc): read-only bind hides content
-        // since parent is already read-only
-    }
-
-    // 3. Writable tmpfs for dirs agents need to write to
-    // Agent config state (sessions, cache) goes here — ephemeral, vanishes on exit
-    for name in &[".cache", ".local", ".config"] {
-        let path = merged.join(name);
-        std::fs::create_dir_all(&path).ok();
-        mount(
-            Some("tmpfs"),
-            &path,
-            Some("tmpfs"),
-            MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
-            Some("size=64m"),
-        )
-        .ok();
-    }
-
-    // .openclaw: writable tmpfs populated from parent-staged config.
-    // Parent pre-copied host's ~/.openclaw/ to /tmp/gvm-sandbox-staging-home-{pid}/.openclaw/
-    // before clone(). Mount tmpfs over .openclaw and copy from staging.
-    let my_pid = std::process::id();
-    let staging = PathBuf::from(format!("/tmp/gvm-sandbox-staging-home-{}", my_pid));
-    let oc_staging = staging.join(".openclaw");
-    let oc_sandbox = merged.join(".openclaw");
-    if oc_staging.exists() {
-        std::fs::create_dir_all(&oc_sandbox).ok();
-        mount(
-            Some("tmpfs"),
-            &oc_sandbox,
-            Some("tmpfs"),
-            MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
-            Some("size=64m"),
-        )
-        .ok();
-        copy_dir_contents(&oc_staging, &oc_sandbox);
-        tracing::debug!("Copied staged .openclaw config into sandbox");
     }
 
     tracing::info!(
-        home = %home.display(),
-        merged = %merged.display(),
-        "Home directory mounted (sensitive dirs masked, config accessible)"
+        overlay = %overlay_path.display(),
+        target = %merged.display(),
+        "Home directory mounted (sensitive dirs masked)"
     );
 }
 
@@ -911,16 +935,22 @@ fn inject_ca_cert(new_root: &Path, ca_pem: &[u8]) -> Result<()> {
         anyhow::bail!("Failed to inject CA into any trust store path");
     }
 
-    // Also write to the system CA bundle path that certifi/requests defaults to.
-    // Python's `certifi.where()` returns `/etc/ssl/certs/ca-certificates.crt` on Ubuntu.
-    // If this file doesn't exist, `requests` can't find any CAs even when
-    // REQUESTS_CA_BUNDLE is set (internal urllib3 context creation reads it).
-    let system_bundle = new_root.join("etc/ssl/certs/ca-certificates.crt");
-    std::fs::write(&system_bundle, ca_pem).ok();
+    // Merge GVM CA with host system CA bundle so both MITM and direct HTTPS work.
+    // Without the host CAs, direct HTTPS connections (DNAT bypass, or agents that
+    // don't use HTTP_PROXY) fail with "self-signed certificate in certificate chain"
+    // because the sandbox only trusts the MITM CA.
+    let host_bundle = std::fs::read("/etc/ssl/certs/ca-certificates.crt")
+        .or_else(|_| std::fs::read("/etc/pki/tls/certs/ca-bundle.crt"))
+        .unwrap_or_default();
+    let mut merged_bundle = host_bundle;
+    merged_bundle.extend_from_slice(b"\n");
+    merged_bundle.extend_from_slice(ca_pem);
 
-    // Also write to the certifi package's expected location
+    let system_bundle = new_root.join("etc/ssl/certs/ca-certificates.crt");
+    std::fs::write(&system_bundle, &merged_bundle).ok();
+
     let certifi_bundle = new_root.join("etc/ssl/certs/cert.pem");
-    std::fs::write(&certifi_bundle, ca_pem).ok();
+    std::fs::write(&certifi_bundle, &merged_bundle).ok();
 
     tracing::debug!("Ephemeral CA injected into sandbox trust store");
     Ok(())

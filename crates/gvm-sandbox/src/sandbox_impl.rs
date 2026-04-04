@@ -86,34 +86,31 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         )
     })?;
 
-    // Pre-stage home config in parent (same pattern as workspace staging).
-    // Copy user's agent config dirs to a staging tmpfs before clone().
-    // Child mounts this staging path into /home/agent/.openclaw etc.
-    let staging_home = PathBuf::from(format!("/tmp/gvm-sandbox-staging-home-{}", my_pid));
-    std::fs::remove_dir_all(&staging_home).ok();
-    {
-        let user_home = std::env::var("SUDO_USER")
-            .ok()
-            .and_then(|user| {
-                std::process::Command::new("getent")
-                    .args(["passwd", &user])
-                    .output()
-                    .ok()
-                    .and_then(|o| {
-                        let s = String::from_utf8_lossy(&o.stdout);
-                        s.split(':').nth(5).map(|h| PathBuf::from(h.trim()))
-                    })
-            })
-            .unwrap_or_else(|| PathBuf::from("/root"));
+    // Mount overlayfs for $HOME in PARENT process (real root).
+    // Parent (real root) can mount overlayfs without UID restrictions.
+    // lower=$HOME (read-only), upper=tmpfs (ephemeral writes).
+    // Child inherits via clone() and bind-mounts merged → /home/agent.
+    let host_home: Option<PathBuf> = std::env::var("SUDO_USER")
+        .ok()
+        .and_then(|user| {
+            std::process::Command::new("getent")
+                .args(["passwd", &user])
+                .output()
+                .ok()
+                .and_then(|o| {
+                    let s = String::from_utf8_lossy(&o.stdout);
+                    s.split(':').nth(5).map(|h| PathBuf::from(h.trim()))
+                })
+        })
+        .or_else(|| std::env::var("HOME").ok().map(PathBuf::from))
+        .filter(|p| p.exists());
 
-        // Copy .openclaw config to staging (parent has access, child may not)
-        let oc_src = user_home.join(".openclaw");
-        if oc_src.exists() {
-            let oc_dst = staging_home.join(".openclaw");
-            std::fs::create_dir_all(&oc_dst).ok();
-            crate::mount::copy_dir_contents(&oc_src, &oc_dst);
-            tracing::debug!(src = %oc_src.display(), dst = %oc_dst.display(), "Staged .openclaw config");
-        }
+    let home_overlay_merged: Option<PathBuf> = host_home.as_ref().and_then(|home| {
+        crate::mount::mount_home_overlay(home, my_pid)
+    });
+
+    if let Some(ref m) = home_overlay_merged {
+        tracing::debug!(merged = %m.display(), "Home overlayfs mounted by parent");
     }
 
     // Create coordination pipe
@@ -128,6 +125,7 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     let child_interpreter_path = interpreter_path.clone();
     let child_ca_pem = ca_cert_pem.clone();
     let child_extra_libs = extra_lib_paths;
+    let child_home_overlay = home_overlay_merged.clone();
 
     let child_pid = unsafe {
         nix::sched::clone(
@@ -139,6 +137,7 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
                     &child_interpreter_path,
                     child_ca_pem.as_deref(),
                     &child_extra_libs,
+                    child_home_overlay.as_deref(),
                 )
             }),
             &mut stack,
@@ -176,7 +175,11 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     };
 
     if network_result.is_ok() {
-        let mount_paths = vec![staging_ws.clone(), sandbox_root.clone()];
+        let mut mount_paths = vec![staging_ws.clone(), sandbox_root.clone()];
+        if let Some(ref m) = home_overlay_merged {
+            mount_paths.push(m.clone());
+            mount_paths.push(PathBuf::from(format!("/tmp/gvm-home-overlay-{}", my_pid)));
+        }
         if let Err(e) =
             record_sandbox_state(&veth_config, &mount_paths, None, dns_target.as_deref())
         {
@@ -521,9 +524,8 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     // Unmount the staging workspace (pre-mounted before clone for kernel 6.17+ compat)
     nix::mount::umount(&staging_ws).ok();
     std::fs::remove_dir(&staging_ws).ok();
-    // Clean up home config staging
-    std::fs::remove_dir_all(&staging_home).ok();
-
+    // Clean up home overlayfs (parent-mounted before clone)
+    crate::mount::cleanup_home_overlay(my_pid);
     // Drop TC filter guard first — this detaches the filter via RAII Drop.
     // Must happen before cleanup_host_network which deletes the veth interface.
     drop(_ebpf_guard);
@@ -548,6 +550,7 @@ fn child_entry(
     interpreter_path: &std::path::Path,
     ca_cert_pem: Option<&[u8]>,
     extra_lib_paths: &[std::path::PathBuf],
+    home_overlay_merged: Option<&std::path::Path>,
 ) -> isize {
     // Wait for parent to complete UID mapping and network setup
     let network_seed = match wait_for_parent(coord_fd) {
@@ -579,6 +582,7 @@ fn child_entry(
         config.fs_policy.as_ref(),
         extra_lib_paths,
         &config.sandbox_profile,
+        home_overlay_merged,
     ) {
         eprintln!("gvm-sandbox: mount namespace setup failed: {:#}", e);
         eprintln!("  Hint: this usually means the interpreter binary or its shared");
@@ -764,16 +768,38 @@ fn child_entry(
     }
 }
 
-/// Drop all capabilities from the bounding set.
+/// Drop capabilities from the bounding set, keeping only DAC overrides.
 ///
-/// After mount/network setup completes, capabilities are no longer needed.
-/// Dropping them prevents the sandboxed agent from using iptables, mounting
-/// filesystems, loading kernel modules, etc. — even when running as root.
+/// After mount/network setup completes, most capabilities are no longer needed.
+/// We keep CAP_DAC_READ_SEARCH and CAP_DAC_OVERRIDE so the capless-root agent
+/// can read files with restrictive permissions (e.g., 600 owned by uid 1000
+/// in the overlayfs $HOME mount). This matches Docker's default behavior:
+/// container root can read all files within the container's filesystem.
+///
+/// Security model: the sandbox controls WHICH files are exposed (overlayfs
+/// lower=$HOME + blocklist masking .ssh/.aws/.gnupg). Within that boundary,
+/// the agent has full read access. Write access is controlled by overlayfs
+/// (writes go to tmpfs upper layer, host is unmodified).
 fn drop_all_capabilities() -> anyhow::Result<()> {
-    // Linux capability IDs range from 0 to CAP_LAST_CAP.
-    // As of Linux 6.x, CAP_LAST_CAP is ~41. We iterate to 64 for future-proofing;
-    // prctl returns EINVAL for non-existent caps, which we safely ignore.
+    // Capabilities to KEEP for filesystem access inside sandbox.
+    // These allow root to bypass DAC permission checks (read/traverse).
+    // All other capabilities (NET_ADMIN, SYS_ADMIN, MOUNT, etc.) are dropped.
+    // Capability constants (linux/capability.h, not in libc crate)
+    const CAP_DAC_OVERRIDE: u64 = 1;     // bypass file read/write/exec perms
+    const CAP_DAC_READ_SEARCH: u64 = 2;  // bypass file read + dir search perms
+    const CAP_FOWNER: u64 = 3;           // bypass permission checks on file owner
+    const CAP_CHOWN: u64 = 0;            // change file ownership
+    let keep: &[u64] = &[
+        CAP_CHOWN,           // chown files in overlayfs (copy-up creates uid mismatch)
+        CAP_DAC_OVERRIDE,    // bypass file read/write/exec perms
+        CAP_DAC_READ_SEARCH, // bypass file read + dir search perms
+        CAP_FOWNER,          // bypass permission checks requiring file owner match (chmod, etc.)
+    ];
+
     for cap in 0..64u64 {
+        if keep.contains(&cap) {
+            continue;
+        }
         let ret = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) };
         if ret < 0 {
             let err = std::io::Error::last_os_error();
@@ -784,7 +810,6 @@ fn drop_all_capabilities() -> anyhow::Result<()> {
                     err
                 ));
             }
-            // EINVAL = capability doesn't exist — expected for cap > CAP_LAST_CAP
         }
     }
     Ok(())
