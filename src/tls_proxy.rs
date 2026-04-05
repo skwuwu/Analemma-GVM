@@ -1116,14 +1116,8 @@ where
     Ok(())
 }
 
-/// Relay chunked transfer encoding with proper framing.
-///
-/// Parses chunk structure: size-line → data → CRLF → repeat → 0\r\n\r\n.
-/// All bytes (including chunk headers) are relayed verbatim to the client.
-/// Body content is never decoded (gzip stays gzip) — only chunk boundaries
-/// are tracked to detect the final zero-length chunk.
-///
-/// `initial_body` contains body bytes already read with the HTTP headers.
+/// Relay chunked transfer encoding until the final chunk (0\r\n\r\n).
+/// `initial_body` contains body bytes already read with the headers.
 async fn relay_chunked<R, W>(
     upstream: &mut R,
     client: &mut W,
@@ -1135,111 +1129,35 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    // Buffered reader: initial_body + upstream reads
-    let mut pending = Vec::from(initial_body);
-    let mut raw_buf = vec![0u8; 32768];
-
+    // Simple approach: relay bytes and detect the terminator pattern
+    // The final chunk is "0\r\n\r\n" (or "0\r\n" + trailers + "\r\n")
+    let mut buf = vec![0u8; 32768];
+    let mut tail = Vec::from(initial_body);
     loop {
-        // 1. Read chunk size line (hex + CRLF)
-        let size_line = read_line_from_chunked(upstream, &mut pending, &mut raw_buf, client, total).await?;
-        let size_str = std::str::from_utf8(&size_line)
-            .unwrap_or("0")
-            .trim()
-            .split(';') // chunk extensions (rare but valid)
-            .next()
-            .unwrap_or("0");
-        let chunk_size = usize::from_str_radix(size_str, 16).unwrap_or(0);
+        let n = match upstream.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                tracing::debug!(error = %e, "MITM: upstream read error during chunked relay");
+                break;
+            }
+        };
+        client.write_all(&buf[..n]).await?;
+        client.flush().await?;
+        *total += n;
 
-        // 2. Final chunk (size == 0): relay trailing CRLF and return
-        if chunk_size == 0 {
-            // Read final \r\n (after "0\r\n")
-            let _ = read_line_from_chunked(upstream, &mut pending, &mut raw_buf, client, total).await;
+        // Track last few bytes to detect end of chunked stream
+        tail.extend_from_slice(&buf[..n]);
+        if tail.len() > 16 {
+            let start = tail.len() - 16;
+            tail = tail[start..].to_vec();
+        }
+        // Final chunk ends with \r\n0\r\n\r\n
+        if tail.windows(5).any(|w| w == b"0\r\n\r\n") {
             break;
-        }
-
-        // 3. Read exactly chunk_size bytes of data + trailing CRLF
-        let to_relay = chunk_size + 2; // +2 for \r\n after chunk data
-        let mut remaining = to_relay;
-
-        // First, drain from pending buffer
-        if !pending.is_empty() {
-            let drain = remaining.min(pending.len());
-            client.write_all(&pending[..drain]).await?;
-            client.flush().await?;
-            *total += drain;
-            remaining -= drain;
-            pending = pending[drain..].to_vec();
-        }
-
-        // Then read from upstream
-        while remaining > 0 {
-            let to_read = remaining.min(raw_buf.len());
-            let n = match upstream.read(&mut raw_buf[..to_read]).await {
-                Ok(0) => return Ok(()), // unexpected EOF
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::debug!(error = %e, "MITM: chunked relay read error");
-                    return Ok(());
-                }
-            };
-            client.write_all(&raw_buf[..n]).await?;
-            client.flush().await?;
-            *total += n;
-            remaining -= n;
         }
     }
     Ok(())
-}
-
-/// Read one line (up to and including \r\n) from pending buffer + upstream.
-/// Relays all bytes to client as they are read.
-async fn read_line_from_chunked<R, W>(
-    upstream: &mut R,
-    pending: &mut Vec<u8>,
-    raw_buf: &mut [u8],
-    client: &mut W,
-    total: &mut usize,
-) -> Result<Vec<u8>>
-where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut line = Vec::new();
-
-    loop {
-        // Check pending buffer for \r\n
-        if let Some(pos) = pending.windows(2).position(|w| w == b"\r\n") {
-            let end = pos + 2;
-            line.extend_from_slice(&pending[..pos]); // line content (without CRLF)
-            // Relay the line + CRLF to client
-            client.write_all(&pending[..end]).await?;
-            client.flush().await?;
-            *total += end;
-            *pending = pending[end..].to_vec();
-            return Ok(line);
-        }
-
-        // No CRLF yet — relay what we have and read more
-        if !pending.is_empty() {
-            line.extend_from_slice(pending);
-            client.write_all(pending).await?;
-            client.flush().await?;
-            *total += pending.len();
-            pending.clear();
-        }
-
-        let n = match upstream.read(raw_buf).await {
-            Ok(0) => return Ok(line), // EOF
-            Ok(n) => n,
-            Err(e) => {
-                tracing::debug!(error = %e, "MITM: chunked line read error");
-                return Ok(line);
-            }
-        };
-        pending.extend_from_slice(&raw_buf[..n]);
-    }
 }
 
 /// Relay until EOF (for responses without Content-Length or chunked).
