@@ -1960,9 +1960,15 @@ async fn handle_connect_inner(
         }
     });
 
-    // Return 200 to signal tunnel is established
+    // Return 200 to signal tunnel is established.
+    // Connection: close forces client to open a new TCP connection for the
+    // next CONNECT. After upgrade, the HTTP/1.1 connection is a raw TCP tunnel —
+    // reusing it for new HTTP requests after the tunnel ends is undefined behavior.
+    // Without this, clients that pipeline CONNECT on a keep-alive connection get
+    // "tls handshake eof" because the previous upgrade's state contaminates the stream.
     Response::builder()
         .status(StatusCode::OK)
+        .header("Connection", "close")
         .body(Body::empty())
         .unwrap_or_default()
 }
