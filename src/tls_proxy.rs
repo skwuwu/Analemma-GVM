@@ -640,6 +640,47 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                 tls_stream.write_all(response.as_bytes()).await?;
                 tls_stream.flush().await?;
                 tracing::warn!(host = %host, path = %req.path, reason = %reason, "MITM: request DENIED");
+
+                // Record Deny in WAL — blocked requests MUST appear in audit trail.
+                // Without this, denied actions are invisible to gvm events/watch/audit,
+                // violating fail-close observability.
+                let deny_event = gvm_types::GVMEvent {
+                    event_id,
+                    trace_id,
+                    parent_event_id: None,
+                    agent_id: classify_output.agent_id.clone(),
+                    tenant_id: None,
+                    session_id: host.clone(),
+                    timestamp: chrono::Utc::now(),
+                    operation: format!("{} {}", req.method, req.path),
+                    resource: gvm_types::ResourceDescriptor {
+                        service: host.clone(),
+                        identifier: Some(req.path.clone()),
+                        tier: gvm_types::ResourceTier::External,
+                        sensitivity: gvm_types::Sensitivity::Medium,
+                    },
+                    context: std::collections::HashMap::new(),
+                    transport: Some(gvm_types::TransportInfo {
+                        method: req.method.clone(),
+                        host: host.clone(),
+                        path: req.path.clone(),
+                        status_code: Some(403),
+                    }),
+                    decision: format!("Deny {{ reason: {:?} }}", reason),
+                    decision_source: format!("{:?}", classify_output.classification.source),
+                    matched_rule_id: classify_output.classification.matched_rule_id.clone(),
+                    enforcement_point: "mitm".to_string(),
+                    status: gvm_types::EventStatus::Confirmed,
+                    payload: gvm_types::PayloadDescriptor::default(),
+                    nats_sequence: None,
+                    event_hash: None,
+                    llm_trace: None,
+                    default_caution: false,
+                };
+                if let Err(e) = state.ledger.append_durable(&deny_event).await {
+                    tracing::error!(error = %e, "MITM: Deny WAL append FAILED");
+                }
+
                 break; // Close connection on deny
             }
             gvm_types::EnforcementDecision::Delay { milliseconds } => {
