@@ -227,25 +227,25 @@ monitor_loop() {
         # Hot-reload (T+8m)
         if [ $elapsed_min -ge 8 ] && [ "$HOTRELOAD_DONE" = "false" ]; then
             HOTRELOAD_DONE=true
-            log_health "HOT-RELOAD: appending httpbin.org Delay rule"
-            cat >> "$REPO_DIR/config/srr_network.toml" << 'HOTRELOAD_RULE'
-
-# Hot-reload test rule (appended by stress test)
-[[rules]]
-method = "GET"
-pattern = "httpbin.org/{any}"
-decision = { type = "Delay", milliseconds = 500 }
-label = "prod-stress-hotreload"
-HOTRELOAD_RULE
+            # SRR is first-match — insert BEFORE catch-all so specific rule wins
+            log_health "HOT-RELOAD: inserting httpbin.org Delay at top of SRR"
+            sed -i '1i\
+# Hot-reload test rule (inserted by stress test)\
+[[rules]]\
+method = "GET"\
+pattern = "httpbin.org/{any}"\
+decision = { type = "Delay", milliseconds = 500 }\
+label = "prod-stress-hotreload"\
+' "$REPO_DIR/config/srr_network.toml"
             run_checkpoint "T${elapsed_min}_reload" "$GVM_BIN" reload --proxy "$PROXY_URL" || true
             sleep 3
             local co
             co=$("$GVM_BIN" check --host httpbin.org --method GET --operation test --proxy "$PROXY_URL" 2>&1) || true
             if echo "$co" | grep -qi "Delay"; then
-                log_health "HOT-RELOAD VERIFY: PASS"
+                log_health "HOT-RELOAD VERIFY: PASS (httpbin.org → Delay)"
                 echo "hotreload_verify|0|$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$CHECKPOINT_LOG"
             else
-                log_health "HOT-RELOAD VERIFY: FAIL"
+                log_health "HOT-RELOAD VERIFY: FAIL (expected Delay)"
                 echo "hotreload_verify|1|$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$CHECKPOINT_LOG"
             fi
         fi

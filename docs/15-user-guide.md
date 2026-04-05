@@ -124,6 +124,8 @@ decision = { type = "Deny", reason = "Wire transfers blocked" }
 
 **Hot-reload:** Edit the file → `gvm reload`. No restart needed.
 
+**Rule order matters:** SRR uses **first-match** — rules are evaluated in file order and the first matching rule wins. Place specific rules (e.g., `api.bank.com/transfer/{any} → Deny`) before catch-all rules (`{any} → Allow`). A catch-all before a specific rule makes the specific rule unreachable.
+
 **Query strings:** Stripped automatically. `^/commits$` matches `/commits?per_page=5`.
 
 > **Tip:** Don't write rules by hand. Use `gvm watch` + `gvm suggest` to generate them, then edit as needed.
