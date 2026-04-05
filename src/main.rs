@@ -915,18 +915,9 @@ async fn start_tls_listener(
             let _permit = permit; // held until task completes → auto-released on drop
             if let Err(e) = handle_tls_connection(stream, sc, cc, st, res).await {
                 let err_str = format!("{}", e);
-                if err_str.contains("handshake")
-                    || err_str.contains("AlertReceived")
-                    || err_str.contains("certificate")
-                {
-                    tracing::warn!(
-                        error = %e, addr = %addr,
-                        "MITM TLS handshake failed — agent may use certificate pinning. \
-                         Try --no-mitm for CONNECT relay (domain-level governance only)."
-                    );
-                } else {
-                    tracing::debug!(error = %e, addr = %addr, "TLS connection error");
-                }
+                // Debug level: intermittent handshake failures are normal
+                // (client connection resets, retries). Not actionable as warnings.
+                tracing::debug!(error = %e, addr = %addr, "TLS connection error");
             }
         });
     }

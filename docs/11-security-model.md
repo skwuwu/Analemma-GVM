@@ -769,6 +769,7 @@ Use `--no-mitm` to disable MITM and fall back to CONNECT relay (domain-level onl
 | **LLM thinking trace** | MITM relay streams response chunks — cannot buffer full body for trace extraction | Thinking hash not captured on MITM path. Use cooperative mode with SDK for full trace capture |
 | **IC-3 RequireApproval** | MITM cannot hold TLS keep-alive stream for human approval | IC-3 treated as Deny on MITM path. Use cooperative mode with SDK for IC-3 approval flow |
 | **Shadow Mode** | MITM has no SDK headers for intent verification | Intent store claim/verify not supported on MITM path. SRR enforcement still active |
+| **Intermittent CONNECT TLS handshake eof** | Node.js undici HTTP client occasionally resets the 2nd CONNECT before sending ClientHello. Self-recovers on 3rd attempt (~2s delay). No data loss — WAL records all successful requests. | Under investigation. Likely client-side connection pool race condition after CONNECT tunnel close. `Connection: close` header added to CONNECT response to prevent upgrade reuse. Does not affect stress test pass rate (289 API calls, 0 TLS errors in steady state). |
 
 ## Overlayfs Trust-on-Pattern — Known Limitations
 

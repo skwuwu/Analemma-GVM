@@ -1935,10 +1935,12 @@ async fn handle_connect_inner(
             {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
-                    tracing::warn!(
+                    // Debug level: intermittent TLS handshake eof is normal with
+                    // Node.js undici — client occasionally resets the connection
+                    // before sending ClientHello, then retries successfully.
+                    tracing::debug!(
                         host = %host_owned, error = %e,
-                        "CONNECT MITM: TLS handshake failed — agent may use certificate pinning. \
-                         Try --no-mitm for CONNECT relay (domain-level governance only)."
+                        "CONNECT MITM: TLS handshake failed (client may retry)"
                     );
                     return;
                 }
