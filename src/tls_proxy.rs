@@ -1015,7 +1015,6 @@ async fn relay_tls<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
             let headers_slice = &header_buf[..header_end];
             content_length = parse_content_length(headers_slice);
             is_chunked = is_transfer_encoding_chunked(headers_slice);
-            let is_sse = is_content_type_sse(headers_slice);
 
             // Relay entire header_buf (headers + any body bytes already read)
             tls_stream.write_all(&header_buf).await?;
@@ -1025,21 +1024,17 @@ async fn relay_tls<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
             // Calculate how many body bytes we already have
             let body_bytes_read = header_buf.len() - header_end;
 
-            if is_sse {
-                // SSE (text/event-stream): no terminator — relay until upstream closes.
-                // Anthropic /v1/messages uses SSE + chunked, but the stream ends
-                // when the server closes the connection, not with a chunk terminator.
-                relay_until_eof(&mut upstream_tls, tls_stream, &mut total_relayed).await?;
-            } else if let Some(cl) = content_length {
-                // Content-Length framing: relay remaining body bytes
+            // HTTP response framing — transport layer only, no Content-Type dispatch.
+            // Chunked encoding wraps ALL content types (SSE, HTML, JSON, gzip).
+            // The chunked parser reads chunk-size + data structurally, so body content
+            // (including SSE events, gzip bytes, or accidental patterns) is irrelevant.
+            // Priority: Content-Length > Transfer-Encoding: chunked > EOF.
+            if let Some(cl) = content_length {
                 let remaining = cl.saturating_sub(body_bytes_read);
                 relay_exact_bytes(&mut upstream_tls, tls_stream, remaining, &mut total_relayed).await?;
             } else if is_chunked {
-                // Chunked framing: state-based parser reads chunk structure.
-                // Correctly handles gzip bodies that contain 0\r\n\r\n bytes.
                 relay_chunked(&mut upstream_tls, tls_stream, &header_buf[header_end..], &mut total_relayed).await?;
             } else {
-                // No framing info — read until EOF (Connection: close or HTTP/1.0)
                 relay_until_eof(&mut upstream_tls, tls_stream, &mut total_relayed).await?;
             }
             break;
@@ -1087,18 +1082,6 @@ fn is_transfer_encoding_chunked(headers: &[u8]) -> bool {
     for line in s.lines() {
         if line.len() > 18 && line[..18].eq_ignore_ascii_case("transfer-encoding:") {
             return line[18..].trim().eq_ignore_ascii_case("chunked");
-        }
-    }
-    false
-}
-
-/// Check if Content-Type is text/event-stream (SSE).
-/// SSE responses have no terminator — they stream until EOF.
-fn is_content_type_sse(headers: &[u8]) -> bool {
-    let Ok(s) = std::str::from_utf8(headers) else { return false };
-    for line in s.lines() {
-        if line.len() > 13 && line[..13].eq_ignore_ascii_case("content-type:") {
-            return line[13..].trim().to_lowercase().starts_with("text/event-stream");
         }
     }
     false
