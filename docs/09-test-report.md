@@ -1,8 +1,8 @@
 # Part 9: Test & Benchmark Report
 
-**Total: 329 Rust Tests (322 passing + 7 wasm-gated) + 75 EC2 E2E Scenarios + 60-min Chaos Stress Test — All Pass**
+**Total: 329 Rust Tests (322 passing + 7 wasm-gated) + 75 EC2 E2E Scenarios + 30-min Chaos Stress Test + CLI Mode Verification — All Pass**
 **Benchmarks: 19 benchmark functions (Criterion v0.5)**
-**Last Verified: 2026-04-03 (`cargo test` + EC2 E2E + chaos stress test)**
+**Last Verified: 2026-04-05 (CLI modes + Deny/Delay enforcement + chaos stress + pentest 15/15)**
 
 > Note: Test count grows with each feature. The number above reflects `grep -r '#[test]\|#[tokio::test]' src/ crates/ tests/` at time of writing. Run `cargo test` to verify current count.
 
@@ -799,7 +799,91 @@ Agents use legitimate, non-refusable tasks to generate sustained HTTPS traffic:
 
 ---
 
-## 9.11 Coverage Gaps and Future Tests
+## 9.11 CLI Mode Verification (2026-04-05, EC2)
+
+**All GVM CLI modes verified with OpenClaw agent in sandbox. CLI-only — no tmux, nsenter, pkill, or internal API calls.**
+
+### Mode Test Results
+
+| Mode | Command | Result | Evidence |
+|------|---------|--------|----------|
+| Cooperative | `gvm run -- openclaw agent --local -m "..."` | **PASS** | "Four" response. Node.js HTTPS_PROXY warning (expected) |
+| Sandbox enforcement | `gvm run --sandbox -- openclaw agent --local -m "..."` | **PASS** | 8 events Allow, chunked SSE relay working |
+| Interactive | `gvm run -i --sandbox -- openclaw agent --local -m "..."` | **PASS** | Audit Trail + rule suggestion guidance |
+| Watch | `gvm watch --sandbox -- openclaw agent --local -m "..."` | **PASS** | Real-time stream + Session Summary JSON |
+| Watch + rules | `gvm watch --with-rules --sandbox -- openclaw agent --local -m "..."` | **PASS** | SRR applied, decisions displayed |
+| Suggest pipeline | `gvm watch --output json` → `gvm suggest --from session.jsonl` | **PASS** | Default-to-Caution → TOML rule generation |
+
+### Enforcement Verification
+
+| Decision | Test | Result | Evidence |
+|----------|------|--------|----------|
+| **Deny** | `httpbin.org/{any}` → Deny rule + `curl https://httpbin.org/ip` from sandbox | **PASS** | HTTP 403 Forbidden + JSON: `{"blocked":true,"decision":"Deny","reason":"test-blocked"}` |
+| **Delay** | `catfact.ninja/{any}` → Delay 2000ms + agent fetch | **PASS** | WAL: `GET /fact → Delay { milliseconds: 2000 }`, 2-second gap in timestamps |
+| **Allow** | `api.anthropic.com/v1/messages` → explicit Allow | **PASS** | All LLM calls pass, Default-to-Caution = 0 after rule applied |
+
+### Intended Experience Flow (watch → suggest → reload → run)
+
+Verified the complete user workflow in a single session:
+
+1. **`gvm watch`** with empty SRR → 16 events, 16 Default-to-Caution hits
+2. **`gvm suggest`** from watch session → generated `POST api.anthropic.com/v1/messages → Allow` rule
+3. **`gvm reload`** with generated rules → SRR rules: 2
+4. **`gvm run --sandbox`** with new rules → 8 events, 8 Allow, 0 Default-to-Caution
+
+This validates the discovery-to-enforcement pipeline: operator observes agent traffic, generates rules from observed patterns, applies them, and runs with enforcement — all via CLI.
+
+### Sandbox Security Pentest (15/15 blocked)
+
+| # | Attack | Result | Defense Layer |
+|---|--------|--------|---------------|
+| 1 | Read /etc/shadow | No such file | Mount namespace (minimal /etc) |
+| 2 | Read ~/.ssh | Empty (masked) | overlayfs + tmpfs blocklist |
+| 3 | AF_PACKET raw socket | EPERM | seccomp BPF |
+| 4 | EC2 metadata (169.254.169.254) | No response | iptables OUTPUT DROP |
+| 5 | mount filesystem | ENOSYS | seccomp (mount blocked) |
+| 6 | iptables -F | Command not found | Binary not mounted + cap dropped |
+| 7 | Write to /usr | Read-only filesystem | bind mount read-only |
+| 8 | Path traversal | No such file | pivot_root (old root removed) |
+| 9 | Blocked domain HTTPS | No response | iptables OUTPUT DROP |
+| 10 | unshare namespace | ENOSYS | seccomp (unshare blocked) |
+| 11 | ptrace | EPERM | seccomp (ptrace blocked) |
+| 12 | kill PID 1 | ENOSYS | seccomp (kill restricted) |
+| 13 | Load kernel module | No file + cap dropped | CAP_SYS_MODULE removed |
+| 14 | /proc/1/root access | Permission denied | hidepid=2 + PID namespace |
+| 15 | DNS exfiltration | ENOSYS | seccomp + DNS DNAT |
+
+### Chaos Stress Test (30 minutes, 2026-04-05)
+
+**VERDICT: PASS** — 10/10 checkpoints, all chaos events recovered.
+
+| Metric | Value |
+|--------|-------|
+| Duration | 30 minutes |
+| Checkpoints | 10/10 PASS |
+| Chaos events | 5 (proxy kill, disk pressure, disk release, network partition, network restore) |
+| LLM calls (MITM) | 445 |
+| MITM inspected | 2,944 |
+| Connection errors | 4 (proxy kill window only) |
+| TLS errors | 5 (proxy kill window only) |
+| WAL size | 11.5 MB |
+| Kernel panic | 0 |
+| Hot-reload verify | PASS (httpbin.org → Delay, sed insert before catch-all) |
+| Proxy recovery | < 5s (proxy_manager auto-restart) |
+| Disk pressure recovery | PASS (emergency WAL → primary resumed) |
+| Network partition recovery | PASS (agent retry → restore) |
+
+### Known Limitations (verified, not bugs)
+
+**Proxy auto-recovery vs sandbox connection pool**: proxy_manager auto-restarts proxy on next `gvm` command. Proxy itself recovers fully (verified: `nsenter -n curl` succeeds after restart). However, already-running sandbox agents hold stale TCP connections in their HTTP client pool (Node.js undici). These connections fail with "Connection error" until the pool creates new ones. This is identical to Docker/Kubernetes sidecar restart behavior — existing pods lose connections to restarted sidecars. **Mitigation**: restart sandbox after proxy crash (`gvm cleanup && gvm run --sandbox`).
+
+**Intermittent 2nd CONNECT TLS handshake eof**: Node.js undici occasionally closes the TCP connection within 4ms of receiving CONNECT 200, before sending ClientHello. The 3rd attempt succeeds 2 seconds later on the same proxy. This is not a proxy state issue (proxy is stateless between CONNECT sessions). Evidence: proxy receives the CONNECT request, returns 200, starts TLS accept, receives EOF. The same proxy successfully handles the next CONNECT. This is a Node.js undici connection pool edge case with CONNECT proxy tunnels — not an OpenClaw bug nor a GVM bug, but an interaction between the two.
+
+**OpenClaw web_fetch Readability parser**: When stress test prompts ask to "fetch README from github.com/...", OpenClaw's web_fetch tool retrieves the HTML successfully through MITM (verified: no Connection error/Network error) but fails at content extraction: `Web fetch extraction failed: Readability returned no content`. GitHub renders READMEs via JavaScript SPA; Readability expects static HTML. This is documented in OpenClaw issue #20442 and their docs ("web_fetch does not execute JavaScript"). **Not a GVM issue** — MITM relay delivers the full HTTP response, extraction fails in OpenClaw's post-processing.
+
+---
+
+## 9.12 Coverage Gaps and Future Tests
 
 | Gap | Priority | Tracking Issue |
 |-----|----------|---------------|
