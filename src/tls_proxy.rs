@@ -1127,7 +1127,6 @@ where
 /// All bytes (chunk headers + data) are relayed verbatim to client.
 /// Body is never decoded — only chunk boundaries are tracked.
 ///
-/// NOT used for SSE (text/event-stream) — SSE uses relay_until_eof().
 /// `initial_body` contains body bytes already read with the headers.
 async fn relay_chunked<R, W>(
     upstream: &mut R,
