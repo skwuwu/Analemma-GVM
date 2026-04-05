@@ -25,6 +25,8 @@ struct NetworkRuleConfig {
     /// Max body bytes to inspect (default 64KB)
     max_body_bytes: Option<usize>,
     description: Option<String>,
+    /// Human-readable label (used in warnings and logs)
+    label: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -164,6 +166,66 @@ impl NetworkSRR {
                     max_body_bytes: rule_cfg.max_body_bytes.unwrap_or(65536),
                     is_catch_all,
                 });
+            }
+        }
+
+        // Detect unreachable rules: any rule after a catch-all is unreachable
+        // for the methods that the catch-all covers. Static analysis at load time.
+        {
+            // Track which methods have a catch-all (host=Any, path=/*) preceding them
+            let mut catchall_methods: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+
+            for (idx, rule_cfg) in file.rules.iter().enumerate() {
+                let (host_pat, path_pat) = parse_pattern(&rule_cfg.pattern);
+                let is_catchall = matches!(host_pat, HostPattern::Any)
+                    && (path_pat == "/*" || path_pat == "*")
+                    && rule_cfg.path_regex.is_none();
+                let label = rule_cfg
+                    .label
+                    .as_deref()
+                    .or(rule_cfg.description.as_deref())
+                    .unwrap_or("(unnamed)");
+
+                if is_catchall {
+                    // Record this catch-all for its methods
+                    if rule_cfg.method == "*" {
+                        for m in &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"] {
+                            catchall_methods
+                                .entry(m.to_string())
+                                .or_insert_with(|| label.to_string());
+                        }
+                    } else {
+                        catchall_methods
+                            .entry(rule_cfg.method.to_uppercase())
+                            .or_insert_with(|| label.to_string());
+                    }
+                } else if !catchall_methods.is_empty() {
+                    // Check if this rule's methods are all covered by a preceding catch-all
+                    let methods: Vec<String> = if rule_cfg.method == "*" {
+                        vec!["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
+                            .into_iter()
+                            .map(String::from)
+                            .collect()
+                    } else {
+                        vec![rule_cfg.method.to_uppercase()]
+                    };
+
+                    for method in &methods {
+                        if let Some(catchall_label) = catchall_methods.get(method) {
+                            tracing::warn!(
+                                rule = label,
+                                rule_index = idx + 1,
+                                catchall = %catchall_label,
+                                method = %method,
+                                "Unreachable rule — catch-all \"{catchall_label}\" matches all {method} \
+                                 requests before this rule. Move specific rules before catch-all \
+                                 (SRR is first-match)."
+                            );
+                            break; // One warning per rule is enough
+                        }
+                    }
+                }
             }
         }
 
