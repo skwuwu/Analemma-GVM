@@ -1037,6 +1037,9 @@ async fn relay_tls<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
             } else {
                 relay_until_eof(&mut upstream_tls, tls_stream, &mut total_relayed).await?;
             }
+            // Final flush: ensure all response bytes reach client before
+            // keep-alive loop reads the next request.
+            tls_stream.flush().await?;
             break;
         }
 
@@ -1156,6 +1159,11 @@ where
         if chunk_size == 0 {
             // Read trailing \r\n after "0\r\n"
             let _ = relay_read_line(upstream, &mut pending, &mut raw_buf, client, total).await;
+            // Ensure all bytes (including the final SSE events in the last data
+            // chunk) are flushed to client before returning to the keep-alive loop.
+            // Without this, the client may not receive message_stop before the
+            // next response's message_start arrives on the same connection.
+            client.flush().await?;
             break;
         }
 
