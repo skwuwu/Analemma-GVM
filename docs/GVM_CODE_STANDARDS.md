@@ -463,7 +463,37 @@ let result = some_async_op(&snapshot).await;
 
 ## 6. Testing Standards
 
-### 6.1 Test Categories
+### 6.1 CLI-Only Testing Principle
+
+Stress tests and E2E tests must interact with GVM **exclusively through CLI commands**:
+
+```
+gvm run --sandbox -- <agent command>   # Agent execution
+gvm status                              # Proxy health
+gvm events list                         # WAL event query
+gvm audit verify                        # Merkle chain verification
+gvm check --host <host> --method GET    # Policy dry-run
+gvm reload                              # Hot-reload SRR rules
+gvm cleanup                             # Orphan resource cleanup
+gvm preflight                           # Environment check
+```
+
+**Never** in test scripts:
+- Invoke proxy binaries directly (`gvm-proxy`, `target/release/gvm-proxy`)
+- Manipulate PID files (`data/proxy.pid`)
+- Call internal APIs (`curl http://127.0.0.1:8080/gvm/...`)
+- Use `tmux`, `nsenter`, `pkill`, or `sudo env` to manage GVM internals
+- Set up proxy environment manually (proxy_manager handles this)
+- Manage CA certificates manually (persistent CA handles this)
+
+**Allowed** external operations in test scripts:
+- Chaos injection: `kill -9 <proxy_pid>`, `tc netem`, `mount -t tmpfs` — these simulate external failures that GVM cannot control
+- Sending prompts to the agent (via Telegram Bot API or CLI)
+- Reading result files (`results/*/summary.txt`, `data/proxy.log`)
+
+**Rationale**: If a test script reimplements what GVM does internally (proxy startup, env setup, CA management), it tests the script's implementation rather than GVM's. Script-specific bugs become indistinguishable from GVM bugs. The stress test must verify that `gvm run --sandbox` handles everything automatically — that's what users run in production.
+
+### 6.2 Test Categories
 
 Every module must have tests in these categories:
 
