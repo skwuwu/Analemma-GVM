@@ -1,0 +1,51 @@
+Fetch the README from github.com/tokio-rs/tokio and summarize its key features in 3 bullet points
+Explain what serde does in Rust in 3 sentences
+Get the description and star count of github.com/denoland/deno
+What is the latest release version of github.com/rust-lang/rust
+Summarize the security policy of github.com/nodejs/node from their SECURITY.md
+List 3 benefits of Rust's ownership model
+Fetch github.com/gin-gonic/gin README and list its middleware features
+What are the top 3 features of FastAPI according to its README at github.com/tiangolo/fastapi
+Explain HTTP/2 multiplexing in 2 sentences
+Get the contributor count and license of github.com/django/django
+Fetch the README from github.com/expressjs/express and summarize it
+What is the difference between TCP and UDP in 3 sentences
+Get the description of github.com/pallets/flask
+Summarize what Kubernetes does based on github.com/kubernetes/kubernetes README
+Explain what a Merkle tree is and why it's useful for audit logs
+Fetch github.com/serde-rs/serde README and explain its derive macro system
+What are Go's goroutines? Explain in 2 sentences
+Get the star count and primary language of github.com/microsoft/TypeScript
+Explain the CAP theorem in 3 sentences
+Fetch github.com/hyperium/hyper README and list its key design goals
+What is WebAssembly and why does it matter? 2 sentences
+Get the description and latest release of github.com/BurntSushi/ripgrep
+Explain what Docker namespaces are used for in 2 sentences
+Fetch github.com/actix/actix-web README and summarize its performance claims
+What is the difference between REST and GraphQL? 3 sentences
+Get the contributor count of github.com/torvalds/linux
+Explain what seccomp-BPF does in Linux in 2 sentences
+Fetch github.com/clap-rs/clap README and list its derive features
+What is TLS certificate pinning and why would an agent use it? 2 sentences
+Get the description of github.com/golang/go
+Explain overlayfs and its use in containers in 3 sentences
+Fetch github.com/launchbadge/sqlx README and summarize its async features
+What is the purpose of a Write-Ahead Log (WAL)? 2 sentences
+Get the star count and license of github.com/prometheus/prometheus
+Explain DNAT and how it's used in network namespaces
+Fetch github.com/diesel-rs/diesel README and list supported databases
+What is the difference between symmetric and asymmetric encryption? 2 sentences
+Get the description and primary language of github.com/grafana/grafana
+Explain what cgroups v2 memory.max does in 2 sentences
+Fetch github.com/tokio-rs/axum README and summarize its routing system
+What is a veth pair and how does it enable container networking? 2 sentences
+Get the latest release version of github.com/python/cpython
+Explain what ECDSA P-256 is used for in TLS
+Fetch github.com/seanmonstar/reqwest README and list its features
+What is the purpose of pivot_root in Linux containers? 2 sentences
+Get the star count of github.com/traefik/traefik
+Explain what NO_PROXY environment variable does
+Fetch github.com/minio/minio README and summarize its S3 compatibility
+What are Linux capabilities and why drop them in a sandbox? 2 sentences
+Get the description of github.com/etcd-io/etcd
+Explain the difference between bind mount and overlayfs in 3 sentences
