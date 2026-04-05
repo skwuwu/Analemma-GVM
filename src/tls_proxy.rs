@@ -494,6 +494,55 @@ impl HttpRequest {
 
 /// Handle a MITM TLS stream: read plaintext HTTP, apply SRR, forward to upstream.
 ///
+/// Write an enforcement event (Deny/Throttle/RequireApproval) to WAL.
+/// Every blocked or rate-limited request must appear in the audit trail.
+async fn append_enforcement_event(
+    ledger: &std::sync::Arc<crate::ledger::Ledger>,
+    classify_output: &crate::enforcement::ClassifyOutput,
+    host: &str,
+    req: &HttpRequest,
+    decision_str: &str,
+    status_code: Option<u16>,
+    default_caution: bool,
+) {
+    let event = gvm_types::GVMEvent {
+        event_id: uuid::Uuid::new_v4().to_string(),
+        trace_id: uuid::Uuid::new_v4().to_string(),
+        parent_event_id: None,
+        agent_id: classify_output.agent_id.clone(),
+        tenant_id: None,
+        session_id: host.to_string(),
+        timestamp: chrono::Utc::now(),
+        operation: format!("{} {}", req.method, req.path),
+        resource: gvm_types::ResourceDescriptor {
+            service: host.to_string(),
+            identifier: Some(req.path.clone()),
+            tier: gvm_types::ResourceTier::External,
+            sensitivity: gvm_types::Sensitivity::Medium,
+        },
+        context: std::collections::HashMap::new(),
+        transport: Some(gvm_types::TransportInfo {
+            method: req.method.clone(),
+            host: host.to_string(),
+            path: req.path.clone(),
+            status_code,
+        }),
+        decision: decision_str.to_string(),
+        decision_source: format!("{:?}", classify_output.classification.source),
+        matched_rule_id: classify_output.classification.matched_rule_id.clone(),
+        enforcement_point: "mitm".to_string(),
+        status: gvm_types::EventStatus::Confirmed,
+        payload: gvm_types::PayloadDescriptor::default(),
+        nats_sequence: None,
+        event_hash: None,
+        llm_trace: None,
+        default_caution,
+    };
+    if let Err(e) = ledger.append_durable(&event).await {
+        tracing::error!(error = %e, decision = %decision_str, "MITM: enforcement WAL append FAILED");
+    }
+}
+
 /// Shared between the port-8443 TLS listener and the CONNECT handler.
 /// `S` can be `TcpStream` (DNAT path) or `TokioIo<Upgraded>` (CONNECT path).
 pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
@@ -604,6 +653,42 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                 );
                 tls_stream.write_all(response.as_bytes()).await?;
                 tls_stream.flush().await?;
+                // Best-effort WAL record for classification failure.
+                // classify_output is unavailable, construct minimal event.
+                let fail_event = gvm_types::GVMEvent {
+                    event_id: uuid::Uuid::new_v4().to_string(),
+                    trace_id: uuid::Uuid::new_v4().to_string(),
+                    parent_event_id: None,
+                    agent_id: "unknown".to_string(),
+                    tenant_id: None,
+                    session_id: host.clone(),
+                    timestamp: chrono::Utc::now(),
+                    operation: format!("{} {}", req.method, req.path),
+                    resource: gvm_types::ResourceDescriptor {
+                        service: host.clone(),
+                        identifier: Some(req.path.clone()),
+                        tier: gvm_types::ResourceTier::External,
+                        sensitivity: gvm_types::Sensitivity::Medium,
+                    },
+                    context: std::collections::HashMap::new(),
+                    transport: Some(gvm_types::TransportInfo {
+                        method: req.method.clone(),
+                        host: host.clone(),
+                        path: req.path.clone(),
+                        status_code: Some(500),
+                    }),
+                    decision: format!("Deny (classification error: {})", err_msg),
+                    decision_source: "fail-close".to_string(),
+                    matched_rule_id: None,
+                    enforcement_point: "mitm".to_string(),
+                    status: gvm_types::EventStatus::Confirmed,
+                    payload: gvm_types::PayloadDescriptor::default(),
+                    nats_sequence: None,
+                    event_hash: None,
+                    llm_trace: None,
+                    default_caution: false,
+                };
+                let _ = state.ledger.append_durable(&fail_event).await;
                 break;
             }
         };
@@ -642,44 +727,10 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                 tracing::warn!(host = %host, path = %req.path, reason = %reason, "MITM: request DENIED");
 
                 // Record Deny in WAL — blocked requests MUST appear in audit trail.
-                // Without this, denied actions are invisible to gvm events/watch/audit,
-                // violating fail-close observability.
-                let deny_event = gvm_types::GVMEvent {
-                    event_id,
-                    trace_id,
-                    parent_event_id: None,
-                    agent_id: classify_output.agent_id.clone(),
-                    tenant_id: None,
-                    session_id: host.clone(),
-                    timestamp: chrono::Utc::now(),
-                    operation: format!("{} {}", req.method, req.path),
-                    resource: gvm_types::ResourceDescriptor {
-                        service: host.clone(),
-                        identifier: Some(req.path.clone()),
-                        tier: gvm_types::ResourceTier::External,
-                        sensitivity: gvm_types::Sensitivity::Medium,
-                    },
-                    context: std::collections::HashMap::new(),
-                    transport: Some(gvm_types::TransportInfo {
-                        method: req.method.clone(),
-                        host: host.clone(),
-                        path: req.path.clone(),
-                        status_code: Some(403),
-                    }),
-                    decision: format!("Deny {{ reason: {:?} }}", reason),
-                    decision_source: format!("{:?}", classify_output.classification.source),
-                    matched_rule_id: classify_output.classification.matched_rule_id.clone(),
-                    enforcement_point: "mitm".to_string(),
-                    status: gvm_types::EventStatus::Confirmed,
-                    payload: gvm_types::PayloadDescriptor::default(),
-                    nats_sequence: None,
-                    event_hash: None,
-                    llm_trace: None,
-                    default_caution: false,
-                };
-                if let Err(e) = state.ledger.append_durable(&deny_event).await {
-                    tracing::error!(error = %e, "MITM: Deny WAL append FAILED");
-                }
+                append_enforcement_event(
+                    &state.ledger, &classify_output, &host, &req,
+                    &format!("Deny {{ reason: {:?} }}", reason), Some(403), false,
+                ).await;
 
                 break; // Close connection on deny
             }
@@ -697,6 +748,9 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                 );
                 tls_stream.write_all(response.as_bytes()).await?;
                 tls_stream.flush().await?;
+                append_enforcement_event(
+                    &state.ledger, &classify_output, &host, &req, "RequireApproval (→ Deny on MITM)", Some(403), false,
+                ).await;
                 break;
             }
             gvm_types::EnforcementDecision::Throttle { max_per_minute } => {
@@ -713,6 +767,9 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                     );
                     tls_stream.write_all(response.as_bytes()).await?;
                     tls_stream.flush().await?;
+                    append_enforcement_event(
+                        &state.ledger, &classify_output, &host, &req, "Throttle (rate limit exceeded)", Some(429), false,
+                    ).await;
                     continue; // Don't break — allow next request in keep-alive
                 }
                 // Rate check passed — allow through
