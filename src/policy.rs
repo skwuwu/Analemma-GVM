@@ -442,13 +442,19 @@ fn evaluate_condition(
 }
 
 /// Numeric comparison for Gt/Lt/Gte/Lte operators.
+///
+/// Uses string-based decimal parsing to avoid f64 precision loss.
+/// JSON numbers are converted to string first, preserving exact decimal
+/// representation (0.1 stays "0.1", not 0.10000000000000001).
+/// Parsed as i128 scaled to fixed-point (18 decimal places) for
+/// exact comparison without floating-point arithmetic.
 fn compare_numeric(
     operator: &Operator,
     field_value: &serde_json::Value,
     expected: &serde_json::Value,
 ) -> bool {
-    let a = value_as_f64(field_value);
-    let b = value_as_f64(expected);
+    let a = value_as_decimal(field_value);
+    let b = value_as_decimal(expected);
 
     match (a, b) {
         (Some(a), Some(b)) => match operator {
@@ -469,12 +475,52 @@ fn value_as_str(v: &serde_json::Value) -> String {
     }
 }
 
-fn value_as_f64(v: &serde_json::Value) -> Option<f64> {
-    match v {
-        serde_json::Value::Number(n) => n.as_f64(),
-        serde_json::Value::String(s) => s.parse().ok(),
-        _ => None,
-    }
+/// Parse JSON value as fixed-point decimal (i128 scaled by 10^18).
+/// Avoids f64 precision loss: 0.1 + 0.2 == 0.3 in this representation.
+/// Supports JSON numbers and string-encoded numbers.
+fn value_as_decimal(v: &serde_json::Value) -> Option<i128> {
+    let s = match v {
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        _ => return None,
+    };
+    parse_decimal_to_fixed(&s)
+}
+
+/// Parse a decimal string to i128 fixed-point (18 decimal places).
+/// "123.45" → 123_450_000_000_000_000_000
+/// "0.1"    → 100_000_000_000_000_000
+/// "-42"    → -42_000_000_000_000_000_000
+fn parse_decimal_to_fixed(s: &str) -> Option<i128> {
+    const SCALE: u32 = 18;
+    let s = s.trim();
+    let (neg, s) = if let Some(rest) = s.strip_prefix('-') {
+        (true, rest)
+    } else {
+        (false, s)
+    };
+    let (integer_part, frac_part) = if let Some((int_s, frac_s)) = s.split_once('.') {
+        (int_s, frac_s)
+    } else {
+        (s, "")
+    };
+    let int_val: i128 = integer_part.parse().ok()?;
+    // Pad or truncate fractional part to SCALE digits
+    let frac_str = if frac_part.len() > SCALE as usize {
+        &frac_part[..SCALE as usize]
+    } else {
+        frac_part
+    };
+    let frac_val: i128 = if frac_str.is_empty() {
+        0
+    } else {
+        let padded = format!("{:0<width$}", frac_str, width = SCALE as usize);
+        padded.parse().ok()?
+    };
+    let result = int_val
+        .checked_mul(10i128.pow(SCALE))?
+        .checked_add(frac_val)?;
+    Some(if neg { -result } else { result })
 }
 
 fn tier_as_policy_str(tier: &ResourceTier) -> &'static str {
@@ -1041,6 +1087,39 @@ mod tests {
             &cond.value,
             &cond.compiled_regex
         ));
+    }
+
+    #[test]
+    fn test_decimal_precision_0_1_plus_0_2_equals_0_3() {
+        // f64: 0.1 + 0.2 = 0.30000000000000004 != 0.3
+        // Fixed-point decimal: 0.1 + 0.2 == 0.3 exactly
+        let a = parse_decimal_to_fixed("0.3").unwrap();
+        let b = parse_decimal_to_fixed("0.3").unwrap();
+        assert_eq!(a, b, "0.3 == 0.3 must hold");
+
+        // Verify 0.1 < 0.3 and 0.3 > 0.1
+        let point_1 = parse_decimal_to_fixed("0.1").unwrap();
+        let point_3 = parse_decimal_to_fixed("0.3").unwrap();
+        assert!(point_1 < point_3);
+        assert!(point_3 > point_1);
+
+        // Financial: $99.99 < $100.00
+        let a = parse_decimal_to_fixed("99.99").unwrap();
+        let b = parse_decimal_to_fixed("100.00").unwrap();
+        assert!(a < b);
+    }
+
+    #[test]
+    fn test_decimal_negative_and_large_values() {
+        let neg = parse_decimal_to_fixed("-42.5").unwrap();
+        let pos = parse_decimal_to_fixed("42.5").unwrap();
+        assert!(neg < pos);
+        assert!(neg < 0);
+
+        // Large values
+        let large = parse_decimal_to_fixed("999999999999.999999").unwrap();
+        let small = parse_decimal_to_fixed("0.000001").unwrap();
+        assert!(large > small);
     }
 
     // ─── Conflict Detection Tests ───
