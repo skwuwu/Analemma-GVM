@@ -117,6 +117,19 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         tracing::debug!(merged = %m.display(), "Home overlayfs mounted by parent");
     }
 
+    // Mount workspace overlayfs in parent if --fs-governance is active.
+    // Parent mounts so upper layer survives child exit (same pattern as $HOME overlay).
+    // Child inherits via clone() and bind-mounts merged → /workspace.
+    let ws_overlay: Option<(PathBuf, PathBuf)> = config.fs_policy.as_ref().and_then(|policy| {
+        crate::mount::mount_workspace_overlay(&config.workspace_dir, my_pid, policy.upper_size_mb)
+    });
+    if let Some((ref merged, ref upper)) = ws_overlay {
+        tracing::debug!(
+            merged = %merged.display(), upper = %upper.display(),
+            "Workspace overlayfs mounted by parent (Trust-on-Pattern)"
+        );
+    }
+
     // Create coordination pipe
     let (parent_fd, child_fd) = coordination_pipe()?;
 
@@ -130,6 +143,7 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     let child_ca_pem = ca_cert_pem.clone();
     let child_extra_libs = extra_lib_paths;
     let child_home_overlay = home_overlay_merged.clone();
+    let child_ws_overlay = ws_overlay.as_ref().map(|(m, _)| m.clone());
 
     let child_pid = unsafe {
         nix::sched::clone(
@@ -142,6 +156,7 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
                     child_ca_pem.as_deref(),
                     &child_extra_libs,
                     child_home_overlay.as_deref(),
+                    child_ws_overlay.as_deref(),
                 )
             }),
             &mut stack,
@@ -183,6 +198,10 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         if let Some(ref m) = home_overlay_merged {
             mount_paths.push(m.clone());
             mount_paths.push(PathBuf::from(format!("/run/gvm/home-overlay-{}", my_pid)));
+        }
+        if let Some((ref merged, _)) = ws_overlay {
+            mount_paths.push(merged.clone());
+            mount_paths.push(PathBuf::from(format!("/run/gvm/ws-overlay-{}", my_pid)));
         }
         if let Err(e) =
             record_sandbox_state(&veth_config, &mount_paths, None, dns_target.as_deref())
@@ -465,9 +484,13 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     }
 
     // 5. Scan overlayfs upper layer BEFORE cleanup (tmpfs umount destroys it).
-    // This must happen while the overlay is still mounted so files are accessible.
+    // Parent-mounted workspace overlay: upper dir is at /run/gvm/ws-overlay-{pid}/upper.
+    // Fallback: child-mounted overlay at sandbox_root/gvm-overlay/upper (legacy).
     let fs_diff = {
-        let upper_dir = sandbox_root.join("gvm-overlay/upper");
+        let upper_dir = ws_overlay
+            .as_ref()
+            .map(|(_, u)| u.clone())
+            .unwrap_or_else(|| sandbox_root.join("gvm-overlay/upper"));
         if upper_dir.exists() {
             let policy = config.fs_policy.as_ref().cloned().unwrap_or_default();
             match crate::filesystem::scan_upper_layer(&upper_dir, &config.workspace_dir, &policy) {
@@ -531,6 +554,8 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     std::fs::remove_dir(&staging_ws).ok();
     // Clean up home overlayfs (parent-mounted before clone)
     crate::mount::cleanup_home_overlay(my_pid);
+    // Clean up workspace overlayfs (parent-mounted, scanned in step 5)
+    crate::mount::cleanup_workspace_overlay(my_pid);
     // Drop TC filter guard first — this detaches the filter via RAII Drop.
     // Must happen before cleanup_host_network which deletes the veth interface.
     drop(_ebpf_guard);
@@ -556,6 +581,7 @@ fn child_entry(
     ca_cert_pem: Option<&[u8]>,
     extra_lib_paths: &[std::path::PathBuf],
     home_overlay_merged: Option<&std::path::Path>,
+    ws_overlay_merged: Option<&std::path::Path>,
 ) -> isize {
     // Wait for parent to complete UID mapping and network setup
     let network_seed = match wait_for_parent(coord_fd) {
@@ -588,6 +614,7 @@ fn child_entry(
         extra_lib_paths,
         &config.sandbox_profile,
         home_overlay_merged,
+        ws_overlay_merged,
     ) {
         eprintln!("gvm-sandbox: mount namespace setup failed: {:#}", e);
         eprintln!("  Hint: this usually means the interpreter binary or its shared");

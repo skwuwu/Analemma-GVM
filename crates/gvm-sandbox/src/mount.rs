@@ -91,6 +91,7 @@ pub fn setup_mount_namespace(
     extra_lib_paths: &[PathBuf],
     profile: &crate::SandboxProfile,
     home_overlay_merged: Option<&Path>,
+    ws_overlay_merged: Option<&Path>,
 ) -> Result<()> {
     // Safety guard: verify we're in a new mount namespace before making / private.
     // If clone(CLONE_NEWNS) failed silently, this would destroy host mount propagation.
@@ -150,7 +151,21 @@ pub fn setup_mount_namespace(
     }
 
     // ─�� Workspace mount: overlayfs (if fs_policy set + kernel supports) or legacy ──
-    let overlayfs_mounted = if let Some(policy) = fs_policy {
+    // If parent prepared workspace overlay, bind-mount it. Otherwise try child overlay or legacy.
+    let overlayfs_mounted = if let Some(ws_merged) = ws_overlay_merged {
+        // Parent-mounted workspace overlay: bind-mount merged dir → /workspace
+        let ws_target = new_root.join("workspace");
+        std::fs::create_dir_all(&ws_target).ok();
+        mount(
+            Some(ws_merged),
+            &ws_target,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .is_ok()
+    } else if let Some(policy) = fs_policy {
+        // Fallback: try child-side overlay (may fail on some kernels)
         try_mount_overlayfs(workspace_dir, &new_root, policy)
     } else {
         false
@@ -391,6 +406,89 @@ pub fn mount_home_overlay(host_home: &Path, pid: u32) -> Option<PathBuf> {
 pub fn cleanup_home_overlay(pid: u32) {
     let merged = PathBuf::from(format!("/run/gvm/home-merged-{}", pid));
     let upper_base = PathBuf::from(format!("/run/gvm/home-overlay-{}", pid));
+    nix::mount::umount2(&merged, nix::mount::MntFlags::MNT_DETACH).ok();
+    nix::mount::umount(&upper_base).ok();
+    std::fs::remove_dir_all(&upper_base).ok();
+    std::fs::remove_dir_all(&merged).ok();
+}
+
+/// Mount workspace overlayfs in the PARENT process (real root).
+///
+/// Same pattern as mount_home_overlay: parent mounts overlayfs so the upper
+/// layer survives child exit. Child inherits via clone() and sees /workspace
+/// as writable. After child exits, parent scans upper layer for diff report.
+///
+/// Returns (merged_path, upper_dir_path) on success.
+pub fn mount_workspace_overlay(
+    workspace_dir: &Path,
+    pid: u32,
+    upper_size_mb: u64,
+) -> Option<(PathBuf, PathBuf)> {
+    let merged = PathBuf::from(format!("/run/gvm/ws-merged-{}", pid));
+    let upper_base = PathBuf::from(format!("/run/gvm/ws-overlay-{}", pid));
+    let upper_dir = upper_base.join("upper");
+    let work_dir = upper_base.join("work");
+
+    // Clean up stale mounts
+    nix::mount::umount2(&merged, nix::mount::MntFlags::MNT_DETACH).ok();
+    nix::mount::umount(&upper_base).ok();
+    std::fs::remove_dir_all(&upper_base).ok();
+    std::fs::remove_dir_all(&merged).ok();
+
+    std::fs::create_dir_all(&merged).ok()?;
+    std::fs::create_dir_all(&upper_base).ok()?;
+
+    // Mount tmpfs for upper + work
+    let size_opt = format!("size={}m", upper_size_mb);
+    if mount(
+        Some("tmpfs"),
+        &upper_base,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        Some(size_opt.as_str()),
+    )
+    .is_err()
+    {
+        return None;
+    }
+
+    std::fs::create_dir_all(&upper_dir).ok()?;
+    std::fs::create_dir_all(&work_dir).ok()?;
+
+    let mount_opts = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        workspace_dir.display(),
+        upper_dir.display(),
+        work_dir.display(),
+    );
+
+    if let Err(e) = mount(
+        Some("overlay"),
+        &merged,
+        Some("overlay"),
+        MsFlags::empty(),
+        Some(mount_opts.as_str()),
+    ) {
+        tracing::warn!(error = %e, "workspace overlayfs mount failed");
+        nix::mount::umount(&upper_base).ok();
+        std::fs::remove_dir_all(&upper_base).ok();
+        std::fs::remove_dir_all(&merged).ok();
+        return None;
+    }
+
+    tracing::info!(
+        lower = %workspace_dir.display(),
+        merged = %merged.display(),
+        upper_size_mb,
+        "Workspace overlayfs mounted by parent (Trust-on-Pattern)"
+    );
+    Some((merged, upper_dir))
+}
+
+/// Cleanup workspace overlay mounts (called by parent after scanning upper layer).
+pub fn cleanup_workspace_overlay(pid: u32) {
+    let merged = PathBuf::from(format!("/run/gvm/ws-merged-{}", pid));
+    let upper_base = PathBuf::from(format!("/run/gvm/ws-overlay-{}", pid));
     nix::mount::umount2(&merged, nix::mount::MntFlags::MNT_DETACH).ok();
     nix::mount::umount(&upper_base).ok();
     std::fs::remove_dir_all(&upper_base).ok();
