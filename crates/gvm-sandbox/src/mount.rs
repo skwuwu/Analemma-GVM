@@ -149,7 +149,7 @@ pub fn setup_mount_namespace(
         std::fs::create_dir_all(new_root.join(dir))?;
     }
 
-    // ── Workspace mount: overlayfs (if fs_policy set + kernel supports) or legacy ──
+    // ─�� Workspace mount: overlayfs (if fs_policy set + kernel supports) or legacy ──
     let overlayfs_mounted = if let Some(policy) = fs_policy {
         try_mount_overlayfs(workspace_dir, &new_root, policy)
     } else {
