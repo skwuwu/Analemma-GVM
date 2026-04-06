@@ -17,17 +17,17 @@ Analemma-GVM is a transparent enforcement proxy for AI agent I/O operations. It 
 ## Architecture Overview
 
 ```
- Agent (Python SDK)        GVM Proxy (Rust)           External APIs
- ┌──────────────┐    ┌──────────────────────┐    ┌──────────────┐
- │  @ic()       │───>│ Layer 1: Semantic     │───>│ Stripe       │
- │  decorator   │    │   ABAC Policy Engine  │    │ Slack        │
- │              │    │ Layer 2: Network SRR  │    │ Gmail        │
- │  GVMAgent    │    │ Layer 3: Capability   │    │ Database     │
- │  base class  │    │   Token (API Key)     │    │ ...          │
- └──────────────┘    │                      │    └──────────────┘
-                     │ WAL → NATS Ledger    │
-                     │ AES-256-GCM Vault    │
-                     └──────────────────────┘
+ Agent (Python SDK)        GVM Proxy (Rust)            External APIs
+ ┌──────────────┐    ┌────────────────────────┐    ┌──────────────┐
+ │  @ic()       │───>│ Layer 1: Semantic       │───>│ Stripe       │
+ │  decorator   │    │   ABAC Policy Engine    │    │ Slack        │
+ │              │    │ Layer 2: Network SRR    │    │ Gmail        │
+ │  GVMAgent    │    │ Layer 3: Capability     │    │ Database     │
+ │  base class  │    │   Token (API Key)       │    │ ...          │
+ └──────────────┘    │                          │    └──────────────┘
+                     │ WAL → NATS Ledger        │
+                     │ AES-256-GCM Vault        │
+                     └────────────────────────┘
 ```
 
 ### 3-Layer Security Model
