@@ -103,7 +103,7 @@ async fn append(&self, event: &GVMEvent) -> Result<()> {
 - **Size-based rotation** — `max_wal_bytes` (100MB default) triggers rotation to `wal.log.<N>`, `max_wal_segments` (10 default) prunes oldest segments. Merkle chain links across segments via `prev_root`
 - **Emergency WAL fallback** — if primary WAL fails, events go to `wal_emergency.log` (degraded mode, no Merkle)
 
-> **Long-term retention warning**: Default settings retain at most 100MB x 10 = 1GB of audit trail on local disk. When the 11th segment is created, the oldest segment is **permanently deleted**. For agents with high request volume, this threshold can be reached in days. WAL files are plain JSON-per-line — copy rotated segments to S3, GCS, or any storage before they are pruned. Automated off-machine retention (NATS JetStream, S3 sync) is planned but not yet implemented.
+> **Long-term retention**: Default settings retain at most 100MB x 10 = 1GB of audit trail on local disk. When the 11th segment is created, the oldest segment is **permanently deleted**. Segments are plain JSON files — back up or archive however you like (cron + S3, rsync, etc.) before they are pruned.
 
 ### Global Merkle Chain Design
 
