@@ -1359,8 +1359,16 @@ fn append_proxy_wal_event(
         llm_trace: None,
         default_caution: false,
     };
-    // Sync WAL append — use append_async (non-blocking, best effort for error paths).
-    state.ledger.append_async(event);
+    // Spawn background task for durable WAL write. Cannot .await in sync fn context,
+    // and append_async only writes to NATS (not WAL file). tokio::spawn ensures the
+    // event reaches the WAL file even without NATS configured.
+    let ledger = state.ledger.clone();
+    let decision_owned = decision.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = ledger.append_durable(&event).await {
+            tracing::error!(error = %e, decision = %decision_owned, "Proxy: enforcement WAL append FAILED");
+        }
+    });
 }
 
 fn error_response_detailed(
