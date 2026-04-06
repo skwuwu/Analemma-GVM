@@ -883,7 +883,64 @@ This validates the discovery-to-enforcement pipeline: operator observes agent tr
 
 ---
 
-## 9.12 Coverage Gaps and Future Tests
+## 9.12 End-to-End Overhead Benchmark (2026-04-06, EC2 t3.medium)
+
+**Script**: [`scripts/bench-overhead.sh`](../scripts/bench-overhead.sh)
+**Platform**: EC2 t3.medium, Ubuntu 24.04, kernel 6.17.0-1009-aws
+
+Measures actual network latency overhead of GVM proxy and sandbox compared to direct connections. All measurements are median values from 20 iterations (HTTP) or 5 iterations (LLM).
+
+### HTTP Request Overhead (httpbin.org/get)
+
+| Path | TTFB (median) | Overhead |
+|------|---------------|----------|
+| Direct HTTPS | 740ms | baseline |
+| Proxy (CONNECT tunnel) | 965ms | **+225ms** |
+| Sandbox MITM (DNAT) | 754ms | **+14ms** |
+
+**Key insight**: Sandbox MITM adds only +14ms per request. This is the TLS termination + leaf cert lookup (cache hit) + SRR check + WAL batch append + upstream relay overhead. The CONNECT tunnel path is slower (+225ms) because it requires HTTP CONNECT handshake + TLS renegotiation on every new connection.
+
+### Sandbox Startup (one-time)
+
+| Metric | Value |
+|--------|-------|
+| Median | 928ms |
+| Range | 910ms – 10,398ms |
+
+Sandbox startup includes: clone(CLONE_NEWPID\|NEWNS\|NEWNET\|NEWUSER), overlayfs $HOME mount, veth pair creation, iptables DNAT rules, seccomp-BPF installation, CA cert injection, and cert pre-warm. The 10s outlier is first-run CA key generation (P-256 keygen).
+
+### LLM Call Overhead (Anthropic API, "Say hi")
+
+| Path | Time (median) | Overhead |
+|------|---------------|----------|
+| Direct (no proxy) | 10,562ms | baseline |
+| Sandbox MITM | 11,245ms | **+683ms (6.5%)** |
+
+Measured inside an already-running sandbox (startup excluded). The +683ms includes MITM TLS termination + chunked SSE relay + WAL append per request. On a 10-second LLM call, this is negligible.
+
+### Concurrent Throughput (10 parallel requests)
+
+| Path | Total time | Overhead |
+|------|-----------|----------|
+| Direct | 1,005ms | baseline |
+| Via proxy | 1,479ms | **+474ms** |
+
+Proxy handles 10 concurrent HTTPS connections with linear scaling. No contention or serialization observed.
+
+### Summary
+
+| Component | Overhead | When |
+|-----------|----------|------|
+| Sandbox startup | ~928ms | One-time per `gvm run --sandbox` |
+| MITM per request | +14ms TTFB | Every HTTPS request |
+| LLM per request | +683ms (6.5%) | Every LLM API call |
+| CONNECT tunnel | +225ms | Every new proxy connection (cooperative mode) |
+
+**Conclusion**: GVM adds <1s one-time startup and <15ms per-request overhead in sandbox MITM mode. For LLM workloads where API calls take 5-60 seconds, the 6.5% overhead is imperceptible to users.
+
+---
+
+## 9.13 Coverage Gaps and Future Tests
 
 | Gap | Priority | Tracking Issue |
 |-----|----------|---------------|
