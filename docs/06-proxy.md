@@ -18,63 +18,63 @@ The Proxy Pipeline is the central enforcement point. Every HTTP request — whet
 Agent HTTP Request
        │
        ▼
-┌──────────────────────────────────────────────────┐
-│  Tower Middleware Stack                           │
-│  1. CatchPanicLayer    ← Panic → 500 (not crash) │
-│  2. RequestBodyLimitLayer(1MB) ← OOM defense     │
-│  3. ConcurrencyLimitLayer(1024) ← FD exhaustion  │
-└──────────────────────┬───────────────────────────┘
-                       │
-                       ▼
-┌──────────────────────────────────────────────────┐
-│  Parse Request                                    │
-│  - Extract GVM headers (X-GVM-Agent-Id, etc.)     │
-│  - Extract target (X-GVM-Target-Host or Host)     │
-└──────────────────────┬───────────────────────────┘
-                       │
-              ┌────────┴────────┐
-              │ GVM headers?    │
-              ▼                 ▼
-     SDK-Routed            Direct HTTP
-              │                 │
-              ▼                 ▼
-┌─────────────────┐  ┌─────────────────┐
-│ Layer 1: ABAC   │  │ Layer 2: SRR    │
-│ Policy Engine   │  │ (URL-based)     │
-│ + Layer 2: SRR  │  │                 │
-│                 │  │                 │
-│ max_strict(     │  │ decision =      │
-│   srr, policy)  │  │   srr.check()   │
-└────────┬────────┘  └────────┬────────┘
-         │                    │
-         └────────┬───────────┘
-                  │
-                  ▼
-┌──────────────────────────────────────────────────┐
-│  Rate Limit Check (if Throttle decision)          │
-│  Token-bucket per agent_id                        │
-└──────────────────────┬───────────────────────────┘
-                       │
-                       ▼
-┌──────────────────────────────────────────────────┐
-│  Enforcement (by decision type)                   │
-│                                                   │
-│  Allow → forward immediately, async audit         │
-│  Delay → WAL write, sleep(ms), forward            │
-│  RequireApproval → WAL write, return 403           │
-│  Deny → WAL write, return 403                     │
-│  Throttle → forward (rate already checked)         │
-│  AuditOnly → WAL write, forward, elevate alert    │
-└──────────────────────┬───────────────────────────┘
-                       │
-                       ▼
-┌──────────────────────────────────────────────────┐
-│  Forward to Upstream                              │
-│  1. Inject API credentials (Layer 3)              │
-│  2. Remove X-GVM-* headers                        │
-│  3. Build outbound URI                            │
-│  4. HTTP client → upstream                        │
-└──────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│  Tower Middleware Stack                             │
+│  1. CatchPanicLayer    ← Panic → 500 (not crash)   │
+│  2. RequestBodyLimitLayer(1MB) ← OOM defense        │
+│  3. ConcurrencyLimitLayer(1024) ← FD exhaustion     │
+└────────────────────────┬────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────┐
+│  Parse Request                                      │
+│  - Extract GVM headers (X-GVM-Agent-Id, etc.)       │
+│  - Extract target (X-GVM-Target-Host or Host)       │
+└────────────────────────┬────────────────────────────┘
+                         │
+                ┌────────┴────────┐
+                │ GVM headers?    │
+                ▼                 ▼
+       SDK-Routed            Direct HTTP
+                │                 │
+                ▼                 ▼
+  ┌─────────────────┐  ┌─────────────────┐
+  │ Layer 1: ABAC   │  │ Layer 2: SRR    │
+  │ Policy Engine   │  │ (URL-based)     │
+  │ + Layer 2: SRR  │  │                 │
+  │                 │  │                 │
+  │ max_strict(     │  │ decision =      │
+  │   srr, policy)  │  │   srr.check()   │
+  └────────┬────────┘  └────────┬────────┘
+           │                    │
+           └────────┬───────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────┐
+│  Rate Limit Check (if Throttle decision)            │
+│  Token-bucket per agent_id                          │
+└────────────────────────┬────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────┐
+│  Enforcement (by decision type)                     │
+│                                                     │
+│  Allow → forward immediately, async audit           │
+│  Delay → WAL write, sleep(ms), forward              │
+│  RequireApproval → WAL write, return 403            │
+│  Deny → WAL write, return 403                       │
+│  Throttle → forward (rate already checked)          │
+│  AuditOnly → WAL write, forward, elevate alert      │
+└────────────────────────┬────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────┐
+│  Forward to Upstream                                │
+│  1. Inject API credentials (Layer 3)                │
+│  2. Remove X-GVM-* headers                          │
+│  3. Build outbound URI                              │
+│  4. HTTP client → upstream                          │
+└─────────────────────────────────────────────────────┘
 ```
 
 ---
