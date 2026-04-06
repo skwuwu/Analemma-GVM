@@ -130,6 +130,7 @@ fn sandbox_config_clone() {
         cpu_limit: None,
         fs_policy: None,
         mitm_ca_cert: None,
+        sandbox_profile: gvm_sandbox::SandboxProfile::Standard,
     };
 
     let cloned = config.clone();
@@ -237,6 +238,7 @@ fn launch_on_non_linux_returns_error() {
         cpu_limit: None,
         fs_policy: None,
         mitm_ca_cert: None,
+        sandbox_profile: gvm_sandbox::SandboxProfile::Standard,
     };
 
     let result = launch_sandboxed(config);
