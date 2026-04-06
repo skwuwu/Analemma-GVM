@@ -16,6 +16,7 @@ pub mod rate_limiter;
 pub mod registry;
 pub mod srr;
 pub mod tls_proxy;
+pub mod tls_proxy_hyper;
 pub mod types;
 pub mod vault;
 /// Wasm policy engine — UNSUPPORTED EXPERIMENTAL FEATURE.

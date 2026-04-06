@@ -496,7 +496,7 @@ impl HttpRequest {
 ///
 /// Write an enforcement event (Deny/Throttle/RequireApproval) to WAL.
 /// Every blocked or rate-limited request must appear in the audit trail.
-async fn append_enforcement_event(
+pub async fn append_enforcement_event(
     ledger: &std::sync::Arc<crate::ledger::Ledger>,
     classify_output: &crate::enforcement::ClassifyOutput,
     host: &str,
@@ -545,7 +545,30 @@ async fn append_enforcement_event(
 
 /// Shared between the port-8443 TLS listener and the CONNECT handler.
 /// `S` can be `TcpStream` (DNAT path) or `TokioIo<Upgraded>` (CONNECT path).
-pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+///
+/// Delegates to hyper-based handler for proper HTTP/1.1 framing.
+/// hyper manages chunked encoding, content-length, keep-alive, and SSE streaming.
+pub async fn handle_mitm_stream<
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+>(
+    tls_stream: tokio_rustls::server::TlsStream<S>,
+    host_hint: &str,
+    client_config: std::sync::Arc<rustls::ClientConfig>,
+    state: &crate::proxy::AppState,
+) -> Result<()> {
+    crate::tls_proxy_hyper::serve_mitm(
+        tls_stream,
+        host_hint.to_string(),
+        client_config,
+        state.clone(),
+    )
+    .await
+}
+
+/// Legacy handle_mitm_stream — custom HTTP parser + relay.
+/// Kept for reference. All MITM traffic now goes through hyper (above).
+#[allow(dead_code)]
+async fn handle_mitm_stream_legacy<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     mut tls_stream: tokio_rustls::server::TlsStream<S>,
     host_hint: &str,
     client_config: std::sync::Arc<rustls::ClientConfig>,
