@@ -103,7 +103,7 @@ async fn append(&self, event: &GVMEvent) -> Result<()> {
 - **Size-based rotation** — `max_wal_bytes` (100MB default) triggers rotation to `wal.log.<N>`, `max_wal_segments` (10 default) prunes oldest segments. Merkle chain links across segments via `prev_root`
 - **Emergency WAL fallback** — if primary WAL fails, events go to `wal_emergency.log` (degraded mode, no Merkle)
 
-> **Long-term retention warning**: Default settings retain at most 100MB x 10 = 1GB of audit trail on local disk. When the 11th segment is created, the oldest segment is **permanently deleted**. For agents with high request volume, this threshold can be reached in days. If audit trail retention is required for compliance or forensics, configure NATS JetStream (`[nats]` in `proxy.toml`) to replicate events before segment pruning. Without NATS, rotated segments are unrecoverable.
+> **Long-term retention warning**: Default settings retain at most 100MB x 10 = 1GB of audit trail on local disk. When the 11th segment is created, the oldest segment is **permanently deleted**. For agents with high request volume, this threshold can be reached in days. WAL files are plain JSON-per-line — copy rotated segments to S3, GCS, or any storage before they are pruned. Automated off-machine retention (NATS JetStream, S3 sync) is planned but not yet implemented.
 
 ### Global Merkle Chain Design
 
@@ -137,17 +137,9 @@ pub struct Ledger {
 }
 ```
 
-**Problem**: NATS messages published via `tokio::spawn` may arrive out of order.
+**Note**: NATS publishing is currently a **stub** — the `[nats]` config is accepted but events are only written to local WAL. The WAL sequence counter and NATS integration design are implemented in the code structure but actual NATS network I/O is not active. When NATS is connected in a future release, the monotonic `wal_sequence` ensures consumers can reconstruct WAL order from out-of-order NATS messages.
 
-**Solution**: Each durable write assigns a monotonic `wal_sequence` (via `AtomicU64::fetch_add`) before the WAL write. This sequence is included as a NATS header, allowing consumers to reconstruct WAL order:
-
-```rust
-let wal_seq = self.wal_sequence.fetch_add(1, Ordering::SeqCst);
-self.wal.append(event).await?;  // group commit: batched fsync + Merkle
-// NATS publish includes wal_seq as header
-```
-
-**Properties**:
+**WAL sequence properties** (active regardless of NATS):
 - Lock-free (`AtomicU64`) — zero performance impact
 - Monotonic — strictly increasing, no gaps within a process lifetime
 - SeqCst ordering — visible to all threads immediately

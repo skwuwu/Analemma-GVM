@@ -21,9 +21,13 @@ GVM Vault is an encrypted key-value store for agent runtime state (checkpoints, 
 - KDF (key derivation function) — key is used directly from env var (planned: Argon2id)
 - Access control between agents
 
-**Production deployments should:**
-- Implement `KeyProvider` for KMS (AWS KMS, GCP KMS)
-- Implement `VaultBackend` for Redis with TLS or DynamoDB
+**Current implementation:**
+- `InMemoryBackend` — state is lost on proxy restart. Suitable for development and short-lived sessions
+- `LocalKeyProvider` — AES-256-GCM with local key from `GVM_VAULT_KEY` env var
+
+**Planned (not yet implemented):**
+- `RedisBackend` — durable state across restarts (v2.0)
+- KMS integration (AWS KMS, GCP KMS) for key management (v2.0)
 - Restrict Vault API to localhost or mTLS-authenticated agents
 
 **Design principle**: Agents never handle raw encryption. The proxy encrypts/decrypts transparently. Key material is zeroed on drop to prevent memory remanence attacks.
@@ -86,12 +90,12 @@ The default type parameter `InMemoryBackend` means existing code using `Vault` (
 // MVP (default): local encryption + in-memory storage
 let vault = Vault::new(ledger)?;
 
-// Production: KMS encryption + Redis storage
-let vault = Vault::with_backends(
-    Box::new(AwsKmsKeyProvider::new(kms_key_id)),
-    RedisBackend::new(redis_url),
-    ledger,
-);
+// Future (v2.0): KMS encryption + Redis storage (not yet implemented)
+// let vault = Vault::with_backends(
+//     Box::new(AwsKmsKeyProvider::new(kms_key_id)),
+//     RedisBackend::new(redis_url),
+//     ledger,
+// );
 ```
 
 ---
@@ -244,11 +248,7 @@ The MVP `InMemoryBackend` loses all data on process restart. For persistent stat
 
 **Key constraint**: WAL currently records only metadata (content hash + size) for vault writes, not the full encrypted value. Full WAL-based recovery would require storing the encrypted ciphertext in the WAL — a design change with WAL size implications.
 
-**Recommended production path**: Redis with TLS as `VaultBackend` implementation. This provides:
-- Persistence across restarts
-- TTL-based key expiration
-- Atomic operations (no TOCTOU)
-- TLS encryption in transit (complementing Vault's at-rest encryption)
+**Current limitation**: `InMemoryBackend` loses all state on proxy restart. Agent checkpoint data does not survive restarts. For production use cases requiring persistence, implement the `VaultBackend` trait with a durable backend (Redis, SQLite, filesystem). Redis with TLS is the planned v2.0 target.
 
 ---
 
