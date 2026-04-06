@@ -1,8 +1,8 @@
 # Changelog
 
 > Architecture decisions, implementation history, and release planning.
-> For security model, see [11-security-model.md](11-security-model.md).
-> For configuration reference, see [13-reference.md](13-reference.md).
+> For security model, see [11-security-model.md](security-model.md).
+> For configuration reference, see [13-reference.md](reference.md).
 
 ---
 
@@ -389,7 +389,7 @@ Core Wasm modules (`wasm32-wasip1`) require WASI preview1 imports. Fixed: `Store
 
 ## Assessed & Closed
 
-Reported during security audit — determined non-vulnerabilities. See [11-security-model.md](11-security-model.md).
+Reported during security audit — determined non-vulnerabilities. See [11-security-model.md](security-model.md).
 
 | Issue | Assessment |
 |-------|-----------|

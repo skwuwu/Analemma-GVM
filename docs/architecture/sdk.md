@@ -407,4 +407,4 @@ Run the demo: `python -m gvm.unified_demo`
 
 ---
 
-[← Part 6: Proxy Pipeline](06-proxy.md) | [Part 8: Memory & Runtime Security →](08-memory-security.md)
+[← Part 6: Proxy Pipeline](architecture/proxy.md) | [Part 8: Memory & Runtime Security →](architecture/memory-security.md)

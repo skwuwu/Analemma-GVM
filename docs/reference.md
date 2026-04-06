@@ -1,7 +1,7 @@
 # Reference Guide
 
 > Configuration, CLI commands, and advanced options.
-> For first-time setup, see [Quick Start →](12-quickstart.md).
+> For first-time setup, see [Quick Start →](quickstart.md).
 
 ---
 
@@ -598,4 +598,4 @@ Best practice: `chmod 600 config/secrets.toml` before first use.
 
 ---
 
-[← Quick Start](12-quickstart.md) | [Architecture Overview →](00-overview.md)
+[← Quick Start](quickstart.md) | [Architecture Overview →](overview.md)

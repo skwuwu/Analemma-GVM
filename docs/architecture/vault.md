@@ -291,4 +291,4 @@ The MVP `InMemoryBackend` loses all data on process restart. For persistent stat
 
 ---
 
-[← Part 4: WAL-First Ledger](04-ledger.md) | [Part 6: Proxy Pipeline →](06-proxy.md)
+[← Part 4: WAL-First Ledger](architecture/ledger.md) | [Part 6: Proxy Pipeline →](architecture/proxy.md)

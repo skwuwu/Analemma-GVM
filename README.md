@@ -50,7 +50,7 @@ gvm run my_agent.py
 gvm run --sandbox my_agent.py
 ```
 
-Everything is `gvm run` with flags. Watch → suggest → enforce. [Quick Start →](docs/12-quickstart.md)
+Everything is `gvm run` with flags. Watch → suggest → enforce. [Quick Start →](docs/quickstart.md)
 
 ---
 
@@ -93,7 +93,7 @@ Sandbox mode intercepts all HTTPS at the network level — the agent physically 
 
 ### MCP (Claude Desktop / Cursor)
 
-GVM provides MCP tools for AI assistants. [Setup guide →](docs/12-quickstart.md#7-mcp-integration--claude-desktop--cursor)
+GVM provides MCP tools for AI assistants. [Setup guide →](docs/quickstart.md#7-mcp-integration--claude-desktop--cursor)
 
 ---
 
@@ -109,7 +109,7 @@ GVM provides MCP tools for AI assistants. [Setup guide →](docs/12-quickstart.m
 | **Enforcement** | Inside the model | Before/after model | **Between agent and APIs** |
 | **Audit** | Provider logs (you don't own) | Prompt logs | **Merkle WAL (you own)** |
 
-[Full analysis →](docs/10-competitive-analysis.md)
+[Full analysis →](docs/security-layers.md)
 
 ---
 
@@ -118,7 +118,7 @@ GVM provides MCP tools for AI assistants. [Setup guide →](docs/12-quickstart.m
 - Rust, ~17MB release binary, ~10MB RSS at idle
 - Policy evaluation < 1μs (SRR + ABAC, no heap allocation on hot path)
 - WAL with Merkle chain, size-based rotation (100MB x 10 segments). Local storage — bring your own retention (S3, GCS, etc)
-- 329 tests, 60-min chaos stress test (proxy kill, network partition, disk pressure) — [PASS](docs/09-test-report.md#910-chaos-stress-test-60-minutes)
+- 329 tests, 60-min chaos stress test (proxy kill, network partition, disk pressure) — [PASS](docs/test-report.md#chaos-stress-test-30-minutes-2026-04-05)
 - seccomp-BPF with ~130 whitelisted syscalls, ENOSYS default for unknown
 - Sandbox auto-cleanup via per-PID state files (Docker pattern)
 
@@ -128,10 +128,10 @@ GVM provides MCP tools for AI assistants. [Setup guide →](docs/12-quickstart.m
 
 | Doc | What it covers |
 |-----|----------------|
-| [Quick Start](docs/12-quickstart.md) | Build, run, isolate, MCP setup |
-| [Reference](docs/13-reference.md) | Config, CLI, API, CI/CD |
-| [Security Model](docs/11-security-model.md) | Threat model, known attack surface (not externally audited) |
-| [Governance Coverage](docs/14-governance-coverage.md) | Per-mode enforcement matrix |
+| [Quick Start](docs/quickstart.md) | Build, run, isolate, MCP setup |
+| [Reference](docs/reference.md) | Config, CLI, API, CI/CD |
+| [Security Model](docs/security-model.md) | Threat model, known attack surface (not externally audited) |
+| [Governance Coverage](docs/governance-coverage.md) | Per-mode enforcement matrix |
 | [Changelog](docs/internal/CHANGELOG.md) | Roadmap, implementation log |
 
 ---

@@ -628,4 +628,4 @@ Block responses include these headers for SDK consumption:
 
 ---
 
-[← Part 5: Encrypted Vault](05-vault.md) | [Part 7: Python SDK →](07-sdk.md)
+[← Part 5: Encrypted Vault](architecture/vault.md) | [Part 7: Python SDK →](architecture/sdk.md)

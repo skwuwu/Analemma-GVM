@@ -290,4 +290,4 @@ Future: `gvm validate --strict config/policies/` will exit with code 1 if any co
 
 ---
 
-[← Part 1: Operations](01-operations.md) | [Part 3: Network SRR →](03-srr.md)
+[← Part 1: Operations](operations.md) | [Part 3: Network SRR →](srr.md)

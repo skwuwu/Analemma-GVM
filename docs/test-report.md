@@ -966,4 +966,4 @@ The +683ms measured in LLM tests includes OpenClaw SDK initialization overhead p
 
 ---
 
-[← Memory & Runtime Security](architecture/memory-security.md) | [Changelog →](internal/CHANGELOG.md) | [Overview →](00-overview.md)
+[← Memory & Runtime Security](architecture/memory-security.md) | [Changelog →](internal/CHANGELOG.md) | [Overview →](overview.md)

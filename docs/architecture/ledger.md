@@ -276,4 +276,4 @@ Auditor: compare context fields across config_load events → hash mismatch dete
 
 ---
 
-[← Part 3: Network SRR](03-srr.md) | [Part 5: Encrypted Vault →](05-vault.md)
+[← Part 3: Network SRR](srr.md) | [Part 5: Encrypted Vault →](architecture/vault.md)

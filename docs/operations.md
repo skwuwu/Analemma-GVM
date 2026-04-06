@@ -152,4 +152,4 @@ SDK declares: @ic(operation="custom.acme.crm.email_customer")
 
 ---
 
-[← Overview](00-overview.md) | [Part 2: ABAC Policy Engine →](02-policy.md)
+[← Overview](overview.md) | [Part 2: ABAC Policy Engine →](policy.md)

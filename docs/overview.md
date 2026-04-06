@@ -112,16 +112,16 @@ Start here if you want to use GVM with your agents.
 
 | Doc | What it covers |
 |-----|----------------|
-| [Quick Start](12-quickstart.md) | Build, run, isolate, MCP setup |
-| [User Guide](15-user-guide.md) | Modes, sandbox, resource limits, proxy lifecycle |
-| [Reference Guide](13-reference.md) | Configuration, CLI, environment variables, API |
-| [SRR Rules](03-srr.md) | Write URL-based rules (`config/srr_network.toml`) |
-| [ABAC Policies](02-policy.md) | Write semantic policies (`config/policies/`) |
-| [Operations](01-operations.md) | Operation namespace for ABAC (`gvm.payment.charge` etc.) |
-| [Security Model](11-security-model.md) | Threat model, known attack surface, mitigations |
-| [Governance Coverage](14-governance-coverage.md) | Per-mode enforcement matrix |
-| [What Makes GVM Different](10-competitive-analysis.md) | GVM vs LLM safety, prompt guards, OPA |
-| [Test Report](09-test-report.md) | Test coverage, benchmarks, chaos stress results |
+| [Quick Start](quickstart.md) | Build, run, isolate, MCP setup |
+| [User Guide](user-guide.md) | Modes, sandbox, resource limits, proxy lifecycle |
+| [Reference Guide](reference.md) | Configuration, CLI, environment variables, API |
+| [SRR Rules](srr.md) | Write URL-based rules (`config/srr_network.toml`) |
+| [ABAC Policies](policy.md) | Write semantic policies (`config/policies/`) |
+| [Operations](operations.md) | Operation namespace for ABAC (`gvm.payment.charge` etc.) |
+| [Security Model](security-model.md) | Threat model, known attack surface, mitigations |
+| [Governance Coverage](governance-coverage.md) | Per-mode enforcement matrix |
+| [Security Layers Comparison](security-layers.md) | GVM vs LLM safety, prompt guards, OPA |
+| [Test Report](test-report.md) | Test coverage, benchmarks, chaos stress results |
 
 ### Architecture (`docs/architecture/`)
 

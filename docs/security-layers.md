@@ -1,4 +1,4 @@
-# What Makes GVM Different
+# Security Layers Comparison
 
 > How GVM relates to existing AI safety layers.
 
@@ -102,4 +102,4 @@ GVM governs what agents *do* (HTTP calls). LLM WAFs analyze what agents *say* (p
 
 ---
 
-[← Security Model](11-security-model.md) | [Overview →](00-overview.md)
+[← Security Model](security-model.md) | [Overview →](overview.md)

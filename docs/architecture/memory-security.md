@@ -355,4 +355,4 @@ The proxy layer (`proxy.rs`) and all enforcement logic (SRR, ABAC, WAL, Vault) r
 
 ---
 
-[← Part 7: Python SDK](07-sdk.md) | [Part 9: Test Coverage Report →](09-test-report.md)
+[← Part 7: Python SDK](architecture/sdk.md) | [Part 9: Test Coverage Report →](test-report.md)

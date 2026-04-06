@@ -274,4 +274,4 @@ The agent's lie is caught at Layer 2 regardless of what it declared at Layer 1.
 
 ---
 
-[← Part 2: ABAC Policy](02-policy.md) | [Part 4: WAL-First Ledger →](04-ledger.md)
+[← Part 2: ABAC Policy](policy.md) | [Part 4: WAL-First Ledger →](architecture/ledger.md)
