@@ -117,7 +117,7 @@ GVM provides MCP tools for AI assistants. [Setup guide →](docs/12-quickstart.m
 
 - Rust, ~17MB release binary, ~10MB RSS at idle
 - Policy evaluation < 1μs (SRR + ABAC, no heap allocation on hot path)
-- WAL with Merkle chain, size-based rotation (100MB x 10 segments = 1GB local max; optional [NATS JetStream](https://nats.io/) for long-term retention — see [Reference](docs/13-reference.md))
+- WAL with Merkle chain, size-based rotation (100MB x 10 segments). Local storage — bring your own retention (S3, GCS, etc)
 - 329 tests, 60-min chaos stress test (proxy kill, network partition, disk pressure) — [PASS](docs/09-test-report.md#910-chaos-stress-test-60-minutes)
 - seccomp-BPF with ~130 whitelisted syscalls, ENOSYS default for unknown
 - Sandbox auto-cleanup via per-PID state files (Docker pattern)
