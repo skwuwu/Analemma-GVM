@@ -230,6 +230,7 @@ pub async fn proxy_handler(
             Ok(guard) => guard,
             Err(_) => {
                 tracing::error!("SRR lock poisoned — denying request (fail-close)");
+                append_proxy_wal_event(&state, request.method().as_str(), &target.host, &target.path, "unknown", "Deny (SRR lock poisoned)", 500);
                 return error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Internal governance error — request denied (fail-close)",
@@ -275,6 +276,7 @@ pub async fn proxy_handler(
             Ok(guard) => guard,
             Err(_) => {
                 tracing::error!("SRR lock poisoned — denying request (fail-close)");
+                append_proxy_wal_event(&state, request.method().as_str(), &target.host, &target.path, "unknown", "Deny (SRR lock poisoned)", 500);
                 return error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Internal governance error — request denied (fail-close)",
@@ -386,6 +388,7 @@ pub async fn proxy_handler(
                         agent = %agent_id,
                         "Shadow STRICT: no intent — DENY"
                     );
+                    append_proxy_wal_event(&state, &request_method, &target.host, &target.path, agent_id, "Deny (Shadow STRICT: no intent)", 403);
                     return error_response(
                         StatusCode::FORBIDDEN,
                         "Shadow verification failed: no intent declared for this request. \
@@ -420,7 +423,7 @@ pub async fn proxy_handler(
     // ── Step 3: Rate Limit check ──
     if let EnforcementDecision::Throttle { max_per_minute } = &classification.decision {
         if !state.rate_limiter.check(agent_id, *max_per_minute) {
-            // Release claimed intent — rate limit is not a WAL event
+            // Release claimed intent
             if let Some(ref claim) = shadow_claim {
                 state.intent_store.release(claim.claim_id);
             }
@@ -428,6 +431,7 @@ pub async fn proxy_handler(
                 .as_ref()
                 .map(|h| h.operation.as_str())
                 .unwrap_or("unknown");
+            append_proxy_wal_event(&state, &request_method, &target.host, &target.path, agent_id, &format!("Throttle (rate limit exceeded: {}/min)", max_per_minute), 429);
             return governance_block_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 GovernanceBlockResponse {
@@ -1311,6 +1315,54 @@ fn error_response(status: StatusCode, message: &str) -> Response<Body> {
     error_response_detailed(status, message, None, None, None, None)
 }
 
+/// Best-effort WAL append for enforcement decisions in proxy_handler / CONNECT.
+/// Every governance decision (Deny, Throttle, classification error) must be audited.
+fn append_proxy_wal_event(
+    state: &AppState,
+    method: &str,
+    host: &str,
+    path: &str,
+    agent_id: &str,
+    decision: &str,
+    status_code: u16,
+) {
+    let event = gvm_types::GVMEvent {
+        event_id: uuid::Uuid::new_v4().to_string(),
+        trace_id: uuid::Uuid::new_v4().to_string(),
+        parent_event_id: None,
+        agent_id: agent_id.to_string(),
+        tenant_id: None,
+        session_id: host.to_string(),
+        timestamp: chrono::Utc::now(),
+        operation: format!("{} {}", method, path),
+        resource: gvm_types::ResourceDescriptor {
+            service: host.to_string(),
+            identifier: Some(path.to_string()),
+            tier: gvm_types::ResourceTier::External,
+            sensitivity: gvm_types::Sensitivity::Medium,
+        },
+        context: std::collections::HashMap::new(),
+        transport: Some(gvm_types::TransportInfo {
+            method: method.to_string(),
+            host: host.to_string(),
+            path: path.to_string(),
+            status_code: Some(status_code),
+        }),
+        decision: decision.to_string(),
+        decision_source: "fail-close".to_string(),
+        matched_rule_id: None,
+        enforcement_point: "proxy".to_string(),
+        status: gvm_types::EventStatus::Confirmed,
+        payload: gvm_types::PayloadDescriptor::default(),
+        nats_sequence: None,
+        event_hash: None,
+        llm_trace: None,
+        default_caution: false,
+    };
+    // Sync WAL append — use append_async (non-blocking, best effort for error paths).
+    state.ledger.append_async(event);
+}
+
 fn error_response_detailed(
     status: StatusCode,
     message: &str,
@@ -1760,6 +1812,7 @@ async fn handle_connect_inner(
                 tracing::error!(
                     "SRR lock poisoned in CONNECT handler — denying tunnel (fail-close)"
                 );
+                append_proxy_wal_event(&state, "CONNECT", host, "/", "unknown", "Deny (SRR lock poisoned in CONNECT)", 500);
                 return error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Internal governance error — request denied (fail-close)",
@@ -1787,6 +1840,7 @@ async fn handle_connect_inner(
         if !claim.verified {
             if state.shadow_config.mode == crate::intent_store::ShadowMode::Strict {
                 tracing::warn!(host = %host, "Shadow STRICT: CONNECT without intent — DENY");
+                append_proxy_wal_event(&state, "CONNECT", host, "/", "unknown", "Deny (Shadow STRICT: CONNECT without intent)", 403);
                 return error_response(
                     StatusCode::FORBIDDEN,
                     "Shadow verification failed for CONNECT tunnel",
