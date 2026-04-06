@@ -718,8 +718,13 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                     "matched_rule": classify_output.classification.matched_rule_id.as_deref().unwrap_or(""),
                 });
                 let body_str = body.to_string();
+                // Keep-alive after Deny: allow agent to retry on the same connection.
+                // Previously Connection: close forced a new CONNECT tunnel per deny,
+                // triggering intermittent TLS handshake eof on reconnect. With keep-alive,
+                // the agent's next request (e.g., fallback URL or LLM call) uses the
+                // same TLS session — no handshake overhead, no reconnect failures.
                 let response = format!(
-                    "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                     body_str.len(), body_str
                 );
                 tls_stream.write_all(response.as_bytes()).await?;
@@ -738,7 +743,7 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                 )
                 .await;
 
-                break; // Close connection on deny
+                continue; // Keep-alive: allow next request on same connection
             }
             gvm_types::EnforcementDecision::Delay { milliseconds } => {
                 tokio::time::sleep(std::time::Duration::from_millis(*milliseconds)).await;
