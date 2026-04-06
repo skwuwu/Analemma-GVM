@@ -385,7 +385,7 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 | 1 | [`edge_empty_body_payload_inspection_skips`](tests/edge_cases.rs) | Empty body `b""` for payload rule | Skips payload inspection, falls through |
 | 2 | [`edge_binary_body_json_parse_fails_gracefully`](tests/edge_cases.rs) | PNG header `\x89PNG\r\n` as body | JSON parse fails, falls through to next rule |
 | 3 | [`edge_null_bytes_in_path_safe_handling`](tests/edge_cases.rs) | Path `/api/\x00/secrets` | No panic, returns decision |
-| 4 | [`edge_unicode_operation_name`](tests/edge_cases.rs) | Korean `"gvm.메시지.전송"`, emoji `"gvm.💰.send"` | No panic, returns decision |
+| 4 | [`edge_unicode_operation_name`](tests/edge_cases.rs) | Korean Unicode operation name, emoji `"gvm.💰.send"` | No panic, returns decision |
 | 5 | [`edge_very_long_host_and_path`](tests/edge_cases.rs) | 10K char host + 100K char path | No panic, returns Default-to-Caution |
 | 6 | [`edge_missing_gvm_headers_srr_only_fallback`](tests/edge_cases.rs) | No X-GVM-Agent-Id header | SRR-only classification (Layer 2) |
 | 7 | [`edge_policy_no_match_returns_allow`](tests/edge_cases.rs) | No matching policy rules | Returns Allow (open-world semantics) |
