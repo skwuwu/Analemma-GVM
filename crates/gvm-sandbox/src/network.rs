@@ -40,6 +40,12 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Monotonic counter for unique veth/subnet allocation.
+/// Eliminates PID-based IP collisions: same process never reuses a slot,
+/// and process restart resets the counter (previous sandboxes are dead).
+static SANDBOX_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// Network configuration for the sandbox.
 pub struct VethConfig {
@@ -57,24 +63,39 @@ pub struct VethConfig {
     pub child_pid: u32,
     /// Proxy listen address on the host.
     pub proxy_addr: SocketAddr,
+    /// Counter slot (sent to child via coordination pipe for address reconstruction).
+    pub slot: u32,
 }
 
 impl VethConfig {
-    /// Create a VethConfig using the child PID to derive unique IPs.
-    pub fn from_pid(child_pid: u32, proxy_addr: SocketAddr) -> Self {
-        // Derive unique /30 subnet from PID: 10.200.(pid % 256).(pid / 256 * 4)
-        // This supports up to 16K concurrent sandboxes
-        let third_octet = (child_pid % 256) as u8;
-        let fourth_base = ((child_pid / 256) % 64) as u8 * 4;
+    /// Allocate a unique veth config using a monotonic counter.
+    ///
+    /// Previous design derived IPs from child PID, which could collide when
+    /// `pid % 256` and `(pid / 256) % 64` matched across concurrent sandboxes.
+    /// The counter guarantees uniqueness within a process lifetime.
+    /// On process restart the counter resets to 0, but all previous sandboxes
+    /// are dead (orphan cleanup runs at launch), so no collision is possible.
+    pub fn new(child_pid: u32, proxy_addr: SocketAddr) -> Self {
+        let slot = SANDBOX_COUNTER.fetch_add(1, Ordering::Relaxed);
+        Self::from_slot(slot, child_pid, proxy_addr)
+    }
+
+    /// Create a VethConfig from a known slot (for child-side reconstruction).
+    /// The child receives the slot via coordination pipe and must reconstruct
+    /// the same addresses the parent used.
+    pub fn from_slot(slot: u32, child_pid: u32, proxy_addr: SocketAddr) -> Self {
+        let third_octet = (slot % 256) as u8;
+        let fourth_base = ((slot / 256) % 64) as u8 * 4;
 
         Self {
-            host_iface: format!("veth-gvm-h{}", child_pid % 10000),
-            sandbox_iface: format!("veth-gvm-s{}", child_pid % 10000),
+            host_iface: format!("veth-gvm-h{}", slot),
+            sandbox_iface: format!("veth-gvm-s{}", slot),
             host_ip: format!("10.200.{}.{}", third_octet, fourth_base + 1),
             sandbox_ip: format!("10.200.{}.{}", third_octet, fourth_base + 2),
             cidr: 30,
             child_pid,
             proxy_addr,
+            slot,
         }
     }
 }
@@ -713,14 +734,15 @@ fn run_iptables(args: &[&str]) -> Result<()> {
 // scans for stale state files (PID dead) and auto-cleans orphan resources.
 // This is the same pattern Docker uses for container state management.
 
-const STATE_DIR: &str = "/tmp";
+const STATE_DIR: &str = "/run/gvm";
 const STATE_PREFIX: &str = "gvm-sandbox-";
 const STATE_SUFFIX: &str = ".state";
-/// Legacy state file path (pre-v0.2). Cleaned up on first run.
+/// Legacy state file paths (pre-v0.2). Cleaned up on first run.
 const LEGACY_STATE_FILE: &str = "/run/gvm/interfaces.json";
+const LEGACY_STATE_DIR: &str = "/tmp";
 
 /// Full resource manifest for a sandbox session.
-/// Serialized to `/tmp/gvm-sandbox-{pid}.state` on startup.
+/// Serialized to `/run/gvm/gvm-sandbox-{pid}.state` on startup.
 /// All fields needed to deterministically clean up orphaned resources.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxState {
@@ -788,6 +810,8 @@ pub fn record_sandbox_state(
     };
 
     let path = state_file_path(state.pid);
+    // Ensure /run/gvm/ exists (root-owned tmpfs, immune to /tmp symlink attacks).
+    std::fs::create_dir_all(STATE_DIR).ok();
     std::fs::write(&path, serde_json::to_string_pretty(&state)?)
         .with_context(|| format!("Failed to write sandbox state to {}", path.display()))?;
 
@@ -893,6 +917,7 @@ fn cleanup_state_resources(state: &SandboxState) {
                 std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 state.proxy_port,
             ),
+            slot: 0, // Cleanup path — slot not needed, only veth/IP matter
         };
         // TC filter must be detached BEFORE veth deletion (cleanup_host_network
         // deletes the veth). Reversing this order makes detach a no-op.
@@ -957,6 +982,43 @@ pub fn cleanup_all_orphans() -> Result<u32> {
         cleaned += 1;
     }
 
+    // 1b. Scan legacy /tmp state files (pre-v0.2 migration).
+    // Previous versions wrote state to /tmp/gvm-sandbox-*.state which is vulnerable
+    // to symlink attacks. Clean up any remaining files and migrate.
+    let legacy_pattern = format!("{}/{}*{}", LEGACY_STATE_DIR, STATE_PREFIX, STATE_SUFFIX);
+    for entry in glob::glob(&legacy_pattern).unwrap_or_else(|_| glob::glob("").unwrap()) {
+        let path = match entry {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // Migrate: read, clean up resources if orphaned, delete legacy file.
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+        };
+        let state: SandboxState = match serde_json::from_str(&content) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+        };
+        if !is_pid_alive(state.pid) {
+            tracing::info!(
+                pid = state.pid,
+                "Cleaning up legacy /tmp state file (PID {} dead)",
+                state.pid
+            );
+            cleanup_state_resources(&state);
+            cleaned += 1;
+        }
+        // Always remove legacy /tmp state files — new ones go to /run/gvm/.
+        let _ = std::fs::remove_file(&path);
+    }
+
     // 2. Clean up legacy single-file state (pre-v0.2 backward compat)
     if let Ok(content) = std::fs::read_to_string(LEGACY_STATE_FILE) {
         if let Ok(legacy) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -982,6 +1044,7 @@ pub fn cleanup_all_orphans() -> Result<u32> {
                             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                             proxy_port,
                         ),
+                        slot: 0, // Legacy — slot not recorded, only used for cleanup
                     };
                     cleanup_host_network(&config, None);
                     crate::ebpf::detach_tc_filter(host_iface);

@@ -605,7 +605,7 @@ async fn main() -> anyhow::Result<()> {
             {
                 if dry_run {
                     eprintln!("Scanning for orphaned sandbox resources (dry run)...");
-                    let pattern = "/tmp/gvm-sandbox-*.state";
+                    let pattern = "/run/gvm/gvm-sandbox-*.state";
                     let mut found = 0u32;
                     for path in glob::glob(pattern)
                         .unwrap_or_else(|_| glob::glob("").unwrap())

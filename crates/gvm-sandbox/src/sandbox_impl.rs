@@ -63,8 +63,12 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     // collisions: sandbox A mounts → sandbox B umounts A's mount → A's child
     // sees empty root.
     let my_pid = std::process::id();
-    let staging_ws = std::path::PathBuf::from(format!("/tmp/gvm-sandbox-staging-ws-{}", my_pid));
-    let sandbox_root = std::path::PathBuf::from(format!("/tmp/gvm-sandbox-root-{}", my_pid));
+    // Use /run/gvm/ (root-owned tmpfs) instead of /tmp to prevent symlink attacks.
+    // /run/gvm/ is immune to TOCTOU because unprivileged users cannot create
+    // entries in it, and tmpfs ensures automatic cleanup on reboot.
+    std::fs::create_dir_all("/run/gvm").ok();
+    let staging_ws = std::path::PathBuf::from(format!("/run/gvm/sandbox-staging-ws-{}", my_pid));
+    let sandbox_root = std::path::PathBuf::from(format!("/run/gvm/sandbox-root-{}", my_pid));
     // Clean up any stale mounts from a previous crashed run.
     // umount2 with MNT_DETACH handles the recursive case (nested mounts).
     nix::mount::umount2(&sandbox_root, nix::mount::MntFlags::MNT_DETACH).ok();
@@ -159,8 +163,8 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         write_uid_map(child_pid)?;
     }
 
-    // 2. Set up veth network pair
-    let veth_config = VethConfig::from_pid(child_pid.as_raw() as u32, config.proxy_addr);
+    // 2. Set up veth network pair (monotonic counter — no PID-based IP collisions)
+    let veth_config = VethConfig::new(child_pid.as_raw() as u32, config.proxy_addr);
     let network_result = setup_host_network(&veth_config);
 
     // dns_target is recorded in state file for deterministic cleanup.
@@ -178,7 +182,7 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         let mut mount_paths = vec![staging_ws.clone(), sandbox_root.clone()];
         if let Some(ref m) = home_overlay_merged {
             mount_paths.push(m.clone());
-            mount_paths.push(PathBuf::from(format!("/tmp/gvm-home-overlay-{}", my_pid)));
+            mount_paths.push(PathBuf::from(format!("/run/gvm/home-overlay-{}", my_pid)));
         }
         if let Err(e) =
             record_sandbox_state(&veth_config, &mount_paths, None, dns_target.as_deref())
@@ -253,8 +257,9 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         None
     };
 
-    // 3. Signal child that setup is complete
-    signal_child_ready(parent_fd, child_pid.as_raw() as u32)?;
+    // 3. Signal child that setup is complete.
+    // Send the veth slot (not child PID) so the child reconstructs matching addresses.
+    signal_child_ready(parent_fd, veth_config.slot)?;
 
     let setup_ms = start.elapsed().as_millis() as u64;
     tracing::info!(
@@ -560,8 +565,8 @@ fn child_entry(
             return 1;
         }
     };
-    // Use parent-provided seed so interface names/IPs match host-side setup.
-    let veth_config = VethConfig::from_pid(network_seed, config.proxy_addr);
+    // Use parent-provided slot so interface names/IPs match host-side setup.
+    let veth_config = VethConfig::from_slot(network_seed, std::process::id(), config.proxy_addr);
 
     // Set up network inside the sandbox
     if let Err(e) = setup_sandbox_network(&veth_config) {

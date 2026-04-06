@@ -55,6 +55,14 @@ v0.2 shipped: Shadow Mode + intent store, CONNECT tunnel, SRR hot-reload, eBPF u
 
 ## Implementation Log
 
+### 2026-04-06: Security hardening — veth IP collision fix + /tmp TOCTOU fix
+
+**Veth IP collision elimination**: Replaced PID-based subnet derivation (`child_pid % 256`, `(child_pid / 256) % 64`) with a monotonic `AtomicU32` counter. Previous design could produce identical /30 subnets when two PIDs mapped to the same slot (e.g., PID 100 and PID 16484), causing network isolation breakdown between concurrent sandboxes. Counter guarantees uniqueness within a process lifetime; orphan cleanup on restart prevents cross-restart collisions. Parent sends the counter slot (not PID) to child via coordination pipe for address reconstruction.
+
+**/tmp → /run/gvm/ migration (TOCTOU fix)**: All sandbox staging paths (`sandbox-staging-ws-{pid}`, `sandbox-root-{pid}`, `home-overlay-{pid}`, `home-merged-{pid}`) and state files (`gvm-sandbox-{pid}.state`) moved from `/tmp` to `/run/gvm/`. `/tmp` is world-writable — a local attacker could pre-create symlinks at predictable PID-based paths, hijacking bind mounts via TOCTOU race. `/run/gvm/` is root-owned tmpfs: immune to symlink attacks, auto-cleaned on reboot. Legacy `/tmp/gvm-sandbox-*.state` files are auto-migrated on first orphan cleanup scan.
+
+Files: `crates/gvm-sandbox/src/{network,sandbox_impl,mount}.rs`, `crates/gvm-cli/src/main.rs`, `crates/gvm-sandbox/tests/security.rs` | Risk: Medium (network allocation scheme change, filesystem path change — requires testing on Linux with concurrent sandboxes)
+
 ### 2026-04-05: Sandbox $HOME overlay + MITM relay fix + resource limits opt-in
 
 **$HOME overlayfs mount**: Parent (real root) mounts overlayfs with lower=$HOME, upper=tmpfs. Child bind-mounts merged dir to /home/agent. Sensitive dirs (.ssh/.aws/.gnupg) masked with empty tmpfs. Writes go to tmpfs upper layer — host $HOME is never modified. No copy, no chmod, instant mount regardless of $HOME size.

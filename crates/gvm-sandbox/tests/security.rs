@@ -45,7 +45,7 @@ fn veth_config_address_format_correct() {
     );
     assert_eq!(cfg.cidr, 30, "Must use /30 point-to-point subnet");
 
-    // Interface names must include PID
+    // Interface names must include slot identifier
     assert!(cfg.host_iface.starts_with("veth-gvm-h"));
     assert!(cfg.sandbox_iface.starts_with("veth-gvm-s"));
 }
@@ -251,14 +251,15 @@ fn launch_on_non_linux_returns_error() {
 
 // ─── Helper to access VethConfig (re-exported for testing) ───
 
-fn veth_config_from_pid(pid: u32, _proxy_addr: SocketAddr) -> VethConfigTestHelper {
-    // Replicate VethConfig::from_pid logic for cross-platform testing
-    let third_octet = (pid % 256) as u8;
-    let fourth_base = ((pid / 256) % 64) as u8 * 4;
+fn veth_config_from_pid(slot: u32, _proxy_addr: SocketAddr) -> VethConfigTestHelper {
+    // Replicate VethConfig::from_slot logic for cross-platform testing.
+    // Production code uses a monotonic AtomicU32 counter (slot), not PID.
+    let third_octet = (slot % 256) as u8;
+    let fourth_base = ((slot / 256) % 64) as u8 * 4;
 
     VethConfigTestHelper {
-        host_iface: format!("veth-gvm-h{}", pid % 10000),
-        sandbox_iface: format!("veth-gvm-s{}", pid % 10000),
+        host_iface: format!("veth-gvm-h{}", slot),
+        sandbox_iface: format!("veth-gvm-s{}", slot),
         host_ip: format!("10.200.{}.{}", third_octet, fourth_base + 1),
         sandbox_ip: format!("10.200.{}.{}", third_octet, fourth_base + 2),
         cidr: 30,
