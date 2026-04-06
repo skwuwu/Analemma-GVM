@@ -773,6 +773,10 @@ pub struct SandboxState {
     /// /run/systemd/resolve/resolv.conf has changed since setup.
     #[serde(default)]
     pub dns_target: Option<String>,
+    /// Child PID (sandbox namespace init). Used by orphan detection:
+    /// if parent is alive but child is dead, resources are orphaned.
+    #[serde(default)]
+    pub child_pid: Option<u32>,
 }
 
 /// Get the state file path for a given PID.
@@ -792,7 +796,7 @@ pub fn record_sandbox_state(
     dns_target: Option<&str>,
 ) -> Result<()> {
     let state = SandboxState {
-        version: 1,
+        version: 2,
         pid: std::process::id(),
         created_at: time::OffsetDateTime::now_utc().to_string(),
         veth_host: config.host_iface.clone(),
@@ -807,6 +811,7 @@ pub fn record_sandbox_state(
             .collect(),
         cgroup_path: cgroup_path.map(|s| s.to_string()),
         dns_target: dns_target.map(|s| s.to_string()),
+        child_pid: Some(config.child_pid),
     };
 
     let path = state_file_path(state.pid);
@@ -964,9 +969,23 @@ pub fn cleanup_all_orphans() -> Result<u32> {
             }
         };
 
-        // Skip if the owning process is still alive
+        // Skip if the owning process is still alive AND has an active child.
+        // If parent is alive but child_pid is dead, resources are orphaned
+        // (parent hasn't cleaned up yet — may be stuck in post_exit_audit).
         if is_pid_alive(state.pid) {
-            continue;
+            // Also check child_pid if recorded (v2+ state files)
+            let child_alive = state
+                .child_pid
+                .map(|cp| cp > 0 && is_pid_alive(cp))
+                .unwrap_or(true); // No child_pid → assume alive (v1 compat)
+            if child_alive {
+                continue;
+            }
+            tracing::info!(
+                parent_pid = state.pid,
+                child_pid = ?state.child_pid,
+                "Parent alive but child dead — cleaning orphan resources"
+            );
         }
 
         tracing::info!(
