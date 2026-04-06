@@ -1,10 +1,10 @@
-# Competitive Positioning
+# Security Layers Comparison
 
-> Where GVM fits in the AI safety landscape.
+> How GVM relates to existing AI safety layers.
 
 ---
 
-## The Question You'll Be Asked
+## Common Questions
 
 **"Why not just use the LLM provider's built-in safety features?"**
 
@@ -29,7 +29,7 @@ But a prompt-injected agent doesn't need the model to say "transfer money." It n
 
 ---
 
-## Competitive Landscape
+## Existing Security Layers
 
 ### Prompt-Level Guards (Lakera, Prompt Armor, Rebuff)
 
@@ -60,26 +60,26 @@ OPA is a policy engine for microservices. GVM is a governance layer for AI agent
 
 ---
 
-## GVM's Unique Position
+## GVM's Role: Action Governance
 
 GVM occupies the **action governance** layer — between the agent runtime and external APIs:
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐     ┌──────────────┐
-│ Prompt Guard │────>│  LLM + Agent │────>│  GVM Proxy  │────>│ External API │
-│ (Lakera etc) │     │  (OpenClaw)  │     │ (audit+enforce)│  │ (Stripe etc) │
-└─────────────┘     └──────────────┘     └─────────────┘     └──────────────┘
-  Input/output         Generates           Intercepts           Receives
-  content filter       API calls           every HTTP call      governed request
+┌───────────────┐    ┌────────────────┐    ┌──────────────────┐    ┌────────────────┐
+│ Prompt Guard  │───>│  LLM + Agent   │───>│    GVM Proxy     │───>│  External API  │
+│ (Lakera etc)  │    │  (OpenClaw)    │    │ (audit+enforce)  │    │  (Stripe etc)  │
+└───────────────┘    └────────────────┘    └──────────────────┘    └────────────────┘
+  Input/output          Generates            Intercepts              Receives
+  content filter        API calls            every HTTP call         governed request
 ```
 
-**Key differentiators:**
-- **Cross-layer lie detection**: ABAC (what the agent claims) vs SRR (what the HTTP actually is). `max_strict()` catches mismatches automatically
+**What makes GVM different:**
 - **Graduated enforcement**: Allow → Delay → RequireApproval → Deny. Not just binary allow/deny
 - **Credential isolation**: Agent never holds API keys. Proxy injects post-enforcement
 - **Durable audit**: WAL with Merkle chain. Every decision recorded before forwarding
 - **Runtime isolation**: `gvm run --sandbox` provides namespace+seccomp+MITM. The agent physically cannot bypass the proxy
 - **Provider-agnostic**: Works with any LLM, any framework, any language. It's an HTTP proxy
+- **Cross-layer verification** *(requires SDK — experimental)*: ABAC (what the agent declares) vs SRR (what the HTTP actually is). `max_strict()` catches mismatches. Without SDK, SRR (Layer 2) provides full URL-based governance independently
 
 ---
 
@@ -94,6 +94,7 @@ GVM occupies the **action governance** layer — between the agent runtime and e
 | Require human approval for high-risk actions | **GVM** |
 | Prevent DNS-based data exfiltration | Route 53 DNS Firewall, Cloudflare Gateway |
 | Service-to-service authorization | OPA + Envoy |
+| Enterprise agent runtime with full infra team | NVIDIA NeMo Guardrails |
 
 **Use all layers together.** Prompt guards + provider safety + GVM + DNS security = defense in depth. No single layer is sufficient for autonomous AI agents.
 
