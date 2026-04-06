@@ -588,6 +588,59 @@ CORRECT:   .current_dir(&workspace_root) when spawning proxy
 INCORRECT: Relying on whatever pwd the user ran gvm from
 ```
 
+### 7.5 Parent-Mount Pattern (Sandbox Resource Survival)
+
+Resources that must outlive the sandbox child process **must be created in the parent** before `clone()`. The child inherits via `clone(CLONE_NEWNS)` and bind-mounts into its namespace. After child exit, the parent retains access for scanning, cleanup, or review.
+
+```
+CORRECT:   Parent mounts overlayfs → child inherits → parent scans upper after exit
+INCORRECT: Child mounts overlayfs → child exits → mount namespace destroyed → parent finds nothing
+```
+
+This applies to any resource that requires post-exit inspection:
+- **$HOME overlay**: parent mounts at `/run/gvm/home-merged-{pid}`, child bind-mounts to `/home/agent`
+- **Workspace overlay**: parent mounts at `/run/gvm/ws-merged-{pid}`, child bind-mounts to `/workspace`
+- **Any future staging/export**: if the parent needs the data after the child dies, the parent must own the mount
+
+**Anti-pattern**: mounting tmpfs or overlayfs inside the child's mount namespace for data that the parent needs to read. tmpfs in a child namespace is destroyed when the namespace is torn down — the parent will see an empty directory or "No such file."
+
+### 7.6 Keep-Alive After Enforcement (MITM Proxy)
+
+When the MITM proxy denies or delays a request, the TLS keep-alive connection must remain open unless the protocol requires closure. Breaking the connection forces the client to create a new CONNECT tunnel, which may trigger intermittent TLS handshake failures (Node.js undici edge case) and prevents natural agent fallback flows.
+
+```
+CORRECT:   Deny → 403 response (no Connection: close) → continue keep-alive loop
+           Agent retries with fallback URL on same TLS session
+INCORRECT: Deny → 403 + Connection: close + break → new CONNECT → handshake eof
+           Agent's fallback attempt fails due to reconnect issues
+```
+
+This principle applies to all proxy-generated responses on the MITM path:
+- **Deny (403)**: continue — agent may retry with different URL
+- **Throttle (429)**: continue — agent retries after rate limit window
+- **Classification error (500)**: break — internal error, connection state uncertain
+- **RequireApproval (403)**: break — approval flow requires out-of-band communication
+- **Circuit breaker (503)**: break — WAL is failing, reject all traffic
+
+The distinction: break when the proxy's internal state is uncertain or the error is systemic. Continue when the denial is a normal policy decision and the connection is healthy.
+
+### 7.7 Transport-Layer Framing Only (MITM Relay)
+
+The MITM relay must dispatch on HTTP transport framing (Content-Length, Transfer-Encoding: chunked, EOF) — never on Content-Type or application-layer semantics. Content-Type is a content-layer concern; transport framing is how the server signals "this response is complete."
+
+```
+CORRECT:   chunked → relay_chunked() regardless of Content-Type
+           Content-Length → relay_exact_bytes() regardless of Content-Type
+           Neither → relay_until_eof()
+INCORRECT: text/event-stream → relay_until_eof() (SSE has no terminator)
+           But SSE + chunked → server uses chunk terminator (0\r\n\r\n) to end
+           relay_until_eof() waits for TCP EOF that never comes (HTTP/1.1 keep-alive)
+```
+
+Anthropic `/v1/messages` with `stream:true` returns `Transfer-Encoding: chunked` + `Content-Type: text/event-stream`. The chunked parser detects the final chunk (`0\r\n\r\n`) correctly — the SSE content inside is irrelevant to transport framing. Dispatching on Content-Type caused the relay to hang indefinitely waiting for EOF on a keep-alive connection.
+
+---
+
 ## 8. Documentation Standards
 
 ### 8.1 Code Documentation
