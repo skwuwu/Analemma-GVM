@@ -1,6 +1,6 @@
 # Part 9: Test & Benchmark Report
 
-**Total: 329 Rust Tests (322 passing + 7 wasm-gated) + 75 EC2 E2E Scenarios + 30-min Chaos Stress Test + CLI Mode Verification — All Pass**
+**Total: 329 Rust Tests (322 passing + 7 wasm-gated) + 75 EC2 E2E Scenarios + 60-min Chaos Stress Test + CLI Mode Verification — All Pass**
 **Benchmarks: 19 benchmark functions (Criterion v0.5)**
 **Last Verified: 2026-04-05 (CLI modes + Deny/Delay enforcement + chaos stress + pentest 15/15)**
 
@@ -966,4 +966,4 @@ The +683ms measured in LLM tests includes OpenClaw SDK initialization overhead p
 
 ---
 
-[← Part 8: Memory & Runtime Security](08-memory-security.md) | [Changelog →](CHANGELOG.md) | [Overview →](00-overview.md)
+[← Part 8: Memory & Runtime Security](08-memory-security.md) | [Changelog →](internal/CHANGELOG.md) | [Overview →](00-overview.md)

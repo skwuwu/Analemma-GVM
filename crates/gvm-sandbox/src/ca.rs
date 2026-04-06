@@ -57,10 +57,8 @@ impl EphemeralCA {
 
     /// Load CA cert + key from disk. No regeneration — exact same bytes.
     fn load_from_disk(cert_path: &Path, key_path: &Path) -> Result<Self> {
-        let cert_pem = std::fs::read(cert_path)
-            .context("Failed to read CA cert")?;
-        let key_pem = std::fs::read(key_path)
-            .context("Failed to read CA key")?;
+        let cert_pem = std::fs::read(cert_path).context("Failed to read CA cert")?;
+        let key_pem = std::fs::read(key_path).context("Failed to read CA key")?;
 
         // Validate that the key is parseable
         KeyPair::from_pem(&String::from_utf8_lossy(&key_pem))
@@ -71,7 +69,10 @@ impl EphemeralCA {
             "MITM CA loaded from disk (persistent across restarts)"
         );
 
-        Ok(Self { ca_cert_pem: cert_pem, ca_key_pem: key_pem })
+        Ok(Self {
+            ca_cert_pem: cert_pem,
+            ca_key_pem: key_pem,
+        })
     }
 
     /// Save CA cert + key to disk with restricted permissions.
@@ -80,10 +81,8 @@ impl EphemeralCA {
             std::fs::create_dir_all(parent).ok();
         }
 
-        std::fs::write(cert_path, &self.ca_cert_pem)
-            .context("Failed to write CA cert")?;
-        std::fs::write(key_path, &self.ca_key_pem)
-            .context("Failed to write CA key")?;
+        std::fs::write(cert_path, &self.ca_cert_pem).context("Failed to write CA cert")?;
+        std::fs::write(key_path, &self.ca_key_pem).context("Failed to write CA key")?;
 
         // Restrict permissions (key file especially)
         #[cfg(unix)]
@@ -130,7 +129,10 @@ impl EphemeralCA {
 
         tracing::info!("MITM CA generated (ECDSA P-256, 365-day validity)");
 
-        Ok(Self { ca_cert_pem, ca_key_pem })
+        Ok(Self {
+            ca_cert_pem,
+            ca_key_pem,
+        })
     }
 
     /// Get the CA certificate in PEM format (for trust store injection).

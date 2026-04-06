@@ -81,6 +81,7 @@ pub fn resolve_dynload_libs(interpreter_path: &Path) -> Vec<PathBuf> {
 /// 3. Bind-mount interpreter + shared libraries
 /// 4. Mount /proc, /dev devices
 /// 5. pivot_root to the new root
+#[allow(clippy::too_many_arguments)]
 pub fn setup_mount_namespace(
     workspace_dir: &Path,
     interpreter_path: &Path,
@@ -326,10 +327,7 @@ fn bind_mount_interpreter(
 ///
 /// Returns the merged path on success, None on failure.
 /// Caller must unmount merged + upper_base on cleanup.
-pub fn mount_home_overlay(
-    host_home: &Path,
-    pid: u32,
-) -> Option<PathBuf> {
+pub fn mount_home_overlay(host_home: &Path, pid: u32) -> Option<PathBuf> {
     let merged = PathBuf::from(format!("/run/gvm/home-merged-{}", pid));
     let upper_base = PathBuf::from(format!("/run/gvm/home-overlay-{}", pid));
     let upper_dir = upper_base.join("upper");
@@ -457,23 +455,6 @@ fn mount_home_directory(new_root: &Path, home_overlay_merged: Option<&Path>) {
         target = %merged.display(),
         "Home directory mounted (sensitive dirs masked)"
     );
-}
-
-/// Recursively copy directory contents (best-effort, for config bootstrapping).
-pub fn copy_dir_contents(src: &Path, dst: &Path) {
-    let Ok(entries) = std::fs::read_dir(src) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
-            std::fs::create_dir_all(&dst_path).ok();
-            copy_dir_contents(&src_path, &dst_path);
-        } else {
-            std::fs::copy(&src_path, &dst_path).ok();
-        }
-    }
 }
 
 /// Minimal profile: interpreter binary + ldd-resolved libraries only.

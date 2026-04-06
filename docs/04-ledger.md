@@ -103,6 +103,8 @@ async fn append(&self, event: &GVMEvent) -> Result<()> {
 - **Size-based rotation** — `max_wal_bytes` (100MB default) triggers rotation to `wal.log.<N>`, `max_wal_segments` (10 default) prunes oldest segments. Merkle chain links across segments via `prev_root`
 - **Emergency WAL fallback** — if primary WAL fails, events go to `wal_emergency.log` (degraded mode, no Merkle)
 
+> **Long-term retention warning**: Default settings retain at most 100MB x 10 = 1GB of audit trail on local disk. When the 11th segment is created, the oldest segment is **permanently deleted**. For agents with high request volume, this threshold can be reached in days. If audit trail retention is required for compliance or forensics, configure NATS JetStream (`[nats]` in `proxy.toml`) to replicate events before segment pruning. Without NATS, rotated segments are unrecoverable.
+
 ### Global Merkle Chain Design
 
 **All agents share a single WAL and a single Merkle chain.** This is a deliberate architectural choice:

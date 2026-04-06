@@ -284,7 +284,7 @@ gvm cleanup              # Remove orphaned sandbox resources
 gvm cleanup --dry-run    # Show what would be cleaned (no action)
 ```
 
-Scans for per-PID state files (`/tmp/gvm-sandbox-{pid}.state`) from previously crashed sandbox sessions. If the owning PID is dead, cleans up all listed resources: veth interfaces, iptables DNAT/FORWARD rules, mount paths, and cgroup directories. Also removes any `veth-gvm-*` interfaces without corresponding state files (defense-in-depth).
+Scans for per-PID state files (`/run/gvm/gvm-sandbox-{pid}.state`) from previously crashed sandbox sessions. If the owning PID is dead, cleans up all listed resources: veth interfaces, iptables DNAT/FORWARD rules, mount paths, and cgroup directories. Also removes any `veth-gvm-*` interfaces without corresponding state files (defense-in-depth). Legacy state files in `/tmp` are auto-migrated on first scan.
 
 Auto-cleanup also runs at the start of every `gvm run --sandbox` — you only need `gvm cleanup` for manual recovery after abnormal termination without a subsequent sandbox launch.
 
@@ -456,7 +456,7 @@ WAL rotation is automatic when `max_wal_bytes` is configured in `proxy.toml`.
 
 Sandbox resources (veth, iptables, cgroups, mounts) are cleaned up automatically:
 - **Normal exit**: RAII guards in `sandbox_impl.rs`
-- **Crash/SIGKILL**: State file (`/tmp/gvm-sandbox-{pid}.state`) enables cleanup on next `gvm run --sandbox`
+- **Crash/SIGKILL**: State file (`/run/gvm/gvm-sandbox-{pid}.state`) enables cleanup on next `gvm run --sandbox`
 - **Manual**: `gvm cleanup` scans for orphaned resources
 - **ip_forward**: Restored to original value when last sandbox exits
 

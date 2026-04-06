@@ -728,9 +728,15 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
 
                 // Record Deny in WAL — blocked requests MUST appear in audit trail.
                 append_enforcement_event(
-                    &state.ledger, &classify_output, &host, &req,
-                    &format!("Deny {{ reason: {:?} }}", reason), Some(403), false,
-                ).await;
+                    &state.ledger,
+                    &classify_output,
+                    &host,
+                    &req,
+                    &format!("Deny {{ reason: {:?} }}", reason),
+                    Some(403),
+                    false,
+                )
+                .await;
 
                 break; // Close connection on deny
             }
@@ -749,8 +755,15 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                 tls_stream.write_all(response.as_bytes()).await?;
                 tls_stream.flush().await?;
                 append_enforcement_event(
-                    &state.ledger, &classify_output, &host, &req, "RequireApproval (→ Deny on MITM)", Some(403), false,
-                ).await;
+                    &state.ledger,
+                    &classify_output,
+                    &host,
+                    &req,
+                    "RequireApproval (→ Deny on MITM)",
+                    Some(403),
+                    false,
+                )
+                .await;
                 break;
             }
             gvm_types::EnforcementDecision::Throttle { max_per_minute } => {
@@ -768,8 +781,15 @@ pub async fn handle_mitm_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                     tls_stream.write_all(response.as_bytes()).await?;
                     tls_stream.flush().await?;
                     append_enforcement_event(
-                        &state.ledger, &classify_output, &host, &req, "Throttle (rate limit exceeded)", Some(429), false,
-                    ).await;
+                        &state.ledger,
+                        &classify_output,
+                        &host,
+                        &req,
+                        "Throttle (rate limit exceeded)",
+                        Some(429),
+                        false,
+                    )
+                    .await;
                     continue; // Don't break — allow next request in keep-alive
                 }
                 // Rate check passed — allow through
@@ -1096,7 +1116,6 @@ async fn relay_tls<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                 if !header_buf.is_empty() {
                     tls_stream.write_all(&header_buf).await?;
                     tls_stream.flush().await?;
-                    total_relayed += header_buf.len();
                 }
                 return Ok(());
             }
@@ -1129,9 +1148,16 @@ async fn relay_tls<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
             // Priority: Content-Length > Transfer-Encoding: chunked > EOF.
             if let Some(cl) = content_length {
                 let remaining = cl.saturating_sub(body_bytes_read);
-                relay_exact_bytes(&mut upstream_tls, tls_stream, remaining, &mut total_relayed).await?;
+                relay_exact_bytes(&mut upstream_tls, tls_stream, remaining, &mut total_relayed)
+                    .await?;
             } else if is_chunked {
-                relay_chunked(&mut upstream_tls, tls_stream, &header_buf[header_end..], &mut total_relayed).await?;
+                relay_chunked(
+                    &mut upstream_tls,
+                    tls_stream,
+                    &header_buf[header_end..],
+                    &mut total_relayed,
+                )
+                .await?;
             } else {
                 relay_until_eof(&mut upstream_tls, tls_stream, &mut total_relayed).await?;
             }
@@ -1157,16 +1183,17 @@ async fn relay_tls<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
 
 /// Find the end of HTTP headers (position after \r\n\r\n).
 fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|p| p + 4)
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
 
 /// Parse Content-Length from raw HTTP headers.
 fn parse_content_length(headers: &[u8]) -> Option<usize> {
     let s = std::str::from_utf8(headers).ok()?;
     for line in s.lines() {
-        if let Some(val) = line.strip_prefix("Content-Length:").or_else(|| line.strip_prefix("content-length:")) {
+        if let Some(val) = line
+            .strip_prefix("Content-Length:")
+            .or_else(|| line.strip_prefix("content-length:"))
+        {
             return val.trim().parse().ok();
         }
         // Case-insensitive match for other capitalizations
@@ -1179,7 +1206,9 @@ fn parse_content_length(headers: &[u8]) -> Option<usize> {
 
 /// Check if Transfer-Encoding is chunked.
 fn is_transfer_encoding_chunked(headers: &[u8]) -> bool {
-    let Ok(s) = std::str::from_utf8(headers) else { return false };
+    let Ok(s) = std::str::from_utf8(headers) else {
+        return false;
+    };
     for line in s.lines() {
         if line.len() > 18 && line[..18].eq_ignore_ascii_case("transfer-encoding:") {
             return line[18..].trim().eq_ignore_ascii_case("chunked");
@@ -1243,7 +1272,8 @@ where
 
     loop {
         // 1. Read chunk size line (hex + optional extensions + CRLF)
-        let size_line = relay_read_line(upstream, &mut pending, &mut raw_buf, client, total).await?;
+        let size_line =
+            relay_read_line(upstream, &mut pending, &mut raw_buf, client, total).await?;
         let size_str = std::str::from_utf8(&size_line)
             .unwrap_or("0")
             .trim()
@@ -1338,11 +1368,7 @@ where
 }
 
 /// Relay until EOF (for responses without Content-Length or chunked).
-async fn relay_until_eof<R, W>(
-    upstream: &mut R,
-    client: &mut W,
-    total: &mut usize,
-) -> Result<()>
+async fn relay_until_eof<R, W>(upstream: &mut R, client: &mut W, total: &mut usize) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,

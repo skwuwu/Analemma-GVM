@@ -230,7 +230,15 @@ pub async fn proxy_handler(
             Ok(guard) => guard,
             Err(_) => {
                 tracing::error!("SRR lock poisoned — denying request (fail-close)");
-                append_proxy_wal_event(&state, request.method().as_str(), &target.host, &target.path, "unknown", "Deny (SRR lock poisoned)", 500);
+                append_proxy_wal_event(
+                    &state,
+                    request.method().as_str(),
+                    &target.host,
+                    &target.path,
+                    "unknown",
+                    "Deny (SRR lock poisoned)",
+                    500,
+                );
                 return error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Internal governance error — request denied (fail-close)",
@@ -276,7 +284,15 @@ pub async fn proxy_handler(
             Ok(guard) => guard,
             Err(_) => {
                 tracing::error!("SRR lock poisoned — denying request (fail-close)");
-                append_proxy_wal_event(&state, request.method().as_str(), &target.host, &target.path, "unknown", "Deny (SRR lock poisoned)", 500);
+                append_proxy_wal_event(
+                    &state,
+                    request.method().as_str(),
+                    &target.host,
+                    &target.path,
+                    "unknown",
+                    "Deny (SRR lock poisoned)",
+                    500,
+                );
                 return error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Internal governance error — request denied (fail-close)",
@@ -388,7 +404,15 @@ pub async fn proxy_handler(
                         agent = %agent_id,
                         "Shadow STRICT: no intent — DENY"
                     );
-                    append_proxy_wal_event(&state, &request_method, &target.host, &target.path, agent_id, "Deny (Shadow STRICT: no intent)", 403);
+                    append_proxy_wal_event(
+                        &state,
+                        &request_method,
+                        &target.host,
+                        &target.path,
+                        agent_id,
+                        "Deny (Shadow STRICT: no intent)",
+                        403,
+                    );
                     return error_response(
                         StatusCode::FORBIDDEN,
                         "Shadow verification failed: no intent declared for this request. \
@@ -431,7 +455,15 @@ pub async fn proxy_handler(
                 .as_ref()
                 .map(|h| h.operation.as_str())
                 .unwrap_or("unknown");
-            append_proxy_wal_event(&state, &request_method, &target.host, &target.path, agent_id, &format!("Throttle (rate limit exceeded: {}/min)", max_per_minute), 429);
+            append_proxy_wal_event(
+                &state,
+                &request_method,
+                &target.host,
+                &target.path,
+                agent_id,
+                &format!("Throttle (rate limit exceeded: {}/min)", max_per_minute),
+                429,
+            );
             return governance_block_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 GovernanceBlockResponse {
@@ -1820,7 +1852,15 @@ async fn handle_connect_inner(
                 tracing::error!(
                     "SRR lock poisoned in CONNECT handler — denying tunnel (fail-close)"
                 );
-                append_proxy_wal_event(&state, "CONNECT", host, "/", "unknown", "Deny (SRR lock poisoned in CONNECT)", 500);
+                append_proxy_wal_event(
+                    &state,
+                    "CONNECT",
+                    host,
+                    "/",
+                    "unknown",
+                    "Deny (SRR lock poisoned in CONNECT)",
+                    500,
+                );
                 return error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Internal governance error — request denied (fail-close)",
@@ -1848,7 +1888,15 @@ async fn handle_connect_inner(
         if !claim.verified {
             if state.shadow_config.mode == crate::intent_store::ShadowMode::Strict {
                 tracing::warn!(host = %host, "Shadow STRICT: CONNECT without intent — DENY");
-                append_proxy_wal_event(&state, "CONNECT", host, "/", "unknown", "Deny (Shadow STRICT: CONNECT without intent)", 403);
+                append_proxy_wal_event(
+                    &state,
+                    "CONNECT",
+                    host,
+                    "/",
+                    "unknown",
+                    "Deny (Shadow STRICT: CONNECT without intent)",
+                    403,
+                );
                 return error_response(
                     StatusCode::FORBIDDEN,
                     "Shadow verification failed for CONNECT tunnel",

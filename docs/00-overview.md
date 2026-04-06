@@ -124,7 +124,7 @@ GVM's governance operates at two semantic levels. A third level (content semanti
 | 12 | [Quick Start](12-quickstart.md) | 1-minute launch, isolation levels, secret injection, policy basics |
 | 13 | [Reference Guide](13-reference.md) | Configuration, environment variables, CLI, SDK API, platform support |
 | 14 | [Governance Coverage](14-governance-coverage.md) | Per-mode enforcement matrix |
-| — | [Changelog](CHANGELOG.md) | Roadmap, implementation log, architecture decisions |
+| — | [Changelog](internal/CHANGELOG.md) | Roadmap, implementation log, architecture decisions |
 
 ---
 

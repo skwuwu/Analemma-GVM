@@ -121,7 +121,7 @@ Defense-in-depth enforcement layers (v0.2.4):
 
 After sandbox network setup, the agent can only reach: (1) GVM proxy via TCP on the host veth IP, (2) DNS via UDP 53 on the same host veth IP, (3) loopback. All other egress is dropped at multiple layers. IPv6 is disabled to prevent bypassing IPv4 firewall rules.
 
-5. **Sandbox resource cleanup** (v0.3): Per-PID state files (`/tmp/gvm-sandbox-{pid}.state`) record all resources created by each sandbox (veth, iptables rules, mounts, cgroups). On normal exit, cleanup + delete. On crash, the next `gvm run --sandbox` detects stale state files (dead PIDs) and auto-cleans orphan resources before proceeding. `gvm cleanup` provides manual recovery. Defense-in-depth: heuristic scan removes `veth-gvm-*` interfaces without corresponding state files.
+5. **Sandbox resource cleanup** (v0.3): Per-PID state files (`/run/gvm/gvm-sandbox-{pid}.state`) record all resources created by each sandbox (veth, iptables rules, mounts, cgroups). On normal exit, cleanup + delete. On crash, the next `gvm run --sandbox` detects stale state files (dead PIDs) and auto-cleans orphan resources before proceeding. `gvm cleanup` provides manual recovery. Defense-in-depth: heuristic scan removes `veth-gvm-*` interfaces without corresponding state files. State files are stored in `/run/gvm/` (root-owned tmpfs) rather than `/tmp` to prevent symlink-based TOCTOU attacks.
 
 **Known limitation — DNS tunneling**: DNS queries are allowed through the host's upstream resolver for name resolution. An agent could encode data in DNS query hostnames (e.g., `base64-data.attacker.com`) to exfiltrate information at low bandwidth (~50 bytes/query).
 
@@ -205,7 +205,7 @@ Both paths pre-compile regex at config load time (fail-fast on invalid patterns)
 
 **Impact**: Agent state (checkpoints, conversation history) decrypted. Note: Vault does not store API credentials — those are in `APIKeyStore`.
 
-**Planned mitigation**: Apply PBKDF2 or Argon2id with configurable iteration count before using the key for AES-GCM. Not implemented in v1 because the Vault is a local-development feature and production deployments should use a proper secrets manager. See [Changelog](CHANGELOG.md) for full feature tracking.
+**Planned mitigation**: Apply PBKDF2 or Argon2id with configurable iteration count before using the key for AES-GCM. Not implemented in v1 because the Vault is a local-development feature and production deployments should use a proper secrets manager. See [Changelog](internal/CHANGELOG.md) for full feature tracking.
 
 ---
 
@@ -288,7 +288,7 @@ Both paths pre-compile regex at config load time (fail-fast on invalid patterns)
 - Inter-batch `prev_root` carries over across rotation — Merkle chain integrity maintained across segment boundaries
 - Configurable via `[wal]` section in `proxy.toml`
 
-**Remaining gap**: No compaction (old events within a segment cannot be removed). Segment pruning is the current mitigation.
+**Remaining gap**: No compaction (old events within a segment cannot be removed). Segment pruning is the current mitigation. **Retention warning**: Without NATS JetStream, pruned segments are permanently lost. Default settings (100MB x 10 segments = 1GB) can fill within days under high request volume. Long-running deployments requiring audit trail retention must configure NATS replication.
 
 ---
 

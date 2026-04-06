@@ -117,7 +117,7 @@ GVM provides MCP tools for AI assistants. [Setup guide →](docs/12-quickstart.m
 
 - Rust, ~17MB release binary, ~10MB RSS at idle
 - Policy evaluation < 1μs (SRR + ABAC, no heap allocation on hot path)
-- WAL with Merkle chain, size-based rotation (100MB default), watermark crash recovery
+- WAL with Merkle chain, size-based rotation (100MB x 10 segments = 1GB local max; configure NATS for long-term retention)
 - 329 tests, 60-min chaos stress test (proxy kill, network partition, disk pressure) — [PASS](docs/09-test-report.md#910-chaos-stress-test-60-minutes)
 - seccomp-BPF with ~130 whitelisted syscalls, ENOSYS default for unknown
 - Sandbox auto-cleanup via per-PID state files (Docker pattern)
@@ -130,12 +130,10 @@ GVM provides MCP tools for AI assistants. [Setup guide →](docs/12-quickstart.m
 |-----|----------------|
 | [Quick Start](docs/12-quickstart.md) | Build, run, isolate, MCP setup |
 | [Reference](docs/13-reference.md) | Config, CLI, API, CI/CD |
-| [Security Model](docs/11-security-model.md) | Threat model, known attack surface |
+| [Security Model](docs/11-security-model.md) | Threat model, known attack surface (not externally audited) |
 | [Governance Coverage](docs/14-governance-coverage.md) | Per-mode enforcement matrix |
-| [Changelog](docs/CHANGELOG.md) | Roadmap, implementation log |
+| [Changelog](docs/internal/CHANGELOG.md) | Roadmap, implementation log |
 
 ---
 
-v0.4 pre-release. [Security model →](docs/11-security-model.md) (not externally audited).
-
-Apache 2.0. [Issues →](https://github.com/skwuwu/Analemma-GVM/issues)
+v0.4 pre-release. Apache 2.0. [Issues →](https://github.com/skwuwu/Analemma-GVM/issues)

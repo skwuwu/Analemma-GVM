@@ -109,9 +109,9 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         .or_else(|| std::env::var("HOME").ok().map(PathBuf::from))
         .filter(|p| p.exists());
 
-    let home_overlay_merged: Option<PathBuf> = host_home.as_ref().and_then(|home| {
-        crate::mount::mount_home_overlay(home, my_pid)
-    });
+    let home_overlay_merged: Option<PathBuf> = host_home
+        .as_ref()
+        .and_then(|home| crate::mount::mount_home_overlay(home, my_pid));
 
     if let Some(ref m) = home_overlay_merged {
         tracing::debug!(merged = %m.display(), "Home overlayfs mounted by parent");
@@ -737,7 +737,7 @@ fn child_entry(
             // Fix: once agent exits, SIGTERM → sleep → SIGKILL all remaining
             // children, then continue reaping until ECHILD.
             let mut agent_exit_code: i32 = 1;
-            let mut agent_exited = false;
+            let mut _agent_exited = false;
 
             loop {
                 let mut status: i32 = 0;
@@ -753,7 +753,7 @@ fn child_entry(
                     } else if libc::WIFSIGNALED(status) {
                         agent_exit_code = 128 + libc::WTERMSIG(status);
                     }
-                    agent_exited = true;
+                    _agent_exited = true;
 
                     // Kill all remaining children in this PID namespace.
                     // kill(-1, sig) sends to all processes except PID 1 (us).
@@ -796,10 +796,10 @@ fn drop_all_capabilities() -> anyhow::Result<()> {
     // These allow root to bypass DAC permission checks (read/traverse).
     // All other capabilities (NET_ADMIN, SYS_ADMIN, MOUNT, etc.) are dropped.
     // Capability constants (linux/capability.h, not in libc crate)
-    const CAP_DAC_OVERRIDE: u64 = 1;     // bypass file read/write/exec perms
-    const CAP_DAC_READ_SEARCH: u64 = 2;  // bypass file read + dir search perms
-    const CAP_FOWNER: u64 = 3;           // bypass permission checks on file owner
-    const CAP_CHOWN: u64 = 0;            // change file ownership
+    const CAP_DAC_OVERRIDE: u64 = 1; // bypass file read/write/exec perms
+    const CAP_DAC_READ_SEARCH: u64 = 2; // bypass file read + dir search perms
+    const CAP_FOWNER: u64 = 3; // bypass permission checks on file owner
+    const CAP_CHOWN: u64 = 0; // change file ownership
     let keep: &[u64] = &[
         CAP_CHOWN,           // chown files in overlayfs (copy-up creates uid mismatch)
         CAP_DAC_OVERRIDE,    // bypass file read/write/exec perms

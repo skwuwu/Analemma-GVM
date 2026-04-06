@@ -340,7 +340,7 @@ Full flags: `gvm <command> --help`
 
 - [ ] Remove `[dev] host_overrides` from proxy.toml
 - [ ] Set `GVM_SECRETS_KEY` and `GVM_VAULT_KEY`
-- [ ] Configure NATS for WAL replication
+- [ ] Configure NATS for WAL replication (**critical for long-term audit retention** — without NATS, rotated WAL segments are permanently deleted after 1GB local storage)
 - [ ] Set credential policy to `Deny` (not Passthrough)
 - [ ] Enable `--shadow-mode strict`
 - [ ] `chmod 600 config/secrets.toml`

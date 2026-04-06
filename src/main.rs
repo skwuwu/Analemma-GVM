@@ -914,7 +914,6 @@ async fn start_tls_listener(
         tokio::spawn(async move {
             let _permit = permit; // held until task completes → auto-released on drop
             if let Err(e) = handle_tls_connection(stream, sc, cc, st, res).await {
-                let err_str = format!("{}", e);
                 // Debug level: intermittent handshake failures are normal
                 // (client connection resets, retries). Not actionable as warnings.
                 tracing::debug!(error = %e, addr = %addr, "TLS connection error");
