@@ -1,4 +1,4 @@
-# Security Layers Comparison
+# What Makes GVM Different
 
 > How GVM relates to existing AI safety layers.
 

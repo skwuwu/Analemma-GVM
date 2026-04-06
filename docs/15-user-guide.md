@@ -350,4 +350,4 @@ Full flags: `gvm <command> --help`
 
 ---
 
-> **Under the hood:** [Architecture](00-overview.md) | [SRR Design](03-srr.md) | [ABAC Engine](02-policy.md) | [Merkle WAL](04-ledger.md) | [Security Model](11-security-model.md) | [Governance Coverage](14-governance-coverage.md)
+> **Under the hood:** [Architecture](00-overview.md) | [SRR Rules](03-srr.md) | [ABAC Policies](02-policy.md) | [Merkle WAL](architecture/ledger.md) | [Security Model](11-security-model.md) | [Governance Coverage](14-governance-coverage.md)

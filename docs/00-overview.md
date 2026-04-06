@@ -115,32 +115,32 @@ Start here if you want to use GVM with your agents.
 | [Quick Start](12-quickstart.md) | Build, run, isolate, MCP setup |
 | [User Guide](15-user-guide.md) | Modes, sandbox, resource limits, proxy lifecycle |
 | [Reference Guide](13-reference.md) | Configuration, CLI, environment variables, API |
+| [SRR Rules](03-srr.md) | Write URL-based rules (`config/srr_network.toml`) |
+| [ABAC Policies](02-policy.md) | Write semantic policies (`config/policies/`) |
+| [Operations](01-operations.md) | Operation namespace for ABAC (`gvm.payment.charge` etc.) |
 | [Security Model](11-security-model.md) | Threat model, known attack surface, mitigations |
 | [Governance Coverage](14-governance-coverage.md) | Per-mode enforcement matrix |
-| [Security Layers Comparison](10-competitive-analysis.md) | GVM vs LLM safety, prompt guards, OPA |
+| [What Makes GVM Different](10-competitive-analysis.md) | GVM vs LLM safety, prompt guards, OPA |
 | [Test Report](09-test-report.md) | Test coverage, benchmarks, chaos stress results |
 
-### Architecture Deep-Dive
+### Architecture (`docs/architecture/`)
 
 Internal design documents for contributors and code reviewers.
 
 | Doc | Source |
 |-----|--------|
-| [Operation Namespace & Registry](01-operations.md) | `src/registry.rs` |
-| [ABAC Policy Engine](02-policy.md) | `src/policy.rs` |
-| [Network SRR Engine](03-srr.md) | `src/srr.rs` |
-| [WAL-First Ledger & Audit](04-ledger.md) | `src/ledger.rs` |
-| [Encrypted Vault](05-vault.md) | `src/vault.rs` |
-| [Proxy Pipeline](06-proxy.md) | `src/proxy.rs` |
-| [Python SDK](07-sdk.md) | `sdk/python/gvm/` (experimental) |
-| [Memory & Runtime Security](08-memory-security.md) | `crates/gvm-sandbox/` |
+| [WAL-First Ledger & Audit](architecture/ledger.md) | `src/ledger.rs` |
+| [Encrypted Vault](architecture/vault.md) | `src/vault.rs` |
+| [Proxy Pipeline](architecture/proxy.md) | `src/proxy.rs` |
+| [Python SDK](architecture/sdk.md) | `sdk/python/gvm/` (experimental) |
+| [Memory & Runtime Security](architecture/memory-security.md) | `crates/gvm-sandbox/` |
 | [Changelog](internal/CHANGELOG.md) | Roadmap, implementation log |
 
 ---
 
 ## Memory & Runtime Security Summary
 
-See [Part 8: Memory & Runtime Security](08-memory-security.md) for full analysis.
+See [Part 8: Memory & Runtime Security](architecture/memory-security.md) for full analysis.
 
 | Threat | Mitigation | Test |
 |--------|-----------|------|
