@@ -25,7 +25,7 @@ Analemma-GVM is a transparent enforcement proxy for AI agent I/O operations. It 
  │  GVMAgent    │    │ Layer 3: Capability     │    │ Database     │
  │  base class  │    │   Token (API Key)       │    │ ...          │
  └──────────────┘    │                          │    └──────────────┘
-                     │ WAL → NATS Ledger        │
+                     │ WAL (Merkle chain)        │
                      │ AES-256-GCM Vault        │
                      └────────────────────────┘
 ```
@@ -106,26 +106,35 @@ GVM's governance operates at two semantic levels. A third level (content semanti
 
 ## Document Map
 
-| Part | Title | File |
-|------|-------|------|
-| 1 | [Operation Namespace & Registry](01-operations.md) | `src/registry.rs` |
-| 2 | [ABAC Policy Engine](02-policy.md) | `src/policy.rs` |
-| 3 | [Network SRR Engine](03-srr.md) | `src/srr.rs` |
-| 4 | [WAL-First Ledger & Audit](04-ledger.md) | `src/ledger.rs` |
-| 5 | [Encrypted Vault](05-vault.md) | `src/vault.rs` |
-| 6 | [Proxy Pipeline](06-proxy.md) | `src/proxy.rs` |
-| 6.9 | [LLM Thinking Trace Extraction](06-proxy.md) | `src/llm_trace.rs` |
-| 7 | [Python SDK](07-sdk.md) | `sdk/python/gvm/` |
-| 8 | [Memory & Runtime Security](08-memory-security.md) | (this whitepaper) |
-| 8.7 | [OS Isolation & MicroVM Assessment](08-memory-security.md) | `crates/gvm-sandbox/` |
-| 9 | [Test Coverage Report](09-test-report.md) | `tests/hostile.rs` |
-| 10 | [Security Layers Comparison](10-competitive-analysis.md) | GVM vs LLM safety, prompt guards, OPA |
-| 11 | [Security Model & Known Attack Surface](11-security-model.md) | Threat model, attack vectors, mitigations |
-| 12 | [Quick Start](12-quickstart.md) | 1-minute launch, isolation levels, secret injection, policy basics |
-| 13 | [Reference Guide](13-reference.md) | Configuration, environment variables, CLI, SDK API, platform support |
-| 14 | [Governance Coverage](14-governance-coverage.md) | Per-mode enforcement matrix |
-| 15 | [User Guide](15-user-guide.md) | Modes, sandbox, resource limits, proxy lifecycle |
-| — | [Changelog](internal/CHANGELOG.md) | Roadmap, implementation log, architecture decisions |
+### For Users
+
+Start here if you want to use GVM with your agents.
+
+| Doc | What it covers |
+|-----|----------------|
+| [Quick Start](12-quickstart.md) | Build, run, isolate, MCP setup |
+| [User Guide](15-user-guide.md) | Modes, sandbox, resource limits, proxy lifecycle |
+| [Reference Guide](13-reference.md) | Configuration, CLI, environment variables, API |
+| [Security Model](11-security-model.md) | Threat model, known attack surface, mitigations |
+| [Governance Coverage](14-governance-coverage.md) | Per-mode enforcement matrix |
+| [Security Layers Comparison](10-competitive-analysis.md) | GVM vs LLM safety, prompt guards, OPA |
+| [Test Report](09-test-report.md) | Test coverage, benchmarks, chaos stress results |
+
+### Architecture Deep-Dive
+
+Internal design documents for contributors and code reviewers.
+
+| Doc | Source |
+|-----|--------|
+| [Operation Namespace & Registry](01-operations.md) | `src/registry.rs` |
+| [ABAC Policy Engine](02-policy.md) | `src/policy.rs` |
+| [Network SRR Engine](03-srr.md) | `src/srr.rs` |
+| [WAL-First Ledger & Audit](04-ledger.md) | `src/ledger.rs` |
+| [Encrypted Vault](05-vault.md) | `src/vault.rs` |
+| [Proxy Pipeline](06-proxy.md) | `src/proxy.rs` |
+| [Python SDK](07-sdk.md) | `sdk/python/gvm/` (experimental) |
+| [Memory & Runtime Security](08-memory-security.md) | `crates/gvm-sandbox/` |
+| [Changelog](internal/CHANGELOG.md) | Roadmap, implementation log |
 
 ---
 
