@@ -28,7 +28,7 @@ If you're running agents on an EC2 instance, you may need this.
 ## Requirements
 
 - **OS**: Linux x86_64. The pre-built binary is dynamically linked against glibc — works on Ubuntu 20.04+, Debian 11+, RHEL 8+, Amazon Linux 2023, and equivalents. Alpine / other musl distros need a `x86_64-unknown-linux-musl` build from source.
-- **Cooperative / watch / MCP modes**: glibc only. No extra system tools.
+- **Cooperative / watch modes**: glibc only. No extra system tools.
 - **`--sandbox` mode**: additionally requires `iproute2` (`ip`), `iptables`, and `ip6tables` on the host (preinstalled on most server distros). `gvm preflight` reports exactly what is missing and prints the install command for your distro. Either run as `sudo` or grant the binary capabilities directly: `sudo setcap 'cap_net_admin,cap_sys_admin,cap_sys_ptrace+ep' ./gvm`.
 - **Other modes** (`--contained`): Docker on the host instead of the above.
 
@@ -101,10 +101,6 @@ Same classification function as the live proxy. Check results always match real 
 
 Sandbox mode intercepts all HTTPS at the network level — the agent physically cannot bypass the proxy. Works with any runtime (Python, Node.js, Go, binaries).
 
-### MCP (Claude Desktop / Cursor)
-
-GVM provides MCP tools for AI assistants. [Setup guide →](docs/quickstart.md#7-mcp-integration--claude-desktop--cursor)
-
 ---
 
 ## What it doesn't do
@@ -137,7 +133,7 @@ GVM provides MCP tools for AI assistants. [Setup guide →](docs/quickstart.md#7
 
 | Doc | What it covers |
 |-----|----------------|
-| [Quick Start](docs/quickstart.md) | Build, run, isolate, MCP setup |
+| [Quick Start](docs/quickstart.md) | Build, run, isolate |
 | [Reference](docs/reference.md) | Config, CLI, API, CI/CD |
 | [Security Model](docs/security-model.md) | Threat model, known attack surface (not externally audited) |
 | [Governance Coverage](docs/governance-coverage.md) | Per-mode enforcement matrix |

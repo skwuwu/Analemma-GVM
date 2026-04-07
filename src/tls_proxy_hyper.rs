@@ -76,9 +76,17 @@ async fn handle_request(
     client_config: Arc<rustls::ClientConfig>,
     state: &crate::proxy::AppState,
 ) -> Result<Response<MitmBody>, String> {
-    // Extract metadata before consuming body
+    // Extract metadata before consuming body.
+    //
+    // path_and_query() preserves the query string (?per_page=10&page=2). The
+    // older path() variant silently dropped it, breaking every paginated /
+    // filtered API call routed through the MITM.
     let method = req.method().to_string();
-    let path = req.uri().path().to_string();
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
     let original_headers = req.headers().clone();
     let host = original_headers
         .get("host")
@@ -312,25 +320,42 @@ async fn handle_request(
         }
     });
 
-    // Build upstream request with original headers
+    // Build upstream request with original headers.
+    //
+    // We must rewrite the Host header to the real upstream host. The agent
+    // sent us its proxy address (e.g. 10.200.0.1:8080 inside the sandbox)
+    // as Host, which would cause GitHub/Cloudflare/etc to reject or stall
+    // the request. The hyper http1 client also relies on us setting Host
+    // explicitly — without it the upstream sees an empty Host header and
+    // may close the connection mid-response, surfacing as
+    // "connection closed before message completed" in our error path.
     let mut upstream_req = Request::builder().method(method.as_str()).uri(&path);
 
     for (k, v) in original_headers.iter() {
         let name = k.as_str().to_lowercase();
-        // Skip hop-by-hop headers
+        // Skip hop-by-hop headers per RFC 7230 §6.1, plus:
+        //   host             — rewritten below to the real upstream
+        //   content-length   — body was re-collected into Full<Bytes>; hyper
+        //                      sets content-length itself, and the original
+        //                      value is stale if the agent re-chunked
+        //   transfer-encoding — same reason
         if matches!(
             name.as_str(),
             "connection"
                 | "proxy-connection"
                 | "transfer-encoding"
+                | "content-length"
                 | "keep-alive"
                 | "te"
                 | "upgrade"
+                | "host"
         ) {
             continue;
         }
         upstream_req = upstream_req.header(k, v);
     }
+    // Always set Host to the actual upstream — the original was the proxy.
+    upstream_req = upstream_req.header("host", upstream_host);
 
     let upstream_req = upstream_req
         .body(
@@ -340,7 +365,32 @@ async fn handle_request(
         )
         .unwrap();
 
-    match sender.send_request(upstream_req).await {
+    // Bound the upstream wait. Without this, a stalled GitHub/Cloudflare
+    // origin keeps the connection open indefinitely and the agent observes
+    // a hang instead of an actionable 504. 60s matches the typical CDN
+    // upstream timeout.
+    const UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    let send_fut = sender.send_request(upstream_req);
+    let send_result = match tokio::time::timeout(UPSTREAM_TIMEOUT, send_fut).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                host = %upstream_host,
+                timeout_secs = UPSTREAM_TIMEOUT.as_secs(),
+                "MITM: upstream request timed out"
+            );
+            return Ok(Response::builder()
+                .status(504)
+                .body(full_body(format!(
+                    "Upstream {} timed out after {}s",
+                    upstream_host,
+                    UPSTREAM_TIMEOUT.as_secs()
+                )))
+                .unwrap());
+        }
+    };
+
+    match send_result {
         Ok(resp) => {
             tracing::debug!(status = %resp.status(), host = %upstream_host, "MITM: upstream response");
             // Stream response directly to client — hyper handles framing.
@@ -392,20 +442,26 @@ async fn forward_http(
         let _ = conn.await;
     });
 
-    let mut req = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("Host", host);
+    let mut req = Request::builder().method(method).uri(path);
     for (k, v) in headers.iter() {
         let name = k.as_str().to_lowercase();
+        // Same skip list as the HTTPS path: hop-by-hop + host + body framing.
         if matches!(
             name.as_str(),
-            "connection" | "proxy-connection" | "transfer-encoding" | "keep-alive"
+            "connection"
+                | "proxy-connection"
+                | "transfer-encoding"
+                | "content-length"
+                | "keep-alive"
+                | "te"
+                | "upgrade"
+                | "host"
         ) {
             continue;
         }
         req = req.header(k, v);
     }
+    req = req.header("host", host);
     let req = req
         .body(
             Full::new(body.clone())
@@ -414,7 +470,22 @@ async fn forward_http(
         )
         .unwrap();
 
-    match sender.send_request(req).await {
+    const UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    let send_result = match tokio::time::timeout(UPSTREAM_TIMEOUT, sender.send_request(req)).await {
+        Ok(r) => r,
+        Err(_) => {
+            return Ok(Response::builder()
+                .status(504)
+                .body(full_body(format!(
+                    "Dev upstream {} timed out after {}s",
+                    host,
+                    UPSTREAM_TIMEOUT.as_secs()
+                )))
+                .unwrap());
+        }
+    };
+
+    match send_result {
         Ok(resp) => {
             let (parts, body) = resp.into_parts();
             Ok(Response::from_parts(
