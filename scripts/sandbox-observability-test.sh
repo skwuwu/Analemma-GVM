@@ -171,7 +171,7 @@ cd "$REPO_DIR"
 
 # ─── 1. OOM kill produces actionable hint ──────────────────────────────
 run_test 1 "OOM kill — actionable memory hint"
-out=$("$GVM_BIN" run --sandbox --memory 32m -- "$WORK_DIR/oom_agent.py" 2>&1)
+out=$("$GVM_BIN" run --sandbox --memory 32m "$WORK_DIR/oom_agent.py" 2>&1)
 fail=0
 assert_contains "out of memory mentioned"        "$out" "out of memory" || fail=1
 assert_contains "limit reported in MB"           "$out" "32MB"          || fail=1
@@ -180,7 +180,7 @@ assert_contains "suggests --memory hint"         "$out" "--memory"      || fail=
 
 # ─── 2. Timeout produces actionable hint ───────────────────────────────
 run_test 2 "Timeout — actionable GVM_SANDBOX_TIMEOUT hint"
-out=$(GVM_SANDBOX_TIMEOUT=3 "$GVM_BIN" run --sandbox -- "$WORK_DIR/sleep_agent.py" 2>&1)
+out=$(GVM_SANDBOX_TIMEOUT=3 "$GVM_BIN" run --sandbox "$WORK_DIR/sleep_agent.py" 2>&1)
 fail=0
 assert_contains "timed out mentioned"            "$out" "timed out"           || fail=1
 assert_contains "GVM_SANDBOX_TIMEOUT hint"       "$out" "GVM_SANDBOX_TIMEOUT" || fail=1
@@ -188,7 +188,7 @@ assert_contains "GVM_SANDBOX_TIMEOUT hint"       "$out" "GVM_SANDBOX_TIMEOUT" ||
 
 # ─── 3. Seccomp violation — concrete syscall name OR generic fallback ──
 run_test 3 "Seccomp violation — concrete syscall name from dmesg"
-out=$("$GVM_BIN" run --sandbox -- "$WORK_DIR/seccomp_agent.py" 2>&1)
+out=$("$GVM_BIN" run --sandbox "$WORK_DIR/seccomp_agent.py" 2>&1)
 # Three valid outcomes (in order of preference):
 #   A. SIGSYS killed agent + dmesg parser resolved syscall → "attempted mount(2)"
 #   B. SIGSYS killed agent + dmesg unreadable → generic "dmesg | grep SECCOMP"
@@ -212,7 +212,7 @@ fi
 
 # ─── 4. Normal exit prints no diagnostic noise ─────────────────────────
 run_test 4 "Normal exit — no false positive diagnostic"
-out=$("$GVM_BIN" run --sandbox -- "$WORK_DIR/normal_agent.py" 2>&1)
+out=$("$GVM_BIN" run --sandbox "$WORK_DIR/normal_agent.py" 2>&1)
 fail=0
 assert_not_contains "no OOM noise"               "$out" "out of memory"     || fail=1
 assert_not_contains "no timeout noise"           "$out" "timed out"         || fail=1
@@ -222,7 +222,7 @@ assert_contains "agent stdout reached"           "$out" "hello from normal" || f
 
 # ─── 5. CPU throttling note appears under --cpus 0.1 ───────────────────
 run_test 5 "CPU throttle note — surfaces when agent is CPU-limited"
-out=$("$GVM_BIN" run --sandbox --cpus 0.1 -- "$WORK_DIR/cpu_burner.py" 2>&1)
+out=$("$GVM_BIN" run --sandbox --cpus 0.1 "$WORK_DIR/cpu_burner.py" 2>&1)
 # Agent runs an 8s busy loop. With --cpus 0.1 (10% of 1 CPU), throttle
 # accumulates well above the 1s threshold the CLI uses to print the note.
 if echo "$out" | grep -qF "CPU throttled"; then
@@ -247,7 +247,7 @@ assert_contains "active sandboxes line"         "$out" "Active Sandboxes"  || fa
 
 # ─── 7. Cleanup verification — no residuals after normal exit ──────────
 run_test 7 "Cleanup verification — clean exit reports no residuals"
-out=$("$GVM_BIN" run --sandbox -- "$WORK_DIR/normal_agent.py" 2>&1)
+out=$("$GVM_BIN" run --sandbox "$WORK_DIR/normal_agent.py" 2>&1)
 fail=0
 # Either the verbose dim "Cleanup verified" line OR no Mount/Cgroup/Network ✗ lines.
 if echo "$out" | grep -qF "Cleanup verified"; then
@@ -264,7 +264,7 @@ fi
 run_test 8 "gvm stop — staged cleanup progress + final verification"
 # Start a proxy in the background via gvm run (a quick agent that exits
 # fast — proxy lingers as a daemon and we can stop it explicitly).
-"$GVM_BIN" run -- "$WORK_DIR/normal_agent.py" >/dev/null 2>&1 || true
+"$GVM_BIN" run "$WORK_DIR/normal_agent.py" >/dev/null 2>&1 || true
 sleep 2
 out=$("$GVM_BIN" stop 2>&1)
 fail=0

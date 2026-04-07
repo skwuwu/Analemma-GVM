@@ -12,6 +12,17 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+/// Path to the `gvm` binary built for this test invocation.
+///
+/// `CARGO_BIN_EXE_<name>` is set by cargo for every binary in the same
+/// package when building integration tests. Using it avoids nesting
+/// `cargo run` inside `cargo test` — the nested invocation contends on
+/// the cargo lock and triggers spurious failures even when the actual
+/// binary works fine.
+fn gvm_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_gvm")
+}
+
 /// Create a minimal test script for agent execution.
 fn create_test_script() -> PathBuf {
     let script_path = PathBuf::from("/tmp/gvm_test_noop.py");
@@ -52,12 +63,9 @@ fn test_gvm_run_local_mode_with_proxy_autostart() {
     let agent_id = "test-agent-local";
     let script = create_test_script();
 
-    // Run gvm run in local mode (no isolation)
-    let output = Command::new("cargo")
-        .arg("run")
-        .arg("-p")
-        .arg("gvm-cli")
-        .arg("--")
+    // Run gvm run in local mode (no isolation) — invoke the prebuilt
+    // binary directly so we don't nest cargo inside cargo test.
+    let output = Command::new(gvm_bin())
         .arg("run")
         .arg(script.to_str().unwrap())
         .arg("--agent-id")
@@ -108,12 +116,8 @@ fn test_gvm_run_local_mode_with_proxy_autostart() {
 
 #[test]
 fn test_gvm_run_help_succeeds() {
-    // Simple smoke test: `gvm run --help` should always work
-    let output = Command::new("cargo")
-        .arg("run")
-        .arg("-p")
-        .arg("gvm-cli")
-        .arg("--")
+    // Simple smoke test: `gvm run --help` should always work.
+    let output = Command::new(gvm_bin())
         .arg("run")
         .arg("--help")
         .output()
@@ -130,12 +134,8 @@ fn test_gvm_run_help_succeeds() {
 
 #[test]
 fn test_gvm_events_list_basic() {
-    // Verify gvm events list command is available and responds
-    let output = Command::new("cargo")
-        .arg("run")
-        .arg("-p")
-        .arg("gvm-cli")
-        .arg("--")
+    // Verify gvm events list command is available and responds.
+    let output = Command::new(gvm_bin())
         .arg("events")
         .arg("list")
         .output()
@@ -147,12 +147,8 @@ fn test_gvm_events_list_basic() {
 
 #[test]
 fn test_gvm_stats_basic() {
-    // Verify gvm stats command is available
-    let output = Command::new("cargo")
-        .arg("run")
-        .arg("-p")
-        .arg("gvm-cli")
-        .arg("--")
+    // Verify gvm stats command is available.
+    let output = Command::new(gvm_bin())
         .arg("stats")
         .arg("tokens")
         .output()
