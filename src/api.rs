@@ -1032,6 +1032,10 @@ pub async fn health(State(state): State<AppState>) -> Response<Body> {
     let srr_rules = state.srr.read().map(|s| s.rule_count()).unwrap_or(0);
     let pending = state.pending_approvals.len();
     let tls_ready = state.tls_ready.load(std::sync::atomic::Ordering::Relaxed);
+    let uptime_secs = state.start_time.elapsed().as_secs();
+    let total_requests = state
+        .request_counter
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     let (status, wal_status) = if wal_failures > 5 {
         ("degraded", "primary_failed")
@@ -1050,6 +1054,9 @@ pub async fn health(State(state): State<AppState>) -> Response<Body> {
             "wal_failures": wal_failures,
             "emergency_writes": emergency_writes,
             "pending_approvals": pending,
+            "uptime_secs": uptime_secs,
+            "total_requests": total_requests,
+            "ca_expires_days": state.ca_expires_days,
         }),
     )
 }

@@ -116,7 +116,38 @@ impl CgroupGuard {
 
         Ok(Some(guard))
     }
+
+    /// Read the cgroup OOM kill counter from `memory.events`.
+    ///
+    /// Returns 0 if the file is unreadable or the counter is missing.
+    /// MUST be called before the guard is dropped — Drop removes the cgroup
+    /// directory, after which `memory.events` is gone.
+    ///
+    /// Safe to call after `waitpid` returns: with `memory.oom.group=1`, the
+    /// kernel kills all cgroup processes atomically before sending SIGCHLD,
+    /// so by the time the parent waits the child, the counter is final.
+    pub fn oom_kill_count(&self) -> u64 {
+        let content = match fs::read_to_string(self.path.join("memory.events")) {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        parse_oom_kill_count(&content)
+    }
+
+    /// Read total CPU throttle time in microseconds from `cpu.stat`.
+    ///
+    /// Returns None if the file is unreadable or the field is missing.
+    /// A non-zero value means the cgroup hit its CPU quota at least once.
+    pub fn cpu_throttled_us(&self) -> Option<u64> {
+        let content = fs::read_to_string(self.path.join("cpu.stat")).ok()?;
+        parse_cpu_throttled_us(&content)
+    }
 }
+
+// Parsing helpers live in `crate::cgroup_parse` so they're testable on
+// non-Linux hosts (Windows dev). The cgroup module itself is linux-only
+// because it depends on cgroup v2 syscalls/files at runtime.
+use crate::cgroup_parse::{parse_cpu_throttled_us, parse_oom_kill_count};
 
 impl Drop for CgroupGuard {
     fn drop(&mut self) {
@@ -186,6 +217,8 @@ mod tests {
         let actual = Path::new("/sys/fs/cgroup").join("gvm-agent-12345");
         assert_eq!(expected, actual);
     }
+
+    // Parser unit tests live in `crate::cgroup_parse::tests` (OS-independent).
 
     #[test]
     fn test_cpu_quota_calculation() {

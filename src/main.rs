@@ -318,6 +318,9 @@ async fn main() {
         .expect("Failed to load or generate MITM CA");
     let mitm_ca_cert_pem = Arc::new(mitm_ca.ca_cert_pem().to_vec());
     let mitm_ca_key_pem = Arc::new(mitm_ca.ca_key_pem());
+    // Snapshot CA validity for `/gvm/health` (consumed by `gvm status`).
+    // Captured here because mitm_ca is dropped at end-of-scope after key extraction.
+    let mitm_ca_expires_days: Option<i64> = Some(mitm_ca.expires_in_days());
 
     // 9.10. Pre-build MITM TLS state (shared between port-8443 listener and CONNECT handler).
     // Single GvmCertResolver instance → single cert cache → no duplicate keygen.
@@ -381,6 +384,9 @@ async fn main() {
             sc
         },
         tls_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        start_time: std::time::Instant::now(),
+        request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ca_expires_days: mitm_ca_expires_days,
     };
 
     // Clone state for CONNECT handler before moving into axum router

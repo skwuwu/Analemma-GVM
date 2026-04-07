@@ -55,6 +55,97 @@ v0.2 shipped: Shadow Mode + intent store, CONNECT tunnel, SRR hot-reload, eBPF u
 
 ## Implementation Log
 
+### 2026-04-07: Post-cleanup residual verification — auditable Zero-Trace claim
+
+**Problem**: Both `gvm run --sandbox` cleanup and `gvm stop` ran cleanup with no way to confirm it actually succeeded. If a veth interface, iptables chain, mount point, cgroup directory, or state file survived (kernel bug, race, partial failure), the leak silently accumulated until the next `gvm cleanup --dry-run`. The "Zero-Trace" UX claim was aspirational, not auditable.
+
+**Fix**: New `cleanup_verify` module with four checks, each cheap (~tens of ms total): one `ip link show`, two `iptables` calls, one `/proc/mounts` read, three `Path::exists()` checks.
+
+`CleanupVerification` struct: per-category `Vec<String>` of leaked resource identifiers, with `is_clean()` and `total()` helpers. `verify_cleanup(pid, host_iface, mount_paths)` runs all four checks and returns the populated report.
+
+The four pure parsers (`parse_mount_residuals`, `iface_present_in_link_show`, `chain_present_in_iptables`, `nat_rule_references_iface`) are OS-independent so they're unit-testable on Windows dev hosts. Only the `Command::new("ip"|"iptables"|"iptables-save")` invocations are gated linux-only. **18 unit tests** cover: real `/proc/mounts` fixture (multiple residuals, substring rejection, empty input), `ip link show` with `@peer` suffix stripping (substring rejection), `iptables -S` with `-N` declarations and `-j` references, NAT `-i`/`-o` matching, and the `is_clean`/`total` helpers.
+
+**Wiring** — `sandbox_impl.rs` runs `verify_cleanup()` after the existing cleanup steps and stores the result in `SandboxResult.cleanup_verification`. `pipeline.rs::print_cleanup_verification()` renders it: silent on the happy path (single dim "Cleanup verified" line so users know the check ran), per-category `✓`/`✗` lines with manual recovery commands when leaks exist (`sudo umount -l <path>`, `sudo rmdir <cgroup>`, `gvm cleanup`).
+
+**`gvm stop` parity** — `main.rs::run_stop()` runs a final residual scan after the orphan cleanup pass: globs `/run/gvm/gvm-sandbox-*.state` and parses `ip -o link show` for `veth-gvm-h*` interfaces. Prints either "✓ Verified: no veth, no state file, no /run/gvm/ residuals" or a list of survivors with the `sudo gvm cleanup` recovery hint. This is what makes "Zero-Trace" auditable instead of aspirational.
+
+**`SandboxResult.cleanup_verification`** is a new field — additive, no existing field changed. CLI consumers update naturally because they pattern-match on `result.exit_reason` (the existing surface).
+
+**E2E coverage** — `scripts/sandbox-observability-test.sh` test 7 (new) runs a normal-exit sandbox and asserts the "Cleanup verified" line appears with no residual markers. Test 8 (renumbered) adds a residual-verification assertion to `gvm stop` so any regression in the final scan is caught immediately.
+
+Files: `crates/gvm-sandbox/src/{lib,sandbox_impl,cleanup_verify}.rs`, `crates/gvm-cli/src/{main,pipeline}.rs`, `scripts/sandbox-observability-test.sh` | Risk: Low (additive — new module, new field on `SandboxResult`, output is silent on happy path so no behavior change for clean exits)
+
+### 2026-04-07: Seccomp violation → concrete syscall name from dmesg
+
+**Problem**: `ExitReason::SeccompViolation` previously told users only that *some* syscall was blocked, with a "run dmesg | grep SECCOMP" pointer. Users then had to manually decode `syscall=165` (mount) into a name. The information existed in the kernel ring buffer the moment `waitpid` returned — we just weren't reading it.
+
+**Fix**: Two new modules.
+
+`syscall_names.rs` — pure number → name lookup built via macro from `libc::SYS_*` constants. Covers ~190 syscalls: the explicit blocklist (mount, ptrace, bpf, unshare, setns, open_by_handle_at, kexec_load, init_module, ...) plus common allowed syscalls so error messages stay useful when an agent dies on something we wouldn't normally expect. No hardcoded magic numbers — the macro stays in sync with libc upstream. Linux-only because `libc::SYS_*` constants don't exist on Windows; gated at module level. 6 unit tests.
+
+`seccomp_audit.rs` — dmesg parser. `find_syscall_for_pid(pid)` invokes `dmesg`, scans newest-to-oldest for an `audit: type=1326` (AUDIT_SECCOMP) line containing `pid={target}` (token-bounded — never substring), extracts `syscall=N`. The line-level parser `extract_syscall_for_pid()` is OS-independent so it's unit-testable on Windows dev hosts. 7 unit tests covering: real dmesg line, wrong PID, non-SECCOMP record (`type=1300` AUDIT_SYSCALL), unrelated kernel line, PID substring boundary (pid=2345 must not match pid=23456), garbage syscall= field, comma-separated tokens.
+
+**Wiring**: `sandbox_impl.rs` calls `find_syscall_name_for_pid(child_pid)` immediately after the SIGSYS branch, before cleanup. The audit record is already in the kernel ring buffer at this point because the seccomp Log filter emits it before the Kill filter terminates the child. `ExitReason::SeccompViolation` gained a `syscall: Option<String>` field — `Some("mount")` when we resolved it, `None` when dmesg is unreadable (`kernel.dmesg_restrict=1` without root) or no record matched.
+
+**CLI**: `pipeline.rs::print_exit_reason` splits the SeccompViolation arm:
+- `Some(name)`: `⚠ Agent killed: seccomp violation — attempted mount(2)` + actionable next step (remove the call or run without --sandbox).
+- `None`: existing fallback (`Inspect blocked syscall(s): dmesg | grep SECCOMP`).
+
+Graceful degradation throughout — if dmesg is unavailable (no permission, command missing, kernel ring buffer rotated), behavior is identical to the previous release.
+
+**Test coverage**: 13 new unit tests (6 syscall_names + 7 seccomp_audit), all running on Windows dev hosts via the OS-independent parser split. `scripts/sandbox-observability-test.sh` test 3 now accepts three valid outcomes — SIGSYS+resolved (PASS), SIGSYS+fallback (PASS, dmesg unreadable), or ENOSYS (PASS, default filter behavior) — distinguishing the resolution path from the fallback path so regressions in dmesg parsing are visible.
+
+Files: `crates/gvm-sandbox/src/{lib,sandbox_impl,syscall_names,seccomp_audit}.rs`, `crates/gvm-cli/src/pipeline.rs`, `scripts/sandbox-observability-test.sh` | Risk: Low (additive — new field on existing variant, dmesg invocation is best-effort, fallback path identical to current behavior)
+
+### 2026-04-07: gvm stop + gvm status resource visibility
+
+**`gvm stop` (new subcommand)**: Reads `data/proxy.pid`, sends SIGTERM, polls 5s for exit, escalates to SIGKILL on timeout, then runs `cleanup_all_orphans_report()` to release sandbox resources. Each step prints a `✓` line so users see exactly what happened — graceful exit time, veth interfaces removed, iptables chains flushed, mount paths released. The "CA key zeroized on exit" annotation is honest because `EphemeralCA::Drop` calls `zeroize` on the key bytes when the proxy process terminates. Persistent files (`data/wal.log`, `proxy.log`, `mitm-ca.pem`) are explicitly named as preserved — no "no trace left" exaggeration.
+
+**`gvm cleanup` progress output**: Promoted `cleanup_all_orphans()` to return a `CleanupReport` (sandboxes, veth_interfaces, veth_names, mount_paths, cgroups, iptables_chains, orphan_veths_swept). The legacy count-only `cleanup_all_orphans()` wrapper stays for backwards compatibility. CLI now prints per-resource ✓ lines with veth names inline so users can verify exactly which interfaces were released.
+
+**`gvm status` resource view**: Two new sections:
+- **Active Sandboxes / Orphan Sandboxes**: Glob `/run/gvm/gvm-sandbox-*.state`, parse JSON, partition by `kill(pid, 0)` liveness. Live PIDs render as "Active Sandboxes" with PID + veth + IP + start time; dead PIDs render as "Orphan Sandboxes" with a `gvm cleanup` hint. Works whether the proxy is reachable or not — orphan recovery does not depend on a running daemon.
+- **Isolation Profile**: Static surface — `gvm_sandbox::allowed_syscall_count()` (computed from `insert_base_syscalls` + the socket family at runtime, no hardcoded magic), `/proc/filesystems` overlay support, `preflight_check().tc_filter_available`. Renders as `seccomp: N syscalls allowed, ENOSYS default` / `overlayfs: supported|unsupported` / `TC ingress: available|unavailable`.
+
+**Health endpoint expansion**: `/gvm/health` now includes `uptime_secs`, `total_requests`, `ca_expires_days`. `AppState` gained `start_time`, `request_counter` (AtomicU64, Relaxed — never branched on), `ca_expires_days` (snapshot of `EphemeralCA::expires_in_days()` at startup). `proxy_handler` increments the counter on entry. The CLI status renderer prints these as `Uptime: 2h 15m`, `Requests: 12,345 total`, `CA expires in N days` only when present — older proxy builds without these fields render cleanly without "unknown" placeholders.
+
+**CA expiry tracking**: `EphemeralCA` gained a `not_after: time::OffsetDateTime` field. `generate()` sets it directly from rcgen params; `load_from_disk()` approximates from cert file mtime + 365d (exact because `generate()` is the only writer). `expires_in_days()` returns the delta. No new dependency added — uses the existing `time` crate already pulled in by rcgen.
+
+**E2E verification**: `scripts/sandbox-observability-test.sh` exercises every diagnostic surface end-to-end through `gvm` CLI only — no nsenter, no PID file mangling, no internal API calls. Seven scenarios: OOM hint (with --memory 32m + 200MB allocator), timeout hint (with GVM_SANDBOX_TIMEOUT=3 + sleep 120), seccomp filter active (mount() → SIGSYS or ENOSYS, both accepted), normal exit silence (no false positives), CPU throttle note (--cpus 0.1 + 8s busy loop), `gvm status` structural check, `gvm stop` staged output. Linux + cgroup v2 + sudo required.
+
+Files: `crates/gvm-cli/src/{main,proxy_manager,status}.rs`, `crates/gvm-sandbox/src/{lib,seccomp,network,ca}.rs`, `src/{api,main,proxy}.rs`, `scripts/sandbox-observability-test.sh` | Risk: Low (additive — new subcommand, additive health fields, all CLI consumers handle missing fields)
+
+### 2026-04-07: Replace hand-rolled /proc and `uname` parsing with `procfs` + `nix::utsname`
+
+**Problem**: Three sites in `gvm-sandbox` reinvented well-validated library functionality:
+1. `ebpf.rs::kernel_version()` fork+exec'd `uname -r` and parsed stdout — both a process spawn and a PATH dependency where a syscall would do.
+2. `capability.rs` preflight kernel-version log read `/proc/sys/kernel/osrelease` directly.
+3. `capability.rs::check_cap_net_admin()` read `/proc/self/status`, located the `CapEff:` line, and called `u64::from_str_radix(.., 16)` — a hand-rolled hex parser on a security-sensitive code path.
+
+**Fix**:
+- Sites (1) and (2) → `nix::sys::utsname::uname()` (single syscall, no fork, no PATH dependency, already-present `nix` dependency).
+- Site (3) → `procfs::process::Process::myself()?.status()?.capeff` (structured `u64` field, parser maintained upstream). Bit-mask check against `CAP_NET_ADMIN` (index 12) is preserved — only the parsing layer changed.
+
+**Out of scope (intentionally)**: `cgroup.rs` parsing of `memory.events` / `cpu.stat` was *not* migrated. Those files live under `/sys/fs/cgroup/`, which the `procfs` crate does not cover. The existing pure parsers in `cgroup_parse.rs` are already isolated, OS-independent, and unit-tested.
+
+**Why this matters**: Aligns with the post-`9104ad5` direction of replacing custom parsers with battle-tested crates. CapEff hex parsing is exactly the kind of code that silently fails-open if the kernel ever changes the field format (e.g., adds a prefix), and a fork+exec on the sandbox preflight hot path is wasted overhead.
+
+Files: `crates/gvm-sandbox/Cargo.toml`, `crates/gvm-sandbox/src/{ebpf,capability}.rs` | Risk: Low (drop-in replacements; behavior preserved on success path; both `nix::utsname::uname()` and `procfs::Process::myself()` return `Result` and the existing fail-closed branches are kept)
+
+### 2026-04-07: Sandbox exit reason classification (OOM, timeout, seccomp, external SIGKILL)
+
+**Problem**: When the sandboxed agent died from `WaitStatus::Signaled(_, SIGKILL, _)`, GVM logged only "Agent killed by signal: SIGKILL" — indistinguishable across cgroup OOM, GVM-initiated timeout, user Ctrl+C, and external `kill -9`. Users had no actionable signal for the most common production failure (OOM).
+
+**Fix**: Added `ExitReason` enum (`Normal | AgentError | Timeout | UserInterrupt | SeccompViolation | OomKill | ExternalKill`) and classified SIGKILL exits by root cause priority: OOM (cgroup `memory.events.oom_kill > 0`) → Timeout (GVM wait loop set the flag) → UserInterrupt (SIGTERM relayed) → ExternalKill. SIGSYS routes directly to SeccompViolation. OOM takes precedence over Timeout because memory pressure is the underlying cause when both fire (slow agent → timeout, but root cause is memory).
+
+**cgroup observability**: `CgroupGuard::oom_kill_count()` reads `memory.events`, `cpu_throttled_us()` reads `cpu.stat`. Both must be called before the guard is dropped (Drop removes the cgroup directory). Called in `sandbox_impl.rs` immediately after `waitpid` returns — safe because `memory.oom.group=1` ensures all cgroup processes are reaped before SIGCHLD, so the counter is final.
+
+**CLI output**: `pipeline.rs::print_exit_reason()` prints actionable hints for each variant. OOM → "out of memory (limit: 32MB). Try: gvm run --sandbox --memory 64m". Timeout → "Increase via: GVM_SANDBOX_TIMEOUT=...". CPU throttling > 1s also surfaces a note independent of exit reason.
+
+**Testability**: Pure parsers (`parse_oom_kill_count`, `parse_cpu_throttled_us`) extracted to `crate::cgroup_parse` (not gated on `target_os = "linux"`) so they're unit-testable on Windows/macOS dev hosts. 8 parser tests covering: empty file, missing field, garbage value, no-throttle, with-throttle. Runtime cgroup file I/O remains in `cgroup.rs` (linux-only).
+
+Files: `crates/gvm-sandbox/src/{lib,sandbox_impl,cgroup,cgroup_parse}.rs`, `crates/gvm-cli/src/pipeline.rs` | Risk: Low (additive — `SandboxResult` gains fields, no existing fields removed; classification logic is post-hoc on existing wait result; cgroup reads are graceful-fallback)
+
 ### 2026-04-06: Security hardening — veth IP collision fix + /tmp TOCTOU fix
 
 **Veth IP collision elimination**: Replaced PID-based subnet derivation (`child_pid % 256`, `(child_pid / 256) % 64`) with a monotonic `AtomicU32` counter. Previous design could produce identical /30 subnets when two PIDs mapped to the same slot (e.g., PID 100 and PID 16484), causing network isolation breakdown between concurrent sandboxes. Counter guarantees uniqueness within a process lifetime; orphan cleanup on restart prevents cross-restart collisions. Parent sends the counter slot (not PID) to child via coordination pipe for address reconstruction.

@@ -421,6 +421,10 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
             .unwrap_or(3600), // Default: 1 hour
     );
     let wait_start = std::time::Instant::now();
+    // Track which path triggered SIGKILL so we can classify SIGKILL exits
+    // by root cause (Timeout vs SIGTERM-relayed-as-SIGKILL vs OOM vs external).
+    let mut timeout_triggered = false;
+    let mut user_interrupt_triggered = false;
     let wait_result = loop {
         match waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {
@@ -430,6 +434,7 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
                         pid = child_pid.as_raw(),
                         "SIGTERM received — killing sandbox child for cleanup"
                     );
+                    user_interrupt_triggered = true;
                     nix::sys::signal::kill(child_pid, nix::sys::signal::SIGTERM).ok();
                     std::thread::sleep(std::time::Duration::from_millis(500));
                     nix::sys::signal::kill(child_pid, nix::sys::signal::SIGKILL).ok();
@@ -444,6 +449,7 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
                         timeout_secs = wait_timeout.as_secs(),
                         "Sandbox child timed out — sending SIGKILL"
                     );
+                    timeout_triggered = true;
                     nix::sys::signal::kill(child_pid, nix::sys::signal::SIGKILL).ok();
                     break waitpid(child_pid, None);
                 }
@@ -458,19 +464,60 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         Err(_) => 0,
     };
 
-    let exit_code = match wait_result {
-        Ok(WaitStatus::Exited(_, code)) => code,
+    // Read cgroup observability counters BEFORE the cgroup guard is dropped.
+    // memory.oom.group=1 ensures all cgroup processes are reaped before SIGCHLD,
+    // so by the time waitpid returns, oom_kill counter is final and stable.
+    let oom_kills = _cgroup_guard
+        .as_ref()
+        .map(|g| g.oom_kill_count())
+        .unwrap_or(0);
+    let cpu_throttled_us = _cgroup_guard.as_ref().and_then(|g| g.cpu_throttled_us());
+    let memory_limit_mb = config.memory_limit.map(|b| b / (1024 * 1024));
+
+    let (exit_code, exit_reason) = match wait_result {
+        Ok(WaitStatus::Exited(_, 0)) => (0, crate::ExitReason::Normal),
+        Ok(WaitStatus::Exited(_, code)) => (code, crate::ExitReason::AgentError { code }),
         Ok(WaitStatus::Signaled(_, signal, _)) => {
-            tracing::warn!(signal = ?signal, "Agent killed by signal");
-            128 + signal as i32
+            let signum = signal as i32;
+            // SIGKILL classification priority (root cause first):
+            //   1. OOM kill (kernel-initiated, cgroup memory.events evidence)
+            //   2. Timeout (GVM-initiated, wait loop set the flag)
+            //   3. UserInterrupt (GVM-initiated, SIGTERM relayed)
+            //   4. SeccompViolation (SIGSYS specifically)
+            //   5. ExternalKill (anything else)
+            let reason = if signal == nix::sys::signal::Signal::SIGSYS {
+                // Best-effort: scan kernel ring buffer for the AUDIT_SECCOMP
+                // record matching this child PID. The record is emitted by
+                // our dual-filter Log layer, so it exists whenever the agent
+                // tripped the filter — but only if dmesg is readable (root
+                // or `kernel.dmesg_restrict=0`). Graceful fallback to None.
+                let syscall =
+                    crate::seccomp_audit::find_syscall_name_for_pid(child_pid.as_raw() as u32);
+                crate::ExitReason::SeccompViolation {
+                    count: seccomp_violations.max(1),
+                    syscall,
+                }
+            } else if oom_kills > 0 {
+                crate::ExitReason::OomKill { memory_limit_mb }
+            } else if timeout_triggered {
+                crate::ExitReason::Timeout {
+                    secs: wait_timeout.as_secs(),
+                }
+            } else if user_interrupt_triggered {
+                crate::ExitReason::UserInterrupt
+            } else {
+                crate::ExitReason::ExternalKill { signal: signum }
+            };
+            tracing::warn!(signal = ?signal, reason = ?reason, "Agent killed by signal");
+            (128 + signum, reason)
         }
         Ok(status) => {
             tracing::warn!(status = ?status, "Unexpected wait status");
-            1
+            (1, crate::ExitReason::ExternalKill { signal: 0 })
         }
         Err(e) => {
             tracing::error!(error = %e, "waitpid failed");
-            1
+            (1, crate::ExitReason::ExternalKill { signal: 0 })
         }
     };
 
@@ -565,11 +612,42 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         clear_sandbox_state();
     }
 
+    // 7. Verify cleanup actually released everything we claim to have released.
+    // Cheap (~tens of ms): one `ip link show`, two iptables calls, one
+    // /proc/mounts read, three Path::exists checks. Run unconditionally so
+    // any leak is visible to the caller — silent residuals would erode trust
+    // in the "Zero-Trace" UX of `gvm stop`.
+    let mount_paths_for_verify: Vec<String> = {
+        let mut v = vec![
+            staging_ws.display().to_string(),
+            sandbox_root.display().to_string(),
+        ];
+        if let Some(ref m) = home_overlay_merged {
+            v.push(m.display().to_string());
+            v.push(format!("/run/gvm/home-overlay-{}", my_pid));
+        }
+        v
+    };
+    let cleanup_verification = crate::verify_cleanup(
+        my_pid,
+        &veth_config.host_iface,
+        &mount_paths_for_verify,
+    );
+    if !cleanup_verification.is_clean() {
+        tracing::warn!(
+            residuals = cleanup_verification.total(),
+            "Post-cleanup residuals detected — see SandboxResult.cleanup_verification"
+        );
+    }
+
     Ok(SandboxResult {
         exit_code,
+        exit_reason,
         setup_ms,
         seccomp_violations,
+        cpu_throttled_us,
         fs_diff,
+        cleanup_verification,
     })
 }
 

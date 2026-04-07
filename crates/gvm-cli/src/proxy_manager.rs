@@ -391,6 +391,65 @@ fn kill_process(pid: u32) {
     }
 }
 
+/// Result of attempting to stop the GVM proxy daemon.
+pub enum StopOutcome {
+    /// SIGTERM caused graceful exit within the deadline.
+    GracefulExit { pid: u32, elapsed_ms: u128 },
+    /// Graceful exit timed out, SIGKILL was required.
+    ForcedKill { pid: u32, elapsed_ms: u128 },
+    /// PID file existed but the process was already dead.
+    AlreadyDead { pid: u32 },
+    /// No PID file at all — proxy was never started, or PID file was cleaned.
+    NotRunning,
+}
+
+/// Stop the GVM proxy daemon: read PID file → SIGTERM → poll for exit → SIGKILL fallback.
+///
+/// Pure lifecycle logic — does NOT touch sandbox cleanup. The CLI handler
+/// orchestrates `stop_proxy()` + `cleanup_all_orphans_report()` separately
+/// so each step is observable.
+pub fn stop_proxy(workspace: &Path) -> StopOutcome {
+    let pid_path = workspace.join("data/proxy.pid");
+    let pid = match read_pid_file(&pid_path) {
+        Some(p) => p,
+        None => return StopOutcome::NotRunning,
+    };
+
+    if !is_process_alive(pid) {
+        // Stale PID file — clean it up so next status query is accurate.
+        let _ = std::fs::remove_file(&pid_path);
+        return StopOutcome::AlreadyDead { pid };
+    }
+
+    let start = std::time::Instant::now();
+    kill_process(pid); // SIGTERM (graceful)
+
+    // Poll for up to 5s, 200ms intervals — matches the proxy's drain timeout.
+    let deadline = start + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if !is_process_alive(pid) {
+            let _ = std::fs::remove_file(&pid_path);
+            return StopOutcome::GracefulExit {
+                pid,
+                elapsed_ms: start.elapsed().as_millis(),
+            };
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    // Still alive after grace period — escalate to SIGKILL.
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let _ = std::fs::remove_file(&pid_path);
+    StopOutcome::ForcedKill {
+        pid,
+        elapsed_ms: start.elapsed().as_millis(),
+    }
+}
+
 /// Background proxy watchdog: polls health, restarts on crash.
 /// Uses PID file for restart instead of cargo run.
 pub async fn watchdog(proxy: String, workspace: PathBuf) {

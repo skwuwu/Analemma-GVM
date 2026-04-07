@@ -873,14 +873,28 @@ fn is_pid_alive(pid: u32) -> bool {
     }
 }
 
+/// Per-resource counters returned by `cleanup_state_resources()`.
+#[derive(Default)]
+struct StateCleanupCounts {
+    mount_paths: u32,
+    cgroups: u32,
+    iptables_chains: u32,
+    veth: bool,
+}
+
 /// Clean up all resources listed in a SandboxState.
-fn cleanup_state_resources(state: &SandboxState) {
+///
+/// Returns per-resource counts so the caller can build a user-facing report.
+fn cleanup_state_resources(state: &SandboxState) -> StateCleanupCounts {
+    let mut counts = StateCleanupCounts::default();
+
     // 1. Unmount sandbox mount paths (reverse order for nested mounts)
     for mount_path in state.mount_paths.iter().rev() {
         let path = std::path::Path::new(mount_path);
         if path.exists() {
             nix::mount::umount2(path, nix::mount::MntFlags::MNT_DETACH).ok();
             std::fs::remove_dir_all(path).ok();
+            counts.mount_paths += 1;
             tracing::debug!(path = mount_path, "Unmounted orphan mount");
         }
     }
@@ -898,7 +912,9 @@ fn cleanup_state_resources(state: &SandboxState) {
                     }
                 }
             }
-            std::fs::remove_dir(cg).ok();
+            if std::fs::remove_dir(cg).is_ok() {
+                counts.cgroups += 1;
+            }
             tracing::debug!(cgroup = cgroup, "Removed orphan cgroup");
         }
     }
@@ -928,20 +944,67 @@ fn cleanup_state_resources(state: &SandboxState) {
         // deletes the veth). Reversing this order makes detach a no-op.
         crate::ebpf::detach_tc_filter(&state.veth_host);
         cleanup_host_network(&veth_config, state.dns_target.as_deref());
+        counts.veth = true;
+        // Per-sandbox iptables chain GVM-{veth_host} + DNAT/MASQUERADE rules.
+        counts.iptables_chains += 1;
         tracing::debug!(iface = %state.veth_host, "Cleaned orphan: TC filter + iptables + veth");
+    }
+
+    counts
+}
+
+/// Per-resource counters from a cleanup pass.
+///
+/// Reported by `cleanup_all_orphans_report()` so the CLI can show users
+/// exactly what was released, instead of a single opaque "cleaned N sandboxes".
+#[derive(Debug, Clone, Default)]
+pub struct CleanupReport {
+    /// Total number of orphaned sandbox state files processed (per-PID + legacy).
+    pub sandboxes: u32,
+    /// veth pairs deleted (host-side `veth-gvm-h*`).
+    pub veth_interfaces: u32,
+    /// veth interface names removed, in deletion order (for "✓ removed: veth-gvm-h0, ..." display).
+    pub veth_names: Vec<String>,
+    /// Mount paths unmounted.
+    pub mount_paths: u32,
+    /// cgroup directories removed.
+    pub cgroups: u32,
+    /// iptables chains flushed (per-sandbox `GVM-veth-*` chains + stale FORWARD chains).
+    pub iptables_chains: u32,
+    /// Defense-in-depth: orphan veths with no matching state file.
+    pub orphan_veths_swept: u32,
+}
+
+impl CleanupReport {
+    /// True if any resource was cleaned. Used by CLI to suppress noise on no-op runs.
+    pub fn is_empty(&self) -> bool {
+        self.sandboxes == 0
+            && self.veth_interfaces == 0
+            && self.mount_paths == 0
+            && self.cgroups == 0
+            && self.iptables_chains == 0
+            && self.orphan_veths_swept == 0
     }
 }
 
 /// Scan for stale state files and clean up orphaned sandbox resources.
 ///
-/// Called at the start of every `gvm run --sandbox`. Finds state files
-/// whose owning PID is no longer running, cleans up all listed resources,
-/// and deletes the state files.
+/// Backwards-compatible wrapper around `cleanup_all_orphans_report()` that
+/// returns only the total sandbox count. Use the report variant when the
+/// caller needs per-resource breakdown for user-facing output.
+pub fn cleanup_all_orphans() -> Result<u32> {
+    cleanup_all_orphans_report().map(|r| r.sandboxes + r.orphan_veths_swept)
+}
+
+/// Same as `cleanup_all_orphans()` but returns a per-resource breakdown.
+///
+/// Called at the start of every `gvm run --sandbox` and by `gvm cleanup`.
+/// Finds state files whose owning PID is no longer running, cleans up all
+/// listed resources, and deletes the state files.
 ///
 /// Also cleans up legacy single-file state from pre-v0.2 (`/run/gvm/interfaces.json`).
-///
-/// Returns the number of orphaned sandboxes cleaned up.
-pub fn cleanup_all_orphans() -> Result<u32> {
+pub fn cleanup_all_orphans_report() -> Result<CleanupReport> {
+    let mut report = CleanupReport::default();
     let mut cleaned = 0u32;
 
     // 1. Scan per-PID state files
@@ -996,7 +1059,15 @@ pub fn cleanup_all_orphans() -> Result<u32> {
             state.pid
         );
 
-        cleanup_state_resources(&state);
+        let counts = cleanup_state_resources(&state);
+        report.mount_paths += counts.mount_paths;
+        report.cgroups += counts.cgroups;
+        report.iptables_chains += counts.iptables_chains;
+        if counts.veth {
+            report.veth_interfaces += 1;
+            report.veth_names.push(state.veth_host.clone());
+        }
+        report.sandboxes += 1;
         let _ = std::fs::remove_file(&path);
         cleaned += 1;
     }
@@ -1031,7 +1102,15 @@ pub fn cleanup_all_orphans() -> Result<u32> {
                 "Cleaning up legacy /tmp state file (PID {} dead)",
                 state.pid
             );
-            cleanup_state_resources(&state);
+            let counts = cleanup_state_resources(&state);
+            report.mount_paths += counts.mount_paths;
+            report.cgroups += counts.cgroups;
+            report.iptables_chains += counts.iptables_chains;
+            if counts.veth {
+                report.veth_interfaces += 1;
+                report.veth_names.push(state.veth_host.clone());
+            }
+            report.sandboxes += 1;
             cleaned += 1;
         }
         // Always remove legacy /tmp state files — new ones go to /run/gvm/.
@@ -1067,9 +1146,13 @@ pub fn cleanup_all_orphans() -> Result<u32> {
                     };
                     cleanup_host_network(&config, None);
                     crate::ebpf::detach_tc_filter(host_iface);
+                    report.veth_interfaces += 1;
+                    report.veth_names.push(host_iface.to_string());
+                    report.iptables_chains += 1;
                     tracing::info!("Cleaned up legacy state file");
                 }
                 let _ = std::fs::remove_file(LEGACY_STATE_FILE);
+                report.sandboxes += 1;
                 cleaned += 1;
             }
         }
@@ -1106,6 +1189,9 @@ pub fn cleanup_all_orphans() -> Result<u32> {
                         // Clean iptables chain for this veth before deleting it
                         cleanup_orphan_iptables_chain(iface);
                         let _ = Command::new("ip").args(["link", "del", iface]).output();
+                        report.orphan_veths_swept += 1;
+                        report.veth_names.push(iface.to_string());
+                        report.iptables_chains += 1;
                         cleaned += 1;
                     }
                 }
@@ -1115,12 +1201,14 @@ pub fn cleanup_all_orphans() -> Result<u32> {
 
     // 4. Defense-in-depth: scan FORWARD chain for stale GVM-* chains without matching veth
     // This catches iptables pollution from SIGKILL'd sandboxes where state file was never written.
-    cleaned += cleanup_stale_forward_chains() as u32;
+    let stale_chains = cleanup_stale_forward_chains() as u32;
+    report.iptables_chains += stale_chains;
+    cleaned += stale_chains;
 
     if cleaned > 0 {
         tracing::info!(count = cleaned, "Orphan sandbox cleanup complete");
     }
-    Ok(cleaned)
+    Ok(report)
 }
 
 /// Remove iptables FORWARD chain and associated NAT/MASQUERADE rules for an orphan veth.

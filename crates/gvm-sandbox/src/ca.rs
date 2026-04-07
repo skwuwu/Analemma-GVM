@@ -25,6 +25,14 @@ pub struct EphemeralCA {
     ca_cert_pem: Vec<u8>,
     /// PEM-encoded CA private key (for GvmCertResolver to sign leaf certs).
     ca_key_pem: Vec<u8>,
+    /// Certificate `not_after` timestamp.
+    ///
+    /// Set exactly when the CA is freshly generated. When loaded from disk
+    /// (subsequent restarts), we approximate via the cert file's mtime + 365d
+    /// — this stays accurate as long as the file was written by `generate()`,
+    /// which is the only path that creates it. Surfaced as `ca_expires_days`
+    /// in `/gvm/health` so `gvm status` can warn before expiry.
+    not_after: time::OffsetDateTime,
 }
 
 /// Default file paths for persistent CA storage.
@@ -64,6 +72,18 @@ impl EphemeralCA {
         KeyPair::from_pem(&String::from_utf8_lossy(&key_pem))
             .context("Saved CA key PEM is invalid")?;
 
+        // Approximate not_after from the cert file's mtime + 365d.
+        // This is exact because generate() always sets a 365-day validity
+        // and writes the file immediately. Falls back to "now + 365d" if the
+        // mtime is unreadable (extremely rare).
+        let mtime = std::fs::metadata(cert_path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| time::OffsetDateTime::from_unix_timestamp(d.as_secs() as i64).ok())
+            .unwrap_or_else(time::OffsetDateTime::now_utc);
+        let not_after = mtime + time::Duration::days(365);
+
         tracing::info!(
             cert = %cert_path.display(),
             "MITM CA loaded from disk (persistent across restarts)"
@@ -72,6 +92,7 @@ impl EphemeralCA {
         Ok(Self {
             ca_cert_pem: cert_pem,
             ca_key_pem: key_pem,
+            not_after,
         })
     }
 
@@ -118,7 +139,8 @@ impl EphemeralCA {
         // 365-day validity. Persistent CA — not ephemeral per-session.
         let now = time::OffsetDateTime::now_utc();
         params.not_before = now - time::Duration::hours(24);
-        params.not_after = now + time::Duration::days(365);
+        let not_after = now + time::Duration::days(365);
+        params.not_after = not_after;
 
         let ca_cert = params
             .self_signed(&key_pair)
@@ -132,7 +154,15 @@ impl EphemeralCA {
         Ok(Self {
             ca_cert_pem,
             ca_key_pem,
+            not_after,
         })
+    }
+
+    /// Days until the CA certificate expires (negative if already expired).
+    /// Used by `/gvm/health` to surface CA validity to `gvm status`.
+    pub fn expires_in_days(&self) -> i64 {
+        let now = time::OffsetDateTime::now_utc();
+        (self.not_after - now).whole_days()
     }
 
     /// Get the CA certificate in PEM format (for trust store injection).

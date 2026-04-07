@@ -198,18 +198,57 @@ pub enum SeccompProfile {
     Custom(PathBuf),
 }
 
+/// Why the sandboxed agent terminated.
+///
+/// Distinguishes user-friendly cases (OOM, timeout, seccomp) from generic
+/// SIGKILL so the CLI can give actionable hints. Priority for SIGKILL
+/// classification: OOM > Timeout > UserInterrupt > ExternalKill (root cause first).
+#[derive(Debug, Clone)]
+pub enum ExitReason {
+    /// Agent exited with code 0.
+    Normal,
+    /// Agent exited with non-zero code (its own error path).
+    AgentError { code: i32 },
+    /// GVM SIGKILL'd the agent because GVM_SANDBOX_TIMEOUT was exceeded.
+    Timeout { secs: u64 },
+    /// GVM SIGKILL'd the agent because the parent received SIGTERM (Ctrl+C, systemd stop).
+    UserInterrupt,
+    /// Killed by SIGSYS — seccomp filter blocked a syscall.
+    ///
+    /// `syscall` is populated when we successfully parsed the AUDIT_SECCOMP
+    /// record from `dmesg` for the dying child PID. `None` means dmesg was
+    /// unavailable, no audit record matched, or the syscall number wasn't
+    /// in our lookup table — caller should fall back to the generic
+    /// "check dmesg" message.
+    SeccompViolation { count: u32, syscall: Option<String> },
+    /// Killed by cgroup OOM killer (memory limit exceeded).
+    OomKill { memory_limit_mb: Option<u64> },
+    /// Killed by an external signal not initiated by GVM and not from cgroup OOM.
+    ExternalKill { signal: i32 },
+}
+
 /// Result of a sandboxed agent execution.
 #[derive(Debug)]
 pub struct SandboxResult {
-    /// Agent process exit code.
+    /// Agent process exit code (128 + signal for signaled exits).
     pub exit_code: i32,
+    /// Classified reason for termination — used by CLI to print actionable hints.
+    pub exit_reason: ExitReason,
     /// Sandbox setup time in milliseconds.
     pub setup_ms: u64,
     /// Whether seccomp violations were detected.
     pub seccomp_violations: u32,
+    /// CPU throttle time in microseconds (from cgroup cpu.stat).
+    /// None if cgroup unavailable or no CPU limit was set.
+    pub cpu_throttled_us: Option<u64>,
     /// Filesystem diff report (overlayfs upper layer scan).
     /// None if overlayfs was not active or scan failed.
     pub fs_diff: Option<filesystem::FsDiffReport>,
+    /// Post-cleanup residual report. Lists any veth/iptables/mount/cgroup/state
+    /// resources that survived the cleanup pass. `is_clean()` is the success
+    /// signal — if it's false, the CLI surfaces actionable manual recovery
+    /// commands rather than silently leaking host resources.
+    pub cleanup_verification: CleanupVerification,
 }
 
 /// Pre-flight check results.
@@ -241,6 +280,18 @@ pub struct PreflightReport {
 
 pub mod ca;
 pub mod filesystem;
+
+// Pure parsers — OS-independent so they can be unit-tested on any host.
+mod cgroup_parse;
+// dmesg-line parser is OS-independent; the runtime invocation is linux-only.
+mod seccomp_audit;
+// Syscall number → name lookup. Linux-only because libc::SYS_* constants
+// only exist on Linux; gated at module level so Windows builds skip it.
+#[cfg(target_os = "linux")]
+mod syscall_names;
+// Cleanup residual scanner. Pure parsers cross-platform; runtime gated linux.
+mod cleanup_verify;
+pub use cleanup_verify::{verify_cleanup, CleanupVerification};
 
 // ── Platform-specific implementation ──
 
@@ -312,6 +363,53 @@ pub fn cleanup_all_orphans() -> Result<u32> {
 #[cfg(not(target_os = "linux"))]
 pub fn cleanup_all_orphans() -> Result<u32> {
     Ok(0)
+}
+
+/// Per-resource cleanup breakdown — used by `gvm cleanup` for user-facing
+/// progress output (which veth/mount/iptables resources were released).
+#[cfg(target_os = "linux")]
+pub use network::CleanupReport;
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Clone, Default)]
+pub struct CleanupReport {
+    pub sandboxes: u32,
+    pub veth_interfaces: u32,
+    pub veth_names: Vec<String>,
+    pub mount_paths: u32,
+    pub cgroups: u32,
+    pub iptables_chains: u32,
+    pub orphan_veths_swept: u32,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl CleanupReport {
+    pub fn is_empty(&self) -> bool {
+        true
+    }
+}
+
+/// Cleanup with per-resource breakdown for the `gvm cleanup` UX.
+#[cfg(target_os = "linux")]
+pub fn cleanup_all_orphans_report() -> Result<CleanupReport> {
+    network::cleanup_all_orphans_report()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn cleanup_all_orphans_report() -> Result<CleanupReport> {
+    Ok(CleanupReport::default())
+}
+
+/// Number of syscalls in the default seccomp whitelist (excludes the implicit
+/// ENOSYS-default for everything else). Used by `gvm status`.
+#[cfg(target_os = "linux")]
+pub fn allowed_syscall_count() -> usize {
+    seccomp::allowed_syscall_count()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn allowed_syscall_count() -> usize {
+    0
 }
 
 /// Run pre-flight checks to verify the system supports sandboxing.

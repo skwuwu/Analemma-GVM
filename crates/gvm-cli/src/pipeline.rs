@@ -251,6 +251,16 @@ async fn launch_sandbox(config: &AgentConfig, pre: &PreLaunchState) -> Result<i3
         );
     }
 
+    // Print actionable termination diagnostic so users understand WHY the agent
+    // died and what to do about it. Generic "killed by signal: SIGKILL" was
+    // useless — OOM, timeout, and external kill all looked identical.
+    print_exit_reason(&result.exit_reason, result.cpu_throttled_us);
+
+    // Verify that cleanup actually released every host resource we claim
+    // to have released. Surfaces leaks immediately rather than letting
+    // them accumulate silently across runs.
+    print_cleanup_verification(&result.cleanup_verification);
+
     // Display filesystem diff report + interactive review (overlayfs Trust-on-Pattern)
     if let Some(ref diff) = result.fs_diff {
         if diff.overlayfs_active {
@@ -260,6 +270,138 @@ async fn launch_sandbox(config: &AgentConfig, pre: &PreLaunchState) -> Result<i3
     }
 
     Ok(result.exit_code)
+}
+
+/// Print a one-line, actionable diagnostic for why the agent terminated.
+///
+/// Distinguishes OOM/timeout/seccomp/external SIGKILL so users know what to fix.
+/// Silent on Normal exit (success — nothing to say).
+fn print_exit_reason(reason: &gvm_sandbox::ExitReason, cpu_throttled_us: Option<u64>) {
+    use gvm_sandbox::ExitReason::*;
+    match reason {
+        Normal => {}
+        AgentError { code } => {
+            eprintln!("  {YELLOW}\u{26a0} Agent exited with error code {}{RESET}", code);
+        }
+        Timeout { secs } => {
+            eprintln!(
+                "  {RED}\u{26a0} Agent timed out after {}s{RESET}\n    \
+                 Increase via: GVM_SANDBOX_TIMEOUT={} gvm run ...",
+                secs,
+                secs * 2
+            );
+        }
+        UserInterrupt => {
+            eprintln!("  {DIM}Agent terminated by user/system signal (SIGTERM){RESET}");
+        }
+        SeccompViolation { count, syscall: Some(name) } => {
+            // We resolved the exact syscall via dmesg AUDIT_SECCOMP scan.
+            // Show the user the syscall name and an actionable next step.
+            eprintln!(
+                "  {RED}\u{26a0} Agent killed: seccomp violation \u{2014} attempted {}(2){RESET}\n    \
+                 This syscall is blocked by the sandbox profile. {} violation(s) total.\n    \
+                 Either remove the call from the agent or run without --sandbox.",
+                name, count
+            );
+        }
+        SeccompViolation { count, syscall: None } => {
+            // dmesg unavailable or no matching record — fall back to the
+            // pointer message so the user can inspect manually.
+            eprintln!(
+                "  {RED}\u{26a0} Agent killed: {} seccomp violation(s){RESET}\n    \
+                 Inspect blocked syscall(s): dmesg | grep SECCOMP",
+                count
+            );
+        }
+        OomKill { memory_limit_mb: Some(mb) } => {
+            eprintln!(
+                "  {RED}\u{26a0} Agent killed: out of memory (limit: {}MB){RESET}\n    \
+                 Try: gvm run --sandbox --memory {}m ...",
+                mb,
+                mb * 2
+            );
+        }
+        OomKill { memory_limit_mb: None } => {
+            eprintln!(
+                "  {RED}\u{26a0} Agent killed: out of memory (system OOM, no --memory limit set){RESET}"
+            );
+        }
+        ExternalKill { signal } => {
+            eprintln!(
+                "  {YELLOW}\u{26a0} Agent killed by external signal {} (not GVM-initiated){RESET}\n    \
+                 Another process sent SIGKILL/SIGTERM. Check: ps, systemd, OOM killer outside cgroup",
+                signal
+            );
+        }
+    }
+
+    // CPU throttling note (independent of exit reason — agent may have completed
+    // successfully but slowly because of --cpus limit).
+    if let Some(throttled) = cpu_throttled_us {
+        if throttled > 1_000_000 {
+            eprintln!(
+                "  {DIM}Note: agent CPU throttled for {:.1}s. Increase --cpus if performance matters.{RESET}",
+                throttled as f64 / 1_000_000.0
+            );
+        }
+    }
+}
+
+/// Print the post-cleanup residual report. Silent on a fully-clean exit
+/// (the common case) so we don't add noise; verbose with manual recovery
+/// commands when leaks exist so users have an actionable next step.
+pub fn print_cleanup_verification(v: &gvm_sandbox::CleanupVerification) {
+    use crate::ui::{DIM, GREEN, RED, RESET, YELLOW};
+
+    if v.is_clean() {
+        // Don't spam the happy path. The diagnostic exists for when something
+        // goes wrong — silence is the success signal.
+        eprintln!("  {DIM}Cleanup verified: network, mounts, cgroup, state file all clean.{RESET}");
+        return;
+    }
+
+    eprintln!();
+    eprintln!("  {YELLOW}Cleanup verification: {} residual(s) detected{RESET}", v.total());
+
+    // Network category
+    if v.network_residuals.is_empty() {
+        eprintln!("  {GREEN}\u{2713}{RESET} Network: clean");
+    } else {
+        for r in &v.network_residuals {
+            eprintln!("  {RED}\u{2717}{RESET} Network: {}", r);
+        }
+        // Recovery hint — `gvm cleanup` re-runs the orphan sweep and will
+        // catch leftover veth/iptables on a second pass.
+        eprintln!("    Run: {}gvm cleanup{}", DIM, RESET);
+    }
+
+    // Mount category
+    if v.mount_residuals.is_empty() {
+        eprintln!("  {GREEN}\u{2713}{RESET} Mounts: clean");
+    } else {
+        for path in &v.mount_residuals {
+            eprintln!("  {RED}\u{2717}{RESET} Mount: {} still in /proc/mounts", path);
+            eprintln!("    Run: sudo umount -l {}", path);
+        }
+    }
+
+    // Cgroup category
+    match &v.cgroup_residual {
+        None => eprintln!("  {GREEN}\u{2713}{RESET} Cgroup: removed"),
+        Some(path) => {
+            eprintln!("  {RED}\u{2717}{RESET} Cgroup: {} still present", path);
+            eprintln!("    Run: sudo rmdir {}", path);
+        }
+    }
+
+    // State file category
+    match &v.state_file_residual {
+        None => eprintln!("  {GREEN}\u{2713}{RESET} State file: removed"),
+        Some(path) => {
+            eprintln!("  {RED}\u{2717}{RESET} State file: {} still present", path);
+            eprintln!("    Run: sudo rm {}", path);
+        }
+    }
 }
 
 async fn launch_contained_wrapper(config: &AgentConfig, _pre: &PreLaunchState) -> Result<i32> {

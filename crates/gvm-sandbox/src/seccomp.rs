@@ -227,6 +227,41 @@ fn build_default_filter(default_action: SeccompAction) -> Result<seccompiler::Bp
         .context("Failed to compile seccomp BPF program")
 }
 
+/// Number of syscalls in the default whitelist — used by `gvm status` to
+/// show users the isolation surface without parsing the kernel BPF program.
+///
+/// Built by replaying `insert_base_syscalls` + the explicit socket family.
+/// Counts distinct syscall numbers only — argument-filtered socket() is
+/// counted once. Anything not in the whitelist returns ENOSYS by default
+/// (no separate blocklist count exists in the current design).
+pub fn allowed_syscall_count() -> usize {
+    let mut allow_rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    insert_base_syscalls(&mut allow_rules);
+    allow_rules.insert(libc::SYS_socket as i64, vec![]);
+    for sys in [
+        libc::SYS_connect,
+        libc::SYS_socketpair,
+        libc::SYS_sendto,
+        libc::SYS_recvfrom,
+        libc::SYS_sendmsg,
+        libc::SYS_recvmsg,
+        libc::SYS_sendmmsg,
+        libc::SYS_recvmmsg,
+        libc::SYS_getsockopt,
+        libc::SYS_setsockopt,
+        libc::SYS_getsockname,
+        libc::SYS_getpeername,
+        libc::SYS_shutdown,
+        libc::SYS_bind,
+        libc::SYS_listen,
+        libc::SYS_accept,
+        libc::SYS_accept4,
+    ] {
+        allow_rules.insert(sys as i64, vec![]);
+    }
+    allow_rules.len()
+}
+
 /// Insert the base (non-networking) syscall whitelist shared by all filter profiles.
 /// This covers process lifecycle, memory, file I/O, polling, time, identity, and runtime support.
 fn insert_base_syscalls(rules: &mut BTreeMap<i64, Vec<SeccompRule>>) {

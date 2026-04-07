@@ -98,12 +98,15 @@ pub fn check(config: &SandboxConfig) -> PreflightReport {
     }
 
     // Kernel version (diagnostic logging, no blocking)
-    if let Ok(uname) = std::fs::read_to_string("/proc/sys/kernel/osrelease") {
-        let version = uname.trim();
-        tracing::info!(kernel = version, "Sandbox environment kernel version");
-        // Warn about known problematic kernels
-        if version.starts_with("6.17.") {
-            tracing::warn!("Kernel 6.17.x detected — ldd-in-PID-namespace panic workaround active");
+    if let Ok(utsname) = nix::sys::utsname::uname() {
+        if let Some(version) = utsname.release().to_str() {
+            tracing::info!(kernel = version, "Sandbox environment kernel version");
+            // Warn about known problematic kernels
+            if version.starts_with("6.17.") {
+                tracing::warn!(
+                    "Kernel 6.17.x detected — ldd-in-PID-namespace panic workaround active"
+                );
+            }
         }
     }
 
@@ -147,30 +150,19 @@ fn check_seccomp() -> bool {
 }
 
 /// Check if current process has CAP_NET_ADMIN in effective capabilities.
+///
+/// Uses the `procfs` crate's structured `/proc/self/status` parser instead
+/// of hand-rolled hex parsing — eliminates a class of off-by-one and
+/// radix-parsing bugs.
 fn check_cap_net_admin() -> bool {
-    let content = match std::fs::read_to_string("/proc/self/status") {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-
-    let cap_eff_hex = match content
-        .lines()
-        .find(|line| line.starts_with("CapEff:"))
-        .and_then(|line| line.split_whitespace().nth(1))
-    {
-        Some(v) => v,
-        None => return false,
-    };
-
-    let cap_eff = match u64::from_str_radix(cap_eff_hex, 16) {
-        Ok(v) => v,
+    let cap_eff = match procfs::process::Process::myself().and_then(|p| p.status()) {
+        Ok(status) => status.capeff,
         Err(_) => return false,
     };
 
     // Linux capability index for CAP_NET_ADMIN.
     const CAP_NET_ADMIN_BIT: u64 = 12;
-    let bit = CAP_NET_ADMIN_BIT;
-    (cap_eff & (1u64 << bit)) != 0
+    (cap_eff & (1u64 << CAP_NET_ADMIN_BIT)) != 0
 }
 
 /// Check if IP forwarding is enabled.

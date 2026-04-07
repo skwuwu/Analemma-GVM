@@ -268,15 +268,16 @@ pub fn detach_tc_filter(interface: &str) {
     tracing::debug!(interface = interface, "TC ingress filter detached");
 }
 
-/// Parse kernel version from uname.
+/// Parse kernel version from the `uname(2)` syscall.
+///
+/// Uses `nix::sys::utsname::uname()` instead of fork+exec'ing `uname -r` —
+/// avoids a process spawn and is robust against PATH issues.
 fn kernel_version() -> Result<(u32, u32)> {
-    let output = Command::new("uname")
-        .arg("-r")
-        .output()
-        .context("Failed to run uname")?;
-
-    let version_str = String::from_utf8_lossy(&output.stdout);
-    let version_str = version_str.trim();
+    let utsname = nix::sys::utsname::uname().context("uname(2) syscall failed")?;
+    let version_str = utsname
+        .release()
+        .to_str()
+        .context("Kernel release is not valid UTF-8")?;
 
     // Parse "5.15.0-generic" → (5, 15)
     let parts: Vec<&str> = version_str.split('.').collect();

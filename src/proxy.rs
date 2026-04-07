@@ -109,6 +109,15 @@ pub struct AppState {
     /// certs are generated. Health endpoint includes this so proxy_manager
     /// can wait for TLS readiness before starting sandbox agents.
     pub tls_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Process start time — surfaced as `uptime_secs` in `/gvm/health`.
+    pub start_time: std::time::Instant,
+    /// Total proxied requests since start. Incremented at the top of
+    /// `proxy_handler` and surfaced as `total_requests` in `/gvm/health`.
+    /// `Relaxed` is sufficient — we never branch on this value.
+    pub request_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Days until the MITM CA certificate expires (computed at startup from
+    /// `not_after`). `None` when MITM is not active.
+    pub ca_expires_days: Option<i64>,
 }
 
 /// Derive event status from upstream HTTP response.
@@ -128,6 +137,12 @@ pub async fn proxy_handler(
     State(state): State<AppState>,
     mut request: Request<Body>,
 ) -> Response<Body> {
+    // Bump the request counter for `/gvm/health` observability.
+    // Relaxed is sufficient — we never branch on this value.
+    state
+        .request_counter
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     // ── Step 0: Verify JWT identity (if configured) ──
     let verified_identity = if let Some(ref jwt) = state.jwt_config {
         match auth::extract_bearer_token(request.headers()) {
