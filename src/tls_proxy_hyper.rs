@@ -381,10 +381,18 @@ async fn handle_request(
         }
     };
 
-    // Drive upstream connection in background
+    // Drive upstream connection in background.
+    // Log the driver's outcome at INFO so a silent failure here is visible —
+    // a dropped driver makes sender.send_request() hang indefinitely.
+    let driver_host = upstream_host.to_string();
     tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            tracing::debug!(error = %e, "MITM: upstream conn driver ended");
+        match conn.await {
+            Ok(()) => {
+                tracing::info!(host = %driver_host, "MITM: upstream conn driver ended cleanly")
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, host = %driver_host, "MITM: upstream conn driver errored")
+            }
         }
     });
 
@@ -433,6 +441,7 @@ async fn handle_request(
         )
         .unwrap();
 
+    tracing::info!(host = %upstream_host, "MITM: sending upstream request");
     // Bound the upstream wait. Without this, a stalled GitHub/Cloudflare
     // origin keeps the connection open indefinitely and the agent observes
     // a hang instead of an actionable 504. 60s matches the typical CDN
@@ -460,7 +469,7 @@ async fn handle_request(
 
     match send_result {
         Ok(resp) => {
-            tracing::debug!(status = %resp.status(), host = %upstream_host, "MITM: upstream response");
+            tracing::info!(status = %resp.status(), host = %upstream_host, "MITM: upstream response");
             // Stream response directly to client — hyper handles framing.
             // No buffering, no custom chunked parser, no manual content-length.
             let (parts, body) = resp.into_parts();
