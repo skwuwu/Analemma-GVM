@@ -192,7 +192,12 @@ async fn launch_sandbox(config: &AgentConfig, pre: &PreLaunchState) -> Result<i3
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
-        let (interpreter, interpreter_args) = run::detect_interpreter(ext, &script_name);
+        // Inside the sandbox, the parent script_dir is bind-mounted at
+        // /workspace and the agent's working directory is /workspace/output.
+        // A bare `python3 script.py` therefore looks for /workspace/output/script.py
+        // which doesn't exist. Pass the sandbox-absolute path instead.
+        let sandbox_script_path = format!("/workspace/{}", script_name);
+        let (interpreter, interpreter_args) = run::detect_interpreter(ext, &sandbox_script_path);
 
         run::assemble_sandbox_config(
             abs_script.clone(),
