@@ -261,6 +261,7 @@ fn print_isolation_profile() {
 #[cfg(target_os = "linux")]
 fn dummy_sandbox_config() -> gvm_sandbox::SandboxConfig {
     gvm_sandbox::SandboxConfig {
+        script_path: std::path::PathBuf::from("/tmp/status-probe.py"),
         workspace_dir: std::path::PathBuf::from("/tmp"),
         interpreter: "python3".to_string(),
         interpreter_args: vec![],
