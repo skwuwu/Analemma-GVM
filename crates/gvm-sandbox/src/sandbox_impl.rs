@@ -596,8 +596,12 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     // Unmount sandbox root (lazy detach handles nested mounts from failed runs)
     nix::mount::umount2(&sandbox_root, nix::mount::MntFlags::MNT_DETACH).ok();
     std::fs::remove_dir_all(&sandbox_root).ok();
-    // Unmount the staging workspace (pre-mounted before clone for kernel 6.17+ compat)
-    nix::mount::umount(&staging_ws).ok();
+    // Unmount the staging workspace (pre-mounted before clone for kernel 6.17+ compat).
+    // Parent mounted with MS_BIND | MS_REC, so cleanup must use MNT_DETACH to release
+    // any nested submounts the recursive bind picked up. A plain umount() leaves the
+    // entry in /proc/mounts because the mount has children, which the post-cleanup
+    // residual scanner correctly flags.
+    nix::mount::umount2(&staging_ws, nix::mount::MntFlags::MNT_DETACH).ok();
     std::fs::remove_dir(&staging_ws).ok();
     // Clean up home overlayfs (parent-mounted before clone)
     crate::mount::cleanup_home_overlay(my_pid);

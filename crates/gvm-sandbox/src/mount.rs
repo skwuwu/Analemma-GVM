@@ -348,9 +348,12 @@ pub fn mount_home_overlay(host_home: &Path, pid: u32) -> Option<PathBuf> {
     let upper_dir = upper_base.join("upper");
     let work_dir = upper_base.join("work");
 
-    // Clean up stale mounts
+    // Clean up stale mounts. MNT_DETACH on both because we just released
+    // `merged` (which had `upper_base/upper` as its upperdir) and the kernel
+    // releases overlay references asynchronously — a plain umount on
+    // upper_base races and returns EBUSY, leaving the tmpfs in /proc/mounts.
     nix::mount::umount2(&merged, nix::mount::MntFlags::MNT_DETACH).ok();
-    nix::mount::umount(&upper_base).ok();
+    nix::mount::umount2(&upper_base, nix::mount::MntFlags::MNT_DETACH).ok();
     std::fs::remove_dir_all(&upper_base).ok();
     std::fs::remove_dir_all(&merged).ok();
 
@@ -388,7 +391,7 @@ pub fn mount_home_overlay(host_home: &Path, pid: u32) -> Option<PathBuf> {
         Some(mount_opts.as_str()),
     ) {
         tracing::warn!(error = %e, "overlayfs home mount failed");
-        nix::mount::umount(&upper_base).ok();
+        nix::mount::umount2(&upper_base, nix::mount::MntFlags::MNT_DETACH).ok();
         std::fs::remove_dir_all(&upper_base).ok();
         std::fs::remove_dir_all(&merged).ok();
         return None;
@@ -406,8 +409,9 @@ pub fn mount_home_overlay(host_home: &Path, pid: u32) -> Option<PathBuf> {
 pub fn cleanup_home_overlay(pid: u32) {
     let merged = PathBuf::from(format!("/run/gvm/home-merged-{}", pid));
     let upper_base = PathBuf::from(format!("/run/gvm/home-overlay-{}", pid));
+    // MNT_DETACH on both — see mount_home_overlay() for the EBUSY rationale.
     nix::mount::umount2(&merged, nix::mount::MntFlags::MNT_DETACH).ok();
-    nix::mount::umount(&upper_base).ok();
+    nix::mount::umount2(&upper_base, nix::mount::MntFlags::MNT_DETACH).ok();
     std::fs::remove_dir_all(&upper_base).ok();
     std::fs::remove_dir_all(&merged).ok();
 }
@@ -429,9 +433,11 @@ pub fn mount_workspace_overlay(
     let upper_dir = upper_base.join("upper");
     let work_dir = upper_base.join("work");
 
-    // Clean up stale mounts
+    // Clean up stale mounts. MNT_DETACH on both — same EBUSY rationale as
+    // mount_home_overlay(): the overlay drop is async, a plain umount on
+    // upper_base races and leaves the tmpfs.
     nix::mount::umount2(&merged, nix::mount::MntFlags::MNT_DETACH).ok();
-    nix::mount::umount(&upper_base).ok();
+    nix::mount::umount2(&upper_base, nix::mount::MntFlags::MNT_DETACH).ok();
     std::fs::remove_dir_all(&upper_base).ok();
     std::fs::remove_dir_all(&merged).ok();
 
@@ -470,7 +476,7 @@ pub fn mount_workspace_overlay(
         Some(mount_opts.as_str()),
     ) {
         tracing::warn!(error = %e, "workspace overlayfs mount failed");
-        nix::mount::umount(&upper_base).ok();
+        nix::mount::umount2(&upper_base, nix::mount::MntFlags::MNT_DETACH).ok();
         std::fs::remove_dir_all(&upper_base).ok();
         std::fs::remove_dir_all(&merged).ok();
         return None;
@@ -489,8 +495,9 @@ pub fn mount_workspace_overlay(
 pub fn cleanup_workspace_overlay(pid: u32) {
     let merged = PathBuf::from(format!("/run/gvm/ws-merged-{}", pid));
     let upper_base = PathBuf::from(format!("/run/gvm/ws-overlay-{}", pid));
+    // MNT_DETACH on both — see mount_workspace_overlay() for the EBUSY rationale.
     nix::mount::umount2(&merged, nix::mount::MntFlags::MNT_DETACH).ok();
-    nix::mount::umount(&upper_base).ok();
+    nix::mount::umount2(&upper_base, nix::mount::MntFlags::MNT_DETACH).ok();
     std::fs::remove_dir_all(&upper_base).ok();
     std::fs::remove_dir_all(&merged).ok();
 }

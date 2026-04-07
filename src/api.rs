@@ -1148,6 +1148,15 @@ pub async fn approve_request(
 ///
 /// Security: returns summary counts only, not internal rule details.
 pub async fn info(State(state): State<AppState>) -> Response<Body> {
+    // Single read lock so both counts come from the same snapshot — a concurrent
+    // reload cannot slip a different version of the registry between the two
+    // fields. Fail-closed to (0, 0) on poison.
+    let (core_ops, custom_ops) = state
+        .registry
+        .read()
+        .map(|r| (r.core_count(), r.custom_count()))
+        .unwrap_or((0, 0));
+
     json_response(
         StatusCode::OK,
         &serde_json::json!({
@@ -1160,8 +1169,8 @@ pub async fn info(State(state): State<AppState>) -> Response<Body> {
                 "ledger": "active",
             },
             "registry": {
-                "core_operations": state.registry.read().map(|r| r.core_count()).unwrap_or(0),
-                "custom_operations": state.registry.read().map(|r| r.custom_count()).unwrap_or(0),
+                "core_operations": core_ops,
+                "custom_operations": custom_ops,
             },
             "shadow": {
                 "mode": format!("{:?}", state.shadow_config.mode),
