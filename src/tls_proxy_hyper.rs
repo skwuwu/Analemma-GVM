@@ -433,6 +433,7 @@ async fn handle_request(
     // Always set Host to the actual upstream — the original was the proxy.
     upstream_req = upstream_req.header("host", upstream_host);
 
+    let body_len = body_bytes.len();
     let upstream_req = upstream_req
         .body(
             Full::new(body_bytes)
@@ -440,6 +441,28 @@ async fn handle_request(
                 .boxed(),
         )
         .unwrap();
+
+    // Dump exactly what we send so a 10s graceful close from upstream is
+    // attributable to *our* request, not guesswork. Logs every header that
+    // hyper will put on the wire — confirms Host rewrite, no duplicates,
+    // User-Agent presence, etc.
+    {
+        let dbg_method = upstream_req.method().clone();
+        let dbg_uri = upstream_req.uri().clone();
+        let dbg_headers: Vec<String> = upstream_req
+            .headers()
+            .iter()
+            .map(|(k, v)| format!("{}: {}", k, v.to_str().unwrap_or("<binary>")))
+            .collect();
+        tracing::info!(
+            host = %upstream_host,
+            method = %dbg_method,
+            uri = %dbg_uri,
+            body_bytes = body_len,
+            headers = ?dbg_headers,
+            "MITM: upstream request dump"
+        );
+    }
 
     tracing::info!(host = %upstream_host, "MITM: sending upstream request");
     // Bound the upstream wait. Without this, a stalled GitHub/Cloudflare
