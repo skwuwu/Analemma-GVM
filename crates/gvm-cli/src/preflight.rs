@@ -142,6 +142,7 @@ struct SandboxCapabilities {
     net_admin: bool,
     ip_cmd: bool,
     iptables_cmd: bool,
+    ip6tables_cmd: bool,
     tc_filter: bool,
     kernel_warning: Option<String>,
 }
@@ -192,9 +193,12 @@ fn gather_sandbox_checks() -> SandboxCapabilities {
                 ok: report.net_admin_capability,
                 label: "CAP_NET_ADMIN",
                 detail: if report.net_admin_capability {
-                    "available (run with sudo)".to_string()
+                    "available".to_string()
                 } else {
-                    "missing (run with sudo)".to_string()
+                    "missing — run with sudo, or grant once: sudo setcap \
+                     'cap_net_admin,cap_sys_admin,cap_sys_ptrace+ep' \
+                     $(which gvm)"
+                        .to_string()
                 },
             },
             Check {
@@ -203,7 +207,7 @@ fn gather_sandbox_checks() -> SandboxCapabilities {
                 detail: if report.ip_command_available {
                     which_path("ip")
                 } else {
-                    "not found (install iproute2)".to_string()
+                    format!("not found — {}", install_hint("iproute2"))
                 },
             },
             Check {
@@ -212,7 +216,19 @@ fn gather_sandbox_checks() -> SandboxCapabilities {
                 detail: if report.iptables_command_available {
                     which_path("iptables")
                 } else {
-                    "not found (apt install iptables)".to_string()
+                    format!("not found — {}", install_hint("iptables"))
+                },
+            },
+            Check {
+                ok: report.ip6tables_command_available,
+                label: "ip6tables",
+                detail: if report.ip6tables_command_available {
+                    which_path("ip6tables")
+                } else {
+                    format!(
+                        "not found — IPv6 cannot be disabled in sandbox netns; {}",
+                        install_hint("iptables")
+                    )
                 },
             },
         ];
@@ -238,6 +254,7 @@ fn gather_sandbox_checks() -> SandboxCapabilities {
             net_admin: report.net_admin_capability,
             ip_cmd: report.ip_command_available,
             iptables_cmd: report.iptables_command_available,
+            ip6tables_cmd: report.ip6tables_command_available,
             tc_filter: report.tc_filter_available,
             kernel_warning,
             checks,
@@ -268,6 +285,7 @@ fn gather_sandbox_checks() -> SandboxCapabilities {
             net_admin: false,
             ip_cmd: false,
             iptables_cmd: false,
+            ip6tables_cmd: false,
             tc_filter: false,
             kernel_warning: None,
         }
@@ -311,16 +329,22 @@ fn compute_modes(_checks: &[Check], sandbox: &SandboxCapabilities) -> Vec<Mode> 
     let sandbox_reason = if !sandbox.is_linux {
         Some("Linux only".to_string())
     } else if !sandbox.net_admin {
-        Some("run with sudo".to_string())
+        Some("run with sudo (or `setcap cap_net_admin,cap_sys_admin+ep gvm`)".to_string())
     } else if !sandbox.user_namespaces {
         Some("enable user namespaces".to_string())
     } else if !sandbox.seccomp {
         Some("kernel lacks seccomp-BPF".to_string())
-    } else if !sandbox.ip_cmd || !sandbox.iptables_cmd {
-        Some("install iproute2 + iptables".to_string())
+    } else if !sandbox.ip_cmd {
+        Some(install_hint("iproute2"))
+    } else if !sandbox.iptables_cmd {
+        Some(install_hint("iptables"))
     } else {
         None
     };
+    // ip6tables is intentionally non-blocking — sandbox launches without it
+    // but operators should be aware of the IPv6 bypass risk. Surfaced in the
+    // checks list above as a yellow warning, not in mode availability.
+    let _ = sandbox.ip6tables_cmd;
 
     let sandbox_mode = Mode {
         available: sandbox_ready,
@@ -388,7 +412,57 @@ fn count_credentials(path: &Path) -> usize {
 
 /// Labels that are optional (warning instead of error).
 fn is_optional(label: &str) -> bool {
-    matches!(label, "TC ingress filter" | "Credentials" | "Kernel")
+    matches!(
+        label,
+        "TC ingress filter" | "Credentials" | "Kernel" | "ip6tables"
+    )
+}
+
+/// Distro-aware install hint for a missing system package.
+///
+/// Reads `/etc/os-release` and maps `ID`/`ID_LIKE` to the appropriate package
+/// manager invocation. Falls back to a generic message on unknown distros so
+/// users at least see *what* is missing even if they have to look up *how*.
+#[cfg(target_os = "linux")]
+fn install_hint(pkg: &str) -> String {
+    let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+    let mut id = String::new();
+    let mut id_like = String::new();
+    for line in os_release.lines() {
+        if let Some(rest) = line.strip_prefix("ID=") {
+            id = rest.trim_matches('"').to_string();
+        } else if let Some(rest) = line.strip_prefix("ID_LIKE=") {
+            id_like = rest.trim_matches('"').to_string();
+        }
+    }
+    let family = format!("{} {}", id, id_like);
+
+    if family.contains("debian") || family.contains("ubuntu") {
+        format!("sudo apt install {}", pkg)
+    } else if family.contains("rhel")
+        || family.contains("fedora")
+        || family.contains("centos")
+        || family.contains("amzn")
+        || family.contains("rocky")
+        || family.contains("almalinux")
+    {
+        // RHEL family uses different package names for the iproute2 package.
+        let rhel_pkg = if pkg == "iproute2" { "iproute" } else { pkg };
+        format!("sudo dnf install {}", rhel_pkg)
+    } else if family.contains("alpine") {
+        format!("sudo apk add {}  (note: musl build required)", pkg)
+    } else if family.contains("arch") {
+        format!("sudo pacman -S {}", pkg)
+    } else if family.contains("suse") {
+        format!("sudo zypper install {}", pkg)
+    } else {
+        format!("install '{}' via your distro's package manager", pkg)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_hint(pkg: &str) -> String {
+    format!("install '{}' (Linux only)", pkg)
 }
 
 /// Resolve a command to its path for display.

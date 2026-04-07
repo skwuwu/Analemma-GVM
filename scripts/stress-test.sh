@@ -279,33 +279,37 @@ launch_agent() {
             done
         ) > "$agent_log" 2>&1 &
     else
-        # Fallback: Python script that makes HTTP requests through proxy
-        timeout $((DURATION_SEC + 120)) "$GVM_BIN" run $gvm_mode_flag \
-            --agent-id "$session_id" -- python3 -c "
-import requests, time, os, random
-proxy = '$PROXY_URL'
-proxies = {'http': proxy, 'https': proxy}
+        # Fallback: disk-based Python script invoked through SCRIPT MODE
+        # (no `--` separator). This deliberately exercises run::detect_interpreter,
+        # /workspace bind mount, and the script-mode sandbox path — code paths
+        # the OpenClaw branch above (binary mode via `-- node ...`) never hits.
+        # Two latent bugs survived weeks of stress runs because nothing here
+        # exercised script mode.
+        local stress_script="$RESULTS_DIR/stress-agent-$id.py"
+        cat > "$stress_script" <<PY
+import requests, time, random
+proxy = "$PROXY_URL"
+proxies = {"http": proxy, "https": proxy}
 urls = [
-    ('GET', 'http://api.github.com/repos/torvalds/linux/commits?per_page=1'),
-    ('GET', 'http://api.github.com/repos/rust-lang/rust/commits?per_page=1'),
-    ('GET', 'http://raw.githubusercontent.com/golang/go/master/README.md'),
-    ('GET', 'http://catfact.ninja/fact'),
-    ('GET', 'http://numbersapi.com/random/trivia'),
-    ('GET', 'http://dog.ceo/api/breeds/image/random'),
-    ('GET', 'http://official-joke-api.appspot.com/random_joke'),
+    ("GET", "http://api.github.com/repos/torvalds/linux/commits?per_page=1"),
+    ("GET", "http://api.github.com/repos/rust-lang/rust/commits?per_page=1"),
+    ("GET", "http://raw.githubusercontent.com/golang/go/master/README.md"),
+    ("GET", "http://catfact.ninja/fact"),
+    ("GET", "http://numbersapi.com/random/trivia"),
+    ("GET", "http://dog.ceo/api/breeds/image/random"),
+    ("GET", "http://official-joke-api.appspot.com/random_joke"),
 ]
 for i in range(200):
     method, url = random.choice(urls)
     try:
-        if method == 'GET':
-            r = requests.get(url, proxies=proxies, timeout=15)
-        else:
-            r = requests.post(url, json={'data':'stress-$id'}, proxies=proxies, timeout=15)
-        print(f'[{i}] {method} {url} -> {r.status_code}')
+        r = requests.get(url, proxies=proxies, timeout=15)
+        print(f"[{i}] {method} {url} -> {r.status_code}")
     except Exception as e:
-        print(f'[{i}] {method} {url} -> ERR: {e}')
+        print(f"[{i}] {method} {url} -> ERR: {e}")
     time.sleep(random.uniform(5, 20))
-" > "$agent_log" 2>&1 &
+PY
+        timeout $((DURATION_SEC + 120)) "$GVM_BIN" run $gvm_mode_flag \
+            --agent-id "$session_id" "$stress_script" > "$agent_log" 2>&1 &
     fi
 
     echo $! >> "$RESULTS_DIR/agent_pids.txt"

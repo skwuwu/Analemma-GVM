@@ -50,6 +50,18 @@ pub fn check(config: &SandboxConfig) -> PreflightReport {
         issues.push("`iptables` command not found in PATH.".to_string());
     }
 
+    // ip6tables is optional but recommended — without it the sandbox cannot
+    // disable IPv6 inside the netns and AAAA-resolving agents may bypass v4
+    // enforcement. Surfaced as a non-blocking warning.
+    let ip6tables_command_available = check_interpreter("ip6tables");
+    if !ip6tables_command_available {
+        issues.push(
+            "`ip6tables` command not found — sandbox cannot disable IPv6 inside the netns. \
+             AAAA-resolving agents may bypass v4 rules. Install via your distro's iptables package."
+                .to_string(),
+        );
+    }
+
     let interpreter_found = check_interpreter(&config.interpreter);
     if !interpreter_found {
         issues.push(format!(
@@ -117,6 +129,7 @@ pub fn check(config: &SandboxConfig) -> PreflightReport {
         ip_forward,
         ip_command_available,
         iptables_command_available,
+        ip6tables_command_available,
         interpreter_found,
         tc_filter_available,
         issues,

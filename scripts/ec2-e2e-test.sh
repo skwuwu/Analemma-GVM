@@ -1959,6 +1959,77 @@ print(f'STATUS:{r.status_code}:REPO:{r.json().get(\"name\",\"?\")}')" 2>/dev/nul
 fi
 
 # ═══════════════════════════════════════════════════════════════════
+# TEST 33-script: gvm run — script mode (auto-interpreter detection)
+# ═══════════════════════════════════════════════════════════════════
+#
+# Script mode is the user-facing happy path documented in the README:
+#
+#   gvm run agent.py
+#
+# It is hit when the first arg is a recognised script extension AND no
+# `--` separator is used. Internally takes a different code path from
+# binary mode (run::detect_interpreter + sandbox /workspace bind mount),
+# so it must be exercised independently — binary-mode coverage does not
+# protect this surface. Two latent bugs went undetected for weeks
+# because every existing E2E used `gvm run -- node openclaw.mjs`
+# (binary mode) and never exercised script mode at all.
+
+if should_run 33; then
+    header "33-script: gvm run — script mode (auto-interpreter)"
+
+    if [ ! -f "$GVM_BIN" ]; then
+        skip "33-script: gvm CLI binary not built"
+    else
+        # Build a tiny .py agent on disk so script mode has something to run.
+        SCRIPT_AGENT="/tmp/gvm-e2e-script-agent.py"
+        cat > "$SCRIPT_AGENT" <<'PY'
+import sys
+print("script-mode-agent-ok")
+sys.exit(0)
+PY
+
+        # 33-script-a: cooperative script mode (no sandbox).
+        # Validates run::detect_interpreter() and PATH-resolved python3.
+        echo -e "  Testing: gvm run /tmp/gvm-e2e-script-agent.py (cooperative)"
+        SCRIPT_OUT=$("$GVM_BIN" run "$SCRIPT_AGENT" 2>&1 || true)
+        if echo "$SCRIPT_OUT" | grep -q "script-mode-agent-ok"; then
+            pass "33-script-a: script mode (cooperative) auto-detects python3"
+        else
+            fail "33-script-a: script mode cooperative — agent did not run"
+            echo "$SCRIPT_OUT" | tail -10 | sed 's/^/    /'
+        fi
+
+        # 33-script-b: sandbox script mode (separate code path — bind mount,
+        # workspace dir, /workspace/<script> path translation). This is the
+        # exact path that was broken by commit d8c0a04 + a069cea.
+        echo -e "  Testing: sudo gvm run --sandbox /tmp/gvm-e2e-script-agent.py"
+        SANDBOX_OUT=$(sudo "$GVM_BIN" run --sandbox "$SCRIPT_AGENT" 2>&1 || true)
+        if echo "$SANDBOX_OUT" | grep -q "script-mode-agent-ok"; then
+            pass "33-script-b: script mode (sandbox) executes inside namespace"
+        else
+            fail "33-script-b: script mode sandbox — agent did not run"
+            echo "$SANDBOX_OUT" | tail -15 | sed 's/^/    /'
+        fi
+
+        # 33-script-c: Pre-flight must NOT report "Interpreter not found"
+        # on a system where python3 exists but the unversioned `python`
+        # symlink does not (default Ubuntu 22.04+). This is the regression
+        # guard for commit 248fc7e.
+        if ! command -v python &>/dev/null && command -v python3 &>/dev/null; then
+            if echo "$SANDBOX_OUT" | grep -q "Interpreter not found"; then
+                fail "33-script-c: detect_interpreter regressed — fell back to 'python' on python3-only host"
+            else
+                pass "33-script-c: detect_interpreter picks python3 when python is absent"
+            fi
+        else
+            skip "33-script-c: host has python symlink, regression guard not applicable"
+        fi
+
+        rm -f "$SCRIPT_AGENT"
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
 # TEST 34: gvm run — full external API integration via gvm run
 # ═══════════════════════════════════════════════════════════════════
 

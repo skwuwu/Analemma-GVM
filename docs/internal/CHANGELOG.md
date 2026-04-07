@@ -55,6 +55,27 @@ v0.2 shipped: Shadow Mode + intent store, CONNECT tunnel, SRR hot-reload, eBPF u
 
 ## Implementation Log
 
+### 2026-04-08: Honest dependency story — README + preflight (ip6tables, distro hints, setcap)
+
+**Problem**: README claimed "single Rust binary with no dependency" — overstated. Reality:
+- Binary is dynamically linked against glibc; Alpine/musl needs a separate build target
+- `--sandbox` mode requires `iproute2`, `iptables`, and `ip6tables` on the host
+- `gvm preflight` checked `ip` and `iptables` but **not** `ip6tables`, even though `network.rs`/`seccomp.rs` use it to disable IPv6 inside the sandbox netns. AAAA-resolving agents could silently bypass v4-only enforcement.
+- Install hints were Debian-only (`apt install iptables`) — RHEL/Fedora/Amazon Linux/Alpine/Arch users had to guess
+- `CAP_NET_ADMIN missing` only suggested sudo — `setcap` alternative was undocumented
+
+**Fix**:
+1. **README**: Replaced "single Rust binary with no dependency" with a realistic Requirements section listing glibc/musl distinction, sandbox-mode tools (iproute2 + iptables + ip6tables), and the `setcap` alternative to sudo. Added `gvm preflight` to Quick Start.
+2. **`PreflightReport`**: Added `ip6tables_command_available` field (`crates/gvm-sandbox/src/lib.rs`). Populated in `capability.rs::check()` as a non-blocking warning — sandbox still launches without it, but operators see the IPv6 bypass risk in the issues list.
+3. **`gvm preflight` CLI**: Surfaces ip6tables as a yellow (optional) check. New `install_hint(pkg)` helper reads `/etc/os-release` and maps `ID`/`ID_LIKE` to the right package manager invocation (`apt`, `dnf`, `apk`, `pacman`, `zypper`). Alpine hint also flags "musl build required". Mode-availability "reason" strings now use the same hint instead of hard-coded `apt`.
+4. **CAP_NET_ADMIN guidance**: Detail message now suggests both `sudo` and `setcap 'cap_net_admin,cap_sys_admin,cap_sys_ptrace+ep' $(which gvm)` so users on minimal/non-root environments have a path forward.
+
+**Why ip6tables is non-blocking**: Sandbox functionally runs without it (v4-only enforcement still active), so blocking would break workflows on minimal containers where IPv6 is already disabled at the kernel. But the warning is loud enough that users on dual-stack hosts see the risk before deploying.
+
+**Out of scope**: glibc-vs-musl detection from inside the binary is impossible if the loader fails to start the binary in the first place. README is the only viable warning channel for that case.
+
+Files: `README.md`, `crates/gvm-sandbox/src/{lib,capability}.rs`, `crates/gvm-cli/src/preflight.rs` | Risk: Low (additive `PreflightReport` field, non-blocking new check, README copy change; `pipeline.rs::missing_critical` unchanged so existing flows still launch identically)
+
 ### 2026-04-07: Post-cleanup residual verification — auditable Zero-Trace claim
 
 **Problem**: Both `gvm run --sandbox` cleanup and `gvm stop` ran cleanup with no way to confirm it actually succeeded. If a veth interface, iptables chain, mount point, cgroup directory, or state file survived (kernel bug, race, partial failure), the leak silently accumulated until the next `gvm cleanup --dry-run`. The "Zero-Trace" UX claim was aspirational, not auditable.

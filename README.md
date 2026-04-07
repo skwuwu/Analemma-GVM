@@ -1,16 +1,16 @@
 # Analemma-GVM
 
-I wanted to run multiple OpenClaw agents for my startup. But every time I let an agent autonomously call external APIs, the same question stopped me: *what if it calls something it shouldn't?*
+I wanted to run multiple OpenClaw agents for my startup. But every time I let agents everything what they wanna do, there was always a little anxiety: What if it does something it shouldn't?
 
-Existing answers required Kubernetes, Envoy sidecars, or trusting the agent to behave. I needed something I could `cargo build` and run in front of any agent, on a single machine, with no infrastructure team.
+Existing answers(such as Openshell, OPA+Envoy) required Kubernetes, Envoy sidecars, or trusting the agent to behave. I wanted a light weight alternative which doesn't need infrastructure settings and highly enforces what agents do.
 
-So I built GVM — an HTTP proxy that sits between your agent and the internet. It doesn't trust the agent. It watches every API call, blocks what you haven't approved, and keeps a tamper-evident log of everything.
+So I built GVM(Governance Virtual Machine) — an governance runtime that exists between your agent and the actual actions. It is designed assuming that agents can't be fully trusted and can sometimes be hostile. It watches every API call, blocks what you haven't approved, and keeps a tamper-proof log(by Merkle chain) of agent's actions.
 
 ```
 Agent (any framework) → GVM Proxy → External APIs
 ```
 
-Single binary. Single process. No Docker, no K8s, no GPU.
+A single Rust binary on glibc-based Linux. No Docker, no K8s, no GPU.
 
 ---
 
@@ -21,19 +21,29 @@ Single binary. Single process. No Docker, no K8s, no GPU.
 - **Startups** that need governance and audit trails but can't adopt enterprise infra (OPA, Envoy, NVIDIA OpenShell)
 - **Agent framework users** (OpenClaw, CrewAI, LangChain, AutoGen) who want a safety layer that doesn't require code changes
 
-If you have a Kubernetes cluster and a platform team, you probably don't need this. If you're one person running agents on an EC2 instance, this is for you.
+If you're running agents on an EC2 instance, you may need this.
 
 ---
+
+## Requirements
+
+- **OS**: Linux x86_64. The pre-built binary is dynamically linked against glibc — works on Ubuntu 20.04+, Debian 11+, RHEL 8+, Amazon Linux 2023, and equivalents. Alpine / other musl distros need a `x86_64-unknown-linux-musl` build from source.
+- **Cooperative / watch / MCP modes**: glibc only. No extra system tools.
+- **`--sandbox` mode**: additionally requires `iproute2` (`ip`), `iptables`, and `ip6tables` on the host (preinstalled on most server distros). `gvm preflight` reports exactly what is missing and prints the install command for your distro. Either run as `sudo` or grant the binary capabilities directly: `sudo setcap 'cap_net_admin,cap_sys_admin,cap_sys_ptrace+ep' ./gvm`.
+- **Other modes** (`--contained`): Docker on the host instead of the above.
 
 ## Quick Start
 
 ```bash
-# Option 1: Pre-built binary (Linux x86_64)
+# Option 1: Pre-built binary (glibc Linux x86_64)
 curl -L https://github.com/skwuwu/Analemma-GVM/releases/latest/download/gvm-linux-x86_64.tar.gz | tar xz
 
 # Option 2: Build from source
 git clone https://github.com/skwuwu/Analemma-GVM.git && cd Analemma-GVM
 cargo build --release
+
+# Verify your environment (sandbox prerequisites, available modes)
+./gvm preflight
 ```
 
 ```bash
@@ -97,10 +107,9 @@ GVM provides MCP tools for AI assistants. [Setup guide →](docs/quickstart.md#7
 
 ---
 
-## What it's not
+## What it doesn't do
 
 - **Not a prompt filter.** Use Lakera or provider safety for that. GVM governs actions, not words.
-- **Not enterprise infra.** No multi-node, no Kubernetes operator, no dashboard. Single binary, single machine.
 - **Not a replacement for OPA.** OPA governs service-to-service. GVM governs agent-to-world.
 
 | | LLM Provider Safety | Prompt Guards (Lakera) | **GVM** |
@@ -135,5 +144,6 @@ GVM provides MCP tools for AI assistants. [Setup guide →](docs/quickstart.md#7
 | [Changelog](docs/internal/CHANGELOG.md) | Roadmap, implementation log |
 
 ---
+- Feedback on technical and structural issues or bug reports is always welcome.
 
 v0.4 pre-release. Apache 2.0. [Issues →](https://github.com/skwuwu/Analemma-GVM/issues)

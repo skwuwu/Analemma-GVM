@@ -266,6 +266,11 @@ pub struct PreflightReport {
     pub ip_command_available: bool,
     /// Whether the `iptables` command is available.
     pub iptables_command_available: bool,
+    /// Whether the `ip6tables` command is available. Used by `network.rs` to
+    /// disable IPv6 inside the sandbox netns as a fallback when IPv6 is enabled
+    /// on the host. Optional — sandbox still launches without it, but agents
+    /// that resolve AAAA records may bypass v4 enforcement.
+    pub ip6tables_command_available: bool,
     /// Whether the interpreter binary exists.
     pub interpreter_found: bool,
     /// Whether TC ingress filter is available (kernel >= 4.15, tc command).
@@ -441,6 +446,7 @@ pub fn preflight_check(_config: &SandboxConfig) -> PreflightReport {
         ip_forward: false,
         ip_command_available: false,
         iptables_command_available: false,
+        ip6tables_command_available: false,
         interpreter_found: false,
         tc_filter_available: false,
         issues: vec![
