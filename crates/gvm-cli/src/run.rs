@@ -202,20 +202,32 @@ pub(crate) fn resolve_script(script: &str) -> Result<std::path::PathBuf> {
 
 /// Determine interpreter and arguments from a script file extension.
 /// `script_ref` is the path/name to pass as argument to the interpreter.
+///
+/// Picks the first interpreter that actually exists in PATH from a list of
+/// candidates. Modern distros (Ubuntu 22.04+, Debian 12+) ship `python3` but
+/// not `python`, so naively returning `"python"` would break sandbox preflight
+/// on default installs. Falls through to the first candidate when none are
+/// found so the caller still gets a name to surface in the error message.
 pub(crate) fn detect_interpreter(ext: &str, script_ref: &str) -> (String, Vec<String>) {
-    let interpreter = match ext {
-        "py" => "python",
-        "js" => "node",
-        "ts" => "npx",
-        "sh" | "bash" => "bash",
-        _ => "python",
+    let candidates: &[&str] = match ext {
+        "py" => &["python3", "python"],
+        "js" => &["node"],
+        "ts" => &["npx"],
+        "sh" | "bash" => &["bash"],
+        _ => &["python3", "python"],
     };
+    let interpreter = candidates
+        .iter()
+        .find(|c| gvm_sandbox::which_interpreter(c).is_some())
+        .copied()
+        .unwrap_or(candidates[0])
+        .to_string();
     let args = if ext == "ts" {
         vec!["ts-node".to_string(), script_ref.to_string()]
     } else {
         vec![script_ref.to_string()]
     };
-    (interpreter.to_string(), args)
+    (interpreter, args)
 }
 
 /// Inject standard GVM proxy environment variables into a Command.

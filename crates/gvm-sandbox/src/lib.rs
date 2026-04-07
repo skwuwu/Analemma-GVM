@@ -412,6 +412,19 @@ pub fn allowed_syscall_count() -> usize {
     0
 }
 
+/// Resolve an interpreter binary by name. Returns the absolute path if it
+/// exists in PATH, `None` otherwise. Used by the CLI to pick the first
+/// available candidate (e.g. `python3` vs `python`) before sandbox launch.
+#[cfg(target_os = "linux")]
+pub fn which_interpreter(interpreter: &str) -> Option<std::path::PathBuf> {
+    capability::which_interpreter(interpreter)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn which_interpreter(_interpreter: &str) -> Option<std::path::PathBuf> {
+    None
+}
+
 /// Run pre-flight checks to verify the system supports sandboxing.
 #[cfg(target_os = "linux")]
 pub fn preflight_check(config: &SandboxConfig) -> PreflightReport {
