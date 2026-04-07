@@ -267,6 +267,7 @@ async fn handle_request(
 
     // ── Forward to upstream ──
     let upstream_host = host.split(':').next().unwrap_or(&host);
+    tracing::info!(upstream_host, "MITM: forwarding to upstream");
 
     // Dev mode host override
     if let Some(local_addr) = state.host_overrides.get(upstream_host) {
@@ -281,14 +282,42 @@ async fn handle_request(
     // Production: TLS upstream
     let connector = tokio_rustls::TlsConnector::from(client_config);
     let upstream_addr = format!("{}:443", upstream_host);
+    tracing::info!(upstream_addr = %upstream_addr, "MITM: connecting to upstream TCP");
 
-    let upstream_tcp = match tokio::net::TcpStream::connect(&upstream_addr).await {
-        Ok(tcp) => tcp,
-        Err(e) => {
+    // Bound the TCP connect — DNS hangs and unreachable hosts would otherwise
+    // sit here for the OS default (~2 minutes) and the agent's client timeout
+    // would fire first, masking the proxy as the cause.
+    const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    let upstream_tcp = match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        tokio::net::TcpStream::connect(&upstream_addr),
+    )
+    .await
+    {
+        Ok(Ok(tcp)) => {
+            tracing::info!(upstream_addr = %upstream_addr, "MITM: TCP connected");
+            tcp
+        }
+        Ok(Err(e)) => {
             tracing::warn!(error = %e, host = %upstream_host, "MITM: upstream connect failed");
             return Ok(Response::builder()
                 .status(502)
                 .body(full_body(format!("Upstream connect failed: {}", e)))
+                .unwrap());
+        }
+        Err(_) => {
+            tracing::warn!(
+                host = %upstream_host,
+                timeout_secs = CONNECT_TIMEOUT.as_secs(),
+                "MITM: upstream TCP connect timed out"
+            );
+            return Ok(Response::builder()
+                .status(504)
+                .body(full_body(format!(
+                    "Upstream {} TCP connect timed out after {}s",
+                    upstream_host,
+                    CONNECT_TIMEOUT.as_secs()
+                )))
                 .unwrap());
         }
     };
