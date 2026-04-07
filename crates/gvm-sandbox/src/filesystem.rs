@@ -579,6 +579,8 @@ mod tests {
     // ── Phase 0 + Phase 1 tests ──
 
     /// Phase 0-A: Symlink targeting outside upper_dir is discarded.
+    /// Unix-only — Windows builds skip it because symlink semantics differ.
+    #[cfg(unix)]
     #[test]
     fn symlink_escape_is_discarded() {
         let dir = tempfile::tempdir().unwrap();
@@ -588,15 +590,7 @@ mod tests {
         std::fs::create_dir_all(&lower).unwrap();
 
         // Create symlink pointing outside upper
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink("/etc/passwd", upper.join("escape.txt")).unwrap();
-        }
-        #[cfg(not(unix))]
-        {
-            // Skip on non-Unix
-            return;
-        }
+        std::os::unix::fs::symlink("/etc/passwd", upper.join("escape.txt")).unwrap();
 
         let policy = FilesystemPolicy::default();
         let report = scan_upper_layer(&upper, &lower, &policy).unwrap();
@@ -710,6 +704,7 @@ mod tests {
     }
 
     /// Phase 1-B: execute_merge rejects symlinks.
+    #[cfg(unix)]
     #[test]
     fn execute_merge_rejects_symlinks() {
         let dir = tempfile::tempdir().unwrap();
@@ -719,14 +714,7 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
 
         // Create a symlink in upper
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink("/etc/hostname", upper.join("link.txt")).unwrap();
-        }
-        #[cfg(not(unix))]
-        {
-            return;
-        }
+        std::os::unix::fs::symlink("/etc/hostname", upper.join("link.txt")).unwrap();
 
         let report = FsDiffReport {
             auto_merged: vec![FileChange {

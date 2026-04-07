@@ -628,11 +628,8 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         }
         v
     };
-    let cleanup_verification = crate::verify_cleanup(
-        my_pid,
-        &veth_config.host_iface,
-        &mount_paths_for_verify,
-    );
+    let cleanup_verification =
+        crate::verify_cleanup(my_pid, &veth_config.host_iface, &mount_paths_for_verify);
     if !cleanup_verification.is_clean() {
         tracing::warn!(
             residuals = cleanup_verification.total(),

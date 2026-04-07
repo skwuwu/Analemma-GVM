@@ -39,3 +39,6 @@ fuzz/artifacts/
 
 # Runtime data
 data/wal.log
+
+# Claude Code local settings
+.claude/settings.local.json

@@ -151,7 +151,7 @@ async fn slowloris_open_connection_no_data_triggers_timeout() {
         "Timeout must fire at ~30s (±15s margin for slow CI), actual: {:?}",
         elapsed,
     );
-    let err_msg = format!("{}", result.err().expect("must be Err"));
+    let err_msg = format!("{}", result.unwrap_err());
     assert!(
         err_msg.contains("timed out") || err_msg.contains("Slowloris"),
         "Error must mention timeout: {}",
@@ -185,7 +185,7 @@ async fn slowloris_partial_header_triggers_timeout() {
         elapsed,
     );
 
-    let err_msg = format!("{}", result.err().expect("must be Err"));
+    let err_msg = format!("{}", result.unwrap_err());
     assert!(
         err_msg.contains("timed out") || err_msg.contains("Slowloris"),
         "Error must mention timeout: {}",

@@ -1328,11 +1328,8 @@ mod tests {
         // GET to a POST-only rule — should NOT be denied
         let result = srr.check("GET", "api.bank.com", "/transfer/123", None);
 
-        match result.decision {
-            EnforcementDecision::Deny { .. } => {
-                panic!("GET should not match a POST-only deny rule");
-            }
-            _ => {} // Any non-Deny is correct
+        if let EnforcementDecision::Deny { .. } = result.decision {
+            panic!("GET should not match a POST-only deny rule");
         }
     }
 

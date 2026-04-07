@@ -1516,304 +1516,6 @@ fn governance_block_response(status: StatusCode, block: GovernanceBlockResponse)
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::body::Bytes;
-    use std::time::{Duration, Instant};
-
-    async fn make_test_ledger() -> (Arc<Ledger>, std::path::PathBuf) {
-        let wal_path =
-            std::env::temp_dir().join(format!("gvm-proxy-test-{}.wal", uuid::Uuid::new_v4()));
-        let ledger = Ledger::new(&wal_path, "", "gvm_test")
-            .await
-            .expect("ledger init should succeed");
-        (Arc::new(ledger), wal_path)
-    }
-
-    fn make_event() -> GVMEvent {
-        GVMEvent {
-            event_id: "evt-test-1".to_string(),
-            trace_id: "trace-test-1".to_string(),
-            parent_event_id: None,
-            agent_id: "agent-test".to_string(),
-            tenant_id: None,
-            session_id: "session-test".to_string(),
-            timestamp: chrono::Utc::now(),
-            operation: "gvm.messaging.send".to_string(),
-            resource: ResourceDescriptor::default(),
-            context: HashMap::new(),
-            transport: None,
-            decision: "Delay".to_string(),
-            decision_source: "ABAC".to_string(),
-            matched_rule_id: None,
-            enforcement_point: "proxy".to_string(),
-            status: EventStatus::Pending,
-            payload: PayloadDescriptor::default(),
-            nats_sequence: None,
-            event_hash: None,
-            llm_trace: None,
-            default_caution: false,
-        }
-    }
-
-    #[tokio::test]
-    async fn llm_trace_skip_when_content_length_missing_preserves_body() {
-        let body = serde_json::json!({
-            "choices": [{
-                "message": {
-                    "reasoning_content": "secret reasoning"
-                }
-            }],
-            "model": "o1-preview"
-        })
-        .to_string();
-
-        let response = Response::builder()
-            .status(StatusCode::OK)
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body.clone()))
-            .expect("response build should succeed");
-
-        let (ledger, _wal_path) = make_test_ledger().await;
-        let event = make_event();
-        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
-
-        let bytes = http_body_util::BodyExt::collect(response.into_body())
-            .await
-            .expect("body collect should succeed")
-            .to_bytes();
-
-        // Body must be preserved regardless of trace extraction
-        assert_eq!(bytes, body.as_bytes());
-    }
-
-    #[tokio::test]
-    async fn llm_trace_extract_when_content_length_bounded() {
-        let body = serde_json::json!({
-            "choices": [{
-                "message": {
-                    "reasoning_content": "explain transfer review path"
-                }
-            }],
-            "model": "o1-preview",
-            "usage": {
-                "prompt_tokens": 10,
-                "completion_tokens": 20,
-                "total_tokens": 30
-            }
-        })
-        .to_string();
-
-        let response = Response::builder()
-            .status(StatusCode::OK)
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body.clone()))
-            .expect("response build should succeed");
-
-        let (ledger, wal_path) = make_test_ledger().await;
-        let mut event = make_event();
-        event.event_id = format!("evt-json-trace-{}", uuid::Uuid::new_v4());
-
-        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
-
-        // Body must be forwarded immediately via tap-stream
-        let bytes = http_body_util::BodyExt::collect(response.into_body())
-            .await
-            .expect("body collect should succeed")
-            .to_bytes();
-        assert_eq!(bytes, body.as_bytes());
-
-        // Trace is persisted asynchronously to WAL after stream completes
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let mut persisted_trace = None;
-
-        while Instant::now() < deadline {
-            let wal = tokio::fs::read_to_string(&wal_path)
-                .await
-                .unwrap_or_default();
-
-            for line in wal.lines() {
-                if !line.contains(&event.event_id) || !line.contains("\"llm_trace\"") {
-                    continue;
-                }
-                if let Ok(parsed) = serde_json::from_str::<GVMEvent>(line) {
-                    if let Some(trace) = parsed.llm_trace {
-                        persisted_trace = Some(trace);
-                        break;
-                    }
-                }
-            }
-
-            if persisted_trace.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-
-        let trace =
-            persisted_trace.expect("bounded JSON body should produce trace persisted to WAL");
-        assert_eq!(trace.provider, "openai");
-    }
-
-    #[tokio::test]
-    async fn llm_trace_skip_when_content_length_exceeds_limit() {
-        let body = "x".repeat(300_001);
-        let response = Response::builder()
-            .status(StatusCode::OK)
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body.clone()))
-            .expect("response build should succeed");
-
-        let (ledger, _wal_path) = make_test_ledger().await;
-        let event = make_event();
-        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
-
-        // Body must be preserved (streamed through) even if oversized
-        let bytes = http_body_util::BodyExt::collect(response.into_body())
-            .await
-            .expect("body collect should succeed")
-            .to_bytes();
-
-        assert_eq!(bytes, body.as_bytes());
-    }
-
-    #[tokio::test]
-    async fn llm_trace_collect_error_returns_explicit_error_response() {
-        // With tap-stream, upstream errors propagate through the stream
-        // rather than returning a 502 response. The stream yields Err.
-        let failing_stream = async_stream::stream! {
-            yield Err::<Bytes, std::io::Error>(std::io::Error::new(
-                std::io::ErrorKind::ConnectionReset,
-                "stream aborted",
-            ));
-        };
-
-        let response = Response::builder()
-            .status(StatusCode::OK)
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .body(Body::from_stream(failing_stream))
-            .expect("response build should succeed");
-
-        let (ledger, _wal_path) = make_test_ledger().await;
-        let event = make_event();
-        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
-
-        // The response status is preserved (200 OK from upstream headers).
-        // The body stream itself will yield the error when consumed.
-        assert_eq!(response.status(), StatusCode::OK);
-        let result = http_body_util::BodyExt::collect(response.into_body()).await;
-        assert!(
-            result.is_err(),
-            "stream error must propagate to the consumer"
-        );
-    }
-
-    #[tokio::test]
-    async fn llm_trace_sse_passthrough_returns_immediately() {
-        let first_event =
-            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}],\"model\":\"o1-preview\"}\n\n";
-        let done_event = "data: [DONE]\n\n";
-        let expected = format!("{}{}", first_event, done_event);
-
-        let slow_stream = async_stream::stream! {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            yield Ok::<Bytes, std::io::Error>(Bytes::from(first_event.to_string()));
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            yield Ok::<Bytes, std::io::Error>(Bytes::from(done_event.to_string()));
-        };
-
-        let response = Response::builder()
-            .status(StatusCode::OK)
-            .header(hyper::header::CONTENT_TYPE, "text/event-stream")
-            .body(Body::from_stream(slow_stream))
-            .expect("response build should succeed");
-
-        let (ledger, _wal_path) = make_test_ledger().await;
-        let event = make_event();
-
-        let start = Instant::now();
-        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
-        assert!(
-            start.elapsed() < Duration::from_millis(150),
-            "tap-stream extraction must not block on upstream stream completion"
-        );
-
-        let bytes = http_body_util::BodyExt::collect(response.into_body())
-            .await
-            .expect("body collect should succeed")
-            .to_bytes();
-        assert_eq!(bytes, expected.as_bytes());
-    }
-
-    #[tokio::test]
-    async fn llm_trace_sse_large_stream_preserves_body_and_persists_trace() {
-        let reasoning_fragment = "r".repeat(512);
-        let sse_event = format!(
-            "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"{}\"}}}}],\"model\":\"o1-preview\"}}\n\n",
-            reasoning_fragment
-        );
-        let repetitions = (MAX_SSE_TRACE_CAPTURE_BYTES / sse_event.len()) + 128;
-
-        let mut body = sse_event.repeat(repetitions);
-        body.push_str("data: [DONE]\n\n");
-
-        let response = Response::builder()
-            .status(StatusCode::OK)
-            .header(hyper::header::CONTENT_TYPE, "text/event-stream")
-            .body(Body::from(body.clone()))
-            .expect("response build should succeed");
-
-        let (ledger, wal_path) = make_test_ledger().await;
-        let mut event = make_event();
-        event.event_id = format!("evt-test-{}", uuid::Uuid::new_v4());
-
-        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
-
-        let bytes = http_body_util::BodyExt::collect(response.into_body())
-            .await
-            .expect("body collect should succeed")
-            .to_bytes();
-        assert_eq!(bytes, body.as_bytes());
-
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let mut persisted_trace = None;
-
-        while Instant::now() < deadline {
-            let wal = tokio::fs::read_to_string(&wal_path)
-                .await
-                .unwrap_or_default();
-
-            for line in wal.lines() {
-                if !line.contains(&event.event_id) || !line.contains("\"llm_trace\"") {
-                    continue;
-                }
-
-                if let Ok(parsed) = serde_json::from_str::<GVMEvent>(line) {
-                    if let Some(trace) = parsed.llm_trace {
-                        persisted_trace = Some(trace);
-                        break;
-                    }
-                }
-            }
-
-            if persisted_trace.is_some() {
-                break;
-            }
-
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-
-        let trace = persisted_trace
-            .expect("large SSE response should persist a bounded trace update asynchronously");
-        assert_eq!(trace.provider, "openai");
-        assert!(
-            trace.truncated,
-            "bounded capture should mark large SSE trace as truncated"
-        );
-    }
-}
-
 // ─── CONNECT Tunnel (HTTPS Proxy) ────────────────────────────────────────────
 //
 // Blind relay: CONNECT host:port → domain-level policy check → TCP relay.
@@ -2119,5 +1821,302 @@ async fn blind_relay(upgraded: hyper::upgrade::Upgraded, target_addr: &str) {
         Err(e) => {
             tracing::error!(target = %target_addr, error = %e, "CONNECT: failed to connect to upstream");
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Bytes;
+    use std::time::{Duration, Instant};
+
+    async fn make_test_ledger() -> (Arc<Ledger>, std::path::PathBuf) {
+        let wal_path =
+            std::env::temp_dir().join(format!("gvm-proxy-test-{}.wal", uuid::Uuid::new_v4()));
+        let ledger = Ledger::new(&wal_path, "", "gvm_test")
+            .await
+            .expect("ledger init should succeed");
+        (Arc::new(ledger), wal_path)
+    }
+
+    fn make_event() -> GVMEvent {
+        GVMEvent {
+            event_id: "evt-test-1".to_string(),
+            trace_id: "trace-test-1".to_string(),
+            parent_event_id: None,
+            agent_id: "agent-test".to_string(),
+            tenant_id: None,
+            session_id: "session-test".to_string(),
+            timestamp: chrono::Utc::now(),
+            operation: "gvm.messaging.send".to_string(),
+            resource: ResourceDescriptor::default(),
+            context: HashMap::new(),
+            transport: None,
+            decision: "Delay".to_string(),
+            decision_source: "ABAC".to_string(),
+            matched_rule_id: None,
+            enforcement_point: "proxy".to_string(),
+            status: EventStatus::Pending,
+            payload: PayloadDescriptor::default(),
+            nats_sequence: None,
+            event_hash: None,
+            llm_trace: None,
+            default_caution: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_trace_skip_when_content_length_missing_preserves_body() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "reasoning_content": "secret reasoning"
+                }
+            }],
+            "model": "o1-preview"
+        })
+        .to_string();
+
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.clone()))
+            .expect("response build should succeed");
+
+        let (ledger, _wal_path) = make_test_ledger().await;
+        let event = make_event();
+        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
+
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("body collect should succeed")
+            .to_bytes();
+
+        // Body must be preserved regardless of trace extraction
+        assert_eq!(bytes, body.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn llm_trace_extract_when_content_length_bounded() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "reasoning_content": "explain transfer review path"
+                }
+            }],
+            "model": "o1-preview",
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 20,
+                "total_tokens": 30
+            }
+        })
+        .to_string();
+
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.clone()))
+            .expect("response build should succeed");
+
+        let (ledger, wal_path) = make_test_ledger().await;
+        let mut event = make_event();
+        event.event_id = format!("evt-json-trace-{}", uuid::Uuid::new_v4());
+
+        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
+
+        // Body must be forwarded immediately via tap-stream
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("body collect should succeed")
+            .to_bytes();
+        assert_eq!(bytes, body.as_bytes());
+
+        // Trace is persisted asynchronously to WAL after stream completes
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut persisted_trace = None;
+
+        while Instant::now() < deadline {
+            let wal = tokio::fs::read_to_string(&wal_path)
+                .await
+                .unwrap_or_default();
+
+            for line in wal.lines() {
+                if !line.contains(&event.event_id) || !line.contains("\"llm_trace\"") {
+                    continue;
+                }
+                if let Ok(parsed) = serde_json::from_str::<GVMEvent>(line) {
+                    if let Some(trace) = parsed.llm_trace {
+                        persisted_trace = Some(trace);
+                        break;
+                    }
+                }
+            }
+
+            if persisted_trace.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let trace =
+            persisted_trace.expect("bounded JSON body should produce trace persisted to WAL");
+        assert_eq!(trace.provider, "openai");
+    }
+
+    #[tokio::test]
+    async fn llm_trace_skip_when_content_length_exceeds_limit() {
+        let body = "x".repeat(300_001);
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.clone()))
+            .expect("response build should succeed");
+
+        let (ledger, _wal_path) = make_test_ledger().await;
+        let event = make_event();
+        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
+
+        // Body must be preserved (streamed through) even if oversized
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("body collect should succeed")
+            .to_bytes();
+
+        assert_eq!(bytes, body.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn llm_trace_collect_error_returns_explicit_error_response() {
+        // With tap-stream, upstream errors propagate through the stream
+        // rather than returning a 502 response. The stream yields Err.
+        let failing_stream = async_stream::stream! {
+            yield Err::<Bytes, std::io::Error>(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "stream aborted",
+            ));
+        };
+
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Body::from_stream(failing_stream))
+            .expect("response build should succeed");
+
+        let (ledger, _wal_path) = make_test_ledger().await;
+        let event = make_event();
+        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
+
+        // The response status is preserved (200 OK from upstream headers).
+        // The body stream itself will yield the error when consumed.
+        assert_eq!(response.status(), StatusCode::OK);
+        let result = http_body_util::BodyExt::collect(response.into_body()).await;
+        assert!(
+            result.is_err(),
+            "stream error must propagate to the consumer"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_trace_sse_passthrough_returns_immediately() {
+        let first_event =
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}],\"model\":\"o1-preview\"}\n\n";
+        let done_event = "data: [DONE]\n\n";
+        let expected = format!("{}{}", first_event, done_event);
+
+        let slow_stream = async_stream::stream! {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(first_event.to_string()));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(done_event.to_string()));
+        };
+
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(slow_stream))
+            .expect("response build should succeed");
+
+        let (ledger, _wal_path) = make_test_ledger().await;
+        let event = make_event();
+
+        let start = Instant::now();
+        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
+        assert!(
+            start.elapsed() < Duration::from_millis(150),
+            "tap-stream extraction must not block on upstream stream completion"
+        );
+
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("body collect should succeed")
+            .to_bytes();
+        assert_eq!(bytes, expected.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn llm_trace_sse_large_stream_preserves_body_and_persists_trace() {
+        let reasoning_fragment = "r".repeat(512);
+        let sse_event = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"{}\"}}}}],\"model\":\"o1-preview\"}}\n\n",
+            reasoning_fragment
+        );
+        let repetitions = (MAX_SSE_TRACE_CAPTURE_BYTES / sse_event.len()) + 128;
+
+        let mut body = sse_event.repeat(repetitions);
+        body.push_str("data: [DONE]\n\n");
+
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body.clone()))
+            .expect("response build should succeed");
+
+        let (ledger, wal_path) = make_test_ledger().await;
+        let mut event = make_event();
+        event.event_id = format!("evt-test-{}", uuid::Uuid::new_v4());
+
+        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
+
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("body collect should succeed")
+            .to_bytes();
+        assert_eq!(bytes, body.as_bytes());
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut persisted_trace = None;
+
+        while Instant::now() < deadline {
+            let wal = tokio::fs::read_to_string(&wal_path)
+                .await
+                .unwrap_or_default();
+
+            for line in wal.lines() {
+                if !line.contains(&event.event_id) || !line.contains("\"llm_trace\"") {
+                    continue;
+                }
+
+                if let Ok(parsed) = serde_json::from_str::<GVMEvent>(line) {
+                    if let Some(trace) = parsed.llm_trace {
+                        persisted_trace = Some(trace);
+                        break;
+                    }
+                }
+            }
+
+            if persisted_trace.is_some() {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let trace = persisted_trace
+            .expect("large SSE response should persist a bounded trace update asynchronously");
+        assert_eq!(trace.provider, "openai");
+        assert!(
+            trace.truncated,
+            "bounded capture should mark large SSE trace as truncated"
+        );
     }
 }

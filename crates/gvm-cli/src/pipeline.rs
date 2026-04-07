@@ -281,7 +281,10 @@ fn print_exit_reason(reason: &gvm_sandbox::ExitReason, cpu_throttled_us: Option<
     match reason {
         Normal => {}
         AgentError { code } => {
-            eprintln!("  {YELLOW}\u{26a0} Agent exited with error code {}{RESET}", code);
+            eprintln!(
+                "  {YELLOW}\u{26a0} Agent exited with error code {}{RESET}",
+                code
+            );
         }
         Timeout { secs } => {
             eprintln!(
@@ -294,7 +297,10 @@ fn print_exit_reason(reason: &gvm_sandbox::ExitReason, cpu_throttled_us: Option<
         UserInterrupt => {
             eprintln!("  {DIM}Agent terminated by user/system signal (SIGTERM){RESET}");
         }
-        SeccompViolation { count, syscall: Some(name) } => {
+        SeccompViolation {
+            count,
+            syscall: Some(name),
+        } => {
             // We resolved the exact syscall via dmesg AUDIT_SECCOMP scan.
             // Show the user the syscall name and an actionable next step.
             eprintln!(
@@ -304,7 +310,10 @@ fn print_exit_reason(reason: &gvm_sandbox::ExitReason, cpu_throttled_us: Option<
                 name, count
             );
         }
-        SeccompViolation { count, syscall: None } => {
+        SeccompViolation {
+            count,
+            syscall: None,
+        } => {
             // dmesg unavailable or no matching record — fall back to the
             // pointer message so the user can inspect manually.
             eprintln!(
@@ -313,7 +322,9 @@ fn print_exit_reason(reason: &gvm_sandbox::ExitReason, cpu_throttled_us: Option<
                 count
             );
         }
-        OomKill { memory_limit_mb: Some(mb) } => {
+        OomKill {
+            memory_limit_mb: Some(mb),
+        } => {
             eprintln!(
                 "  {RED}\u{26a0} Agent killed: out of memory (limit: {}MB){RESET}\n    \
                  Try: gvm run --sandbox --memory {}m ...",
@@ -321,7 +332,9 @@ fn print_exit_reason(reason: &gvm_sandbox::ExitReason, cpu_throttled_us: Option<
                 mb * 2
             );
         }
-        OomKill { memory_limit_mb: None } => {
+        OomKill {
+            memory_limit_mb: None,
+        } => {
             eprintln!(
                 "  {RED}\u{26a0} Agent killed: out of memory (system OOM, no --memory limit set){RESET}"
             );
@@ -361,7 +374,10 @@ pub fn print_cleanup_verification(v: &gvm_sandbox::CleanupVerification) {
     }
 
     eprintln!();
-    eprintln!("  {YELLOW}Cleanup verification: {} residual(s) detected{RESET}", v.total());
+    eprintln!(
+        "  {YELLOW}Cleanup verification: {} residual(s) detected{RESET}",
+        v.total()
+    );
 
     // Network category
     if v.network_residuals.is_empty() {
@@ -380,7 +396,10 @@ pub fn print_cleanup_verification(v: &gvm_sandbox::CleanupVerification) {
         eprintln!("  {GREEN}\u{2713}{RESET} Mounts: clean");
     } else {
         for path in &v.mount_residuals {
-            eprintln!("  {RED}\u{2717}{RESET} Mount: {} still in /proc/mounts", path);
+            eprintln!(
+                "  {RED}\u{2717}{RESET} Mount: {} still in /proc/mounts",
+                path
+            );
             eprintln!("    Run: sudo umount -l {}", path);
         }
     }

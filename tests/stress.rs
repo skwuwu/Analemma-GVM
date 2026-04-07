@@ -166,18 +166,16 @@ fn srr_1mb_toml_file_no_oom() {
 
     // Generate rules with long descriptions to reach ~1MB
     for i in 0..2_000 {
-        let long_desc = format!("Rule {} — {}", i, "x".repeat(400));
+        let long_desc = format!("Rule {i} — {}", "x".repeat(400));
+        let reason = format!("Blocked by rule {i}");
         toml.push_str(&format!(
             r#"
 [[rules]]
 method = "POST"
-pattern = "host-{}.megacorp.internal/api/v1/{{any}}"
-decision = {{ type = "Deny", reason = "{}" }}
-description = "{}"
+pattern = "host-{i}.megacorp.internal/api/v1/{{any}}"
+decision = {{ type = "Deny", reason = "{reason}" }}
+description = "{long_desc}"
 "#,
-            i,
-            format!("Blocked by rule {}", i),
-            long_desc,
         ));
     }
 

@@ -38,11 +38,11 @@ pub fn extract_syscall_for_pid(line: &str, target_pid: u32) -> Option<i64> {
     }
     // PID match — must be a token boundary, not a substring of a longer PID.
     let pid_token = format!("pid={}", target_pid);
-    if !line.split(|c: char| c == ' ' || c == ',').any(|t| t == pid_token) {
+    if !line.split([' ', ',']).any(|t| t == pid_token) {
         return None;
     }
     // Extract syscall=N
-    for token in line.split(|c: char| c == ' ' || c == ',') {
+    for token in line.split([' ', ',']) {
         if let Some(num_str) = token.strip_prefix("syscall=") {
             if let Ok(n) = num_str.parse::<i64>() {
                 return Some(n);

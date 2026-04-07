@@ -237,7 +237,7 @@ fn build_default_filter(default_action: SeccompAction) -> Result<seccompiler::Bp
 pub fn allowed_syscall_count() -> usize {
     let mut allow_rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
     insert_base_syscalls(&mut allow_rules);
-    allow_rules.insert(libc::SYS_socket as i64, vec![]);
+    allow_rules.insert(libc::SYS_socket, vec![]);
     for sys in [
         libc::SYS_connect,
         libc::SYS_socketpair,
@@ -257,7 +257,7 @@ pub fn allowed_syscall_count() -> usize {
         libc::SYS_accept,
         libc::SYS_accept4,
     ] {
-        allow_rules.insert(sys as i64, vec![]);
+        allow_rules.insert(sys, vec![]);
     }
     allow_rules.len()
 }

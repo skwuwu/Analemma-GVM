@@ -45,7 +45,6 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     use hyper::server::conn::http1;
-    use hyper::service::service_fn;
 
     let io = hyper_util::rt::TokioIo::new(tls_stream);
 

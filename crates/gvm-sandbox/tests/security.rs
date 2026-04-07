@@ -210,9 +210,12 @@ fn seccomp_profile_variants_serialize() {
 fn sandbox_result_fields() {
     let result = SandboxResult {
         exit_code: 0,
+        exit_reason: gvm_sandbox::ExitReason::Normal,
         setup_ms: 42,
         seccomp_violations: 0,
+        cpu_throttled_us: None,
         fs_diff: None,
+        cleanup_verification: gvm_sandbox::CleanupVerification::default(),
     };
     assert_eq!(result.exit_code, 0);
     assert_eq!(result.setup_ms, 42);

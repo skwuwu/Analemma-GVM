@@ -679,10 +679,7 @@ async fn main() -> anyhow::Result<()> {
                                     );
                                 }
                                 if report.cgroups > 0 {
-                                    eprintln!(
-                                        "  \u{2713} {} cgroup(s) removed",
-                                        report.cgroups
-                                    );
+                                    eprintln!("  \u{2713} {} cgroup(s) removed", report.cgroups);
                                 }
                                 if report.orphan_veths_swept > 0 {
                                     eprintln!(
@@ -875,7 +872,9 @@ fn run_stop() -> anyhow::Result<()> {
             .unwrap_or_default();
 
         if leftover_state.is_empty() && leftover_veth.is_empty() {
-            eprintln!("  {GREEN}\u{2713}{RESET} Verified: no veth, no state file, no /run/gvm/ residuals");
+            eprintln!(
+                "  {GREEN}\u{2713}{RESET} Verified: no veth, no state file, no /run/gvm/ residuals"
+            );
         } else {
             eprintln!(
                 "  {YELLOW}\u{26a0}{RESET} {} residual(s) survived cleanup:",
@@ -891,7 +890,9 @@ fn run_stop() -> anyhow::Result<()> {
         }
     }
 
-    eprintln!("  Done. {DIM}Persistent data preserved in data/ (wal.log, proxy.log, mitm-ca.pem).{RESET}");
+    eprintln!(
+        "  Done. {DIM}Persistent data preserved in data/ (wal.log, proxy.log, mitm-ca.pem).{RESET}"
+    );
     eprintln!();
     Ok(())
 }

@@ -20,9 +20,7 @@ pub async fn run_status(proxy_url: &str) -> Result<()> {
             print_proxy_health(&body, proxy_url);
         }
         None => {
-            eprintln!(
-                "  {RED}\u{2717}{RESET} {BOLD}Proxy not reachable{RESET} at {proxy_url}"
-            );
+            eprintln!("  {RED}\u{2717}{RESET} {BOLD}Proxy not reachable{RESET} at {proxy_url}");
             eprintln!("    Start with: gvm run <agent>");
         }
     }
@@ -66,15 +64,16 @@ fn print_proxy_health(body: &serde_json::Value, proxy_url: &str) {
         _ => "\u{26a0}",
     };
 
-    eprintln!(
-        "  {status_color}{status_icon}{RESET} {BOLD}{status}{RESET}  {DIM}v{version}{RESET}"
-    );
+    eprintln!("  {status_color}{status_icon}{RESET} {BOLD}{status}{RESET}  {DIM}v{version}{RESET}");
     eprintln!("  {DIM}Listen:{RESET}       {CYAN}{proxy_url}{RESET}");
     if let Some(secs) = uptime_secs {
         eprintln!("  {DIM}Uptime:{RESET}       {}", format_uptime(secs));
     }
     if let Some(total) = total_requests {
-        eprintln!("  {DIM}Requests:{RESET}     {} total", format_thousands(total));
+        eprintln!(
+            "  {DIM}Requests:{RESET}     {} total",
+            format_thousands(total)
+        );
     }
     eprintln!("  {DIM}SRR rules:{RESET}    {srr_rules}");
     if tls_ready {
@@ -118,7 +117,7 @@ fn format_thousands(n: u64) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i) % 3 == 0 {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(*b as char);

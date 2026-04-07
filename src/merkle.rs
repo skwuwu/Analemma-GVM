@@ -358,7 +358,7 @@ mod tests {
             leaf.chars().all(|c| c.is_ascii_hexdigit()),
             "Hash must be valid hex"
         );
-        let root = compute_merkle_root(&[leaf.clone()]).unwrap();
+        let root = compute_merkle_root(std::slice::from_ref(&leaf)).unwrap();
         assert_eq!(root, leaf, "single leaf should be its own root");
     }
 

@@ -728,6 +728,9 @@ milliseconds = 300
         mitm_server_config: None,
         mitm_client_config: None,
         tls_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        start_time: std::time::Instant::now(),
+        request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ca_expires_days: None,
     };
 
     let app = Router::new().fallback(proxy_handler).with_state(state);
@@ -1176,6 +1179,9 @@ token = "sk_test_proxy_injected_key"
         mitm_server_config: None,
         mitm_client_config: None,
         tls_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        start_time: std::time::Instant::now(),
+        request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ca_expires_days: None,
     };
 
     let app = Router::new()
@@ -1359,6 +1365,9 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
         mitm_server_config: None,
         mitm_client_config: None,
         tls_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        start_time: std::time::Instant::now(),
+        request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ca_expires_days: None,
     };
 
     let app = Router::new()
@@ -1558,6 +1567,9 @@ type = "Allow"
         mitm_server_config: None,
         mitm_client_config: None,
         tls_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        start_time: std::time::Instant::now(),
+        request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ca_expires_days: None,
     };
 
     let app = Router::new()
@@ -2005,6 +2017,9 @@ async fn checkpoint_save_restore_merkle_verified() {
         mitm_server_config: None,
         mitm_client_config: None,
         tls_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        start_time: std::time::Instant::now(),
+        request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ca_expires_days: None,
     };
 
     let app = Router::new()
@@ -2479,6 +2494,9 @@ type = "Allow"
         mitm_server_config: None,
         mitm_client_config: None,
         tls_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        start_time: std::time::Instant::now(),
+        request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ca_expires_days: None,
     };
 
     let app = Router::new()
@@ -2642,6 +2660,9 @@ decision = { type = "Allow" }
         mitm_server_config: None,
         mitm_client_config: None,
         tls_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        start_time: std::time::Instant::now(),
+        request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ca_expires_days: None,
     };
 
     let app = Router::new().fallback(proxy_handler).with_state(state);
@@ -2770,6 +2791,9 @@ decision = { type = "Allow" }
         mitm_server_config: None,
         mitm_client_config: None,
         tls_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        start_time: std::time::Instant::now(),
+        request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ca_expires_days: None,
     };
 
     let app = Router::new().fallback(proxy_handler).with_state(state);
@@ -2902,6 +2926,9 @@ decision = { type = "Allow" }
         mitm_server_config: None,
         mitm_client_config: None,
         tls_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        start_time: std::time::Instant::now(),
+        request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ca_expires_days: None,
     };
 
     let app = Router::new().fallback(proxy_handler).with_state(state);
@@ -3002,6 +3029,9 @@ async fn ic3_self_approval_blocked_on_proxy_port() {
         mitm_server_config: None,
         mitm_client_config: None,
         tls_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        start_time: std::time::Instant::now(),
+        request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ca_expires_days: None,
     };
 
     // Build AGENT-FACING router only (no admin endpoints)

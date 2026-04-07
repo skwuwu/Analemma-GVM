@@ -411,7 +411,7 @@ fn edge_max_strict_delay_vs_require_approval() {
 /// max_strict: all pairs — verify transitivity of strictness ordering.
 #[test]
 fn edge_max_strict_strictness_ordering_complete() {
-    let decisions = vec![
+    let decisions = [
         EnforcementDecision::Allow,
         EnforcementDecision::AuditOnly {
             alert_level: AlertLevel::Info,

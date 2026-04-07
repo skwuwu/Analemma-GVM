@@ -681,7 +681,13 @@ fn bench_vault_large(c: &mut Criterion) {
 // ═══════════════════════════════════════════════
 // 12. Wasm vs Native Policy Engine Benchmarks
 // ═══════════════════════════════════════════════
+//
+// Wasm benches need both `gvm_proxy::wasm_engine` (gated on `wasm` feature)
+// and the `gvm_engine` crate (only linked when wasm feature is on). Gating
+// the entire bench function and its registration entry keeps the bench
+// binary buildable on default features without needing a separate file.
 
+#[cfg(feature = "wasm")]
 fn bench_wasm_vs_native(c: &mut Criterion) {
     use gvm_proxy::wasm_engine::WasmEngine;
 
@@ -1102,6 +1108,7 @@ fn bench_vault_contention_p99(c: &mut Criterion) {
 // 16. Wasm Cold Start — Module Load Latency
 // ═══════════════════════════════════════════════
 
+#[cfg(feature = "wasm")]
 fn bench_wasm_cold_start(c: &mut Criterion) {
     use gvm_proxy::wasm_engine::WasmEngine;
 
@@ -1467,8 +1474,11 @@ fn bench_ebpf_setup(c: &mut Criterion) {
 
 // ═══════════════════════════════════════════════
 
+// Native bench group — always built. Wasm benches are split out behind
+// `--features wasm` so the bench binary builds on default features without
+// pulling in `gvm_engine` (which is gated on the same flag).
 criterion_group!(
-    benches,
+    native_benches,
     bench_srr,
     bench_policy,
     bench_max_strict,
@@ -1481,10 +1491,16 @@ criterion_group!(
     bench_ic2_delay_accuracy,
     bench_vault_large,
     bench_rate_limiter,
-    bench_wasm_vs_native,
     bench_vault_p99,
     bench_vault_contention_p99,
-    bench_wasm_cold_start,
     bench_ebpf_setup,
 );
-criterion_main!(benches);
+
+#[cfg(feature = "wasm")]
+criterion_group!(wasm_benches, bench_wasm_vs_native, bench_wasm_cold_start);
+
+#[cfg(feature = "wasm")]
+criterion_main!(native_benches, wasm_benches);
+
+#[cfg(not(feature = "wasm"))]
+criterion_main!(native_benches);

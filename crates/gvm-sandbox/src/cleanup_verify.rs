@@ -72,7 +72,7 @@ pub fn parse_mount_residuals(proc_mounts: &str, expected_paths: &[&str]) -> Vec<
             Some(m) => m,
             None => continue,
         };
-        if expected_paths.iter().any(|&p| p == mountpoint) {
+        if expected_paths.contains(&mountpoint) {
             residuals.push(mountpoint.to_string());
         }
     }
@@ -113,10 +113,10 @@ pub fn iface_present_in_link_show(ip_link_output: &str, iface: &str) -> bool {
 pub fn chain_present_in_iptables(iptables_output: &str, chain_name: &str) -> bool {
     for line in iptables_output.lines() {
         // -N declares the chain; -A references it as a target.
-        if line.starts_with("-N ") || line.contains(" -j ") {
-            if line.split_whitespace().any(|t| t == chain_name) {
-                return true;
-            }
+        if (line.starts_with("-N ") || line.contains(" -j "))
+            && line.split_whitespace().any(|t| t == chain_name)
+        {
+            return true;
         }
     }
     false
@@ -145,11 +145,7 @@ pub fn nat_rule_references_iface(nat_output: &str, iface: &str) -> bool {
 /// `host_iface` is the host-side veth name. `mount_paths` is the list
 /// of paths recorded in the SandboxState's mount manifest.
 #[cfg(target_os = "linux")]
-pub fn verify_cleanup(
-    pid: u32,
-    host_iface: &str,
-    mount_paths: &[String],
-) -> CleanupVerification {
+pub fn verify_cleanup(pid: u32, host_iface: &str, mount_paths: &[String]) -> CleanupVerification {
     use std::process::Command;
 
     let mut report = CleanupVerification::default();
@@ -159,7 +155,9 @@ pub fn verify_cleanup(
 
     if let Ok(out) = Command::new("ip").args(["-o", "link", "show"]).output() {
         if iface_present_in_link_show(&String::from_utf8_lossy(&out.stdout), host_iface) {
-            report.network_residuals.push(format!("veth {}", host_iface));
+            report
+                .network_residuals
+                .push(format!("veth {}", host_iface));
         }
     }
 
@@ -233,10 +231,7 @@ tmpfs /run/lock tmpfs rw,nosuid,nodev,noexec,relatime,size=5120k 0 0
 
     #[test]
     fn parse_mounts_finds_multiple_residuals() {
-        let expected = [
-            "/run/gvm/sandbox-root-12345",
-            "/run/gvm/home-merged-12345",
-        ];
+        let expected = ["/run/gvm/sandbox-root-12345", "/run/gvm/home-merged-12345"];
         let r = parse_mount_residuals(PROC_MOUNTS_WITH_RESIDUAL, &expected);
         assert_eq!(r.len(), 2);
         assert!(r.contains(&"/run/gvm/sandbox-root-12345".to_string()));
@@ -306,12 +301,18 @@ tmpfs /run/lock tmpfs rw,nosuid,nodev,noexec,relatime,size=5120k 0 0
 
     #[test]
     fn iptables_finds_chain_declaration() {
-        assert!(chain_present_in_iptables(IPTABLES_OUTPUT, "GVM-veth-gvm-h0"));
+        assert!(chain_present_in_iptables(
+            IPTABLES_OUTPUT,
+            "GVM-veth-gvm-h0"
+        ));
     }
 
     #[test]
     fn iptables_missing_chain_returns_false() {
-        assert!(!chain_present_in_iptables(IPTABLES_OUTPUT, "GVM-veth-gvm-h99"));
+        assert!(!chain_present_in_iptables(
+            IPTABLES_OUTPUT,
+            "GVM-veth-gvm-h99"
+        ));
     }
 
     #[test]
@@ -357,8 +358,10 @@ COMMIT
 
     #[test]
     fn report_with_any_residual_is_dirty() {
-        let mut v = CleanupVerification::default();
-        v.cgroup_residual = Some("/sys/fs/cgroup/gvm-agent-12345".to_string());
+        let v = CleanupVerification {
+            cgroup_residual: Some("/sys/fs/cgroup/gvm-agent-12345".to_string()),
+            ..Default::default()
+        };
         assert!(!v.is_clean());
         assert_eq!(v.total(), 1);
     }
