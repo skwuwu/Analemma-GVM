@@ -332,21 +332,48 @@ async fn handle_request(
         }
     };
 
-    let upstream_tls = match connector.connect(server_name, upstream_tcp).await {
-        Ok(tls) => tls,
-        Err(e) => {
-            tracing::warn!(error = %e, host = %upstream_host, "MITM: upstream TLS failed");
-            return Ok(Response::builder()
-                .status(502)
-                .body(full_body(format!("Upstream TLS failed: {}", e)))
-                .unwrap());
-        }
-    };
+    tracing::info!(host = %upstream_host, "MITM: starting upstream TLS handshake");
+    const TLS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+    let upstream_tls =
+        match tokio::time::timeout(TLS_TIMEOUT, connector.connect(server_name, upstream_tcp)).await
+        {
+            Ok(Ok(tls)) => {
+                tracing::info!(host = %upstream_host, "MITM: upstream TLS handshake complete");
+                tls
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, host = %upstream_host, "MITM: upstream TLS failed");
+                return Ok(Response::builder()
+                    .status(502)
+                    .body(full_body(format!("Upstream TLS failed: {}", e)))
+                    .unwrap());
+            }
+            Err(_) => {
+                tracing::warn!(
+                    host = %upstream_host,
+                    timeout_secs = TLS_TIMEOUT.as_secs(),
+                    "MITM: upstream TLS handshake timed out"
+                );
+                return Ok(Response::builder()
+                    .status(504)
+                    .body(full_body(format!(
+                        "Upstream {} TLS handshake timed out after {}s",
+                        upstream_host,
+                        TLS_TIMEOUT.as_secs()
+                    )))
+                    .unwrap());
+            }
+        };
 
     let io = hyper_util::rt::TokioIo::new(upstream_tls);
+    tracing::info!(host = %upstream_host, "MITM: starting HTTP/1.1 handshake");
     let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
-        Ok(parts) => parts,
+        Ok(parts) => {
+            tracing::info!(host = %upstream_host, "MITM: HTTP/1.1 handshake complete");
+            parts
+        }
         Err(e) => {
+            tracing::warn!(error = %e, host = %upstream_host, "MITM: HTTP handshake failed");
             return Ok(Response::builder()
                 .status(502)
                 .body(full_body(format!("Upstream HTTP handshake failed: {}", e)))
