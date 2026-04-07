@@ -947,8 +947,14 @@ async fn handle_tls_connection(
 
     // 1. Pre-warm cert cache: peek SNI from raw TCP, generate cert on blocking
     //    thread pool. This prevents CPU-bound keygen from starving tokio workers.
-    if let Some(sni) = peek_sni(&stream).await {
-        resolver.ensure_cached(sni).await;
+    //    We also keep the SNI string itself to pass to the MITM handler — it's
+    //    the only authoritative source for the upstream host on this code path.
+    //    Without it the handler falls back to the client's Host header, which
+    //    inside a sandbox is the proxy's own veth IP, causing the upstream
+    //    relay to connect back to itself and hang.
+    let sni = peek_sni(&stream).await;
+    if let Some(ref s) = sni {
+        resolver.ensure_cached(s.clone()).await;
     }
 
     // 2. TLS handshake with timeout (SNI → cache hit from step 1)
@@ -958,7 +964,8 @@ async fn handle_tls_connection(
         .map_err(|_| anyhow::anyhow!("TLS handshake timed out"))??;
 
     // 3-8. Shared MITM handler (read request, SRR check, enforce, forward, relay)
-    gvm_proxy::tls_proxy::handle_mitm_stream(tls_stream, "unknown", client_config, &state).await
+    let host_hint = sni.as_deref().unwrap_or("");
+    gvm_proxy::tls_proxy::handle_mitm_stream(tls_stream, host_hint, client_config, &state).await
 }
 
 /// Print a human-readable startup summary of loaded governance rules.

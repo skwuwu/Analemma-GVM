@@ -88,14 +88,26 @@ async fn handle_request(
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| req.uri().path().to_string());
     let original_headers = req.headers().clone();
-    let host = original_headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or(host_hint)
-        .split(':')
-        .next()
-        .unwrap_or(host_hint)
-        .to_string();
+
+    // Real upstream host comes from the TLS handshake SNI (host_hint), not
+    // from the agent-supplied Host header. Inside a sandbox the agent's
+    // Host is the proxy's veth IP (e.g. 10.200.0.1:8080), so trusting it
+    // would have the proxy connect back to itself — exactly the hang we
+    // observed. SNI is set by the agent's TLS stack from the original
+    // upstream URL and is reliable. Fall back to the client Host only when
+    // SNI is empty (HTTP/1.0, IP-only access — rare).
+    let host = if !host_hint.is_empty() {
+        host_hint.split(':').next().unwrap_or(host_hint).to_string()
+    } else {
+        original_headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .to_string()
+    };
 
     tracing::info!(method = %method, host = %host, path = %path, "MITM: inspecting HTTPS request");
 
