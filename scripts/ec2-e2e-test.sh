@@ -2358,25 +2358,51 @@ if should_run 38; then
     elif [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
         skip "38: requires root for --sandbox"
     else
-        # Check capabilities inside sandbox — CapBnd must be 0 (all dropped).
-        # bash/iptables are not available inside the minimal sandbox rootfs,
-        # so we use python3 to read /proc/self/status instead.
+        # Check capabilities inside sandbox. By design (commit e219028),
+        # the sandbox keeps exactly four DAC-related capabilities so the
+        # capless-root agent can chown/chmod copy-up files inside the
+        # overlayfs upper layer:
+        #   CAP_CHOWN (0), CAP_DAC_OVERRIDE (1),
+        #   CAP_DAC_READ_SEARCH (2), CAP_FOWNER (3)
+        # That's bitmask 0x0f = "000000000000000f". Everything else —
+        # CAP_NET_ADMIN, CAP_SYS_ADMIN, CAP_SYS_PTRACE, CAP_BPF, etc. —
+        # MUST be gone. The test enforces both halves: the exact DAC-only
+        # bitmask AND the absence of any of the dangerous capabilities
+        # that would let the agent tamper with the sandbox itself.
         CAP_RESULT=$(sudo timeout 15 "$GVM_BIN" run --sandbox -- python3 -c "
+DAC_ONLY_MASK = 0x0f  # CAP_CHOWN|CAP_DAC_OVERRIDE|CAP_DAC_READ_SEARCH|CAP_FOWNER
+DANGEROUS_CAPS = {
+    'CAP_NET_ADMIN':   12,
+    'CAP_SYS_ADMIN':   21,
+    'CAP_SYS_PTRACE':  19,
+    'CAP_SYS_MODULE':  16,
+    'CAP_BPF':         39,
+    'CAP_NET_RAW':     13,
+    'CAP_SYS_BOOT':    22,
+    'CAP_SYS_CHROOT':  18,
+}
 with open('/proc/self/status') as f:
     for line in f:
         if line.startswith('CapBnd:'):
-            val = line.split(':')[1].strip()
-            if val == '0000000000000000':
-                print('CAPS_DROPPED')
+            raw = line.split(':')[1].strip()
+            val = int(raw, 16)
+            if val == DAC_ONLY_MASK:
+                print(f'CAPS_DAC_ONLY:{raw}')
             else:
-                print('CAPS_PRESENT:' + val)
+                leaked = [name for name, bit in DANGEROUS_CAPS.items() if val & (1 << bit)]
+                if leaked:
+                    print(f'CAPS_LEAKED:{raw}:{\",\".join(leaked)}')
+                else:
+                    print(f'CAPS_UNEXPECTED:{raw}')
             break
-" 2>/dev/null | grep -E "CAPS_DROPPED|CAPS_PRESENT" | tail -1)
+" 2>/dev/null | grep -E "CAPS_" | tail -1)
 
-        if echo "$CAP_RESULT" | grep -q "CAPS_DROPPED"; then
-            pass "38: all capabilities dropped inside sandbox (CapBnd=0)"
+        if echo "$CAP_RESULT" | grep -q "CAPS_DAC_ONLY"; then
+            pass "38: only DAC caps retained inside sandbox ($CAP_RESULT)"
+        elif echo "$CAP_RESULT" | grep -q "CAPS_LEAKED"; then
+            fail "38: dangerous capabilities leaked into sandbox ($CAP_RESULT)"
         else
-            fail "38: capabilities not dropped inside sandbox ($CAP_RESULT)"
+            fail "38: unexpected capability set inside sandbox ($CAP_RESULT)"
         fi
     fi
 fi

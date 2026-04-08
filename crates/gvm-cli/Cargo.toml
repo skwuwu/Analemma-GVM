@@ -1,6 +1,6 @@
 [package]
 name = "gvm-cli"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "CLI tool for the Analemma Governance Virtual Machine"
 license = "Apache-2.0"
