@@ -1205,10 +1205,145 @@ pub fn cleanup_all_orphans_report() -> Result<CleanupReport> {
     report.iptables_chains += stale_chains;
     cleaned += stale_chains;
 
+    // 5. Defense-in-depth: scan NAT table directly for -i veth-gvm-h* rules
+    // even when no matching veth or state file exists. The previous step (#3)
+    // only processed veths that ip link still showed; if the veth was deleted
+    // independently (namespace teardown, manual `ip link del`) the NAT rules
+    // it referenced were stranded with no path back. This sweep is the last
+    // resort and runs unconditionally.
+    let stale_nat = cleanup_stale_nat_rules() as u32;
+    report.iptables_chains += stale_nat;
+    cleaned += stale_nat;
+
+    // 6. Defense-in-depth: remove /run/gvm/{sandbox-staging-ws,sandbox-root,
+    //    home-merged,home-overlay,ws-merged,ws-overlay}-<pid> directories
+    // whose owning PID is dead AND which have no live mount underneath.
+    // These leak when the launch failed mid-setup or cleanup was killed
+    // before the rmdir step.
+    let stale_dirs = cleanup_stale_run_gvm_dirs() as u32;
+    report.mount_paths += stale_dirs;
+    cleaned += stale_dirs;
+
     if cleaned > 0 {
         tracing::info!(count = cleaned, "Orphan sandbox cleanup complete");
     }
     Ok(report)
+}
+
+/// Defense-in-depth: scan iptables `-t nat` for any rule with `-i veth-gvm-h*`
+/// and delete it. Catches NAT pollution that survives veth deletion.
+///
+/// This is independent of `cleanup_stale_forward_chains` (which targets the
+/// filter table FORWARD chain) and `cleanup_orphan_iptables_chain` (which
+/// only fires when the veth is still listed by `ip link show`). On a host
+/// where the veth has been deleted but its NAT rules linger, neither of
+/// those covers the stranded rules — this function does.
+fn cleanup_stale_nat_rules() -> usize {
+    let mut cleaned = 0usize;
+    let output = match Command::new("iptables-save").args(["-t", "nat"]).output() {
+        Ok(o) => o,
+        Err(_) => return 0,
+    };
+    if !output.status.success() {
+        return 0;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        // Only -A (append) lines we recognise as ours.
+        if !line.starts_with("-A ") {
+            continue;
+        }
+        // Token-bounded match — must contain ` veth-gvm-h` so we don't
+        // accidentally delete a rule referring to a hostname that happens
+        // to contain "veth-gvm-h" as a substring.
+        if !line.split_whitespace().any(|t| t.starts_with("veth-gvm-h")) {
+            continue;
+        }
+        let delete_rule = line.replacen("-A ", "-D ", 1);
+        let args: Vec<&str> = std::iter::once("-t")
+            .chain(std::iter::once("nat"))
+            .chain(delete_rule.split_whitespace())
+            .collect();
+        if run_iptables(&args).is_ok() {
+            cleaned += 1;
+        }
+    }
+    if cleaned > 0 {
+        tracing::warn!(
+            count = cleaned,
+            "Cleaned stranded NAT rules referencing veth-gvm-h*"
+        );
+    }
+    cleaned
+}
+
+/// Defense-in-depth: remove leaked /run/gvm/ per-sandbox directories whose
+/// owning PID is dead and which have no live mount underneath.
+///
+/// These accumulate when the launch sequence fails mid-setup, when the
+/// cleanup path was SIGKILL'd between umount and rmdir, or when an old
+/// run on a previous binary used a slightly different cleanup order. The
+/// directories are tiny but they confuse `gvm status` and clutter
+/// /run/gvm/, so we sweep them out unconditionally.
+fn cleanup_stale_run_gvm_dirs() -> usize {
+    let mut cleaned = 0usize;
+    let prefixes = [
+        "sandbox-staging-ws-",
+        "sandbox-root-",
+        "home-merged-",
+        "home-overlay-",
+        "ws-merged-",
+        "ws-overlay-",
+    ];
+    let entries = match std::fs::read_dir("/run/gvm") {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    // Snapshot /proc/mounts once so we don't re-read it per directory.
+    let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+    for entry in entries.flatten() {
+        let name = match entry.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // Recognise our naming convention.
+        let matched_prefix = prefixes.iter().find(|p| name.starts_with(*p));
+        let prefix = match matched_prefix {
+            Some(p) => *p,
+            None => continue,
+        };
+        // Extract trailing PID and require it to be dead.
+        let suffix = &name[prefix.len()..];
+        let pid: u32 = match suffix.parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if is_pid_alive(pid) {
+            continue;
+        }
+        let path = format!("/run/gvm/{}", name);
+        // Skip anything still mounted (mount table check is cheaper than
+        // a stat-based heuristic and matches what /proc/mounts reports).
+        if mounts.lines().any(|l| {
+            l.split_whitespace()
+                .nth(1)
+                .map(|m| m == path.as_str())
+                .unwrap_or(false)
+        }) {
+            // Try a lazy unmount first; if it succeeds the next iteration
+            // would see it gone, but we just remove on the next pass.
+            nix::mount::umount2(
+                std::path::Path::new(&path),
+                nix::mount::MntFlags::MNT_DETACH,
+            )
+            .ok();
+        }
+        if std::fs::remove_dir_all(&path).is_ok() {
+            cleaned += 1;
+            tracing::warn!(path = %path, pid = pid, "Removed stale /run/gvm/ directory");
+        }
+    }
+    cleaned
 }
 
 /// Remove iptables FORWARD chain and associated NAT/MASQUERADE rules for an orphan veth.
