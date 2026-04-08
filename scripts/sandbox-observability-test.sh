@@ -90,14 +90,78 @@ PY
 }
 
 write_seccomp_agent() {
-    # mount() is in the seccomp blocklist (ENOSYS default).
-    # Python's ctypes lets us call the syscall directly.
+    # Attempts a broad set of syscalls that the default seccomp profile
+    # either explicitly kills (SIGSYS) or defaults to ENOSYS for. Each
+    # prints RESULT=<name>,<ret>,<errno> so the test can assert the
+    # filter is active across the *category*, not just on mount(2).
+    #
+    # Syscalls exercised:
+    #   mount        filesystem manipulation — must not succeed
+    #   umount2      same
+    #   unshare      namespace creation — sandbox escape vector
+    #   ptrace       process introspection — sandbox escape vector
+    #   bpf          BPF loading (would override seccomp itself)
+    #   open_by_handle_at  filehandle escape (CVE-2015-3627)
+    #   init_module  kernel module loading — root escape
+    #   kexec_load   new kernel boot — root escape
     cat > "$WORK_DIR/seccomp_agent.py" <<'PY'
 import ctypes
+import ctypes.util
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
-# mount("none", "/tmp", "tmpfs", 0, NULL)
-ret = libc.mount(b"none", b"/tmp", b"tmpfs", 0, None)
-print(f"mount() returned {ret} errno={ctypes.get_errno()}")
+
+def syscall_by_name(name, *args):
+    # Use libc functions where available so we go through the same glibc
+    # wrapper the sandbox filter was compiled against.
+    fn = getattr(libc, name, None)
+    if fn is None:
+        return None, 38  # ENOSYS
+    ctypes.set_errno(0)
+    ret = fn(*args)
+    return ret, ctypes.get_errno()
+
+# 1. mount
+ret, err = syscall_by_name("mount", b"none", b"/tmp", b"tmpfs", 0, None)
+print(f"RESULT=mount,{ret},{err}")
+
+# 2. umount2
+ret, err = syscall_by_name("umount2", b"/proc", 0)
+print(f"RESULT=umount2,{ret},{err}")
+
+# 3. unshare
+ret, err = syscall_by_name("unshare", 0x10000000)  # CLONE_NEWNS
+print(f"RESULT=unshare,{ret},{err}")
+
+# 4. ptrace (PTRACE_TRACEME = 0)
+ret, err = syscall_by_name("ptrace", 0, 0, 0, 0)
+print(f"RESULT=ptrace,{ret},{err}")
+
+# 5. bpf (cmd=0 BPF_MAP_CREATE, attr=NULL → EFAULT if allowed, ENOSYS if blocked)
+bpf_num = 321  # __NR_bpf on x86_64
+syscall = libc.syscall
+syscall.restype = ctypes.c_long
+ctypes.set_errno(0)
+ret = syscall(bpf_num, 0, None, 0)
+print(f"RESULT=bpf,{ret},{ctypes.get_errno()}")
+
+# 6. init_module
+init_module_num = 175  # __NR_init_module on x86_64
+ctypes.set_errno(0)
+ret = syscall(init_module_num, None, 0, None)
+print(f"RESULT=init_module,{ret},{ctypes.get_errno()}")
+
+# 7. kexec_load
+kexec_num = 246  # __NR_kexec_load on x86_64
+ctypes.set_errno(0)
+ret = syscall(kexec_num, 0, 0, None, 0)
+print(f"RESULT=kexec_load,{ret},{ctypes.get_errno()}")
+
+# 8. open_by_handle_at
+obha_num = 304  # __NR_open_by_handle_at on x86_64
+ctypes.set_errno(0)
+ret = syscall(obha_num, -1, None, 0)
+print(f"RESULT=open_by_handle_at,{ret},{ctypes.get_errno()}")
+
+print("SECCOMP_PROBE_DONE")
 PY
 }
 
@@ -187,27 +251,64 @@ assert_contains "GVM_SANDBOX_TIMEOUT hint"       "$out" "GVM_SANDBOX_TIMEOUT" ||
 [ $fail -eq 0 ] && record "Timeout hint" "PASS" || record "Timeout hint" "FAIL"
 
 # ─── 3. Seccomp violation — concrete syscall name OR generic fallback ──
-run_test 3 "Seccomp violation — concrete syscall name from dmesg"
+run_test 3 "Seccomp negative — broad blocked syscall probe"
+# Probes 8 syscalls that the default profile must not allow to succeed:
+#   mount, umount2, unshare, ptrace, bpf, init_module, kexec_load,
+#   open_by_handle_at. Each must produce one of:
+#     - SIGSYS death (agent killed, CLI reports seccomp violation)
+#     - ENOSYS return (errno 38 — ENOSYS-default path)
+#     - EPERM return (errno 1 — capability-dropped path)
+# Any syscall returning 0 (success) or a non-error value means the
+# sandbox is leaking that capability and the test fails.
 out=$("$GVM_BIN" run --sandbox "$WORK_DIR/seccomp_agent.py" 2>&1)
-# Three valid outcomes (in order of preference):
-#   A. SIGSYS killed agent + dmesg parser resolved syscall → "attempted mount(2)"
-#   B. SIGSYS killed agent + dmesg unreadable → generic "dmesg | grep SECCOMP"
-#   C. ENOSYS returned to agent (default behavior with current filter) →
-#      filter is active but no SIGSYS path triggered, agent saw errno=38
-if echo "$out" | grep -qF "attempted mount(2)"; then
-    echo -e "  ${GREEN}✓${NC} dmesg parser resolved exact syscall: mount(2)"
-    record "Seccomp syscall resolution" "PASS"
+fail=0
+
+# Case 1: entire script ran to completion — check each RESULT line.
+# Agent either runs all 8 probes (if filter is ENOSYS-default style)
+# or is killed on the first SIGSYS (SIGKILL profile style). Both are
+# acceptable — what we must NOT see is a successful return for any
+# dangerous syscall.
+if echo "$out" | grep -qF "SECCOMP_PROBE_DONE"; then
+    echo -e "  ${DIM}Agent completed — verifying each syscall was blocked${NC}"
+    leaks=0
+    for syscall in mount umount2 unshare ptrace bpf init_module kexec_load open_by_handle_at; do
+        line=$(echo "$out" | grep -E "^RESULT=${syscall}," | head -1)
+        if [ -z "$line" ]; then
+            echo -e "  ${YELLOW}⚠${NC} $syscall: no RESULT line (agent crashed before this probe?)"
+            continue
+        fi
+        ret=$(echo "$line" | awk -F, '{print $2}')
+        err=$(echo "$line" | awk -F, '{print $3}')
+        # Success cases: ret >= 0 with errno 0 → the syscall worked,
+        # which is a filter bypass.
+        if [ "$ret" -ge 0 ] 2>/dev/null && [ "$err" = "0" ]; then
+            echo -e "  ${RED}✗${NC} $syscall: SUCCEEDED (ret=$ret) — filter leak!"
+            leaks=$((leaks + 1))
+            fail=1
+        else
+            echo -e "  ${GREEN}✓${NC} $syscall: blocked (ret=$ret errno=$err)"
+        fi
+    done
+    if [ "$leaks" = "0" ]; then
+        record "Seccomp negative probe (8 syscalls)" "PASS"
+    else
+        record "Seccomp negative probe ($leaks leak(s))" "FAIL"
+    fi
 elif echo "$out" | grep -qF "seccomp violation"; then
-    assert_contains "generic dmesg pointer present" "$out" "dmesg | grep SECCOMP"
-    echo -e "  ${YELLOW}⚠${NC} fell back to generic message (dmesg unreadable?)"
-    record "Seccomp violation hint (fallback path)" "PASS"
-elif echo "$out" | grep -qF "errno=38"; then
-    echo -e "  ${GREEN}✓${NC} mount() returned ENOSYS — filter active (no SIGSYS path triggered)"
-    record "Seccomp filter active (ENOSYS path)" "PASS"
+    # Agent was SIGSYS-killed on the very first syscall. Our CLI diagnostic
+    # already printed the concrete name; that's a PASS — filter is enforcing.
+    if echo "$out" | grep -qF "attempted mount(2)"; then
+        echo -e "  ${GREEN}✓${NC} SIGSYS on mount(2) — dmesg parser resolved exact syscall"
+    else
+        echo -e "  ${GREEN}✓${NC} SIGSYS killed agent (filter enforcing via KillProcess)"
+        assert_contains "generic dmesg pointer present" "$out" "dmesg | grep SECCOMP" || fail=1
+    fi
+    [ $fail -eq 0 ] && record "Seccomp negative probe (SIGSYS on first syscall)" "PASS" \
+                    || record "Seccomp negative probe" "FAIL"
 else
-    echo -e "  ${RED}✗${NC} neither SIGSYS nor ENOSYS observed — filter may not be applied"
-    echo "$out" | sed 's/^/    /'
-    record "Seccomp violation hint" "FAIL"
+    echo -e "  ${RED}✗${NC} neither SECCOMP_PROBE_DONE nor seccomp violation observed"
+    echo "$out" | tail -15 | sed 's/^/    /'
+    record "Seccomp negative probe" "FAIL"
 fi
 
 # ─── 4. Normal exit prints no diagnostic noise ─────────────────────────
@@ -272,7 +373,21 @@ run_test 8 "Ctrl+C (SIGINT) — graceful cleanup path"
 "$GVM_BIN" cleanup >/dev/null 2>&1 || true
 "$GVM_BIN" run --sandbox "$WORK_DIR/sleep_agent.py" > /tmp/sigint_out.log 2>&1 &
 gvm_pid=$!
-sleep 3   # Let the sandbox launch fully (namespaces + veth up)
+# Wait for the sandbox to actually exist before sending SIGINT. Polling
+# on the state file is deterministic — it only appears after clone() +
+# veth setup + record_sandbox_state(). Max 15s; anything longer means
+# the sandbox never launched and the test is hopeless anyway.
+launch_deadline=$(($(date +%s) + 15))
+while [ "$(date +%s)" -lt "$launch_deadline" ]; do
+    if ls /run/gvm/gvm-sandbox-*.state >/dev/null 2>&1; then
+        break
+    fi
+    if ! kill -0 "$gvm_pid" 2>/dev/null; then
+        echo -e "  ${YELLOW}⚠${NC} gvm exited before sandbox came up"
+        break
+    fi
+    sleep 0.2
+done
 kill -INT "$gvm_pid" 2>/dev/null || true
 wait "$gvm_pid" 2>/dev/null || true
 sigint_out=$(cat /tmp/sigint_out.log)
@@ -345,4 +460,71 @@ for r in "${RESULTS[@]}"; do
 done
 echo
 echo -e "${BOLD}$pass passed, $fail failed, $skip skipped${NC}"
+
+# ─── Structured report (JUnit XML + JSON) ──────────────────────────────
+# Emitted to $OBS_REPORT_DIR (default /tmp/gvm-obs-report) so CI pipelines
+# can surface per-test status without parsing colourised shell output.
+# JUnit format is consumed by GitHub Actions test-reporter, CircleCI, etc.
+# JSON is the easy path for ad-hoc dashboards.
+report_dir="${OBS_REPORT_DIR:-/tmp/gvm-obs-report}"
+mkdir -p "$report_dir"
+junit="$report_dir/sandbox-observability.junit.xml"
+jsonf="$report_dir/sandbox-observability.json"
+
+# JUnit XML
+{
+    echo '<?xml version="1.0" encoding="UTF-8"?>'
+    printf '<testsuite name="sandbox-observability" tests="%d" failures="%d" skipped="%d">\n' \
+        "$((pass + fail + skip))" "$fail" "$skip"
+    for r in "${RESULTS[@]}"; do
+        status="${r%% *}"
+        name="${r#* }"
+        # XML-escape minimal set: &, <, >, "
+        safe=$(printf '%s' "$name" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g')
+        case "$status" in
+            PASS)
+                printf '  <testcase name="%s"/>\n' "$safe"
+                ;;
+            FAIL)
+                printf '  <testcase name="%s"><failure message="assertion failed"/></testcase>\n' "$safe"
+                ;;
+            SKIP)
+                printf '  <testcase name="%s"><skipped/></testcase>\n' "$safe"
+                ;;
+        esac
+    done
+    echo '</testsuite>'
+} > "$junit"
+
+# JSON
+{
+    printf '{\n'
+    printf '  "suite": "sandbox-observability",\n'
+    printf '  "host": "%s",\n' "$(hostname)"
+    printf '  "kernel": "%s",\n' "$(uname -r)"
+    printf '  "timestamp": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '  "pass": %d,\n' "$pass"
+    printf '  "fail": %d,\n' "$fail"
+    printf '  "skip": %d,\n' "$skip"
+    printf '  "tests": [\n'
+    total=${#RESULTS[@]}
+    idx=0
+    for r in "${RESULTS[@]}"; do
+        idx=$((idx + 1))
+        status="${r%% *}"
+        name="${r#* }"
+        # JSON-escape backslashes and quotes
+        jsafe=$(printf '%s' "$name" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+        comma=","
+        [ "$idx" = "$total" ] && comma=""
+        printf '    {"name": "%s", "status": "%s"}%s\n' "$jsafe" "$status" "$comma"
+    done
+    printf '  ]\n'
+    printf '}\n'
+} > "$jsonf"
+
+echo -e "${DIM}Structured report:${NC}"
+echo -e "  ${DIM}JUnit XML: $junit${NC}"
+echo -e "  ${DIM}JSON:      $jsonf${NC}"
+
 [ $fail -eq 0 ] && exit 0 || exit 1

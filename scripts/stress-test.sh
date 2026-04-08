@@ -179,11 +179,25 @@ setup() {
     PROXY_PID=$!
     echo "$PROXY_PID" > "$REPO_DIR/data/proxy.pid"
     echo "$PROXY_PID" > "$RESULTS_DIR/proxy.pid"
-    sleep 3
 
-    # Verify proxy health
-    local status
-    status=$( (curl -sf "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])") 2>/dev/null) || status="dead"
+    # Wait for proxy to report healthy instead of sleeping an arbitrary
+    # amount. Polls /gvm/health at 200ms intervals for up to 30s. On slow
+    # EC2 instances the old `sleep 3` was flaky — cold caches pushed
+    # startup past 3s and the subsequent health check ran before the
+    # proxy was ready, tanking the whole run.
+    local status="unknown"
+    local deadline=$(($(date +%s) + 30))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        status=$( (curl -sf --max-time 2 "$PROXY_URL/gvm/health" \
+            | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])") 2>/dev/null) \
+            || status="dead"
+        [ "$status" = "healthy" ] && break
+        if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+            status="crashed"
+            break
+        fi
+        sleep 0.2
+    done
     if [ "$status" != "healthy" ]; then
         echo -e "${RED}Proxy failed to start (status: $status)${NC}"
         exit 1
@@ -554,8 +568,66 @@ evaluate_results() {
         echo "FAIL: memory leak — ${mem_increase}MB increase exceeds ${MAX_MEM_INCREASE_MB}MB limit" >> "$SUMMARY"
         pass=false
     else
-        echo "PASS: memory stable" >> "$SUMMARY"
+        echo "PASS: memory stable (max − initial check)" >> "$SUMMARY"
     fi
+
+    # 1b. Memory trend — linear regression over the full time series.
+    # The max-minus-initial check is satisfied by a slow monotonic leak
+    # as long as it stays under the budget for the test duration. Fit a
+    # line to the (elapsed_sec, rss_mb) samples and fail if the slope
+    # projects more than MAX_MEM_INCREASE_MB over a 24h window. This
+    # catches leaks of 2–3 MB/hour which the absolute limit misses.
+    # Run the regression script out-of-line to avoid heredoc-in-command
+    # -substitution parsing pitfalls. The script lives in a tempfile for
+    # the duration of this function.
+    local slope_script
+    slope_script=$(mktemp /tmp/gvm-slope.XXXXXX.py)
+    cat > "$slope_script" <<'PY'
+import sys, csv
+path, budget = sys.argv[1], float(sys.argv[2])
+rows = []
+with open(path) as f:
+    reader = csv.reader(f)
+    next(reader, None)  # drop header
+    for r in reader:
+        try:
+            rows.append((float(r[1]), float(r[2])))
+        except (ValueError, IndexError):
+            continue
+if len(rows) < 5:
+    print("skip n<5")
+    sys.exit(0)
+n = len(rows)
+sum_x = sum(x for x, _ in rows)
+sum_y = sum(y for _, y in rows)
+sum_xy = sum(x * y for x, y in rows)
+sum_xx = sum(x * x for x, _ in rows)
+denom = n * sum_xx - sum_x * sum_x
+if denom == 0:
+    print("skip flat")
+    sys.exit(0)
+slope_mb_per_sec = (n * sum_xy - sum_x * sum_y) / denom
+slope_mb_per_hour = slope_mb_per_sec * 3600
+# Project over 24h. Negative slope (memory releasing) is always fine.
+projected_24h = slope_mb_per_hour * 24
+verdict = "PASS" if projected_24h <= budget else "FAIL"
+print(f"{verdict} slope={slope_mb_per_hour:.3f}MB/h projected_24h={projected_24h:.1f}MB budget={budget}MB")
+PY
+    local slope_result
+    slope_result=$(python3 "$slope_script" "$METRICS_CSV" "$MAX_MEM_INCREASE_MB" 2>/dev/null || echo "skip")
+    rm -f "$slope_script"
+    case "$slope_result" in
+        PASS*)
+            echo "PASS: memory trend ($slope_result)" >> "$SUMMARY"
+            ;;
+        FAIL*)
+            echo "FAIL: memory trend — 24h projection exceeds budget ($slope_result)" >> "$SUMMARY"
+            pass=false
+            ;;
+        *)
+            echo "SKIP: memory trend ($slope_result)" >> "$SUMMARY"
+            ;;
+    esac
 
     # 2. FD leak check (monotonic increase detection)
     local fd_increases=0
@@ -804,7 +876,19 @@ main() {
         while read -r pid; do
             kill "$pid" 2>/dev/null || true
         done < "$RESULTS_DIR/agent_pids.txt"
-        sleep 3  # Wait for sandbox cleanup (veth deletion, state file removal)
+        # Poll until every agent PID is gone rather than sleeping a fixed 3s.
+        # On loaded EC2 instances 3s was occasionally too short, leaving live
+        # sandboxes that then showed up as "orphan veth" in the evaluation
+        # phase and falsely failed the run.
+        local agent_deadline=$(($(date +%s) + 15))
+        while [ "$(date +%s)" -lt "$agent_deadline" ]; do
+            local alive=0
+            while read -r pid; do
+                kill -0 "$pid" 2>/dev/null && alive=$((alive + 1))
+            done < "$RESULTS_DIR/agent_pids.txt"
+            [ "$alive" = "0" ] && break
+            sleep 0.3
+        done
     fi
 
     # Run GVM cleanup to deterministically remove any orphaned sandbox resources.
