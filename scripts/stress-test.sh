@@ -116,6 +116,39 @@ setup() {
     echo -e "  Results:    $RESULTS_DIR"
     echo ""
 
+    # ── Defensive cleanup of leftover chaos state ──
+    #
+    # A previous stress run that died via SIGKILL (timeout --signal=KILL, OOM,
+    # kernel panic, lost SSH session mid-teardown) can leave behind kernel-scope
+    # state that the `trap cleanup EXIT` handler never ran against:
+    #
+    #   - `tc qdisc` netem rules on the default egress interface (from
+    #     chaos_network_partition) — delay/loss applied to all subsequent HTTPS
+    #     traffic, silently breaking the host's outbound connectivity until
+    #     explicitly removed.
+    #   - iptables mangle fwmark rules matching the netem filter.
+    #   - Orphan disk-pressure tmpfs mounts.
+    #
+    # Ran into exactly this: a timeout-killed stress run left
+    # `qdisc netem 30: delay 5s loss 20%` active, which looked indistinguishable
+    # from a broken EC2 instance until `tc qdisc show` revealed it.
+    #
+    # Run the teardown operations unconditionally here so the next run starts
+    # from a known-clean kernel state regardless of how the previous one died.
+    local default_iface
+    default_iface=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' || echo "")
+    if [ -n "$default_iface" ]; then
+        if sudo tc qdisc show dev "$default_iface" 2>/dev/null | grep -q "netem\|prio 1:"; then
+            echo -e "  ${YELLOW}⚠ Leftover tc qdisc on $default_iface — removing${NC}"
+            sudo tc qdisc del dev "$default_iface" root 2>/dev/null || true
+        fi
+    fi
+    # iptables mangle fwmark cleanup (best-effort — matches chaos_network_partition exactly)
+    sudo iptables -t mangle -D OUTPUT -p tcp --dport 443 ! -d 127.0.0.0/8 \
+        -j MARK --set-mark 42 2>/dev/null || true
+    sudo iptables -t mangle -D OUTPUT -p tcp --dport 80 ! -d 127.0.0.0/8 \
+        -j MARK --set-mark 42 2>/dev/null || true
+
     # Load stress SRR via symlink — NEVER overwrite the original config.
     # Previous bug: cp stress-srr → srr_network.toml destroyed production rules
     # on abnormal exit (SSH disconnect, kernel panic). Now we symlink so the
@@ -722,6 +755,12 @@ cleanup() {
 }
 
 trap cleanup EXIT
+# Catch termination signals explicitly and forward to cleanup.
+# The EXIT trap alone is not enough when the parent is `timeout`: under SIGKILL
+# the shell dies without running EXIT traps. Under SIGTERM/INT/HUP we want
+# cleanup to run before the shell exits. Under SIGKILL the next run's
+# defensive cleanup in setup() is the only safety net — by design.
+trap 'cleanup; exit 143' TERM INT HUP
 
 # ── Main ──
 main() {
