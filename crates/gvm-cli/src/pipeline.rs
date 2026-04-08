@@ -713,7 +713,7 @@ fn print_fs_diff_report(diff: &gvm_sandbox::filesystem::FsDiffReport, workspace:
             write_staging_manifest(&staging_dir, workspace, diff);
         }
 
-        if std::io::stdin().is_terminal() && staging_dir.exists() {
+        if is_interactive_foreground() && staging_dir.exists() {
             eprintln!();
             let mut accepted = 0usize;
             let mut rejected = 0usize;
@@ -912,4 +912,48 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
     }
+}
+
+/// Return true only when the process can safely prompt the user interactively.
+///
+/// `is_terminal()` alone is not enough. In a pipeline like
+/// `sudo gvm run --sandbox -- python ... | grep ...`, gvm inherits the shell's
+/// controlling tty on stdin (so `is_terminal()` returns true) but sits in a
+/// *background* process group because of the pipeline. A bare `read_line()`
+/// on stdin in that state triggers `SIGTTIN` and the kernel puts the process
+/// into state `T` (stopped) — `timeout 30` can't even kill it because SIGTERM
+/// queues behind the stop and never delivers. Every test doing
+/// `sudo gvm run --sandbox -- ... | grep ...` hangs forever.
+///
+/// Fix: require stdin AND stderr to be ttys *and* the current process group
+/// to be the foreground group of that tty. When any of those fails we skip
+/// the prompt and rely on the staging manifest so the user can drain the
+/// batch later with `gvm fs approve`.
+#[cfg(unix)]
+fn is_interactive_foreground() -> bool {
+    use std::io::IsTerminal;
+    use std::os::unix::io::AsRawFd;
+
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return false;
+    }
+
+    // tcgetpgrp(stdin) == getpgrp() means "we own the foreground of this tty".
+    // Background pipeline: tcgetpgrp returns the shell's pgrp, not ours.
+    let stdin_fd = std::io::stdin().as_raw_fd();
+    // SAFETY: we just checked stdin is a terminal; getpgrp is infallible.
+    unsafe {
+        let tty_pgrp = libc::tcgetpgrp(stdin_fd);
+        if tty_pgrp < 0 {
+            return false; // no controlling terminal
+        }
+        let our_pgrp = libc::getpgrp();
+        tty_pgrp == our_pgrp
+    }
+}
+
+#[cfg(not(unix))]
+fn is_interactive_foreground() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
