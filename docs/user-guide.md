@@ -225,6 +225,49 @@ sudo gvm run --sandbox my_agent.py
 
 Agent runs in an isolated environment where it cannot bypass the proxy. Linux only, requires sudo.
 
+#### Combining sandbox with other modes
+
+Isolation (`--sandbox` / `--contained` / cooperative default) and enforcement
+(`--watch` / normal enforce / `-i` interactive) are **orthogonal axes**. Pick
+one from each column and combine with the corresponding flags. Every
+combination below is a real, supported workflow — not just hypothetical.
+
+```bash
+# Watch an untrusted third-party agent in full namespace isolation.
+# Every URL it tries to hit is logged; nothing is blocked by rules; but
+# the agent physically cannot reach anything except through the proxy,
+# so it cannot phone home while you profile it.
+sudo gvm run --watch --sandbox third_party_agent.py
+
+# Discover rules for a brand-new agent, with sandbox isolation on from
+# day one. On exit you get an interactive prompt to turn each
+# Default-to-Caution hit into an explicit rule.
+sudo gvm run -i --sandbox my_agent.py
+
+# Normal production path: enforce existing rules, kernel isolation on.
+# The default when the agent is "trusted enough to run, untrusted
+# enough to isolate."
+sudo gvm run --sandbox my_agent.py
+
+# Cooperative watch for your own agent during development — fastest
+# iteration, no sudo required. Acceptable because *you* wrote the
+# HTTP client.
+gvm run --watch my_agent.py
+```
+
+The full matrix:
+
+| Isolation ↓  /  Enforcement → | **Watch** (`--watch`) | **Enforce** (none) | **Discover** (`-i`) |
+|---|---|---|---|
+| **Cooperative** (default) | `gvm run --watch a.py` | `gvm run a.py` | `gvm run -i a.py` |
+| **Sandbox** (`--sandbox`) | `sudo gvm run --watch --sandbox a.py` | `sudo gvm run --sandbox a.py` | `sudo gvm run -i --sandbox a.py` |
+| **Contained** (`--contained`, experimental) | `gvm run --watch --contained a.py` | `gvm run --contained a.py` | `gvm run -i --contained a.py` |
+
+All twelve cells work. `--watch` and `-i` are mutually exclusive (watch means
+"no rules," interactive means "suggest rules for caution hits" — one
+requires the other to be off). `--sandbox` and `--contained` are mutually
+exclusive (pick one isolation layer). Everything else composes freely.
+
 ```bash
 --sandbox-timeout 300       # Kill after 5 minutes (default: 3600)
 --sandbox-timeout 0         # No timeout (persistent agent)

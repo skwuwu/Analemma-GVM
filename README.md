@@ -117,14 +117,39 @@ Same classification function as the live proxy. Check results always match real 
 
 ## Modes
 
+GVM has two orthogonal axes: **what to do about rules** (watch / enforce /
+discover) and **how isolated the agent runs** (cooperative / sandbox / contained).
+Pick one from each column and combine with the corresponding flags.
+
+**Enforcement (`--watch` / none / `-i`)**
+
 | Mode | Command | What it does |
 |------|---------|-------------|
-| **Watch** | `gvm run --watch agent.py` | See every API call. No blocking. |
-| **Enforce** | `gvm run agent.py` | Apply URL rules + audit trail |
-| **Discover** | `gvm run -i agent.py` | Enforce + suggest new rules after exit |
-| **Sandbox** | `gvm run --sandbox agent.py` | Kernel isolation (namespace + seccomp + MITM) |
+| **Watch** | `gvm run --watch agent.py` | Observe every API call, stream to the terminal, no blocking. |
+| **Enforce** | `gvm run agent.py` | Apply SRR + ABAC rules, record to the Merkle WAL, return the enforcement decision to the agent. |
+| **Discover** | `gvm run -i agent.py` | Enforce + interactively suggest new rules for Default-to-Caution hits on exit. |
 
-Sandbox mode intercepts all HTTPS at the network level — the agent physically cannot bypass the proxy. Works with any runtime (Python, Node.js, Go, binaries).
+**Isolation (`--sandbox` / `--contained` / none)**
+
+| Mode | Command | Trust model |
+|------|---------|-------------|
+| **Cooperative** (default) | `gvm run agent.py` | `HTTP_PROXY`/`HTTPS_PROXY` env vars are injected. The agent's HTTP client must honour them. A non-cooperating client that opens a raw socket to port 443 bypasses the proxy. Suitable for agents you wrote or trust to use standard libraries (Python `requests`, Node `fetch`/`undici`, curl). |
+| **Sandbox** | `gvm run --sandbox agent.py` | Linux user/PID/mount/net namespaces + seccomp-BPF + iptables DNAT. All outbound port 443 is rewritten to the proxy's MITM listener at the kernel level. The agent **cannot** reach the network except through GVM — there is no env var to unset. Works with any runtime (Python, Node, Go, arbitrary binaries). |
+| **Contained** (experimental) | `gvm run --contained agent.py` | Docker `--internal` network + DNAT, same trust properties as sandbox but with Docker as the boundary. |
+
+**Combining the two axes** — `--watch` and `--sandbox` compose freely:
+
+```bash
+gvm run --watch --sandbox agent.py
+```
+
+gives you "observe everything, no rules applied, but the agent is still
+namespace-isolated." This is the safest way to profile an untrusted
+third-party agent for the first time — you see every call it tries to
+make, and it can't phone home even if it wants to.
+
+The demo at the top of this README uses pure cooperative mode for brevity,
+but the same three commands work with `--sandbox` added to each line.
 
 ---
 
