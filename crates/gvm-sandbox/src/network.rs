@@ -1295,12 +1295,39 @@ fn cleanup_stale_run_gvm_dirs() -> usize {
         "ws-merged-",
         "ws-overlay-",
     ];
+    // Fixed names without a PID suffix. These come from child-side mkdirs
+    // inside the sandbox mount namespace — Linux still creates the dirent
+    // on the underlying filesystem because the namespace shares inodes
+    // with the host (only mount propagation differs). The child cleanup
+    // handles them via pivot_root + umount, but a SIGKILL'd or panicked
+    // child leaves the empty dirent behind. Always safe to rmdir if empty
+    // and not currently a mount point.
+    let fixed_names = ["sandbox-root", "sandbox-staging-ws"];
+    let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+    for name in fixed_names {
+        let path = format!("/run/gvm/{}", name);
+        let p = std::path::Path::new(&path);
+        if !p.exists() {
+            continue;
+        }
+        if mounts.lines().any(|l| {
+            l.split_whitespace()
+                .nth(1)
+                .map(|m| m == path.as_str())
+                .unwrap_or(false)
+        }) {
+            continue;
+        }
+        if std::fs::remove_dir(&path).is_ok() {
+            cleaned += 1;
+            tracing::warn!(path = %path, "Removed stale fixed-name /run/gvm/ directory");
+        }
+    }
+
     let entries = match std::fs::read_dir("/run/gvm") {
         Ok(e) => e,
-        Err(_) => return 0,
+        Err(_) => return cleaned,
     };
-    // Snapshot /proc/mounts once so we don't re-read it per directory.
-    let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
     for entry in entries.flatten() {
         let name = match entry.file_name().into_string() {
             Ok(s) => s,
