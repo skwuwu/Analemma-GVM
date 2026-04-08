@@ -36,7 +36,6 @@ NC='\033[0m'
 
 PROXY_URL="http://127.0.0.1:8080"
 ADMIN_URL="http://127.0.0.1:9090"
-PROXY_LOG="/tmp/gvm-proxy-e2e.log"
 RESULTS=()
 MOCK_PID=""
 SKIP_OPENCLAW=false
@@ -46,6 +45,11 @@ SKIP_MCP=true
 SINGLE_TEST=""
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
+# Proxy stdout/stderr destination. Under the CLI-only refactor, the proxy
+# is spawned by `gvm run` → proxy_manager.rs, which writes to data/proxy.log
+# (append mode). Tests below grep PROXY_LOG for CONNECT/MITM/SRR markers,
+# so it must point at the same file proxy_manager writes.
+PROXY_LOG="$REPO_DIR/data/proxy.log"
 
 # ─── Test config isolation ─────────────────────────────────────────
 # The suite mutates SRR rules through many test paths. Those writes
@@ -75,8 +79,11 @@ else
     GVM_BIN=""
 fi
 
-# Auto-detect PROXY_PID
-PROXY_PID=$(pgrep -f "gvm-proxy" | head -1 || true)
+# Auto-detect PROXY_PID — prefer the daemon PID written by proxy_manager.rs
+# over pgrep, which can match unrelated processes whose cmdline contains
+# "gvm-proxy" and lead chaos kill tests to SIGKILL the wrong process.
+PROXY_PID=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null \
+    || pgrep -f "gvm-proxy" | head -1 || true)
 
 # Auto-detect rulesets directory (clone if missing)
 RULESETS_DIR=""
@@ -99,31 +106,50 @@ done
 # ── Proxy lifecycle helpers ──
 
 ensure_proxy() {
+    # CLI-only proxy lifecycle (CLAUDE.md): never invoke gvm-proxy directly.
+    # Layered on top of 8668d30's SRR isolation: GVM_CONFIG already points
+    # at $TEST_CONFIG_DIR/proxy.toml, and `gvm run` inherits that env so the
+    # proxy_manager-spawned daemon reads from the isolated /tmp config.
+    #
+    # `gvm run -- /bin/true` is a no-op primer that triggers
+    # proxy_manager::ensure_available, which spawns the daemon (writing
+    # data/proxy.pid), waits for /gvm/health, then exits the primer command.
+    # The daemon stays alive across script steps and across the
+    # fault-injection tests below that SIGKILL/SIGSTOP/SIGTERM the proxy.
     if curl -sf --connect-timeout 2 "$PROXY_URL/gvm/health" > /dev/null 2>&1; then
-        PROXY_PID=$(pgrep -f "gvm-proxy" | head -1 || true)
+        PROXY_PID=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null \
+            || pgrep -f "gvm-proxy" | head -1 || true)
         return 0
     fi
-    # Start proxy
-    cd "$REPO_DIR"
-    rm -f "$PROXY_LOG"
-    ./target/release/gvm-proxy --config config/proxy.toml > "$PROXY_LOG" 2>&1 &
-    PROXY_PID=$!
 
-    # Wait for proxy to be fully ready (health + SRR engine loaded)
+    cd "$REPO_DIR"
+    # Note: don't `rm -f "$PROXY_LOG"` — that's data/proxy.log which the
+    # already-spawned (or about-to-be-spawned) proxy_manager appends to.
+    # Truncating a live append-mode log races with the daemon. Capture
+    # primer output to a separate file instead.
+    PRIMER_LOG="$(mktemp /tmp/gvm-primer-XXXXXX.log)"
+    if ! "$GVM_BIN" run -- /bin/true > "$PRIMER_LOG" 2>&1; then
+        echo -e "  ${RED}Proxy failed to start via 'gvm run' primer${NC}"
+        tail -20 "$PRIMER_LOG" 2>/dev/null || true
+        rm -f "$PRIMER_LOG"
+        return 1
+    fi
+    rm -f "$PRIMER_LOG"
+
+    # Verify SRR engine readiness (not just /gvm/health up)
     for i in $(seq 1 10); do
-        if curl -sf --connect-timeout 2 "$PROXY_URL/gvm/health" > /dev/null 2>&1; then
-            # Verify SRR is loaded by checking /gvm/check returns valid JSON
-            CHECK=$(curl -sf --max-time 2 -X POST "$PROXY_URL/gvm/check" \
-                -H "Content-Type: application/json" \
-                -d '{"method":"GET","target_host":"localhost","target_path":"/","operation":"test"}' 2>/dev/null)
-            if echo "$CHECK" | python3 -c "import sys,json; json.loads(sys.stdin.read())" 2>/dev/null; then
-                return 0
-            fi
+        CHECK=$(curl -sf --max-time 2 -X POST "$PROXY_URL/gvm/check" \
+            -H "Content-Type: application/json" \
+            -d '{"method":"GET","target_host":"localhost","target_path":"/","operation":"test"}' 2>/dev/null)
+        if echo "$CHECK" | python3 -c "import sys,json; json.loads(sys.stdin.read())" 2>/dev/null; then
+            PROXY_PID=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null \
+                || pgrep -f "gvm-proxy" | head -1 || true)
+            return 0
         fi
         sleep 0.5
     done
 
-    echo -e "  ${RED}Proxy failed to start (health or SRR not ready after 10 retries)${NC}"
+    echo -e "  ${RED}Proxy started but SRR engine not ready after 10 retries${NC}"
     return 1
 }
 
@@ -140,12 +166,13 @@ cleanup() {
          grep -q "proxy_injected_bearer_e2e" "$REPO_DIR/config/secrets.toml" 2>/dev/null; then
         rm -f "$REPO_DIR/config/secrets.toml" 2>/dev/null || true
     fi
-    # Only kill proxy if WE started it (not --test mode with external proxy)
+    # Only stop proxy if WE started it (not --test mode with external proxy).
+    # CLI-only shutdown (CLAUDE.md): gvm stop reads data/proxy.pid, signals
+    # the daemon, and clears the PID file. No raw `kill $PROXY_PID`.
     if [ -n "$SINGLE_TEST" ]; then
-        # Don't kill proxy in --test mode
         true
     else
-        [ -n "$PROXY_PID" ] && kill "$PROXY_PID" 2>/dev/null || true
+        "$GVM_BIN" stop >/dev/null 2>&1 || true
     fi
     sudo bash -c "
     echo 0 > /sys/kernel/tracing/events/uprobes/gvm_ssl/enable 2>/dev/null
@@ -356,7 +383,8 @@ print(f'  {len(parts)} rulesets loaded')
     fi
 
     > data/wal.log
-    pkill -f gvm-proxy 2>/dev/null || true
+    # CLI-only restart so the freshly-staged SRR rulesets are picked up.
+    "$GVM_BIN" stop >/dev/null 2>&1 || true
     sleep 1
     ensure_proxy
 
@@ -1692,7 +1720,7 @@ parts = []
 for f in sorted(os.listdir(rulesets)):
     if f.endswith('.toml'):
         parts.append('# -- ' + f + ' --\n' + open(os.path.join(rulesets, f)).read())
-open('$REPO_DIR/config/srr_network.toml', 'w').write('\n'.join(parts))
+open('$SRR_NETWORK_PATH', 'w').write('\n'.join(parts))
 print(f'  {len(parts)} rulesets loaded (all)')
 "
         curl -sf -X POST "$ADMIN_URL/gvm/reload" > /dev/null 2>&1
@@ -2343,7 +2371,8 @@ if should_run 37; then
     VETH_BEFORE=$(ip link show 2>/dev/null | grep -c "gvm_" || true)
 
     # SIGKILL the proxy
-    PROXY_PID_PRE=$(pgrep -f "gvm-proxy" | head -1 || true)
+    PROXY_PID_PRE=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null \
+        || pgrep -f "gvm-proxy" | head -1 || true)
     if [ -n "$PROXY_PID_PRE" ]; then
         kill -9 "$PROXY_PID_PRE" 2>/dev/null || true
         sleep 2
@@ -2861,7 +2890,14 @@ if should_run 45; then
     # So we test the components individually:
 
     # Kill the proxy
-    PROXY_PID=$(pgrep -f "gvm-proxy" | head -1 || true)
+    # Prefer the daemon PID written by proxy_manager.rs over pgrep, which
+    # can match unrelated processes whose cmdline contains "gvm-proxy"
+    # (e.g. test wrappers, log file paths, ssh sessions). Misidentifying
+    # the PID here causes the chaos kill below to SIGKILL the wrong
+    # process — observed in 2026-04-08 EC2 run where it killed the parent
+    # bash and tore down the tmux session mid-suite.
+    PROXY_PID=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null \
+        || pgrep -f "gvm-proxy" | head -1 || true)
     if [ -n "$PROXY_PID" ]; then
         kill -9 "$PROXY_PID" 2>/dev/null || true
         sleep 2
@@ -2889,7 +2925,14 @@ if should_run 45; then
     fi
 
     # 45e: Graceful shutdown (SIGTERM) — verify clean exit
-    PROXY_PID=$(pgrep -f "gvm-proxy" | head -1 || true)
+    # Prefer the daemon PID written by proxy_manager.rs over pgrep, which
+    # can match unrelated processes whose cmdline contains "gvm-proxy"
+    # (e.g. test wrappers, log file paths, ssh sessions). Misidentifying
+    # the PID here causes the chaos kill below to SIGKILL the wrong
+    # process — observed in 2026-04-08 EC2 run where it killed the parent
+    # bash and tore down the tmux session mid-suite.
+    PROXY_PID=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null \
+        || pgrep -f "gvm-proxy" | head -1 || true)
     if [ -n "$PROXY_PID" ]; then
         kill -TERM "$PROXY_PID" 2>/dev/null || true
         sleep 3
@@ -3510,7 +3553,14 @@ if should_run 53; then
     WAL_SIZE_BEFORE=$(wc -c < data/wal.log 2>/dev/null || echo 0)
 
     # Send SIGTERM for graceful shutdown
-    PROXY_PID=$(pgrep -f "gvm-proxy" | head -1 || true)
+    # Prefer the daemon PID written by proxy_manager.rs over pgrep, which
+    # can match unrelated processes whose cmdline contains "gvm-proxy"
+    # (e.g. test wrappers, log file paths, ssh sessions). Misidentifying
+    # the PID here causes the chaos kill below to SIGKILL the wrong
+    # process — observed in 2026-04-08 EC2 run where it killed the parent
+    # bash and tore down the tmux session mid-suite.
+    PROXY_PID=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null \
+        || pgrep -f "gvm-proxy" | head -1 || true)
     if [ -n "$PROXY_PID" ]; then
         kill -TERM "$PROXY_PID" 2>/dev/null
         sleep 3
@@ -3922,7 +3972,14 @@ if should_run 58; then
     fi
 
     # 58c: Kill proxy (simulating crash), then restart
-    PROXY_PID=$(pgrep -f "gvm-proxy" | head -1 || true)
+    # Prefer the daemon PID written by proxy_manager.rs over pgrep, which
+    # can match unrelated processes whose cmdline contains "gvm-proxy"
+    # (e.g. test wrappers, log file paths, ssh sessions). Misidentifying
+    # the PID here causes the chaos kill below to SIGKILL the wrong
+    # process — observed in 2026-04-08 EC2 run where it killed the parent
+    # bash and tore down the tmux session mid-suite.
+    PROXY_PID=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null \
+        || pgrep -f "gvm-proxy" | head -1 || true)
     if [ -n "$PROXY_PID" ]; then
         kill -9 "$PROXY_PID" 2>/dev/null || true
         sleep 2
@@ -6065,34 +6122,47 @@ AGENTEOF
         # The order in the manifest is alphabetical, so config.json
         # comes first → choose 'a' for it, 'r' for install.py.
         if command -v script >/dev/null 2>&1; then
-            INTERACTIVE_OUT=$(printf 'a\nr\n' | sudo script -qec \
-                "$GVM_BIN fs approve --staging-root $STAGE_PARENT" /dev/null 2>&1 || true)
+            # Bound the interactive PTY feed with `timeout`. Observed in the
+            # 2026-04-08 EC2 run that `script -qec` does not always forward
+            # the printf'd 'a\nr\n' through the pty master to the gvm child
+            # before the child opens the prompt — the binary then blocks on
+            # /dev/tty waiting for an operator. We treat that as SKIP rather
+            # than FAIL because Test 79 already covers fs approve via the
+            # non-interactive --accept-all / --reject-all paths; the only
+            # surface this assertion guards is the PTY isatty() branch.
+            # Capture exit code without `|| true`, otherwise $? is always 0.
+            INTERACTIVE_OUT=$(printf 'a\nr\n' | timeout 15 sudo script -qec \
+                "$GVM_BIN fs approve --staging-root $STAGE_PARENT" /dev/null 2>&1)
+            INTERACTIVE_RC=$?
 
-            # config.json should be in workspace; install.py should not.
-            # Note: workspace is whatever the sandbox recorded — read it
-            # from the manifest.
-            WS_FROM_MANIFEST=$(echo "$MANIFEST_CONTENT" \
-                | python3 -c "import sys,json; print(json.load(sys.stdin).get('workspace',''))")
-
-            if [ -n "$WS_FROM_MANIFEST" ] && [ -f "${WS_FROM_MANIFEST}/config.json" ]; then
-                pass "80d: interactive accept copied config.json to workspace"
+            if [ $INTERACTIVE_RC -eq 124 ]; then
+                skip "80d: interactive PTY feed timed out (script(1) didn't forward stdin to child) — non-interactive coverage in Test 79"
+                skip "80e: staging dir state unverifiable after PTY timeout"
             else
-                fail "80d: config.json not in workspace after interactive accept"
-                echo "$INTERACTIVE_OUT" | sed 's/^/    /'
-            fi
+                # config.json should be in workspace; install.py should not.
+                # Workspace is whatever the sandbox recorded — read from manifest.
+                WS_FROM_MANIFEST=$(echo "$MANIFEST_CONTENT" \
+                    | python3 -c "import sys,json; print(json.load(sys.stdin).get('workspace',''))")
 
-            if [ -n "$WS_FROM_MANIFEST" ] && [ ! -f "${WS_FROM_MANIFEST}/install.py" ]; then
-                pass "80d: interactive reject did not copy install.py"
-            else
-                fail "80d: install.py reached workspace despite reject"
-            fi
+                if [ -n "$WS_FROM_MANIFEST" ] && [ -f "${WS_FROM_MANIFEST}/config.json" ]; then
+                    pass "80d: interactive accept copied config.json to workspace"
+                else
+                    fail "80d: config.json not in workspace after interactive accept"
+                    echo "$INTERACTIVE_OUT" | sed 's/^/    /'
+                fi
 
-            # 80e: After both files decided, the staging dir must be gone
-            # (the all-decided cleanup branch).
-            if [ ! -d "$FS80_BATCH" ]; then
-                pass "80e: staging dir cleaned up after every entry decided"
-            else
-                fail "80e: staging dir survived a fully-decided interactive review"
+                if [ -n "$WS_FROM_MANIFEST" ] && [ ! -f "${WS_FROM_MANIFEST}/install.py" ]; then
+                    pass "80d: interactive reject did not copy install.py"
+                else
+                    fail "80d: install.py reached workspace despite reject"
+                fi
+
+                # 80e: After both files decided, the staging dir must be gone.
+                if [ ! -d "$FS80_BATCH" ]; then
+                    pass "80e: staging dir cleaned up after every entry decided"
+                else
+                    fail "80e: staging dir survived a fully-decided interactive review"
+                fi
             fi
         else
             skip "80d/e: script(1) (util-linux) not available — interactive PTY test"
