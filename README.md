@@ -10,7 +10,31 @@ So I built GVM(Governance Virtual Machine) — an governance runtime that exists
 Agent (any framework) → GVM Proxy → External APIs
 ```
 
-A single Rust binary on glibc-based Linux. No Docker, no K8s, no GPU.
+A single Rust binary. No Kubernetes, no service mesh, no sidecar, no GPU. Linux x86_64 host with glibc — that's the entire runtime requirement for cooperative and watch modes. Sandbox mode adds the standard `iproute2` / `iptables` userland that ships with every server distribution. See [Requirements](#requirements) below for the full matrix.
+
+## Demo — Watch → Suggest → Enforce in 3 commands
+
+[▶ docs/assets/gvm-demo.cast](docs/assets/gvm-demo.cast) (33 seconds, plain
+asciinema v2 cast — `asciinema play docs/assets/gvm-demo.cast` or open at
+[asciinema.org/connect](https://asciinema.org)).
+
+The cast runs the full Watch → Suggest → Enforce loop end-to-end on a real
+Ubuntu 24.04 host:
+
+1. **`gvm run --watch demo_agent.py`** — observes every URL the agent calls,
+   prints a live stream and a session summary, marks unknown hosts as
+   Default-to-Caution.
+2. **`gvm run --watch --output json demo_agent.py > session.jsonl`** then
+   **`gvm suggest --from session.jsonl > config/srr_network.toml`** — turns
+   the recorded session into explicit SRR rules.
+3. **`gvm run demo_agent.py`** — enforces. The known URLs land instantly;
+   a fourth URL added after the rules were written falls into
+   Default-to-Caution and lights up the audit trail with `2 delayed`,
+   exactly as the rest of this README describes.
+
+No agent code was changed between steps. The same `demo_agent.py` and the
+same proxy port handle all three runs — only the SRR config and the
+agent's URL list differ.
 
 ---
 
