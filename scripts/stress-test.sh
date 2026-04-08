@@ -164,51 +164,38 @@ setup() {
     cp "$REPO_DIR/data/wal.log" "$RESULTS_DIR/wal-pre-stress.log" 2>/dev/null || true
     > "$REPO_DIR/data/wal.log"
 
-    # Start proxy as independent daemon via proxy_manager pattern.
-    # Uses setsid + PID file so proxy survives script exit and chaos kill recovery.
-    # Kill any existing proxy first to ensure clean state with stress SRR.
-    if [ -f "$REPO_DIR/data/proxy.pid" ]; then
-        local old_pid
-        old_pid=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null || echo "0")
-        kill "$old_pid" 2>/dev/null || true
-        sleep 1
-    fi
-
+    # Bring up the proxy through the GVM CLI only — no direct gvm-proxy
+    # invocation, no setsid, no PID file mangling. CLAUDE.md requires test
+    # scripts to drive GVM exclusively through CLI commands; proxy_manager.rs
+    # already handles daemonization, PID file ownership, stale-process cleanup
+    # and health-wait deterministically.
+    #
+    # Sequence:
+    #   1. `gvm stop`  — terminate any leftover proxy from a previous run
+    #                    so it loads the freshly-staged stress SRR config.
+    #   2. `gvm run -- /bin/true` — primer agent. ensure_available() spawns
+    #                    the proxy daemon, waits for health (and TLS warm-up),
+    #                    then runs `/bin/true` and exits. The daemon stays.
+    #
+    # Chaos-kill recovery still works for free: every subsequent `gvm run`
+    # call inside launch_agent() re-runs ensure_available(), which respawns
+    # the proxy if chaos_proxy_kill() has just SIGKILLed it.
     cd "$REPO_DIR"
-    setsid "$PROXY_BIN" > "$REPO_DIR/data/proxy.log" 2>&1 &
-    PROXY_PID=$!
-    echo "$PROXY_PID" > "$REPO_DIR/data/proxy.pid"
-    echo "$PROXY_PID" > "$RESULTS_DIR/proxy.pid"
-
-    # Wait for proxy to report healthy instead of sleeping an arbitrary
-    # amount. Polls /gvm/health at 200ms intervals for up to 30s. On slow
-    # EC2 instances the old `sleep 3` was flaky — cold caches pushed
-    # startup past 3s and the subsequent health check ran before the
-    # proxy was ready, tanking the whole run.
-    local status="unknown"
-    local deadline=$(($(date +%s) + 30))
-    while [ "$(date +%s)" -lt "$deadline" ]; do
-        status=$( (curl -sf --max-time 2 "$PROXY_URL/gvm/health" \
-            | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])") 2>/dev/null) \
-            || status="dead"
-        [ "$status" = "healthy" ] && break
-        if ! kill -0 "$PROXY_PID" 2>/dev/null; then
-            status="crashed"
-            break
-        fi
-        sleep 0.2
-    done
-    if [ "$status" != "healthy" ]; then
-        echo -e "${RED}Proxy failed to start (status: $status)${NC}"
+    "$GVM_BIN" stop >/dev/null 2>&1 || true
+    if ! "$GVM_BIN" run -- /bin/true >"$RESULTS_DIR/proxy-bootstrap.log" 2>&1; then
+        echo -e "${RED}Proxy failed to start via 'gvm run' primer${NC}"
+        cat "$RESULTS_DIR/proxy-bootstrap.log" || true
         exit 1
     fi
 
-    # Reload with stress SRR
-    curl -sf -X POST "$ADMIN_URL/gvm/reload" > /dev/null 2>&1
-    echo -e "  ${GREEN}Proxy started as daemon (PID $PROXY_PID)${NC}"
+    # PID file is written by proxy_manager.rs — read it for metrics only.
+    # This is read-only observation, not lifecycle management.
+    PROXY_PID=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null || echo "0")
+    echo "$PROXY_PID" > "$RESULTS_DIR/proxy.pid"
+    echo -e "  ${GREEN}Proxy started via gvm CLI (PID $PROXY_PID)${NC}"
 
     # Record initial metrics
-    INITIAL_RSS=$(get_rss $PROXY_PID)
+    INITIAL_RSS=$(get_rss "$PROXY_PID")
     echo "initial_rss_mb=$INITIAL_RSS" >> "$SUMMARY"
 
     # CSV header
@@ -774,9 +761,11 @@ cleanup() {
         done < "$RESULTS_DIR/agent_pids.txt"
     fi
 
-    # Kill ALL gvm-proxy processes (not just PID file — setsid daemons may outlive PID file)
-    pkill -f gvm-proxy 2>/dev/null || true
-    rm -f "$REPO_DIR/data/proxy.pid" "$RESULTS_DIR/proxy.pid" 2>/dev/null
+    # Stop the proxy through the CLI — gvm stop reads data/proxy.pid,
+    # signals the daemon, waits for it, and clears the PID file. No
+    # pkill / no direct process scanning (CLAUDE.md CLI-only rule).
+    "$GVM_BIN" stop >/dev/null 2>&1 || true
+    rm -f "$RESULTS_DIR/proxy.pid" 2>/dev/null
 
     # Remove network chaos if active
     local iface

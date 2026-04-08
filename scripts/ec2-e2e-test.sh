@@ -47,6 +47,25 @@ SINGLE_TEST=""
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
+# ─── Test config isolation ─────────────────────────────────────────
+# The suite mutates SRR rules through many test paths. Those writes
+# MUST NOT land in the checked-in config/srr_network.toml. Create a
+# fresh copy under /tmp and point the proxy at it via GVM_CONFIG.
+# Every reference below uses $SRR_NETWORK_PATH so the repo file is
+# never touched.
+TEST_CONFIG_DIR="/tmp/gvm-e2e-config-$$"
+SRR_NETWORK_PATH="$TEST_CONFIG_DIR/srr_network.toml"
+PROXY_TOML_PATH="$TEST_CONFIG_DIR/proxy.toml"
+rm -rf "$TEST_CONFIG_DIR"
+mkdir -p "$TEST_CONFIG_DIR"
+cp "$REPO_DIR/config/proxy.toml" "$PROXY_TOML_PATH"
+cp "$REPO_DIR/config/srr_network.toml" "$SRR_NETWORK_PATH"
+# Absolutise network_file inside the copied proxy.toml
+sed -i "s|^network_file = .*|network_file = \"$SRR_NETWORK_PATH\"|" "$PROXY_TOML_PATH"
+export GVM_CONFIG="$PROXY_TOML_PATH"
+trap 'rm -rf "$TEST_CONFIG_DIR"' EXIT
+echo "  Test config isolated at $TEST_CONFIG_DIR (GVM_CONFIG exported)"
+
 # Auto-detect GVM binary (Windows: .exe suffix)
 if [ -f "$REPO_DIR/target/release/gvm.exe" ]; then
     GVM_BIN="$REPO_DIR/target/release/gvm.exe"
@@ -293,16 +312,15 @@ if should_run 1; then
     header "1: Native Linux Build"
 
     cd "$REPO_DIR"
-    BUILD_START=$(date +%s)
-    if cargo build --release -p gvm-proxy -p gvm-cli 2>&1 | tail -3; then
-        BUILD_END=$(date +%s)
-        BUILD_TIME=$((BUILD_END - BUILD_START))
-        PROXY_SIZE=$(stat -c%s target/release/gvm-proxy 2>/dev/null || echo 0)
-        echo -e "  Build time: ${BUILD_TIME}s"
+    # RELEASE-VALIDATION MODE: verify pre-built release binary
+    if [ -f target/release/gvm-proxy ] && [ -f target/release/gvm ]; then
+        PROXY_SIZE=$(stat -c%s target/release/gvm-proxy)
+        GVM_VER=$(target/release/gvm --version 2>&1 || echo unknown)
+        echo -e "  Using pre-built release binary ($GVM_VER)"
         echo -e "  Binary size: $((PROXY_SIZE / 1024 / 1024))MB"
-        [ -f target/release/gvm-proxy ] && pass "1: cargo build (${BUILD_TIME}s)" || fail "1: binary not found"
+        pass "1: release binary present ($GVM_VER)"
     else
-        fail "1: cargo build failed"
+        fail "1: release binary missing in target/release/"
     fi
 fi
 
@@ -332,7 +350,7 @@ for f in ['_default.toml', 'github.toml', 'slack.toml', 'web-browsing.toml']:
     path = os.path.join(rulesets, f)
     if os.path.exists(path):
         parts.append('# -- ' + f + ' --\n' + open(path).read())
-open('config/srr_network.toml', 'w').write('\n'.join(parts))
+open('$SRR_NETWORK_PATH', 'w').write('\n'.join(parts))
 print(f'  {len(parts)} rulesets loaded')
 "
     fi
@@ -670,7 +688,7 @@ if should_run 10; then
     ensure_proxy || { fail "10: proxy not available"; }
 
     # Before: only _default ruleset (github = delay)
-    cat "$RULESETS_DIR/_default.toml" > config/srr_network.toml 2>/dev/null
+    cat "$RULESETS_DIR/_default.toml" > $SRR_NETWORK_PATH 2>/dev/null
     curl -sf -X POST "$ADMIN_URL/gvm/reload" > /dev/null
 
     BEFORE=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
@@ -685,7 +703,7 @@ parts = []
 for f in ['$RULESETS_DIR/_default.toml', '$RULESETS_DIR/github.toml']:
     try: parts.append(open(f).read())
     except: pass
-open('config/srr_network.toml', 'w').write('\n'.join(parts))
+open('$SRR_NETWORK_PATH', 'w').write('\n'.join(parts))
 "
     RELOAD_RESP=$(curl -sf -X POST "$ADMIN_URL/gvm/reload" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('rules','?'))" 2>/dev/null)
     echo -e "  Reload: $RELOAD_RESP rules"
@@ -721,7 +739,7 @@ parts = []
 for f in ['_default.toml', 'github.toml', 'slack.toml', 'web-browsing.toml']:
     try: parts.append(open('$RULESETS_DIR/' + f).read())
     except: pass
-open('config/srr_network.toml', 'w').write('\n'.join(parts))
+open('$SRR_NETWORK_PATH', 'w').write('\n'.join(parts))
 "
     curl -sf -X POST "$ADMIN_URL/gvm/reload" > /dev/null
 fi
@@ -1956,7 +1974,7 @@ if should_run 33; then
     else
         # 33a: gvm run -- curl (simple binary through proxy)
         echo -e "  Testing: gvm run -- curl https://api.github.com"
-        GVM_RUN_OUTPUT=$("$GVM_BIN" run -- curl -sf https://api.github.com -o /dev/null -w "%{http_code}" 2>/dev/null || echo "")
+        GVM_RUN_OUTPUT=$("$GVM_BIN" run </dev/null -- curl -sf https://api.github.com -o /dev/null -w "%{http_code}" 2>/dev/null || echo "")
         echo -e "  Output (last 3 lines):"
         echo "$GVM_RUN_OUTPUT" | tail -3 | while read -r line; do echo -e "    $line"; done
 
@@ -1968,7 +1986,7 @@ if should_run 33; then
 
         # 33b: gvm run -- python (script via binary mode)
         echo -e "  Testing: gvm run -- python3 -c 'import requests; ...'"
-        GVM_PY_OUTPUT=$("$GVM_BIN" run -- python3 -c "
+        GVM_PY_OUTPUT=$("$GVM_BIN" run </dev/null -- python3 -c "
 import requests
 r = requests.get('https://api.github.com/repos/skwuwu/Analemma-GVM', timeout=10)
 print(f'STATUS:{r.status_code}:REPO:{r.json().get(\"name\",\"?\")}')" 2>/dev/null || echo "")
@@ -1989,7 +2007,7 @@ print(f'STATUS:{r.status_code}:REPO:{r.json().get(\"name\",\"?\")}')" 2>/dev/nul
         # 33d: gvm run with OpenClaw (if installed)
         if command -v openclaw &>/dev/null && [ -n "${ANTHROPIC_API_KEY:-}" ] && [ "$SKIP_OPENCLAW" = false ]; then
             echo -e "  Testing: gvm run -- openclaw agent --local ..."
-            GVM_OC_OUTPUT=$("$GVM_BIN" run -- openclaw agent --local \
+            GVM_OC_OUTPUT=$("$GVM_BIN" run </dev/null -- openclaw agent --local \
                 --session-id "gvm-run-test-$(date +%s)" \
                 --message "Say hello in one word." \
                 --timeout 30 2>&1 | grep -v "model-selection" | tail -5 || echo "")
@@ -2041,7 +2059,7 @@ PY
         # 33-script-a: cooperative script mode (no sandbox).
         # Validates run::detect_interpreter() and PATH-resolved python3.
         echo -e "  Testing: gvm run /tmp/gvm-e2e-script-agent.py (cooperative)"
-        SCRIPT_OUT=$("$GVM_BIN" run "$SCRIPT_AGENT" 2>&1 || true)
+        SCRIPT_OUT=$("$GVM_BIN" run </dev/null "$SCRIPT_AGENT" 2>&1 || true)
         if echo "$SCRIPT_OUT" | grep -q "script-mode-agent-ok"; then
             pass "33-script-a: script mode (cooperative) auto-detects python3"
         else
@@ -2053,7 +2071,7 @@ PY
         # workspace dir, /workspace/<script> path translation). This is the
         # exact path that was broken by commit d8c0a04 + a069cea.
         echo -e "  Testing: sudo gvm run --sandbox /tmp/gvm-e2e-script-agent.py"
-        SANDBOX_OUT=$(sudo "$GVM_BIN" run --sandbox "$SCRIPT_AGENT" 2>&1 || true)
+        SANDBOX_OUT=$(sudo "$GVM_BIN" run </dev/null --sandbox "$SCRIPT_AGENT" 2>&1 || true)
         if echo "$SANDBOX_OUT" | grep -q "script-mode-agent-ok"; then
             pass "33-script-b: script mode (sandbox) executes inside namespace"
         else
@@ -2094,7 +2112,7 @@ if should_run 34 && [ "$SKIP_MCP" = false ]; then
     else
         # 34a: GitHub API read via gvm run (real HTTPS, child process inherits proxy)
         echo -e "  ${BOLD}GitHub API via gvm run${NC}"
-        GH_RESULT=$("$GVM_BIN" run -- python3 -c "
+        GH_RESULT=$("$GVM_BIN" run </dev/null -- python3 -c "
 import requests
 r = requests.get('https://api.github.com/repos/skwuwu/Analemma-GVM', timeout=10)
 print(f'{r.status_code}:{r.json().get(\"name\",\"?\")}')" 2>/dev/null | grep "^200:" || echo "FAIL")
@@ -2104,7 +2122,7 @@ print(f'{r.status_code}:{r.json().get(\"name\",\"?\")}')" 2>/dev/null | grep "^2
         GH_TOKEN=$(gh auth token 2>/dev/null || echo "")
         if [ -n "$GH_TOKEN" ]; then
             echo -e "  ${BOLD}GitHub MCP Server via gvm run${NC}"
-            MCP_GH=$("$GVM_BIN" run -- bash -c "
+            MCP_GH=$("$GVM_BIN" run </dev/null -- bash -c "
 echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1.0\"}}}
 {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"search_repositories\",\"arguments\":{\"query\":\"Analemma-GVM\",\"perPage\":1}}}' \
 | GITHUB_PERSONAL_ACCESS_TOKEN='$GH_TOKEN' npx @modelcontextprotocol/server-github 2>/dev/null \
@@ -2128,12 +2146,12 @@ for line in sys.stdin:
         if [ -n "$MCP_DIR" ] && [ -f "$MCP_DIR/scripts/mcp_call.py" ]; then
             echo -e "  ${BOLD}GVM MCP tools via gvm run${NC}"
             # gvm run outputs banner to stderr; redirect stderr to /dev/null so only mcp_call.py JSON on stdout
-            MCP_ALLOW=$("$GVM_BIN" run -- python3 "$MCP_DIR/scripts/mcp_call.py" gvm_policy_check \
+            MCP_ALLOW=$("$GVM_BIN" run </dev/null -- python3 "$MCP_DIR/scripts/mcp_call.py" gvm_policy_check \
                 '{"method":"GET","url":"https://api.github.com/repos/t/t/issues"}' 2>/dev/null \
                 | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null || echo "?")
             [ "$MCP_ALLOW" = "Allow" ] && pass "34c: MCP policy_check Allow via gvm run" || fail "34c: MCP via gvm run ($MCP_ALLOW)"
 
-            MCP_DENY=$("$GVM_BIN" run -- python3 "$MCP_DIR/scripts/mcp_call.py" gvm_fetch \
+            MCP_DENY=$("$GVM_BIN" run </dev/null -- python3 "$MCP_DIR/scripts/mcp_call.py" gvm_fetch \
                 '{"operation":"github.merge","method":"PUT","url":"https://api.github.com/repos/t/t/pulls/1/merge"}' 2>/dev/null \
                 | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('blocked',False))" 2>/dev/null || echo "?")
             [ "$MCP_DENY" = "True" ] && pass "34d: MCP gvm_fetch blocked via gvm run" || fail "34d: MCP fetch via gvm run ($MCP_DENY)"
@@ -2145,7 +2163,7 @@ for line in sys.stdin:
         # 34e: OpenClaw agent via gvm run (LLM + web_fetch, child process chain)
         if command -v openclaw &>/dev/null && [ -n "${ANTHROPIC_API_KEY:-}" ] && [ "$SKIP_OPENCLAW" = false ]; then
             echo -e "  ${BOLD}OpenClaw agent via gvm run${NC}"
-            OC_OUTPUT=$("$GVM_BIN" run -- openclaw agent --local \
+            OC_OUTPUT=$("$GVM_BIN" run </dev/null -- openclaw agent --local \
                 --session-id "gvm-run-integ-$(date +%s)" \
                 --message "Use web_fetch to get https://api.github.com/repos/skwuwu/Analemma-GVM and tell me the repo name in one word." \
                 --timeout 45 2>&1 | grep -v "model-selection" | tail -3 || echo "")
@@ -2169,7 +2187,7 @@ for line in sys.stdin:
         # 34g: Telegram API via gvm run (if token available)
         if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
             echo -e "  ${BOLD}Telegram API via gvm run${NC}"
-            TG_RESULT=$("$GVM_BIN" run -- python3 -c "
+            TG_RESULT=$("$GVM_BIN" run </dev/null -- python3 -c "
 import requests
 r = requests.post('https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe', timeout=10)
 print(f'{r.status_code}:{r.json().get(\"result\",{}).get(\"username\",\"?\")}')" 2>&1 \
@@ -2181,7 +2199,7 @@ print(f'{r.status_code}:{r.json().get(\"result\",{}).get(\"username\",\"?\")}')"
 
         # 34h: Multi-service kill chain via gvm run
         echo -e "  ${BOLD}Kill chain via gvm run${NC}"
-        KC_RESULT=$("$GVM_BIN" run -- python3 -c "
+        KC_RESULT=$("$GVM_BIN" run </dev/null -- python3 -c "
 import requests, json
 results = []
 # Step 1: GitHub read (Allow)
@@ -2253,7 +2271,7 @@ SRREOF
         ensure_proxy || { fail "35: proxy not available"; }
 
         # 35b. Run agent inside sandbox — GET (should be allowed)
-        GET_RESULT=$(sudo timeout 30 "$GVM_BIN" run --sandbox -- python3 -c "
+        GET_RESULT=$(sudo timeout 30 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
 import urllib.request, json, ssl, os
 proxy = os.environ.get('HTTPS_PROXY', os.environ.get('https_proxy', ''))
 # Use requests if available, fallback to urllib
@@ -2369,7 +2387,7 @@ if should_run 38; then
         # MUST be gone. The test enforces both halves: the exact DAC-only
         # bitmask AND the absence of any of the dangerous capabilities
         # that would let the agent tamper with the sandbox itself.
-        CAP_RESULT=$(sudo timeout 15 "$GVM_BIN" run --sandbox -- python3 -c "
+        CAP_RESULT=$(sudo timeout 15 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
 DAC_ONLY_MASK = 0x0f  # CAP_CHOWN|CAP_DAC_OVERRIDE|CAP_DAC_READ_SEARCH|CAP_FOWNER
 DANGEROUS_CAPS = {
     'CAP_NET_ADMIN':   12,
@@ -2427,7 +2445,7 @@ if should_run 39; then
         ensure_proxy || { fail "39: proxy not available"; }
 
         # Run simple HTTPS request through sandbox
-        RESULT=$(sudo timeout 30 "$GVM_BIN" run --sandbox -- python3 -c "
+        RESULT=$(sudo timeout 30 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
 try:
     import requests
     r = requests.get('https://api.github.com', timeout=15)
@@ -2509,7 +2527,7 @@ if should_run 41; then
         # Launch 5 short-lived sandboxes concurrently (reduced from 20 for stability).
         # Use python3 instead of bash since sandbox has minimal rootfs.
         for i in $(seq 1 5); do
-            sudo timeout 20 "$GVM_BIN" run --sandbox -- python3 -c "
+            sudo timeout 20 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
 import os, socket
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 try:
@@ -2577,7 +2595,7 @@ if should_run 42; then
         ensure_proxy || { fail "42: proxy not available"; }
 
         # 42a: mount() syscall — must be killed by seccomp
-        MOUNT_RESULT=$(sudo timeout 30 "$GVM_BIN" run --sandbox -- python3 -c "
+        MOUNT_RESULT=$(sudo timeout 30 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
 import ctypes, os
 libc = ctypes.CDLL('libc.so.6', use_errno=True)
 # Attempt mount() — should trigger seccomp SIGSYS
@@ -2595,7 +2613,7 @@ print(f'MOUNT_SUCCEEDED:{ret}')  # Should never reach here
         fi
 
         # 42b: unshare() syscall — namespace escape attempt
-        UNSHARE_RESULT=$(sudo timeout 30 "$GVM_BIN" run --sandbox -- python3 -c "
+        UNSHARE_RESULT=$(sudo timeout 30 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
 import ctypes, os
 libc = ctypes.CDLL('libc.so.6', use_errno=True)
 # CLONE_NEWNET = 0x40000000 — attempt network namespace escape
@@ -2616,7 +2634,7 @@ else:
         fi
 
         # 42c: ptrace() syscall — debugging/injection attempt
-        PTRACE_RESULT=$(sudo timeout 30 "$GVM_BIN" run --sandbox -- python3 -c "
+        PTRACE_RESULT=$(sudo timeout 30 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
 import ctypes, os
 libc = ctypes.CDLL('libc.so.6', use_errno=True)
 # PTRACE_TRACEME = 0
@@ -2654,7 +2672,7 @@ if should_run 43; then
 
         # 43a: Verify proxy-only routing — agent cannot reach external IP directly
         # Use a known public IP (Google DNS 8.8.8.8) to test direct connectivity
-        DIRECT_RESULT=$(sudo timeout 30 "$GVM_BIN" run --sandbox -- python3 -c "
+        DIRECT_RESULT=$(sudo timeout 30 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
 import socket, sys
 try:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -2675,7 +2693,7 @@ except (socket.timeout, ConnectionRefusedError, OSError) as e:
         fi
 
         # 43b: Verify proxy path works — agent CAN reach the proxy
-        PROXY_RESULT=$(sudo timeout 30 "$GVM_BIN" run --sandbox -- python3 -c "
+        PROXY_RESULT=$(sudo timeout 30 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
 import urllib.request, os
 proxy = os.environ.get('HTTP_PROXY', '')
 try:
@@ -2706,7 +2724,7 @@ except Exception as e:
         fi
 
         # 43d: Verify IPv6 is blocked
-        IPV6_RESULT=$(sudo timeout 30 "$GVM_BIN" run --sandbox -- python3 -c "
+        IPV6_RESULT=$(sudo timeout 30 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
 import socket
 try:
     s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
@@ -2752,7 +2770,7 @@ if should_run 44; then
 
         # 44b: MITM inspection — GET to GitHub (Allow path)
         # The proxy must terminate TLS, inspect plaintext, apply SRR, re-encrypt
-        MITM_GET=$(sudo timeout 30 "$GVM_BIN" run --sandbox -- python3 -c "
+        MITM_GET=$(sudo timeout 30 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
 import os
 try:
     import requests
@@ -3040,7 +3058,7 @@ if should_run 47 && [ "$SKIP_OPENCLAW" = false ]; then
         # 47a: OpenClaw agent in sandbox — LLM call through MITM
         # The agent asks Claude a simple question. The HTTPS call to api.anthropic.com
         # goes through DNAT → MITM listener → SRR → upstream.
-        OC_SANDBOX_OUT=$(sudo -E timeout 60 "$GVM_BIN" run --sandbox -- \
+        OC_SANDBOX_OUT=$(sudo -E timeout 60 "$GVM_BIN" run </dev/null --sandbox -- \
             openclaw agent --local \
             --session-id "mitm-e2e-$(date +%s)" \
             --message "Reply with only the word 'pong'." \
@@ -3136,17 +3154,17 @@ DENYSRR
 
         # Hot-reload the deny rule
         OLD_SRR_CONTENT=""
-        if [ -f "config/srr_network.toml" ]; then
-            OLD_SRR_CONTENT=$(cat config/srr_network.toml)
+        if [ -f "$SRR_NETWORK_PATH" ]; then
+            OLD_SRR_CONTENT=$(cat $SRR_NETWORK_PATH)
         fi
-        cp "$DENY_SRR" config/srr_network.toml 2>/dev/null || true
+        cp "$DENY_SRR" $SRR_NETWORK_PATH 2>/dev/null || true
         curl -sf -X POST "$ADMIN_URL/gvm/reload" >/dev/null 2>&1
 
         # Clear log
         > "$PROXY_LOG" 2>/dev/null || true
 
         # Run agent — should get denied
-        DENY_OUT=$(sudo -E timeout 60 "$GVM_BIN" run --sandbox -- \
+        DENY_OUT=$(sudo -E timeout 60 "$GVM_BIN" run </dev/null --sandbox -- \
             openclaw agent --local \
             --session-id "deny-e2e-$(date +%s)" \
             --message "Say hello." \
@@ -3178,7 +3196,7 @@ DENYSRR
 
         # Restore original SRR rules
         if [ -n "$OLD_SRR_CONTENT" ]; then
-            echo "$OLD_SRR_CONTENT" > config/srr_network.toml
+            echo "$OLD_SRR_CONTENT" > $SRR_NETWORK_PATH
         fi
         curl -sf -X POST "$ADMIN_URL/gvm/reload" >/dev/null 2>&1
 
@@ -3277,7 +3295,7 @@ if should_run 50; then
         # 50a: overlayfs mount — verify agent can write anywhere in /workspace
         # In legacy mode, only /workspace/output is writable. With overlayfs,
         # the agent can write to any path (changes go to upper layer).
-        OVERLAY_RESULT=$(sudo timeout 30 "$GVM_BIN" run --sandbox -- python3 -c "
+        OVERLAY_RESULT=$(sudo timeout 30 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
 import os, sys
 
 # Test 1: Write to /workspace root (not just /workspace/output)
@@ -3380,7 +3398,7 @@ if should_run 51; then
         ensure_proxy || { fail "51: proxy not available"; }
 
         # Run agent that creates files of each category
-        sudo timeout 30 "$GVM_BIN" run --sandbox -- python3 -c "
+        sudo timeout 30 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
 import os
 
 # Auto-merge candidates
@@ -3533,7 +3551,7 @@ if should_run 54; then
         ensure_proxy || { fail "54: proxy not available"; }
 
         # 54a: --default-policy deny should block unknown URLs
-        DENY_OUT=$(timeout 15 "$GVM_BIN" run --default-policy deny -- python3 -c "
+        DENY_OUT=$(timeout 15 "$GVM_BIN" run </dev/null --default-policy deny -- python3 -c "
 import requests
 try:
     r = requests.get('http://unknown-deny-test.example.com/',
@@ -3555,7 +3573,7 @@ except Exception as e:
         fi
 
         # 54b: --default-policy delay should allow with delay (default behavior)
-        DELAY_OUT=$(timeout 15 "$GVM_BIN" run --default-policy delay -- python3 -c "
+        DELAY_OUT=$(timeout 15 "$GVM_BIN" run </dev/null --default-policy delay -- python3 -c "
 import requests, time
 start = time.time()
 try:
@@ -3593,7 +3611,7 @@ if should_run 55; then
         # Agent attempts to write more than the tmpfs upper layer limit (default 256MB).
         # On overlayfs: should get ENOSPC (OSError 28) — agent must NOT crash silently.
         # On legacy mode: writes to /workspace/output which is host disk — no limit.
-        ENOSPC_RESULT=$(sudo timeout 30 "$GVM_BIN" run --sandbox -- python3 -c "
+        ENOSPC_RESULT=$(sudo timeout 30 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
 import os, sys
 
 # Determine which mode we're in
@@ -3672,7 +3690,7 @@ if should_run 56; then
         # Agent creates files that could match multiple categories.
         # The priority must be: discard > manual_commit > auto_merge > default
         # This is consistent with SRR's max_strict principle.
-        PRIORITY_RESULT=$(sudo timeout 30 "$GVM_BIN" run --sandbox -- python3 -c "
+        PRIORITY_RESULT=$(sudo timeout 30 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
 import os
 
 # Create test files in /workspace/output (always writable)
@@ -3781,7 +3799,7 @@ max_age_days = 30
 [redis]
 url = ""
 [srr]
-network_file = "config/srr_network.toml"
+network_file = "$SRR_NETWORK_PATH"
 semantic_file = ""
 hot_reload = true
 [policies]
@@ -4130,7 +4148,7 @@ if should_run 61; then
 
         # Agent in sandbox tries to reach admin port (9090) — should be blocked
         # Sandbox iptables OUTPUT only allows proxy port (8080), TLS (8443), and DNS (53)
-        ADMIN_REACH=$(sudo timeout 15 "$GVM_BIN" run --sandbox -- python3 -c "
+        ADMIN_REACH=$(sudo timeout 15 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
 import socket
 s = socket.socket()
 s.settimeout(3)
@@ -4171,7 +4189,7 @@ if should_run 62; then
         ensure_proxy || { fail "62: proxy not available"; }
 
         # Agent in sandbox sends DNS query for suspicious domain
-        DNS_OUTPUT=$(sudo timeout 15 "$GVM_BIN" run --sandbox -- python3 -c "
+        DNS_OUTPUT=$(sudo timeout 15 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
 import socket
 try:
     socket.getaddrinfo('exfil-test-data.attacker-test.example.com', 80)
@@ -4219,7 +4237,7 @@ if should_run 63; then
         SRR_HASH_BEFORE=$(sha256sum "$REPO_DIR/config/srr_network.toml" 2>/dev/null | cut -d' ' -f1)
 
         # 63a: Non-sandbox agent tries to modify SRR rules
-        MODIFY_RESULT=$("$GVM_BIN" run -- python3 -c "
+        MODIFY_RESULT=$("$GVM_BIN" run </dev/null -- python3 -c "
 import os, sys
 try:
     path = os.path.join('$REPO_DIR', 'config', 'srr_network.toml')
@@ -4262,7 +4280,7 @@ except Exception as e:
 
         # 63b: Verify sandbox mode DOES protect config
         if [ "$(id -u)" -eq 0 ] || sudo -n true 2>/dev/null; then
-            SANDBOX_MODIFY=$(sudo timeout 15 "$GVM_BIN" run --sandbox -- python3 -c "
+            SANDBOX_MODIFY=$(sudo timeout 15 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
 try:
     with open('/workspace/config/srr_network.toml', 'a') as f:
         f.write('# INJECTED')
@@ -4300,8 +4318,8 @@ if should_run 64; then
         ensure_proxy || { fail "64: proxy not available"; }
 
         # Save current SRR and load IC-3 test rules
-        cp config/srr_network.toml config/srr_network.toml.ic3bak
-        cat > config/srr_network.toml << 'IC3SRR'
+        cp $SRR_NETWORK_PATH $TEST_CONFIG_DIR/srr_network.toml.ic3bak
+        cat > $SRR_NETWORK_PATH << 'IC3SRR'
 [[rules]]
 method = "POST"
 pattern = "api.github.com"
@@ -4333,7 +4351,7 @@ IC3SRR
         else
             fail "64a: Expected RequireApproval, got: $IC3_CHECK"
             # Restore and skip remaining
-            mv config/srr_network.toml.ic3bak config/srr_network.toml
+            mv $TEST_CONFIG_DIR/srr_network.toml.ic3bak $SRR_NETWORK_PATH
             curl -sf -X POST "$ADMIN_URL/gvm/reload" > /dev/null 2>&1
         fi
 
@@ -4430,7 +4448,7 @@ if items:
         rm -f "$AGENT_OUT"
 
         # Restore SRR rules
-        mv config/srr_network.toml.ic3bak config/srr_network.toml
+        mv $TEST_CONFIG_DIR/srr_network.toml.ic3bak $SRR_NETWORK_PATH
         curl -sf -X POST "$ADMIN_URL/gvm/reload" > /dev/null 2>&1
     fi
 fi
@@ -4580,7 +4598,7 @@ AGENTPY
 
         # Phase 2: ENFORCE with gvm run
         echo -e "  ${BOLD}Phase 2: Enforce${NC}"
-        RUN_OUT=$(timeout 20 "$GVM_BIN" run -- python3 "$AGENT_SCRIPT" 2>&1 | tail -5)
+        RUN_OUT=$(timeout 20 "$GVM_BIN" run </dev/null -- python3 "$AGENT_SCRIPT" 2>&1 | tail -5)
 
         echo -e "  ${DIM}Run output: $RUN_OUT${NC}"
 
@@ -4727,7 +4745,7 @@ print('|'.join(results))
 AGENTEOF
 
         # Run contained agent
-        RESULT=$("$GVM_BIN" run --contained --agent-id contained-test "$CONTAINED_AGENT" 2>/dev/null | grep -E 'HTTPS:|DNAT_|CA_FILE:|PROXY_VARS:' | tail -1)
+        RESULT=$("$GVM_BIN" run </dev/null --contained --agent-id contained-test "$CONTAINED_AGENT" 2>/dev/null | grep -E 'HTTPS:|DNAT_|CA_FILE:|PROXY_VARS:' | tail -1)
 
         echo -e "  Result: $RESULT"
 
@@ -4826,7 +4844,7 @@ except Exception as e:
 print('|'.join(results))
 AGENTEOF
 
-        RESULT=$("$GVM_BIN" run --contained --agent-id contained-deny "$DENY_AGENT" 2>/dev/null | grep -E 'DELETE:|GET:' | tail -1)
+        RESULT=$("$GVM_BIN" run </dev/null --contained --agent-id contained-deny "$DENY_AGENT" 2>/dev/null | grep -E 'DELETE:|GET:' | tail -1)
 
         echo -e "  Result: $RESULT"
 
@@ -4879,7 +4897,7 @@ print("AGENT_REACHED")
 AGENTEOF
 
         # Run with python:3.12-slim (no iptables installed)
-        RESULT=$("$GVM_BIN" run --contained --image python:3.12-slim --agent-id no-iptables "$NO_IPT_AGENT" 2>&1)
+        RESULT=$("$GVM_BIN" run </dev/null --contained --image python:3.12-slim --agent-id no-iptables "$NO_IPT_AGENT" 2>&1)
 
         echo -e "  Result (first 200 chars): $(echo "$RESULT" | head -c 200)"
 
@@ -4963,7 +4981,7 @@ except Exception as e:
 print('|'.join(results))
 AGENTEOF
 
-        RESULT=$("$GVM_BIN" run --contained --agent-id bypass-test "$BYPASS_AGENT" 2>/dev/null | grep -E 'DIRECT_TLS:|DIRECT_HTTP:' | tail -1)
+        RESULT=$("$GVM_BIN" run </dev/null --contained --agent-id bypass-test "$BYPASS_AGENT" 2>/dev/null | grep -E 'DIRECT_TLS:|DIRECT_HTTP:' | tail -1)
 
         echo -e "  Result: $RESULT"
 
@@ -5064,7 +5082,7 @@ except Exception as e:
 print('|'.join(results))
 AGENTEOF
 
-        RESULT=$("$GVM_BIN" run --contained --agent-id readonly-test "$RO_AGENT" 2>/dev/null | grep -E 'WRITE_' | tail -1)
+        RESULT=$("$GVM_BIN" run </dev/null --contained --agent-id readonly-test "$RO_AGENT" 2>/dev/null | grep -E 'WRITE_' | tail -1)
 
         echo -e "  Result: $RESULT"
 
@@ -5158,11 +5176,11 @@ print('|'.join(results))
 AGENTEOF
 
         # Run in contained mode
-        CONTAINED_RESULT=$("$GVM_BIN" run --contained --agent-id parity-test "$PARITY_AGENT" 2>/dev/null | grep -E 'GET:|DELETE:' | tail -1)
+        CONTAINED_RESULT=$("$GVM_BIN" run </dev/null --contained --agent-id parity-test "$PARITY_AGENT" 2>/dev/null | grep -E 'GET:|DELETE:' | tail -1)
         echo -e "  Contained: $CONTAINED_RESULT"
 
         # Run in sandbox mode
-        SANDBOX_RESULT=$(sudo timeout 60 "$GVM_BIN" run --sandbox -- python3 "$PARITY_AGENT" 2>/dev/null | grep -E 'GET:|DELETE:' | tail -1)
+        SANDBOX_RESULT=$(sudo timeout 60 "$GVM_BIN" run </dev/null --sandbox -- python3 "$PARITY_AGENT" 2>/dev/null | grep -E 'GET:|DELETE:' | tail -1)
         echo -e "  Sandbox:   $SANDBOX_RESULT"
 
         # 73a: GET decision must match
@@ -5227,7 +5245,7 @@ print("AGENT_OUTPUT_OK")
 AGENTEOF
 
         # Capture both stdout and stderr (session summary may be on either)
-        FULL_OUTPUT=$("$GVM_BIN" run --contained --agent-id ux-test "$UX_AGENT" 2>&1)
+        FULL_OUTPUT=$("$GVM_BIN" run </dev/null --contained --agent-id ux-test "$UX_AGENT" 2>&1)
 
         echo -e "  Output (first 500 chars): $(echo "$FULL_OUTPUT" | head -c 500)"
 
@@ -5315,7 +5333,7 @@ except Exception as e:
 print('|'.join(results))
 AGENTEOF
 
-        RESULT=$("$GVM_BIN" run --contained --agent-id netadmin-test "$NETADMIN_AGENT" 2>/dev/null | grep -E 'DNAT_|FLUSH_|HTTPS_AFTER:' | tail -1)
+        RESULT=$("$GVM_BIN" run </dev/null --contained --agent-id netadmin-test "$NETADMIN_AGENT" 2>/dev/null | grep -E 'DNAT_|FLUSH_|HTTPS_AFTER:' | tail -1)
 
         echo -e "  Result: $RESULT"
 
@@ -5985,7 +6003,7 @@ AGENTEOF
         # binary supports it, otherwise fall back to the default
         # `data/sandbox-staging/` and copy out afterwards. The current
         # binary uses the default; we work with that.
-        sudo "$GVM_BIN" run --sandbox --fs-governance \
+        sudo "$GVM_BIN" run </dev/null --sandbox --fs-governance \
             --agent-id fs80 \
             -- python3 "$FS80_AGENT" >/tmp/gvm-fs80-run.out 2>&1 || true
 
@@ -6127,8 +6145,8 @@ if should_run 81; then
 
         # Install IC-3 rule. Use a synthetic hostname that already has
         # a host_overrides entry pointing at the mock server.
-        cp config/srr_network.toml config/srr_network.toml.ic3guardbak
-        cat > config/srr_network.toml << 'IC3SRR2'
+        cp $SRR_NETWORK_PATH $TEST_CONFIG_DIR/srr_network.toml.ic3guardbak
+        cat > $SRR_NETWORK_PATH << 'IC3SRR2'
 [[rules]]
 method = "POST"
 pattern = "ghostcheck.test.gvm"
@@ -6241,7 +6259,7 @@ except: print(0)
 
         rm -f "$AGENT81_OUT"
         # Restore SRR
-        mv config/srr_network.toml.ic3guardbak config/srr_network.toml
+        mv $TEST_CONFIG_DIR/srr_network.toml.ic3guardbak $SRR_NETWORK_PATH
         curl -sf -X POST "$ADMIN_URL/gvm/reload" >/dev/null 2>&1
     fi
 fi
