@@ -1047,7 +1047,7 @@ pub async fn health(State(state): State<AppState>) -> Response<Body> {
         StatusCode::OK,
         &serde_json::json!({
             "status": status,
-            "version": "0.1.0",
+            "version": env!("CARGO_PKG_VERSION"),
             "srr_rules": srr_rules,
             "tls_ready": tls_ready,
             "wal": wal_status,
@@ -1185,7 +1185,7 @@ pub async fn info(State(state): State<AppState>) -> Response<Body> {
     json_response(
         StatusCode::OK,
         &serde_json::json!({
-            "version": "0.1.0",
+            "version": env!("CARGO_PKG_VERSION"),
             "components": {
                 "srr": "loaded",
                 "policy_engine": "loaded",

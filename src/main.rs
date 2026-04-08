@@ -31,7 +31,7 @@ async fn main() {
         )
         .init();
 
-    tracing::info!("Analemma GVM Proxy v0.1.0 starting...");
+    tracing::info!("Analemma GVM Proxy v{} starting...", env!("CARGO_PKG_VERSION"));
 
     // 1. Load configuration (tries GVM_CONFIG env, CWD, home dir, then defaults)
     let mut config = ProxyConfig::load_or_default();

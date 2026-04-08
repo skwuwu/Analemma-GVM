@@ -40,6 +40,9 @@ PROXY_LOG="/tmp/gvm-proxy-e2e.log"
 RESULTS=()
 MOCK_PID=""
 SKIP_OPENCLAW=false
+# MCP tests (27, 34) depend on the external analemma-gvm-openclaw repo and
+# its MCP server being running. Default to skip — enable with --with-mcp.
+SKIP_MCP=true
 SINGLE_TEST=""
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
@@ -141,6 +144,8 @@ header() { echo -e "\n${BOLD}${CYAN}═══ Test $1 ═══${NC}"; }
 while [[ $# -gt 0 ]]; do
     case $1 in
         --skip-openclaw) SKIP_OPENCLAW=true; shift ;;
+        --skip-mcp) SKIP_MCP=true; shift ;;
+        --with-mcp) SKIP_MCP=false; shift ;;
         --test) SINGLE_TEST="$2"; shift 2 ;;
         *) shift ;;
     esac
@@ -1532,7 +1537,7 @@ fi
 # TEST 27: GitHub MCP Server Through Proxy (child process control)
 # ═══════════════════════════════════════════════════════════════════
 
-if should_run 27; then
+if should_run 27 && [ "$SKIP_MCP" = false ]; then
     header "27: GitHub MCP Server Through Proxy"
 
     ensure_proxy || { fail "27: proxy not available"; }
@@ -1597,6 +1602,8 @@ for line in sys.stdin:
 
         echo "$ISSUE_CHECK" | grep -q "Delay" && pass "27d: MCP create_issue would be Delayed ($ISSUE_CHECK)" || fail "27d: unexpected decision ($ISSUE_CHECK)"
     fi
+elif should_run 27; then
+    skip "27: MCP (--skip-mcp)"
 fi
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2076,7 +2083,7 @@ fi
 # TEST 34: gvm run — full external API integration via gvm run
 # ═══════════════════════════════════════════════════════════════════
 
-if should_run 34; then
+if should_run 34 && [ "$SKIP_MCP" = false ]; then
     header "34: gvm run — external API integration"
 
     ensure_proxy || { fail "34: proxy not available"; }
@@ -2207,6 +2214,8 @@ print('|'.join(results))
             fail "34h: kill chain via gvm run"
         fi
     fi
+elif should_run 34; then
+    skip "34: MCP (--skip-mcp)"
 fi
 
 # ═══════════════════════════════════════════════════════════════════
