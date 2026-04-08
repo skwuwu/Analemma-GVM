@@ -1277,6 +1277,314 @@ token = "sk_test_proxy_injected_key"
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Test 8b: E2E credential injection variants — ApiKey custom header,
+//          and agent-smuggled Authorization header is overwritten end-to-end.
+//
+// Test 8 already covers Bearer injection through the real forward path. This
+// test closes the gap between the unit tests (api_keys.rs::tests) and the
+// real proxy_handler() flow for two cases that previously had only unit
+// coverage:
+//   1. ApiKey credential type — value goes into a custom header (not Authorization).
+//      Verifies the proxy strips smuggled `x-api-key` headers from the agent
+//      and replaces them with the configured value, all the way through to
+//      a real upstream socket.
+//   2. Agent attempts to smuggle a fake `Authorization: Bearer evil-token` for
+//      a host that has its own Bearer credential configured. The proxy must
+//      overwrite, not append. Verified at the upstream, not just at inject().
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn e2e_credential_injection_apikey_and_agent_smuggling() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::Router;
+    use tower::ServiceExt;
+
+    // ── Step 1: Mock upstream that echoes the auth-relevant headers it received ──
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binding upstream mock server must succeed");
+    let upstream_addr = upstream
+        .local_addr()
+        .expect("upstream must have an address");
+
+    let upstream_app = axum::Router::new().fallback(|req: Request<Body>| async move {
+        // Snapshot every header the agent could have used to smuggle credentials.
+        // The proxy MUST strip all of these and inject only its configured value.
+        let auth = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .map(|v| v.to_str().unwrap_or("").to_string())
+            .unwrap_or_default();
+        let x_api_key = req
+            .headers()
+            .get("x-api-key")
+            .map(|v| v.to_str().unwrap_or("").to_string())
+            .unwrap_or_default();
+        let apikey = req
+            .headers()
+            .get("apikey")
+            .map(|v| v.to_str().unwrap_or("").to_string())
+            .unwrap_or_default();
+        let cookie = req
+            .headers()
+            .get(axum::http::header::COOKIE)
+            .map(|v| v.to_str().unwrap_or("").to_string())
+            .unwrap_or_default();
+        let host = req
+            .headers()
+            .get(axum::http::header::HOST)
+            .map(|v| v.to_str().unwrap_or("").to_string())
+            .unwrap_or_default();
+
+        let body = serde_json::json!({
+            "host": host,
+            "authorization": auth,
+            "x_api_key": x_api_key,
+            "apikey": apikey,
+            "cookie": cookie,
+        });
+
+        axum::http::Response::builder()
+            .status(200)
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("upstream response must build")
+    });
+
+    tokio::spawn(async move {
+        axum::serve(upstream, upstream_app).await.ok();
+    });
+
+    // ── Step 2: Build proxy AppState with two host credentials ──
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
+
+    let srr_path = dir.path().join("srr.toml");
+    std::fs::write(
+        &srr_path,
+        r#"
+[[rules]]
+method = "*"
+pattern = "{any}"
+decision = { type = "Allow" }
+"#,
+    )
+    .expect("writing SRR config must succeed");
+
+    let registry_path = dir.path().join("registry.toml");
+    std::fs::write(&registry_path, "").expect("writing empty registry must succeed");
+
+    let policy_dir = dir.path().join("policies");
+    std::fs::create_dir_all(&policy_dir).expect("creating policy dir must succeed");
+    std::fs::write(
+        policy_dir.join("global.toml"),
+        r#"
+[[rules]]
+id = "allow-all"
+priority = 999
+layer = "Global"
+description = "Allow everything"
+[rules.decision]
+type = "Allow"
+"#,
+    )
+    .expect("writing global policy must succeed");
+
+    // Two hosts: one with ApiKey type (custom header), one with Bearer.
+    // Both will be remapped to the same local upstream via host_overrides.
+    let secrets_path = dir.path().join("secrets.toml");
+    std::fs::write(
+        &secrets_path,
+        r#"
+[credentials."api.sendgrid-test.com"]
+type = "ApiKey"
+header = "x-api-key"
+value = "SG.proxy_injected_sendgrid_key"
+
+[credentials."api.stripe-test.com"]
+type = "Bearer"
+token = "sk_test_proxy_injected_bearer"
+"#,
+    )
+    .expect("writing secrets config must succeed");
+
+    let wal_path = dir.path().join("wal.log");
+
+    let srr = Arc::new(std::sync::RwLock::new(
+        NetworkSRR::load(&srr_path).expect("valid SRR config must parse"),
+    ));
+    let policy = Arc::new(std::sync::RwLock::new(
+        PolicyEngine::load(&policy_dir).expect("valid policy must parse"),
+    ));
+    let registry = Arc::new(std::sync::RwLock::new(
+        OperationRegistry::load(&registry_path).expect("valid registry must parse"),
+    ));
+    let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("valid secrets must parse"));
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "")
+            .await
+            .expect("ledger must init"),
+    );
+    let vault = Arc::new(Vault::new(ledger.clone()).expect("vault must init"));
+    let rate_limiter = Arc::new(RateLimiter::new());
+    let http_client =
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .build_http();
+
+    let mut host_overrides = std::collections::HashMap::new();
+    host_overrides.insert(
+        "api.sendgrid-test.com".to_string(),
+        format!("127.0.0.1:{}", upstream_addr.port()),
+    );
+    host_overrides.insert(
+        "api.stripe-test.com".to_string(),
+        format!("127.0.0.1:{}", upstream_addr.port()),
+    );
+
+    let state = gvm_proxy::proxy::AppState {
+        srr,
+        policy,
+        registry,
+        api_keys,
+        ledger: ledger.clone(),
+        vault,
+        rate_limiter,
+        #[cfg(feature = "wasm")]
+        wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
+        checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
+        on_block: gvm_proxy::config::OnBlockConfig::default(),
+        http_client,
+        host_overrides,
+        jwt_config: None,
+        intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
+        srr_config_path: String::new(),
+        policy_dir: String::new(),
+        registry_path: String::new(),
+        mitm_ca_pem: None,
+        payload_inspection: false,
+        max_body_bytes: 65536,
+        pending_approvals: std::sync::Arc::new(dashmap::DashMap::new()),
+        ic3_approval_timeout_secs: 300,
+        shadow_config: gvm_proxy::intent_store::ShadowConfig::default(),
+        mitm_resolver: None,
+        mitm_server_config: None,
+        mitm_client_config: None,
+        tls_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        start_time: std::time::Instant::now(),
+        request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        ca_expires_days: None,
+    };
+
+    let app = Router::new()
+        .fallback(gvm_proxy::proxy::proxy_handler)
+        .with_state(state);
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Scenario A: keyless agent → SendGrid (ApiKey custom header)
+    //
+    // The agent has no credential of its own and just calls the API. The
+    // proxy must inject `x-api-key: SG.proxy_injected_sendgrid_key` into the
+    // upstream-bound request. Authorization must remain empty because the
+    // ApiKey credential type does not touch it.
+    // ─────────────────────────────────────────────────────────────────────
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v3/mail/send")
+        .header("X-GVM-Agent-Id", "keyless-agent-A")
+        .header("X-GVM-Operation", "gvm.email.send")
+        .header("X-GVM-Target-Host", "api.sendgrid-test.com")
+        .header("X-GVM-Trace-Id", "trace-credinj-A")
+        .header("X-GVM-Event-Id", "evt-credinj-A")
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"to":"x@example.com"}"#))
+        .expect("request must build");
+
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("proxy must handle keyless ApiKey request");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "Allowed request must reach upstream and return 200"
+    );
+
+    let body_bytes = axum::body::to_bytes(response.into_body(), 65536)
+        .await
+        .expect("response body must be readable");
+    let body: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("upstream JSON must parse");
+
+    assert_eq!(
+        body["x_api_key"], "SG.proxy_injected_sendgrid_key",
+        "ApiKey credential value must be injected into the configured header (x-api-key)"
+    );
+    assert_eq!(
+        body["authorization"], "",
+        "ApiKey credential type must NOT populate the Authorization header"
+    );
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Scenario B: malicious agent smuggles a fake Authorization header for
+    // Stripe. Stripe has a Bearer credential configured. The proxy must
+    // overwrite the agent's value, not append it. Also smuggles fake
+    // x-api-key, apikey, and Cookie headers — all must be stripped.
+    // ─────────────────────────────────────────────────────────────────────
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/charges")
+        .header("X-GVM-Agent-Id", "malicious-agent-B")
+        .header("X-GVM-Operation", "gvm.payment.charge")
+        .header("X-GVM-Target-Host", "api.stripe-test.com")
+        .header("X-GVM-Trace-Id", "trace-credinj-B")
+        .header("X-GVM-Event-Id", "evt-credinj-B")
+        .header("Content-Type", "application/json")
+        .header("Authorization", "Bearer agent-smuggled-evil-token")
+        .header("x-api-key", "agent-smuggled-evil-apikey")
+        .header("apikey", "agent-smuggled-evil-apikey-2")
+        .header("Cookie", "session=agent-smuggled-session")
+        .body(Body::from(r#"{"amount":1000}"#))
+        .expect("request must build");
+
+    let response = app
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("proxy must handle smuggling request");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "Allowed request must reach upstream and return 200"
+    );
+
+    let body_bytes = axum::body::to_bytes(response.into_body(), 65536)
+        .await
+        .expect("response body must be readable");
+    let body: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("upstream JSON must parse");
+
+    // Authorization must be the proxy's Bearer token, not the agent's.
+    assert_eq!(
+        body["authorization"], "Bearer sk_test_proxy_injected_bearer",
+        "Proxy Bearer credential must REPLACE the agent-supplied Authorization header"
+    );
+    // None of the smuggled secondary auth headers may have reached upstream.
+    assert_eq!(
+        body["x_api_key"], "",
+        "Smuggled x-api-key must be stripped before forwarding"
+    );
+    assert_eq!(
+        body["apikey"], "",
+        "Smuggled apikey must be stripped before forwarding"
+    );
+    assert_eq!(
+        body["cookie"], "",
+        "Smuggled Cookie must be stripped before forwarding"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Test 9: GovernanceBlockResponse — Verify 403 JSON body contract
 // ═══════════════════════════════════════════════════════════════════════════
 

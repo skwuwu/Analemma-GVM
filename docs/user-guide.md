@@ -336,6 +336,27 @@ Full flags: `gvm <command> --help`
 
 ---
 
+## Running on a remote host (EC2, cloud VM, SSH)
+
+When you run `gvm run`, a stress test, or any multi-minute command
+against a remote host, **host it inside a `tmux` session**. SSH
+disconnects, terminal glitches, and laptop lid closures all race
+against `nohup`, and losing a long-running pipeline halfway through
+leaves kernel state behind (`tc netem` rules, `/run/gvm/` staging
+dirs, orphan `gvm-proxy` processes) that `gvm cleanup` has to sweep
+on the next invocation. `tmux` sidesteps the race entirely.
+
+```bash
+ssh ec2-host
+tmux new -s gvm
+cd ~/Analemma-GVM
+sudo bash scripts/stress-test.sh --duration 60
+# Ctrl-b d to detach, re-attach later with: tmux attach -t gvm
+```
+
+This is a recommendation for operators; the `gvm` CLI itself does
+not start or depend on tmux.
+
 ## Production Checklist
 
 - [ ] Remove `[dev] host_overrides` from proxy.toml
@@ -347,6 +368,61 @@ Full flags: `gvm <command> --help`
 - [ ] Review SRR: no catch-all Allow
 - [ ] Set up `gvm stats` + `gvm audit verify` in cron
 - [ ] Test with `gvm check` before deploying policy changes
+
+## Production deployment mode
+
+`gvm run` already launches `gvm-proxy` as a background daemon
+(`setsid` + PID file + health check), so the short-term "run the
+proxy and let it survive terminal exit" story is covered. For
+a real production deployment you usually want one more layer:
+a service supervisor that restarts the proxy on crash, forwards
+its logs to the host's log aggregator, and boots it at system
+start. GVM does not ship its own service unit yet, but a minimal
+systemd drop-in is straightforward:
+
+```ini
+# /etc/systemd/system/gvm-proxy.service
+[Unit]
+Description=Analemma GVM Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gvm-proxy
+WorkingDirectory=/var/lib/gvm
+User=gvm
+Group=gvm
+# Needs CAP_NET_ADMIN for veth/iptables in --sandbox; drop if you
+# only run cooperative mode.
+AmbientCapabilities=CAP_NET_ADMIN
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+# Proxy listens on 8080 by default; expose via reverse proxy if
+# you want TLS termination in front of it.
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Known gaps when running under systemd today:
+- `gvm stop` reads `data/proxy.pid`, which systemd doesn't use; use
+  `systemctl stop gvm-proxy` instead on systemd-managed hosts.
+- `gvm status` queries the proxy's HTTP health endpoint and is
+  independent of the supervisor, so it keeps working under either
+  model.
+- Log rotation is delegated to journald/journalctl; the proxy's
+  own `data/proxy.log` is a no-op under systemd (stdout/stderr go
+  to the journal instead).
+- The sandbox mode's kernel resources (veth, iptables, cgroups) are
+  cleaned up by the per-sandbox lifecycle handlers regardless of
+  supervisor. `/run/gvm/` state survives reboot because it's tmpfs.
+
+Pick the systemd path when you need unattended restart on crash,
+boot-time start, and centralised log ingestion. Stick with
+`gvm run`'s built-in daemon for single-host dev/demo environments.
 
 ---
 

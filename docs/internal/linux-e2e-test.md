@@ -1,5 +1,33 @@
 # Linux E2E Test Guide (Codespace / VM)
 
+## Session management on remote hosts
+
+Every long-running command on an EC2 instance, cloud VM, or any SSH'd
+host **must** be hosted inside a `tmux` (or `screen`) session. Never
+launch a multi-minute pipeline with `nohup ... &`.
+
+Why: `nohup` loses races around SSH disconnect. We have repeatedly
+hit the failure mode where the child is killed between starting its
+work and installing its signal handlers, which strands `tc netem`
+rules, `/run/gvm/` directories, and orphan `gvm-proxy` processes
+that the test script never had a chance to clean up. `tmux` survives
+SSH death independently, lets you reattach to watch progress, and
+gives a deterministic teardown path (`tmux kill-session -t gvm`).
+
+```bash
+# On the remote host, before starting anything expensive:
+tmux new -s gvm
+cd ~/Analemma-GVM
+
+# Inside the tmux session, run the pipeline:
+sudo bash scripts/stress-test.sh --duration 60
+
+# Detach: Ctrl-b d
+# Reattach from a new SSH session:
+ssh <host>
+tmux attach -t gvm
+```
+
 ## Prerequisites
 
 ```bash
