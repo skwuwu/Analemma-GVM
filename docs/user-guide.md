@@ -128,6 +128,19 @@ decision = { type = "Deny", reason = "Wire transfers blocked" }
 
 **Rule order matters:** SRR uses **first-match** — rules are evaluated in file order and the first matching rule wins. Place specific rules (e.g., `api.bank.com/transfer/{any} → Deny`) before catch-all rules (`{any} → Allow`). A catch-all before a specific rule makes the specific rule unreachable.
 
+**Host + port precedence (Normalize then Match):** patterns are normalized before matching — default ports (`:80`, `:443`) are stripped, so `api.demo:443` and `api.demo` are the same pattern. Non-default ports are preserved. A pattern *with* an explicit non-default port (`api.demo:9999`) only matches requests to that exact port; a pattern *without* a port (`api.demo`) matches any port on that host. When both exist, first-match in file order still decides — put the port-qualified rule **above** the bare-host rule, otherwise the bare-host rule swallows every port first and the `:9999` rule is unreachable:
+
+```toml
+# Correct: specific port first
+[[rules]]
+pattern = "api.demo:9999"
+decision = { type = "Deny", reason = "Admin port blocked" }
+
+[[rules]]
+pattern = "api.demo"
+decision = { type = "Allow" }
+```
+
 **Query strings:** Stripped automatically. `^/commits$` matches `/commits?per_page=5`.
 
 > **Tip:** Don't write rules by hand. Use `gvm watch` + `gvm suggest` to generate them, then edit as needed.
@@ -224,6 +237,8 @@ sudo gvm run --sandbox my_agent.py
 ```
 
 Agent runs in an isolated environment where it cannot bypass the proxy. Linux only, requires sudo.
+
+**File ownership under `sudo`:** the proxy daemon drops privileges back to `SUDO_UID:SUDO_GID` on launch, so everything it writes (`data/wal.log`, `data/proxy.pid`, `data/proxy.log`, the MITM CA) stays owned by your normal user — you can `tail`, `cat`, and `rm` them without `sudo`. The **sandbox child itself** still runs as root inside its user namespace (uid 0 → host root), so files the *agent* creates inside `/workspace` end up root-owned on the host. If you pull those files out via `--fs-governance` or by copying from the staging dir, `chown` them back to your user before editing. Plain `data/` is never root-owned.
 
 #### Combining sandbox with other modes
 
@@ -336,6 +351,8 @@ gvm run --shadow-mode strict -- node agent.js
 ```bash
 sudo gvm run --sandbox --fs-governance my_agent.py
 ```
+
+**Where agent files actually live while the sandbox is running.** The agent sees a normal writable `/workspace`, but that path is an overlayfs mount: the read-only lower layer is the host workspace, and the writable upper layer is `data/sandbox-staging/<pid>/upper/` on the host. Every file the agent creates or modifies inside `/workspace/...` appears **immediately** at `data/sandbox-staging/<pid>/upper/<same-relative-path>` — you can `ls` and `cat` it from another terminal while the agent is still running. Nothing is copied back into the real workspace until the session ends and you (or `gvm fs approve`) accept it, so a crashed or killed agent leaves zero mess in your actual project tree. Deletions show up in the upper layer as overlayfs whiteout files (`.wh.<name>`) rather than touching the real file.
 
 Agent file changes are classified at session end:
 
