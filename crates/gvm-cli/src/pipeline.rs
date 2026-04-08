@@ -213,14 +213,20 @@ async fn launch_sandbox(config: &AgentConfig, pre: &PreLaunchState) -> Result<i3
         )
     };
 
-    // Set filesystem governance mode and sandbox profile based on CLI flags
+    // Filesystem governance mode and sandbox profile.
+    //
+    // Overlayfs is ALWAYS on for --sandbox — this is what makes /workspace
+    // writable end-to-end (agents expect a normal writable working dir).
+    // The --fs-governance flag used to gate overlayfs itself, but that left
+    // --sandbox alone in a confusing read-only legacy mode where even
+    // `mkdir /workspace/foo` failed. Now --sandbox means: namespace isolation
+    // + overlayfs + file-pattern classification + diff report on exit.
+    // The --fs-governance flag is retained for backwards compatibility but
+    // no longer changes behaviour when --sandbox is set.
     let mut sandbox_config = sandbox_config;
-    sandbox_config.fs_policy = if config.fs_governance {
-        Some(gvm_sandbox::FilesystemPolicy::default())
-    } else {
-        None // Legacy mode: workspace/output/ only
-    };
+    sandbox_config.fs_policy = Some(gvm_sandbox::FilesystemPolicy::default());
     sandbox_config.sandbox_profile = config.sandbox_profile.clone();
+    let _fs_governance_flag = config.fs_governance; // reserved for future opt-out
 
     // Preflight check (sandbox only)
     let preflight = gvm_sandbox::preflight_check(&sandbox_config);
