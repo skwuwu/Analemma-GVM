@@ -14,11 +14,12 @@ A single Rust binary. No Kubernetes, no service mesh, no sidecar, no GPU. Linux 
 
 ## Demo — Watch → Suggest → Enforce in 3 commands
 
-[▶ docs/assets/gvm-demo.cast](docs/assets/gvm-demo.cast) (33 seconds, plain
-asciinema v2 cast — `asciinema play docs/assets/gvm-demo.cast` or open at
-[asciinema.org/connect](https://asciinema.org)).
+![GVM demo: watch → suggest → enforce](docs/assets/gvm-demo.gif)
 
-The cast runs the full Watch → Suggest → Enforce loop end-to-end on a real
+*33-second GIF, rendered from [`docs/assets/gvm-demo.cast`](docs/assets/gvm-demo.cast).
+Replay interactively with `asciinema play docs/assets/gvm-demo.cast`.*
+
+The demo runs the full Watch → Suggest → Enforce loop end-to-end on a real
 Ubuntu 24.04 host:
 
 1. **`gvm run --watch demo_agent.py`** — observes every URL the agent calls,
@@ -32,7 +33,7 @@ Ubuntu 24.04 host:
    Default-to-Caution and lights up the audit trail with `2 delayed`,
    exactly as the rest of this README describes.
 
-No agent code was changed between steps. The same `demo_agent.py` and the
+Agent code was not changed between steps. The same `demo_agent.py` and the
 same proxy port handle all three runs — only the SRR config and the
 agent's URL list differ.
 
@@ -45,7 +46,7 @@ agent's URL list differ.
 - **Startups** that need governance and audit trails but can't adopt enterprise infra (OPA, Envoy, NVIDIA OpenShell)
 - **Agent framework users** (OpenClaw, CrewAI, LangChain, AutoGen) who want a safety layer that doesn't require code changes
 
-If you're running agents on an EC2 instance, you may need this.
+If you're running agents without any governance tools, you may need this.
 
 ---
 
@@ -54,7 +55,7 @@ If you're running agents on an EC2 instance, you may need this.
 - **OS**: Linux x86_64. The pre-built binary is dynamically linked against glibc — works on Ubuntu 20.04+, Debian 11+, RHEL 8+, Amazon Linux 2023, and equivalents. Alpine / other musl distros need a `x86_64-unknown-linux-musl` build from source.
 - **Cooperative / watch modes**: glibc only. No extra system tools.
 - **`--sandbox` mode**: additionally requires `iproute2` (`ip`), `iptables`, and `ip6tables` on the host (preinstalled on most server distros). `gvm preflight` reports exactly what is missing and prints the install command for your distro. Either run as `sudo` or grant the binary capabilities directly: `sudo setcap 'cap_net_admin,cap_sys_admin,cap_sys_ptrace+ep' ./gvm`.
-- **Other modes** (`--contained`): Docker on the host instead of the above.
+- **Other modes** (`--contained`): Docker on the host instead of the above.(not stabilized yet-experimental)
 
 ## Quick Start
 
