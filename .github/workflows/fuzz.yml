@@ -49,10 +49,6 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
-      - name: Skip if target filter set and doesn't match
-        if: github.event.inputs.target != '' && github.event.inputs.target != matrix.target
-        run: echo "Skipping ${{ matrix.target }} (filter: ${{ github.event.inputs.target }})" && exit 0
-
       - name: Restore corpus
         uses: actions/cache@v4
         with:
