@@ -11,7 +11,6 @@
 use crate::run;
 use crate::ui::{BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
 use anyhow::{Context, Result};
-use std::io::IsTerminal;
 use std::path::PathBuf;
 
 // ─── Configuration ───
