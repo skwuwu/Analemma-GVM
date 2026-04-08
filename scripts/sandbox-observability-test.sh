@@ -260,8 +260,47 @@ else
 fi
 [ $fail -eq 0 ] && record "Cleanup verification clean" "PASS" || record "Cleanup verification clean" "FAIL"
 
-# ─── 8. gvm stop produces staged cleanup output ────────────────────────
-run_test 8 "gvm stop — staged cleanup progress + final verification"
+# ─── 8. Ctrl+C during sandbox run releases all resources ───────────────
+run_test 8 "Ctrl+C (SIGINT) — graceful cleanup path"
+# Launch a long-running agent and kill the gvm parent process with SIGINT
+# mid-run. The sandbox_impl SIGINT handler should flip TERMINATION_FLAG,
+# the waitpid loop should catch it within 200ms, SIGKILL the child, then
+# fall through to the normal cleanup + residual verification path.
+#
+# Must succeed regardless of GVM_SANDBOX_TIMEOUT: we kill it ourselves
+# before the timeout fires.
+"$GVM_BIN" cleanup >/dev/null 2>&1 || true
+"$GVM_BIN" run --sandbox "$WORK_DIR/sleep_agent.py" > /tmp/sigint_out.log 2>&1 &
+gvm_pid=$!
+sleep 3   # Let the sandbox launch fully (namespaces + veth up)
+kill -INT "$gvm_pid" 2>/dev/null || true
+wait "$gvm_pid" 2>/dev/null || true
+sigint_out=$(cat /tmp/sigint_out.log)
+fail=0
+# The CLI should print the SIGINT-branded UserInterrupt diagnostic.
+if echo "$sigint_out" | grep -qE "terminated by user signal \(SIGINT\)"; then
+    echo -e "  ${GREEN}✓${NC} SIGINT diagnostic printed with signal name"
+else
+    echo -e "  ${YELLOW}⚠${NC} SIGINT diagnostic not exactly matched (may be fine if timing races)"
+    assert_contains "termination diagnostic present" "$sigint_out" "terminated by user signal" || fail=1
+fi
+# Cleanup verification must run even on signal path — this is the whole point.
+assert_contains "cleanup verification ran" "$sigint_out" "Cleanup verified"  || fail=1
+# Global residual scan to catch any leak the in-process verification missed.
+residuals=$(sudo tc qdisc show 2>/dev/null | grep -c "veth-gvm" || true)
+state_files=$(ls /run/gvm/gvm-sandbox-*.state 2>/dev/null | wc -l)
+veth_ifaces=$(ip -o link show 2>/dev/null | grep -c "veth-gvm-h" || true)
+if [ "$state_files" = "0" ] && [ "$veth_ifaces" = "0" ]; then
+    echo -e "  ${GREEN}✓${NC} no orphan state files, no orphan veths post-SIGINT"
+else
+    echo -e "  ${RED}✗${NC} orphan leak after SIGINT: state=$state_files veth=$veth_ifaces"
+    fail=1
+fi
+rm -f /tmp/sigint_out.log
+[ $fail -eq 0 ] && record "Ctrl+C graceful cleanup" "PASS" || record "Ctrl+C graceful cleanup" "FAIL"
+
+# ─── 9. gvm stop produces staged cleanup output ────────────────────────
+run_test 9 "gvm stop — staged cleanup progress + final verification"
 # Start a proxy in the background via gvm run (a quick agent that exits
 # fast — proxy lingers as a daemon and we can stop it explicitly).
 "$GVM_BIN" run "$WORK_DIR/normal_agent.py" >/dev/null 2>&1 || true

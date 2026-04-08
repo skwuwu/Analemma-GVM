@@ -211,8 +211,11 @@ pub enum ExitReason {
     AgentError { code: i32 },
     /// GVM SIGKILL'd the agent because GVM_SANDBOX_TIMEOUT was exceeded.
     Timeout { secs: u64 },
-    /// GVM SIGKILL'd the agent because the parent received SIGTERM (Ctrl+C, systemd stop).
-    UserInterrupt,
+    /// GVM SIGKILL'd the agent because the parent received a termination
+    /// signal (SIGTERM from systemd / `gvm stop`, SIGINT from Ctrl+C, or
+    /// SIGHUP from SSH disconnect). Carries the signal name so the CLI
+    /// can print an accurate diagnostic instead of always claiming SIGTERM.
+    UserInterrupt { signal: &'static str },
     /// Killed by SIGSYS — seccomp filter blocked a syscall.
     ///
     /// `syscall` is populated when we successfully parsed the AUDIT_SECCOMP

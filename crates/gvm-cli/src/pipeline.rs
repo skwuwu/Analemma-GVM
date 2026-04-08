@@ -299,8 +299,8 @@ fn print_exit_reason(reason: &gvm_sandbox::ExitReason, cpu_throttled_us: Option<
                 secs * 2
             );
         }
-        UserInterrupt => {
-            eprintln!("  {DIM}Agent terminated by user/system signal (SIGTERM){RESET}");
+        UserInterrupt { signal } => {
+            eprintln!("  {DIM}Agent terminated by user signal ({signal}){RESET}");
         }
         SeccompViolation {
             count,

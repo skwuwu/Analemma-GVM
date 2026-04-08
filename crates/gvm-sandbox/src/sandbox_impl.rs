@@ -392,26 +392,37 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     #[cfg(not(feature = "uprobe"))]
     let _tls_probe_handle: Option<()> = None;
 
-    // 4. Wait for child to exit with timeout + SIGTERM awareness.
+    // 4. Wait for child to exit with timeout + termination signal awareness.
     //
     // The WNOHANG polling loop serves three purposes:
     // a) Timeout: kill child after GVM_SANDBOX_TIMEOUT
-    // b) SIGTERM: detect parent's pending termination via SIGTERM flag
+    // b) User termination: detect parent-bound SIGTERM/SIGINT/SIGHUP via flag
     // c) Cleanup guarantee: always reach cleanup code (step 5) even if
     //    the tokio runtime is shutting down, because this runs in spawn_blocking
     //
-    // SIGTERM detection: we install a signal flag that the polling loop checks.
-    // When SIGTERM is received (Ctrl+C, systemd stop, stress-test kill), we
-    // kill the child and proceed to cleanup — preventing orphan veths.
+    // Termination detection: we install a single flag-setting handler on
+    // three signals — SIGTERM (systemd stop, `gvm stop`, stress-test kill),
+    // SIGINT (user Ctrl+C at the terminal), and SIGHUP (SSH disconnect /
+    // controlling tty closed). All three indicate "operator wants us gone".
+    // The polling loop sees the flag, gracefully kills the child, and falls
+    // through to cleanup — preventing orphan veths, iptables chains, mounts,
+    // cgroups, and state files. Without SIGINT coverage, Ctrl+C during a
+    // sandbox run would leave the runtime crashing through Rust's default
+    // signal handling before cleanup could run, forcing the next launch to
+    // pick up the mess via cleanup_all_orphans().
+    //
+    // SIGKILL is unrecoverable by design — no userspace handler runs for it.
+    // The safety net for -9 is the orphan sweep at the top of launch().
     use std::sync::atomic::Ordering;
 
-    // Install SIGTERM handler (sets SIGTERM_FLAG atomic bool)
-    SIGTERM_FLAG.store(false, Ordering::Relaxed); // Reset for this sandbox run
+    // Install single handler on SIGTERM + SIGINT + SIGHUP (sets TERMINATION_FLAG)
+    TERMINATION_FLAG.store(false, Ordering::Relaxed); // Reset for this sandbox run
+    TERMINATION_SIGNAL.store(0, Ordering::Relaxed);
     unsafe {
-        libc::signal(
-            libc::SIGTERM,
-            sigterm_flag_handler as *const () as libc::sighandler_t,
-        );
+        let handler = termination_flag_handler as *const () as libc::sighandler_t;
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGHUP, handler);
     }
 
     let wait_timeout = std::time::Duration::from_secs(
@@ -429,10 +440,10 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         match waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {
                 // Check SIGTERM — kill child gracefully and proceed to cleanup
-                if SIGTERM_FLAG.load(Ordering::Relaxed) {
+                if TERMINATION_FLAG.load(Ordering::Relaxed) {
                     tracing::info!(
                         pid = child_pid.as_raw(),
-                        "SIGTERM received — killing sandbox child for cleanup"
+                        "Termination signal received (SIGTERM/SIGINT/SIGHUP) — killing sandbox child for cleanup"
                     );
                     user_interrupt_triggered = true;
                     nix::sys::signal::kill(child_pid, nix::sys::signal::SIGTERM).ok();
@@ -504,7 +515,16 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
                     secs: wait_timeout.as_secs(),
                 }
             } else if user_interrupt_triggered {
-                crate::ExitReason::UserInterrupt
+                let sig = TERMINATION_SIGNAL.load(Ordering::Relaxed);
+                let signal_name = match sig {
+                    libc::SIGINT => "SIGINT",
+                    libc::SIGTERM => "SIGTERM",
+                    libc::SIGHUP => "SIGHUP",
+                    _ => "unknown",
+                };
+                crate::ExitReason::UserInterrupt {
+                    signal: signal_name,
+                }
             } else {
                 crate::ExitReason::ExternalKill { signal: signum }
             };
@@ -932,14 +952,24 @@ fn drop_all_capabilities() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// SIGTERM handler that sets an atomic flag.
-/// Async-signal-safe: only writes to an atomic bool.
-/// The waitpid polling loop checks this flag every 200ms.
-extern "C" fn sigterm_flag_handler(_sig: libc::c_int) {
-    // Async-signal-safe: AtomicBool::store with Relaxed is safe from signal handlers.
-    // SIGTERM_FLAG is a module-level static checked by the waitpid polling loop.
-    SIGTERM_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
+/// Termination-signal handler shared by SIGTERM, SIGINT, and SIGHUP.
+/// Async-signal-safe: only writes to two atomics.
+/// The waitpid polling loop checks TERMINATION_FLAG every 200ms and, on
+/// transition to true, kills the sandbox child and falls through to the
+/// cleanup stage. TERMINATION_SIGNAL records which of the three signals
+/// fired so the CLI can print an accurate diagnostic.
+extern "C" fn termination_flag_handler(sig: libc::c_int) {
+    // Async-signal-safe: AtomicBool/AtomicI32 store with Relaxed is safe
+    // from signal handlers.
+    TERMINATION_SIGNAL.store(sig, std::sync::atomic::Ordering::Relaxed);
+    TERMINATION_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Global SIGTERM flag — checked by sandbox waitpid loop.
-static SIGTERM_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Global termination flag — set by SIGTERM/SIGINT/SIGHUP handlers,
+/// checked by the sandbox waitpid loop to trigger graceful teardown.
+static TERMINATION_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The signal number that most recently tripped the termination handler.
+/// Read when classifying the exit reason so the CLI can distinguish
+/// SIGINT (user Ctrl+C) from SIGTERM (systemd) from SIGHUP (SSH disconnect).
+static TERMINATION_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
