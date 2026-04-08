@@ -240,6 +240,24 @@ async fn start_daemon(proxy: &str, workspace: &Path, require_tls: bool) -> Resul
 
 /// Find the proxy binary. Prefer release > debug > cargo fallback.
 fn find_proxy_binary(workspace: &Path) -> Result<PathBuf> {
+    // 1. Same directory as the currently-running `gvm` executable.
+    //    This is the most reliable lookup: when `gvm` is extracted from a
+    //    release tarball, `gvm-proxy` sits right next to it regardless of
+    //    which directory the user `cd`d into before running it.
+    if let Ok(gvm_exe) = std::env::current_exe() {
+        if let Some(dir) = gvm_exe.parent() {
+            let sibling = dir.join(if cfg!(windows) {
+                "gvm-proxy.exe"
+            } else {
+                "gvm-proxy"
+            });
+            if sibling.exists() {
+                return Ok(sibling);
+            }
+        }
+    }
+
+    // 2. Workspace-relative (cargo build layout: <repo>/target/release/).
     let release = workspace.join("target/release/gvm-proxy");
     if release.exists() {
         return Ok(release);
@@ -250,12 +268,33 @@ fn find_proxy_binary(workspace: &Path) -> Result<PathBuf> {
         return Ok(debug);
     }
 
-    // Check if gvm-proxy is in PATH
+    // 3. Walk up from CWD looking for a sibling target/ dir. Handles
+    //    `cd workspace-stress && gvm run` style invocations where the
+    //    stress harness switches directory before launching the agent.
+    let mut cursor: Option<&Path> = Some(workspace);
+    for _ in 0..6 {
+        let Some(dir) = cursor else { break };
+        let r = dir.join("target/release/gvm-proxy");
+        if r.exists() {
+            return Ok(r);
+        }
+        let d = dir.join("target/debug/gvm-proxy");
+        if d.exists() {
+            return Ok(d);
+        }
+        cursor = dir.parent();
+    }
+
+    // 4. PATH lookup as a last resort (system install case).
     if let Ok(path) = which::which("gvm-proxy") {
         return Ok(path);
     }
 
-    anyhow::bail!("gvm-proxy binary not found. Build with: cargo build --release -p gvm-proxy")
+    anyhow::bail!(
+        "gvm-proxy binary not found. Expected it next to `gvm`, in \
+         target/release/ (or target/debug/), walking up from the current \
+         directory, or on $PATH. Build with: cargo build --release -p gvm-proxy"
+    )
 }
 
 /// Check if a proxy URL is a local address.
