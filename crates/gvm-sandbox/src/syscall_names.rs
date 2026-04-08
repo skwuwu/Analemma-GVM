@@ -19,6 +19,13 @@
 /// back to printing the raw number. The table is built via macro from
 /// `libc::SYS_*` constants, so it stays in sync with the libc crate.
 pub fn name_for(num: i64) -> Option<&'static str> {
+    // Legacy x86_64-only syscalls — arm64 never shipped these constants
+    // in libc, so referencing them on aarch64 fails to compile. Handle
+    // them in an arch-gated helper and short-circuit.
+    if let Some(name) = legacy_x86_64_name(num) {
+        return Some(name);
+    }
+
     macro_rules! table {
         ($($sys:ident),+ $(,)?) => {
             match num {
@@ -55,8 +62,6 @@ pub fn name_for(num: i64) -> Option<&'static str> {
         SYS_syslog,
         SYS_personality,
         SYS_quotactl,
-        SYS_iopl,
-        SYS_ioperm,
         SYS_settimeofday,
         SYS_clock_settime,
         SYS_clock_adjtime,
@@ -76,10 +81,6 @@ pub fn name_for(num: i64) -> Option<&'static str> {
         SYS_userfaultfd,
         SYS_fanotify_init,
         SYS_fanotify_mark,
-        SYS_modify_ldt,
-        SYS_uselib,
-        SYS_ustat,
-        SYS_sysfs,
         SYS_capset,
         SYS_setfsuid,
         SYS_setfsgid,
@@ -92,7 +93,6 @@ pub fn name_for(num: i64) -> Option<&'static str> {
         SYS_setgroups,
         SYS_seccomp,
         SYS_prctl,
-        SYS_arch_prctl,
     );
     if blocked.is_some() {
         return blocked;
@@ -107,8 +107,6 @@ pub fn name_for(num: i64) -> Option<&'static str> {
         SYS_exit_group,
         SYS_clone,
         SYS_clone3,
-        SYS_fork,
-        SYS_vfork,
         SYS_execve,
         SYS_execveat,
         SYS_wait4,
@@ -124,7 +122,6 @@ pub fn name_for(num: i64) -> Option<&'static str> {
         SYS_rt_sigqueueinfo,
         SYS_rt_sigpending,
         SYS_signalfd4,
-        SYS_pause,
         // Memory management
         SYS_mmap,
         SYS_munmap,
@@ -151,17 +148,13 @@ pub fn name_for(num: i64) -> Option<&'static str> {
         SYS_writev,
         SYS_pwritev,
         SYS_pwritev2,
-        SYS_open,
         SYS_openat,
         SYS_openat2,
         SYS_close,
         SYS_close_range,
-        SYS_creat,
         SYS_lseek,
-        SYS_pipe,
         SYS_pipe2,
         SYS_dup,
-        SYS_dup2,
         SYS_dup3,
         SYS_fcntl,
         SYS_flock,
@@ -169,46 +162,31 @@ pub fn name_for(num: i64) -> Option<&'static str> {
         SYS_fdatasync,
         SYS_truncate,
         SYS_ftruncate,
-        SYS_sendfile,
         SYS_splice,
         SYS_tee,
         SYS_vmsplice,
         SYS_copy_file_range,
         // File metadata
-        SYS_stat,
         SYS_fstat,
-        SYS_lstat,
         SYS_newfstatat,
         SYS_statx,
-        SYS_access,
         SYS_faccessat,
         SYS_faccessat2,
-        SYS_chmod,
         SYS_fchmod,
         SYS_fchmodat,
-        SYS_chown,
         SYS_fchown,
-        SYS_lchown,
         SYS_fchownat,
         SYS_umask,
         // Directory ops
         SYS_getcwd,
         SYS_chdir,
         SYS_fchdir,
-        SYS_mkdir,
         SYS_mkdirat,
-        SYS_rmdir,
-        SYS_getdents,
         SYS_getdents64,
-        SYS_link,
         SYS_linkat,
-        SYS_unlink,
         SYS_unlinkat,
-        SYS_symlink,
         SYS_symlinkat,
-        SYS_readlink,
         SYS_readlinkat,
-        SYS_rename,
         SYS_renameat,
         SYS_renameat2,
         // Networking
@@ -231,21 +209,15 @@ pub fn name_for(num: i64) -> Option<&'static str> {
         SYS_getsockopt,
         SYS_shutdown,
         // Polling / events
-        SYS_poll,
         SYS_ppoll,
-        SYS_select,
         SYS_pselect6,
-        SYS_epoll_create,
         SYS_epoll_create1,
         SYS_epoll_ctl,
-        SYS_epoll_wait,
         SYS_epoll_pwait,
-        SYS_eventfd,
         SYS_eventfd2,
         SYS_timerfd_create,
         SYS_timerfd_settime,
         SYS_timerfd_gettime,
-        SYS_inotify_init,
         SYS_inotify_init1,
         SYS_inotify_add_watch,
         SYS_inotify_rm_watch,
@@ -255,7 +227,6 @@ pub fn name_for(num: i64) -> Option<&'static str> {
         SYS_clock_getres,
         SYS_clock_nanosleep,
         SYS_nanosleep,
-        SYS_time,
         SYS_times,
         // Identity
         SYS_getpid,
@@ -268,7 +239,6 @@ pub fn name_for(num: i64) -> Option<&'static str> {
         SYS_getgroups,
         SYS_getsid,
         SYS_getpgid,
-        SYS_getpgrp,
         SYS_setsid,
         SYS_setpgid,
         // Resource / scheduling
@@ -296,6 +266,71 @@ pub fn name_for(num: i64) -> Option<&'static str> {
         SYS_ioctl,
         SYS_rseq,
     )
+}
+
+/// Look up legacy x86_64-only syscalls. arm64 never had these constants
+/// in libc (it only ships the modern *at / *2 / *64 variants), so we
+/// gate the lookup by target_arch and return None on everything else.
+#[cfg(target_arch = "x86_64")]
+#[allow(deprecated)]
+fn legacy_x86_64_name(num: i64) -> Option<&'static str> {
+    macro_rules! legacy_table {
+        ($($sys:ident),+ $(,)?) => {
+            match num {
+                $(n if n == libc::$sys as i64 => Some(stringify!($sys).trim_start_matches("SYS_")),)+
+                _ => None,
+            }
+        };
+    }
+    legacy_table!(
+        // High-risk legacy blocked list
+        SYS_iopl,
+        SYS_ioperm,
+        SYS_modify_ldt,
+        SYS_uselib,
+        SYS_ustat,
+        SYS_sysfs,
+        SYS_arch_prctl,
+        // Process lifecycle legacy
+        SYS_fork,
+        SYS_vfork,
+        SYS_pause,
+        SYS_getpgrp,
+        // File I/O legacy
+        SYS_open,
+        SYS_creat,
+        SYS_pipe,
+        SYS_dup2,
+        SYS_sendfile,
+        SYS_stat,
+        SYS_lstat,
+        SYS_access,
+        SYS_chmod,
+        SYS_chown,
+        SYS_lchown,
+        SYS_mkdir,
+        SYS_rmdir,
+        SYS_getdents,
+        SYS_link,
+        SYS_unlink,
+        SYS_symlink,
+        SYS_readlink,
+        SYS_rename,
+        // Polling / events legacy
+        SYS_poll,
+        SYS_select,
+        SYS_epoll_create,
+        SYS_epoll_wait,
+        SYS_eventfd,
+        SYS_inotify_init,
+        // Time legacy
+        SYS_time
+    )
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn legacy_x86_64_name(_num: i64) -> Option<&'static str> {
+    None
 }
 
 #[cfg(test)]

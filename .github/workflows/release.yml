@@ -33,12 +33,10 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             binary_ext: ""
-          # aarch64-unknown-linux-gnu intentionally omitted: the sandbox
-          # seccomp whitelist in crates/gvm-sandbox/src/seccomp.rs uses
-          # x86_64-only syscall numbers (SYS_select, SYS_eventfd,
-          # SYS_arch_prctl, etc.). README already states Linux x86_64 is
-          # the supported target; add ARM back only after seccomp is
-          # ported with cfg(target_arch).
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            binary_ext: ""
+            cross: true
           - target: x86_64-apple-darwin
             os: macos-latest
             binary_ext: ""
@@ -57,12 +55,26 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install cross (Linux cross-compilation)
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
       - name: Build gvm-proxy
-        run: cargo build --release --target ${{ matrix.target }} -p gvm-proxy
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} -p gvm-proxy
+          else
+            cargo build --release --target ${{ matrix.target }} -p gvm-proxy
+          fi
         shell: bash
 
       - name: Build gvm-cli
-        run: cargo build --release --target ${{ matrix.target }} -p gvm-cli
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} -p gvm-cli
+          else
+            cargo build --release --target ${{ matrix.target }} -p gvm-cli
+          fi
         shell: bash
 
       - name: Package binaries

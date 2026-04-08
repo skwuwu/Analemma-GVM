@@ -309,21 +309,17 @@ fn insert_base_syscalls(rules: &mut BTreeMap<i64, Vec<SeccompRule>>) {
         libc::SYS_membarrier
     );
 
-    // File I/O
+    // File I/O (arch-independent — uses *at / *64 / modern variants only)
     allow!(
         libc::SYS_read,
         libc::SYS_write,
         libc::SYS_close,
         libc::SYS_fstat,
-        libc::SYS_stat,
-        libc::SYS_lstat,
         libc::SYS_lseek,
         libc::SYS_openat,
         libc::SYS_fcntl,
         libc::SYS_dup,
-        libc::SYS_dup2,
         libc::SYS_dup3,
-        libc::SYS_pipe,
         libc::SYS_pipe2,
         libc::SYS_readv,
         libc::SYS_writev,
@@ -333,45 +329,31 @@ fn insert_base_syscalls(rules: &mut BTreeMap<i64, Vec<SeccompRule>>) {
         libc::SYS_pwritev2, // Node.js libuv async vectored I/O (syscall 328)
         libc::SYS_pread64,
         libc::SYS_pwrite64,
-        libc::SYS_access,
         libc::SYS_faccessat,
         libc::SYS_faccessat2,
         libc::SYS_getcwd,
-        libc::SYS_readlink,
         libc::SYS_readlinkat,
         libc::SYS_newfstatat,
         libc::SYS_statx,
-        libc::SYS_getdents,
         libc::SYS_getdents64,
         libc::SYS_ftruncate,
-        libc::SYS_rename,
         libc::SYS_renameat,
         libc::SYS_renameat2,
-        libc::SYS_unlink,
         libc::SYS_unlinkat,
-        libc::SYS_mkdir,
         libc::SYS_mkdirat,
-        libc::SYS_rmdir,
         libc::SYS_chdir,
         libc::SYS_fchdir,
-        libc::SYS_chmod,
         libc::SYS_fchmod,
-        libc::SYS_fchmodat,
-        libc::SYS_fadvise64 // coreutils (cat, etc.) use posix_fadvise for read-ahead hints
+        libc::SYS_fchmodat
     );
 
-    // Polling / event loop
+    // Polling / event loop (arch-independent)
     allow!(
-        libc::SYS_poll,
         libc::SYS_ppoll,
-        libc::SYS_epoll_create,
         libc::SYS_epoll_create1,
         libc::SYS_epoll_ctl,
-        libc::SYS_epoll_wait,
         libc::SYS_epoll_pwait,
-        libc::SYS_select,
         libc::SYS_pselect6,
-        libc::SYS_eventfd,
         libc::SYS_eventfd2
     );
 
@@ -391,10 +373,9 @@ fn insert_base_syscalls(rules: &mut BTreeMap<i64, Vec<SeccompRule>>) {
         libc::SYS_getgroups
     );
 
-    // Misc required by Python/Node runtimes
+    // Misc required by Python/Node runtimes (arch-independent)
     allow!(
         libc::SYS_getrandom,
-        libc::SYS_arch_prctl,
         libc::SYS_prctl,
         libc::SYS_ioctl,
         libc::SYS_uname,
@@ -413,6 +394,41 @@ fn insert_base_syscalls(rules: &mut BTreeMap<i64, Vec<SeccompRule>>) {
         libc::SYS_timer_delete,
         libc::SYS_rt_sigsuspend
     );
+
+    // ── Legacy x86_64-only syscalls ──
+    // arm64 never shipped these — it only has the modern *at / *2 /
+    // *64 variants above. Whitelisting them on x86_64 keeps coreutils,
+    // older Python, and glibc fallback paths happy; on aarch64 they
+    // are unreachable (the kernel never issues them), so there is
+    // nothing to whitelist.
+    #[cfg(target_arch = "x86_64")]
+    #[allow(deprecated)]
+    {
+        allow!(
+            // File I/O legacy
+            libc::SYS_stat,
+            libc::SYS_lstat,
+            libc::SYS_dup2,
+            libc::SYS_pipe,
+            libc::SYS_access,
+            libc::SYS_readlink,
+            libc::SYS_getdents,
+            libc::SYS_rename,
+            libc::SYS_unlink,
+            libc::SYS_mkdir,
+            libc::SYS_rmdir,
+            libc::SYS_chmod,
+            libc::SYS_fadvise64,
+            // Polling legacy
+            libc::SYS_poll,
+            libc::SYS_epoll_create,
+            libc::SYS_epoll_wait,
+            libc::SYS_select,
+            libc::SYS_eventfd,
+            // Misc x86_64-specific
+            libc::SYS_arch_prctl
+        );
+    }
 }
 
 /// Build a strict filter: no networking at all (offline computation only).
