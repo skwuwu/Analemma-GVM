@@ -11,6 +11,30 @@ struct CautionTarget {
     path_pattern: String,
 }
 
+/// Strip the default port (`:80` for HTTP, `:443` for HTTPS) from a host
+/// authority before serialising into a suggested SRR pattern.
+///
+/// The SRR matcher already collapses default ports on both sides, so the
+/// behaviour is identical with or without the suffix — but operators read
+/// these generated files and a noisy `:443` suffix on every HTTPS rule
+/// just adds visual clutter and trains them to ignore the port column.
+/// Non-default ports stay so the human can see "this rule was learned
+/// from a non-standard endpoint" at a glance.
+fn pretty_host(host: &str) -> String {
+    if let Some((h, p)) = host.rsplit_once(':') {
+        if p == "80" || p == "443" {
+            return h.to_string();
+        }
+    }
+    host.to_string()
+}
+
+/// Sanitise a host for use in a TOML label. Strips the optional port
+/// before slugging so labels stay stable across HTTP/HTTPS variants.
+fn host_label(host: &str) -> String {
+    pretty_host(host).replace('.', "-")
+}
+
 /// Scan WAL events for Default-to-Caution hits and interactively suggest rules.
 ///
 /// Called after the agent run when `--interactive` is set. Reads new WAL entries,
@@ -110,7 +134,7 @@ pub fn suggest_rules_interactive(wal_path: &str, start_offset: u64, srr_file: &s
     let mut rules_added = 0usize;
 
     for (target, count) in &caution_targets {
-        let pattern = format!("{}{}", target.host, target.path_pattern);
+        let pattern = format!("{}{}", pretty_host(&target.host), target.path_pattern);
         println!(
             "  {YELLOW}\u{26a0}{RESET} {BOLD}{} {}{RESET} {DIM}({} hit{}){RESET}",
             target.method,
@@ -299,11 +323,11 @@ pub fn suggest_rules_batch(log_path: &str, output_path: Option<&str>, default_de
     );
 
     for (target, count) in &caution_targets {
-        let pattern = format!("{}{}", target.host, target.path_pattern);
+        let pattern = format!("{}{}", pretty_host(&target.host), target.path_pattern);
         let label = format!(
             "suggest-{}-{}",
             target.method.to_lowercase(),
-            target.host.replace('.', "-")
+            host_label(&target.host)
         );
         toml_output.push_str(&format!(
             "[[rules]]\nmethod = \"{}\"\npattern = \"{}\"\ndecision = {}\n\
@@ -498,5 +522,39 @@ mod tests {
     fn looks_like_id_detects_uuids() {
         assert!(looks_like_id("550e8400-e29b-41d4-a716-446655440000"));
         assert!(!looks_like_id("short-uuid"));
+    }
+
+    #[test]
+    fn pretty_host_strips_default_https_port() {
+        assert_eq!(pretty_host("api.bank.com:443"), "api.bank.com");
+    }
+
+    #[test]
+    fn pretty_host_strips_default_http_port() {
+        assert_eq!(pretty_host("api.bank.com:80"), "api.bank.com");
+    }
+
+    #[test]
+    fn pretty_host_keeps_nonstandard_port() {
+        // Non-default ports stay so an operator reading the generated TOML
+        // can see "this rule was learned from a non-standard endpoint".
+        assert_eq!(pretty_host("api.demo:9999"), "api.demo:9999");
+        assert_eq!(pretty_host("internal.svc:8080"), "internal.svc:8080");
+    }
+
+    #[test]
+    fn pretty_host_handles_no_port() {
+        assert_eq!(pretty_host("api.bank.com"), "api.bank.com");
+    }
+
+    #[test]
+    fn host_label_strips_port_before_slugging() {
+        // Label sanitisation must produce the same slug whether the host
+        // came in with a default port or without — otherwise HTTPS and
+        // HTTP variants of the same host generate two different labels
+        // and the operator sees duplicate-looking entries.
+        assert_eq!(host_label("api.bank.com"), "api-bank-com");
+        assert_eq!(host_label("api.bank.com:443"), "api-bank-com");
+        assert_eq!(host_label("api.demo:9999"), "api-demo:9999");
     }
 }

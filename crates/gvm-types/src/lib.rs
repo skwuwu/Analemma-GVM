@@ -277,6 +277,32 @@ pub fn strip_port(host: &str) -> &str {
     }
 }
 
+/// Split a host:port authority into (host, optional_port).
+/// Returns the bare host plus the parsed port number when present.
+///
+/// IPv6 bracket form is preserved as-is in the host portion (port parsing
+/// for IPv6 is intentionally out of scope — the only callers today are
+/// SRR pattern compilation and request normalization, both of which feed
+/// downstream code that already handles IPv6 separately).
+///
+/// Examples:
+///   "api.bank.com"        -> ("api.bank.com", None)
+///   "api.bank.com:443"    -> ("api.bank.com", Some(443))
+///   "api.bank.com:abc"    -> ("api.bank.com:abc", None)  // unparseable, treat as opaque host
+///   "[::1]:8080"          -> ("[::1]:8080", None)        // IPv6 bracket form passthrough
+pub fn split_host_port(authority: &str) -> (&str, Option<u16>) {
+    if authority.starts_with('[') {
+        return (authority, None);
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port_str)) => match port_str.parse::<u16>() {
+            Ok(p) => (host, Some(p)),
+            Err(_) => (authority, None),
+        },
+        None => (authority, None),
+    }
+}
+
 /// WAL batch record written after each group commit flush.
 /// Contains the Merkle root of all events in the batch and a chain
 /// pointer to the previous batch's root (inter-batch integrity).

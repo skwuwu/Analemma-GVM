@@ -1,7 +1,7 @@
 use crate::types::EnforcementDecision;
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use gvm_types::strip_port;
+use gvm_types::split_host_port;
 use regex::Regex;
 use serde::Deserialize;
 use std::path::Path;
@@ -76,13 +76,21 @@ pub struct SrrCheckResult {
     pub is_catch_all: bool,
 }
 
-/// Host matching pattern
+/// Host matching pattern with optional port constraint.
+///
+/// `port` follows Max-Strict semantics. `None` means "any port" — the
+/// pattern matches whatever port the request used. `Some(p)` means
+/// "port `p` only" — the request must use that exact port. Standard
+/// ports (80 for HTTP, 443 for HTTPS) are normalised to `None` at
+/// pattern compile time so that a pattern of "api.example.com:443"
+/// matches both "api.example.com" and "api.example.com:443" — the
+/// explicit port is redundant for the default-port case.
 #[derive(Clone, Debug)]
 pub enum HostPattern {
     /// Exact host match: "api.bank.com"
-    Exact(String),
+    Exact { host: String, port: Option<u16> },
     /// Suffix match: "{host}.database.com" → *.database.com
-    Suffix(String),
+    Suffix { suffix: String, port: Option<u16> },
     /// Any host: "{any}" or "*"
     Any,
 }
@@ -256,8 +264,14 @@ impl NetworkSRR {
                     deny += 1;
                     if sample_denies.len() < 3 && !rule.is_catch_all {
                         let host = match &rule.host_pattern {
-                            HostPattern::Exact(h) => h.clone(),
-                            HostPattern::Suffix(s) => format!("*{}", s),
+                            HostPattern::Exact { host: h, port } => match port {
+                                Some(p) => format!("{}:{}", h, p),
+                                None => h.clone(),
+                            },
+                            HostPattern::Suffix { suffix: s, port } => match port {
+                                Some(p) => format!("*{}:{}", s, p),
+                                None => format!("*{}", s),
+                            },
                             HostPattern::Any => "*".to_string(),
                         };
                         sample_denies
@@ -303,12 +317,13 @@ impl NetworkSRR {
 
     /// Extract all exact-match host domains from loaded rules.
     /// Used by MITM cert pre-warm to generate leaf certs at startup.
+    /// Port qualifiers are dropped — cert SAN matches by hostname only.
     pub fn known_hosts(&self) -> Vec<String> {
         let mut hosts: Vec<String> = self
             .rules
             .iter()
             .filter_map(|r| match &r.host_pattern {
-                HostPattern::Exact(h) => Some(h.clone()),
+                HostPattern::Exact { host, .. } => Some(host.clone()),
                 _ => None,
             })
             .collect();
@@ -515,7 +530,14 @@ impl NetworkSRR {
 }
 
 /// Parse an SRR pattern into (host_pattern, path_pattern).
-/// Pattern format: "api.bank.com/transfer/{any}" → Exact("api.bank.com"), "/transfer/*"
+///
+/// Pattern format: `[host[:port]]/path`. Examples:
+///   "api.bank.com/transfer/{any}"      -> Exact("api.bank.com", None), "/transfer/*"
+///   "api.bank.com:8080/api"            -> Exact("api.bank.com", Some(8080)), "/api"
+///   "api.bank.com:443/api"             -> Exact("api.bank.com", None), "/api"
+///                                          (default https port collapses to None)
+///   "{host}.bank.com:9999/api"         -> Suffix(".bank.com", Some(9999)), "/api"
+///   "{any}/anything"                   -> Any, "/anything"
 fn parse_pattern(pattern: &str) -> (HostPattern, String) {
     // Split on first '/'
     let (host_part, path_part) = match pattern.find('/') {
@@ -528,14 +550,29 @@ fn parse_pattern(pattern: &str) -> (HostPattern, String) {
     // to avoid being incorrectly parsed as a Suffix pattern.
     let host_pattern = if host_part == "{any}" || host_part == "*" {
         HostPattern::Any
-    } else if host_part.starts_with("{") && host_part.contains('.') {
-        // e.g. "{host}.database.com" → suffix match on ".database.com"
-        // Safe: contains('.') guard above ensures find('.') always returns Some.
-        // unwrap_or(0) is unreachable but avoids panic for defense-in-depth.
-        let dot_idx = host_part.find('.').unwrap_or(0);
-        HostPattern::Suffix(host_part[dot_idx..].to_lowercase())
     } else {
-        HostPattern::Exact(host_part.to_lowercase())
+        // Split host:port BEFORE wildcard detection so authors can write
+        // "{host}.bank.com:9999" without breaking on the colon.
+        let (host_only, port) = split_host_port(host_part);
+        // Standard ports collapse to None — "api.example.com:443" matches
+        // requests for "api.example.com" too. Explicit ports stay set.
+        let normalised_port = match port {
+            Some(80) | Some(443) => None,
+            other => other,
+        };
+        if host_only.starts_with("{") && host_only.contains('.') {
+            // e.g. "{host}.database.com" → suffix match on ".database.com"
+            let dot_idx = host_only.find('.').unwrap_or(0);
+            HostPattern::Suffix {
+                suffix: host_only[dot_idx..].to_lowercase(),
+                port: normalised_port,
+            }
+        } else {
+            HostPattern::Exact {
+                host: host_only.to_lowercase(),
+                port: normalised_port,
+            }
+        }
     };
 
     let path_pattern = path_part.replace("{any}", "*").to_string();
@@ -543,21 +580,43 @@ fn parse_pattern(pattern: &str) -> (HostPattern, String) {
     (host_pattern, path_pattern)
 }
 
-/// Match a host against a HostPattern.
-/// Strips port number before matching (e.g., "api.bank.com:443" → "api.bank.com").
+/// Match a host:port authority against a HostPattern.
+///
+/// Port matching follows Max-Strict semantics. A pattern port of `None`
+/// matches any request port; a pattern port of `Some(p)` matches only that
+/// exact request port. Default ports (80 for HTTP, 443 for HTTPS) are
+/// collapsed to `None` at compile time, so a pattern that omits the port
+/// and a request that omits the port are equivalent for default-port traffic.
 ///
 /// Caller must pass a pre-lowercased host (done once in `check()` for O(1) cost).
 /// Patterns are lowercased at compile time in `parse_pattern()`.
 fn match_host(pattern: &HostPattern, host: &str) -> bool {
-    let host_without_port = strip_port(host);
+    let (host_only, port) = split_host_port(host);
+    // Normalise default ports the same way the pattern compile does so
+    // a request to "api.example.com:443" matches a pattern that didn't
+    // bother spelling out the default port.
+    let request_port = match port {
+        Some(80) | Some(443) => None,
+        other => other,
+    };
 
     match pattern {
-        HostPattern::Exact(expected) => host_without_port == expected.as_str(),
-        HostPattern::Suffix(suffix) => {
+        HostPattern::Exact {
+            host: expected,
+            port: pattern_port,
+        } => {
+            host_only == expected.as_str()
+                && (pattern_port.is_none() || pattern_port == &request_port)
+        }
+        HostPattern::Suffix {
+            suffix,
+            port: pattern_port,
+        } => {
             // Dot-boundary enforcement: suffix always starts with '.' from parse_pattern
             // (e.g., ".database.com"), so "attacker-database.com" cannot match —
             // it would need to end with ".database.com" which requires a dot boundary.
-            host_without_port.ends_with(suffix.as_str())
+            host_only.ends_with(suffix.as_str())
+                && (pattern_port.is_none() || pattern_port == &request_port)
         }
         HostPattern::Any => true,
     }
@@ -1701,5 +1760,167 @@ mod tests {
             r3.matched_description.is_none(),
             "Built-in default has no description"
         );
+    }
+
+    // ── Port-aware host matching ──────────────────────────────────────
+    //
+    // Pattern matrix the matcher must satisfy:
+    //
+    //   pattern               request                expect
+    //   --------------------  ---------------------  ------
+    //   api.demo/repos/foo    api.demo/repos/foo     Allow  (no port both sides)
+    //   api.demo/repos/foo    api.demo:9999/...      Allow  (pattern omits port → any port)
+    //   api.demo:443/...      api.demo/...           Allow  (default port collapses)
+    //   api.demo:443/...      api.demo:443/...       Allow  (default port collapses)
+    //   api.demo:9999/foo     api.demo:9999/foo      Allow  (exact non-default port)
+    //   api.demo:9999/foo     api.demo:8888/foo      Default-to-Caution  (port mismatch)
+    //   api.demo:9999/foo     api.demo/foo           Default-to-Caution  (request omits port)
+    //   {host}.demo:9999/x    a.demo:9999/x          Allow  (suffix + port)
+    //
+    // The first three cases are the "default port collapses" guarantee
+    // operators rely on so they don't have to spell out :443 in every
+    // HTTPS rule. The fourth and fifth case enforce Max-Strict for
+    // non-default ports — a pattern that explicitly names a port must
+    // not silently allow other ports.
+
+    fn allow(host: &str, path: &str, srr: &NetworkSRR) -> bool {
+        matches!(
+            srr.check("GET", host, path, None).decision,
+            EnforcementDecision::Allow
+        )
+    }
+
+    #[test]
+    fn host_match_no_port_either_side() {
+        let srr = srr_from_toml(
+            r#"
+            [[rules]]
+            method = "GET"
+            pattern = "api.demo/repos/foo"
+            decision = { type = "Allow" }
+        "#,
+        );
+        assert!(allow("api.demo", "/repos/foo", &srr));
+    }
+
+    #[test]
+    fn host_match_pattern_omits_port_request_supplies_port() {
+        let srr = srr_from_toml(
+            r#"
+            [[rules]]
+            method = "GET"
+            pattern = "api.demo/repos/foo"
+            decision = { type = "Allow" }
+        "#,
+        );
+        assert!(
+            allow("api.demo:9999", "/repos/foo", &srr),
+            "Pattern without port must allow any request port"
+        );
+    }
+
+    #[test]
+    fn host_match_default_https_port_collapses() {
+        let srr = srr_from_toml(
+            r#"
+            [[rules]]
+            method = "GET"
+            pattern = "api.bank.com:443/wire"
+            decision = { type = "Allow" }
+        "#,
+        );
+        assert!(allow("api.bank.com", "/wire", &srr));
+        assert!(allow("api.bank.com:443", "/wire", &srr));
+    }
+
+    #[test]
+    fn host_match_default_http_port_collapses() {
+        let srr = srr_from_toml(
+            r#"
+            [[rules]]
+            method = "GET"
+            pattern = "api.bank.com:80/wire"
+            decision = { type = "Allow" }
+        "#,
+        );
+        assert!(allow("api.bank.com", "/wire", &srr));
+        assert!(allow("api.bank.com:80", "/wire", &srr));
+    }
+
+    #[test]
+    fn host_match_explicit_nonstandard_port_exact() {
+        let srr = srr_from_toml(
+            r#"
+            [[rules]]
+            method = "GET"
+            pattern = "api.demo:9999/foo"
+            decision = { type = "Allow" }
+        "#,
+        );
+        assert!(allow("api.demo:9999", "/foo", &srr));
+    }
+
+    #[test]
+    fn host_match_explicit_port_rejects_other_port() {
+        let srr = srr_from_toml(
+            r#"
+            [[rules]]
+            method = "GET"
+            pattern = "api.demo:9999/foo"
+            decision = { type = "Allow" }
+        "#,
+        );
+        assert!(
+            !allow("api.demo:8888", "/foo", &srr),
+            "Pattern :9999 must NOT match request :8888"
+        );
+    }
+
+    #[test]
+    fn host_match_explicit_port_rejects_unported_request() {
+        let srr = srr_from_toml(
+            r#"
+            [[rules]]
+            method = "GET"
+            pattern = "api.demo:9999/foo"
+            decision = { type = "Allow" }
+        "#,
+        );
+        // Bare "api.demo" implies the protocol's default port. The pattern
+        // demands :9999 explicitly so this must NOT match.
+        assert!(!allow("api.demo", "/foo", &srr));
+    }
+
+    #[test]
+    fn host_match_suffix_pattern_with_explicit_port() {
+        let srr = srr_from_toml(
+            r#"
+            [[rules]]
+            method = "GET"
+            pattern = "{host}.demo:9999/x"
+            decision = { type = "Allow" }
+        "#,
+        );
+        assert!(allow("a.demo:9999", "/x", &srr));
+        assert!(
+            !allow("a.demo:8888", "/x", &srr),
+            "Suffix pattern with port must enforce port"
+        );
+    }
+
+    #[test]
+    fn host_match_case_insensitive_with_port() {
+        let srr = srr_from_toml(
+            r#"
+            [[rules]]
+            method = "GET"
+            pattern = "API.demo:9999/Foo"
+            decision = { type = "Allow" }
+        "#,
+        );
+        // Host part lowercased at compile and request time. Path is
+        // case-sensitive (RFC 7230) so we keep the original casing.
+        assert!(allow("api.demo:9999", "/Foo", &srr));
+        assert!(allow("API.DEMO:9999", "/Foo", &srr));
     }
 }
