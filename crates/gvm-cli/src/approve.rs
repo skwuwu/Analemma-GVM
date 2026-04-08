@@ -59,35 +59,16 @@ pub async fn run_approve(proxy: &str, poll_interval: u64, auto_deny: bool) -> Re
 
             if auto_deny {
                 // Auto-deny
-                match send_decision(&client, &approve_url, &entry.event_id, false).await {
-                    Ok(_) => {
-                        eprintln!(
-                            "  {RED}\u{2717}{RESET} Auto-denied: {DIM}{} {} {}{RESET}",
-                            entry.method, entry.host, entry.path
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("  {RED}Failed to deny {}: {}{RESET}", entry.event_id, e);
-                    }
-                }
+                let outcome = send_decision(&client, &approve_url, &entry.event_id, false).await;
+                render_outcome(entry, false, &outcome);
                 prompted.insert(entry.event_id.clone());
             } else {
                 // Interactive prompt
                 print_approval_prompt(entry);
                 let approved = prompt_user_decision()?;
 
-                match send_decision(&client, &approve_url, &entry.event_id, approved).await {
-                    Ok(_) => {
-                        if approved {
-                            eprintln!("  {GREEN}\u{2713} Approved{RESET}");
-                        } else {
-                            eprintln!("  {RED}\u{2717} Denied{RESET}");
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("  {RED}Failed to send decision: {}{RESET}", e);
-                    }
-                }
+                let outcome = send_decision(&client, &approve_url, &entry.event_id, approved).await;
+                render_outcome(entry, approved, &outcome);
                 prompted.insert(entry.event_id.clone());
                 eprintln!();
             }
@@ -116,14 +97,31 @@ async fn fetch_pending(client: &reqwest::Client, url: &str) -> Result<Vec<Pendin
     Ok(body.pending)
 }
 
-/// Send an approval decision to the proxy.
+/// Outcome of a single approve/deny POST.
+enum DecisionOutcome {
+    /// Proxy accepted the decision and delivered it to the waiting handler.
+    Delivered,
+    /// Proxy returned 410 Gone — the agent disconnected before the
+    /// decision arrived. The operator's click had no effect on the
+    /// upstream request because there is no upstream request anymore.
+    AgentGone,
+    /// Proxy returned 404 — the event_id is unknown (already drained,
+    /// already timed out, or never existed).
+    Unknown,
+    /// Other / network failure.
+    Error(String),
+}
+
+/// Send an approval decision to the proxy. Maps the proxy's status
+/// code into an explicit outcome so the caller can render a truthful
+/// message instead of an unconditional "Approved".
 async fn send_decision(
     client: &reqwest::Client,
     url: &str,
     event_id: &str,
     approved: bool,
-) -> Result<()> {
-    let resp = client
+) -> DecisionOutcome {
+    let resp = match client
         .post(url)
         .json(&serde_json::json!({
             "event_id": event_id,
@@ -131,13 +129,22 @@ async fn send_decision(
         }))
         .send()
         .await
-        .context("Failed to send approval decision")?;
+    {
+        Ok(r) => r,
+        Err(e) => return DecisionOutcome::Error(format!("send: {}", e)),
+    };
 
-    if !resp.status().is_success() {
+    let status = resp.status();
+    if status.is_success() {
+        DecisionOutcome::Delivered
+    } else if status == reqwest::StatusCode::GONE {
+        DecisionOutcome::AgentGone
+    } else if status == reqwest::StatusCode::NOT_FOUND {
+        DecisionOutcome::Unknown
+    } else {
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Proxy returned error: {}", body);
+        DecisionOutcome::Error(format!("{}: {}", status, body))
     }
-    Ok(())
 }
 
 /// Print the approval prompt for a pending request.
@@ -166,58 +173,51 @@ fn prompt_user_decision() -> Result<bool> {
     Ok(trimmed == "y" || trimmed == "yes")
 }
 
-/// Poll for pending approvals and display prompts inline during `gvm run`.
-/// This is a background task spawned by `gvm run` when the proxy has IC-3 rules.
-/// Returns when the cancellation token is set.
-pub async fn poll_and_prompt_background(
-    proxy: &str,
-    mut cancel: tokio::sync::watch::Receiver<bool>,
-) {
-    let client = reqwest::Client::new();
-    let pending_url = format!("{}/gvm/pending", proxy.trim_end_matches('/'));
-    let approve_url = format!("{}/gvm/approve", proxy.trim_end_matches('/'));
-    let mut prompted: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
-
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                if let Ok(pending) = fetch_pending(&client, &pending_url).await {
-                    for entry in &pending {
-                        if prompted.contains(&entry.event_id) {
-                            continue;
-                        }
-
-                        // Show prompt on stderr (interleaved with agent output)
-                        print_approval_prompt(entry);
-
-                        // In background mode, read from stdin
-                        match prompt_user_decision() {
-                            Ok(approved) => {
-                                let _ = send_decision(&client, &approve_url, &entry.event_id, approved).await;
-                                if approved {
-                                    eprintln!("  {GREEN}\u{2713} Approved — request forwarded{RESET}");
-                                } else {
-                                    eprintln!("  {RED}\u{2717} Denied — 403 returned to agent{RESET}");
-                                }
-                            }
-                            Err(_) => {
-                                // stdin closed or error — auto-deny
-                                let _ = send_decision(&client, &approve_url, &entry.event_id, false).await;
-                                eprintln!("  {RED}\u{2717} Auto-denied (stdin unavailable){RESET}");
-                            }
-                        }
-                        prompted.insert(entry.event_id.clone());
-                        eprintln!();
-                    }
-                }
+/// Render the result of a single approve/deny POST. The truth-table
+/// matters here: the operator needs to know when their click did
+/// nothing (agent already disconnected) so they don't trust a stale
+/// audit log entry.
+fn render_outcome(entry: &PendingEntry, approved: bool, outcome: &DecisionOutcome) {
+    match outcome {
+        DecisionOutcome::Delivered => {
+            if approved {
+                eprintln!("  {GREEN}\u{2713} Approved — request forwarded to upstream{RESET}");
+            } else {
+                eprintln!("  {RED}\u{2717} Denied — 403 returned to agent{RESET}");
             }
-            Ok(()) = cancel.changed() => {
-                if *cancel.borrow() {
-                    return;
-                }
-            }
+        }
+        DecisionOutcome::AgentGone => {
+            // The proxy returned 410 Gone: hyper cancelled the handler
+            // future before our decision arrived, almost always because
+            // the agent's HTTP client timed out. Tell the operator
+            // explicitly so they don't think they just approved a wire
+            // transfer that actually never happened.
+            eprintln!(
+                "  {YELLOW}\u{26a0}  Agent already disconnected{RESET}  \
+                 {DIM}({} {}){RESET}",
+                entry.method, entry.host
+            );
+            eprintln!(
+                "  {DIM}    The agent's HTTP client closed the connection \
+                 before your decision arrived. No upstream call was made;{RESET}"
+            );
+            eprintln!(
+                "  {DIM}    your '{}' had no effect on the request.{RESET}",
+                if approved { "approve" } else { "deny" }
+            );
+        }
+        DecisionOutcome::Unknown => {
+            // 404: event_id is gone. Most likely the IC-3 timeout fired
+            // first or another `gvm approve` instance already drained
+            // it. Show as a soft warning, not an error.
+            eprintln!(
+                "  {DIM}\u{2014} {} already drained (timeout or another \
+                 approver got there first){RESET}",
+                entry.event_id
+            );
+        }
+        DecisionOutcome::Error(msg) => {
+            eprintln!("  {RED}Failed to send decision: {}{RESET}", msg);
         }
     }
 }

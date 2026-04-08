@@ -1,0 +1,60 @@
+[Unit]
+Description=GVM sandboxed agent (%i)
+Documentation=https://github.com/skwuwu/Analemma-GVM
+# Boot-time orphan sweep must complete before any agent launches —
+# otherwise a stale veth or iptables rule from the previous boot could
+# collide with the new sandbox setup.
+Requires=gvm-cleanup.service
+After=gvm-cleanup.service network.target
+
+[Service]
+# `gvm run --sandbox` runs in the foreground and exits when the agent
+# does. systemd treats that as the unit's lifecycle — exactly what we
+# want for a per-agent unit.
+Type=simple
+
+# Per-agent script. The instance name `%i` becomes the file basename so
+# `systemctl start gvm-sandbox@my-agent.service` runs
+# `/etc/gvm/agents/my-agent.py`. Override `AgentScript=` via a drop-in
+# (`systemctl edit gvm-sandbox@my-agent.service`) for non-default paths.
+Environment=AgentScript=/etc/gvm/agents/%i.py
+
+# Defense in depth: run the orphan sweep again immediately before the
+# launch in case the boot-time `gvm-cleanup.service` ran much earlier
+# and another sandbox has crashed since. Idempotent + cheap.
+ExecStartPre=/usr/local/bin/gvm cleanup
+ExecStart=/usr/local/bin/gvm run --sandbox --agent-id %i ${AgentScript}
+
+# When systemd stops the unit (`systemctl stop`, host shutdown), send
+# SIGTERM and give the agent + cleanup pipeline 30s to release host
+# kernel state before SIGKILL. The post-stop hook runs `gvm cleanup`
+# unconditionally as the safety net for the SIGKILL case.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+ExecStopPost=/usr/local/bin/gvm cleanup
+
+# Auto-restart on crash but not on intentional exit. `Restart=on-failure`
+# fires only for non-zero exit codes and signals — clean exit (the agent
+# finished) is left alone. Cap at 3 restarts per minute so a wedged agent
+# doesn't busy-loop the host.
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+# Sandbox setup needs CAP_NET_ADMIN (veth + iptables), CAP_SYS_ADMIN
+# (mount namespaces), and CAP_SYS_PTRACE (seccomp introspection). We
+# leave User=root because user namespaces are entered inside the sandbox
+# itself — running the unit as a non-root user requires `setcap` on the
+# binary, which is documented in docs/operations.md as the alternative.
+User=root
+
+# Logging — agent stdout/stderr go to journald, tagged with the instance
+# name so `journalctl -u gvm-sandbox@my-agent` Just Works.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gvm-sandbox-%i
+
+[Install]
+WantedBy=multi-user.target

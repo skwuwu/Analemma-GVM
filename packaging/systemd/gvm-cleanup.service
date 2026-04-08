@@ -1,0 +1,29 @@
+[Unit]
+Description=GVM sandbox orphan resource cleanup (boot-time sweep)
+Documentation=https://github.com/skwuwu/Analemma-GVM
+# Run after the network stack is up so iptables/ip commands resolve, but
+# before any user-facing GVM unit pulls in a new sandbox. Both
+# `gvm-sandbox@.service` and operator-launched `gvm run` are gated on
+# this completing.
+After=network-pre.target
+Before=network.target
+
+[Service]
+Type=oneshot
+# Sweep host kernel state from any sandbox that crashed before reboot:
+# leftover veth pairs, iptables FORWARD/NAT rules, mount points, cgroups,
+# and `/run/gvm/*.state` files. Idempotent — safe to run on a clean host.
+ExecStart=/usr/local/bin/gvm cleanup
+# Cleanup must succeed for the system to be considered ready. If it fails,
+# the operator should see the failure on `systemctl status gvm-cleanup` and
+# investigate before launching agents.
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+# Cleanup touches iptables / ip / mount / cgroupfs — needs full root.
+# We do NOT drop capabilities here because the whole point is to undo
+# resources that only root can release.
+User=root
+
+[Install]
+WantedBy=multi-user.target

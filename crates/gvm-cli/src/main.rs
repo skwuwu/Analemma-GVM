@@ -5,6 +5,7 @@ mod audit;
 mod check;
 mod demo;
 mod events;
+mod fs_approve;
 mod init;
 mod pipeline;
 mod preflight;
@@ -356,6 +357,49 @@ enum Commands {
     ///
     ///   gvm stop
     Stop {},
+
+    /// Filesystem governance: review and drain pending file changes
+    /// from sandboxes that ran with `--fs-governance`.
+    ///
+    /// Each `gvm run --sandbox --fs-governance` session that exits
+    /// with `needs_review` files leaves a staging directory under
+    /// `data/sandbox-staging/<pid>/` plus a manifest sidecar. This
+    /// subcommand walks every staging directory on the host, presents
+    /// the staged files for review, and either copies them to the
+    /// recorded workspace or deletes them. Without this command,
+    /// staging directories grow until disk fills.
+    Fs {
+        #[command(subcommand)]
+        action: FsAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum FsAction {
+    /// Review and drain `data/sandbox-staging/*/` directories.
+    ///
+    ///   gvm fs approve                # interactive prompt per file
+    ///   gvm fs approve --accept-all   # CI: copy everything to workspace
+    ///   gvm fs approve --reject-all   # CI: delete everything (disk-leak gc)
+    ///   gvm fs approve --list         # show pending batches without acting
+    Approve {
+        /// Path to the sandbox staging root (default: data/sandbox-staging).
+        #[arg(long, default_value = "data/sandbox-staging")]
+        staging_root: String,
+
+        /// Accept every pending file in every batch (no prompt).
+        #[arg(long, conflicts_with_all = ["reject_all", "list"])]
+        accept_all: bool,
+
+        /// Reject (delete) every pending file in every batch (no prompt).
+        /// Use this as the disk-leak garbage collector in cron.
+        #[arg(long, conflicts_with_all = ["accept_all", "list"])]
+        reject_all: bool,
+
+        /// List pending batches without modifying anything.
+        #[arg(long, conflicts_with_all = ["accept_all", "reject_all"])]
+        list: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -747,6 +791,26 @@ async fn main() -> anyhow::Result<()> {
         Commands::Stop {} => {
             run_stop()?;
         }
+
+        Commands::Fs { action } => match action {
+            FsAction::Approve {
+                staging_root,
+                accept_all,
+                reject_all,
+                list,
+            } => {
+                let mode = if list {
+                    fs_approve::Mode::List
+                } else if accept_all {
+                    fs_approve::Mode::AcceptAll
+                } else if reject_all {
+                    fs_approve::Mode::RejectAll
+                } else {
+                    fs_approve::Mode::Interactive
+                };
+                fs_approve::run(std::path::Path::new(&staging_root), mode)?;
+            }
+        },
     }
 
     Ok(())

@@ -143,6 +143,7 @@ fn print_active_sandboxes() {
         veth: String,
         host_ip: String,
         created: String,
+        tmux_session: Option<String>,
     }
 
     let mut active: Vec<SandboxRow> = Vec::new();
@@ -166,8 +167,14 @@ fn print_active_sandboxes() {
             veth: state["veth_host"].as_str().unwrap_or("?").to_string(),
             host_ip: state["host_ip"].as_str().unwrap_or("?").to_string(),
             created: state["created_at"].as_str().unwrap_or("?").to_string(),
+            tmux_session: state["tmux_session"].as_str().map(|s| s.to_string()),
         };
         // Liveness check: kill(pid, 0) returns 0 if alive (no signal sent).
+        // Note: this is intentionally weaker than the cleanup-time check in
+        // `gvm-sandbox::network::is_pid_alive_with_starttime`. Status is a
+        // read-only display; on a false positive we just show "active" for
+        // a fraction of a second longer, which is harmless. The authoritative
+        // check runs inside `gvm cleanup`.
         let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
         if alive {
             active.push(row);
@@ -182,30 +189,71 @@ fn print_active_sandboxes() {
         eprintln!();
         active.sort_by_key(|r| r.pid);
         for r in &active {
+            // Build the optional " [tmux: name]" suffix without an extra
+            // line — keeps the table compact for the common single-row case.
+            let tmux_suffix = match &r.tmux_session {
+                Some(s) => format!("  {DIM}[tmux: {}]{RESET}", short_tmux_label(s)),
+                None => String::new(),
+            };
             eprintln!(
-                "  {DIM}PID {}{RESET}  {CYAN}{}{RESET}  {DIM}{}/30{RESET}  {DIM}started {}{RESET}",
-                r.pid, r.veth, r.host_ip, r.created
+                "  {DIM}PID {}{RESET}  {CYAN}{}{RESET}  {DIM}{}/30{RESET}  {DIM}started {}{RESET}{}",
+                r.pid, r.veth, r.host_ip, r.created, tmux_suffix
             );
         }
     }
 
     if !orphaned.is_empty() {
+        // P3: loud, unmissable warning. Three lines of red so the user can't
+        // skim past it. Includes the actionable command at the bottom of the
+        // block, not after the host-IP table, so it stays on screen even with
+        // many orphans.
         eprintln!();
-        eprintln!("  {YELLOW}Orphan Sandboxes:{RESET} {}", orphaned.len());
+        eprintln!(
+            "  {RED}{BOLD}\u{26a0} {} orphaned sandbox(es) detected{RESET}",
+            orphaned.len()
+        );
+        eprintln!(
+            "  {RED}  PID is gone but kernel resources (veth, iptables, mounts, cgroup) are still held.{RESET}"
+        );
+        eprintln!("  {RED}  Run: {BOLD}sudo gvm cleanup{RESET}{RED} to release them.{RESET}");
         eprintln!();
         orphaned.sort_by_key(|r| r.pid);
         for r in &orphaned {
+            let tmux_suffix = match &r.tmux_session {
+                Some(s) => format!("  {DIM}[tmux: {}]{RESET}", short_tmux_label(s)),
+                None => String::new(),
+            };
             eprintln!(
-                "  {DIM}PID {} (dead){RESET}  {CYAN}{}{RESET}  {DIM}cleanup needed{RESET}",
-                r.pid, r.veth
+                "  {DIM}PID {} (dead){RESET}  {CYAN}{}{RESET}  {DIM}cleanup needed{RESET}{}",
+                r.pid, r.veth, tmux_suffix
             );
         }
-        eprintln!("    Run: {BOLD}gvm cleanup{RESET}");
     }
 
     if active.is_empty() && orphaned.is_empty() {
         eprintln!();
         eprintln!("  {DIM}Active Sandboxes: 0{RESET}");
+    }
+}
+
+/// Shorten a `$TMUX` value (`/tmp/tmux-1000/default,12345,0`) to a
+/// human-friendly label. We display the trailing session id when present,
+/// falling back to the basename of the socket path. Pure formatting —
+/// no security relevance.
+#[cfg(target_os = "linux")]
+fn short_tmux_label(raw: &str) -> String {
+    // Format: <socket-path>,<server-pid>,<session-id>
+    let parts: Vec<&str> = raw.split(',').collect();
+    if parts.len() == 3 {
+        format!("session {}", parts[2])
+    } else if let Some(socket) = parts.first() {
+        std::path::Path::new(socket)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(raw)
+            .to_string()
+    } else {
+        raw.to_string()
     }
 }
 

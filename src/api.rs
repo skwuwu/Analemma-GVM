@@ -1120,12 +1120,37 @@ pub async fn approve_request(
     match state.pending_approvals.remove(&event_id) {
         Some((_, pending)) => {
             let decision_str = if approved { "approved" } else { "denied" };
+
+            // Deliver decision via oneshot channel. If `send` returns an
+            // error, the receiver has been dropped — almost always
+            // because the agent disconnected (HTTP client timed out,
+            // TCP closed) and hyper cancelled the proxy handler future
+            // before the operator clicked approve. The proxy's
+            // `ApprovalGuard` should have caught this, but the entry
+            // can still be present briefly in a race window between
+            // hyper drop and the guard running. Either way, the
+            // operator's decision can no longer be honored — surface a
+            // distinct 410 Gone with a clear reason instead of OK so
+            // `gvm approve` can tell the operator the truth.
+            if pending.sender.send(approved).is_err() {
+                tracing::warn!(
+                    event_id = %event_id,
+                    "IC-3: approval arrived after agent disconnected — \
+                     decision not deliverable"
+                );
+                return json_response(
+                    StatusCode::GONE,
+                    &serde_json::json!({
+                        "error": "agent_disconnected",
+                        "event_id": event_id,
+                        "reason": "Agent's HTTP client closed the connection \
+                                   before the approval was delivered. The \
+                                   request is gone; no upstream call was made.",
+                    }),
+                );
+            }
+
             tracing::info!(event_id = %event_id, decision = %decision_str, "IC-3: Approval decision delivered");
-
-            // Deliver decision via oneshot channel. If receiver was dropped
-            // (proxy handler timed out), the send will fail — that's OK.
-            let _ = pending.sender.send(approved);
-
             json_response(
                 StatusCode::OK,
                 &serde_json::json!({

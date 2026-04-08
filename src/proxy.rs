@@ -36,6 +36,66 @@ pub struct PendingApproval {
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
+/// RAII guard that removes a pending IC-3 approval entry from the
+/// shared map when the proxy handler future is dropped.
+///
+/// **Why this exists**: hyper cancels in-flight handler futures when
+/// the agent disconnects (HTTP client timeout, Ctrl-C in the agent,
+/// closed TCP). When that happens mid-`tokio::time::timeout(rx)` the
+/// `rx` is dropped, but the matching `tx` was already moved into the
+/// `pending_approvals` DashMap and would otherwise sit there until
+/// the much-longer proxy IC-3 timeout (default 5 min) elapsed.
+///
+/// During that window, `gvm approve` would list the entry as if it
+/// were live, and the operator's `(y)es` would deliver to a closed
+/// receiver — the operator sees "Approved" but nothing happens. The
+/// guard closes the race by removing the entry the moment the
+/// handler is cancelled.
+///
+/// On the happy path the guard is `disarm()`'d before the function
+/// returns, so the entry is consumed by `pending_approvals.remove()`
+/// in the API handler, not by us.
+struct ApprovalGuard {
+    event_id: String,
+    map: Arc<dashmap::DashMap<String, PendingApproval>>,
+    armed: bool,
+}
+
+impl ApprovalGuard {
+    /// Create a guard that will remove `event_id` from `map` on drop
+    /// unless `disarm()` is called first.
+    fn new(event_id: String, map: Arc<dashmap::DashMap<String, PendingApproval>>) -> Self {
+        Self {
+            event_id,
+            map,
+            armed: true,
+        }
+    }
+
+    /// Mark the guard as no longer responsible for cleanup. Call this
+    /// once the approval flow has consumed the entry through normal
+    /// channels (operator decision, IC-3 timeout) so the guard does
+    /// not double-remove on drop.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ApprovalGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.map.remove(&self.event_id).is_some() {
+            tracing::debug!(
+                event_id = %self.event_id,
+                "IC-3: pending approval removed by guard (handler cancelled \
+                 — agent disconnected before approval arrived)"
+            );
+        }
+    }
+}
+
 // ─── Circuit Breaker Configuration ───
 
 /// Number of consecutive primary WAL failures before the circuit breaker opens.
@@ -695,19 +755,42 @@ pub async fn proxy_handler(
                 },
             );
 
+            // Arm a Drop-guard against agent disconnect. If hyper cancels
+            // this handler future (agent's HTTP client timed out, TCP
+            // closed, etc.), the guard removes our entry from
+            // `pending_approvals` so the operator's next `gvm approve`
+            // does not see a ghost request that can never be delivered.
+            // We disarm the guard on every normal exit (decision arrived,
+            // timeout fired, sender dropped) so the API handler can
+            // consume the entry through `remove()` without a double-pop.
+            let guard = ApprovalGuard::new(event_id.clone(), state.pending_approvals.clone());
+
             // Wait for approval decision or timeout
             let timeout_duration = std::time::Duration::from_secs(state.ic3_approval_timeout_secs);
             let approved = match tokio::time::timeout(timeout_duration, rx).await {
-                Ok(Ok(decision)) => decision,
+                Ok(Ok(decision)) => {
+                    // Operator delivered a decision via /gvm/approve. The
+                    // API handler already pop'd the entry, so we disarm
+                    // the guard to avoid a no-op double-remove warning.
+                    guard.disarm();
+                    decision
+                }
                 Ok(Err(_)) => {
-                    // Sender dropped (proxy shutting down) → deny
+                    // Sender dropped (proxy shutting down or some other
+                    // unexpected map clear). The entry is already gone;
+                    // disarm to avoid logging a misleading "cancelled"
+                    // message on shutdown.
                     tracing::warn!(event_id = %event_id, "IC-3: Approval channel closed — auto-denied");
+                    guard.disarm();
                     false
                 }
                 Err(_) => {
-                    // Timeout → auto-deny (fail-close)
+                    // IC-3 timeout fired before any decision → fail-close.
+                    // We pop the entry ourselves and disarm so the guard
+                    // does not log a stale "cancellation" reason.
                     tracing::warn!(event_id = %event_id, "IC-3: Approval timeout — auto-denied");
                     state.pending_approvals.remove(&event_id);
+                    guard.disarm();
                     false
                 }
             };
@@ -2117,6 +2200,87 @@ mod tests {
         assert!(
             trace.truncated,
             "bounded capture should mark large SSE trace as truncated"
+        );
+    }
+
+    // ─── ApprovalGuard regression tests ───
+    //
+    // These are pure logic tests that do not need a full proxy stack.
+    // They lock in two invariants:
+    //   1. When the IC-3 handler future is cancelled (rx dropped), the
+    //      guard removes its entry from `pending_approvals`. This is
+    //      the fix for the agent-disconnect ghost-approval bug.
+    //   2. When the handler completes normally and `disarm()` is
+    //      called, the guard does NOT remove a (possibly already
+    //      reused) map entry. This locks in the no-double-pop
+    //      contract that lets api.rs own the consumption side.
+
+    fn make_pending(event_id: &str) -> (PendingApproval, tokio::sync::oneshot::Receiver<bool>) {
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        let pending = PendingApproval {
+            sender: tx,
+            event_id: event_id.to_string(),
+            operation: "test.op".to_string(),
+            host: "example.com".to_string(),
+            path: "/x".to_string(),
+            method: "POST".to_string(),
+            agent_id: "test-agent".to_string(),
+            timestamp: chrono::Utc::now(),
+        };
+        (pending, rx)
+    }
+
+    #[test]
+    fn approval_guard_removes_entry_on_drop_when_armed() {
+        let map: Arc<dashmap::DashMap<String, PendingApproval>> = Arc::new(dashmap::DashMap::new());
+        let event_id = "evt-cancel-1".to_string();
+        let (pending, _rx) = make_pending(&event_id);
+        map.insert(event_id.clone(), pending);
+
+        {
+            let _guard = ApprovalGuard::new(event_id.clone(), map.clone());
+            assert_eq!(map.len(), 1, "entry must be present while guard is armed");
+            // Simulate hyper cancelling the handler future: guard goes
+            // out of scope without disarm().
+        }
+
+        assert_eq!(
+            map.len(),
+            0,
+            "guard drop must remove the leaked pending approval entry"
+        );
+    }
+
+    #[test]
+    fn approval_guard_keeps_entry_when_disarmed() {
+        // When the operator delivers a decision, api.rs pops the entry
+        // via `pending_approvals.remove(&event_id)`. The proxy's
+        // approval-handler future then disarms the guard before exit.
+        // The guard must NOT remove an entry that has been re-inserted
+        // for an unrelated event with the same id (shouldn't happen,
+        // but the contract is "disarm == hands off").
+        let map: Arc<dashmap::DashMap<String, PendingApproval>> = Arc::new(dashmap::DashMap::new());
+        let event_id = "evt-normal-1".to_string();
+        let (pending, _rx) = make_pending(&event_id);
+        map.insert(event_id.clone(), pending);
+
+        let guard = ApprovalGuard::new(event_id.clone(), map.clone());
+        // Simulate api.rs popping the entry through the normal channel.
+        let _popped = map.remove(&event_id);
+        // And then proxy.rs disarming because the decision was delivered.
+        // `disarm()` consumes the guard by value: armed flag is cleared
+        // and Drop runs immediately as the binding goes out of scope.
+        guard.disarm();
+
+        // Re-insert a fresh entry for the same id. The disarmed guard
+        // is already gone (consumed by disarm above), so the freshly
+        // inserted entry is owned solely by `map`.
+        let (pending2, _rx2) = make_pending(&event_id);
+        map.insert(event_id.clone(), pending2);
+        assert_eq!(
+            map.len(),
+            1,
+            "disarmed guard must not interfere with subsequent inserts"
         );
     }
 }

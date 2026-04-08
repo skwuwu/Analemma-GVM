@@ -55,6 +55,158 @@ v0.2 shipped: Shadow Mode + intent store, CONNECT tunnel, SRR hot-reload, eBPF u
 
 ## Implementation Log
 
+### 2026-04-08: IC-3 ghost-approval fix — RAII guard + 410 Gone
+
+**Problem (the deferred "Question C")**: When an SRR rule held an HTTP request via `RequireApproval`, the proxy inserted a `PendingApproval { sender: tx, ... }` into a shared `DashMap` and `await`'d the matching `rx` inside the axum handler future. If the agent's HTTP client timed out first, hyper cancelled the proxy handler future, dropping the `rx` — but the `tx` lived on inside `pending_approvals` until the much-longer proxy IC-3 timeout (default 5 min) elapsed. During that window:
+
+1. **`gvm approve` showed a ghost.** The leaked entry kept appearing in `GET /gvm/pending` and looked indistinguishable from a live request.
+2. **The operator's "approve" succeeded silently.** `api.rs` did `let _ = pending.sender.send(approved)` — when the receiver was dropped, send returned `Err(...)` but the leading `_` discarded it. The CLI received `200 OK` and printed `✓ Approved`, but no upstream call was made because the agent had already given up. The audit trail showed the event stuck in `Pending` state forever.
+
+This is the worst kind of governance bug: the operator believes they made a security-relevant decision and the system pretends it complied, but nothing actually happened. A wire-transfer "approve" that the agent never sees.
+
+**Fix**:
+
+**1. RAII guard in `src/proxy.rs`.** New `ApprovalGuard { event_id, map, armed }` struct with a `Drop` impl that calls `pending_approvals.remove(&event_id)` when `armed`. The IC-3 hold path constructs the guard immediately after inserting the pending entry. On every normal exit (decision delivered, IC-3 timeout fired, sender dropped on shutdown) the function calls `guard.disarm()` so the guard's Drop becomes a no-op and the entry is consumed by whoever owns it (api.rs for delivered decisions, the timeout branch for fail-close, etc.). On the abnormal exit — hyper cancelling the handler because the agent disconnected — the function never reaches the disarm; the future is dropped, the guard's Drop runs, and the leaked entry is removed within microseconds.
+
+**2. `410 Gone` in `src/api.rs`.** `pending_approvals_decision()` now checks the result of `pending.sender.send(approved)`. If it returns `Err`, the receiver is gone and the operator's decision cannot be honored. The handler returns `410 Gone` with `error: "agent_disconnected"` and a clear `reason` string instead of `200 OK`. The race between the guard's Drop and a fast `gvm approve` POST is the only window where this branch fires (the guard normally removes the entry first), but it's the safety net that catches the case where the operator's HTTP request crossed the cancellation in flight.
+
+**3. CLI surfaces the new outcomes.** `crates/gvm-cli/src/approve.rs` introduces `enum DecisionOutcome { Delivered, AgentGone, Unknown, Error(String) }` and a new `render_outcome()` helper. `--auto-deny` and the interactive prompt both go through it. Output now reads:
+   - `✓ Approved — request forwarded to upstream` (200)
+   - `✗ Denied — 403 returned to agent` (200, deny)
+   - `⚠  Agent already disconnected` + a two-line explanation that the operator's click had no effect (410)
+   - `— <event_id> already drained (timeout or another approver got there first)` (404, soft, not an error)
+   - `Failed to send decision: ...` (network/other)
+
+**4. Unit tests in `src/proxy.rs::tests`.** Two pure tests, no full proxy stack needed:
+   - `approval_guard_removes_entry_on_drop_when_armed` — inserts a synthetic pending entry, scopes a guard, lets it fall out of scope without disarming, asserts the map is empty. This is the cancellation path.
+   - `approval_guard_keeps_entry_when_disarmed` — pops the entry through the normal channel, calls `disarm()`, re-inserts a fresh entry with the same id, asserts the map still contains it. This locks in the no-double-pop contract that lets api.rs own the consumption side without race-pop'ing the guard's entry.
+
+**5. ec2-e2e Test 80 — real fs-governance round-trip (8 sub-tests)**. Spawns `sudo gvm run --sandbox --fs-governance` against a Python agent that creates one auto-merge file (`*.csv`), two manual-commit files (`*.py`, `*.json`), and one discard file (`*.log`). Asserts:
+   - 80a: a staging dir with `manifest.json` was produced.
+   - 80b: the manifest lists the manual-commit files but **not** the auto-merge or discard files. Catches any future regression where bucket classification leaks into the operator-review queue.
+   - 80c: `gvm fs approve --list` sees the batch (read-only path).
+   - 80d: per-file interactive `(a)ccept`/`(r)eject` through a faked PTY (`script(1)` from util-linux). Feeds `a\nr\n` so config.json is committed and install.py is rejected. Asserts the workspace contains the accepted file and **not** the rejected one — proves the per-file remove fix from the previous CHANGELOG entry holds end-to-end.
+   - 80e: after every entry is decided, the staging dir is cleaned up (the all-decided cleanup branch).
+   - 80f: re-running on an empty staging root is idempotent.
+   - Skips cleanly if `script(1)` is unavailable, no sudo, or no python3.
+
+**6. ec2-e2e Test 81 — IC-3 ghost-approval guard regression (3 sub-tests)**. The C-fix's main load-bearing assertion. Installs an SRR rule that triggers `RequireApproval` for `ghostcheck.test.gvm` (a synthetic host wired into `host_overrides` at script setup). Spawns a Python agent with a 3-second HTTP timeout, then:
+   - 81a: while the agent is still waiting, `/gvm/pending` must show the held entry. Polls up to 2 seconds — if the entry never appears, the IC-3 path was never reached and the test fails loudly.
+   - 81b: after the agent's HTTP timeout fires + a 1s grace window for hyper to cancel the handler future and the guard's `Drop` to run, `/gvm/pending` MUST no longer contain the entry. **This is the regression assertion for `ApprovalGuard`** — without the guard the entry would persist for `ic3_approval_timeout_secs` (default 5 minutes) and the test would fail.
+   - 81c: as a sanity check, `POST /gvm/approve` for an unknown event id returns 404 (confirming the entry was actually removed, not just hidden from `/gvm/pending`).
+
+The 410 Gone path is not tested via shell (it requires racing the operator's POST against hyper's cancellation in a window of microseconds, which is non-deterministic from a script). The unit test in `src/proxy.rs::tests` covers the guard semantics; the 410 branch is reachable code that triggers only on the brief window between hyper-cancel and guard-Drop.
+
+**Why no flock or extra channel**: The Drop guard is the canonical Rust idiom for tying resource lifetime to a future. Adding any kind of explicit cancellation token would require threading the token through every hold-path branch, and any channel-based notification would itself have to handle the cancellation race we just fixed. The guard is ~30 lines and runs zero cost on the happy path (one boolean check in disarm, no syscalls).
+
+**What this does NOT fix**: The audit trail still records the original event as `Pending` because the proxy never reaches the WAL update branch when its handler is cancelled. A separate piece of work could add a `Cancelled` `EventStatus` variant and write it from the guard's Drop — out of scope for this PR because it touches `gvm-types::EventStatus` and the WAL schema.
+
+Files: `src/proxy.rs`, `src/api.rs`, `crates/gvm-cli/src/approve.rs` | Risk: Low-medium. Changes are localized to the IC-3 hold path. The guard's only side effect is `DashMap::remove`, which is the same call the timeout branch already makes. The 410 Gone branch is reachable only when `tx.send` fails, which previously was silently ignored — no path that worked before is now broken. CLI output strings change but no machine-parsed format does.
+
+### 2026-04-08: `gvm fs approve` race-aware accept + partial-accept fix
+
+**Two follow-up bugs found in the just-shipped `gvm fs approve`**:
+
+**B (real bug — partial accept double-prompts)**: `interactive_batch` and `pipeline.rs::print_fs_diff_report`'s inline review both *copied* the staged file to the workspace on `(a)ccept` but never *removed* it from staging. A user who accepted 3 of 5 files and then hit `s` (skip rest) left all 3 already-merged files behind in the staging dir + manifest. The next `gvm fs approve` re-prompted the same 3 files and re-copied them — wasted operator time + a confusing audit trail. The `(r)eject` branch already removed the staged file, so this was a copy-paste asymmetry, not a design choice.
+
+**A (race + UX gap — operator vs cron GC)**: nothing serialised `gvm fs approve` against `gvm fs approve --reject-all` running in cron. If the GC ran while an operator was reviewing, the staged file could vanish mid-loop and `fs::copy` returned a generic `No such file or directory (os error 2)`. The operator could not tell whether they had a permission problem, a corrupt batch, or a concurrent reject.
+
+**Fix**:
+1. **Per-file remove on accept**. Both `accept_batch()` and `interactive_batch()` (in `fs_approve.rs`) and the inline review in `pipeline.rs::print_fs_diff_report()` now `remove_file(&staged)` immediately after a successful `copy(&staged, &dst)`. Symmetric with the `reject` branch.
+2. **Pre-check + race-aware error message**. Before each copy, both code paths check `staged.exists()`. If the file is already gone (previous accept, concurrent reject, manual cleanup), the entry is skipped with a `(staged file already gone — already processed or concurrent --reject-all)` message. If the file passes the check but `copy` then fails with `ErrorKind::NotFound`, the error is reported as `(vanished mid-copy — concurrent gvm fs approve --reject-all or cron GC?)` instead of the bare OS error.
+3. **No flock**. We deliberately did not add a per-batch lockfile. Both `--accept-all` and `--reject-all` are idempotent under this fix, and cron GC running while an operator reviews is benign — at worst the operator sees the new race-aware warning and re-runs. Adding a flock would block cron behind an inattentive operator, which is the worse failure mode.
+
+**Tests**: `Test 79` grows two sub-tests:
+- **79i** — partial-accept regression guard: feed a 2-file batch, run `--accept-all`, assert that **both** the workspace contains the files **and** the staged sources are gone. Catches any future copy-paste regression of the remove-after-copy invariant.
+- **79j** — race simulation: manifest lists two files but only one exists on disk (staging the cron-GC scenario without actually running cron). Asserts the surviving file still gets copied AND the missing file produces the new race-aware message — not a generic OS error.
+
+**Known issue (deferred — Question C)**: HTTP IC-3 hold has its own race. When the agent's HTTP client times out before `gvm approve` arrives, hyper cancels the proxy-handler future, dropping the oneshot `rx` — but the matching `tx` remains live inside `pending_approvals`. The entry stays in the map for up to `ic3_approval_timeout_secs` (5 min default). During that window, `gvm approve` lists the entry as if it were live, and approving it succeeds at the API layer (`pending.sender.send(approved)` ignores the error from a dropped receiver) → operator sees `✓ Approved`, but nothing actually happened — the agent already gave up. Audit trail is left in `Pending` state.
+
+This needs a fix in `src/proxy.rs` (hold the `pending_approvals` entry behind a Drop guard so cancellation removes it) plus `src/api.rs` (return a different status to `gvm approve` when `send` fails). Both files are sensitive — proxy.rs is the 2K-LOC handler. **Not in this PR**. Tracked here so the next session knows to fix it.
+
+Files: `crates/gvm-cli/src/{fs_approve,pipeline}.rs`, `scripts/ec2-e2e-test.sh` | Risk: Low. The new pre-check is read-only; the new remove is conditional on successful copy; both are additive over the prior behavior.
+
+### 2026-04-08: `gvm fs approve` (filesystem disk-leak fix) + collapse IC-3 to one channel
+
+**Problem (P0)**: `gvm run --sandbox --fs-governance` writes overlayfs `manual_commit` files into `data/sandbox-staging/<pid>/` for human review. The TTY path drained the directory inline, but every non-TTY exit (CI, redirect, `nohup`, systemd unit, agent crash, `Ctrl-C` mid-prompt with `s` skip-rest) left the staging dir on disk forever. There was no command to drain it. Disk grew until the host filled — and unlike the HTTP IC-3 queue, FS staging has no timeout that eventually frees the space. The user-guide even referenced `gvm fs approve` as the recovery command, but that command did not exist.
+
+**Problem (UX)**: `gvm run` spawned a background poller (`approve::poll_and_prompt_background`) that interleaved IC-3 approval prompts with the agent's stdout in the same terminal. It fought for `stdin` against the running agent, dropped lines on `stderr` non-deterministically, and racefully overlapped with anyone running `gvm approve` in a second terminal. The right model is one channel.
+
+**Fix**:
+
+**1. Manifest sidecar.** `pipeline.rs::print_fs_diff_report()` now writes `data/sandbox-staging/<pid>/manifest.json` *before* entering the interactive review branch. The manifest is v1 and records the workspace destination (which only the CLI knows — staging is keyed by PID), the agent ID, the creation timestamp, and per-file `path`/`size`/`kind`/`matched_pattern`. Written unconditionally so even a TTY user who hits `s` (skip rest) leaves the manifest behind for later drain.
+
+**2. Drain criterion.** Inline interactive review only deletes the staging directory when `accepted + rejected == needs_review.len()`. Skipped batches stay on disk + the manifest, and the user is told `Drain later with: gvm fs approve`.
+
+**3. New `gvm fs approve` subcommand.** Lives in `crates/gvm-cli/src/fs_approve.rs`. Walks `--staging-root` (default `data/sandbox-staging`), loads each `<pid>/manifest.json`, and applies one of four modes:
+   - `--list` — print pending batches, modify nothing. Read-only inspection.
+   - `(default)` interactive — TTY prompt per file with the same `(a)/(r)/(s)` UX as inline review. Bails out if no TTY (instead of silently skipping).
+   - `--accept-all` — copy every staged file to its recorded workspace destination, then delete the staging dir. CI-friendly.
+   - `--reject-all` — delete every staging directory without copying. The disk-leak garbage collector — wire into cron on hosts running untrusted agents.
+   - All modes are idempotent; corrupt manifests log a warning and skip rather than crash; missing/empty staging root exits 0 cleanly.
+
+**4. Collapse to one IC-3 channel.** Removed `approve::poll_and_prompt_background()` and the spawn of it from `BackgroundTasks`. `gvm run` no longer interleaves approval prompts with agent stdout. The single supported channel is now `gvm approve` in a separate terminal (or `--auto-deny` in CI). `BackgroundTasks` still spawns the proxy watchdog — that part is unchanged.
+
+**Tests**: New `Test 79` in `scripts/ec2-e2e-test.sh` (8 sub-tests) — synthesizes a fake batch in a tempdir + manifest, then exercises `--list` (read-only), `--accept-all` (copy + cleanup), `--reject-all` (delete without copy — security-relevant: catches a regression that copies a rejected file), empty staging root (clean exit), missing staging root (clean exit), and corrupt manifest (skip with warning, no crash). No real sandbox needed — the test isolates the CLI walk + apply behavior.
+
+**Docs**: `docs/user-guide.md` Filesystem Governance section rewritten with the four-mode workflow. The `gvm approve` section gains a "why a separate terminal" note explaining the channel collapse. CLI Reference table grows the `gvm fs approve` row.
+
+Files: `crates/gvm-cli/src/{main,pipeline,approve,fs_approve}.rs` (new file: `fs_approve.rs`), `scripts/ec2-e2e-test.sh`, `docs/user-guide.md` | Risk: Low. The new manifest is additive (older sandbox builds simply won't have one, and `gvm fs approve` skips them with a visible warning). Removing the inline poller is a behavior change, but the replacement (`gvm approve`) was already implemented and tested — the only thing that disappears is the foot-gun. Existing CI that depended on inline prompts (none known) should switch to `gvm approve --auto-deny`.
+
+### 2026-04-08: tmux observability + loud orphan warning + systemd packaging (P2 + P3 + D)
+
+**Problem**: After the P1 PID-reuse fix, sandbox cleanup is correct under all known races, but there were still three operational gaps:
+1. **No way to find which tmux session owned a leaked sandbox.** Operators running multiple `tmux` panes had to manually correlate `gvm status` PIDs against tmux server output.
+2. **`gvm status` orphan output was muted yellow.** Easy to skim past, especially in long status dumps. The cleanup hint was at the bottom of the table — out of sight if there were many orphans.
+3. **No supported way to run `gvm run --sandbox` as a real production daemon.** SSH disconnect resilience required tmux; host reboot resilience and crash auto-restart had no answer at all.
+
+**Fix (three independent pieces, one PR)**:
+
+**P2 — tmux session in state file + status display**
+- `SandboxState` gains `tmux_session: Option<String>` (still v3 schema, additive `#[serde(default)]`).
+- `record_sandbox_state()` reads `$TMUX` (the canonical tmux session env var) and stores it raw. Empty/absent → `None`.
+- `gvm status` reads the field and renders a `[tmux: session 42]` suffix on each sandbox row. New helper `short_tmux_label()` parses the `socket,server-pid,session-id` triple into a friendly form, with a basename fallback for non-standard formats.
+- Pure observability: cleanup is still PID-based, this field never affects correctness.
+
+**P3 — Loud orphan warning in `gvm status`**
+- Three lines of bold red at the top of the orphan section, listing the count, what kind of resources are leaked (veth, iptables, mounts, cgroup), and the exact command to run (`sudo gvm cleanup`). The actionable command is *above* the orphan table so it stays on screen even with many orphans.
+- Added a comment clarifying that the status-time liveness check (`kill(pid, 0)`) is intentionally weaker than the cleanup-time `is_pid_alive_with_starttime` — status is read-only and a false positive is harmless, the authoritative check is in `gvm cleanup`.
+
+**D — systemd packaging**
+- New `packaging/systemd/` directory with three files. Zero code changes; pure packaging.
+- `gvm-cleanup.service` — oneshot, ordered `After=network-pre.target Before=network.target`. Runs `gvm cleanup` at boot to release any sandbox state left behind by a sandbox that crashed before reboot. `RemainAfterExit=yes` so the success state persists.
+- `gvm-sandbox@.service` — template (`%i` = agent name), `Type=simple` so systemd treats `gvm run --sandbox` as the unit lifecycle directly. Pulls in `gvm-cleanup.service` via `Requires=`. Layers a second `ExecStartPre=gvm cleanup` for defense in depth. `KillMode=mixed` + `TimeoutStopSec=30` so the agent gets a graceful SIGTERM window before SIGKILL. `ExecStopPost=gvm cleanup` is the safety net for the SIGKILL case. `Restart=on-failure` with `StartLimitBurst=3/min` to avoid wedge loops.
+- `packaging/systemd/README.md` — install/uninstall, lifecycle diagram, drop-in override pattern, and a tmux-vs-systemd decision table making it explicit which mode to use for which use case.
+
+**Test infra (`scripts/ec2-e2e-test.sh`)**
+
+Two new tests integrated into the existing `should_run N` framework:
+
+- **Test 77 — orphan warning visibility (4 sub-tests)**: synthesizes a v3 `SandboxState` JSON with `pid=999999` (guaranteed dead — above `pid_max` on every distro), runs `gvm status`, and asserts the warning header, the cleanup hint, the PID listing, and the tmux label all render. Then runs `gvm cleanup` and verifies the synthetic state file is removed. Pure CLI test, no real sandbox needed.
+- **Test 78 — systemd unit integration (6 sub-tests)**: installs the unit files into `/etc/systemd/system`, patching `/usr/local/bin/gvm` to the actual binary path used by the rest of the script. Runs `gvm-cleanup.service` and asserts `Result=success`. Drops a no-op agent script into `/etc/gvm/agents/`, starts `gvm-sandbox@e2e-systemd-test.service`, waits for it to come up, asserts `ActiveState=active`, then asserts agent stdout reaches journald and `gvm status` lists the sandbox. After the agent exits, verifies `ExecStopPost=gvm cleanup` released `/run/gvm` state. Finally drops a deliberately failing agent script and asserts `NRestarts >= 1` to prove `Restart=on-failure` engages. Cleans up its own units, agent files, and host kernel state at the end.
+
+Both tests gate on `should_run`, `command -v systemctl`, passwordless sudo, and `$GVM_BIN` existence — they skip cleanly on environments that lack any prerequisite, just like every other Test in this script.
+
+**Why this matters**: tmux is now the right answer for *interactive* work and systemd is the right answer for *production*. Both modes use the exact same `gvm` binary and the same orphan-detection state file, so an operator can mix them on the same host without surprises. P2 and P3 close the observability loop on either side; D gives operators a tested, packaged path to actually run agents in production without writing their own systemd units from scratch.
+
+Files: `crates/gvm-sandbox/src/network.rs`, `crates/gvm-cli/src/status.rs`, `packaging/systemd/{gvm-cleanup.service,gvm-sandbox@.service,README.md}`, `scripts/ec2-e2e-test.sh` | Risk: Low. State file additions are `#[serde(default)]` (no schema break). `gvm status` changes are output-only — no behavioral change to cleanup. The systemd units are new files that nothing in the build pipeline references, so they cannot affect existing builds; they only activate when an operator manually `systemctl enable`s them.
+
+### 2026-04-08: Defeat PID reuse races in sandbox orphan detection
+
+**Problem**: `is_pid_alive()` (`crates/gvm-sandbox/src/network.rs`) classified a PID as alive based on three checks: `kill(pid, 0)`, `/proc/PID/stat` zombie state, and a substring search for `"gvm"` in `/proc/PID/cmdline`. The substring check was the only PID-identity guard, and it is not actually one — the kernel is free to recycle a dead `gvm` PID to any unrelated process whose command line happens to contain `gvm` (`/usr/bin/gvm-helper`, `/opt/gvm-monitoring/agent`, etc.). When that happened, `cleanup_all_orphans_report()` would skip the orphaned veth/iptables/cgroup/mount resources indefinitely. Probability low, blast radius high (permanent host-state leak that survives reboots only because tmpfs is volatile).
+
+**Fix**: Use `/proc/PID/stat` field 22 (`starttime`, clock ticks since boot), which is monotonic per-process and resets only when the kernel hands the PID to a brand new process. The starttime is the canonical Linux PID-identity check.
+
+1. **State file schema bump**: `SandboxState` is now version 3 with two new optional fields, `pid_starttime` and `child_pid_starttime`. Both use `#[serde(default)]` so v1 and v2 state files written by older binaries continue to deserialize and are handled by the legacy fallback path.
+2. **Capture at launch**: `record_sandbox_state()` reads field 22 for both the parent (`std::process::id()`) and the child (`config.child_pid`) and stores it alongside the other resource manifest fields.
+3. **Verify at scan**: New `is_pid_alive_with_starttime(pid, expected)` function. When `expected` is `Some`, the current `/proc/PID/stat` starttime must match exactly — otherwise the PID has been recycled and the original is treated as dead so its leaked resources get cleaned up. The legacy `is_pid_alive(pid)` is kept as a thin wrapper passing `None`, so the four call sites that operate on PIDs without recorded state (post-cleanup safety sweeps, ad-hoc PID checks) keep their existing behavior.
+4. **Wire the orphan-scan caller**: `cleanup_all_orphans_report()` (both the `/run/gvm/` and the legacy `/tmp/` migration loop) now passes `state.pid_starttime` / `state.child_pid_starttime` to the new variant. v3 state files get the strict starttime guard; v1/v2 state files fall back to the previous cmdline-substring heuristic, so upgrading does not regress any existing orphan that the older binary would have handled.
+5. **Pure parser + tests**: Field-22 parsing is split into `parse_proc_stat_starttime(&str)` and unit-tested for the four real-world shapes that have historically broken hand-rolled `/proc/PID/stat` parsers: comm fields with spaces and embedded parentheses, truncated stat lines, missing `)`, and non-numeric field 22. All tests fail closed (return `None`), never panic.
+
+**What this does NOT fix**: tmux session tracking (P2) and `gvm status` auto-suggesting cleanup (P3) are deferred — the audit found those are observability/UX gaps, not correctness gaps. The core orphan-detection invariant ("if any of {parent, child} is gone, clean up") is now sound against PID reuse.
+
+Files: `crates/gvm-sandbox/src/network.rs` | Risk: Low. New fields are additive and `#[serde(default)]`. The new code path only runs when a v3 state file is read; v1/v2 files keep their previous behavior bit-for-bit. The substring-fallback branch is preserved for legacy file paths so this cannot make orphan detection *worse* on upgrade.
+
 ### 2026-04-08: Honest dependency story — README + preflight (ip6tables, distro hints, setcap)
 
 **Problem**: README claimed "single Rust binary with no dependency" — overstated. Reality:

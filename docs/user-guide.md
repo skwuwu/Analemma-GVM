@@ -19,6 +19,8 @@ Step 1 records every API call to the audit log (`data/wal.log`). Step 2 reads th
 
 That's the entire workflow. Everything below is optional — use it when you need it.
 
+> **First time on a fresh checkout?** Run `gvm init --industry saas` (or `--industry finance`) to drop a starter `config/` directory with sensible SRR rules, a `proxy.toml`, and an empty `secrets.toml`. Skip this if you already have a `config/` directory you want to keep.
+
 ---
 
 ## Level 1: Basic — Run and Watch
@@ -118,7 +120,7 @@ decision = { type = "Deny", reason = "Wire transfers blocked" }
 | `Allow` | Pass immediately |
 | `Delay { milliseconds: 300 }` | Pause then pass |
 | `Deny { reason: "..." }` | Block with 403 |
-| `RequireApproval` | Hold for human approval |
+| `RequireApproval` | Hold for human approval (clear the queue with `gvm approve`) |
 | `Throttle { max_per_minute: 10 }` | Rate limit |
 | `AuditOnly` | Pass but flag |
 
@@ -153,6 +155,22 @@ value = "SG.your_sendgrid_key"
 Existing agents with hardcoded keys work immediately — no code changes. When ready, move keys to `secrets.toml` for centralized management.
 
 > **Scope:** HTTP headers only. LLM SDKs require keys at initialization — use `ANTHROPIC_API_KEY` env var for that. Credential injection is for tool API calls (Stripe, Slack, GitHub, etc.).
+
+### `gvm approve` — Human-in-the-Loop Approvals
+
+When an SRR rule decides `RequireApproval`, the proxy holds the request and queues it on the admin port (`/gvm/pending`). The agent's HTTP call blocks until either (a) `gvm approve` delivers a decision or (b) `ic3_approval_timeout_secs` (default 5 min) elapses and the request is auto-denied with 503.
+
+**`gvm approve` is the only supported channel for human approval.** Run it in a separate terminal (or tmux pane, or systemd `Type=simple` service) from `gvm run`:
+
+```bash
+gvm approve                       # interactive prompt: y/n per pending request
+gvm approve --auto-deny           # CI-friendly: deny everything still pending
+gvm approve --admin http://127.0.0.1:9090   # custom admin port
+```
+
+The interactive prompt shows the agent ID, target host, method, and operation for each held request, then waits for `y`/`n`. Hit `Ctrl-C` to leave the rest of the queue alone — already-displayed decisions are still applied. Pair this with `RequireApproval` rules for high-risk endpoints (wire transfers, deletes, prod-only mutations).
+
+> **Why a separate terminal?** Earlier versions of `gvm run` interleaved approval prompts with the agent's stdout in the same terminal. That fought for stdin against the running agent and produced confusing output. The current design has one channel: `gvm approve` reads pending from the admin port and writes the decision back, regardless of where `gvm run` is running.
 
 ### `gvm check` — Dry-Run Policy Test
 
@@ -286,7 +304,25 @@ Agent file changes are classified at session end:
 | Modified file | (any) | Review prompt |
 | Deleted file | (any) | Review prompt |
 
-TTY: interactive accept/reject per file. CI/CD: staged for `gvm fs approve`.
+**TTY (interactive)**: at session end, GVM walks each `manual_commit` file and prompts `(a)ccept / (r)eject / (s)kip rest`. Accepted files are copied to the workspace; rejected files are deleted from staging; skipped files stay in `data/sandbox-staging/<pid>/` for later.
+
+**CI / non-TTY**: GVM prints the staging path and exits without a prompt. Drain it later with `gvm fs approve`:
+
+```bash
+# Inspect what's pending across all sandbox sessions on this host
+gvm fs approve --list
+
+# Interactive review (single TTY) — same prompt as inline review
+gvm fs approve
+
+# CI: copy every staged file to its recorded workspace, then clean up
+gvm fs approve --accept-all
+
+# Cron / disk-leak garbage collector: delete every staging dir
+gvm fs approve --reject-all
+```
+
+Each session writes a `manifest.json` sidecar in its staging dir recording the workspace destination, the agent ID, and per-file metadata, so `gvm fs approve` can drain batches even after the original sandbox process is gone. Without this command, staging directories grow indefinitely. Wire `gvm fs approve --reject-all` into a daily cron on hosts that run untrusted agents.
 
 ---
 
@@ -312,25 +348,38 @@ lsof -i :8080                    # Port conflict
 sudo gvm run --sandbox ...       # Sandbox needs sudo
 ```
 
+### Stopping the proxy
+
+`gvm run` launches the proxy as a background daemon (PID file at `data/proxy.pid`). To shut it down cleanly:
+
+```bash
+gvm stop                         # graceful shutdown + sandbox cleanup
+```
+
+`gvm stop` flushes the WAL, releases sandbox host state (veth, iptables, mounts, cgroups), and removes the PID file. Use this instead of `kill <pid>` so the audit trail closes properly. On systemd-managed hosts (see [Production deployment](#production-deployment-mode-systemd)) use `systemctl stop gvm-sandbox@<agent>` instead — systemd reads its own state, not `data/proxy.pid`.
+
 ---
 
 ## CLI Reference
 
 | Command | Purpose |
 |---------|---------|
+| `gvm init --industry <finance\|saas>` | Initialize a starter `config/` directory from a template |
 | `gvm run [--sandbox] [--] <cmd>` | Run agent with governance |
-| `gvm watch [--with-rules] [--] <cmd>` | Observe traffic |
+| `gvm watch [--with-rules] [--] <cmd>` | Observe traffic without enforcement |
 | `gvm run -i <cmd>` | Interactive rule suggestion |
 | `gvm check --host H --method M` | Dry-run policy test |
 | `gvm suggest --from F` | Generate rules from watch log |
+| `gvm approve [--auto-deny]` | Drain the `RequireApproval` queue (interactive or CI) |
 | `gvm events list` | Query audit trail |
 | `gvm audit verify` | Check WAL integrity |
 | `gvm stats tokens` | Token usage per agent |
-| `gvm status` | Show proxy health, SRR rules, WAL state |
+| `gvm status` | Show proxy health, SRR rules, WAL state, sandboxes |
 | `gvm reload` | Hot-reload SRR rules and policies |
 | `gvm preflight` | Check environment and available modes |
-| `gvm cleanup` | Remove orphaned sandbox resources |
-| `gvm init --industry I` | Initialize config templates |
+| `gvm cleanup [--dry-run]` | Remove orphaned sandbox resources (veth, iptables, mounts, cgroups) |
+| `gvm fs approve [--list\|--accept-all\|--reject-all]` | Drain pending overlayfs staging dirs (`--fs-governance`) |
+| `gvm stop` | Gracefully stop the proxy daemon and release sandbox state |
 
 Full flags: `gvm <command> --help`
 
@@ -338,24 +387,46 @@ Full flags: `gvm <command> --help`
 
 ## Running on a remote host (EC2, cloud VM, SSH)
 
-When you run `gvm run`, a stress test, or any multi-minute command
-against a remote host, **host it inside a `tmux` session**. SSH
-disconnects, terminal glitches, and laptop lid closures all race
-against `nohup`, and losing a long-running pipeline halfway through
-leaves kernel state behind (`tc netem` rules, `/run/gvm/` staging
-dirs, orphan `gvm-proxy` processes) that `gvm cleanup` has to sweep
-on the next invocation. `tmux` sidesteps the race entirely.
+Pick one of two modes depending on how long the agent needs to live:
+
+| Use case | Use this |
+|---|---|
+| Interactive debugging, short-lived runs, quick stress tests | **tmux** |
+| Long-running production agents, host reboot survival, auto-restart on crash | **systemd** (see [Production deployment](#production-deployment-mode-systemd)) |
+
+Both modes use the same `gvm` binary. `gvm status` records the tmux
+session name (when present) in the per-sandbox state file, so you
+can mix the two on one host without losing track of which session
+owns which sandbox.
+
+### tmux (interactive)
 
 ```bash
 ssh ec2-host
 tmux new -s gvm
 cd ~/Analemma-GVM
-sudo bash scripts/stress-test.sh --duration 60
+sudo gvm run --sandbox my_agent.py
 # Ctrl-b d to detach, re-attach later with: tmux attach -t gvm
 ```
 
-This is a recommendation for operators; the `gvm` CLI itself does
-not start or depend on tmux.
+SSH disconnects, terminal glitches, and laptop lid closures all race
+against `nohup`, and losing a long-running pipeline halfway through
+leaves kernel state behind (veth, iptables, mount points, cgroups)
+that `gvm cleanup` has to sweep on the next invocation. tmux
+sidesteps the race entirely. The `gvm` CLI itself does not start or
+depend on tmux — it just notices `$TMUX` and records it for
+observability.
+
+If a sandbox does end up orphaned (tmux killed mid-run, `gvm`
+segfault, etc.), `gvm status` will tell you loudly:
+
+```
+  ⚠ 1 orphaned sandbox(es) detected
+    PID is gone but kernel resources (veth, iptables, mounts, cgroup) are still held.
+    Run: sudo gvm cleanup to release them.
+
+  PID 12345 (dead)  veth-gvm-h-7  cleanup needed  [tmux: session 0]
+```
 
 ## Production Checklist
 
@@ -369,60 +440,128 @@ not start or depend on tmux.
 - [ ] Set up `gvm stats` + `gvm audit verify` in cron
 - [ ] Test with `gvm check` before deploying policy changes
 
-## Production deployment mode
+## Production deployment mode (systemd)
 
-`gvm run` already launches `gvm-proxy` as a background daemon
-(`setsid` + PID file + health check), so the short-term "run the
-proxy and let it survive terminal exit" story is covered. For
-a real production deployment you usually want one more layer:
-a service supervisor that restarts the proxy on crash, forwards
-its logs to the host's log aggregator, and boots it at system
-start. GVM does not ship its own service unit yet, but a minimal
-systemd drop-in is straightforward:
+GVM ships two systemd unit files in
+[`packaging/systemd/`](../packaging/systemd/) that turn `gvm run --sandbox`
+into a production-grade daemon. No code change is needed — they wrap
+the existing CLI directly.
 
-```ini
-# /etc/systemd/system/gvm-proxy.service
-[Unit]
-Description=Analemma GVM Proxy
-After=network-online.target
-Wants=network-online.target
+| File | Type | Purpose |
+|---|---|---|
+| `gvm-cleanup.service` | oneshot | Boot-time orphan sweep. Releases any veth / iptables / mount / cgroup state left behind by a sandbox that crashed before reboot. |
+| `gvm-sandbox@.service` | template | Per-agent supervisor. Instance name `%i` selects which script under `/etc/gvm/agents/<name>.py` to launch. |
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/gvm-proxy
-WorkingDirectory=/var/lib/gvm
-User=gvm
-Group=gvm
-# Needs CAP_NET_ADMIN for veth/iptables in --sandbox; drop if you
-# only run cooperative mode.
-AmbientCapabilities=CAP_NET_ADMIN
-Restart=on-failure
-RestartSec=5s
-StandardOutput=journal
-StandardError=journal
-# Proxy listens on 8080 by default; expose via reverse proxy if
-# you want TLS termination in front of it.
+### Install
 
-[Install]
-WantedBy=multi-user.target
+```bash
+sudo install -m 0644 packaging/systemd/gvm-cleanup.service  /etc/systemd/system/
+sudo install -m 0644 packaging/systemd/gvm-sandbox@.service /etc/systemd/system/
+sudo install -m 0755 target/release/gvm /usr/local/bin/gvm
+
+sudo mkdir -p /etc/gvm/agents
+sudo cp my-agent.py /etc/gvm/agents/my-agent.py
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now gvm-cleanup.service
+sudo systemctl enable --now gvm-sandbox@my-agent.service
 ```
 
-Known gaps when running under systemd today:
-- `gvm stop` reads `data/proxy.pid`, which systemd doesn't use; use
-  `systemctl stop gvm-proxy` instead on systemd-managed hosts.
-- `gvm status` queries the proxy's HTTP health endpoint and is
-  independent of the supervisor, so it keeps working under either
-  model.
-- Log rotation is delegated to journald/journalctl; the proxy's
-  own `data/proxy.log` is a no-op under systemd (stdout/stderr go
-  to the journal instead).
-- The sandbox mode's kernel resources (veth, iptables, cgroups) are
-  cleaned up by the per-sandbox lifecycle handlers regardless of
-  supervisor. `/run/gvm/` state survives reboot because it's tmpfs.
+Verify and observe:
 
-Pick the systemd path when you need unattended restart on crash,
-boot-time start, and centralised log ingestion. Stick with
-`gvm run`'s built-in daemon for single-host dev/demo environments.
+```bash
+sudo systemctl status gvm-sandbox@my-agent.service
+journalctl -u gvm-sandbox@my-agent.service -f
+gvm status            # also lists systemd-launched sandboxes
+```
+
+### What the units actually do
+
+```
+boot
+ │
+ ├── network-pre.target
+ ├── gvm-cleanup.service          (sweeps any pre-reboot orphans)
+ ├── network.target
+ ├── multi-user.target
+ │     │
+ │     └── gvm-sandbox@my-agent.service
+ │           ExecStartPre=gvm cleanup     ← second sweep, defense in depth
+ │           ExecStart=gvm run --sandbox  ← long-running
+ │           on crash → SIGTERM → 30s grace → SIGKILL
+ │           ExecStopPost=gvm cleanup     ← release whatever the run leaked
+ │           Restart=on-failure (capped at 3 restarts/min)
+```
+
+This gives you:
+
+- **Survives SSH disconnect.** `gvm run --sandbox` runs as a systemd
+  service, not a tty child.
+- **Survives host reboot.** `gvm-cleanup.service` clears any
+  pre-reboot orphans before agents launch; the unit is enabled at
+  boot.
+- **Auto-restart on crash.** `Restart=on-failure` re-launches the
+  agent, with a 3 restarts/60s burst cap so a wedged agent does not
+  busy-loop the host. Clean exit (the agent finished normally) does
+  not trigger a restart.
+- **Centralized logs.** Agent stdout and stderr stream to journald,
+  tagged with `gvm-sandbox-<agent>` so `journalctl -u gvm-sandbox@<agent>`
+  Just Works.
+- **Belt-and-suspenders cleanup.** `ExecStartPre`, `ExecStopPost`, and
+  the boot-time oneshot all run `gvm cleanup`, so even a SIGKILL or
+  power loss leaves no host state behind on the next boot.
+
+### Per-agent overrides (drop-ins)
+
+Use a drop-in instead of editing the shipped unit file:
+
+```bash
+sudo systemctl edit gvm-sandbox@my-agent.service
+```
+
+```ini
+[Service]
+# Use a script outside the default /etc/gvm/agents/ location
+Environment=AgentScript=/srv/agents/my-agent/main.py
+
+# Layer a systemd memory limit on top of GVM's --memory flag
+MemoryMax=2G
+
+# Per-agent timeout
+Environment=GVM_SANDBOX_TIMEOUT=3600
+```
+
+### tmux vs systemd
+
+| Capability | tmux | systemd |
+|---|---|---|
+| Survives SSH disconnect | ✅ | ✅ |
+| Survives host reboot | ❌ | ✅ |
+| Auto-restart on crash | ❌ | ✅ |
+| Auto-cleanup on boot | ❌ | ✅ (via `gvm-cleanup.service`) |
+| Centralized log aggregation | ❌ | ✅ (journald) |
+| Single-command setup | ✅ | ❌ (one-time install) |
+| Best for short interactive runs | ✅ | ❌ |
+
+`gvm` itself behaves identically in both modes. The only difference
+is who supervises the process — your tty (tmux) or PID 1 (systemd).
+Mix freely on the same host: `gvm status` will show every sandbox
+regardless of how it was launched, with the tmux session name on
+the rows that have one.
+
+### Uninstall
+
+```bash
+sudo systemctl disable --now gvm-sandbox@my-agent.service
+sudo systemctl disable --now gvm-cleanup.service
+sudo rm /etc/systemd/system/gvm-cleanup.service \
+        /etc/systemd/system/gvm-sandbox@.service
+sudo systemctl daemon-reload
+sudo gvm cleanup    # final safety net
+```
+
+For the full lifecycle diagram, drop-in patterns, and the install
+matrix, see [`packaging/systemd/README.md`](../packaging/systemd/README.md).
 
 ---
 

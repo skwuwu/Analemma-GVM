@@ -523,37 +523,30 @@ pub fn post_exit_audit(
 // ─── Background tasks ───
 
 /// Handles for background tasks that run alongside the agent.
+///
+/// Previously this also spawned an IC-3 approval poller that interleaved
+/// y/n prompts with the agent's stdout — that was removed because it
+/// fought for stdin with the running agent and produced confusing
+/// interleaved output. The single supported channel for human approval
+/// is now `gvm approve` in a separate terminal (or `--auto-deny` in CI).
+/// `gvm run` itself only forwards a one-line hint when it sees that the
+/// proxy has at least one rule that can produce `RequireApproval`.
 pub struct BackgroundTasks {
     watchdog: tokio::task::JoinHandle<()>,
-    approval: tokio::task::JoinHandle<()>,
-    approval_cancel: tokio::sync::watch::Sender<bool>,
 }
 
 impl BackgroundTasks {
-    /// Spawn watchdog and IC-3 approval poller.
+    /// Spawn watchdog only. IC-3 approvals are no longer polled inline.
     pub fn spawn(proxy: &str) -> Self {
         let proxy_url = proxy.to_string();
         let workspace = run::workspace_root_for_proxy();
         let watchdog = tokio::spawn(crate::proxy_manager::watchdog(proxy_url, workspace));
-
-        let (approval_cancel, approval_rx) = tokio::sync::watch::channel(false);
-        let admin_url = run::derive_admin_url(proxy);
-        let approval = tokio::spawn(async move {
-            crate::approve::poll_and_prompt_background(&admin_url, approval_rx).await;
-        });
-
-        Self {
-            watchdog,
-            approval,
-            approval_cancel,
-        }
+        Self { watchdog }
     }
 
     /// Abort all background tasks.
     pub fn abort(self) {
         self.watchdog.abort();
-        let _ = self.approval_cancel.send(true);
-        self.approval.abort();
     }
 }
 
@@ -701,6 +694,19 @@ fn print_fs_diff_report(diff: &gvm_sandbox::filesystem::FsDiffReport, workspace:
         let staging_dir =
             std::path::PathBuf::from(format!("data/sandbox-staging/{}", std::process::id()));
 
+        // Write a manifest.json sidecar so `gvm fs approve` can drain
+        // staged files later. The manifest records the workspace
+        // destination (staging is keyed by PID, but the workspace is only
+        // known here), the agent identity, and per-file metadata so the
+        // standalone approver can render the same prompt without
+        // re-running the sandbox. We write this UNCONDITIONALLY before
+        // interactive review — even the TTY user can choose `s` (skip
+        // all), in which case the manifest is the only thing that lets
+        // them come back later.
+        if staging_dir.exists() {
+            write_staging_manifest(&staging_dir, workspace, diff);
+        }
+
         if std::io::stdin().is_terminal() && staging_dir.exists() {
             eprintln!();
             let mut accepted = 0usize;
@@ -747,20 +753,42 @@ fn print_fs_diff_report(diff: &gvm_sandbox::filesystem::FsDiffReport, workspace:
                     let choice = input.trim().to_lowercase();
                     match choice.as_str() {
                         "a" | "accept" | "y" | "yes" => {
-                            // Copy staged file to workspace
-                            let dst = workspace.join(&f.path);
-                            if let Some(parent) = dst.parent() {
-                                std::fs::create_dir_all(parent).ok();
-                            }
-                            if std::fs::copy(&staged, &dst).is_ok() {
+                            // Copy staged file to workspace, then remove
+                            // the staged source so a partial-accept session
+                            // (skip rest, run `gvm fs approve` later) does
+                            // not re-prompt this file.
+                            if !staged.exists() {
                                 eprintln!(
-                                    "  {GREEN}\u{2713}{RESET} {} \u{2192} {}",
-                                    f.path.display(),
-                                    dst.display()
+                                    "  {YELLOW}\u{26a0}{RESET} {} {DIM}(staged file gone — \
+                                     concurrent gvm fs approve --reject-all?){RESET}",
+                                    f.path.display()
                                 );
-                                accepted += 1;
                             } else {
-                                eprintln!("  {RED}\u{2717}{RESET} copy failed");
+                                let dst = workspace.join(&f.path);
+                                if let Some(parent) = dst.parent() {
+                                    std::fs::create_dir_all(parent).ok();
+                                }
+                                match std::fs::copy(&staged, &dst) {
+                                    Ok(_) => {
+                                        let _ = std::fs::remove_file(&staged);
+                                        eprintln!(
+                                            "  {GREEN}\u{2713}{RESET} {} \u{2192} {}",
+                                            f.path.display(),
+                                            dst.display()
+                                        );
+                                        accepted += 1;
+                                    }
+                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                        eprintln!(
+                                            "  {YELLOW}\u{26a0}{RESET} {} {DIM}(vanished \
+                                             mid-copy){RESET}",
+                                            f.path.display()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        eprintln!("  {RED}\u{2717}{RESET} copy failed: {}", e);
+                                    }
+                                }
                             }
                         }
                         "s" | "skip" => {
@@ -787,8 +815,21 @@ fn print_fs_diff_report(diff: &gvm_sandbox::filesystem::FsDiffReport, workspace:
                 diff.discarded.len()
             );
 
-            // Clean up staging
-            std::fs::remove_dir_all(&staging_dir).ok();
+            // Clean up staging only if the user actually drained the
+            // queue interactively. If they hit `s` (skip all), there
+            // are still files left and the manifest is the audit trail
+            // for `gvm fs approve` to pick up later — we keep both so
+            // disk leak prevention falls back to that path instead of
+            // silently deleting their pending files.
+            if accepted + rejected >= diff.needs_review.len() {
+                std::fs::remove_dir_all(&staging_dir).ok();
+            } else {
+                eprintln!(
+                    "  {DIM}{} file(s) still pending. Drain later with: \
+                     {CYAN}gvm fs approve{RESET}",
+                    diff.needs_review.len() - accepted - rejected
+                );
+            }
         } else {
             // Non-TTY: print staging path
             eprintln!();
@@ -805,6 +846,56 @@ fn print_fs_diff_report(diff: &gvm_sandbox::filesystem::FsDiffReport, workspace:
     }
 
     eprintln!();
+}
+
+/// Persist a manifest sidecar so `gvm fs approve` can drain this staging
+/// dir without needing the original sandbox process. Best-effort: a
+/// failed write is logged but never aborts the run, because the agent
+/// has already exited and the staged files are still on disk regardless.
+fn write_staging_manifest(
+    staging_dir: &std::path::Path,
+    workspace: &std::path::Path,
+    diff: &gvm_sandbox::filesystem::FsDiffReport,
+) {
+    use gvm_sandbox::filesystem::ChangeKind;
+
+    let entries: Vec<serde_json::Value> = diff
+        .needs_review
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "path": f.path.display().to_string(),
+                "size": f.size,
+                "kind": match f.kind {
+                    ChangeKind::Created => "Created",
+                    ChangeKind::Modified => "Modified",
+                    ChangeKind::Deleted => "Deleted",
+                },
+                "matched_pattern": f.matched_pattern,
+            })
+        })
+        .collect();
+
+    let manifest = serde_json::json!({
+        "version": 1,
+        "pid": std::process::id(),
+        "workspace": workspace.display().to_string(),
+        "created_at": chrono::Utc::now().to_rfc3339(),
+        "entries": entries,
+    });
+
+    let manifest_path = staging_dir.join("manifest.json");
+    if let Err(e) = std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+    ) {
+        eprintln!(
+            "  {YELLOW}\u{26a0}{RESET} {DIM}Failed to write fs staging manifest \
+             ({}): {}. `gvm fs approve` will not see this batch.{RESET}",
+            manifest_path.display(),
+            e
+        );
+    }
 }
 
 fn format_size(bytes: u64) -> String {

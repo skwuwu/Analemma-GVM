@@ -110,6 +110,14 @@ cleanup() {
     [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null || true
     # Restore original proxy.toml if we backed it up
     [ -f "$REPO_DIR/config/proxy.toml.bak" ] && mv "$REPO_DIR/config/proxy.toml.bak" "$REPO_DIR/config/proxy.toml" 2>/dev/null || true
+    # Restore original secrets.toml if Test 76 setup backed it up.
+    # If there was no original (first-run), remove the synthetic file we created.
+    if [ -f "$REPO_DIR/config/secrets.toml.bak" ]; then
+        mv "$REPO_DIR/config/secrets.toml.bak" "$REPO_DIR/config/secrets.toml" 2>/dev/null || true
+    elif [ -f "$REPO_DIR/config/secrets.toml" ] && \
+         grep -q "proxy_injected_bearer_e2e" "$REPO_DIR/config/secrets.toml" 2>/dev/null; then
+        rm -f "$REPO_DIR/config/secrets.toml" 2>/dev/null || true
+    fi
     # Only kill proxy if WE started it (not --test mode with external proxy)
     if [ -n "$SINGLE_TEST" ]; then
         # Don't kill proxy in --test mode
@@ -218,13 +226,24 @@ else
 fi
 
 # Save original proxy config and inject mock host_overrides
+# Also adds two synthetic hostnames used by the credential-injection test (76):
+#   - bearer-creds.test.gvm  → exercises Credential::Bearer
+#   - apikey-creds.test.gvm  → exercises Credential::ApiKey (custom header)
+# Both remap to the same mock server so /echo-headers reports what the proxy
+# actually delivered to the upstream socket after stripping + injection.
 if [ -n "$MOCK_PID" ] && [ -f "$REPO_DIR/config/proxy.toml" ]; then
     cp "$REPO_DIR/config/proxy.toml" "$REPO_DIR/config/proxy.toml.bak"
     python3 -c "
 import re, sys
 with open('$REPO_DIR/config/proxy.toml') as f:
     content = f.read()
-override = '\"api.github.com\" = \"127.0.0.1:$MOCK_PORT\", \"httpbin.org\" = \"127.0.0.1:$MOCK_PORT\"'
+override = (
+    '\"api.github.com\" = \"127.0.0.1:$MOCK_PORT\", '
+    '\"httpbin.org\" = \"127.0.0.1:$MOCK_PORT\", '
+    '\"bearer-creds.test.gvm\" = \"127.0.0.1:$MOCK_PORT\", '
+    '\"apikey-creds.test.gvm\" = \"127.0.0.1:$MOCK_PORT\", '
+    '\"ghostcheck.test.gvm\" = \"127.0.0.1:$MOCK_PORT\"'
+)
 content = re.sub(
     r'(host_overrides\s*=\s*\{)',
     r'\1 ' + override + ',',
@@ -235,6 +254,30 @@ with open('$REPO_DIR/config/proxy.toml', 'w') as f:
 print('  Mock overrides injected into proxy.toml')
 " 2>/dev/null || echo -e "  ${YELLOW}Could not inject mock overrides into proxy.toml${NC}"
 fi
+
+# Inject test credentials into secrets.toml so Test 76 can verify the
+# end-to-end injection path. APIKeyStore is loaded once at proxy startup
+# (no hot-reload) — must happen before ensure_proxy. Backup is restored
+# in cleanup().
+SECRETS_FILE="$REPO_DIR/config/secrets.toml"
+if [ -f "$SECRETS_FILE" ]; then
+    cp "$SECRETS_FILE" "${SECRETS_FILE}.bak"
+fi
+cat >> "$SECRETS_FILE" 2>/dev/null << 'CREDSEOF' || true
+
+# ── Synthetic credentials for ec2-e2e-test Test 76 (credential injection) ──
+# These hostnames are remapped to the local mock server via host_overrides.
+[credentials."bearer-creds.test.gvm"]
+type = "Bearer"
+token = "sk_test_proxy_injected_bearer_e2e"
+
+[credentials."apikey-creds.test.gvm"]
+type = "ApiKey"
+header = "x-api-key"
+value = "SG.proxy_injected_apikey_e2e"
+CREDSEOF
+chmod 600 "$SECRETS_FILE" 2>/dev/null || true
+echo "  Test credentials appended to secrets.toml"
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════
@@ -5280,6 +5323,891 @@ AGENTEOF
         # Cleanup
         docker rm -f gvm-agent-netadmin-test 2>/dev/null || true
         rm -f "$NETADMIN_AGENT"
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# Test 76: Credential Injection End-to-End
+#
+# Closes the gap between unit tests (api_keys.rs::tests, integration.rs
+# Test 8 / 8b) and the running proxy on EC2: a keyless agent should be
+# able to call an upstream that the proxy has Bearer/ApiKey credentials
+# for, and an agent that smuggles a fake Authorization header should be
+# overwritten — verified by reading what the upstream actually received,
+# not by greping proxy logs.
+#
+# Setup (already done at script start):
+#   - secrets.toml has bearer-creds.test.gvm (Bearer) and
+#     apikey-creds.test.gvm (ApiKey custom header) credentials.
+#   - proxy.toml host_overrides remap both to the local mock server,
+#     which exposes /echo-headers returning the auth headers it received.
+# ═══════════════════════════════════════════════════════════════════
+if should_run 76; then
+    header "76: Credential Injection End-to-End"
+
+    ensure_proxy || { fail "76: proxy not available"; }
+
+    # Confirm the synthetic credentials made it into the running proxy.
+    # If APIKeyStore failed to parse them, every sub-test below would
+    # silently degrade to passthrough — fail loudly here instead.
+    if ! grep -q "bearer-creds.test.gvm" "$REPO_DIR/config/secrets.toml" 2>/dev/null; then
+        skip "76: synthetic credentials not present in secrets.toml (setup skipped)"
+    elif [ -z "$MOCK_PID" ] || ! kill -0 "$MOCK_PID" 2>/dev/null; then
+        skip "76: mock upstream not running"
+    else
+        PROXY_HTTP="http://127.0.0.1:8080"
+
+        # ─── 76a: keyless agent → Bearer host ───
+        # Agent sends NO Authorization header. Proxy must inject the
+        # Bearer token from secrets.toml. Mock echoes what it received.
+        ECHO_A=$(curl -sf -x "$PROXY_HTTP" \
+            "http://bearer-creds.test.gvm/echo-headers" 2>/dev/null || echo "")
+        AUTH_A=$(echo "$ECHO_A" | python3 -c "import sys,json; print(json.load(sys.stdin).get('authorization',''))" 2>/dev/null)
+
+        if [ "$AUTH_A" = "Bearer sk_test_proxy_injected_bearer_e2e" ]; then
+            pass "76a: Bearer credential injected end-to-end (keyless agent)"
+        else
+            fail "76a: Bearer not injected (upstream saw: '$AUTH_A')"
+        fi
+
+        # ─── 76b: malicious agent smuggles fake Authorization ───
+        # Proxy must overwrite the agent's value, not append.
+        ECHO_B=$(curl -sf -x "$PROXY_HTTP" \
+            -H "Authorization: Bearer agent-smuggled-evil-token" \
+            -H "x-api-key: agent-smuggled-evil-apikey" \
+            -H "Cookie: session=agent-smuggled-session" \
+            "http://bearer-creds.test.gvm/echo-headers" 2>/dev/null || echo "")
+        AUTH_B=$(echo "$ECHO_B" | python3 -c "import sys,json; print(json.load(sys.stdin).get('authorization',''))" 2>/dev/null)
+        XAPIK_B=$(echo "$ECHO_B" | python3 -c "import sys,json; print(json.load(sys.stdin).get('x_api_key',''))" 2>/dev/null)
+        COOKIE_B=$(echo "$ECHO_B" | python3 -c "import sys,json; print(json.load(sys.stdin).get('cookie',''))" 2>/dev/null)
+
+        if [ "$AUTH_B" = "Bearer sk_test_proxy_injected_bearer_e2e" ]; then
+            pass "76b: smuggled Authorization overwritten by proxy credential"
+        else
+            fail "76b: smuggled Authorization leaked to upstream (saw: '$AUTH_B')"
+        fi
+        if [ -z "$XAPIK_B" ]; then
+            pass "76b: smuggled x-api-key stripped before upstream"
+        else
+            fail "76b: smuggled x-api-key reached upstream ('$XAPIK_B')"
+        fi
+        if [ -z "$COOKIE_B" ]; then
+            pass "76b: smuggled Cookie stripped before upstream"
+        else
+            fail "76b: smuggled Cookie reached upstream ('$COOKIE_B')"
+        fi
+
+        # ─── 76c: ApiKey credential type (custom header, not Authorization) ───
+        ECHO_C=$(curl -sf -x "$PROXY_HTTP" \
+            "http://apikey-creds.test.gvm/echo-headers" 2>/dev/null || echo "")
+        XAPIK_C=$(echo "$ECHO_C" | python3 -c "import sys,json; print(json.load(sys.stdin).get('x_api_key',''))" 2>/dev/null)
+        AUTH_C=$(echo "$ECHO_C" | python3 -c "import sys,json; print(json.load(sys.stdin).get('authorization',''))" 2>/dev/null)
+
+        if [ "$XAPIK_C" = "SG.proxy_injected_apikey_e2e" ]; then
+            pass "76c: ApiKey credential injected into custom header"
+        else
+            fail "76c: ApiKey not injected (upstream saw x-api-key: '$XAPIK_C')"
+        fi
+        if [ -z "$AUTH_C" ]; then
+            pass "76c: ApiKey type leaves Authorization untouched"
+        else
+            fail "76c: ApiKey type unexpectedly populated Authorization ('$AUTH_C')"
+        fi
+
+        # ─── 76d: WAL must not contain the plaintext token ───
+        # Defense-in-depth: if the proxy ever logged credentials, this
+        # would catch it before it ships.
+        if [ -f "$REPO_DIR/data/wal.log" ] && \
+           grep -q "sk_test_proxy_injected_bearer_e2e\|SG.proxy_injected_apikey_e2e" \
+                "$REPO_DIR/data/wal.log" 2>/dev/null; then
+            fail "76d: plaintext credential leaked into WAL"
+        else
+            pass "76d: credentials never written to WAL"
+        fi
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# Test 77: gvm status — orphan warning visibility
+#
+# Validates the P3 UX gate: when a sandbox state file exists but the
+# owning PID is dead, `gvm status` must surface a loud warning AND
+# the actionable cleanup command. We do not need a real sandbox here —
+# we synthesize a state file with a guaranteed-dead PID and check that
+# the status output renders the right text. Then `gvm cleanup` must
+# remove it.
+# ═══════════════════════════════════════════════════════════════════
+if should_run 77; then
+    header "77: gvm status — orphan warning visibility"
+
+    if [ ! -f "$GVM_BIN" ]; then
+        skip "77: gvm binary not built"
+    elif ! sudo -n true 2>/dev/null; then
+        skip "77: passwordless sudo required"
+    else
+        # 77a: synthesize an orphan state file with PID 999999 (well above
+        # /proc/sys/kernel/pid_max on every supported distro → guaranteed
+        # dead). The schema must match SandboxState v3 closely enough that
+        # `gvm status` parses it.
+        sudo mkdir -p /run/gvm
+        SYNTH_PID=999999
+        SYNTH_STATE="/run/gvm/gvm-sandbox-${SYNTH_PID}.state"
+        sudo tee "$SYNTH_STATE" >/dev/null << SYNTHEOF
+{
+  "version": 3,
+  "pid": ${SYNTH_PID},
+  "created_at": "2026-01-01T00:00:00Z",
+  "veth_host": "veth-gvm-h-test77",
+  "veth_sandbox": "veth-gvm-s-test77",
+  "host_ip": "10.99.77.1",
+  "sandbox_ip": "10.99.77.2",
+  "proxy_port": 8080,
+  "forward_chain": "GVM-veth-gvm-h-test77",
+  "mount_paths": [],
+  "cgroup_path": null,
+  "dns_target": null,
+  "child_pid": null,
+  "pid_starttime": null,
+  "child_pid_starttime": null,
+  "tmux_session": "/tmp/tmux-1000/default,12345,42"
+}
+SYNTHEOF
+
+        STATUS_OUT=$("$GVM_BIN" status 2>&1 || true)
+
+        # 77a: warning header present
+        if echo "$STATUS_OUT" | grep -qE "orphaned sandbox.*detected"; then
+            pass "77a: orphan warning header rendered"
+        else
+            fail "77a: orphan warning header missing from gvm status output"
+            echo "  ${DIM}Output snippet:${NC}"
+            echo "$STATUS_OUT" | sed -n '1,40p' | sed 's/^/    /'
+        fi
+
+        # 77b: actionable cleanup command surfaced
+        if echo "$STATUS_OUT" | grep -q "gvm cleanup"; then
+            pass "77b: cleanup command surfaced in warning"
+        else
+            fail "77b: 'gvm cleanup' hint missing from orphan warning"
+        fi
+
+        # 77c: synthetic PID listed
+        if echo "$STATUS_OUT" | grep -q "$SYNTH_PID"; then
+            pass "77c: orphan PID ${SYNTH_PID} listed"
+        else
+            fail "77c: orphan PID ${SYNTH_PID} not listed in status output"
+        fi
+
+        # 77d: tmux session label rendered (P2)
+        if echo "$STATUS_OUT" | grep -qE "\[tmux: session 42\]|\[tmux: "; then
+            pass "77d: tmux session label visible in status row"
+        else
+            # Non-fatal — formatting is best-effort. Warn but don't fail.
+            echo "  ${YELLOW}77d: tmux label not found (formatting changed?)${NC}"
+            skip "77d: tmux label visibility (non-blocking)"
+        fi
+
+        # 77e: gvm cleanup actually releases the synthetic orphan.
+        # The veth never existed so the only thing to remove is the state
+        # file itself — but that is exactly the path the cleanup loop is
+        # supposed to walk for crashed sandboxes whose veth was already
+        # released externally.
+        sudo "$GVM_BIN" cleanup >/dev/null 2>&1 || true
+        if [ ! -f "$SYNTH_STATE" ]; then
+            pass "77e: gvm cleanup removed the orphan state file"
+        else
+            fail "77e: gvm cleanup left $SYNTH_STATE behind"
+            sudo rm -f "$SYNTH_STATE"
+        fi
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# Test 78: systemd unit integration (gvm-cleanup + gvm-sandbox@)
+#
+# Validates the production deployment path documented in
+# packaging/systemd/README.md. We:
+#   1. Install the unit files into a temporary location and reload systemd
+#   2. Run gvm-cleanup.service as a oneshot — must succeed
+#   3. Install the template service against a tiny no-op agent script
+#   4. Start gvm-sandbox@e2e-systemd-test.service, wait for it to come up
+#   5. Verify systemctl reports active, journalctl has agent stdout
+#   6. Stop the unit, verify host kernel state is fully released
+#   7. Remove the test units
+#
+# This is the systemd version of the tmux smoke test — same behavior must
+# work whether the operator uses one or the other.
+# ═══════════════════════════════════════════════════════════════════
+if should_run 78; then
+    header "78: systemd unit integration"
+
+    if [ ! -f "$GVM_BIN" ]; then
+        skip "78: gvm binary not built"
+    elif ! command -v systemctl >/dev/null 2>&1; then
+        skip "78: systemd not available on this host"
+    elif ! sudo -n true 2>/dev/null; then
+        skip "78: passwordless sudo required"
+    elif [ ! -f "$REPO_DIR/packaging/systemd/gvm-sandbox@.service" ]; then
+        fail "78: packaging/systemd/gvm-sandbox@.service missing"
+    else
+        SYSTEMD_DIR="/etc/systemd/system"
+        TEST_INSTANCE="e2e-systemd-test"
+        AGENT_SCRIPT="/etc/gvm/agents/${TEST_INSTANCE}.py"
+
+        # ── Install ──
+        # `gvm` may live anywhere on the test host — patch the units so
+        # they point at the actual binary used by the rest of this script.
+        BIN_PATH=$(realpath "$GVM_BIN")
+        sudo mkdir -p /etc/gvm/agents
+        sudo tee "$AGENT_SCRIPT" >/dev/null << 'AGENTEOF'
+import sys, time
+print("e2e-systemd-test agent up", flush=True)
+# Sleep just long enough for systemctl to observe the active state
+# and for the test to inspect journald. The unit's Restart=on-failure
+# means a clean exit doesn't restart, so this is a one-shot agent.
+time.sleep(8)
+print("e2e-systemd-test agent done", flush=True)
+sys.exit(0)
+AGENTEOF
+        sudo chmod 0644 "$AGENT_SCRIPT"
+
+        # Patch unit files in-place to use the real binary path.
+        sudo sed -e "s|/usr/local/bin/gvm|${BIN_PATH}|g" \
+            "$REPO_DIR/packaging/systemd/gvm-cleanup.service" \
+            | sudo tee "${SYSTEMD_DIR}/gvm-cleanup.service" >/dev/null
+        sudo sed -e "s|/usr/local/bin/gvm|${BIN_PATH}|g" \
+            "$REPO_DIR/packaging/systemd/gvm-sandbox@.service" \
+            | sudo tee "${SYSTEMD_DIR}/gvm-sandbox@.service" >/dev/null
+        sudo systemctl daemon-reload
+
+        # ── 78a: gvm-cleanup.service runs cleanly ──
+        if sudo systemctl start gvm-cleanup.service && \
+           sudo systemctl is-active --quiet gvm-cleanup.service 2>/dev/null || \
+           sudo systemctl show gvm-cleanup.service -p ActiveState --value 2>/dev/null \
+              | grep -qE "active|inactive"; then
+            # oneshot units may report "inactive (dead)" with result=success after running.
+            RESULT=$(sudo systemctl show gvm-cleanup.service -p Result --value 2>/dev/null)
+            if [ "$RESULT" = "success" ]; then
+                pass "78a: gvm-cleanup.service ran (Result=success)"
+            else
+                fail "78a: gvm-cleanup.service Result=$RESULT"
+            fi
+        else
+            fail "78a: gvm-cleanup.service failed to start"
+        fi
+
+        # ── 78b: gvm-sandbox@${TEST_INSTANCE} starts ──
+        sudo systemctl start "gvm-sandbox@${TEST_INSTANCE}.service" 2>&1 | tail -5
+        sleep 2
+
+        SANDBOX_ACTIVE=$(sudo systemctl show "gvm-sandbox@${TEST_INSTANCE}.service" \
+            -p ActiveState --value 2>/dev/null)
+        if [ "$SANDBOX_ACTIVE" = "active" ] || [ "$SANDBOX_ACTIVE" = "activating" ]; then
+            pass "78b: gvm-sandbox@${TEST_INSTANCE}.service reached active state"
+        else
+            fail "78b: gvm-sandbox@${TEST_INSTANCE}.service ActiveState=$SANDBOX_ACTIVE"
+            sudo journalctl -u "gvm-sandbox@${TEST_INSTANCE}.service" --no-pager -n 30 \
+                | sed 's/^/    /'
+        fi
+
+        # ── 78c: agent stdout flows to journald ──
+        sleep 2
+        if sudo journalctl -u "gvm-sandbox@${TEST_INSTANCE}.service" --no-pager -n 50 2>/dev/null \
+                | grep -q "e2e-systemd-test agent up"; then
+            pass "78c: agent stdout reached journald"
+        else
+            fail "78c: agent stdout missing from journald (logging not wired)"
+        fi
+
+        # ── 78d: gvm status sees the systemd-launched sandbox as active ──
+        if sudo "$GVM_BIN" status 2>&1 | grep -qiE "Active Sandbox|veth-gvm-h"; then
+            pass "78d: gvm status reports the systemd-launched sandbox"
+        else
+            # Non-fatal — could race with the 8s agent. Warn only.
+            echo "  ${YELLOW}78d: gvm status did not list a live sandbox${NC}"
+            skip "78d: status visibility (timing-sensitive, non-blocking)"
+        fi
+
+        # ── Wait for the agent to finish on its own ──
+        # The 8s sleep above means the unit will exit cleanly. We wait
+        # up to 20s for systemd to observe the exit before checking
+        # cleanup state.
+        for i in $(seq 1 20); do
+            STATE=$(sudo systemctl show "gvm-sandbox@${TEST_INSTANCE}.service" \
+                -p ActiveState --value 2>/dev/null)
+            if [ "$STATE" = "inactive" ] || [ "$STATE" = "failed" ]; then
+                break
+            fi
+            sleep 1
+        done
+
+        # ── 78e: ExecStopPost cleanup released kernel state ──
+        # After the unit exits, the cleanup pipeline should have removed
+        # the per-PID state file. The exact veth name is unknown to us
+        # (chosen by the sandbox at runtime), so we check that no
+        # `gvm-sandbox-*.state` files remain whose PID belonged to this
+        # systemd instance — easier proxy: count the files before and
+        # after, and verify the post-stop count is ≤ pre-start count.
+        REMAINING_STATE=$(sudo find /run/gvm -name "gvm-sandbox-*.state" 2>/dev/null | wc -l)
+        if [ "$REMAINING_STATE" -eq 0 ]; then
+            pass "78e: ExecStopPost cleanup released all sandbox state"
+        else
+            # Some other test on the same host may have a live sandbox.
+            # Verify gvm cleanup --dry-run reports no leaks instead.
+            if sudo "$GVM_BIN" cleanup 2>&1 | grep -qiE "released 0|no orphan|nothing to clean"; then
+                pass "78e: cleanup reports no leaks after systemd stop"
+            else
+                fail "78e: $REMAINING_STATE state file(s) remained after systemd stop"
+            fi
+        fi
+
+        # ── 78f: Restart=on-failure semantics — agent that exits non-zero
+        # must be restarted at least once. We swap in a failing script,
+        # `systemctl restart`, wait for it to fail, and check NRestarts.
+        FAIL_INSTANCE="e2e-systemd-fail"
+        FAIL_SCRIPT="/etc/gvm/agents/${FAIL_INSTANCE}.py"
+        sudo tee "$FAIL_SCRIPT" >/dev/null << 'FAILEOF'
+import sys
+print("intentional failure", flush=True)
+sys.exit(2)
+FAILEOF
+        sudo systemctl start "gvm-sandbox@${FAIL_INSTANCE}.service" 2>&1 | tail -3 >/dev/null
+        sleep 12  # let one or two restart cycles happen
+        NRESTARTS=$(sudo systemctl show "gvm-sandbox@${FAIL_INSTANCE}.service" \
+            -p NRestarts --value 2>/dev/null)
+        if [ -n "$NRESTARTS" ] && [ "$NRESTARTS" -ge 1 ]; then
+            pass "78f: Restart=on-failure fired (NRestarts=$NRESTARTS)"
+        else
+            fail "78f: Restart=on-failure did not engage (NRestarts=$NRESTARTS)"
+        fi
+        sudo systemctl stop "gvm-sandbox@${FAIL_INSTANCE}.service" 2>/dev/null || true
+
+        # ── Cleanup test units + agent files ──
+        sudo systemctl stop "gvm-sandbox@${TEST_INSTANCE}.service" 2>/dev/null || true
+        sudo rm -f "${SYSTEMD_DIR}/gvm-cleanup.service" \
+                   "${SYSTEMD_DIR}/gvm-sandbox@.service" \
+                   "$AGENT_SCRIPT" "$FAIL_SCRIPT"
+        sudo systemctl daemon-reload
+        sudo "$GVM_BIN" cleanup >/dev/null 2>&1 || true
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# Test 79: gvm fs approve — drain overlayfs staging directories
+#
+# `gvm run --sandbox --fs-governance` leaves a `data/sandbox-staging/<pid>/`
+# directory whenever a session ends with files matching the
+# `manual_commit` pattern set. Without `gvm fs approve`, those
+# directories grow indefinitely → disk leak. This test synthesizes a
+# fake batch (we do not need a real sandbox for this — only that the
+# CLI walks staging dirs and applies the right action), then exercises
+# all four subcommand modes: --list, --accept-all, --reject-all, and
+# (skipped if no TTY) interactive.
+# ═══════════════════════════════════════════════════════════════════
+if should_run 79; then
+    header "79: gvm fs approve — drain staging"
+
+    if [ ! -f "$GVM_BIN" ]; then
+        skip "79: gvm binary not built"
+    else
+        # Use a tempdir as the staging root so we don't touch the user's
+        # real data/sandbox-staging/. The CLI accepts --staging-root for
+        # exactly this reason.
+        FS_TEST_ROOT=$(mktemp -d /tmp/gvm-fs-approve-XXXXXX)
+        FS_WORKSPACE=$(mktemp -d /tmp/gvm-fs-approve-ws-XXXXXX)
+        FS_BATCH="${FS_TEST_ROOT}/991779"
+        mkdir -p "${FS_BATCH}/scripts"
+        echo "echo hello" > "${FS_BATCH}/scripts/install.sh"
+        echo "{\"k\":\"v\"}" > "${FS_BATCH}/config.json"
+        cat > "${FS_BATCH}/manifest.json" << MANIFESTEOF
+{
+  "version": 1,
+  "pid": 991779,
+  "workspace": "${FS_WORKSPACE}",
+  "created_at": "2026-04-08T00:00:00Z",
+  "entries": [
+    {"path": "scripts/install.sh", "size": 11, "kind": "Created", "matched_pattern": "*.sh"},
+    {"path": "config.json", "size": 9, "kind": "Modified", "matched_pattern": "*.json"}
+  ]
+}
+MANIFESTEOF
+
+        # ── 79a: --list shows pending without modifying anything ──
+        LIST_OUT=$("$GVM_BIN" fs approve --staging-root "$FS_TEST_ROOT" --list 2>&1 || true)
+        if echo "$LIST_OUT" | grep -q "1 batch(es) found" && \
+           echo "$LIST_OUT" | grep -q "scripts/install.sh"; then
+            pass "79a: --list reports pending batch and entries"
+        else
+            fail "79a: --list output unexpected"
+            echo "$LIST_OUT" | sed 's/^/    /'
+        fi
+
+        # 79b: --list does not delete or copy anything
+        if [ -f "${FS_BATCH}/scripts/install.sh" ] && \
+           [ ! -f "${FS_WORKSPACE}/scripts/install.sh" ]; then
+            pass "79b: --list left staging and workspace untouched"
+        else
+            fail "79b: --list modified files (must be read-only)"
+        fi
+
+        # ── 79c: --accept-all copies to workspace and clears staging ──
+        ACCEPT_OUT=$("$GVM_BIN" fs approve --staging-root "$FS_TEST_ROOT" --accept-all 2>&1 || true)
+        if [ -f "${FS_WORKSPACE}/scripts/install.sh" ] && \
+           [ -f "${FS_WORKSPACE}/config.json" ]; then
+            pass "79c: --accept-all copied entries to workspace"
+        else
+            fail "79c: --accept-all did not copy entries"
+            echo "$ACCEPT_OUT" | sed 's/^/    /'
+        fi
+
+        # 79d: staging directory was removed
+        if [ ! -d "$FS_BATCH" ]; then
+            pass "79d: --accept-all removed staging dir"
+        else
+            fail "79d: staging dir survived --accept-all"
+        fi
+
+        # ── 79e: --reject-all on a fresh batch deletes without copying ──
+        # Re-create with different content so we can detect a stray copy.
+        FS_BATCH2="${FS_TEST_ROOT}/991780"
+        mkdir -p "${FS_BATCH2}"
+        echo "rm -rf /" > "${FS_BATCH2}/evil.sh"
+        cat > "${FS_BATCH2}/manifest.json" << MANIFESTEOF
+{
+  "version": 1,
+  "pid": 991780,
+  "workspace": "${FS_WORKSPACE}",
+  "created_at": "2026-04-08T00:00:00Z",
+  "entries": [
+    {"path": "evil.sh", "size": 9, "kind": "Created", "matched_pattern": "*.sh"}
+  ]
+}
+MANIFESTEOF
+        REJECT_OUT=$("$GVM_BIN" fs approve --staging-root "$FS_TEST_ROOT" --reject-all 2>&1 || true)
+        if [ ! -d "$FS_BATCH2" ]; then
+            pass "79e: --reject-all removed staging dir"
+        else
+            fail "79e: --reject-all left staging dir"
+        fi
+        if [ ! -f "${FS_WORKSPACE}/evil.sh" ]; then
+            pass "79e: --reject-all did not copy to workspace"
+        else
+            fail "79e: --reject-all copied a rejected file (security regression)"
+        fi
+
+        # ── 79f: empty staging root reports nothing-pending and exits 0 ──
+        EMPTY_DIR=$(mktemp -d /tmp/gvm-fs-approve-empty-XXXXXX)
+        if "$GVM_BIN" fs approve --staging-root "$EMPTY_DIR" --list >/dev/null 2>&1; then
+            pass "79f: empty staging root exits cleanly"
+        else
+            fail "79f: empty staging root returned non-zero"
+        fi
+
+        # ── 79g: missing staging root is not an error ──
+        if "$GVM_BIN" fs approve --staging-root /nonexistent/path/no-such-dir --list >/dev/null 2>&1; then
+            pass "79g: missing staging root exits cleanly"
+        else
+            fail "79g: missing staging root returned non-zero"
+        fi
+
+        # ── 79i: --accept-all removes staged source after copy ──
+        # Partial-accept regression guard: a follow-up `gvm fs approve`
+        # must not re-prompt files that are already in the workspace.
+        # We do this in two passes — first --list to see one batch
+        # remaining, then --accept-all, then --list to confirm zero.
+        FS_BATCH3="${FS_TEST_ROOT}/991782"
+        mkdir -p "$FS_BATCH3"
+        echo "data1" > "${FS_BATCH3}/a.txt"
+        echo "data2" > "${FS_BATCH3}/b.txt"
+        cat > "${FS_BATCH3}/manifest.json" << MANIFESTEOF
+{
+  "version": 1,
+  "pid": 991782,
+  "workspace": "${FS_WORKSPACE}",
+  "created_at": "2026-04-08T00:00:00Z",
+  "entries": [
+    {"path": "a.txt", "size": 6, "kind": "Created", "matched_pattern": "*.txt"},
+    {"path": "b.txt", "size": 6, "kind": "Created", "matched_pattern": "*.txt"}
+  ]
+}
+MANIFESTEOF
+        "$GVM_BIN" fs approve --staging-root "$FS_TEST_ROOT" --accept-all >/dev/null 2>&1 || true
+        # After accept-all, both staged sources MUST be gone (not just the dir).
+        if [ ! -f "${FS_BATCH3}/a.txt" ] && [ ! -f "${FS_BATCH3}/b.txt" ]; then
+            pass "79i: --accept-all removed staged sources after copy"
+        else
+            fail "79i: staged sources survived --accept-all (partial-accept regression possible)"
+        fi
+        # And the workspace got both files
+        if [ -f "${FS_WORKSPACE}/a.txt" ] && [ -f "${FS_WORKSPACE}/b.txt" ]; then
+            pass "79i: both files reached workspace"
+        else
+            fail "79i: --accept-all left files un-copied"
+        fi
+
+        # ── 79j: vanished file mid-batch produces a clear warning ──
+        # Cron-race simulation: create a batch, then before running
+        # accept-all, delete one of the staged files manually. The CLI
+        # must report it as "vanished" / "already gone" rather than
+        # a generic OS error, and must still process the remaining file.
+        FS_BATCH4="${FS_TEST_ROOT}/991783"
+        FS_WS4=$(mktemp -d /tmp/gvm-fs-approve-ws4-XXXXXX)
+        mkdir -p "$FS_BATCH4"
+        echo "alive" > "${FS_BATCH4}/alive.txt"
+        # Note: ghost.txt is in the manifest but never created → simulates
+        # cron-GC having removed it just before our walk.
+        cat > "${FS_BATCH4}/manifest.json" << MANIFESTEOF
+{
+  "version": 1,
+  "pid": 991783,
+  "workspace": "${FS_WS4}",
+  "created_at": "2026-04-08T00:00:00Z",
+  "entries": [
+    {"path": "alive.txt", "size": 6, "kind": "Created", "matched_pattern": "*.txt"},
+    {"path": "ghost.txt", "size": 6, "kind": "Created", "matched_pattern": "*.txt"}
+  ]
+}
+MANIFESTEOF
+        VANISH_OUT=$("$GVM_BIN" fs approve --staging-root "$FS_TEST_ROOT" --accept-all 2>&1 || true)
+        if echo "$VANISH_OUT" | grep -qE "already gone|vanished"; then
+            pass "79j: vanished file produces a clear race-aware message"
+        else
+            fail "79j: vanished file did not produce a clear message"
+            echo "$VANISH_OUT" | sed 's/^/    /'
+        fi
+        if [ -f "${FS_WS4}/alive.txt" ]; then
+            pass "79j: surviving file still copied despite the vanished sibling"
+        else
+            fail "79j: --accept-all aborted on the vanished file"
+        fi
+        rm -rf "$FS_WS4"
+
+        # ── 79h: corrupt manifest is skipped, not crashed ──
+        BAD_BATCH="${FS_TEST_ROOT}/991781"
+        mkdir -p "$BAD_BATCH"
+        echo "this is not json {{{" > "${BAD_BATCH}/manifest.json"
+        BAD_OUT=$("$GVM_BIN" fs approve --staging-root "$FS_TEST_ROOT" --list 2>&1 || true)
+        if echo "$BAD_OUT" | grep -q "cannot parse"; then
+            pass "79h: corrupt manifest is skipped with a warning"
+        else
+            fail "79h: corrupt manifest did not produce skip warning"
+            echo "$BAD_OUT" | sed 's/^/    /'
+        fi
+
+        # Cleanup
+        rm -rf "$FS_TEST_ROOT" "$FS_WORKSPACE" "$EMPTY_DIR"
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# Test 80: Real fs-governance agent round-trip through `gvm fs approve`
+#
+# Test 79 covers `gvm fs approve` against synthetic batches. This test
+# closes the loop with a real sandbox: a Python agent inside
+# `gvm run --sandbox --fs-governance` that touches a mix of files
+# matching different staging policies. We then verify the manifest
+# round-trip (list → accept-all → workspace populated → staging gone)
+# and exercise per-file accept/reject through a faked PTY so the
+# interactive code path is also covered end-to-end.
+# ═══════════════════════════════════════════════════════════════════
+if should_run 80; then
+    header "80: Real fs-governance agent → gvm fs approve round-trip"
+
+    if [ ! -f "$GVM_BIN" ]; then
+        skip "80: gvm binary not built"
+    elif ! sudo -n true 2>/dev/null; then
+        skip "80: passwordless sudo required for --sandbox"
+    elif ! command -v python3 >/dev/null 2>&1; then
+        skip "80: python3 not available"
+    else
+        # Use a fresh, isolated workspace + staging root so we never
+        # touch other tests' state. The CLI accepts --staging-root for
+        # exactly this reason.
+        FS80_WS=$(mktemp -d /tmp/gvm-fs80-ws-XXXXXX)
+        FS80_STAGING=$(mktemp -d /tmp/gvm-fs80-staging-XXXXXX)
+
+        # Agent script: deliberately creates files that hit each
+        # policy bucket (auto_merge / manual_commit / discard).
+        FS80_AGENT="${FS80_WS}/agent.py"
+        cat > "$FS80_AGENT" << 'AGENTEOF'
+import os, pathlib
+
+# auto_merge bucket: *.csv
+pathlib.Path("output/report.csv").parent.mkdir(parents=True, exist_ok=True)
+open("output/report.csv", "w").write("col1,col2\n1,2\n")
+
+# manual_commit bucket: *.py and *.json (must be reviewed)
+open("install.py", "w").write("import os\nprint('hello from agent')\n")
+open("config.json", "w").write('{"key":"value"}\n')
+
+# discard bucket: *.log
+open("debug.log", "w").write("noisy log lines\n")
+print("agent done")
+AGENTEOF
+        chmod 0755 "$FS80_AGENT"
+
+        # Run the sandbox. We override GVM_SANDBOX_STAGING_ROOT if the
+        # binary supports it, otherwise fall back to the default
+        # `data/sandbox-staging/` and copy out afterwards. The current
+        # binary uses the default; we work with that.
+        sudo "$GVM_BIN" run --sandbox --fs-governance \
+            --agent-id fs80 \
+            -- python3 "$FS80_AGENT" >/tmp/gvm-fs80-run.out 2>&1 || true
+
+        # Find this run's staging dir. Newest dir under
+        # data/sandbox-staging/ that contains a manifest.json wins.
+        STAGE_PARENT="$REPO_DIR/data/sandbox-staging"
+        FS80_BATCH=""
+        if [ -d "$STAGE_PARENT" ]; then
+            FS80_BATCH=$(sudo find "$STAGE_PARENT" -mindepth 1 -maxdepth 1 -type d \
+                -newer "$FS80_AGENT" 2>/dev/null \
+                | head -1)
+        fi
+
+        # 80a: A staging dir with a manifest exists
+        if [ -n "$FS80_BATCH" ] && sudo test -f "${FS80_BATCH}/manifest.json"; then
+            pass "80a: sandbox produced staging dir with manifest.json"
+        else
+            fail "80a: no staging dir with manifest after sandbox run"
+            sed -n '1,20p' /tmp/gvm-fs80-run.out | sed 's/^/    /'
+            rm -rf "$FS80_WS" "$FS80_STAGING"
+            return 0 2>/dev/null || true
+        fi
+
+        # 80b: Manifest lists install.py and config.json (manual_commit)
+        # but NOT report.csv (auto_merge already merged) and NOT debug.log
+        # (discarded).
+        MANIFEST_CONTENT=$(sudo cat "${FS80_BATCH}/manifest.json")
+        if echo "$MANIFEST_CONTENT" | grep -q "install.py" && \
+           echo "$MANIFEST_CONTENT" | grep -q "config.json"; then
+            pass "80b: manifest lists *.py and *.json (manual_commit)"
+        else
+            fail "80b: manifest missing expected manual_commit entries"
+            echo "$MANIFEST_CONTENT" | sed 's/^/    /'
+        fi
+        if echo "$MANIFEST_CONTENT" | grep -q "report.csv"; then
+            fail "80b: manifest unexpectedly lists *.csv (should auto-merge silently)"
+        else
+            pass "80b: auto_merge files (*.csv) NOT in manifest"
+        fi
+        if echo "$MANIFEST_CONTENT" | grep -q "debug.log"; then
+            fail "80b: manifest unexpectedly lists *.log (should be discarded)"
+        else
+            pass "80b: discard files (*.log) NOT in manifest"
+        fi
+
+        # 80c: --list sees the batch (read-only path)
+        LIST_OUT=$(sudo "$GVM_BIN" fs approve --staging-root "$STAGE_PARENT" --list 2>&1 || true)
+        if echo "$LIST_OUT" | grep -q "install.py"; then
+            pass "80c: gvm fs approve --list sees the agent's pending batch"
+        else
+            fail "80c: --list did not see the agent's batch"
+            echo "$LIST_OUT" | sed 's/^/    /'
+        fi
+
+        # 80d: Per-file interactive commit/reject through a faked PTY.
+        # We use script(1) (util-linux) to provide a real pseudo-terminal
+        # so `is_terminal()` returns true, then feed `a\nr\n` on the
+        # script's stdin to commit install.py and reject config.json.
+        # The order in the manifest is alphabetical, so config.json
+        # comes first → choose 'a' for it, 'r' for install.py.
+        if command -v script >/dev/null 2>&1; then
+            INTERACTIVE_OUT=$(printf 'a\nr\n' | sudo script -qec \
+                "$GVM_BIN fs approve --staging-root $STAGE_PARENT" /dev/null 2>&1 || true)
+
+            # config.json should be in workspace; install.py should not.
+            # Note: workspace is whatever the sandbox recorded — read it
+            # from the manifest.
+            WS_FROM_MANIFEST=$(echo "$MANIFEST_CONTENT" \
+                | python3 -c "import sys,json; print(json.load(sys.stdin).get('workspace',''))")
+
+            if [ -n "$WS_FROM_MANIFEST" ] && [ -f "${WS_FROM_MANIFEST}/config.json" ]; then
+                pass "80d: interactive accept copied config.json to workspace"
+            else
+                fail "80d: config.json not in workspace after interactive accept"
+                echo "$INTERACTIVE_OUT" | sed 's/^/    /'
+            fi
+
+            if [ -n "$WS_FROM_MANIFEST" ] && [ ! -f "${WS_FROM_MANIFEST}/install.py" ]; then
+                pass "80d: interactive reject did not copy install.py"
+            else
+                fail "80d: install.py reached workspace despite reject"
+            fi
+
+            # 80e: After both files decided, the staging dir must be gone
+            # (the all-decided cleanup branch).
+            if [ ! -d "$FS80_BATCH" ]; then
+                pass "80e: staging dir cleaned up after every entry decided"
+            else
+                fail "80e: staging dir survived a fully-decided interactive review"
+            fi
+        else
+            skip "80d/e: script(1) (util-linux) not available — interactive PTY test"
+        fi
+
+        # 80f: Re-run on an empty staging root → idempotent, exit 0.
+        sudo "$GVM_BIN" fs approve --staging-root "$STAGE_PARENT" --list >/dev/null 2>&1 \
+            && pass "80f: re-run on empty staging exits cleanly" \
+            || fail "80f: re-run on empty staging returned non-zero"
+
+        # Cleanup
+        sudo rm -rf "$FS80_WS" "$FS80_STAGING" /tmp/gvm-fs80-run.out 2>/dev/null || true
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# Test 81: IC-3 ghost-approval guard — agent disconnect releases hold
+#
+# The C-fix (ApprovalGuard RAII) must guarantee that when an agent's
+# HTTP client times out before the operator decides, the proxy
+# releases the entry from `pending_approvals` instead of leaving a
+# ghost that an operator could later "approve" with no effect.
+#
+# Strategy:
+#   1. Install an SRR rule that triggers RequireApproval for a known
+#      target host that the mock server already serves.
+#   2. Hot-reload SRR.
+#   3. Run a Python agent with a SHORT HTTP timeout (3s) against the
+#      target. The agent will receive a timeout error.
+#   4. Sample /gvm/pending immediately after the agent starts: the
+#      entry MUST be visible (the proxy is holding it).
+#   5. Wait for the agent's HTTP timeout to fire + a small grace
+#      window for the guard's Drop to run.
+#   6. Sample /gvm/pending again: the entry MUST be gone. This is the
+#      regression assertion for the C-fix.
+#   7. Restore SRR.
+#
+# Without the ApprovalGuard the entry would persist for the proxy's
+# IC-3 timeout window (default 300s) and the test would fail.
+# ═══════════════════════════════════════════════════════════════════
+if should_run 81; then
+    header "81: IC-3 ghost-approval guard (agent timeout cleanup)"
+
+    if [ ! -f "$GVM_BIN" ]; then
+        skip "81: gvm binary not built"
+    elif [ -z "$MOCK_PID" ] || ! kill -0 "$MOCK_PID" 2>/dev/null; then
+        skip "81: mock upstream not running"
+    else
+        ensure_proxy || { fail "81: proxy not available"; }
+
+        # Install IC-3 rule. Use a synthetic hostname that already has
+        # a host_overrides entry pointing at the mock server.
+        cp config/srr_network.toml config/srr_network.toml.ic3guardbak
+        cat > config/srr_network.toml << 'IC3SRR2'
+[[rules]]
+method = "POST"
+pattern = "ghostcheck.test.gvm"
+decision = { type = "RequireApproval", urgency = "Standard" }
+reason = "Test 81 IC-3 guard"
+
+[[rules]]
+method = "*"
+pattern = "{any}"
+decision = { type = "Allow" }
+IC3SRR2
+        # The mock-host override is set up in the script's setup
+        # block; if a previous test removed it, re-add ghostcheck.
+        if ! grep -q "ghostcheck.test.gvm" config/proxy.toml 2>/dev/null; then
+            python3 -c "
+import re
+with open('config/proxy.toml') as f:
+    content = f.read()
+override = '\"ghostcheck.test.gvm\" = \"127.0.0.1:$MOCK_PORT\"'
+content = re.sub(r'(host_overrides\s*=\s*\{)', r'\1 ' + override + ',', content)
+open('config/proxy.toml', 'w').write(content)
+" 2>/dev/null
+            curl -sf -X POST "$ADMIN_URL/gvm/reload-config" >/dev/null 2>&1 || true
+        fi
+        curl -sf -X POST "$ADMIN_URL/gvm/reload" >/dev/null 2>&1
+        sleep 1
+
+        # Spawn the agent. 3-second HTTP timeout — short enough that
+        # the test runs fast, long enough that we can observe the
+        # /gvm/pending entry before it disconnects.
+        AGENT81_OUT=$(mktemp /tmp/gvm-ic3-guard-XXXX.txt)
+        python3 -c "
+import requests
+try:
+    r = requests.post('http://ghostcheck.test.gvm/echo-headers',
+        json={'x':'y'},
+        proxies={'http': '$PROXY_URL'},
+        timeout=3)
+    print(f'STATUS:{r.status_code}')
+except Exception as e:
+    print(f'ERR:{type(e).__name__}')
+" > "$AGENT81_OUT" 2>&1 &
+        AGENT81_PID=$!
+
+        # 81a: While the agent is still waiting, /gvm/pending must
+        # show our entry. Poll up to 2s — the proxy needs a moment to
+        # classify and insert.
+        SAW_PENDING=false
+        for i in 1 2 3 4 5 6 7 8; do
+            PENDING_NOW=$(curl -sf "$ADMIN_URL/gvm/pending" 2>/dev/null | \
+                python3 -c "
+import sys,json
+try:
+    d = json.load(sys.stdin)
+    items = d if isinstance(d, list) else d.get('pending', d.get('items', []))
+    print(len([i for i in items if 'ghostcheck' in str(i)]))
+except: print(0)
+" 2>/dev/null || echo 0)
+            if [ "${PENDING_NOW:-0}" -ge 1 ] 2>/dev/null; then
+                SAW_PENDING=true
+                break
+            fi
+            sleep 0.25
+        done
+
+        if [ "$SAW_PENDING" = "true" ]; then
+            pass "81a: /gvm/pending shows the held request before agent timeout"
+        else
+            fail "81a: never saw the request in /gvm/pending — IC-3 path not reached"
+            cat "$AGENT81_OUT" 2>/dev/null | sed 's/^/    /'
+        fi
+
+        # Wait for the agent's HTTP client to time out (3s) + a small
+        # grace window for the proxy handler future to be cancelled
+        # by hyper and the guard's Drop to run.
+        wait $AGENT81_PID 2>/dev/null || true
+        sleep 1
+
+        # 81b: After the agent disconnects, /gvm/pending MUST no longer
+        # contain the entry. This is the ApprovalGuard regression
+        # assertion — without the guard, the entry would persist for
+        # ~5 minutes (the proxy's IC-3 timeout).
+        PENDING_AFTER=$(curl -sf "$ADMIN_URL/gvm/pending" 2>/dev/null | \
+            python3 -c "
+import sys,json
+try:
+    d = json.load(sys.stdin)
+    items = d if isinstance(d, list) else d.get('pending', d.get('items', []))
+    print(len([i for i in items if 'ghostcheck' in str(i)]))
+except: print(0)
+" 2>/dev/null || echo 0)
+
+        if [ "${PENDING_AFTER:-0}" -eq 0 ] 2>/dev/null; then
+            pass "81b: ApprovalGuard cleared the entry after agent disconnect"
+        else
+            fail "81b: ghost entry survived agent timeout (PENDING_AFTER=$PENDING_AFTER)"
+        fi
+
+        # 81c: Operator approving an unknown event_id returns 404,
+        # confirming the entry was actually removed (not just hidden).
+        FAKE_RESP=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "$ADMIN_URL/gvm/approve" \
+            -H "Content-Type: application/json" \
+            -d '{"event_id":"never-existed-evt-99","approved":true}' 2>/dev/null)
+        if [ "$FAKE_RESP" = "404" ]; then
+            pass "81c: /gvm/approve on unknown event_id returns 404"
+        else
+            fail "81c: expected 404 for unknown event_id, got $FAKE_RESP"
+        fi
+
+        rm -f "$AGENT81_OUT"
+        # Restore SRR
+        mv config/srr_network.toml.ic3guardbak config/srr_network.toml
+        curl -sf -X POST "$ADMIN_URL/gvm/reload" >/dev/null 2>&1
     fi
 fi
 

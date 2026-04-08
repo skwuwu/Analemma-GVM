@@ -777,6 +777,30 @@ pub struct SandboxState {
     /// if parent is alive but child is dead, resources are orphaned.
     #[serde(default)]
     pub child_pid: Option<u32>,
+    /// Parent PID's `starttime` (clock ticks since boot, field 22 of
+    /// `/proc/PID/stat`). Used by orphan detection to defeat PID reuse:
+    /// if the kernel reassigns `pid` to an unrelated process after the
+    /// original gvm exited, the new process will have a later starttime
+    /// and the cleanup code can correctly classify the original PID as
+    /// dead. `None` for state files written by older versions — those
+    /// fall back to the cmdline-substring check, preserving prior
+    /// behavior on upgrade.
+    #[serde(default)]
+    pub pid_starttime: Option<u64>,
+    /// Child PID's `starttime` — same purpose as `pid_starttime`, but
+    /// for the sandbox-init child. The child PID is the more common
+    /// reuse target because it lives in a separate process tree and
+    /// can outlive the parent on `gvm` segfault.
+    #[serde(default)]
+    pub child_pid_starttime: Option<u64>,
+    /// tmux session name, captured from `$TMUX` if `gvm` was launched
+    /// from inside a tmux pane. Operational/observability metadata
+    /// only — cleanup is still PID-based, so this field never affects
+    /// correctness. `gvm status` displays it so an operator looking
+    /// at "why is this sandbox still here?" can immediately find which
+    /// session owns it.
+    #[serde(default)]
+    pub tmux_session: Option<String>,
 }
 
 /// Get the state file path for a given PID.
@@ -795,9 +819,19 @@ pub fn record_sandbox_state(
     cgroup_path: Option<&str>,
     dns_target: Option<&str>,
 ) -> Result<()> {
+    let parent_pid = std::process::id();
     let state = SandboxState {
-        version: 2,
-        pid: std::process::id(),
+        // Bumped to 3 with the addition of `pid_starttime` /
+        // `child_pid_starttime` / `tmux_session`. Older v1/v2 files
+        // remain readable because the new fields use `#[serde(default)]`.
+        version: 3,
+        pid: parent_pid,
+        pid_starttime: read_proc_starttime(parent_pid),
+        child_pid_starttime: read_proc_starttime(config.child_pid),
+        // tmux's session env var is `$TMUX` (format: socket,pid,session-id).
+        // We keep the raw string — it survives `tmux ls` matching and is
+        // only ever displayed, never parsed for control flow.
+        tmux_session: std::env::var("TMUX").ok().filter(|s| !s.is_empty()),
         created_at: time::OffsetDateTime::now_utc().to_string(),
         veth_host: config.host_iface.clone(),
         veth_sandbox: config.sandbox_iface.clone(),
@@ -834,13 +868,55 @@ pub fn clear_sandbox_state() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Pure parser for `/proc/PID/stat`, returning the `starttime` field
+/// (field 22 in the original numbering — clock ticks since boot).
+///
+/// Split out from [`read_proc_starttime`] so it can be unit-tested on
+/// non-Linux dev hosts. The comm field is allowed to contain spaces and
+/// arbitrary parentheses, so we split after the LAST `)` to find the
+/// post-comm fields.
+fn parse_proc_stat_starttime(stat: &str) -> Option<u64> {
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    // Fields after `)` are space-separated: state(1) ppid(2) pgrp(3) ...
+    // starttime is field 22 in the original numbering, which is index 19
+    // here (0-based) because we already skipped `pid` and `comm`.
+    after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Read field 22 (`starttime`, clock ticks since boot) from `/proc/PID/stat`.
+///
+/// Returns `None` if the file is unreadable or malformed. The starttime is
+/// monotonic for the lifetime of a single process and resets only when the
+/// PID is reassigned to a new process by the kernel — making it the canonical
+/// "is this still the same process?" test.
+fn read_proc_starttime(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    parse_proc_stat_starttime(&stat)
+}
+
 /// Check if a process is still running (signal 0 = liveness check).
 /// Check if a process is genuinely alive (not zombie, not PID-reused).
 /// Returns false for:
 /// - Dead processes (ESRCH)
 /// - Zombie processes (state = Z in /proc/PID/stat)
 /// - PID-reused processes (start time differs from state file creation)
+///
+/// Backwards-compatible wrapper for callers that have no recorded
+/// starttime to compare against (legacy state files, or runtime call
+/// sites where the PID was learned from the live system rather than a
+/// state file). New cleanup paths should use
+/// [`is_pid_alive_with_starttime`] with the value from SandboxState
+/// to defeat PID reuse races.
 fn is_pid_alive(pid: u32) -> bool {
+    is_pid_alive_with_starttime(pid, None)
+}
+
+/// Same liveness check as [`is_pid_alive`] plus an optional starttime
+/// guard. When `expected_starttime` is `Some`, the current value of
+/// `/proc/PID/stat` field 22 must match exactly — otherwise the kernel
+/// has reassigned this PID to an unrelated process and we treat the
+/// original PID as dead so its leaked resources get cleaned up.
+fn is_pid_alive_with_starttime(pid: u32, expected_starttime: Option<u64>) -> bool {
     // Step 1: basic liveness check
     if unsafe { libc::kill(pid as i32, 0) != 0 } {
         return false;
@@ -855,17 +931,48 @@ fn is_pid_alive(pid: u32) -> bool {
 
     // Parse state field (3rd field, after PID and comm in parens)
     // Format: "PID (comm) S ..."  where S is the state character
-    if let Some(close_paren) = stat_content.rfind(')') {
-        let after_comm = &stat_content[close_paren + 2..];
-        let state = after_comm.chars().next().unwrap_or('?');
-        if state == 'Z' {
-            // Zombie — process exists but is dead, parent hasn't reaped
-            tracing::debug!(pid = pid, "PID is zombie — treating as dead for cleanup");
-            return false;
+    let close_paren = match stat_content.rfind(')') {
+        Some(i) => i,
+        None => return false,
+    };
+    let after_comm = &stat_content[close_paren + 2..];
+    let state = after_comm.chars().next().unwrap_or('?');
+    if state == 'Z' {
+        // Zombie — process exists but is dead, parent hasn't reaped
+        tracing::debug!(pid = pid, "PID is zombie — treating as dead for cleanup");
+        return false;
+    }
+
+    // Step 3: starttime check (preferred — defeats PID reuse races).
+    // The starttime field is monotonic per-process; if it differs from
+    // what we recorded at sandbox launch, the kernel has handed this PID
+    // to a brand new process and the original is gone. This is the
+    // canonical PID identity check on Linux.
+    if let Some(expected) = expected_starttime {
+        let current_starttime = parse_proc_stat_starttime(&stat_content);
+        match current_starttime {
+            Some(t) if t == expected => return true,
+            Some(t) => {
+                tracing::info!(
+                    pid = pid,
+                    expected_starttime = expected,
+                    current_starttime = t,
+                    "PID reuse detected — original process is gone, treating as dead"
+                );
+                return false;
+            }
+            None => {
+                // Couldn't parse current starttime — fall through to the
+                // less precise cmdline check rather than fail open.
+            }
         }
     }
 
-    // Step 3: verify it's actually a GVM-related process (not PID reuse)
+    // Step 4: fallback heuristic for legacy state files without
+    // recorded starttime. Substring match — defeats most casual
+    // reassignments but not all (e.g. unrelated `/usr/bin/gvm-helper`
+    // process). New state files always carry starttime so they skip
+    // this branch entirely.
     let cmdline_path = format!("/proc/{}/cmdline", pid);
     match std::fs::read_to_string(&cmdline_path) {
         Ok(cmdline) => cmdline.contains("gvm"),
@@ -1035,11 +1142,18 @@ pub fn cleanup_all_orphans_report() -> Result<CleanupReport> {
         // Skip if the owning process is still alive AND has an active child.
         // If parent is alive but child_pid is dead, resources are orphaned
         // (parent hasn't cleaned up yet — may be stuck in post_exit_audit).
-        if is_pid_alive(state.pid) {
+        //
+        // The starttime guards (v3+ state files) defeat PID reuse: if the
+        // kernel has reassigned `state.pid` or `state.child_pid` to an
+        // unrelated process between sandbox launch and this scan, the
+        // current /proc/PID/stat starttime will not match the recorded
+        // value and the PID is treated as dead — so the leaked resources
+        // get cleaned up instead of being skipped indefinitely.
+        if is_pid_alive_with_starttime(state.pid, state.pid_starttime) {
             // Also check child_pid if recorded (v2+ state files)
             let child_alive = state
                 .child_pid
-                .map(|cp| cp > 0 && is_pid_alive(cp))
+                .map(|cp| cp > 0 && is_pid_alive_with_starttime(cp, state.child_pid_starttime))
                 .unwrap_or(true); // No child_pid → assume alive (v1 compat)
             if child_alive {
                 continue;
@@ -1096,7 +1210,10 @@ pub fn cleanup_all_orphans_report() -> Result<CleanupReport> {
                 continue;
             }
         };
-        if !is_pid_alive(state.pid) {
+        // Legacy /tmp state files predate v3, but if a v3 file ever lands
+        // here we still want the starttime guard. `pid_starttime` is `None`
+        // for true legacy entries, so behavior is unchanged for those.
+        if !is_pid_alive_with_starttime(state.pid, state.pid_starttime) {
             tracing::info!(
                 pid = state.pid,
                 "Cleaning up legacy /tmp state file (PID {} dead)",
@@ -1469,4 +1586,54 @@ fn run_ip6tables(args: &[&str]) -> Result<()> {
         anyhow::bail!("ip6tables {} failed: {}", args.join(" "), stderr.trim());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_proc_stat_starttime;
+
+    // Field 22 (starttime) is the canonical PID-reuse defeater. The parser
+    // has to survive comm fields containing spaces, parens, and surprising
+    // characters — all of which Linux allows in /proc/PID/stat. These tests
+    // anchor that contract so a future refactor can't silently break it.
+
+    #[test]
+    fn starttime_parses_simple_kernel_thread() {
+        // Real-world shape: `pid (comm) state ppid pgrp session tty_nr tpgid
+        // flags minflt cminflt majflt cmajflt utime stime cutime cstime
+        // priority nice num_threads itrealvalue starttime ...`
+        // We only care that field 22 (index 19 after `)`) is what we get back.
+        let stat = "1234 (bash) S 1 1234 1234 34816 1234 4194304 100 0 0 0 \
+                    1 2 0 0 20 0 1 0 987654321 ...";
+        assert_eq!(parse_proc_stat_starttime(stat), Some(987654321));
+    }
+
+    #[test]
+    fn starttime_handles_comm_with_spaces_and_parens() {
+        // Linux allows comm to contain almost anything up to 16 bytes.
+        // We must split after the LAST `)` to find post-comm fields.
+        let stat = "4242 (weird (comm) name) R 1 4242 4242 0 -1 4194304 0 0 \
+                    0 0 0 0 0 0 20 0 1 0 555555 ...";
+        assert_eq!(parse_proc_stat_starttime(stat), Some(555555));
+    }
+
+    #[test]
+    fn starttime_returns_none_on_truncated_stat() {
+        // Fewer than 22 fields → must not panic, must not lie.
+        let stat = "1 (init) S 0 1 1 0";
+        assert_eq!(parse_proc_stat_starttime(stat), None);
+    }
+
+    #[test]
+    fn starttime_returns_none_when_no_close_paren() {
+        // Pathological / corrupted input.
+        assert_eq!(parse_proc_stat_starttime("garbage no parens here"), None);
+    }
+
+    #[test]
+    fn starttime_returns_none_when_field_22_not_numeric() {
+        // Non-numeric in field 22 → must fail closed (None), not panic.
+        let stat = "1 (init) S 0 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 NaN ...";
+        assert_eq!(parse_proc_stat_starttime(stat), None);
+    }
 }

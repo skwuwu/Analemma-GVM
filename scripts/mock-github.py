@@ -22,11 +22,33 @@ ROUTES = {
     "/post": "",  # will echo body
 }
 
+def _echo_headers_payload(headers):
+    """Snapshot of the auth-relevant headers the proxy actually delivered.
+
+    Used by the credential-injection sub-tests in ec2-e2e-test.sh (Test 76):
+    the proxy is supposed to strip every agent-supplied auth header and
+    inject only the value configured in secrets.toml — this endpoint lets
+    the test see exactly what arrived on the upstream side of the wire.
+    """
+    return json.dumps({
+        "host": headers.get("Host", ""),
+        "authorization": headers.get("Authorization", ""),
+        "x_api_key": headers.get("x-api-key", ""),
+        "apikey": headers.get("apikey", ""),
+        "x_auth_token": headers.get("x-auth-token", ""),
+        "cookie": headers.get("Cookie", ""),
+    })
+
+
 class MockHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
-        body = ROUTES.get(path, json.dumps({"message": "Not Found", "mock": True}))
-        status = 200 if path in ROUTES else 404
+        if path == "/echo-headers":
+            body = _echo_headers_payload(self.headers)
+            status = 200
+        else:
+            body = ROUTES.get(path, json.dumps({"message": "Not Found", "mock": True}))
+            status = 200 if path in ROUTES else 404
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
@@ -36,7 +58,9 @@ class MockHandler(http.server.BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length) if content_length else b""
         path = self.path.split("?")[0]
-        if path == "/post":
+        if path == "/echo-headers":
+            response = _echo_headers_payload(self.headers)
+        elif path == "/post":
             # Echo body like httpbin
             response = json.dumps({"data": body.decode("utf-8", errors="replace"), "url": "http://mock/post"})
         else:
