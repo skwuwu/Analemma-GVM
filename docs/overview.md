@@ -10,7 +10,7 @@ Version: 0.1.0 | Date: 2026-03-14
 
 Analemma-GVM is a transparent enforcement proxy for AI agent I/O operations. It enforces security policies at the infrastructure level, ensuring that no agent — regardless of framework, language, or behavior — can bypass governance controls. The system operates as a "security kernel" sitting between AI agents and external APIs.
 
-**Core thesis**: Security must be structural, not behavioral. Agent code is unchanged. Enforcement is guaranteed by the proxy layer.
+**Core thesis**: Security must be structural, not behavioral. Agent code is unchanged. In `--sandbox` mode, enforcement is structurally guaranteed by kernel-level redirection; in cooperative mode it depends on the agent honouring `HTTP_PROXY`.
 
 ---
 

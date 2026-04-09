@@ -1,16 +1,16 @@
 # Analemma-GVM
 
-I wanted to run multiple OpenClaw agents for my startup. But every time I let agents everything what they wanna do, there was always a little anxiety: What if it does something it shouldn't?
+I wanted to run multiple autonomous AI agents(such as OpenClaw) for my personal affairs. But every time I let agents everything what they wanna do, there was always a little anxiety. What if it does something it shouldn't? What if it leaks personal informations or deletes important datas?
 
-Existing answers(such as Openshell, OPA+Envoy) required Kubernetes, Envoy sidecars, or trusting the agent to behave. I wanted a light weight alternative which doesn't need infrastructure settings and highly enforces what agents do.
+Existing answers (such as NeMo Guardrails, OPA+Envoy) required Kubernetes, Envoy sidecars, or trusting the agent to behave. I wanted a light weight alternative which doesn't need infrastructure settings and highly enforces what agents do.
 
-So I built GVM(Governance Virtual Machine) — an governance runtime that exists between your agent and the actual actions. It is designed assuming that agents can't be fully trusted and can sometimes be hostile. It watches every API call, blocks what you haven't approved, and keeps a tamper-proof log(by Merkle chain) of agent's actions.
+So I built GVM(Governance Virtual Machine) — an governance runtime that exists between your agent and the actual actions. It is designed assuming that agents can't be fully trusted and can sometimes be hostile. It watches every API call, blocks what you haven't approved, and keeps a tamper-evident log (Merkle chain) of agent's actions.
 
 ```
 Agent (any framework) → GVM Proxy → External APIs
 ```
 
-A single Rust binary. No Kubernetes, no service mesh, no sidecar, no GPU. Linux x86_64 host with glibc — that's the entire runtime requirement for cooperative and watch modes. Sandbox mode adds the standard `iproute2` / `iptables` userland that ships with every server distribution. See [Requirements](#requirements) below for the full matrix.
+A single Rust binary. No Kubernetes, no service mesh, no sidecar, no GPU. Cooperative and watch modes are pure userspace and build cleanly on Linux, macOS, and Windows — they only need a Rust toolchain. Sandbox mode is Linux-only because it relies on user/PID/mount/net namespaces, seccomp-BPF, and the standard `iproute2` / `iptables` userland that ships with every server distribution. See [Requirements](#requirements) below for the full matrix.
 
 ## Demo — Watch → Suggest → Enforce in 3 commands
 
@@ -43,7 +43,7 @@ agent's URL list differ.
 
 - **Solo devs / small teams** running AI agents in production without a dedicated security team
 - **Anyone who's nervous** about giving an agent access to Stripe, Slack, Gmail, or a database API
-- **Startups** that need governance and audit trails but can't adopt enterprise infra (OPA, Envoy, NVIDIA OpenShell)
+- **Startups** that need governance and audit trails but can't adopt enterprise infra (OPA, Envoy, NVIDIA NeMo Guardrails)
 - **Agent framework users** (OpenClaw, CrewAI, LangChain, AutoGen) who want a safety layer that doesn't require code changes
 
 If you're running agents without any governance tools, you may need this.
@@ -52,10 +52,10 @@ If you're running agents without any governance tools, you may need this.
 
 ## Requirements
 
-- **OS**: Linux x86_64. The pre-built binary is dynamically linked against glibc — works on Ubuntu 20.04+, Debian 11+, RHEL 8+, Amazon Linux 2023, and equivalents. Alpine / other musl distros need a `x86_64-unknown-linux-musl` build from source.
-- **Cooperative / watch modes**: glibc only. No extra system tools.
-- **`--sandbox` mode**: additionally requires `iproute2` (`ip`), `iptables`, and `ip6tables` on the host (preinstalled on most server distros). `gvm preflight` reports exactly what is missing and prints the install command for your distro. Either run as `sudo` or grant the binary capabilities directly: `sudo setcap 'cap_net_admin,cap_sys_admin,cap_sys_ptrace+ep' ./gvm`.
-- **Other modes** (`--contained`): Docker on the host instead of the above.(not stabilized yet-experimental)
+- **Cooperative / watch modes**: any OS that can run a Rust binary — Linux, macOS, Windows. No system tools required beyond the agent's own runtime (Python, Node, etc.). The pre-built release binary targets Linux x86_64 / glibc; on macOS or Windows, build from source with `cargo build --release`.
+- **Pre-built binary**: Linux x86_64, dynamically linked against glibc — works on Ubuntu 20.04+, Debian 11+, RHEL 8+, Amazon Linux 2023, and equivalents. Alpine / other musl distros need a `x86_64-unknown-linux-musl` build from source.
+- **`--sandbox` mode**: Linux only. Additionally requires `iproute2` (`ip`), `iptables`, and `ip6tables` on the host (preinstalled on most server distros). `gvm preflight` reports exactly what is missing and prints the install command for your distro. Either run as `sudo` or grant the binary capabilities directly: `sudo setcap 'cap_net_admin,cap_sys_admin,cap_sys_ptrace+ep' ./gvm`.
+- **`--contained` mode** (experimental, not stabilized): Docker on the host instead of the kernel features above.
 
 ## Quick Start
 
@@ -91,7 +91,7 @@ Everything is `gvm run` with flags. Watch → suggest → enforce. [Quick Start 
 
 ## What it does
 
-GVM is the enforcement layer, not a filter. It doesn't read prompts or classify outputs — it intercepts the HTTP calls the agent actually makes.
+GVM is the enforcement layer, not a filter. It doesn't read prompts or classify outputs — it intercepts HTTP calls the agent actually makes.
 
 | Decision | What happens | Example |
 |----------|-------------|---------|
@@ -111,7 +111,7 @@ gvm check --agent-id finance-bot --host api.stripe.com --method POST
 #  Latency:      38μs
 ```
 
-Same classification function as the live proxy. Check results always match real enforcement.
+Same classification function as the live proxy — given the same inputs, `gvm check` and live enforcement reach the same decision (rate-limiter and approval state are evaluated at request time and not exercised by `check`).
 
 ---
 
@@ -134,7 +134,7 @@ Pick one from each column and combine with the corresponding flags.
 | Mode | Command | Trust model |
 |------|---------|-------------|
 | **Cooperative** (default) | `gvm run agent.py` | `HTTP_PROXY`/`HTTPS_PROXY` env vars are injected. The agent's HTTP client must honour them. A non-cooperating client that opens a raw socket to port 443 bypasses the proxy. Suitable for agents you wrote or trust to use standard libraries (Python `requests`, Node `fetch`/`undici`, curl). |
-| **Sandbox** | `gvm run --sandbox agent.py` | Linux user/PID/mount/net namespaces + seccomp-BPF + iptables DNAT. All outbound port 443 is rewritten to the proxy's MITM listener at the kernel level. The agent **cannot** reach the network except through GVM — there is no env var to unset. Works with any runtime (Python, Node, Go, arbitrary binaries). |
+| **Sandbox** | `gvm run --sandbox agent.py` | Linux user/PID/mount/net namespaces + seccomp-BPF + iptables DNAT. All outbound port 443 is rewritten to the proxy's MITM listener at the kernel level. The agent has no userspace path to the network except through GVM — there is no env var to unset, and a non-cooperating client opening a raw socket is redirected at the kernel level. Works with any runtime (Python, Node, Go, arbitrary binaries). |
 | **Contained** (experimental) | `gvm run --contained agent.py` | Docker `--internal` network + DNAT, same trust properties as sandbox but with Docker as the boundary. |
 
 **Combining the two axes** — `--watch` and `--sandbox` compose freely:
@@ -173,7 +173,7 @@ but the same three commands work with `--sandbox` added to each line.
 - Rust, ~17MB release binary, ~10MB RSS at idle
 - Policy evaluation < 1μs (SRR + ABAC, no heap allocation on hot path)
 - WAL with Merkle chain, size-based rotation (100MB x 10 segments). Local storage — bring your own retention (S3, GCS, etc)
-- 329 tests, 60-min chaos stress test (proxy kill, network partition, disk pressure) — [PASS](docs/test-report.md#chaos-stress-test-30-minutes-2026-04-05)
+- 329 tests, 60-min chaos stress test (proxy kill, network partition, disk pressure) — [PASS](docs/test-report.md#910-chaos-stress-test-60-minutes)
 - seccomp-BPF with ~130 whitelisted syscalls, ENOSYS default for unknown
 - Sandbox auto-cleanup via per-PID state files (Docker pattern)
 
@@ -190,6 +190,6 @@ but the same three commands work with `--sandbox` added to each line.
 | [Changelog](docs/internal/CHANGELOG.md) | Roadmap, implementation log |
 
 ---
-- Feedback on technical and structural issues or bug reports is always welcome.
+- Feedback on technical and structural issues or bug reports is always welcome!
 
 v0.4 pre-release. Apache 2.0. [Issues →](https://github.com/skwuwu/Analemma-GVM/issues)

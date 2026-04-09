@@ -112,7 +112,7 @@ For stronger isolation, use `--sandbox`.
 
 ## Mode 3: Sandbox (`gvm run --sandbox`)
 
-The agent runs in isolated Linux namespaces (user, PID, mount, network) with seccomp-BPF syscall filtering, TC ingress filter network enforcement (kernel-level, unbypassable), and overlayfs filesystem governance. This is the **production security boundary**.
+The agent runs in isolated Linux namespaces (user, PID, mount, network) with seccomp-BPF syscall filtering, TC ingress filter network enforcement (kernel-level, no userspace bypass), and overlayfs filesystem governance. This is the **production security boundary**.
 
 **Resource lifecycle**: Each sandbox writes a per-PID state file (`/run/gvm/gvm-sandbox-{pid}.state`) listing all created resources (veth, iptables rules, mounts, cgroups). On normal exit, cleanup + delete. On crash, the next `gvm run --sandbox` auto-cleans orphaned resources. Manual cleanup: `gvm cleanup`.
 

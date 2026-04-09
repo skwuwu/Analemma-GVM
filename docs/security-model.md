@@ -83,7 +83,7 @@ If an attacker has root access to the host, GVM — like any userspace process �
 
 **Current (v1)**:
 - Cooperative default: SDK sets `HTTP_PROXY` via `GVMAgent.create_session()`.
-- **Enforced mode**: `gvm run --sandbox` (Linux namespace + veth + TC filter + iptables + seccomp). Three-layer defense-in-depth: (1) TC ingress filter on host-side veth (unbypassable), (2) iptables OUTPUT chain inside sandbox, (3) seccomp AF_NETLINK blocking prevents iptables modification.
+- **Enforced mode**: `gvm run --sandbox` (Linux namespace + veth + TC filter + iptables + seccomp). Three-layer defense-in-depth: (1) TC ingress filter on host-side veth (kernel-enforced, no userspace bypass), (2) iptables OUTPUT chain inside sandbox, (3) seccomp AF_NETLINK blocking prevents iptables modification.
 - Docker fallback: `gvm run --contained` (experimental — not production-ready, see Known Limitations).
 - Limitation: containment is opt-in and process-scoped. Processes not launched via `gvm run` still rely on cooperative proxy routing.
 
@@ -135,7 +135,7 @@ Building a DNS filter into GVM would create more problems than it solves: SRR-al
 
 | Kernel | TC filter | iptables | seccomp AF_NETLINK | Enforcement |
 |--------|-----------|----------|--------------------|-------------|
-| >= 4.15 | Active | Active | Active | Triple-layer (unbypassable) |
+| >= 4.15 | Active | Active | Active | Triple-layer (kernel-enforced) |
 | 3.17 - 4.14 | Fallback | Active | Active | Dual-layer (seccomp prevents iptables escape) |
 | < 3.17 | N/A | Active | N/A | iptables only (`--contained` Docker mode is experimental) |
 
@@ -189,7 +189,7 @@ Both paths pre-compile regex at config load time (fail-fast on invalid patterns)
 
 **Mitigation (v1)**: At startup, the proxy records SHA-256 hashes of all loaded config files as a `gvm.system.config_load` event in the Merkle chain via `append_durable()`. The hashes are stored in the event's `context` field as `label → hex digest` pairs.
 
-**Detection**: An auditor compares `gvm.system.config_load` events across restarts. A hash mismatch indicates the config file was modified between runs. Because the event is in the Merkle chain, the hash record itself is tamper-proof — an attacker cannot retroactively alter the recorded hash without breaking the chain.
+**Detection**: An auditor compares `gvm.system.config_load` events across restarts. A hash mismatch indicates the config file was modified between runs. Because the event is in the Merkle chain, the hash record itself is tamper-evident — an attacker cannot retroactively alter the recorded hash without breaking the chain, which any auditor will detect on verification.
 
 **Scope**: Detects file modification after the fact. Does not prevent loading a tampered config (the proxy still starts with whatever files are on disk). Real-time prevention requires file integrity monitoring (e.g., IMA/EVM, AIDE) at the OS level.
 
