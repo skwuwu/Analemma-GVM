@@ -55,7 +55,31 @@ v0.2 shipped: Shadow Mode + intent store, CONNECT tunnel, SRR hot-reload, eBPF u
 
 ## Implementation Log
 
-### 2026-04-09: v0.4.6 — three follow-ups exposed by validating v0.4.5 on EC2
+### 2026-04-10: v0.4.7 -- fuzzing CI hardening + cargo-audit ignore review process
+
+Four CI weaknesses called out during a security review of the fuzzing pipeline. None of them are exploitable bugs in the runtime, but together they meant fuzzing was producing far less assurance than the README implied and the audit-ignore list was opaque.
+
+1. **Tiered fuzz schedule** ([.github/workflows/fuzz.yml](../../.github/workflows/fuzz.yml)). The previous schedule ran every target for a flat 5 minutes daily. libFuzzer accumulates coverage as it explores corpora, and 5 minutes is enough only to verify "no immediate crashes from cached seeds" -- deeper code paths (SRR regex backtracking edges, WAL Merkle batch parsing, HTTP framing pivots) take tens of minutes to reach. Switched to **Mon-Sat 5 min smoke + Sunday 30 min deep**, with `workflow_dispatch` accepting any duration the operator picks. Sunday's run is what actually grows the corpus; weekday runs guard against new crashes on the existing corpus seeds. Why 30 not 60: GitHub Actions free-tier minutes are finite, and 30 min × 6 targets × 1 day/week = 3 Actions-hours/week, which fits comfortably under the free quota. If we ever find a real crash that needs a longer hunt, bump it.
+
+2. **Coverage feedback in the run summary** ([.github/workflows/fuzz.yml](../../.github/workflows/fuzz.yml)). Previously the only signal a fuzz run produced was "did it crash?" -- there was no way to tell if it actually executed anything new or just sat on the cached corpus. Added `-print_final_stats=1` and parsed the `stat::*` and `cov:.*ft:` lines into a per-target Markdown block in `$GITHUB_STEP_SUMMARY`, plus corpus entry count and total bytes. The fuzz logs themselves are also uploaded as 14-day retention artifacts. The next time someone looks at a Sunday run they can see whether `cov` and `ft` actually grew or whether the deep run was a waste of minutes.
+
+3. **libFuzzer dictionaries** ([fuzz/dictionaries/srr.dict](../../fuzz/dictionaries/srr.dict), [fuzz/dictionaries/wal.dict](../../fuzz/dictionaries/wal.dict), [fuzz/dictionaries/http.dict](../../fuzz/dictionaries/http.dict)). Three dictionaries written, each containing the tokens that look meaningful to the corresponding parser:
+    - `srr.dict`: HTTP methods, scheme tokens, fixture host names, SRR pattern wildcards (`{any}`, `{host}`, `*`), path traversal pivots (`../`, `%2F`, `%00`), GraphQL operationName values the rule fixture inspects.
+    - `wal.dict`: JSON structural tokens, every WAL event field name, batch / Merkle metadata keys, all five `EventStatus` values, decision shapes the parser must accept.
+    - `http.dict`: HTTP/1.x methods + versions, header names the proxy actually looks at, smuggling pivots (`Content-Length` / `Transfer-Encoding` interleavings).
+    The fuzz workflow now passes `-dict=...` for the four targets that have a matching dictionary (`fuzz_srr`, `fuzz_wal_parse`, `fuzz_http_parse`, `fuzz_path_normalize`). Targets without a dedicated dictionary fall back to plain byte mutation, no error.
+
+4. **cargo-audit ignore review process** ([audit.toml](../../audit.toml), [.github/workflows/ci.yml](../../.github/workflows/ci.yml)). The CI was carrying five `--ignore RUSTSEC-...` flags inline with no explanation of why each one was being suppressed. Moved all five into a project-root `audit.toml` with a header that documents the rule for the project: an unjustified ignore is treated as a security defect on the same severity as a missing review, every entry needs a 1-sentence reachability assessment, and the full list is reviewed on each minor release. The five existing entries are explicitly marked **NEEDS-REVIEW**, blocking on the v0.5 audit pass -- this commit does not silently approve them, it just makes the silence visible. The CI step now simply runs `cargo audit` (which auto-discovers `audit.toml`); the ignore list is no longer hidden in shell flags.
+
+**Items intentionally deferred to v0.4.8**:
+- Structure-aware fuzzing via the `arbitrary` crate. The current targets feed raw bytes and split them into method/host/path/body using ad-hoc length prefixes; this means the fuzzer spends a lot of cycles producing inputs that fail at the very first parse step. Wrapping the fuzz inputs in `Arbitrary` impls (`StructuredHttpRequest`, `StructuredWalEvent`, etc.) would let the mutator generate inputs that are already structurally valid and instead exercise deeper logic. This is a non-trivial rewrite of all six targets and warrants its own PR.
+- Full v0.5 audit review of the five RUSTSEC IDs. Each one needs an actual reachability assessment ("does GVM call the vulnerable function?") and a remediation plan ("upgrade X to Y when released, or pin to Z"). That review should land in the v0.5 PR alongside actually flipping any of these from NEEDS-REVIEW to either accepted-with-justification or fixed.
+
+**Risk**: None at runtime -- this is entirely CI / configuration work. The audit step continues to fail on any new advisory that is not in `audit.toml`, so the only behavior change in CI is that the comment trail is now visible at the diff level instead of hidden in shell flags.
+
+---
+
+### 2026-04-09: v0.4.6 -- three follow-ups exposed by validating v0.4.5 on EC2
 
 Verifying v0.4.5 against the actual EC2 dry run of Test 82 surfaced three follow-ups. None are new bugs in the strict sense (two are over-eager fixes from v0.4.5, one is an existing bug in the loader's serde shape that the v0.4.5 work simply revealed). All three are needed for Test 82 to actually pass.
 

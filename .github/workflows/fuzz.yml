@@ -1,12 +1,32 @@
-# Continuous fuzzing: runs cargo-fuzz on all targets.
-# Schedule: daily at 03:00 UTC + manual trigger.
-# Each target runs for 5 minutes (300s) per invocation.
+# Continuous fuzzing: cargo-fuzz on all targets.
+#
+# Schedule strategy (chosen to balance Actions free-tier minutes against
+# meaningful libFuzzer coverage growth):
+#
+#   * Mon-Sat 03:00 UTC : 5 minutes per target  (smoke / regression)
+#   * Sunday  03:00 UTC : 30 minutes per target (deep run, accumulates corpus)
+#   * manual workflow_dispatch : caller picks duration
+#
+# 5 minutes per target is enough to verify no immediate crashes on the
+# current corpus seeds; the Sunday run is what actually grows coverage
+# into deeper paths (SRR regex backtracking edges, WAL Merkle batch
+# parsing, HTTP framing pivots). Anything longer than ~30 min/target
+# starts eating noticeable Actions minutes -- revisit if we ever find
+# crashes that need a longer hunt.
+#
+# Each target gets a libFuzzer dictionary (fuzz/dictionaries/*.dict) so
+# the mutator starts from meaningful tokens (HTTP methods, JSON keys,
+# SRR pattern wildcards) instead of having to discover them by random
+# byte mutation. -print_final_stats=1 is collected and surfaced via
+# GITHUB_STEP_SUMMARY so it is obvious whether a run actually grew
+# coverage or just sat on the cached corpus.
 
 name: Fuzz
 
 on:
   schedule:
-    - cron: '0 3 * * *'  # Daily at 03:00 UTC
+    - cron: '0 3 * * 1-6'  # Mon-Sat 03:00 UTC -- short run
+    - cron: '0 3 * * 0'    # Sun 03:00 UTC      -- deep run
   workflow_dispatch:
     inputs:
       duration:
@@ -20,7 +40,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  FUZZ_DURATION: ${{ github.event.inputs.duration || '300' }}
 
 jobs:
   fuzz:
@@ -57,15 +76,81 @@ jobs:
           restore-keys: |
             fuzz-corpus-${{ matrix.target }}-
 
+      - name: Pick fuzz duration
+        id: duration
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "secs=${{ github.event.inputs.duration }}" >> $GITHUB_OUTPUT
+            echo "label=manual" >> $GITHUB_OUTPUT
+          elif [ "$(date -u +%u)" = "7" ]; then
+            # Sunday -- deep run
+            echo "secs=1800" >> $GITHUB_OUTPUT
+            echo "label=deep (Sun)" >> $GITHUB_OUTPUT
+          else
+            echo "secs=300" >> $GITHUB_OUTPUT
+            echo "label=smoke (weekday)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Pick dictionary
+        id: dict
+        run: |
+          # Map fuzz target to dictionary file. Targets without a
+          # dedicated dictionary fall back to no -dict flag.
+          case "${{ matrix.target }}" in
+            fuzz_srr)            echo "path=../fuzz/dictionaries/srr.dict"  >> $GITHUB_OUTPUT ;;
+            fuzz_wal_parse)      echo "path=../fuzz/dictionaries/wal.dict"  >> $GITHUB_OUTPUT ;;
+            fuzz_http_parse)     echo "path=../fuzz/dictionaries/http.dict" >> $GITHUB_OUTPUT ;;
+            fuzz_path_normalize) echo "path=../fuzz/dictionaries/http.dict" >> $GITHUB_OUTPUT ;;
+            *)                   echo "path=" >> $GITHUB_OUTPUT ;;
+          esac
+
       - name: Run fuzzer
         if: github.event.inputs.target == '' || github.event.inputs.target == matrix.target
         run: |
           cd fuzz
+          DICT_ARG=""
+          if [ -n "${{ steps.dict.outputs.path }}" ] && [ -f "${{ steps.dict.outputs.path }}" ]; then
+            DICT_ARG="-dict=${{ steps.dict.outputs.path }}"
+          fi
+          mkdir -p stats
+          set -o pipefail
           cargo +nightly fuzz run ${{ matrix.target }} -- \
-            -max_total_time=${{ env.FUZZ_DURATION }} \
-            -max_len=65536
+            -max_total_time=${{ steps.duration.outputs.secs }} \
+            -max_len=65536 \
+            -print_final_stats=1 \
+            $DICT_ARG \
+            2>&1 | tee "stats/${{ matrix.target }}.log"
         env:
           RUST_BACKTRACE: 1
+
+      - name: Surface fuzz stats in step summary
+        if: always()
+        run: |
+          cd fuzz
+          LOG="stats/${{ matrix.target }}.log"
+          {
+            echo "## ${{ matrix.target }} (${{ steps.duration.outputs.label }}, ${{ steps.duration.outputs.secs }}s)"
+            echo ""
+            if [ -f "$LOG" ]; then
+              echo '### libFuzzer final stats'
+              echo '```'
+              grep -E '^stat::|cov:.*ft:' "$LOG" | tail -20 || echo '(no stats lines emitted)'
+              echo '```'
+              echo ''
+              echo '### Corpus size'
+              CORPUS_DIR="corpus/${{ matrix.target }}"
+              if [ -d "$CORPUS_DIR" ]; then
+                COUNT=$(find "$CORPUS_DIR" -type f | wc -l)
+                BYTES=$(du -sb "$CORPUS_DIR" | cut -f1)
+                echo "- entries: $COUNT"
+                echo "- bytes:   $BYTES"
+              else
+                echo "- (no corpus directory)"
+              fi
+            else
+              echo '_(no log captured)_'
+            fi
+          } >> $GITHUB_STEP_SUMMARY
 
       - name: Save corpus
         if: always()
@@ -82,3 +167,12 @@ jobs:
           path: |
             fuzz/artifacts/${{ matrix.target }}/*
           retention-days: 30
+
+      - name: Upload fuzz logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-stats-${{ matrix.target }}
+          path: fuzz/stats/${{ matrix.target }}.log
+          retention-days: 14
+          if-no-files-found: ignore

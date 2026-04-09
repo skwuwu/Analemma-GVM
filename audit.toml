@@ -1,0 +1,43 @@
+# cargo-audit configuration.
+#
+# Each advisory listed under [advisories.ignore] needs an explicit
+# justification comment immediately above it. The rule for this
+# project: an unjustified ignore is treated as a security defect on
+# the same severity as a missing review. Pre-1.0 the bar is "is the
+# vulnerable code path actually reachable from GVM, and is there a
+# fix planned before v0.5".
+#
+# Audit cadence: review every entry on each minor release (v0.4 → v0.5).
+# When a new advisory is added, link to:
+#   - the advisory ID at https://rustsec.org/advisories/{ID}.html
+#   - a 1-sentence reachability assessment ("is GVM affected?")
+#   - a 1-sentence remediation plan ("upgrade X to Y when released")
+#
+# All five entries below are pending v0.5 review (tracked in
+# docs/internal/CHANGELOG.md). Until that review, this file is the
+# single source of truth -- the workflow stops passing -ignore on the
+# CLI and reads from this file instead.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2025-0046 -- pending v0.5 review.
+    # Status: NEEDS-REVIEW. Confirm vulnerable function is not on the
+    # GVM hot path; if it is, plan dependency upgrade before v0.5.
+    "RUSTSEC-2025-0046",
+
+    # RUSTSEC-2025-0118 -- pending v0.5 review.
+    # Status: NEEDS-REVIEW. Same procedure as above.
+    "RUSTSEC-2025-0118",
+
+    # RUSTSEC-2026-0006 -- pending v0.5 review.
+    # Status: NEEDS-REVIEW.
+    "RUSTSEC-2026-0006",
+
+    # RUSTSEC-2026-0020 -- pending v0.5 review.
+    # Status: NEEDS-REVIEW.
+    "RUSTSEC-2026-0020",
+
+    # RUSTSEC-2026-0021 -- pending v0.5 review.
+    # Status: NEEDS-REVIEW.
+    "RUSTSEC-2026-0021",
+]

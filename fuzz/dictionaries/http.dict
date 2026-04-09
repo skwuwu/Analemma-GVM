@@ -1,0 +1,61 @@
+# libFuzzer dictionary for fuzz_http_parse.
+# Tokens for an HTTP/1.1 request/response framing fuzzer.
+
+# Methods
+"GET"
+"POST"
+"PUT"
+"DELETE"
+"PATCH"
+"HEAD"
+"OPTIONS"
+"CONNECT"
+
+# Versions
+"HTTP/1.0"
+"HTTP/1.1"
+"HTTP/2"
+
+# Line/header separators
+"\r\n"
+"\r\n\r\n"
+": "
+" "
+
+# Standard headers httparse + the proxy actually inspect
+"Host:"
+"Content-Length:"
+"Content-Type:"
+"Transfer-Encoding:"
+"chunked"
+"Connection:"
+"keep-alive"
+"close"
+"Authorization:"
+"Bearer "
+"Cookie:"
+"Accept:"
+"Accept-Encoding:"
+"User-Agent:"
+"X-GVM-Agent-Id:"
+"X-GVM-Tenant-Id:"
+"Via:"
+
+# Statuses
+"200 OK"
+"301 Moved Permanently"
+"403 Forbidden"
+"404 Not Found"
+"500 Internal Server Error"
+
+# Path / authority tokens
+"/"
+"/?"
+"//"
+"://"
+
+# Smuggling pivots
+"\r\nContent-Length: 0\r\n"
+"\r\nTransfer-Encoding: chunked\r\n"
+"0\r\n\r\n"
+"\\x00"

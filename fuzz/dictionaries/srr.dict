@@ -1,0 +1,60 @@
+# libFuzzer dictionary for fuzz_srr.
+# Tokens that look meaningful to NetworkSRR::check(method, host, path, body).
+# Format: one quoted token per line. \xNN escapes, \\ literal backslash.
+
+# HTTP methods
+"GET"
+"POST"
+"PUT"
+"DELETE"
+"PATCH"
+"HEAD"
+"OPTIONS"
+"CONNECT"
+"TRACE"
+
+# Authority / scheme tokens
+"://"
+"http"
+"https"
+"127.0.0.1"
+"localhost"
+"::1"
+":443"
+":80"
+":8080"
+
+# Hosts that exist in the fixture rule set
+"api.bank.com"
+"api.bank.com/transfer/"
+"api.bank.com/graphql"
+
+# Pattern wildcards used by SRR
+"{any}"
+"{host}"
+"*"
+
+# Path traversal / normalisation triggers
+"/"
+"./"
+"../"
+"%2e%2e"
+"%2F"
+"//"
+"\x00"
+"?"
+"#"
+
+# JSON payload keys SRR may inspect (operationName, query, variables)
+"operationName"
+"TransferFunds"
+"DeleteAccount"
+"query"
+"variables"
+"{\"operationName\":"
+
+# Edge cases
+"%00"
+"\r\n"
+"\n"
+"\t"

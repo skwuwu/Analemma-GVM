@@ -1,0 +1,68 @@
+# libFuzzer dictionary for fuzz_wal_parse.
+# Tokens that look meaningful to the WAL JSON-line decoder + Merkle batch parser.
+
+# JSON structural tokens
+"{"
+"}"
+"["
+"]"
+":"
+","
+"\""
+"null"
+"true"
+"false"
+
+# WAL event field names
+"event_id"
+"trace_id"
+"parent_event_id"
+"agent_id"
+"tenant_id"
+"session_id"
+"timestamp"
+"operation"
+"resource"
+"context"
+"transport"
+"decision"
+"decision_source"
+"matched_rule_id"
+"enforcement_point"
+"status"
+"payload"
+"event_hash"
+"default_caution"
+
+# Batch / Merkle metadata
+"batch_id"
+"merkle_root"
+"prev_batch_root"
+"event_count"
+
+# EventStatus values
+"Pending"
+"Executed"
+"Confirmed"
+"Failed"
+"Expired"
+
+# Decision shapes the parser must accept
+"\"Allow\""
+"\"Deny\""
+"Delay { milliseconds: 300 }"
+"RequireApproval"
+
+# Transport sub-fields
+"method"
+"host"
+"path"
+"status_code"
+"GET"
+"POST"
+
+# Common fuzz pivots
+"\\u0000"
+"\"\""
+"\\\""
+"\\\\"
