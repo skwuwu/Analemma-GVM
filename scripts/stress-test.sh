@@ -280,8 +280,27 @@ launch_agent() {
     # so even Node.js (which ignores HTTPS_PROXY) is governed.
     # In contained mode: Docker DNAT does the same.
     local gvm_mode_flag=""
+    local gvm_invoker=""
     if [ "$MODE" = "sandbox" ]; then
         gvm_mode_flag="--sandbox"
+        # Sandbox requires CAP_NET_ADMIN (veth + iptables) and CAP_SYS_ADMIN
+        # (mount namespaces). When the stress script is run as a non-root
+        # user (the default — operators tmux into ubuntu and start it),
+        # `gvm run --sandbox` would fail preflight on net_admin_capability
+        # and every turn would die in 0s with "Pre-flight check failed".
+        # That mode produces a 60-minute "stress run" with zero WAL events
+        # and a misleading PASS verdict (memory/FD/recovery still look
+        # stable because nothing is actually exercising them). Detect the
+        # uid here and prepend `sudo -E` so the API key + path env are
+        # preserved across the privilege boundary.
+        if [ "$(id -u)" -ne 0 ]; then
+            if sudo -n true 2>/dev/null; then
+                gvm_invoker="sudo -E"
+            else
+                echo -e "${RED}stress-test sandbox mode requires passwordless sudo for CAP_NET_ADMIN${NC}" >&2
+                exit 1
+            fi
+        fi
     elif [ "$MODE" = "contained" ]; then
         gvm_mode_flag="--contained"
     fi
@@ -302,7 +321,7 @@ launch_agent() {
                 [ $ELAPSED -ge $DURATION_SEC ] && break
 
                 echo "[Turn $turn] $(date -u +%H:%M:%S)"
-                "$GVM_BIN" run $gvm_mode_flag \
+                $gvm_invoker "$GVM_BIN" run $gvm_mode_flag \
                     --agent-id "${session_id}-t${turn}" -- \
                     node "$OC_MJS" agent --local \
                     --session-id "${session_id}-t${turn}" \
@@ -342,7 +361,7 @@ for i in range(200):
         print(f"[{i}] {method} {url} -> ERR: {e}")
     time.sleep(random.uniform(5, 20))
 PY
-        timeout $((DURATION_SEC + 120)) "$GVM_BIN" run $gvm_mode_flag \
+        timeout $((DURATION_SEC + 120)) $gvm_invoker "$GVM_BIN" run $gvm_mode_flag \
             --agent-id "$session_id" "$stress_script" > "$agent_log" 2>&1 &
     fi
 
@@ -677,6 +696,29 @@ PY
         local event_count
         event_count=$(wc -l < "$RESULTS_DIR/audit-export.jsonl" 2>/dev/null || echo "0")
         echo "audit_export: $event_count events → audit-export.jsonl" >> "$SUMMARY"
+
+        # Liveness check: count non-system events (filter out the
+        # `gvm-proxy` startup config_load events that are emitted on
+        # every proxy boot whether agents do anything or not). A 60-min
+        # stress run with 3 agents must produce at least dozens of
+        # agent-initiated events; anything below the threshold means
+        # the agents never actually exercised the proxy. Without this
+        # assertion the previous run silently passed with only 4
+        # gvm-proxy startup events (NRestarts due to chaos kill) and
+        # zero agent traffic — a 0-coverage stress test that looked
+        # green because memory/FD/recovery still appeared stable.
+        local agent_events
+        agent_events=$(grep -v '"agent_id":"gvm-proxy"' "$RESULTS_DIR/audit-export.jsonl" 2>/dev/null | wc -l)
+        echo "agent_events: $agent_events (system events excluded)" >> "$SUMMARY"
+        # Threshold: 1 event per minute per agent is a very conservative
+        # floor — real OpenClaw runs produce 5-10x that.
+        local min_agent_events=$((DURATION_MIN * NUM_AGENTS))
+        if [ "${agent_events:-0}" -lt "$min_agent_events" ]; then
+            echo "FAIL: agent_events=$agent_events below floor $min_agent_events ($DURATION_MIN min × $NUM_AGENTS agents — agents not actually exercising the proxy)" >> "$SUMMARY"
+            pass=false
+        else
+            echo "PASS: agent traffic above floor ($agent_events ≥ $min_agent_events)" >> "$SUMMARY"
+        fi
 
         # Extract decision breakdown from audit log
         if [ "$event_count" -gt 0 ] 2>/dev/null && command -v jq >/dev/null 2>&1; then

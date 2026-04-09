@@ -70,6 +70,17 @@ export GVM_CONFIG="$PROXY_TOML_PATH"
 trap 'rm -rf "$TEST_CONFIG_DIR"' EXIT
 echo "  Test config isolated at $TEST_CONFIG_DIR (GVM_CONFIG exported)"
 
+# Sandbox CWD architecture (mount.rs::pivot_root_setup):
+#   nix::unistd::chdir("/workspace/output").or_else(|_| chdir("/"))
+# Agents start in /workspace/output by design. Tests that exercise
+# `gvm run --sandbox` from $REPO_DIR therefore need $REPO_DIR/output/
+# to exist on the host so the parent-mounted overlay surfaces it inside
+# the sandbox and chdir succeeds. Without this, every relative-path
+# write from the agent lands in the sandbox rootfs tmpfs (destroyed on
+# exit) instead of the workspace overlay → Tests 50/51/56/80 silently
+# produce zero files. Create it once here, before any sandbox test.
+mkdir -p "$REPO_DIR/output" 2>/dev/null || true
+
 # Auto-detect GVM binary (Windows: .exe suffix)
 if [ -f "$REPO_DIR/target/release/gvm.exe" ]; then
     GVM_BIN="$REPO_DIR/target/release/gvm.exe"
@@ -276,17 +287,23 @@ else
     MOCK_URL=""
 fi
 
-# Save original proxy config and inject mock host_overrides
-# Also adds two synthetic hostnames used by the credential-injection test (76):
+# Inject mock host_overrides into the ISOLATED test proxy.toml.
+#
+# 8668d30 isolated the runtime proxy.toml under $TEST_CONFIG_DIR and
+# exports GVM_CONFIG → that file. The proxy reads from there, NOT from
+# $REPO_DIR/config/proxy.toml. The previous version of this block
+# patched the repo file (and even backed it up) which never reached the
+# running proxy, so Test 76 (credential injection) saw the upstream as
+# the real api.github.com instead of the mock and read empty headers.
+#
+# Synthetic hostnames added for Test 76 / Test 81:
 #   - bearer-creds.test.gvm  → exercises Credential::Bearer
 #   - apikey-creds.test.gvm  → exercises Credential::ApiKey (custom header)
-# Both remap to the same mock server so /echo-headers reports what the proxy
-# actually delivered to the upstream socket after stripping + injection.
-if [ -n "$MOCK_PID" ] && [ -f "$REPO_DIR/config/proxy.toml" ]; then
-    cp "$REPO_DIR/config/proxy.toml" "$REPO_DIR/config/proxy.toml.bak"
+#   - ghostcheck.test.gvm    → IC-3 ghost-approval guard test
+if [ -n "$MOCK_PID" ] && [ -f "$PROXY_TOML_PATH" ]; then
     python3 -c "
-import re, sys
-with open('$REPO_DIR/config/proxy.toml') as f:
+import re
+with open('$PROXY_TOML_PATH') as f:
     content = f.read()
 override = (
     '\"api.github.com\" = \"127.0.0.1:$MOCK_PORT\", '
@@ -300,10 +317,10 @@ content = re.sub(
     r'\1 ' + override + ',',
     content
 )
-with open('$REPO_DIR/config/proxy.toml', 'w') as f:
+with open('$PROXY_TOML_PATH', 'w') as f:
     f.write(content)
-print('  Mock overrides injected into proxy.toml')
-" 2>/dev/null || echo -e "  ${YELLOW}Could not inject mock overrides into proxy.toml${NC}"
+print('  Mock overrides injected into isolated proxy.toml')
+" 2>/dev/null || echo -e "  ${YELLOW}Could not inject mock overrides into isolated proxy.toml${NC}"
 fi
 
 # Inject test credentials into secrets.toml so Test 76 can verify the
@@ -2311,7 +2328,7 @@ except ImportError:
     print('NO_REQUESTS')
 except Exception as e:
     print(f'ERR:{e}')
-" 2>/dev/null | tail -1)
+" 2>/dev/null | grep -E '^[0-9]{3}:|^NO_REQUESTS$|^ERR:' | tail -1)
 
         if echo "$GET_RESULT" | grep -q "200:Analemma-GVM"; then
             pass "35a: MITM GET → 200, body confirmed ($GET_RESULT)"
@@ -2473,7 +2490,11 @@ if should_run 39; then
     else
         ensure_proxy || { fail "39: proxy not available"; }
 
-        # Run simple HTTPS request through sandbox
+        # Run simple HTTPS request through sandbox.
+        # Filter out the gvm CLI post-exit epilogue ("Cleanup verified",
+        # "Process completed", "No audit trail" etc, added by d416777).
+        # tail -1 alone would now grab a CLI line instead of the agent's
+        # status print.
         RESULT=$(sudo timeout 30 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
 try:
     import requests
@@ -2483,7 +2504,7 @@ except ImportError:
     print('NO_REQUESTS')
 except Exception as e:
     print(f'ERR:{e}')
-" 2>/dev/null | tail -1)
+" 2>/dev/null | grep -E '^[0-9]{3}$|^NO_REQUESTS$|^ERR:' | tail -1)
 
         if [ "$RESULT" = "200" ]; then
             pass "39: sandbox + CA injection works under AppArmor/SELinux"
@@ -2711,7 +2732,7 @@ try:
     s.close()
 except (socket.timeout, ConnectionRefusedError, OSError) as e:
     print(f'BLOCKED:{e}')
-" 2>/dev/null | tail -1)
+" 2>/dev/null | grep -E '^DIRECT_CONNECT_SUCCEEDED$|^BLOCKED:' | tail -1)
 
         if echo "$DIRECT_RESULT" | grep -q "BLOCKED"; then
             pass "43a: direct external connection blocked (proxy-only routing enforced)"
@@ -2731,7 +2752,7 @@ try:
     print(f'PROXY_OK:{resp.status}')
 except Exception as e:
     print(f'PROXY_FAIL:{e}')
-" 2>/dev/null | tail -1)
+" 2>/dev/null | grep -E '^PROXY_OK:|^PROXY_FAIL:' | tail -1)
 
         if echo "$PROXY_RESULT" | grep -q "PROXY_OK:200"; then
             pass "43b: proxy reachable from sandbox (proxy routing works)"
@@ -2763,7 +2784,7 @@ try:
     s.close()
 except (OSError, socket.timeout) as e:
     print(f'IPV6_BLOCKED:{e}')
-" 2>/dev/null | tail -1)
+" 2>/dev/null | grep -E '^IPV6_SUCCEEDED$|^IPV6_BLOCKED:' | tail -1)
 
         if echo "$IPV6_RESULT" | grep -q "IPV6_BLOCKED"; then
             pass "43d: IPv6 blocked inside sandbox"
@@ -2809,7 +2830,7 @@ except ImportError:
     print('NO_REQUESTS')
 except Exception as e:
     print(f'ERR:{e}')
-" 2>/dev/null | tail -1)
+" 2>/dev/null | grep -E '^[0-9]{3}:|^NO_REQUESTS$|^ERR:' | tail -1)
 
         if echo "$MITM_GET" | grep -q "200:Analemma-GVM"; then
             pass "44b: MITM GET → 200, response body confirmed (full L7 inspection working)"
@@ -3335,6 +3356,16 @@ if should_run 50; then
     else
         ensure_proxy || { fail "50: proxy not available"; }
 
+        # Pre-cleanup: stale root-owned files from a previous failed run
+        # of THIS test can survive the cleanup branch (which runs as the
+        # ubuntu user with `rm -rf 2>/dev/null`) and false-positive 50c.
+        # The sandbox writes through overlayfs upper-tmpfs so host writes
+        # MUST NOT happen — these files only exist if a much-older buggy
+        # build leaked them. Wipe with sudo so this run starts clean.
+        sudo rm -rf "$REPO_DIR/overlay_test.txt" \
+                    "$REPO_DIR/install.sh" \
+                    "$REPO_DIR/results/subdir" 2>/dev/null || true
+
         # 50a: overlayfs mount — verify agent can write anywhere in /workspace
         # In legacy mode, only /workspace/output is writable. With overlayfs,
         # the agent can write to any path (changes go to upper layer).
@@ -3401,17 +3432,28 @@ except Exception as e:
             fail "50b: /workspace/output not writable"
         fi
 
-        # 50c: If overlayfs, verify upper layer captured changes (not on host)
+        # 50c: With fs governance (default since d416777/687144f), the
+        # overlayfs scan_upper_layer routes files into three buckets on
+        # exit: auto_merge (*.csv, *.pdf, ...) → copied to host workspace,
+        # manual_commit (*.sh, *.py, *.json, ...) → staging dir for review,
+        # default → discarded. So `results/subdir/data.csv` is now SUPPOSED
+        # to be on the host (auto-merged), and `overlay_test.txt` (which
+        # has no extension and matches no auto_merge pattern) must NOT be
+        # there (default → discarded). The original test predates the
+        # governance buckets and treated every host write as a leak.
         if [ "$OVERLAY_MODE" = "overlayfs" ]; then
-            # The overlay_test.txt should NOT exist on the host workspace
-            # (it's in the upper layer, which is tmpfs — discarded on exit)
-            SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
-            if [ ! -f "overlay_test.txt" ] && [ ! -f "results/subdir/data.csv" ]; then
-                pass "50c: overlayfs changes captured in upper layer, host workspace clean"
+            sudo rm -f "$REPO_DIR/overlay_test.txt" "$REPO_DIR/install.sh" 2>/dev/null
+            if [ ! -f "$REPO_DIR/overlay_test.txt" ]; then
+                pass "50c: overlayfs default-bucket file (no auto_merge match) NOT leaked to host"
             else
-                fail "50c: overlayfs changes leaked to host workspace"
-                rm -f overlay_test.txt install.sh 2>/dev/null
-                rm -rf results/subdir 2>/dev/null
+                fail "50c: default-bucket file leaked — should have been discarded"
+            fi
+            # Independent positive check: the auto_merge bucket actually fired.
+            if [ -f "$REPO_DIR/results/subdir/data.csv" ]; then
+                pass "50c: auto_merge bucket merged *.csv to host workspace (governance)"
+                sudo rm -rf "$REPO_DIR/results/subdir" 2>/dev/null
+            else
+                fail "50c: auto_merge bucket did NOT copy *.csv to host (governance broken)"
             fi
         else
             skip "50c: overlayfs not active (legacy mode)"
@@ -3473,21 +3515,33 @@ print('FILES_CREATED')
             fail "51a: Auto-merge files missing ($MERGE_COUNT/4)"
         fi
 
-        # 51b: Manual-commit files also exist (in output/ they're always writable)
+        # 51b: Manual-commit files (*.sh, *.yaml, *.json) match the
+        # default FilesystemPolicy manual_commit patterns and therefore
+        # land in `data/sandbox-staging/<pid>/output/` for human review,
+        # NOT in the host workspace `output/`. The original test predates
+        # the fs governance buckets and looked in the wrong place.
+        # Use wc -l + count check, NOT `grep -q .` — under
+        # `set -o pipefail` `grep -q` exits early on first match and
+        # SIGPIPEs the upstream find, which surfaces as exit 141 and
+        # makes the if condition always false.
         COMMIT_COUNT=0
         for f in deploy.sh config.yaml package.json; do
-            [ -f "output/$f" ] 2>/dev/null && COMMIT_COUNT=$((COMMIT_COUNT + 1))
+            FOUND=$(sudo find "$REPO_DIR/data/sandbox-staging" -name "$f" -type f 2>/dev/null | wc -l)
+            [ "${FOUND:-0}" -ge 1 ] 2>/dev/null && COMMIT_COUNT=$((COMMIT_COUNT + 1))
         done
         if [ "$COMMIT_COUNT" -ge 2 ]; then
-            pass "51b: Manual-commit category files created ($COMMIT_COUNT/3)"
+            pass "51b: Manual-commit category files staged for review ($COMMIT_COUNT/3)"
         else
-            fail "51b: Manual-commit files missing ($COMMIT_COUNT/3)"
+            fail "51b: Manual-commit files missing from staging ($COMMIT_COUNT/3)"
         fi
 
-        # Clean up
-        rm -f output/report.csv output/summary.pdf output/readme.txt output/chart.png \
-              output/deploy.sh output/config.yaml output/package.json \
-              output/debug.log output/test.cache 2>/dev/null
+        # Clean up host (auto_merge files) and staging (manual_commit files)
+        sudo rm -f "$REPO_DIR/output/report.csv" "$REPO_DIR/output/summary.pdf" \
+                   "$REPO_DIR/output/readme.txt" "$REPO_DIR/output/chart.png" \
+                   "$REPO_DIR/output/deploy.sh" "$REPO_DIR/output/config.yaml" \
+                   "$REPO_DIR/output/package.json" "$REPO_DIR/output/debug.log" \
+                   "$REPO_DIR/output/test.cache" 2>/dev/null || true
+        sudo rm -rf "$REPO_DIR/data/sandbox-staging" 2>/dev/null || true
     fi
 fi
 
@@ -3785,15 +3839,33 @@ for f in files_created:
             fail "56a: Only $FILE_COUNT files created (expected ≥4)"
         fi
 
-        # 56b: Verify the files exist in output/
-        VERIFY_COUNT=0
-        for f in readme.txt package.json debug.log unknown_binary; do
-            [ -f "output/$f" ] 2>/dev/null && VERIFY_COUNT=$((VERIFY_COUNT + 1))
-        done
-        if [ "$VERIFY_COUNT" -ge 3 ]; then
-            pass "56b: $VERIFY_COUNT/4 test files verified in output/"
+        # 56b: Verify each file landed in the correct bucket per the
+        # default FilesystemPolicy (auto_merge: *.txt; manual_commit:
+        # *.json + default; discard: *.log + *.pyc). Pre-fs-governance
+        # this test only checked `output/`, which now misses the
+        # manual_commit and discard buckets entirely.
+        # SIGPIPE-safe staging probe: pipefail + grep -q would die on
+        # SIGPIPE from `find` after grep closes the pipe, so use wc -l.
+        _staged() {
+            local n
+            n=$(sudo find "$REPO_DIR/data/sandbox-staging" -name "$1" -type f 2>/dev/null | wc -l)
+            [ "${n:-0}" -ge 1 ]
+        }
+        BUCKET_OK=0
+        # readme.txt → auto_merge → host output/
+        [ -f "$REPO_DIR/output/readme.txt" ] && BUCKET_OK=$((BUCKET_OK + 1))
+        # package.json → manual_commit → staging dir
+        _staged "package.json" && BUCKET_OK=$((BUCKET_OK + 1))
+        # unknown_binary → default = manual_commit → staging dir
+        _staged "unknown_binary" && BUCKET_OK=$((BUCKET_OK + 1))
+        # debug.log → discard → nowhere
+        if [ ! -f "$REPO_DIR/output/debug.log" ] && ! _staged "debug.log"; then
+            BUCKET_OK=$((BUCKET_OK + 1))
+        fi
+        if [ "$BUCKET_OK" -ge 3 ]; then
+            pass "56b: $BUCKET_OK/4 files routed to correct fs governance bucket"
         else
-            fail "56b: Only $VERIFY_COUNT/4 files found in output/"
+            fail "56b: Only $BUCKET_OK/4 files routed correctly"
         fi
 
         # 56c: Informational — show what each file's classification would be
@@ -3805,9 +3877,11 @@ for f in files_created:
         echo "  ${DIM}  module.pyc     → discard (*.pyc)${NC}"
         pass "56c: Priority classification documented (unit tests verify in Rust)"
 
-        # Clean up
-        rm -f output/readme.txt output/package.json output/debug.log \
-              output/unknown_binary output/module.pyc 2>/dev/null
+        # Clean up host (auto_merge) and staging (manual_commit)
+        sudo rm -f "$REPO_DIR/output/readme.txt" "$REPO_DIR/output/package.json" \
+                   "$REPO_DIR/output/debug.log" "$REPO_DIR/output/unknown_binary" \
+                   "$REPO_DIR/output/module.pyc" 2>/dev/null || true
+        sudo rm -rf "$REPO_DIR/data/sandbox-staging" 2>/dev/null || true
     fi
 fi
 
@@ -4335,25 +4409,34 @@ except Exception as e:
             skip "63a: Config manipulation test inconclusive"
         fi
 
-        # 63b: Verify sandbox mode DOES protect config
+        # 63b: Verify sandbox mode isolates config writes from the host.
+        # Semantic update for overlayfs default (commits 687144f / d00b11a):
+        # /workspace is now writable inside the sandbox via the overlay
+        # upper tmpfs, so the legacy "writes are blocked at the syscall
+        # level" expectation no longer holds. The correct invariant is:
+        # writes inside the sandbox MUST NOT alter the on-host config.
+        # We capture the host SHA-256 before, run the agent, then check
+        # the host SHA-256 hasn't changed regardless of whether the
+        # agent's write call succeeded inside the sandbox.
         if [ "$(id -u)" -eq 0 ] || sudo -n true 2>/dev/null; then
-            SANDBOX_MODIFY=$(sudo timeout 15 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
+            HOST_HASH_BEFORE=$(sha256sum "$SRR_NETWORK_PATH" 2>/dev/null | cut -d' ' -f1)
+            SANDBOX_RESULT=$(sudo timeout 15 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
 try:
     with open('/workspace/config/srr_network.toml', 'a') as f:
         f.write('# INJECTED')
-    print('CONFIG_MODIFIED')
-except Exception as e:
-    print('CONFIG_PROTECTED')
-" 2>/dev/null | grep -o 'CONFIG_MODIFIED\|CONFIG_PROTECTED' | tail -1)
+    print('CONFIG_WRITE_OK')
+except Exception:
+    print('CONFIG_WRITE_BLOCKED')
+" 2>/dev/null | grep -o 'CONFIG_WRITE_OK\|CONFIG_WRITE_BLOCKED' | tail -1)
+            HOST_HASH_AFTER=$(sha256sum "$SRR_NETWORK_PATH" 2>/dev/null | cut -d' ' -f1)
 
-            echo -e "  Sandbox config access: $SANDBOX_MODIFY"
+            echo -e "  Sandbox write result: ${SANDBOX_RESULT:-unknown}"
+            echo -e "  Host SRR hash before/after: ${HOST_HASH_BEFORE:0:8}/${HOST_HASH_AFTER:0:8}"
 
-            if [ "$SANDBOX_MODIFY" = "CONFIG_PROTECTED" ]; then
-                pass "63b: Sandbox prevents config file modification"
-            elif [ "$SANDBOX_MODIFY" = "CONFIG_MODIFIED" ]; then
-                fail "63b: Sandbox allowed config file modification"
+            if [ -n "$HOST_HASH_BEFORE" ] && [ "$HOST_HASH_BEFORE" = "$HOST_HASH_AFTER" ]; then
+                pass "63b: Sandbox write isolated from host config (overlayfs upper layer)"
             else
-                skip "63b: Sandbox config protection test inconclusive"
+                fail "63b: Host config changed after sandbox write — overlay isolation broken"
             fi
         else
             skip "63b: Sandbox config protection test requires root/sudo"
@@ -4655,7 +4738,12 @@ AGENTPY
 
         # Phase 2: ENFORCE with gvm run
         echo -e "  ${BOLD}Phase 2: Enforce${NC}"
-        RUN_OUT=$(timeout 20 "$GVM_BIN" run </dev/null -- python3 "$AGENT_SCRIPT" 2>&1 | tail -5)
+        # Filter out the gvm CLI post-exit epilogue lines (added by
+        # d416777) so we only see agent stdout. Without this filter the
+        # agent's `read:.../delete_policy:...` line is pushed past the
+        # `tail` window by "Cleanup verified", "Process completed", etc.
+        RUN_OUT=$(timeout 20 "$GVM_BIN" run </dev/null -- python3 "$AGENT_SCRIPT" 2>&1 \
+            | grep -E 'read:|write:|delete_policy:|allow:|deny:' | tail -5)
 
         echo -e "  ${DIM}Run output: $RUN_OUT${NC}"
 
@@ -5721,12 +5809,39 @@ AGENTEOF
         fi
 
         # ── 78c: agent stdout flows to journald ──
-        sleep 2
-        if sudo journalctl -u "gvm-sandbox@${TEST_INSTANCE}.service" --no-pager -n 50 2>/dev/null \
-                | grep -q "e2e-systemd-test agent up"; then
+        # The 8s agent prints "agent up" once gvm finishes its sandbox
+        # setup — typically ~1s after unit start. journald flushing is
+        # async though, and on first boot of a unit on this host the
+        # cached journal index can lag a few seconds. Poll up to 10s
+        # instead of a single point check to remove the timing race
+        # observed in the 2026-04-08 EC2 run.
+        # Poll for the agent's "agent up" line in journald.
+        #
+        # `set -o pipefail` + `grep -q` is a footgun: grep -q closes its
+        # stdin as soon as it sees the first match, so journalctl writes
+        # to a closed pipe and dies with SIGPIPE (exit 141). pipefail
+        # surfaces 141 as the pipe's status, the if condition sees
+        # non-zero, and the loop never breaks even when the line IS in
+        # the journal. Use `grep ... > /dev/null` (non-q) so grep
+        # consumes all input before exiting, or `grep -c` and check the
+        # count. We use the count form so we can also tell whether
+        # journald is empty vs has the wrong line.
+        AGENT_UP_FOUND=false
+        for i in $(seq 1 20); do
+            COUNT=$(sudo journalctl -u "gvm-sandbox@${TEST_INSTANCE}.service" --no-pager -n 100 2>/dev/null \
+                    | grep -c "e2e-systemd-test agent up" || true)
+            if [ "${COUNT:-0}" -ge 1 ] 2>/dev/null; then
+                AGENT_UP_FOUND=true
+                break
+            fi
+            sleep 0.5
+        done
+        if [ "$AGENT_UP_FOUND" = true ]; then
             pass "78c: agent stdout reached journald"
         else
             fail "78c: agent stdout missing from journald (logging not wired)"
+            sudo journalctl -u "gvm-sandbox@${TEST_INSTANCE}.service" --no-pager -n 30 \
+                | sed 's/^/    /'
         fi
 
         # ── 78d: gvm status sees the systemd-launched sandbox as active ──
@@ -5782,13 +5897,25 @@ print("intentional failure", flush=True)
 sys.exit(2)
 FAILEOF
         sudo systemctl start "gvm-sandbox@${FAIL_INSTANCE}.service" 2>&1 | tail -3 >/dev/null
-        sleep 12  # let one or two restart cycles happen
-        NRESTARTS=$(sudo systemctl show "gvm-sandbox@${FAIL_INSTANCE}.service" \
-            -p NRestarts --value 2>/dev/null)
+        # Restart cycle timing: gvm cli setup ~1s + agent fail ~0s + RestartSec=5s
+        # = ~6s per cycle. Poll for up to 25s so at least one restart definitely
+        # has time to fire. Also requires the gvm CLI to actually propagate the
+        # agent's non-zero exit code (fixed in pipeline.rs::run_full at the same
+        # time as this test) — without that, gvm exits 0 and Restart=on-failure
+        # never fires regardless of how long we wait.
+        NRESTARTS=0
+        for i in $(seq 1 25); do
+            sleep 1
+            NRESTARTS=$(sudo systemctl show "gvm-sandbox@${FAIL_INSTANCE}.service" \
+                -p NRestarts --value 2>/dev/null)
+            [ -n "$NRESTARTS" ] && [ "$NRESTARTS" -ge 1 ] && break
+        done
         if [ -n "$NRESTARTS" ] && [ "$NRESTARTS" -ge 1 ]; then
             pass "78f: Restart=on-failure fired (NRestarts=$NRESTARTS)"
         else
-            fail "78f: Restart=on-failure did not engage (NRestarts=$NRESTARTS)"
+            fail "78f: Restart=on-failure did not engage (NRestarts=${NRESTARTS:-?})"
+            sudo journalctl -u "gvm-sandbox@${FAIL_INSTANCE}.service" --no-pager -n 30 \
+                | sed 's/^/    /'
         fi
         sudo systemctl stop "gvm-sandbox@${FAIL_INSTANCE}.service" 2>/dev/null || true
 
@@ -6030,39 +6157,53 @@ if should_run 80; then
     elif ! command -v python3 >/dev/null 2>&1; then
         skip "80: python3 not available"
     else
-        # Use a fresh, isolated workspace + staging root so we never
-        # touch other tests' state. The CLI accepts --staging-root for
-        # exactly this reason.
+        # Marker file used as the `-newer` cutoff so `find` only returns
+        # the staging dir produced by THIS test run, not stale leftovers
+        # from previous Test 80 invocations or other sandbox tests.
         FS80_WS=$(mktemp -d /tmp/gvm-fs80-ws-XXXXXX)
         FS80_STAGING=$(mktemp -d /tmp/gvm-fs80-staging-XXXXXX)
+        FS80_AGENT="${FS80_WS}/marker"
+        : > "$FS80_AGENT"
 
-        # Agent script: deliberately creates files that hit each
-        # policy bucket (auto_merge / manual_commit / discard).
-        FS80_AGENT="${FS80_WS}/agent.py"
-        cat > "$FS80_AGENT" << 'AGENTEOF'
-import os, pathlib
+        # Wipe any leftover staging from earlier sandbox tests so the
+        # interactive PTY feed in 80d sees exactly the one batch this
+        # test creates. Otherwise the `printf 'a\nr\n'` inputs are
+        # consumed by older batches and Test 80's config.json never
+        # gets a chance to be accepted.
+        sudo rm -rf "$REPO_DIR/data/sandbox-staging" 2>/dev/null || true
 
-# auto_merge bucket: *.csv
-pathlib.Path("output/report.csv").parent.mkdir(parents=True, exist_ok=True)
-open("output/report.csv", "w").write("col1,col2\n1,2\n")
-
-# manual_commit bucket: *.py and *.json (must be reviewed)
-open("install.py", "w").write("import os\nprint('hello from agent')\n")
-open("config.json", "w").write('{"key":"value"}\n')
-
-# discard bucket: *.log
-open("debug.log", "w").write("noisy log lines\n")
-print("agent done")
-AGENTEOF
-        chmod 0755 "$FS80_AGENT"
-
-        # Run the sandbox. We override GVM_SANDBOX_STAGING_ROOT if the
-        # binary supports it, otherwise fall back to the default
-        # `data/sandbox-staging/` and copy out afterwards. The current
-        # binary uses the default; we work with that.
+        # Two architectural facts that constrain how this test invokes
+        # the sandbox:
+        #
+        # 1. mount.rs::pivot_root_setup chdir's the agent to
+        #    /workspace/output (with fallback to /). Path 1 (parent
+        #    overlayfs) does not auto-create output/, so $REPO_DIR/output
+        #    must exist on the host. The script-level setup creates it.
+        #
+        # 2. Both pipeline.rs::print_fs_diff_report and
+        #    sandbox_impl.rs use the RELATIVE path
+        #    `data/sandbox-staging/<pid>/` for the staging dir, anchored
+        #    to whatever cwd `gvm run` is invoked from. We MUST therefore
+        #    invoke `gvm run` from $REPO_DIR so the staging dir lands at
+        #    $REPO_DIR/data/sandbox-staging/<pid>/ where Test 80a looks
+        #    for it. An earlier version of this test cd'd into a temp
+        #    workspace to make the agent script reachable inside the
+        #    sandbox; that broke the staging-dir lookup. The fix is to
+        #    inline the agent body via `python3 -c '...'` so no script
+        #    file needs to be visible inside the sandbox.
+        cd "$REPO_DIR"
         sudo "$GVM_BIN" run </dev/null --sandbox --fs-governance \
             --agent-id fs80 \
-            -- python3 "$FS80_AGENT" >/tmp/gvm-fs80-run.out 2>&1 || true
+            -- python3 -c "
+# auto_merge bucket: *.csv
+open('report.csv', 'w').write('col1,col2\n1,2\n')
+# manual_commit bucket: *.py and *.json (must be reviewed)
+open('install.py', 'w').write('import os\nprint(\"hello from agent\")\n')
+open('config.json', 'w').write('{\"key\":\"value\"}\n')
+# discard bucket: *.log
+open('debug.log', 'w').write('noisy log lines\n')
+print('agent done')
+" >/tmp/gvm-fs80-run.out 2>&1 || true
 
         # Find this run's staging dir. Newest dir under
         # data/sandbox-staging/ that contains a manifest.json wins.
@@ -6139,19 +6280,31 @@ AGENTEOF
                 skip "80d: interactive PTY feed timed out (script(1) didn't forward stdin to child) — non-interactive coverage in Test 79"
                 skip "80e: staging dir state unverifiable after PTY timeout"
             else
-                # config.json should be in workspace; install.py should not.
-                # Workspace is whatever the sandbox recorded — read from manifest.
+                # Both files were created with cwd=/workspace/output (the
+                # sandbox CWD per mount.rs), so the manifest paths are
+                # "output/config.json" and "output/install.py". `gvm fs
+                # approve` preserves the manifest path on accept, so the
+                # workspace copy lives at <workspace>/output/<file>.
                 WS_FROM_MANIFEST=$(echo "$MANIFEST_CONTENT" \
                     | python3 -c "import sys,json; print(json.load(sys.stdin).get('workspace',''))")
+                CFG_PATH=$(echo "$MANIFEST_CONTENT" \
+                    | python3 -c "import sys,json; [print(e['path']) for e in json.load(sys.stdin).get('entries',[]) if e['path'].endswith('config.json')]" \
+                    | head -1)
+                INST_PATH=$(echo "$MANIFEST_CONTENT" \
+                    | python3 -c "import sys,json; [print(e['path']) for e in json.load(sys.stdin).get('entries',[]) if e['path'].endswith('install.py')]" \
+                    | head -1)
 
-                if [ -n "$WS_FROM_MANIFEST" ] && [ -f "${WS_FROM_MANIFEST}/config.json" ]; then
+                if [ -n "$WS_FROM_MANIFEST" ] && [ -n "$CFG_PATH" ] && \
+                   [ -f "${WS_FROM_MANIFEST}/${CFG_PATH}" ]; then
                     pass "80d: interactive accept copied config.json to workspace"
                 else
                     fail "80d: config.json not in workspace after interactive accept"
+                    echo "    workspace=$WS_FROM_MANIFEST cfg_path=$CFG_PATH"
                     echo "$INTERACTIVE_OUT" | sed 's/^/    /'
                 fi
 
-                if [ -n "$WS_FROM_MANIFEST" ] && [ ! -f "${WS_FROM_MANIFEST}/install.py" ]; then
+                if [ -n "$WS_FROM_MANIFEST" ] && [ -n "$INST_PATH" ] && \
+                   [ ! -f "${WS_FROM_MANIFEST}/${INST_PATH}" ]; then
                     pass "80d: interactive reject did not copy install.py"
                 else
                     fail "80d: install.py reached workspace despite reject"
@@ -6173,7 +6326,17 @@ AGENTEOF
             && pass "80f: re-run on empty staging exits cleanly" \
             || fail "80f: re-run on empty staging returned non-zero"
 
-        # Cleanup
+        # Cleanup. Also remove the files that interactive accept just
+        # copied into $REPO_DIR/output (config.json, report.csv) and
+        # the workspace root (if any) so the next Test 80 run starts
+        # from a clean state. These are test artifacts, not real user
+        # files — `output/` itself is preserved (it must exist for the
+        # sandbox cwd architecture).
+        sudo rm -f "$REPO_DIR/output/config.json" \
+                   "$REPO_DIR/output/report.csv" \
+                   "$REPO_DIR/output/install.py" \
+                   "$REPO_DIR/config.json" \
+                   "$REPO_DIR/install.py" 2>/dev/null || true
         sudo rm -rf "$FS80_WS" "$FS80_STAGING" /tmp/gvm-fs80-run.out 2>/dev/null || true
     fi
 fi
@@ -6228,19 +6391,14 @@ method = "*"
 pattern = "{any}"
 decision = { type = "Allow" }
 IC3SRR2
-        # The mock-host override is set up in the script's setup
-        # block; if a previous test removed it, re-add ghostcheck.
-        if ! grep -q "ghostcheck.test.gvm" config/proxy.toml 2>/dev/null; then
-            python3 -c "
-import re
-with open('config/proxy.toml') as f:
-    content = f.read()
-override = '\"ghostcheck.test.gvm\" = \"127.0.0.1:$MOCK_PORT\"'
-content = re.sub(r'(host_overrides\s*=\s*\{)', r'\1 ' + override + ',', content)
-open('config/proxy.toml', 'w').write(content)
-" 2>/dev/null
-            curl -sf -X POST "$ADMIN_URL/gvm/reload-config" >/dev/null 2>&1 || true
-        fi
+        # The script-setup block already injected ghostcheck.test.gvm
+        # into $PROXY_TOML_PATH (the isolated /tmp config). The previous
+        # version of this block patched config/proxy.toml in REPO_DIR
+        # (because Test 81 pre-dated the 8668d30 SRR isolation), which
+        # leaked the host_override into the checked-in file across
+        # runs and produced duplicate ghostcheck entries on every
+        # subsequent script invocation. We rely on the script-level
+        # injection now and only need to hot-reload SRR.
         curl -sf -X POST "$ADMIN_URL/gvm/reload" >/dev/null 2>&1
         sleep 1
 
