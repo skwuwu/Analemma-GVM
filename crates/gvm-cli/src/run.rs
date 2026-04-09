@@ -61,19 +61,7 @@ pub async fn run_agent(
 
     // Warn if Node.js in cooperative mode (HTTPS_PROXY not respected)
     if mode == crate::pipeline::LaunchMode::Cooperative {
-        let cmd_str = command.join(" ").to_lowercase();
-        if cmd_str.contains("node")
-            || cmd_str.contains("openclaw")
-            || cmd_str.contains("npx")
-            || command[0].ends_with(".js")
-            || command[0].ends_with(".ts")
-        {
-            eprintln!("  {YELLOW}\u{26a0} Node.js agent detected in cooperative mode.{RESET}");
-            eprintln!(
-                "  {DIM}Node.js does not respect HTTPS_PROXY. Use --sandbox for full HTTPS coverage.{RESET}"
-            );
-            eprintln!();
-        }
+        warn_if_node_cooperative(command);
     }
 
     let profile = match sandbox_profile {
@@ -230,6 +218,33 @@ pub(crate) fn detect_interpreter(ext: &str, script_ref: &str) -> (String, Vec<St
     (interpreter, args)
 }
 
+/// Detect Node.js-based agents and warn that the standard `HTTPS_PROXY` env
+/// variable is silently ignored by Node's `http`/`https` modules and `undici`,
+/// so cooperative-mode interception will miss most or all of the agent's
+/// outbound HTTPS traffic. The recommended path is `--sandbox` (Linux), which
+/// rewrites traffic at the kernel level. Called by both the enforce and watch
+/// code paths so the warning fires consistently regardless of how the agent
+/// was launched.
+pub(crate) fn warn_if_node_cooperative(command: &[String]) {
+    if command.is_empty() {
+        return;
+    }
+    let cmd_str = command.join(" ").to_lowercase();
+    let looks_like_node = cmd_str.contains("node")
+        || cmd_str.contains("openclaw")
+        || cmd_str.contains("npx")
+        || command[0].ends_with(".js")
+        || command[0].ends_with(".ts")
+        || command[0].ends_with(".cmd"); // Windows npm shim wrapping a Node binary
+    if looks_like_node {
+        eprintln!("  {YELLOW}\u{26a0} Node.js agent detected in cooperative mode.{RESET}");
+        eprintln!(
+            "  {DIM}Node.js does not respect HTTPS_PROXY. Use --sandbox for full HTTPS coverage.{RESET}"
+        );
+        eprintln!();
+    }
+}
+
 /// Inject standard GVM proxy environment variables into a Command.
 pub(crate) fn inject_proxy_env(cmd: &mut tokio::process::Command, proxy: &str, agent_id: &str) {
     cmd.env("HTTP_PROXY", proxy)
@@ -357,10 +372,43 @@ pub(crate) fn print_wal_audit(wal_path: &str, start_offset: u64, agent_id: &str)
         ""
     };
 
-    let events: Vec<serde_json::Value> = new_content
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(is_governance_event)
+    // Each request that hits a Delay/RequireApproval rule produces TWO WAL
+    // entries with the same event_id: one with status=Pending (written before
+    // the request is forwarded, IC-2 fail-close audit) and one with the final
+    // status=Confirmed/Failed (written after the upstream response). Without
+    // dedup the audit summary inflates the counts: 1 actual call shows up as
+    // "2 delayed". Dedup by event_id, keeping the LAST occurrence which has
+    // the resolved status.
+    let mut by_id: std::collections::BTreeMap<String, serde_json::Value> =
+        std::collections::BTreeMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for line in new_content.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if !is_governance_event(&value) {
+            continue;
+        }
+        let id = value
+            .get("event_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if id.is_empty() {
+            // No id - keep as-is, can't dedup. Use a synthetic key.
+            let synthetic = format!("__noid_{}", order.len());
+            order.push(synthetic.clone());
+            by_id.insert(synthetic, value);
+            continue;
+        }
+        if !by_id.contains_key(&id) {
+            order.push(id.clone());
+        }
+        by_id.insert(id, value); // overwrite -> keep latest
+    }
+    let events: Vec<serde_json::Value> = order
+        .iter()
+        .filter_map(|id| by_id.get(id).cloned())
         .collect();
 
     if events.is_empty() {

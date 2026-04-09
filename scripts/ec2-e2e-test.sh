@@ -6493,6 +6493,120 @@ except: print(0)
 fi
 
 # ═══════════════════════════════════════════════════════════════════
+# Test 82: watch -> suggest -> enforce regression
+# ═══════════════════════════════════════════════════════════════════
+#
+# This test guards the README's headline UX:
+#
+#     gvm run --watch --output json -- agent  > session.jsonl
+#     gvm suggest --from session.jsonl        > config/srr_network.toml
+#     gvm run -- agent                          # rules MUST take effect
+#
+# The third step is the critical one. Before v0.4.4, the proxy was reused
+# across CLI invocations and silently kept its old (empty) rule set, so the
+# freshly written srr_network.toml was ignored unless the operator manually
+# called `curl POST /gvm/reload` first. None of the existing e2e tests
+# exercised this flow without an explicit reload, so the bug shipped in
+# v0.4.0 / v0.4.1 / v0.4.2 / v0.4.3 unnoticed.
+#
+# The assertion that catches the regression: after the enforce step, the
+# audit summary must contain `[1-9] allowed`. If the proxy fails to pick
+# up the new rules, every request still hits Default-to-Caution and the
+# summary reports `0 allowed N delayed`.
+if should_run 82; then
+    header "82: watch -> suggest -> enforce loop (README headline UX)"
+
+    if [ ! -f "$GVM_BIN" ]; then
+        skip "82: gvm binary not built"
+    else
+        ensure_proxy || { fail "82: proxy not available"; }
+
+        # Snapshot the live srr_network.toml so we can restore it after the
+        # test, regardless of whether suggest writes to it.
+        SRR_LIVE_PATH="${SRR_NETWORK_PATH:-config/srr_network.toml}"
+        SRR_BAK_82=$(mktemp /tmp/gvm-srr-82-XXXX.toml)
+        cp "$SRR_LIVE_PATH" "$SRR_BAK_82" 2>/dev/null || true
+
+        # Start with an empty SRR file so we know any Allow at the end came
+        # from suggest's output, not from a pre-existing rule.
+        : > "$SRR_LIVE_PATH"
+        curl -sf -X POST "$ADMIN_URL/gvm/reload" >/dev/null 2>&1 || true
+
+        # Tiny stdlib agent — three GETs against httpbin paths to give
+        # `gvm suggest` enough material to emit at least one rule.
+        AGENT_82=$(mktemp /tmp/gvm-agent82-XXXX.py)
+        cat > "$AGENT_82" <<'PYEOF'
+import urllib.request
+for url in ("http://httpbin.org/get",
+            "http://httpbin.org/uuid",
+            "http://httpbin.org/headers"):
+    urllib.request.urlopen(url, timeout=15).read(64)
+print("AGENT_82_OK")
+PYEOF
+
+        SESSION_82=$(mktemp /tmp/gvm-session82-XXXX.jsonl)
+        WATCH_82=$(mktemp /tmp/gvm-watch82-XXXX.txt)
+        ENFORCE_82=$(mktemp /tmp/gvm-enforce82-XXXX.txt)
+
+        # 82a: watch run produces JSONL with at least one event
+        timeout 30 "$GVM_BIN" run --watch --output json -- python3 "$AGENT_82" \
+            > "$SESSION_82" 2> "$WATCH_82" || true
+
+        # Strip any non-JSONL lines that an agent's stdout may have leaked
+        # into the redirected stream.
+        SESSION_CLEAN=$(mktemp /tmp/gvm-session82-clean-XXXX.jsonl)
+        grep -E '^\s*\{' "$SESSION_82" > "$SESSION_CLEAN" || true
+
+        if [ -s "$SESSION_CLEAN" ]; then
+            pass "82a: watch mode produced JSONL events"
+        else
+            fail "82a: watch mode produced no JSONL events"
+            echo "  ${DIM}stderr: $(head -3 "$WATCH_82")${NC}"
+        fi
+
+        # 82b: suggest emits at least one [[rules]] block
+        SUGGEST_OUT=$(mktemp /tmp/gvm-suggest82-XXXX.toml)
+        timeout 15 "$GVM_BIN" suggest --from "$SESSION_CLEAN" > "$SUGGEST_OUT" 2>&1 || true
+        RULE_COUNT=$(grep -c '^\[\[rules\]\]' "$SUGGEST_OUT" 2>/dev/null || echo 0)
+        if [ "$RULE_COUNT" -ge 1 ] 2>/dev/null; then
+            pass "82b: gvm suggest produced $RULE_COUNT rule(s)"
+        else
+            fail "82b: gvm suggest produced no rules"
+            echo "  ${DIM}suggest output: $(head -10 "$SUGGEST_OUT")${NC}"
+        fi
+
+        # Move suggest's TOML into the live SRR path. NO manual /gvm/reload —
+        # the next gvm run invocation must trigger reload on its own.
+        cp "$SUGGEST_OUT" "$SRR_LIVE_PATH"
+
+        # 82c: enforce run picks up the new rules WITHOUT manual reload
+        timeout 30 "$GVM_BIN" run -- python3 "$AGENT_82" \
+            > "$ENFORCE_82" 2>&1 || true
+
+        # Audit summary must report at least one allowed event. Match
+        #     "  3 allowed  0 delayed  0 blocked"
+        # but reject the broken case
+        #     "  0 allowed  3 delayed  0 blocked"
+        if grep -E '[1-9][0-9]* allowed' "$ENFORCE_82" >/dev/null 2>&1; then
+            ALLOWED_LINE=$(grep -E '[0-9]+ allowed' "$ENFORCE_82" | head -1 | sed 's/^[[:space:]]*//')
+            pass "82c: enforce picked up freshly written rules without manual reload ($ALLOWED_LINE)"
+        else
+            fail "82c: enforce did NOT apply suggest's rules — proxy reload regression"
+            echo "  ${DIM}audit tail: $(grep -E 'allowed|delayed|blocked|GVM Audit' "$ENFORCE_82" | head -5)${NC}"
+        fi
+
+        # Restore the user's original SRR file and re-load it into the proxy.
+        if [ -s "$SRR_BAK_82" ]; then
+            cp "$SRR_BAK_82" "$SRR_LIVE_PATH"
+        fi
+        curl -sf -X POST "$ADMIN_URL/gvm/reload" >/dev/null 2>&1 || true
+
+        rm -f "$AGENT_82" "$SESSION_82" "$SESSION_CLEAN" "$WATCH_82" \
+              "$SUGGEST_OUT" "$ENFORCE_82" "$SRR_BAK_82"
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
 # SUMMARY
 # ═══════════════════════════════════════════════════════════════════
 

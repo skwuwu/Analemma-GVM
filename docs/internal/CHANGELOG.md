@@ -55,6 +55,32 @@ v0.2 shipped: Shadow Mode + intent store, CONNECT tunnel, SRR hot-reload, eBPF u
 
 ## Implementation Log
 
+### 2026-04-09: v0.4.4 — watch -> suggest -> enforce loop actually works + audit dedup + e2e regression
+
+**Background**: Dogfooding the v0.4.3 Windows release with a real Python urllib agent surfaced six bugs along the README's headline UX (`watch -> suggest -> enforce`). The flow looked working at the boundary — every command exited zero, suggest emitted plausible TOML — but the third step silently kept the proxy's stale rule set and every captured request still hit Default-to-Caution. None of the existing 200+ ec2-e2e tests caught this because none of them simulated the *implicit* CLI sequence the README advertises; the only reload tests in ec2-e2e-test.sh use explicit `curl POST /gvm/reload` calls.
+
+**Code fixes**
+
+1. **Proxy reuse skipped config reload** ([crates/gvm-cli/src/proxy_manager.rs](../../crates/gvm-cli/src/proxy_manager.rs)). `ensure_available()` returned immediately when the proxy was healthy, so a `gvm suggest > config/srr_network.toml` followed by `gvm run` connected to the existing daemon and never picked up the new rules. Added `config_changed_since_proxy_start()` which compares `config/*.toml` mtimes against `data/proxy.pid`. If anything is newer, the CLI POSTs to the localhost-only `/gvm/reload` endpoint (which already does atomic parse-before-swap) and touches the PID file so subsequent invocations don't keep retriggering the reload until the user actually edits config again. Falls back to kill+restart if reload fails.
+
+2. **Audit summary double-counted state-machine transitions** ([crates/gvm-cli/src/run.rs](../../crates/gvm-cli/src/run.rs)). Each Delay/RequireApproval request writes the SAME event_id to WAL twice: once with `status=Pending` (IC-2 fail-close audit, before forwarding) and once with the final status (after the upstream response). Allow uses `append_async` and writes once. `print_wal_audit` walked every line and counted each transition as a separate event, so 1 actual delayed call surfaced as "2 delayed". Dedup by event_id, keeping the latest status.
+
+3. **`gvm suggest` double-counted the same transitions** ([crates/gvm-cli/src/suggest.rs](../../crates/gvm-cli/src/suggest.rs)). Same root cause as #2. Generated rules listed inflated `# N hits` counts. Same fix: HashSet of seen event_ids in `suggest_rules_batch`.
+
+4. **Startup-failure heuristic fired on every short-lived agent** ([crates/gvm-cli/src/pipeline.rs](../../crates/gvm-cli/src/pipeline.rs)). The post-exit warning "Agent exited in 3s with code 1 — possible startup failure" triggered on `runtime_secs < 10 && exit_code != 0` alone, mislabeling perfectly normal short demos that happened to propagate an upstream 5xx exit code. Changed to additionally require that the WAL did NOT grow during the run — if even one event landed, the agent reached the proxy and a non-zero exit is on the agent's own logic, not on launch.
+
+5. **Node detection warning never fired in watch mode** ([crates/gvm-cli/src/run.rs](../../crates/gvm-cli/src/run.rs), [crates/gvm-cli/src/watch.rs](../../crates/gvm-cli/src/watch.rs)). The "Node.js does not respect HTTPS_PROXY" warning was inline in `run::run_full` and gated on `mode == LaunchMode::Cooperative`, but `--watch` is dispatched to `watch::run_watch` which never enters that code path. Extracted into `run::warn_if_node_cooperative()` and called from both. Also added `.cmd` to the heuristic so npm-installed Windows shims like `openclaw.cmd` are detected.
+
+**Test fix — the regression that should have caught all of the above**
+
+6. **New ec2-e2e Test 82: watch -> suggest -> enforce loop** ([scripts/ec2-e2e-test.sh](../../scripts/ec2-e2e-test.sh)). Reproduces the README's exact command sequence with NO manual `/gvm/reload` calls. Steps: (a) snapshot live SRR and replace with empty file, (b) run a tiny Python urllib agent under `gvm run --watch --output json` and capture JSONL, (c) run `gvm suggest --from session.jsonl` and assert at least one `[[rules]]` block, (d) overwrite SRR with the suggest output, (e) run the agent again under enforce mode and assert the audit summary contains `[1-9][0-9]* allowed`. The third assertion is what catches the proxy-reuse regression: if the proxy fails to pick up the new rules, every event still hits Default-to-Caution and the line reads `0 allowed N delayed`. This is the test that should have existed since v0.4.0 — it directly exercises the user-facing flow the README headlines.
+
+**Discovery method**: dogfooding session, walked through the entire watch -> suggest -> enforce loop on a Windows host with a real Python agent. Twelve issues surfaced in total; six are in this release and the rest (POST events occasionally missing from `--output json`, agent_id stuck at "unknown" without an SDK, Windows PATHEXT for spawn, response `Via` header making catfact.ninja return 403, trailing event re-render in watch stream, `gvm-proxy --version` not being a flag) are tracked for v0.4.5. Several of these need design work (per-source agent_id binding, header policy) rather than a code edit, so they were intentionally deferred rather than rushed into this hot-fix.
+
+**Risk**: Low for #1-#5 (each is a localized change with the previous behavior available as a fallback). The reload fallback path in #1 exercises kill+restart, which is the same code that already handles stale PIDs, so no new failure mode. Test 82 in #6 backs out cleanly via `cp $SRR_BAK_82 $SRR_LIVE_PATH` + reload, even on failure.
+
+---
+
 ### 2026-04-09: v0.4.3 — fix workspace path baked into release binaries (critical)
 
 **Bug**: `workspace_root_for_proxy()` in `crates/gvm-cli/src/run.rs` resolved the workspace via the compile-time macro `env!("CARGO_MANIFEST_DIR")`. On dev machines and EC2 — where the binary is built and run inside the same checkout — this happened to point at the right directory, so the bug was invisible. On any release artifact built by GitHub Actions, however, the path baked in was the runner's path (`D:\a\Analemma-GVM\Analemma-GVM\...` for Windows, equivalent for Linux/macOS), which doesn't exist on user machines. Result: every distributed v0.4.0/v0.4.1/v0.4.2 binary failed at first `gvm run` with `Cannot open proxy log: <runner path>\data\proxy.log` (os error 3 / ENOENT).

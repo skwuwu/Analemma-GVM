@@ -477,11 +477,21 @@ pub fn post_exit_audit(
         eprintln!("  {YELLOW}Process exited with code: {}{RESET}", exit_code);
     }
 
-    // Fast exit warning: agent died very quickly, likely a startup failure.
-    // Common causes: missing API key, bad arguments, sandbox fs/network issue.
-    if runtime_secs < 10 && exit_code != 0 {
+    // Fast exit warning: agent died very quickly AND never reached the proxy.
+    // Without checking WAL growth, this fired on every short-lived agent that
+    // legitimately made some HTTP calls and then exited non-zero (e.g. an
+    // upstream API returned 5xx and the agent propagated it). The reliable
+    // signal for "actual startup failure" is: agent process exited fast AND
+    // the proxy WAL never recorded anything from it. If even one event landed,
+    // the agent at least reached the proxy and a non-zero exit is on the
+    // agent's own logic, not on launch.
+    let wal_grew = match std::fs::metadata("data/wal.log") {
+        Ok(meta) => meta.len() > pre.wal_offset,
+        Err(_) => false,
+    };
+    if runtime_secs < 10 && exit_code != 0 && !wal_grew {
         eprintln!(
-            "  {RED}\u{26a0} Agent exited in {}s with code {} — possible startup failure.{RESET}",
+            "  {RED}\u{26a0} Agent exited in {}s with code {} and made no proxied HTTP calls — possible startup failure.{RESET}",
             runtime_secs, exit_code
         );
         if config.mode == LaunchMode::Sandbox {

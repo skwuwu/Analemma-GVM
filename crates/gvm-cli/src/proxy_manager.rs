@@ -40,9 +40,112 @@ pub async fn proxy_healthy_with_tls(proxy: &str, require_tls: bool) -> bool {
 /// If already running (checked via health endpoint + PID file), reuse it.
 /// `require_tls`: if true, waits for MITM cert pre-warm to complete before returning.
 /// Set to true for sandbox mode (agents need warm cert cache), false for cooperative.
+/// Config files whose mtime determines whether a running proxy is "stale".
+/// Edits to any of these after the proxy started should trigger a reload
+/// so the new rules actually take effect.
+const TRACKED_CONFIG_FILES: &[&str] = &[
+    "config/srr_network.toml",
+    "config/proxy.toml",
+    "config/operation_registry.toml",
+    "config/secrets.toml",
+];
+
+/// Returns true if any tracked config file is newer than the proxy PID file.
+/// The PID file is written by the proxy on startup, so its mtime is a proxy
+/// for "when did this proxy first read the config".
+fn config_changed_since_proxy_start(workspace: &Path) -> bool {
+    let pid_path = workspace.join("data/proxy.pid");
+    let proxy_started_at = match std::fs::metadata(&pid_path).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return false, // can't tell — leave the proxy alone
+    };
+
+    // Also include every TOML under config/policies/
+    let mut candidates: Vec<PathBuf> = TRACKED_CONFIG_FILES
+        .iter()
+        .map(|p| workspace.join(p))
+        .collect();
+    if let Ok(entries) = std::fs::read_dir(workspace.join("config/policies")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("toml") {
+                candidates.push(path);
+            }
+        }
+    }
+
+    for path in candidates {
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if let Ok(modified) = meta.modified() {
+                if modified > proxy_started_at {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Ask a running proxy to atomically reload its rule set via the localhost-only
+/// `/gvm/reload` endpoint. This avoids killing and restarting the daemon when
+/// the user has only edited config files (e.g. via `gvm suggest`).
+async fn reload_running_proxy(proxy: &str) -> Result<()> {
+    let url = format!("{}/gvm/reload", proxy.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .context("Failed to build reload HTTP client")?;
+    let resp = client
+        .post(&url)
+        .send()
+        .await
+        .with_context(|| format!("POST {} failed", url))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Proxy reload returned {}: {}", status, body);
+    }
+    Ok(())
+}
+
 pub async fn ensure_available(proxy: &str, workspace: &Path, require_tls: bool) -> Result<()> {
     // 1. Check health endpoint first (fastest path)
     if proxy_healthy_with_tls(proxy, require_tls).await {
+        // 1a. Proxy is alive — but if config files have been edited since the
+        // proxy last started, its in-memory rules are stale. Hot-reload them
+        // via the localhost-only /gvm/reload endpoint instead of restarting
+        // the daemon. This is what makes `gvm suggest` -> `gvm run` actually
+        // pick up the freshly written srr_network.toml.
+        if config_changed_since_proxy_start(workspace) {
+            eprintln!(
+                "  {DIM}Config changed since proxy startup — reloading rules...{RESET}"
+            );
+            match reload_running_proxy(proxy).await {
+                Ok(()) => {
+                    eprintln!("  {GREEN}Rules reloaded{RESET}");
+                    // Touch the PID file so its mtime moves forward to "now"
+                    // and subsequent invocations don't keep retriggering the
+                    // reload until the user actually edits config again.
+                    let pid_path = workspace.join("data/proxy.pid");
+                    if let Ok(pid) = std::fs::read_to_string(&pid_path) {
+                        let _ = std::fs::write(&pid_path, pid);
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  {YELLOW}Reload failed ({e}) — falling back to restart{RESET}"
+                    );
+                    let pid_path = workspace.join("data/proxy.pid");
+                    if let Some(pid) = read_pid_file(&pid_path) {
+                        kill_process(pid);
+                        tokio::time::sleep(std::time::Duration::from_millis(500))
+                            .await;
+                    }
+                    return start_daemon(proxy, workspace, require_tls).await;
+                }
+            }
+        }
+
         // Health OK — but verify PID file matches the actual process.
         // If PID file is stale (points to dead process while a different proxy
         // is alive on the port), update it so future operations work correctly.

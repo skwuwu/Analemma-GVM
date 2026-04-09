@@ -819,6 +819,13 @@ pub async fn run_watch(
         anyhow::bail!("Cannot use --sandbox and --contained together.");
     }
 
+    // Watch mode is cooperative-only by default. Warn if the agent is Node-based,
+    // since Node's HTTP clients silently ignore HTTPS_PROXY and the user will
+    // otherwise see a confusing "0 requests captured" with no obvious cause.
+    if !sandbox && !contained {
+        run::warn_if_node_cooperative(command);
+    }
+
     let output_mode = OutputMode::parse(output)?;
     // run::run_agent determines binary vs script mode internally
 

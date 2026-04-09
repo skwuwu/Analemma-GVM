@@ -245,6 +245,13 @@ pub fn suggest_rules_batch(log_path: &str, output_path: Option<&str>, default_de
     let reader = std::io::BufReader::new(file);
     let mut caution_targets: BTreeMap<CautionTarget, usize> = BTreeMap::new();
     let mut total_events = 0usize;
+    // Each request produces multiple WAL events as it transitions through the
+    // EventStatus state machine (Pending -> Executed -> Confirmed/Failed). All
+    // share the same `event_id`. Without dedup, suggest counts a single call
+    // 2-3 times and inflates rule "hits". Dedup by event_id, keeping the first
+    // occurrence (which has the request transport info we care about).
+    let mut seen_event_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for line_result in reader.lines() {
         let line = match line_result {
@@ -255,6 +262,12 @@ pub fn suggest_rules_batch(log_path: &str, output_path: Option<&str>, default_de
             Ok(v) => v,
             Err(_) => continue,
         };
+
+        if let Some(event_id) = event.get("event_id").and_then(|v| v.as_str()) {
+            if !seen_event_ids.insert(event_id.to_string()) {
+                continue; // duplicate state-machine transition for the same request
+            }
+        }
 
         total_events += 1;
 
