@@ -39,6 +39,14 @@ struct NetworkDecisionConfig {
 
 #[derive(Deserialize, Clone, Debug)]
 struct NetworkSrrFile {
+    /// `#[serde(default)]` lets an entirely empty file (or one that
+    /// only contains comments) deserialize as `rules: vec![]` instead
+    /// of failing with "missing field `rules`". Operators legitimately
+    /// keep an empty rule file as a "no extra rules, defaults only"
+    /// state — and `gvm suggest` may overwrite the file with content
+    /// that has a leading TOML comment but no `rules =` line yet.
+    /// Without the default, every such file fails proxy startup.
+    #[serde(default)]
     rules: Vec<NetworkRuleConfig>,
 }
 
@@ -156,18 +164,28 @@ impl NetworkSRR {
         let file: NetworkSrrFile = toml::from_str(&content)
             .with_context(|| format!("Failed to parse SRR file: {}", path.display()))?;
 
-        // Final fail-close check: if the file is non-trivial in size but
-        // produced zero rule blocks, the loader almost certainly silently
-        // dropped them. Refuse to load rather than serve traffic with an
-        // empty governance set. An intentionally empty file is allowed
-        // (size <= 64 bytes is treated as a deliberate empty placeholder).
-        if file.rules.is_empty() && content.trim().len() > 64 {
+        // Final fail-close check: if the file textually contains at least
+        // one `[[rules]]` array-of-tables header but the parser handed
+        // back zero rules, those rules were silently dropped — refuse
+        // rather than serve traffic with an empty governance set.
+        //
+        // We deliberately do NOT bail just because the file is "big and
+        // empty" — operators legitimately keep `rules = []` placeholders
+        // (Test 82's baseline writes exactly that), and rule-free files
+        // with only comments and an empty array are 100+ bytes. Counting
+        // `[[rules]]` headers in the raw text is the precise signal: if
+        // none are present, the file is legitimately rule-free; if any
+        // are present but `file.rules` is empty, something corrupted the
+        // entries between disk and the deserialised struct.
+        let textual_rule_blocks = content.matches("[[rules]]").count();
+        if file.rules.is_empty() && textual_rule_blocks > 0 {
             anyhow::bail!(
-                "SRR file {} parsed to zero rules even though the file is {} bytes. \
-                 The TOML loader likely dropped malformed entries silently. \
-                 Inspect the file for stray non-ASCII bytes or unexpected sections.",
+                "SRR file {} contains {} [[rules]] block(s) in the source text \
+                 but parsed to zero rules. The TOML loader likely dropped \
+                 malformed entries silently. Inspect the file for stray \
+                 non-ASCII bytes or unexpected sections.",
                 path.display(),
-                content.len(),
+                textual_rule_blocks,
             );
         }
 

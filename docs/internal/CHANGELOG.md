@@ -55,6 +55,22 @@ v0.2 shipped: Shadow Mode + intent store, CONNECT tunnel, SRR hot-reload, eBPF u
 
 ## Implementation Log
 
+### 2026-04-09: v0.4.6 — three follow-ups exposed by validating v0.4.5 on EC2
+
+Verifying v0.4.5 against the actual EC2 dry run of Test 82 surfaced three follow-ups. None are new bugs in the strict sense (two are over-eager fixes from v0.4.5, one is an existing bug in the loader's serde shape that the v0.4.5 work simply revealed). All three are needed for Test 82 to actually pass.
+
+1. **Empty SRR file fails proxy startup** ([src/srr.rs](../../src/srr.rs)). `NetworkSrrFile.rules` had no `#[serde(default)]`, so an entirely empty `srr_network.toml` (or one with only comments) failed `toml::from_str` with "missing field `rules`" → proxy refused to start. Test 82 was deliberately writing a placeholder rule file as its baseline; once the placeholder was rejected, every subsequent step in the test was a phantom failure cascading from the broken proxy. Added `#[serde(default)]` so a missing `rules` table deserialises to `vec![]`. Operators can now legitimately keep an empty rule file as a "defaults only" state, which several documentation paths already implied was supported.
+
+2. **v0.4.5 fail-close threshold was too aggressive** ([src/srr.rs](../../src/srr.rs)). The original "non-trivial file produced zero rules" guard (`content.trim().len() > 64`) fired on the perfectly legitimate placeholder `# Test 82 placeholder ...\nrules = []\n` (76 bytes). The intent of v0.4.5 fix #2 was to catch the case where the source text had `[[rules]]` blocks but the parser silently dropped them. Replaced the byte-count heuristic with a textual `[[rules]]` count: if the raw file contains one or more `[[rules]]` headers but `file.rules` is empty, the entries were dropped → bail. If the file legitimately has no `[[rules]]` blocks (only comments + `rules = []`), it loads cleanly. This is the precise signal we wanted in v0.4.5 — the byte threshold was a stand-in that misfired on the first real test. All 40 existing SRR unit tests still pass.
+
+3. **`print_wal_audit` proxy.log fallback never matched anything** ([crates/gvm-cli/src/run.rs](../../crates/gvm-cli/src/run.rs)). The v0.4.5 fix #5 fallback grepped proxy.log for the literal substring `decision=Allow` to surface IC-1 Allow events when the WAL was empty. But proxy.log is written by tracing-subscriber with ANSI color escapes by default, so the on-disk bytes are actually `decision\x1b[0m\x1b[2m=\x1b[0mAllow` — no consecutive substring match. Loosened the search to require both `decision` and `Allow` independently per line (still gated on the line containing `Request classified` so we don't match unrelated log entries). Increased the lookback from 200 lines to 500 to cover startup-heavy proxy logs. The user-facing impact: after a successful all-Allow enforce run, the audit summary now correctly shows `✓ N request(s) classified as Allow (IC-1 fast-path)` instead of the misleading "no events recorded".
+
+**Discovery**: Direct EC2 dry run of `bash scripts/ec2-e2e-test.sh 82` against the v0.4.5 release binary. Test 82 reported `82a/82b/82c` all FAIL with stderr showing the SRR loader rejecting the 76-byte placeholder file. Repro on a fresh shell with the user's GVM_CONFIG isolation pattern reproduced the exact error. The proxy.log scrape miss was found while validating the same chain on Windows: enforce mode showed `srr_rules=5` and 5 Allow classifications in proxy.log, yet the audit summary printed "No GVM events recorded".
+
+**Risk**: Low. (1) is a serde annotation that broadens the accepted input set — strictly more permissive, no test regressions. (2) replaces a heuristic with a precise textual signal — strictly more accurate. (3) loosens a substring match in a read-only display fallback — pure additive surface area. All three preserve the v0.4.5 safety properties (control-byte rejection still strict, fail-close on dropped rules still strict).
+
+---
+
 ### 2026-04-09: v0.4.5 — fail-close on corrupted SRR files + suggest stdout safety + audit clarity
 
 **Background**: Test 82 (the watch->suggest->enforce regression guard added in v0.4.4) failed on the EC2 dry run, but **not** because the v0.4.4 reload fix had regressed. Two distinct production bugs were exposed by the test, plus one bug in the test script itself. All three are fixed here, plus three smaller UX items uncovered along the way.

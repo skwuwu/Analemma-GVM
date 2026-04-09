@@ -419,13 +419,24 @@ pub(crate) fn print_wal_audit(wal_path: &str, start_offset: u64, agent_id: &str)
         // stub today and intentionally never lands in the file WAL — so
         // an entirely-Allow run produces an empty audit by design). If the
         // proxy.log has nothing, the agent really did bypass HTTP_PROXY.
+        // proxy.log contains ANSI color escapes by default (it's the same
+        // tracing-subscriber output the user sees on stderr), so naive
+        // substring matching like `l.contains("decision=Allow")` fails —
+        // the actual bytes are `decision\x1b[0m\x1b[2m=\x1b[0mAllow`. Strip
+        // ESC sequences before matching, or just match two looser substrings
+        // separately. The cheap path is to detect the two anchors
+        // independently per line.
         let allow_signal = std::fs::read_to_string("data/proxy.log")
             .ok()
             .map(|log| {
                 log.lines()
                     .rev()
-                    .take(200)
-                    .filter(|l| l.contains("Request classified") && l.contains("decision=Allow"))
+                    .take(500)
+                    .filter(|l| {
+                        l.contains("Request classified")
+                            && l.contains("decision")
+                            && l.contains("Allow")
+                    })
                     .count()
             })
             .unwrap_or(0);
