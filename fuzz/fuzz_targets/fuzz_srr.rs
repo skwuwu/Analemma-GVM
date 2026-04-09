@@ -10,15 +10,23 @@
 use libfuzzer_sys::fuzz_target;
 use std::sync::OnceLock;
 
-static SRR: OnceLock<gvm_proxy::srr::NetworkSRR> = OnceLock::new();
+// Wrap the engine + the temp dir in one struct so the OnceLock owns
+// both. The previous version Box::leak'd the TempDir, which LSan
+// correctly reports as a leak (no reachable root pointer to the Box).
+// Bundling them into a single OnceLock-owned struct keeps the directory
+// alive for the same fuzzer lifetime without leaking — the pointer is
+// reachable from `static SRR`, so LSan considers it owned.
+struct SrrFixture {
+    srr: gvm_proxy::srr::NetworkSRR,
+    _tempdir: tempfile::TempDir,
+}
+
+static SRR: OnceLock<SrrFixture> = OnceLock::new();
 
 fn get_srr() -> &'static gvm_proxy::srr::NetworkSRR {
-    SRR.get_or_init(|| {
+    &SRR.get_or_init(|| {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("srr.toml");
-        // Intentionally leak the tempdir so the file persists for the fuzzer's lifetime
-        let dir = Box::leak(Box::new(dir));
-        let _ = dir;
 
         std::fs::write(&path, r#"
             [[rules]]
@@ -45,8 +53,10 @@ fn get_srr() -> &'static gvm_proxy::srr::NetworkSRR {
             decision = { type = "Delay", milliseconds = 300 }
         "#).expect("write SRR config");
 
-        gvm_proxy::srr::NetworkSRR::load(&path).expect("load SRR config")
+        let srr = gvm_proxy::srr::NetworkSRR::load(&path).expect("load SRR config");
+        SrrFixture { srr, _tempdir: dir }
     })
+    .srr
 }
 
 fuzz_target!(|data: &[u8]| {

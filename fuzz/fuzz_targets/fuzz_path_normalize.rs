@@ -12,14 +12,21 @@
 use libfuzzer_sys::fuzz_target;
 use std::sync::OnceLock;
 
-static SRR: OnceLock<gvm_proxy::srr::NetworkSRR> = OnceLock::new();
+// Bundle the engine + temp dir into one OnceLock-owned struct so LSan
+// sees a reachable root pointer. The previous Box::leak'd TempDir was
+// flagged as a 24+15 byte leak on every fuzz invocation. Same fix as
+// fuzz_srr / fuzz_policy_eval.
+struct SrrFixture {
+    srr: gvm_proxy::srr::NetworkSRR,
+    _tempdir: tempfile::TempDir,
+}
+
+static SRR: OnceLock<SrrFixture> = OnceLock::new();
 
 fn get_srr() -> &'static gvm_proxy::srr::NetworkSRR {
-    SRR.get_or_init(|| {
+    &SRR.get_or_init(|| {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("srr.toml");
-        let dir = Box::leak(Box::new(dir));
-        let _ = dir;
 
         // Rules that exercise path matching edge cases:
         // - Exact path, prefix, wildcard, deep nesting, encoded characters
@@ -45,8 +52,10 @@ fn get_srr() -> &'static gvm_proxy::srr::NetworkSRR {
             decision = { type = "Delay", milliseconds = 300 }
         "#).expect("write SRR config");
 
-        gvm_proxy::srr::NetworkSRR::load(&path).expect("load SRR config")
+        let srr = gvm_proxy::srr::NetworkSRR::load(&path).expect("load SRR config");
+        SrrFixture { srr, _tempdir: dir }
     })
+    .srr
 }
 
 fuzz_target!(|data: &[u8]| {
