@@ -172,6 +172,12 @@ struct SessionStats {
     thinking_count: u64,
     estimated_cost: f64,
     start_time: Instant,
+    /// event_ids already counted. Each request transitions through the
+    /// EventStatus state machine (Pending -> Executed -> Confirmed/Failed),
+    /// emitting one WAL line per transition with the SAME event_id. Without
+    /// dedup the watch session counter inflates 1 actual call to 2-3
+    /// "requests", and the per-host bars become wrong.
+    seen_event_ids: HashSet<String>,
 }
 
 impl SessionStats {
@@ -193,10 +199,18 @@ impl SessionStats {
             thinking_count: 0,
             estimated_cost: 0.0,
             start_time: Instant::now(),
+            seen_event_ids: HashSet::new(),
         }
     }
 
     fn record_event(&mut self, event: &serde_json::Value) {
+        // Dedup state-machine transitions for the same request. See note
+        // on `seen_event_ids`.
+        if let Some(event_id) = event.get("event_id").and_then(|v| v.as_str()) {
+            if !self.seen_event_ids.insert(event_id.to_string()) {
+                return;
+            }
+        }
         self.total_requests += 1;
 
         // Host

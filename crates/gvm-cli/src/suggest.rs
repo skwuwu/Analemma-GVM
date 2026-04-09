@@ -368,14 +368,26 @@ pub fn suggest_rules_batch(log_path: &str, output_path: Option<&str>, default_de
             Err(e) => eprintln!("{RED}Failed to write {path}: {e}{RESET}"),
         },
         None => {
-            // stdout
-            print!("{toml_output}");
-            eprintln!(
-                "{DIM}# {} rule(s) from {} events ({} caution hits){RESET}",
+            // stdout — used by `gvm suggest --from x > srr.toml`. Whatever
+            // we emit here MUST remain valid TOML, because the user almost
+            // always pipes us straight into srr_network.toml. Previously
+            // this branch printed a colored summary on stderr; if the
+            // shell merged stderr into stdout (e.g. `2>&1`, CI capture,
+            // some IDE consoles), the ANSI escape bytes landed inside the
+            // rule file. The proxy's TOML loader then silently produced
+            // zero rules and governance was disabled without any error
+            // surface. Lesson: the only safe channel that survives every
+            // shell redirection mode is the toml_output buffer itself,
+            // and the only safe content is plain ASCII inside a `#`
+            // comment line. So embed the summary as the final TOML
+            // comment and drop the stderr write entirely.
+            let summary = format!(
+                "# {} rule(s) from {} events ({} caution hits)\n",
                 caution_targets.len(),
                 total_events,
                 caution_targets.values().sum::<usize>(),
             );
+            print!("{toml_output}{summary}");
         }
     }
 }

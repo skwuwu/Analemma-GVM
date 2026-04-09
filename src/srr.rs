@@ -122,8 +122,54 @@ impl NetworkSRR {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read SRR file: {}", path.display()))?;
+
+        // Defense in depth: reject SRR files containing ASCII control bytes
+        // other than whitespace. The trigger is `gvm suggest > srr.toml` in
+        // a shell that merges stderr into stdout (e.g. `2>&1`, some CI
+        // capture wrappers), which used to embed an ANSI-coloured summary
+        // line into the rule file. The TOML crate handled the resulting
+        // ESC (0x1b) bytes inconsistently — some versions returned an
+        // empty rule set silently, which left the proxy running with zero
+        // governance rules and no error surface. That violates fail-close
+        // ([CLAUDE.md](docs/internal/GVM_CODE_STANDARDS.md)). Fail loudly
+        // here so the operator sees the file is corrupted before any
+        // request is mis-classified.
+        for (lineno, line) in content.lines().enumerate() {
+            for (col, byte) in line.bytes().enumerate() {
+                let is_control = byte < 0x20 && byte != b'\t';
+                let is_del = byte == 0x7f;
+                if is_control || is_del {
+                    anyhow::bail!(
+                        "SRR file {} contains a control byte (0x{:02x}) at line {}, column {}. \
+                         This usually means terminal escape codes leaked into the file — \
+                         likely `gvm suggest` was invoked with stderr merged into stdout \
+                         (`2>&1`). Re-generate the file without merging stderr.",
+                        path.display(),
+                        byte,
+                        lineno + 1,
+                        col + 1,
+                    );
+                }
+            }
+        }
+
         let file: NetworkSrrFile = toml::from_str(&content)
             .with_context(|| format!("Failed to parse SRR file: {}", path.display()))?;
+
+        // Final fail-close check: if the file is non-trivial in size but
+        // produced zero rule blocks, the loader almost certainly silently
+        // dropped them. Refuse to load rather than serve traffic with an
+        // empty governance set. An intentionally empty file is allowed
+        // (size <= 64 bytes is treated as a deliberate empty placeholder).
+        if file.rules.is_empty() && content.trim().len() > 64 {
+            anyhow::bail!(
+                "SRR file {} parsed to zero rules even though the file is {} bytes. \
+                 The TOML loader likely dropped malformed entries silently. \
+                 Inspect the file for stray non-ASCII bytes or unexpected sections.",
+                path.display(),
+                content.len(),
+            );
+        }
 
         let mut rules = Vec::new();
 

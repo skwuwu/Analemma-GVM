@@ -53,6 +53,16 @@ const TRACKED_CONFIG_FILES: &[&str] = &[
 /// Returns true if any tracked config file is newer than the proxy PID file.
 /// The PID file is written by the proxy on startup, so its mtime is a proxy
 /// for "when did this proxy first read the config".
+///
+/// Honors `GVM_CONFIG` (and the corresponding `srr_network.toml` next to it)
+/// when set, in addition to the default `config/` paths under `workspace`.
+/// Without this, an isolated test config under `/tmp/gvm-e2e-config-XXX/`
+/// is invisible to the detector — `gvm suggest` writes the new rules,
+/// `gvm run` checks `workspace/config/srr_network.toml` (unchanged), sees
+/// no edit, never triggers reload, and the next agent run still hits the
+/// stale in-memory ruleset. That breakage was caught by Test 82 on the
+/// 2026-04-09 EC2 dry run after the v0.4.4 reload-on-stale-config fix
+/// landed but was never validated against the 8668d30 SRR isolation.
 fn config_changed_since_proxy_start(workspace: &Path) -> bool {
     let pid_path = workspace.join("data/proxy.pid");
     let proxy_started_at = match std::fs::metadata(&pid_path).and_then(|m| m.modified()) {
@@ -60,16 +70,41 @@ fn config_changed_since_proxy_start(workspace: &Path) -> bool {
         Err(_) => return false, // can't tell — leave the proxy alone
     };
 
-    // Also include every TOML under config/policies/
+    // Default tracked paths under the workspace root.
     let mut candidates: Vec<PathBuf> = TRACKED_CONFIG_FILES
         .iter()
         .map(|p| workspace.join(p))
         .collect();
+
+    // Also include every TOML under workspace/config/policies/
     if let Ok(entries) = std::fs::read_dir(workspace.join("config/policies")) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("toml") {
                 candidates.push(path);
+            }
+        }
+    }
+
+    // Override / extension via $GVM_CONFIG. The proxy honors this env var
+    // to load proxy.toml from a non-default location (used by the e2e
+    // test isolation pattern). We also probe a sibling `srr_network.toml`
+    // and a `policies/` directory next to it so the same convention holds
+    // end-to-end without requiring callers to set extra env vars.
+    if let Ok(gvm_config) = std::env::var("GVM_CONFIG") {
+        let gvm_config = PathBuf::from(gvm_config);
+        if let Some(parent) = gvm_config.parent() {
+            candidates.push(gvm_config.clone());
+            candidates.push(parent.join("srr_network.toml"));
+            candidates.push(parent.join("operation_registry.toml"));
+            candidates.push(parent.join("secrets.toml"));
+            if let Ok(entries) = std::fs::read_dir(parent.join("policies")) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|s| s.to_str()) == Some("toml") {
+                        candidates.push(path);
+                    }
+                }
             }
         }
     }

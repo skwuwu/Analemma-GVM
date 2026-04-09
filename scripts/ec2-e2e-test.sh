@@ -6527,9 +6527,22 @@ if should_run 82; then
         SRR_BAK_82=$(mktemp /tmp/gvm-srr-82-XXXX.toml)
         cp "$SRR_LIVE_PATH" "$SRR_BAK_82" 2>/dev/null || true
 
-        # Start with an empty SRR file so we know any Allow at the end came
-        # from suggest's output, not from a pre-existing rule.
-        : > "$SRR_LIVE_PATH"
+        # Start with a MINIMAL VALID SRR file (empty rules array) so we
+        # know any Allow at the end came from suggest's output, not from
+        # a pre-existing rule. The SRR loader requires the `rules`
+        # field on the root NetworkSrrFile struct (no #[serde(default)])
+        # — both an empty file AND a comment-only file fail to parse
+        # with "missing field `rules`", which causes
+        # proxy_manager::ensure_available to take its reload→restart
+        # fallback path, restart the daemon with the same broken file,
+        # and exit immediately. Use `rules = []` to satisfy the parser
+        # while still leaving a clean slate for `gvm suggest` to fill.
+        # Discovered on the EC2 dry run when Test 82 itself was caught
+        # by the exact regression it was meant to guard against.
+        cat > "$SRR_LIVE_PATH" << 'PLACEHOLDEREOF'
+# Test 82 placeholder — overwritten by `gvm suggest` mid-test.
+rules = []
+PLACEHOLDEREOF
         curl -sf -X POST "$ADMIN_URL/gvm/reload" >/dev/null 2>&1 || true
 
         # Tiny stdlib agent — three GETs against httpbin paths to give
@@ -6565,14 +6578,33 @@ PYEOF
         fi
 
         # 82b: suggest emits at least one [[rules]] block
+        # Capture stdout (the TOML rules) to a file, send stderr to a
+        # SEPARATE file. The previous version used `2>&1` which folded
+        # gvm suggest's stderr summary line — which contains raw ANSI
+        # color escapes (DIM/RESET) — into the TOML file. The TOML
+        # parser then quietly produced 0 rules from the corrupted
+        # comment, the proxy hot-reloaded with srr_rules=0, and 82c
+        # always failed regardless of whether the v0.4.4 reload fix
+        # was working. (gvm-cli should ALSO suppress ANSI when stderr
+        # isn't a tty — separate fix.)
         SUGGEST_OUT=$(mktemp /tmp/gvm-suggest82-XXXX.toml)
-        timeout 15 "$GVM_BIN" suggest --from "$SESSION_CLEAN" > "$SUGGEST_OUT" 2>&1 || true
+        SUGGEST_ERR=$(mktemp /tmp/gvm-suggest82-err-XXXX.txt)
+        timeout 15 "$GVM_BIN" suggest --from "$SESSION_CLEAN" > "$SUGGEST_OUT" 2> "$SUGGEST_ERR" || true
         RULE_COUNT=$(grep -c '^\[\[rules\]\]' "$SUGGEST_OUT" 2>/dev/null || echo 0)
-        if [ "$RULE_COUNT" -ge 1 ] 2>/dev/null; then
-            pass "82b: gvm suggest produced $RULE_COUNT rule(s)"
+
+        # Regression guard for v0.4.5 Bug A: gvm suggest must NEVER write
+        # ASCII control bytes (other than tab/newline) to stdout, even if
+        # the user later collapses stderr in. If this fires, the embed-as-
+        # TOML-comment fix in suggest.rs has regressed.
+        if LC_ALL=C grep -lP '[\x00-\x08\x0B-\x1F\x7F]' "$SUGGEST_OUT" >/dev/null 2>&1; then
+            fail "82b: gvm suggest emitted control bytes on stdout (Bug A regression)"
+            od -c "$SUGGEST_OUT" | head -3
+        elif [ "$RULE_COUNT" -ge 1 ] 2>/dev/null; then
+            pass "82b: gvm suggest produced $RULE_COUNT rule(s) on clean stdout"
         else
             fail "82b: gvm suggest produced no rules"
-            echo "  ${DIM}suggest output: $(head -10 "$SUGGEST_OUT")${NC}"
+            echo "  ${DIM}stdout: $(head -10 "$SUGGEST_OUT")${NC}"
+            echo "  ${DIM}stderr: $(head -5 "$SUGGEST_ERR")${NC}"
         fi
 
         # Move suggest's TOML into the live SRR path. NO manual /gvm/reload —
@@ -6602,7 +6634,7 @@ PYEOF
         curl -sf -X POST "$ADMIN_URL/gvm/reload" >/dev/null 2>&1 || true
 
         rm -f "$AGENT_82" "$SESSION_82" "$SESSION_CLEAN" "$WATCH_82" \
-              "$SUGGEST_OUT" "$ENFORCE_82" "$SRR_BAK_82"
+              "$SUGGEST_OUT" "$SUGGEST_ERR" "$ENFORCE_82" "$SRR_BAK_82"
     fi
 fi
 

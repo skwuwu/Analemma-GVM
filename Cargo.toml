@@ -5,7 +5,7 @@ resolver = "2"
 
 [package]
 name = "gvm-proxy"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2021"
 description = "Analemma Governance Virtual Machine — AI agent enforcement proxy"
 license = "Apache-2.0"

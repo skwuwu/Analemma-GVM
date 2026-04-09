@@ -412,8 +412,39 @@ pub(crate) fn print_wal_audit(wal_path: &str, start_offset: u64, agent_id: &str)
         .collect();
 
     if events.is_empty() {
-        println!("  {DIM}No GVM events recorded during this run.{RESET}");
-        println!("  {DIM}Make sure your agent uses HTTP_PROXY to route through GVM.{RESET}");
+        // Two very different reasons we land here, and the user needs to
+        // know which one. Check proxy.log for recent classification lines:
+        // if any are present, the agent DID hit the proxy and every call
+        // was Allowed (IC-1 events use `append_async` which is a NATS-only
+        // stub today and intentionally never lands in the file WAL — so
+        // an entirely-Allow run produces an empty audit by design). If the
+        // proxy.log has nothing, the agent really did bypass HTTP_PROXY.
+        let allow_signal = std::fs::read_to_string("data/proxy.log")
+            .ok()
+            .map(|log| {
+                log.lines()
+                    .rev()
+                    .take(200)
+                    .filter(|l| l.contains("Request classified") && l.contains("decision=Allow"))
+                    .count()
+            })
+            .unwrap_or(0);
+
+        if allow_signal > 0 {
+            println!(
+                "  {GREEN}\u{2713} {} request(s) classified as Allow (IC-1 fast-path).{RESET}",
+                allow_signal
+            );
+            println!(
+                "  {DIM}IC-1 Allow uses async dispatch and is not recorded in the durable WAL{RESET}"
+            );
+            println!(
+                "  {DIM}by design (loss tolerated at <0.1%). See data/proxy.log for the live trace.{RESET}"
+            );
+        } else {
+            println!("  {DIM}No GVM events recorded during this run.{RESET}");
+            println!("  {DIM}Make sure your agent uses HTTP_PROXY to route through GVM.{RESET}");
+        }
         println!();
         return;
     }

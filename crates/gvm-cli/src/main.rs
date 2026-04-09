@@ -292,8 +292,11 @@ enum Commands {
     /// without actually sending it. Shows decision path (ABAC + SRR → final).
     ///
     ///   gvm check --operation gvm.payment.charge --host api.bank.com
-    ///   gvm check --operation test --host api.github.com --method GET
+    ///   gvm check --operation test --host api.github.com --method GET --path /repos/foo/bar
     ///   gvm check --agent-id finance-001 --operation gvm.payment.charge --host api.bank.com
+    ///
+    /// Note: SRR rules from `gvm suggest` are path-specific (e.g. `httpbin.org/get`).
+    /// Pass `--path /get` to test those rules — the default `/` will not match them.
     Check {
         /// Operation name (e.g. "gvm.payment.charge")
         #[arg(long)]

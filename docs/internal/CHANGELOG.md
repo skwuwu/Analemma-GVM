@@ -55,6 +55,45 @@ v0.2 shipped: Shadow Mode + intent store, CONNECT tunnel, SRR hot-reload, eBPF u
 
 ## Implementation Log
 
+### 2026-04-09: v0.4.5 — fail-close on corrupted SRR files + suggest stdout safety + audit clarity
+
+**Background**: Test 82 (the watch->suggest->enforce regression guard added in v0.4.4) failed on the EC2 dry run, but **not** because the v0.4.4 reload fix had regressed. Two distinct production bugs were exposed by the test, plus one bug in the test script itself. All three are fixed here, plus three smaller UX items uncovered along the way.
+
+**Bug A — `gvm suggest` writes ANSI color codes to stderr unconditionally** ([crates/gvm-cli/src/suggest.rs](../../crates/gvm-cli/src/suggest.rs)). The trailing summary line `# {N} rule(s) from {M} events` was emitted via `eprintln!` with `{DIM}/{RESET}` color escapes. Most of the time stderr stays on the terminal and this is fine. The trouble is the README's headline UX: `gvm suggest > srr.toml`. Inside Test 82 the line was `... > "$SUGGEST_OUT" 2>&1` (capturing stderr too for debug visibility), which folded the ANSI bytes into the rule file. Even outside of the test, every IDE/CI capture wrapper that merges stderr into stdout would corrupt the same way.
+
+**Fix A**: Move the trailing summary into the `toml_output` buffer itself as a leading-`#` TOML comment, drop the `eprintln!` entirely. This means the same content shows up no matter how the shell redirects, and there are zero ANSI bytes anywhere in suggest's stdout path. A TOML `#` comment is harmless to the parser.
+
+**Bug B — SRR loader silently produced 0 rules from corrupted TOML** ([src/srr.rs](../../src/srr.rs)). Once Bug A leaked ANSI bytes into srr_network.toml, the proxy's `NetworkSRR::load()` fed the file to `toml::from_str` and got back a `NetworkSrrFile { rules: vec![] }` with no error. The proxy logged `Governance hot-reloaded srr_rules=0` and started classifying every request as Default-to-Caution. This is a textbook fail-close violation: the operator has no way to tell that the rule set was just zero'd out by a stray byte. (Manually verified by writing a clean TOML to the same path and confirming reload returned `srr_rules=1`.)
+
+**Fix B**: Two new defensive checks at the top of `NetworkSRR::load()`. First, scan the file content for ASCII control bytes (0x00–0x1F except `\t`/`\n`/`\r`, plus 0x7F DEL). If any are present, bail with a precise line/column diagnostic and a hint that this usually means terminal escapes leaked in via `2>&1`. Second, if the parser succeeded but produced zero rules from a non-trivial file (>64 bytes), bail with an explicit "loader silently dropped malformed entries" message. An intentionally empty file (≤64 bytes) is still allowed so that operators can deliberately disable a ruleset. Both fail-close paths surface the actual file path so the operator can fix it instead of digging through proxy logs.
+
+**Test 82 — `2>&1` was masking both production bugs** ([scripts/ec2-e2e-test.sh](../../scripts/ec2-e2e-test.sh)). The original Test 82 used `> "$SUGGEST_OUT" 2>&1`, which is exactly the redirect mode that triggers Bug A. The test was busy verifying step C (rule application) without first checking that step B's output was sanitary. Split stdout and stderr into separate temp files, and add a control-byte regression check on the stdout file using `LC_ALL=C grep -lP '[\x00-\x08\x0B-\x1F\x7F]'`. If `gvm suggest` ever starts leaking control bytes to stdout again, 82b fails loudly with an `od -c` dump.
+
+**Watch session counter inflated by state-machine transitions** ([crates/gvm-cli/src/watch.rs](../../crates/gvm-cli/src/watch.rs)). v0.4.4 fixed the dedup in `print_wal_audit` and `suggest_rules_batch` but missed the parallel counter inside `SessionStats::record_event`, so the watch summary still showed "8 requests" for 4 actual calls (each WAL transition counted as a request). Added `seen_event_ids: HashSet<String>` to `SessionStats`, dedup on entry. Same root cause as the v0.4.4 fix, just one more code path that needed the same treatment.
+
+**`print_wal_audit` could not surface IC-1 Allow events** ([crates/gvm-cli/src/run.rs](../../crates/gvm-cli/src/run.rs)). Discovered while verifying v0.4.4: after a successful enforce run with all-Allow rules, the audit summary printed "No GVM events recorded during this run" and the user couldn't tell whether the rules had matched. Investigating, `Ledger::append_async` is a NATS-publish stub today and **never writes to the durable WAL by design** (IC-1 = "loss tolerated < 0.1%"), so an entirely-Allow run produces an empty WAL by definition. Proper ring-buffer / IC-1 visibility belongs in v0.4.6 (significant feature work). For v0.4.5 the minimal pragmatic improvement: when the WAL is empty, scrape `data/proxy.log` for recent `Request classified ... decision=Allow` lines. If any are found, surface them as a green check with an explicit note that IC-1 doesn't durable-WAL. If none, fall back to the original "agent didn't reach the proxy" hint. The user now sees a clear distinction between "all good, all allowed" and "agent bypassed governance entirely".
+
+**`gvm check --path` was undocumented in `--help` examples** ([crates/gvm-cli/src/main.rs](../../crates/gvm-cli/src/main.rs)). The `--path` flag has been there since v0.4.0 with default `/`, but the doc-comment examples never showed it, so users testing `gvm suggest`-generated path-specific rules (`pattern = "httpbin.org/get"`) hit Default-to-Caution because their `gvm check --host httpbin.org` defaulted to `/`. Added an explicit example using `--path /repos/foo/bar` and a note that suggest's rules are path-scoped.
+
+**Affected files**: [crates/gvm-cli/src/suggest.rs](../../crates/gvm-cli/src/suggest.rs), [src/srr.rs](../../src/srr.rs), [scripts/ec2-e2e-test.sh](../../scripts/ec2-e2e-test.sh) (Test 82b), [crates/gvm-cli/src/watch.rs](../../crates/gvm-cli/src/watch.rs), [crates/gvm-cli/src/run.rs](../../crates/gvm-cli/src/run.rs), [crates/gvm-cli/src/main.rs](../../crates/gvm-cli/src/main.rs).
+
+**Risk**:
+- Fix A (suggest stdout): **Negligible.** Output now contains an extra TOML comment line. Existing TOML parsers and downstream tools all tolerate `#` comments. The eprintln removal means scripts that were `2>` capturing the summary as a status indicator will lose it, but those scripts were already broken if they tried to do anything machine-readable with the colored output.
+- Fix B (SRR loader fail-close): **Low.** The loader is stricter, which is the entire point. Verified against the existing 40 SRR unit tests (all pass) and the 64-byte threshold means deliberately empty rulesets continue to load. The risk surface is operator-facing: a previously-broken-but-silent file now refuses to load — that's a fail-close behavior change but the failure mode is "proxy refuses to start with bad rules", which is exactly what fail-close mandates.
+- Test 82 fix: **None.** Test-only.
+- Watch counter dedup: **Negligible.** Same fix pattern as v0.4.4 audit dedup, applied to a parallel code path.
+- Allow-via-proxy.log fallback: **Low.** Pure read-only fallback. If proxy.log doesn't exist or is unreadable, falls back to the original "no events recorded" message. Worst case is the user sees the same message they saw before this fix.
+
+**Items intentionally deferred to v0.4.6**:
+- IC-1 Allow ring buffer (proper /gvm/recent_events endpoint instead of grepping proxy.log)
+- agent_id propagation (needs CLI <-> proxy session registration design)
+- Windows PATHEXT support for `Command::spawn` (`which` crate)
+- `Via` header policy (suppress vs annotate vs configurable)
+- Watch stream trailing event re-render (cosmetic)
+- `gvm-proxy --version` flag (currently triggers full startup)
+
+---
+
 ### 2026-04-09: v0.4.4 — watch -> suggest -> enforce loop actually works + audit dedup + e2e regression
 
 **Background**: Dogfooding the v0.4.3 Windows release with a real Python urllib agent surfaced six bugs along the README's headline UX (`watch -> suggest -> enforce`). The flow looked working at the boundary — every command exited zero, suggest emitted plausible TOML — but the third step silently kept the proxy's stale rule set and every captured request still hit Default-to-Caution. None of the existing 200+ ec2-e2e tests caught this because none of them simulated the *implicit* CLI sequence the README advertises; the only reload tests in ec2-e2e-test.sh use explicit `curl POST /gvm/reload` calls.
