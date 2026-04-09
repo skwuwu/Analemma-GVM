@@ -11,14 +11,25 @@ use libfuzzer_sys::fuzz_target;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-static ENGINE: OnceLock<gvm_proxy::policy::PolicyEngine> = OnceLock::new();
+// The TempDir lives inside the same OnceLock as the engine so LSan
+// doesn't flag it. The previous version Box::leak'd a separate TempDir,
+// which produced a 24-byte direct + 15-byte indirect leak report on
+// every run because the leaked allocation has no reachable root pointer.
+struct PolicyFixture {
+    engine: gvm_proxy::policy::PolicyEngine,
+    // Held here so its Drop runs on process exit (or never, but the
+    // pointer is reachable from ENGINE so LSan considers it owned).
+    _tempdir: tempfile::TempDir,
+}
+
+static ENGINE: OnceLock<PolicyFixture> = OnceLock::new();
 
 fn get_engine() -> &'static gvm_proxy::policy::PolicyEngine {
-    ENGINE.get_or_init(|| {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let dir = Box::leak(Box::new(dir));
-        let policy_dir = dir.path().join("policies");
-        std::fs::create_dir_all(&policy_dir).expect("create policy dir");
+    &ENGINE
+        .get_or_init(|| {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let policy_dir = dir.path().join("policies");
+            std::fs::create_dir_all(&policy_dir).expect("create policy dir");
 
         // Policy rules that exercise condition evaluation edge cases:
         // numeric comparisons, string matching, regex, nested attributes
@@ -71,9 +82,16 @@ fn get_engine() -> &'static gvm_proxy::policy::PolicyEngine {
             type = "Allow"
         "#).expect("write policy");
 
-        gvm_proxy::policy::PolicyEngine::load(dir.path().join("policies").as_path())
-            .expect("load policy engine")
-    })
+            let engine = gvm_proxy::policy::PolicyEngine::load(
+                dir.path().join("policies").as_path(),
+            )
+            .expect("load policy engine");
+            PolicyFixture {
+                engine,
+                _tempdir: dir,
+            }
+        })
+        .engine
 }
 
 fuzz_target!(|data: &[u8]| {

@@ -951,16 +951,25 @@ fn expand_ipv6(addr: &str) -> [u16; 8] {
                 parts[1].split(':').collect()
             };
 
+            // Length guard MUST run before we touch `result[i]`. The left
+            // loop below indexes `result` by `i` directly, so a malformed
+            // input with > max_segments left tokens (e.g. "1:2:3:4:5:6:7:8:9::")
+            // would panic with index out of bounds before we ever reach
+            // the post-loop check. Discovered by libFuzzer (fuzz_srr,
+            // fuzz_path_normalize) — bounds_check panic at this exact site.
+            if left.len() > max_segments
+                || right.len() > max_segments
+                || left.len() + right.len() > max_segments
+            {
+                return result; // Malformed — fail closed to all zeros
+            }
+
             for (i, seg) in left.iter().enumerate() {
                 if !seg.is_empty() {
                     result[i] = u16::from_str_radix(seg, 16).unwrap_or(0);
                 }
             }
 
-            // Guard: malformed IPv6 with too many segments after `::`
-            if right.len() > max_segments || left.len() + right.len() > max_segments {
-                return result; // Invalid — return all zeros
-            }
             let right_start = max_segments - right.len();
             for (i, seg) in right.iter().enumerate() {
                 if !seg.is_empty() {
@@ -1011,6 +1020,45 @@ mod tests {
         let path = dir.path().join("test_srr.toml");
         std::fs::write(&path, toml_str).expect("writing SRR TOML to temp file must succeed");
         NetworkSRR::load(&path).expect("valid SRR TOML must load")
+    }
+
+    // ── Regression: expand_ipv6 must not panic on malformed addresses ──
+    //
+    // libFuzzer (fuzz_srr / fuzz_path_normalize) hit `index out of bounds`
+    // panics in expand_ipv6 when an attacker-controlled IPv6 string had
+    // more than 8 segments on the left side of `::`. The length guard
+    // ran AFTER the left loop, so `result[i]` panicked first. Fixed by
+    // moving the guard above both loops; this test pins the contract.
+    #[test]
+    fn expand_ipv6_oversized_left_does_not_panic() {
+        // 9 left segments + empty right (`::` at end) — previously OOB
+        let addr = "1:2:3:4:5:6:7:8:9::";
+        let r = expand_ipv6(addr);
+        assert_eq!(r, [0u16; 8], "malformed input must fail closed to zeros");
+    }
+
+    #[test]
+    fn expand_ipv6_oversized_right_does_not_panic() {
+        let addr = "::1:2:3:4:5:6:7:8:9";
+        let r = expand_ipv6(addr);
+        assert_eq!(r, [0u16; 8]);
+    }
+
+    #[test]
+    fn expand_ipv6_oversized_combined_does_not_panic() {
+        // 5 + 5 = 10 segments around `::`
+        let addr = "1:2:3:4:5::6:7:8:9:a";
+        let r = expand_ipv6(addr);
+        assert_eq!(r, [0u16; 8]);
+    }
+
+    #[test]
+    fn expand_ipv6_well_formed_still_works() {
+        let r = expand_ipv6("2001:db8::1");
+        assert_eq!(r[0], 0x2001);
+        assert_eq!(r[1], 0x0db8);
+        assert_eq!(r[7], 0x0001);
+        assert_eq!(r[2], 0);
     }
 
     // ── Test 1: Payload > max_body_bytes → skips to next rule (continue, not return) ──
