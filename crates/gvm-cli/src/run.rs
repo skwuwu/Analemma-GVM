@@ -299,11 +299,44 @@ pub(crate) async fn proxy_healthy(proxy: &str) -> bool {
     matches!(reqwest::get(&health_url).await, Ok(resp) if resp.status().is_success())
 }
 
+/// Resolve the workspace root for proxy startup at runtime.
+///
+/// Priority:
+///   1. `GVM_WORKSPACE` env var (explicit override)
+///   2. Current working directory if it contains `config/operation_registry.toml`
+///   3. Directory containing the running executable (unpacked release archive)
+///   4. Fallback: current working directory (downstream surfaces a clean
+///      "config not found" error if it really is missing)
+///
+/// Compile-time `env!("CARGO_MANIFEST_DIR")` was previously used here, which
+/// baked the build host's path into release binaries — breaking every
+/// distributed artifact (e.g. GitHub Actions runner paths leaking into the
+/// Windows release zip). Resolution is now fully runtime-driven.
 pub(crate) fn workspace_root_for_proxy() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap_or_else(|_| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+    let marker = std::path::Path::new("config").join("operation_registry.toml");
+
+    if let Ok(p) = std::env::var("GVM_WORKSPACE") {
+        let path = std::path::PathBuf::from(p);
+        if path.join(&marker).exists() {
+            return path;
+        }
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        if cwd.join(&marker).exists() {
+            return cwd;
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if dir.join(&marker).exists() {
+                return dir.to_path_buf();
+            }
+        }
+    }
+
+    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
 /// Read WAL entries that were added during the agent run and display audit summary.

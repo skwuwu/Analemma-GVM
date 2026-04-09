@@ -1,6 +1,6 @@
 [package]
 name = "gvm-types"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 description = "Shared types for the Analemma Governance Virtual Machine"
 license = "Apache-2.0"

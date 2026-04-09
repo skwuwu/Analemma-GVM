@@ -55,6 +55,22 @@ v0.2 shipped: Shadow Mode + intent store, CONNECT tunnel, SRR hot-reload, eBPF u
 
 ## Implementation Log
 
+### 2026-04-09: v0.4.3 — fix workspace path baked into release binaries (critical)
+
+**Bug**: `workspace_root_for_proxy()` in `crates/gvm-cli/src/run.rs` resolved the workspace via the compile-time macro `env!("CARGO_MANIFEST_DIR")`. On dev machines and EC2 — where the binary is built and run inside the same checkout — this happened to point at the right directory, so the bug was invisible. On any release artifact built by GitHub Actions, however, the path baked in was the runner's path (`D:\a\Analemma-GVM\Analemma-GVM\...` for Windows, equivalent for Linux/macOS), which doesn't exist on user machines. Result: every distributed v0.4.0/v0.4.1/v0.4.2 binary failed at first `gvm run` with `Cannot open proxy log: <runner path>\data\proxy.log` (os error 3 / ENOENT).
+
+**Discovery**: surfaced when dogfooding the v0.4.2 Windows release zip with OpenClaw on a Windows host outside the repo checkout.
+
+**Fix**: replaced the compile-time lookup with a runtime resolver that checks, in order: (1) `GVM_WORKSPACE` env override, (2) cwd if it contains `config/operation_registry.toml`, (3) directory of the running executable (the unpacked release archive layout), (4) cwd as final fallback so the downstream "config not found" error is clean. The `config/operation_registry.toml` marker is used because it's the file the proxy refuses to start without, so its presence is the canonical "this is a workspace" signal.
+
+**Affected files**: [crates/gvm-cli/src/run.rs](../../crates/gvm-cli/src/run.rs) (function body only — no callers changed; `GVM_CODE_STANDARDS.md` already documents this as the canonical source).
+
+**Risk**: Low. The function still returns a `PathBuf` with the same semantics; only the discovery mechanism changed. All call sites (`watch.rs`, `pipeline.rs`, `run.rs:515`) keep working unchanged. Worst case if all four lookups fail to find a marker, the function returns cwd, which is what users almost always want anyway.
+
+**Validation plan**: tag v0.4.3, let the release workflow rebuild all five targets, redownload the Windows zip on the dogfooding host, and confirm `gvm run --watch -- openclaw agent ...` proceeds past proxy startup. EC2 is unaffected (it builds locally) but should be re-smoke-tested for safety.
+
+---
+
 ### 2026-04-09: EC2 E2E + stress test regression sweep — 23 fixes (165→201 PASS)
 
 **Background**: A baseline run of `scripts/ec2-e2e-test.sh` against the latest EC2 binary surfaced 29 failures across many unrelated tests. The 60-min stress run looked green but recorded only 4 system events from 1500+ silently-failing agent turns. This entry consolidates the root-cause investigation and fixes from a single multi-day session. Final state: **E2E 201 PASS / 8 FAIL / 30 SKIP** (8 remaining are environmental — EC2 IP exhausted GitHub's anonymous 60req/h quota, not code regressions). **Stress 5-min validation: 36 agent events vs floor 15 — agents actually exercising the proxy now**, with the 60-min run in progress at commit time.
