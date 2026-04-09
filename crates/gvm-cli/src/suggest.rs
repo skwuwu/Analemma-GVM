@@ -250,8 +250,7 @@ pub fn suggest_rules_batch(log_path: &str, output_path: Option<&str>, default_de
     // share the same `event_id`. Without dedup, suggest counts a single call
     // 2-3 times and inflates rule "hits". Dedup by event_id, keeping the first
     // occurrence (which has the request transport info we care about).
-    let mut seen_event_ids: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut seen_event_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for line_result in reader.lines() {
         let line = match line_result {

@@ -152,9 +152,7 @@ pub async fn ensure_available(proxy: &str, workspace: &Path, require_tls: bool) 
         // the daemon. This is what makes `gvm suggest` -> `gvm run` actually
         // pick up the freshly written srr_network.toml.
         if config_changed_since_proxy_start(workspace) {
-            eprintln!(
-                "  {DIM}Config changed since proxy startup — reloading rules...{RESET}"
-            );
+            eprintln!("  {DIM}Config changed since proxy startup — reloading rules...{RESET}");
             match reload_running_proxy(proxy).await {
                 Ok(()) => {
                     eprintln!("  {GREEN}Rules reloaded{RESET}");
@@ -167,14 +165,11 @@ pub async fn ensure_available(proxy: &str, workspace: &Path, require_tls: bool) 
                     }
                 }
                 Err(e) => {
-                    eprintln!(
-                        "  {YELLOW}Reload failed ({e}) — falling back to restart{RESET}"
-                    );
+                    eprintln!("  {YELLOW}Reload failed ({e}) — falling back to restart{RESET}");
                     let pid_path = workspace.join("data/proxy.pid");
                     if let Some(pid) = read_pid_file(&pid_path) {
                         kill_process(pid);
-                        tokio::time::sleep(std::time::Duration::from_millis(500))
-                            .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     }
                     return start_daemon(proxy, workspace, require_tls).await;
                 }
