@@ -26,7 +26,7 @@ pub async fn run_agent(
     no_mitm: bool,
     fs_governance: bool,
     sandbox_profile: &str,
-) -> Result<()> {
+) -> Result<i32> {
     if command.is_empty() {
         anyhow::bail!(
             "No command specified. Usage: gvm run agent.py  OR  gvm run -- openclaw gateway"

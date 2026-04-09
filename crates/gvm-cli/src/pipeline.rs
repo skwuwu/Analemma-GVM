@@ -559,7 +559,13 @@ impl BackgroundTasks {
 
 /// Execute the full run pipeline: pre-launch → banner → launch → post-exit.
 /// Used by `gvm run`. Watch uses pre_launch/launch separately with its own wrapping.
-pub async fn run_full(config: AgentConfig) -> Result<()> {
+///
+/// Returns the agent's exit code so the CLI can propagate it to the OS.
+/// Without this, systemd's `Restart=on-failure` never fires (the unit's
+/// ExecStart is `gvm run …` and gvm previously always exited 0 even when
+/// the inner agent failed). Discovered via Test 78f in the 2026-04-08
+/// EC2 run: NRestarts stayed at 0 because gvm masked the agent's exit 2.
+pub async fn run_full(config: AgentConfig) -> Result<i32> {
     // Print mode-specific banner
     print_banner(&config);
 
@@ -586,7 +592,7 @@ pub async fn run_full(config: AgentConfig) -> Result<()> {
     // Phase 3
     post_exit_audit(&config, &pre, exit_code, runtime_secs);
 
-    Ok(())
+    Ok(exit_code)
 }
 
 fn print_banner(config: &AgentConfig) {

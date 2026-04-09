@@ -597,7 +597,7 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(timeout) = sandbox_timeout {
                     std::env::set_var("GVM_SANDBOX_TIMEOUT", timeout.to_string());
                 }
-                run::run_agent(
+                let agent_exit = run::run_agent(
                     &command,
                     &agent_id,
                     &proxy,
@@ -613,6 +613,13 @@ async fn main() -> anyhow::Result<()> {
                     &sandbox_profile,
                 )
                 .await?;
+                // Propagate the agent's exit code to the OS so callers
+                // (systemd `Restart=on-failure`, shell `$?`, CI runners)
+                // can detect agent failures. Without this `gvm run` always
+                // exits 0 and `Restart=on-failure` never engages.
+                if agent_exit != 0 {
+                    std::process::exit(agent_exit);
+                }
             }
         }
 
