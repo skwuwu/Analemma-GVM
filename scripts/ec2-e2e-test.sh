@@ -6615,16 +6615,25 @@ PYEOF
         timeout 30 "$GVM_BIN" run -- python3 "$AGENT_82" \
             > "$ENFORCE_82" 2>&1 || true
 
-        # Audit summary must report at least one allowed event. Match
-        #     "  3 allowed  0 delayed  0 blocked"
-        # but reject the broken case
-        #     "  0 allowed  3 delayed  0 blocked"
+        # Audit summary must report at least one allowed event. The audit
+        # surface has two distinct success shapes depending on whether the
+        # request hit a Delay/RequireApproval rule (durable WAL → audit
+        # table prints "  3 allowed  0 delayed  0 blocked") or only Allow
+        # rules (IC-1 fast-path → no durable WAL entry → v0.4.5+ run.rs
+        # falls back to grepping proxy.log and prints "  ✓ N request(s)
+        # classified as Allow (IC-1 fast-path)."). Both shapes mean the
+        # rules took effect; we accept either. The broken case to reject
+        # is "0 allowed N delayed" or the older "No GVM events recorded"
+        # message — both indicate the proxy never picked up suggest's rules.
         if grep -E '[1-9][0-9]* allowed' "$ENFORCE_82" >/dev/null 2>&1; then
             ALLOWED_LINE=$(grep -E '[0-9]+ allowed' "$ENFORCE_82" | head -1 | sed 's/^[[:space:]]*//')
-            pass "82c: enforce picked up freshly written rules without manual reload ($ALLOWED_LINE)"
+            pass "82c: enforce applied suggest's rules without manual reload ($ALLOWED_LINE)"
+        elif grep -E '[1-9][0-9]* request\(s\) classified as Allow' "$ENFORCE_82" >/dev/null 2>&1; then
+            IC1_LINE=$(grep -E 'request\(s\) classified as Allow' "$ENFORCE_82" | head -1 | sed 's/^[[:space:]]*//')
+            pass "82c: enforce applied suggest's rules without manual reload (IC-1: $IC1_LINE)"
         else
             fail "82c: enforce did NOT apply suggest's rules — proxy reload regression"
-            echo "  ${DIM}audit tail: $(grep -E 'allowed|delayed|blocked|GVM Audit' "$ENFORCE_82" | head -5)${NC}"
+            echo "  ${DIM}audit tail: $(grep -E 'allowed|delayed|blocked|classified|GVM Audit|No GVM events' "$ENFORCE_82" | head -5)${NC}"
         fi
 
         # Restore the user's original SRR file and re-load it into the proxy.
