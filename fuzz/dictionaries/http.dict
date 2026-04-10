@@ -16,9 +16,9 @@
 "HTTP/1.1"
 "HTTP/2"
 
-# Line/header separators
-"\r\n"
-"\r\n\r\n"
+# Line/header separators (libFuzzer only supports \xNN hex escapes)
+"\x0d\x0a"
+"\x0d\x0a\x0d\x0a"
 ": "
 " "
 
@@ -55,7 +55,7 @@
 "://"
 
 # Smuggling pivots
-"\r\nContent-Length: 0\r\n"
-"\r\nTransfer-Encoding: chunked\r\n"
-"0\r\n\r\n"
-"\\x00"
+"\x0d\x0aContent-Length: 0\x0d\x0a"
+"\x0d\x0aTransfer-Encoding: chunked\x0d\x0a"
+"0\x0d\x0a\x0d\x0a"
+"\x00"

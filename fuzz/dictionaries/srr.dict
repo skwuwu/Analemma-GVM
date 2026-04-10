@@ -53,8 +53,8 @@
 "variables"
 "{\"operationName\":"
 
-# Edge cases
+# Edge cases (libFuzzer only supports \xNN hex escapes, not \r\n)
 "%00"
-"\r\n"
-"\n"
-"\t"
+"\x0d\x0a"
+"\x0a"
+"\x09"
