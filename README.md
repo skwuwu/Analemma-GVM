@@ -1,5 +1,7 @@
 # Analemma-GVM
 
+**A lightweight secure runtime for autonomous AI agents.** Governs every outbound HTTP call, isolates the filesystem, and locks down syscalls — using a Rust proxy and Linux kernel primitives.
+
 I wanted to run multiple autonomous AI agents (such as OpenClaw) for my personal affairs. But every time I let agents do everything they want, there was always a little anxiety. What if it does something it shouldn't? What if it leaks personal information or deletes important data?
 
 Existing answers (such as NemoClaw, OPA+Envoy) required Docker, an embedded Kubernetes cluster, NVIDIA GPUs, or Envoy sidecars. I wanted a lightweight alternative that doesn't need infrastructure setup and strictly enforces what agents do.
