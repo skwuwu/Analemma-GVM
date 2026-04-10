@@ -2,7 +2,7 @@
 
 I wanted to run multiple autonomous AI agents(such as OpenClaw) for my personal affairs. But every time I let agents everything what they wanna do, there was always a little anxiety. What if it does something it shouldn't? What if it leaks personal informations or deletes important datas?
 
-Existing answers (such as NeMo Guardrails, OPA+Envoy) required Kubernetes, Envoy sidecars, or trusting the agent to behave. I wanted a light weight alternative which doesn't need infrastructure settings and highly enforces what agents do.
+Existing answers (such as NemoClaw, OPA+Envoy) required Docker, an embedded Kubernetes cluster, NVIDIA GPUs, or Envoy sidecars. I wanted a light weight alternative which doesn't need infrastructure settings and highly enforces what agents do.
 
 So I built GVM(Governance Virtual Machine) — an governance runtime that exists between your agent and the actual actions. It is designed assuming that agents can't be fully trusted and can sometimes be hostile. It watches every API call, blocks what you haven't approved, and keeps a tamper-evident log (Merkle chain) of agent's actions.
 
@@ -43,7 +43,7 @@ agent's URL list differ.
 
 - **Solo devs / small teams** running AI agents in production without a dedicated security team
 - **Anyone who's nervous** about giving an agent access to Stripe, Slack, Gmail, or a database API
-- **Startups** that need governance and audit trails but can't adopt enterprise infra (OPA, Envoy, NVIDIA NeMo Guardrails)
+- **Startups** that need governance and audit trails but can't adopt enterprise infra (OPA, Envoy, NVIDIA NemoClaw)
 - **Agent framework users** (OpenClaw, CrewAI, LangChain, AutoGen) who want a safety layer that doesn't require code changes
 
 If you're running agents without any governance tools, you may need this.
