@@ -202,6 +202,69 @@ echo -e "  Proxy:  ${PROXY_MS}ms"
 echo ""
 
 # ═══════════════════════════════════════
+# Test E: Memory (RSS) Measurement
+# ═══════════════════════════════════════
+echo -e "${BOLD}Test E: Memory Usage (RSS)${NC}"
+
+# E1: gvm-proxy idle RSS
+echo -e "  ${DIM}E1: gvm-proxy idle RSS...${NC}"
+# Kill any existing proxy, start fresh, wait for startup, measure
+pkill -f gvm-proxy 2>/dev/null
+sleep 1
+"$GVM_BIN" run --agent-id rss-warmup -- echo ok > /dev/null 2>&1
+sleep 2
+PROXY_PID=$(pgrep -f "gvm-proxy" | head -1)
+if [ -n "$PROXY_PID" ]; then
+    PROXY_RSS_KB=$(awk '/^VmRSS:/ {print $2}' /proc/$PROXY_PID/status 2>/dev/null)
+    PROXY_RSS_MB=$(python3 -c "print(f'{${PROXY_RSS_KB:-0}/1024:.1f}')")
+    echo -e "  gvm-proxy PID $PROXY_PID: ${PROXY_RSS_MB}MB RSS (idle)"
+    echo "$PROXY_RSS_KB" > "$RESULTS_DIR/e1-proxy-idle-rss-kb.txt"
+else
+    echo -e "  (proxy not found)"
+fi
+
+# E2: gvm-proxy RSS after load (send 50 requests through it)
+echo -e "  ${DIM}E2: gvm-proxy RSS after 50 requests...${NC}"
+for i in $(seq 1 50); do
+    curl -sf -o /dev/null -x "$PROXY_URL" https://httpbin.org/get &
+done
+wait
+sleep 1
+if [ -n "$PROXY_PID" ] && [ -d "/proc/$PROXY_PID" ]; then
+    PROXY_RSS_LOADED_KB=$(awk '/^VmRSS:/ {print $2}' /proc/$PROXY_PID/status 2>/dev/null)
+    PROXY_RSS_LOADED_MB=$(python3 -c "print(f'{${PROXY_RSS_LOADED_KB:-0}/1024:.1f}')")
+    echo -e "  gvm-proxy PID $PROXY_PID: ${PROXY_RSS_LOADED_MB}MB RSS (after 50 reqs)"
+    echo "$PROXY_RSS_LOADED_KB" > "$RESULTS_DIR/e2-proxy-loaded-rss-kb.txt"
+else
+    echo -e "  (proxy exited)"
+fi
+
+# E3: Sandbox agent RSS (the agent process itself inside sandbox)
+echo -e "  ${DIM}E3: Sandbox overhead (agent RSS inside sandbox vs direct)...${NC}"
+"$GVM_BIN" cleanup > /dev/null 2>&1
+timeout 30 "$GVM_BIN" run --sandbox --agent-id bench-rss --sandbox-timeout 15 \
+    -- bash -c "
+# Measure this shell's own RSS as a proxy for 'sandbox overhead on the agent'
+awk '/^VmRSS:/ {print \$2}' /proc/self/status
+" > /tmp/e3-raw.txt 2>/dev/null
+SANDBOX_AGENT_RSS_KB=$(grep "^[0-9]" /tmp/e3-raw.txt | head -1)
+if [ -n "$SANDBOX_AGENT_RSS_KB" ]; then
+    SANDBOX_AGENT_RSS_MB=$(python3 -c "print(f'{${SANDBOX_AGENT_RSS_KB}/1024:.1f}')")
+    echo -e "  Agent inside sandbox: ${SANDBOX_AGENT_RSS_MB}MB RSS"
+    echo "$SANDBOX_AGENT_RSS_KB" > "$RESULTS_DIR/e3-sandbox-agent-rss-kb.txt"
+fi
+
+# E4: Direct agent RSS (same bash -c, no sandbox) for comparison
+DIRECT_AGENT_RSS_KB=$(bash -c "awk '/^VmRSS:/ {print \$2}' /proc/self/status" 2>/dev/null)
+if [ -n "$DIRECT_AGENT_RSS_KB" ]; then
+    DIRECT_AGENT_RSS_MB=$(python3 -c "print(f'{${DIRECT_AGENT_RSS_KB}/1024:.1f}')")
+    echo -e "  Agent without sandbox: ${DIRECT_AGENT_RSS_MB}MB RSS"
+    echo "$DIRECT_AGENT_RSS_KB" > "$RESULTS_DIR/e4-direct-agent-rss-kb.txt"
+fi
+
+echo ""
+
+# ═══════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════
 echo -e "${BOLD}═══ Summary ═══${NC}"
@@ -266,6 +329,25 @@ try:
     print(f"  Direct: {cd:.0f}ms")
     print(f"  Proxy:  {cp:.0f}ms")
     print(f"  Overhead: +{cp-cd:.0f}ms")
+except: pass
+
+# RSS
+print(f"\nMemory (RSS):")
+try:
+    idle_kb = float(open(f"{R}/e1-proxy-idle-rss-kb.txt").read().strip())
+    print(f"  gvm-proxy idle:       {idle_kb/1024:.1f}MB")
+except: pass
+try:
+    loaded_kb = float(open(f"{R}/e2-proxy-loaded-rss-kb.txt").read().strip())
+    print(f"  gvm-proxy after load: {loaded_kb/1024:.1f}MB")
+except: pass
+try:
+    sb_kb = float(open(f"{R}/e3-sandbox-agent-rss-kb.txt").read().strip())
+    print(f"  Agent in sandbox:     {sb_kb/1024:.1f}MB")
+except: pass
+try:
+    dr_kb = float(open(f"{R}/e4-direct-agent-rss-kb.txt").read().strip())
+    print(f"  Agent direct:         {dr_kb/1024:.1f}MB")
 except: pass
 
 print()

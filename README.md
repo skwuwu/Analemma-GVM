@@ -94,11 +94,12 @@ Use cooperative mode for agents you trust or wrote yourself (Python `requests`, 
 ## Technical facts
 
 - Rust, two binaries totaling ~22MB on Linux x86_64 (gvm-proxy ~13MB + gvm CLI ~10MB)
-- Policy evaluation < 1μs (SRR + ABAC, no heap allocation on hot path)
+- Sandbox MITM overhead: +14ms TTFB per request ([measured on EC2 t3.medium](docs/test-report.md#912-end-to-end-overhead-benchmark-2026-04-06-ec2-t3medium))
+- Sandbox startup: ~928ms one-time (comparable to `docker run`)
+- Policy evaluation < 1μs (SRR + ABAC, Criterion benchmark)
 - WAL with Merkle chain, size-based rotation (100MB x 10 segments). Local storage — bring your own retention (S3, GCS, etc)
 - 329 tests, 60-min chaos stress test (proxy kill, network partition, disk pressure) — [PASS](docs/test-report.md#910-chaos-stress-test-60-minutes)
 - seccomp-BPF with ~130 whitelisted syscalls, ENOSYS default for unknown
-- Sandbox auto-cleanup via per-PID state files
 - All data stays local. No telemetry, no phone-home.
 
 ---
