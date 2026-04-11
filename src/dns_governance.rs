@@ -465,14 +465,12 @@ pub async fn run_dns_proxy(
     governance: Arc<DnsGovernance>,
     ledger: Arc<crate::ledger::Ledger>,
 ) -> anyhow::Result<()> {
-    let socket = UdpSocket::bind(listen_addr).await?;
+    let socket = Arc::new(UdpSocket::bind(listen_addr).await?);
     tracing::info!(
         listen = %listen_addr,
         upstream = %upstream,
         "DNS governance proxy started"
     );
-
-    let _upstream_socket = UdpSocket::bind("0.0.0.0:0").await?;
 
     let mut buf = vec![0u8; 4096];
     loop {
@@ -488,16 +486,21 @@ pub async fn run_dns_proxy(
         let governance = governance.clone();
         let ledger = ledger.clone();
         let upstream_addr = upstream;
-        // Clone the listen socket for sending responses. Each query gets its own
-        // upstream socket so concurrent queries don't interleave responses.
-        let _listen_socket = socket.local_addr().ok();
+        // Share the listen socket so responses go back from the same
+        // address:port the sandbox sent the query to. If we used a
+        // new socket (random port), the response's source address
+        // wouldn't match what the sandbox firewall allows (only
+        // host_ip:53 or the DNAT'd host_ip:5353 — new random ports
+        // are dropped by the OUTPUT chain's ESTABLISHED,RELATED rule
+        // or simply don't reach the sandbox).
+        let reply_socket = socket.clone();
 
         tokio::spawn(async move {
             let domain = parse_dns_question(&packet).unwrap_or_default();
 
             if domain.is_empty() {
                 // Can't parse — forward without governance (fail-open for DNS)
-                if let Err(e) = forward_dns(&packet, src, upstream_addr).await {
+                if let Err(e) = forward_dns(&packet, src, upstream_addr, &reply_socket).await {
                     tracing::debug!(error = %e, "DNS forward failed (unparseable)");
                 }
                 return;
@@ -534,8 +537,8 @@ pub async fn run_dns_proxy(
                 tokio::time::sleep(delay).await;
             }
 
-            // Forward to upstream
-            if let Err(e) = forward_dns(&packet, src, upstream_addr).await {
+            // Forward to upstream and relay response via the listen socket
+            if let Err(e) = forward_dns(&packet, src, upstream_addr, &reply_socket).await {
                 tracing::debug!(error = %e, domain = domain, "DNS forward failed");
             }
         });
@@ -543,7 +546,19 @@ pub async fn run_dns_proxy(
 }
 
 /// Forward a DNS packet to upstream and relay the response back to the client.
-async fn forward_dns(query: &[u8], client: SocketAddr, upstream: SocketAddr) -> anyhow::Result<()> {
+///
+/// The `reply_socket` MUST be the same socket that received the query (the
+/// listen socket, shared via Arc). The sandbox's iptables only allows traffic
+/// from/to host_ip:5353 — a response from a random ephemeral port would be
+/// silently dropped by the sandbox OUTPUT chain's ESTABLISHED,RELATED rule.
+async fn forward_dns(
+    query: &[u8],
+    client: SocketAddr,
+    upstream: SocketAddr,
+    reply_socket: &UdpSocket,
+) -> anyhow::Result<()> {
+    // Each query gets its own ephemeral socket for the upstream leg so
+    // concurrent queries don't interleave responses.
     let fwd_socket = UdpSocket::bind("0.0.0.0:0").await?;
     fwd_socket.send_to(query, upstream).await?;
 
@@ -551,11 +566,8 @@ async fn forward_dns(query: &[u8], client: SocketAddr, upstream: SocketAddr) -> 
     let recv = tokio::time::timeout(Duration::from_secs(5), fwd_socket.recv_from(&mut resp_buf));
     let (resp_len, _) = recv.await??;
 
-    // Send response back to original client via a new socket bound to the
-    // listen port. We can't reuse the main socket from inside a spawned task,
-    // so we send from a fresh socket. The client accepts responses from any
-    // source port (standard DNS behavior).
-    let reply_socket = UdpSocket::bind("0.0.0.0:0").await?;
+    // Reply via the listen socket so the source address matches what the
+    // sandbox expects (host_ip:5353 after DNAT reversal).
     reply_socket.send_to(&resp_buf[..resp_len], client).await?;
 
     Ok(())

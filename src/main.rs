@@ -419,8 +419,9 @@ async fn main() {
         // enabling route_localnet opens a class of SSRF attacks). Binding
         // to 0.0.0.0 lets the proxy receive packets on any interface,
         // including the host-side veth.
-        let dns_listen: std::net::SocketAddr =
-            format!("0.0.0.0:{}", config.dns.listen_port).parse().unwrap();
+        let dns_listen: std::net::SocketAddr = format!("0.0.0.0:{}", config.dns.listen_port)
+            .parse()
+            .unwrap();
         let dns_upstream = gvm_proxy::dns_governance::resolve_upstream_dns();
         let dns_ledger = state.ledger.clone();
 
