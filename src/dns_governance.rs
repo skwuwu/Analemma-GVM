@@ -31,7 +31,17 @@ const TIER3_DELAY: Duration = Duration::from_secs(3);
 const TIER4_DELAY: Duration = Duration::from_secs(10);
 
 /// Sliding window duration for per-domain unique subdomain counting.
-const WINDOW_DURATION: Duration = Duration::from_secs(60);
+/// Override with `GVM_TEST_DNS_WINDOW_SEC` for E2E tests (e.g. 5 seconds
+/// instead of 60 so decay can be verified without a 60-second wait).
+fn window_duration() -> Duration {
+    if let Ok(v) = std::env::var("GVM_TEST_DNS_WINDOW_SEC") {
+        if let Ok(secs) = v.parse::<u64>() {
+            return Duration::from_secs(secs);
+        }
+    }
+    Duration::from_secs(60)
+}
+
 /// Unique subdomains on an unknown base domain within the window to trigger Tier 3.
 const TIER3_UNIQUE_THRESHOLD: usize = 5;
 /// Global unique subdomain queries across all domains within the window to trigger Tier 4.
@@ -131,7 +141,7 @@ impl DomainWindow {
     fn record(&mut self, subdomain: &str, now: Instant) -> usize {
         // Expire old entries
         self.entries
-            .retain(|(_, ts)| now.duration_since(*ts) < WINDOW_DURATION);
+            .retain(|(_, ts)| now.duration_since(*ts) < window_duration());
         self.entries.push((subdomain.to_string(), now));
         // Count unique subdomains
         let uniques: HashSet<&str> = self.entries.iter().map(|(s, _)| s.as_str()).collect();
@@ -142,7 +152,7 @@ impl DomainWindow {
     fn is_idle(&self, now: Instant) -> bool {
         self.entries
             .last()
-            .map(|(_, ts)| now.duration_since(*ts) >= WINDOW_DURATION)
+            .map(|(_, ts)| now.duration_since(*ts) >= window_duration())
             .unwrap_or(true)
     }
 }
@@ -163,7 +173,7 @@ impl GlobalWindow {
 
     fn record(&mut self, domain: &str, now: Instant) -> usize {
         self.entries
-            .retain(|(_, ts)| now.duration_since(*ts) < WINDOW_DURATION);
+            .retain(|(_, ts)| now.duration_since(*ts) < window_duration());
         self.entries.push((domain.to_string(), now));
         let uniques: HashSet<&str> = self.entries.iter().map(|(s, _)| s.as_str()).collect();
         uniques.len()
@@ -256,6 +266,12 @@ impl DnsGovernance {
     pub fn classify(&self, domain: &str) -> DnsClassification {
         let now = Instant::now();
 
+        // Normalize: lowercase + strip trailing dot (DNS root label).
+        // This prevents case-based bypass (ATTACKER.COM vs attacker.com)
+        // and ensures consistent keying in the sliding window HashMap.
+        let domain = domain.to_ascii_lowercase();
+        let domain = domain.strip_suffix('.').unwrap_or(&domain);
+
         let (subdomain, base) = split_domain(domain);
 
         // Tier 1: known host — free pass
@@ -297,7 +313,7 @@ impl DnsGovernance {
             tracing::warn!(
                 domain = domain,
                 unique_queries = global_uniques,
-                window_secs = WINDOW_DURATION.as_secs(),
+                window_secs = window_duration().as_secs(),
                 "DNS flood detected — Tier 4 (10s delay)"
             );
             return DnsClassification {
@@ -372,7 +388,7 @@ impl DnsGovernance {
                     base_domain = base,
                     subdomain = subdomain,
                     unique_subdomains = unique_count,
-                    window_secs = WINDOW_DURATION.as_secs(),
+                    window_secs = window_duration().as_secs(),
                     "DNS subdomain burst detected — Tier 3 (3s delay)"
                 );
                 return DnsClassification {
@@ -657,7 +673,7 @@ mod tests {
         assert!(w.record("sub6", start) > TIER3_UNIQUE_THRESHOLD);
 
         // After window expires, count should reset
-        let future = start + WINDOW_DURATION + Duration::from_secs(1);
+        let future = start + window_duration() + Duration::from_secs(1);
         let count = w.record("newsub", future);
         assert_eq!(
             count, 1,
@@ -679,6 +695,32 @@ mod tests {
         assert_eq!(gov.classify("sub.httpbin.org").tier, DnsTier::Known);
         // Unknown
         assert_eq!(gov.classify("evil.com").tier, DnsTier::Unknown);
+        // Case-insensitive: HTTPBIN.ORG should match known httpbin.org
+        assert_eq!(gov.classify("HTTPBIN.ORG").tier, DnsTier::Known);
+        assert_eq!(gov.classify("Api.GitHub.COM").tier, DnsTier::Known);
+        // Trailing dot normalization (DNS root label)
+        assert_eq!(gov.classify("httpbin.org.").tier, DnsTier::Known);
+    }
+
+    #[test]
+    fn test_case_insensitive_counting() {
+        // ATTACKER.COM and attacker.com must count as the same base domain
+        let hosts = Arc::new(std::sync::RwLock::new(HashSet::new()));
+        let gov = DnsGovernance::new(hosts);
+
+        for i in 0..3 {
+            gov.classify(&format!("sub{}.ATTACKER.COM", i));
+        }
+        for i in 3..=TIER3_UNIQUE_THRESHOLD + 1 {
+            gov.classify(&format!("sub{}.attacker.com", i));
+        }
+        // Should trigger Tier 3 because all queries hit the same normalized base
+        let c = gov.classify("another.Attacker.Com");
+        assert_eq!(
+            c.tier,
+            DnsTier::Anomalous,
+            "Mixed-case domains must be normalized to the same base for counting"
+        );
     }
 
     #[test]

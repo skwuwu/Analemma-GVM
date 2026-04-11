@@ -6717,6 +6717,188 @@ print('DNS_83B_DONE')
         fi
 
         rm -f "$DNS83_OUT"
+
+        # 83c: subdomain burst on unknown base → Tier 3 escalation
+        DNS83C_OUT=$(mktemp /tmp/gvm-dns83c-XXXX.txt)
+        WAL_BEFORE=$(wc -c < data/wal.log 2>/dev/null || echo 0)
+        timeout 30 sudo "$GVM_BIN" run --sandbox --agent-id dns-burst -- python3 -c "
+import socket, time
+# Fire 7 unique subdomains to the same unknown base domain.
+# Tier 3 threshold is 5 unique, so queries 6+ should escalate.
+for i in range(7):
+    try:
+        socket.getaddrinfo(f'sub{i}.dns83c-test.example.test', 80,
+                           socket.AF_INET, socket.SOCK_STREAM)
+    except: pass
+    time.sleep(0.01)  # propagation delay between queries
+print('DNS_83C_DONE')
+" > "$DNS83C_OUT" 2>&1 || true
+
+        if grep -q "DNS_83C_DONE" "$DNS83C_OUT" 2>/dev/null; then
+            WAL_AFTER=$(wc -c < data/wal.log 2>/dev/null || echo 0)
+            TAIL_WAL=$(tail -c $((WAL_AFTER - WAL_BEFORE)) data/wal.log 2>/dev/null)
+            if echo "$TAIL_WAL" | grep -q "dns_tier.*anomalous" 2>/dev/null; then
+                pass "83c: subdomain burst escalated to Tier 3 (anomalous)"
+            else
+                fail "83c: no Tier 3 escalation in WAL after 7 unique subdomains"
+                echo "  ${DIM}WAL tiers: $(echo "$TAIL_WAL" | grep -oP 'dns_tier[^,}]+' | sort | uniq -c)${NC}"
+            fi
+        else
+            fail "83c: sandbox agent did not complete"
+            echo "  ${DIM}$(head -5 "$DNS83C_OUT")${NC}"
+        fi
+        rm -f "$DNS83C_OUT"
+
+        # 83d: decay — after window expires, tier drops back to Tier 2
+        # Uses GVM_TEST_DNS_WINDOW_SEC=5 so we only wait 6 seconds
+        pkill -f gvm-proxy 2>/dev/null
+        sleep 1
+        DNS83D_OUT=$(mktemp /tmp/gvm-dns83d-XXXX.txt)
+        timeout 60 sudo GVM_TEST_DNS_WINDOW_SEC=5 "$GVM_BIN" run --sandbox \
+            --agent-id dns-decay -- python3 -c "
+import socket, time
+
+# Phase 1: burst to trigger Tier 3
+for i in range(7):
+    try:
+        socket.getaddrinfo(f'burst{i}.dns83d-test.example.test', 80,
+                           socket.AF_INET, socket.SOCK_STREAM)
+    except: pass
+    time.sleep(0.01)
+
+# Phase 2: wait for window to expire (5s test window + 1s margin)
+time.sleep(6)
+
+# Phase 3: single new query — should be back to Tier 2 (unknown), not Tier 3
+try:
+    socket.getaddrinfo('fresh.dns83d-test.example.test', 80,
+                       socket.AF_INET, socket.SOCK_STREAM)
+except: pass
+print('DNS_83D_DONE')
+" > "$DNS83D_OUT" 2>&1 || true
+
+        if grep -q "DNS_83D_DONE" "$DNS83D_OUT" 2>/dev/null; then
+            # The last WAL entry for dns83d-test should be "unknown" not "anomalous"
+            LAST_DNS83D=$(grep "dns83d-test" data/wal.log 2>/dev/null | tail -1)
+            if echo "$LAST_DNS83D" | grep -q "dns_tier.*unknown" 2>/dev/null; then
+                pass "83d: tier decayed back to Tier 2 after window expiry"
+            elif echo "$LAST_DNS83D" | grep -q "dns_tier.*anomalous" 2>/dev/null; then
+                fail "83d: tier stuck at Tier 3 — window did not decay"
+            else
+                fail "83d: no WAL entry for post-decay query"
+                echo "  ${DIM}last: $LAST_DNS83D${NC}"
+            fi
+        else
+            fail "83d: sandbox agent did not complete (decay test)"
+            echo "  ${DIM}$(head -5 "$DNS83D_OUT")${NC}"
+        fi
+        rm -f "$DNS83D_OUT"
+
+        # Restart proxy without test window override for remaining tests
+        pkill -f gvm-proxy 2>/dev/null
+        sleep 1
+        ensure_proxy || true
+
+        # 83e: global flood → Tier 4
+        DNS83E_OUT=$(mktemp /tmp/gvm-dns83e-XXXX.txt)
+        WAL_BEFORE=$(wc -c < data/wal.log 2>/dev/null || echo 0)
+        timeout 30 sudo "$GVM_BIN" run --sandbox --agent-id dns-flood -- python3 -c "
+import socket, time
+# Fire 22 unique domains (threshold is 20) across different bases
+for i in range(22):
+    try:
+        socket.getaddrinfo(f'host{i}.flood83e-{i}.example.test', 80,
+                           socket.AF_INET, socket.SOCK_STREAM)
+    except: pass
+    time.sleep(0.01)
+print('DNS_83E_DONE')
+" > "$DNS83E_OUT" 2>&1 || true
+
+        if grep -q "DNS_83E_DONE" "$DNS83E_OUT" 2>/dev/null; then
+            WAL_AFTER=$(wc -c < data/wal.log 2>/dev/null || echo 0)
+            TAIL_WAL=$(tail -c $((WAL_AFTER - WAL_BEFORE)) data/wal.log 2>/dev/null)
+            if echo "$TAIL_WAL" | grep -q "dns_tier.*flood" 2>/dev/null; then
+                pass "83e: global flood escalated to Tier 4 (flood)"
+            else
+                fail "83e: no Tier 4 flood in WAL after 22 unique domains"
+                echo "  ${DIM}WAL tiers: $(echo "$TAIL_WAL" | grep -oP 'dns_tier[^,}]+' | sort | uniq -c)${NC}"
+            fi
+        else
+            fail "83e: sandbox agent did not complete (flood test)"
+            echo "  ${DIM}$(head -5 "$DNS83E_OUT")${NC}"
+        fi
+        rm -f "$DNS83E_OUT"
+
+        # 83f: WAL audit integrity — verify context fields exist
+        WAL_DNS_EVENT=$(grep "gvm.dns.query" data/wal.log 2>/dev/null | grep "anomalous" | tail -1)
+        if [ -n "$WAL_DNS_EVENT" ]; then
+            MISSING=""
+            for field in dns_tier dns_base_domain dns_unique_subdomain_count dns_global_unique_count dns_window_age_secs; do
+                if ! echo "$WAL_DNS_EVENT" | grep -q "$field" 2>/dev/null; then
+                    MISSING="$MISSING $field"
+                fi
+            done
+            if [ -z "$MISSING" ]; then
+                pass "83f: WAL DNS event contains all audit context fields"
+            else
+                fail "83f: WAL DNS event missing fields:$MISSING"
+            fi
+        else
+            fail "83f: no anomalous DNS event in WAL to verify"
+        fi
+
+        # 83g: bypass attempt — /etc/hosts write + direct UDP 53
+        DNS83G_OUT=$(mktemp /tmp/gvm-dns83g-XXXX.txt)
+        timeout 20 sudo "$GVM_BIN" run --sandbox --agent-id dns-bypass -- python3 -c "
+import os, socket
+
+# Attempt 1: write to /etc/hosts (should fail — overlayfs or read-only)
+try:
+    with open('/etc/hosts', 'a') as f:
+        f.write('1.2.3.4 bypass.example.com\n')
+    print('HOSTS_WRITE=ok')
+except Exception as e:
+    print(f'HOSTS_WRITE=blocked:{type(e).__name__}')
+
+# Attempt 2: direct UDP to external DNS (8.8.8.8:53)
+# Should be blocked by iptables — only host veth IP:53 is allowed
+import struct
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(3)
+    # Minimal DNS query for example.com type A
+    query = struct.pack('>HHHHHH', 0x1234, 0x0100, 1, 0, 0, 0)
+    query += b'\x07example\x03com\x00\x00\x01\x00\x01'
+    s.sendto(query, ('8.8.8.8', 53))
+    data, addr = s.recvfrom(512)
+    print('DIRECT_DNS=reachable')  # BAD — bypass succeeded
+    s.close()
+except Exception as e:
+    print(f'DIRECT_DNS=blocked:{type(e).__name__}')
+
+print('DNS_83G_DONE')
+" > "$DNS83G_OUT" 2>&1 || true
+
+        if grep -q "DNS_83G_DONE" "$DNS83G_OUT" 2>/dev/null; then
+            HOSTS_RESULT=$(grep "HOSTS_WRITE=" "$DNS83G_OUT" 2>/dev/null | head -1)
+            DNS_RESULT=$(grep "DIRECT_DNS=" "$DNS83G_OUT" 2>/dev/null | head -1)
+
+            if echo "$HOSTS_RESULT" | grep -q "blocked" 2>/dev/null; then
+                pass "83g-hosts: /etc/hosts write blocked by sandbox ($HOSTS_RESULT)"
+            else
+                fail "83g-hosts: /etc/hosts write NOT blocked ($HOSTS_RESULT)"
+            fi
+
+            if echo "$DNS_RESULT" | grep -q "blocked" 2>/dev/null; then
+                pass "83g-dns: direct UDP 53 to 8.8.8.8 blocked by iptables ($DNS_RESULT)"
+            else
+                fail "83g-dns: direct DNS to 8.8.8.8 NOT blocked — sandbox bypass! ($DNS_RESULT)"
+            fi
+        else
+            fail "83g: sandbox agent did not complete (bypass test)"
+            echo "  ${DIM}$(head -5 "$DNS83G_OUT")${NC}"
+        fi
+        rm -f "$DNS83G_OUT"
     fi
 fi
 
