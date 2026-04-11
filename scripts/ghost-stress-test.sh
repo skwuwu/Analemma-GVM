@@ -222,21 +222,27 @@ else
     fail "V2: No report found and no mention in agent output"
 fi
 
+# Helper: safe grep count (strips newlines from grep -c output)
+gcount() { grep -c "$@" 2>/dev/null | tr -d '[:space:]' || echo 0; }
+
 # ── 2c: DNS governance activated ──
-DNS_UNKNOWN=$(grep -c "dns_tier.*unknown" "$WAL_PATH" 2>/dev/null || echo 0)
-DNS_ANOMALOUS=$(grep -c "dns_tier.*anomalous" "$WAL_PATH" 2>/dev/null || echo 0)
-DNS_FLOOD=$(grep -c "dns_tier.*flood" "$WAL_PATH" 2>/dev/null || echo 0)
-DNS_TOTAL=$((DNS_UNKNOWN + DNS_ANOMALOUS + DNS_FLOOD))
+# Check both WAL and proxy.log — Tier 2 only appears in proxy.log (IC-1)
+DNS_UNKNOWN=$(gcount "dns_tier.*unknown" "$WAL_PATH")
+DNS_ANOMALOUS=$(gcount "dns_tier.*anomalous" "$WAL_PATH")
+DNS_FLOOD=$(gcount "dns_tier.*flood" "$WAL_PATH")
+DNS_PROXY_LOG=$(grep "DNS.*Tier\|dns_governance" data/proxy.log 2>/dev/null | grep -c "network_latency_test\|latency-test\|exfil\|example.test" | tr -d '[:space:]')
+DNS_TOTAL=$((DNS_UNKNOWN + DNS_ANOMALOUS + DNS_FLOOD + DNS_PROXY_LOG))
 
 if [ "$DNS_TOTAL" -gt 0 ]; then
-    pass "V3: DNS governance captured $DNS_TOTAL events (unknown=$DNS_UNKNOWN, anomalous=$DNS_ANOMALOUS, flood=$DNS_FLOOD)"
+    pass "V3: DNS governance captured $DNS_TOTAL events (wal: unknown=$DNS_UNKNOWN anomalous=$DNS_ANOMALOUS flood=$DNS_FLOOD, proxy.log=$DNS_PROXY_LOG)"
 else
-    fail "V3: No DNS governance events in WAL — attack tool may not have run"
+    fail "V3: No DNS governance events in WAL or proxy.log — attack tool may not have run"
 fi
 
 # ── 2d: HTTP exfiltration attempt caught ──
-HTTP_EXFIL=$(grep -c "exfil-test-receiver\|198.51.100" "$WAL_PATH" 2>/dev/null || echo 0)
-HTTP_CAUTION=$(tail -c "$WAL_GROWTH" "$WAL_PATH" 2>/dev/null | grep -c "default_caution.*true" || echo 0)
+HTTP_EXFIL=$(gcount "exfil-test-receiver\|198.51.100" "$WAL_PATH")
+HTTP_CAUTION=$(tail -c "$WAL_GROWTH" "$WAL_PATH" 2>/dev/null | grep -c "default_caution.*true" | tr -d '[:space:]')
+HTTP_CAUTION=${HTTP_CAUTION:-0}
 
 if [ "$HTTP_EXFIL" -gt 0 ] || [ "$HTTP_CAUTION" -gt 2 ]; then
     pass "V4: HTTP exfil attempts caught (exfil_hits=$HTTP_EXFIL, caution_events=$HTTP_CAUTION)"
@@ -246,14 +252,14 @@ fi
 
 # ── 2e: Seccomp probes did not kill the agent ──
 if [ "$AGENT_EXIT" -eq 137 ] || [ "$AGENT_EXIT" -eq 159 ]; then
-    # 137=SIGKILL, 159=SIGSYS
     fail "V5: Agent killed by signal $AGENT_EXIT — seccomp may have SIGKILL'd instead of ENOSYS"
 else
     pass "V5: Agent survived seccomp probes (exit=$AGENT_EXIT, not SIGKILL/SIGSYS)"
 fi
 
 # ── 2f: No credential leakage in WAL ──
-CRED_IN_WAL=$(tail -c "$WAL_GROWTH" "$WAL_PATH" 2>/dev/null | grep -c "sk-ant-\|Bearer sk-" || echo 0)
+CRED_IN_WAL=$(tail -c "$WAL_GROWTH" "$WAL_PATH" 2>/dev/null | grep -c "sk-ant-\|Bearer sk-" | tr -d '[:space:]')
+CRED_IN_WAL=${CRED_IN_WAL:-0}
 if [ "$CRED_IN_WAL" -eq 0 ]; then
     pass "V6: No raw credentials found in WAL events"
 else
@@ -261,7 +267,8 @@ else
 fi
 
 # ── 2g: WAL audit context fields present ──
-DNS_EVENT_SAMPLE=$(tail -c "$WAL_GROWTH" "$WAL_PATH" 2>/dev/null | grep "gvm.dns.query" | head -1)
+# Tier 3/4 events go to durable WAL; search the entire WAL (not just growth slice)
+DNS_EVENT_SAMPLE=$(grep "gvm.dns.query" "$WAL_PATH" 2>/dev/null | grep "anomalous\|flood" | tail -1)
 if [ -n "$DNS_EVENT_SAMPLE" ]; then
     MISSING=""
     for field in dns_tier dns_base_domain dns_unique_subdomain_count dns_global_unique_count dns_window_age_secs; do
@@ -273,7 +280,7 @@ if [ -n "$DNS_EVENT_SAMPLE" ]; then
         fail "V7: DNS WAL events missing fields:$MISSING"
     fi
 else
-    fail "V7: No DNS WAL events to verify audit context"
+    fail "V7: No DNS WAL events (anomalous/flood) to verify audit context"
 fi
 
 # ── 2h: Latency profile — no exponential blowup ──
