@@ -125,8 +125,8 @@ The agent runs in isolated Linux namespaces (user, PID, mount, network) with sec
 | HTTPS direct bypass attempt | **Blocked** | DNAT forces all TCP 443 through MITM |
 | API key injection (HTTPS) | **Yes** | MITM strips + injects, agent never sees keys |
 | UDP (except DNS) | **Blocked** | iptables OUTPUT DROP |
-| DNS | **Allowed** | UDP 53 to host veth IP only |
-| DNS tunneling | **Out of scope** | Use DNS security (Route 53 DNS Firewall, Cloudflare Gateway). GVM logs DNS queries for audit. |
+| DNS (Layer 0) | **Governed** | All queries routed through built-in DNS governance proxy via iptables DNAT. Tiered delay: known hosts = 0ms, unknown = 200ms, subdomain burst = 3s, flood = 10s. No Deny — worst case is delay. Disable: `--no-dns-governance`. |
+| DNS tunneling | **Detected + delayed** | Subdomain burst on unknown base domain triggers Tier 3 (3s) → Tier 4 (10s) escalation. Sliding window decays when pattern stops. WAL records full window state for forensic audit. |
 | QUIC / HTTP3 (UDP 443) | **Blocked** | UDP DROP (browser falls back to TCP/TLS) |
 | ICMP | **Blocked** | iptables OUTPUT DROP |
 | WebRTC / P2P | **Blocked** | UDP DROP + no STUN server reachable |
@@ -252,11 +252,12 @@ These are architectural boundaries, not missing features:
 
 | Capability | Cooperative | Contained (experimental) | Sandbox |
 |-----------|-------------|-----------|---------|
-| HTTP governance | Cooperative | Structural | Structural |
+| DNS governance (Layer 0) | None | None | **Tiered delay** (known=0ms, unknown=200ms, burst=3s, flood=10s) |
+| HTTP governance (Layer 1) | Cooperative | Structural | Structural |
 | HTTPS L7 inspection | Domain only | Full (MITM) | Full (MITM) |
 | API key isolation | HTTP only | HTTP + HTTPS | HTTP + HTTPS |
 | Network bypass prevention | None | Docker network | Kernel (TC + iptables + seccomp) |
-| Filesystem governance | None | Read-only root | overlayfs Trust-on-Pattern |
+| Filesystem governance (Layer 2) | None | Read-only root | overlayfs Trust-on-Pattern |
 | Resource limits | None | Docker limits | cgroup v2 |
 | Syscall filtering | None | Docker default | Custom seccomp (~130 allowed) |
 | IC-3 self-approval prevention | None | None | Admin port unreachable |

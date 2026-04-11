@@ -17,28 +17,33 @@ Analemma-GVM is a transparent enforcement proxy for AI agent I/O operations. It 
 ## Architecture Overview
 
 ```
- Agent (Python SDK)        GVM Proxy (Rust)            External APIs
- ┌──────────────┐    ┌────────────────────────┐    ┌──────────────┐
- │  @ic()       │───>│ Layer 1: Semantic       │───>│ Stripe       │
- │  decorator   │    │   ABAC Policy Engine    │    │ Slack        │
- │              │    │ Layer 2: Network SRR    │    │ Gmail        │
- │  GVMAgent    │    │ Layer 3: Capability     │    │ Database     │
- │  base class  │    │   Token (API Key)       │    │ ...          │
- └──────────────┘    │                          │    └──────────────┘
-                     │ WAL (Merkle chain)        │
-                     │ AES-256-GCM Vault        │
-                     └────────────────────────┘
+ Agent Process              GVM Runtime                     External
+ ┌──────────────┐    ┌──────────────────────────┐    ┌──────────────┐
+ │              │    │ Layer 0: DNS Governance   │    │              │
+ │  Any agent   │───>│   Tiered delay on queries │───>│ DNS Resolver │
+ │  (any lang)  │    │                            │    │              │
+ │              │    │ Layer 1: HTTP Governance   │    │ Stripe       │
+ │              │───>│   SRR + ABAC + Credential │───>│ Slack, Gmail │
+ │              │    │                            │    │ GitHub, ...  │
+ │              │    │ Layer 2: FS Governance     │    │              │
+ │              │───>│   overlayfs + approve      │───>│ Host disk    │
+ └──────────────┘    │                            │    └──────────────┘
+                     │ WAL (Merkle chain)          │
+                     │ AES-256-GCM Vault          │
+                     │ seccomp-BPF (~130 syscalls) │
+                     └──────────────────────────┘
 ```
 
-### 3-Layer Security Model
+### Governance Layer Model
 
 | Layer | Name | Function | Bypass-Proof |
 |-------|------|----------|-------------|
-| 1 | Semantic (ABAC) | Operation-level policy evaluation | SDK declares operation; proxy evaluates ABAC rules |
-| 2 | Network (SRR) | URL-based rule matching | Even if SDK lies about operation, URL is inspected independently |
-| 3 | Capability Token | API key injection | Agent never holds API keys; proxy injects them post-enforcement |
+| 0 | DNS | Tiered delay on DNS queries (known=0ms, unknown=200ms, burst=3s, flood=10s). No Deny. | iptables DNAT forces all UDP 53 through governance proxy; seccomp blocks direct external DNS |
+| 1 | HTTP (SRR + ABAC) | URL-based rule matching + operation-level policy | iptables DNAT forces all TCP 443 through MITM; TC ingress filter on host veth |
+| 2 | Filesystem | overlayfs copy-on-write + human approval | Mount namespace isolation; writes go to tmpfs upper layer |
+| 3 | Capability Token | API key injection post-enforcement | Agent env has no external API keys; proxy injects after governance pass |
 
-**Combined Decision**: `max_strict(Layer1, Layer2)` — the stricter decision always wins.
+**Combined Decision**: `max_strict(Layer1_ABAC, Layer1_SRR)` — the stricter decision always wins. DNS (Layer 0) and FS (Layer 2) operate independently on their respective I/O channels.
 
 ### Enforcement Decision Model (IC Classification)
 

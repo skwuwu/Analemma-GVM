@@ -384,6 +384,69 @@ gvm fs approve --reject-all
 
 Each session writes a `manifest.json` sidecar in its staging dir recording the workspace destination, the agent ID, and per-file metadata, so `gvm fs approve` can drain batches even after the original sandbox process is gone. Without this command, staging directories grow indefinitely. Wire `gvm fs approve --reject-all` into a daily cron on hosts that run untrusted agents.
 
+### DNS Governance (Layer 0)
+
+DNS governance is **enabled by default** in sandbox mode. Every DNS query from the agent passes through a built-in governance proxy before any HTTP call can happen.
+
+**How it works:**
+
+```
+Agent DNS query → sandbox iptables DNAT → GVM DNS proxy (classify + delay) → upstream resolver
+```
+
+The DNS proxy classifies each query into a tier based on whether the domain is known and the query pattern:
+
+| Tier | Condition | Delay | What happens |
+|------|-----------|-------|-------------|
+| **1 (known)** | Domain learned via `gvm suggest` or in SRR known_hosts | 0ms | Free pass — no delay, no log |
+| **2 (unknown)** | First-seen domain | 200ms | Short delay + logged in proxy.log |
+| **3 (anomalous)** | >5 unique subdomains on the same unknown base domain within 60s | 3s | Alert-level delay + durable WAL entry |
+| **4 (flood)** | >20 unique subdomain queries globally within 60s | 10s | Maximum delay + durable WAL entry |
+
+**Key design decisions:**
+
+- **No Deny**: DNS denial kills the entire agent. One false positive = outage. Worst case with GVM is a 10-second delay, not a crash.
+- **Decay**: When the anomalous pattern stops (sliding window expires after 60s), the tier drops back to Tier 2. The system never permanently escalates.
+- **WAL audit**: Tier 3/4 events include full window state in the WAL (unique_subdomain_count, global_unique_count, window_age_secs) so an auditor can reconstruct *why* the delay was applied.
+
+**Typical workflow:**
+
+```bash
+# 1. Watch mode learns which domains the agent uses
+gvm run --sandbox --watch agent.py
+
+# 2. gvm suggest generates rules — these become the "known hosts" for DNS free-pass
+gvm suggest --from session.jsonl > config/srr_network.toml
+
+# 3. Enforce mode — known domains resolve instantly, unknown get 200ms delay
+gvm run --sandbox agent.py
+```
+
+After step 2, domains like `api.github.com` and `api.anthropic.com` that appeared in the watch session are classified as Tier 1 (known) and resolve with zero governance delay.
+
+**Disabling DNS governance:**
+
+```bash
+# CLI flag
+gvm run --sandbox --no-dns-governance agent.py
+
+# Or in proxy.toml
+[dns]
+enabled = false
+```
+
+Use this when you already have dedicated DNS security tools (Route 53 DNS Firewall, Cloudflare Gateway, Cisco Umbrella) handling DNS-level threats.
+
+**Tuning for tests:**
+
+The sliding window duration (default 60s) can be overridden with `GVM_TEST_DNS_WINDOW_SEC` for E2E tests:
+
+```bash
+GVM_TEST_DNS_WINDOW_SEC=5 gvm run --sandbox agent.py  # 5-second window
+```
+
+This is a test-only knob — do not use in production.
+
 ---
 
 ## Troubleshooting

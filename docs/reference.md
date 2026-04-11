@@ -59,6 +59,12 @@ hot_reload = true                # Live-reload without restart
 file = "config/secrets.toml"
 key_env = "GVM_SECRETS_KEY"
 
+# DNS governance (Layer 0). Default: enabled.
+# Disable with --no-dns-governance CLI flag or set enabled = false.
+[dns]
+enabled = true       # Set to false to disable DNS governance entirely
+listen_port = 5353   # Local UDP port for the DNS proxy
+
 # Dev-only: remap hosts to local mock server. Ignored when GVM_ENV=production.
 [dev]
 host_overrides = { "gmail.googleapis.com" = "127.0.0.1:9090" }
@@ -583,6 +589,7 @@ Returns proxy health, SRR rule count, WAL status, emergency write count, and Sha
 | `--no-mitm` | Disable MITM TLS inspection. HTTPS uses CONNECT relay (domain-level only). Use for mTLS endpoints or certificate pinning. |
 | `--sandbox-timeout N` | Kill agent after N seconds (default: 3600) |
 | `--fs-governance` | Enable overlayfs Trust-on-Pattern file governance |
+| `--no-dns-governance` | Disable DNS governance proxy (Layer 0). Use when dedicated DNS security tools (Route 53 Firewall, Cloudflare Gateway) are already in place. Default: DNS governance enabled. |
 | `--shadow-mode MODE` | `disabled` (default), `observe`, or `strict` |
 | `--memory 512m` | cgroup v2 memory limit |
 | `--cpus 1.0` | cgroup v2 CPU limit |

@@ -23,7 +23,9 @@ The demo runs on a real Ubuntu 24.04 host. Agent code is not changed between ste
 
 One command activates four security layers. This is the production mode — Linux only (requires namespaces, iptables, seccomp-BPF).
 
-**Network governance** — Every outbound HTTP/HTTPS call goes through the GVM proxy. Calls that match your ruleset pass through; unknown calls are delayed or denied. The agent cannot bypass the proxy — even if it unsets env vars or opens raw sockets, kernel-level iptables DNAT redirects all traffic through GVM.
+**DNS governance (Layer 0)** — Every DNS query passes through a built-in governance proxy before any HTTP call happens. Known domains (learned via `gvm suggest`) resolve instantly. Unknown domains are delayed 200ms. Repeated anomalous patterns (e.g. subdomain burst — a DNS tunneling signature) escalate to 3–10 second delays with alerts. No DNS query is ever denied — worst case is a delay, never an outage. Disable with `--no-dns-governance` if you already use dedicated DNS security tools.
+
+**Network governance (Layer 1)** — Every outbound HTTP/HTTPS call goes through the GVM proxy. Calls that match your ruleset pass through; unknown calls are delayed or denied. The agent cannot bypass the proxy — even if it unsets env vars or opens raw sockets, kernel-level iptables DNAT redirects all traffic through GVM.
 
 | Decision | What happens | Example |
 |----------|-------------|---------|
@@ -32,7 +34,7 @@ One command activates four security layers. This is the production mode — Linu
 | **RequireApproval** | Hold until human approves | `POST api.stripe.com/charges` |
 | **Deny** | Block immediately | `DELETE production-db/users` |
 
-**Filesystem governance** — The agent works on an overlayfs layer, not the real host filesystem. Nothing lands on disk until a human reviews and approves via `gvm fs approve`.
+**Filesystem governance (Layer 2)** — The agent works on an overlayfs layer, not the real host filesystem. Nothing lands on disk until a human reviews and approves via `gvm fs approve`.
 
 **Credential isolation** — When the agent calls a governed API, GVM strips whatever credentials the agent sends and injects the real keys post-enforcement. The agent never needs to hold those API keys. (LLM provider keys that the agent needs for its own reasoning are passed through — stripping them would stop the agent from functioning.)
 
