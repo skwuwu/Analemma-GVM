@@ -6675,7 +6675,8 @@ if should_run 83; then
         # 83a: DNS works at all inside sandbox (governance proxy is reachable)
         # The first sandbox run starts the proxy + DNS proxy, so allow up to
         # 5 seconds for cold start. This tests the DNAT path works end-to-end.
-        DNS83A_SCRIPT=$(mktemp /tmp/gvm-dns83a-XXXX.py)
+        mkdir -p workspace
+        DNS83A_SCRIPT="workspace/dns83a_test.py"
         cat > "$DNS83A_SCRIPT" << 'PY83A'
 import time, socket
 start = time.monotonic()
@@ -6689,7 +6690,7 @@ except Exception as e:
 PY83A
         DNS83_OUT=$(mktemp /tmp/gvm-dns83-XXXX.txt)
         timeout 30 sudo "$GVM_BIN" run --sandbox --agent-id dns-test \
-            -- python3 "$DNS83A_SCRIPT" > "$DNS83_OUT" 2>&1 || true
+            -- python3 /workspace/dns83a_test.py > "$DNS83_OUT" 2>&1 || true
 
         KNOWN_MS=$(grep "KNOWN_DNS_MS=" "$DNS83_OUT" 2>/dev/null | sed 's/.*KNOWN_DNS_MS=\([0-9]*\).*/\1/' | head -1)
         if [ -n "$KNOWN_MS" ] && [ "$KNOWN_MS" -lt 5000 ] 2>/dev/null; then
@@ -6698,10 +6699,10 @@ PY83A
             fail "83a: sandbox DNS failed or > 5s (${KNOWN_MS:-?}ms)"
             echo "  ${DIM}$(head -5 "$DNS83_OUT")${NC}"
         fi
-        rm -f "$DNS83A_SCRIPT"
+        rm -f workspace/dns83a_test.py
 
         # 83b: unknown host should show Tier 2 in proxy.log
-        DNS83B_SCRIPT=$(mktemp /tmp/gvm-dns83b-XXXX.py)
+        DNS83B_SCRIPT="workspace/dns83b_test.py"
         cat > "$DNS83B_SCRIPT" << 'PY83B'
 import socket
 try:
@@ -6710,8 +6711,8 @@ except: pass
 print('DNS_83B_DONE')
 PY83B
         timeout 30 sudo "$GVM_BIN" run --sandbox --agent-id dns-test \
-            -- python3 "$DNS83B_SCRIPT" > "$DNS83_OUT" 2>&1 || true
-        rm -f "$DNS83B_SCRIPT"
+            -- python3 /workspace/dns83b_test.py > "$DNS83_OUT" 2>&1 || true
+        rm -f workspace/dns83b_test.py
 
         if grep -q "^DNS_83B_DONE" "$DNS83_OUT" 2>/dev/null; then
             # Tier 2 uses IC-1 append_async which is a NATS stub and does
