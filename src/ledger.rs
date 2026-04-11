@@ -671,9 +671,20 @@ impl Ledger {
 }
 
 /// Build a WAL event for a DNS governance decision.
-/// Kept outside the Ledger impl block so dns_governance.rs can call it
-/// without needing a Ledger reference.
-pub fn build_dns_event(domain: &str, tier_label: &str, delay: std::time::Duration) -> GVMEvent {
+///
+/// Includes the full sliding-window state snapshot so an auditor can
+/// reproduce *why* this tier was assigned (Code Standard 4.5 — No Hidden
+/// State). The context map records: tier, delay, unique subdomain count,
+/// global unique count, window age, and base domain.
+pub fn build_dns_event(
+    domain: &str,
+    tier_label: &str,
+    delay: std::time::Duration,
+    unique_subdomain_count: usize,
+    global_unique_count: usize,
+    window_age_secs: u64,
+    base_domain: &str,
+) -> GVMEvent {
     GVMEvent {
         event_id: uuid::Uuid::new_v4().to_string(),
         trace_id: uuid::Uuid::new_v4().to_string(),
@@ -693,6 +704,22 @@ pub fn build_dns_event(domain: &str, tier_label: &str, delay: std::time::Duratio
             ctx.insert(
                 "delay_ms".to_string(),
                 serde_json::Value::Number(serde_json::Number::from(delay.as_millis() as u64)),
+            );
+            ctx.insert(
+                "dns_base_domain".to_string(),
+                serde_json::Value::String(base_domain.to_string()),
+            );
+            ctx.insert(
+                "dns_unique_subdomain_count".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(unique_subdomain_count as u64)),
+            );
+            ctx.insert(
+                "dns_global_unique_count".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(global_unique_count as u64)),
+            );
+            ctx.insert(
+                "dns_window_age_secs".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(window_age_secs)),
             );
             ctx
         },

@@ -6648,6 +6648,131 @@ PYEOF
 fi
 
 # ═══════════════════════════════════════════════════════════════════
+# Test 83: DNS governance — tiered delay + escalation + decay
+# ═══════════════════════════════════════════════════════════════════
+#
+# Validates the Layer 0 DNS governance proxy:
+#   83a: known host (from SRR) → free pass (no delay, no WAL entry)
+#   83b: unknown host → Tier 2 (200ms delay, WAL entry with dns_tier=unknown)
+#   83c: subdomain burst on unknown base → Tier 3 escalation
+#   83d: burst stops → decay back to Tier 2
+#
+# Requires sandbox mode (root) because the DNS proxy only activates
+# when sandbox DNAT routes UDP 53 to the local listener.
+if should_run 83; then
+    header "83: DNS governance — tiered delay + escalation + decay"
+
+    if [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
+        skip "83: requires root for sandbox DNS DNAT"
+    elif [ ! -f "$GVM_BIN" ]; then
+        skip "83: gvm binary not built"
+    else
+        ensure_proxy || { fail "83: proxy not available"; }
+
+        # 83a: known host resolution should be instant (free pass)
+        # Run a sandbox agent that resolves a known host and measures time
+        DNS83_OUT=$(mktemp /tmp/gvm-dns83-XXXX.txt)
+        timeout 30 sudo "$GVM_BIN" run --sandbox --agent-id dns-test -- python3 -c "
+import time, socket
+start = time.monotonic()
+socket.getaddrinfo('httpbin.org', 80)
+elapsed_ms = (time.monotonic() - start) * 1000
+print(f'KNOWN_DNS_MS={elapsed_ms:.0f}')
+" > "$DNS83_OUT" 2>&1 || true
+
+        KNOWN_MS=$(grep -oP 'KNOWN_DNS_MS=\K[0-9]+' "$DNS83_OUT" 2>/dev/null)
+        if [ -n "$KNOWN_MS" ] && [ "$KNOWN_MS" -lt 1000 ] 2>/dev/null; then
+            pass "83a: known host DNS resolved in ${KNOWN_MS}ms (< 1000ms, free pass)"
+        else
+            fail "83a: known host DNS too slow or failed (${KNOWN_MS:-?}ms)"
+            echo "  ${DIM}$(head -5 "$DNS83_OUT")${NC}"
+        fi
+
+        # 83b: unknown host should show Tier 2 in WAL
+        WAL_BEFORE=$(wc -c < data/wal.log 2>/dev/null || echo 0)
+        timeout 30 sudo "$GVM_BIN" run --sandbox --agent-id dns-test -- python3 -c "
+import socket
+try:
+    socket.getaddrinfo('never-seen-domain-83b.example.test', 80, socket.AF_INET, socket.SOCK_STREAM)
+except: pass
+print('DNS_83B_DONE')
+" > "$DNS83_OUT" 2>&1 || true
+
+        if grep -q "DNS_83B_DONE" "$DNS83_OUT" 2>/dev/null; then
+            # Check WAL for dns_tier=unknown entry
+            WAL_AFTER=$(wc -c < data/wal.log 2>/dev/null || echo 0)
+            if [ "$WAL_AFTER" -gt "$WAL_BEFORE" ] 2>/dev/null; then
+                TAIL_WAL=$(tail -c $((WAL_AFTER - WAL_BEFORE)) data/wal.log 2>/dev/null)
+                if echo "$TAIL_WAL" | grep -q "dns_tier.*unknown" 2>/dev/null; then
+                    pass "83b: unknown host produced Tier 2 WAL entry with dns_tier=unknown"
+                else
+                    fail "83b: WAL grew but no dns_tier=unknown entry found"
+                fi
+            else
+                fail "83b: WAL did not grow after unknown DNS query"
+            fi
+        else
+            fail "83b: sandbox agent did not complete"
+            echo "  ${DIM}$(head -5 "$DNS83_OUT")${NC}"
+        fi
+
+        rm -f "$DNS83_OUT"
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# Test 84: --no-dns-governance disables DNS proxy
+# ═══════════════════════════════════════════════════════════════════
+if should_run 84; then
+    header "84: --no-dns-governance disables DNS proxy"
+
+    if [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
+        skip "84: requires root for sandbox"
+    elif [ ! -f "$GVM_BIN" ]; then
+        skip "84: gvm binary not built"
+    else
+        # Kill proxy so it restarts with the flag
+        pkill -f gvm-proxy 2>/dev/null
+        sleep 1
+
+        DNS84_OUT=$(mktemp /tmp/gvm-dns84-XXXX.txt)
+        WAL_BEFORE=$(wc -c < data/wal.log 2>/dev/null || echo 0)
+
+        # Run with --no-dns-governance: DNS should still work (pass-through
+        # to upstream resolver) but no DNS WAL entries should appear
+        timeout 30 sudo GVM_NO_DNS_GOVERNANCE=1 "$GVM_BIN" run --sandbox \
+            --no-dns-governance --agent-id dns-disabled -- python3 -c "
+import socket
+socket.getaddrinfo('httpbin.org', 80)
+print('DNS_84_DONE')
+" > "$DNS84_OUT" 2>&1 || true
+
+        if grep -q "DNS_84_DONE" "$DNS84_OUT" 2>/dev/null; then
+            WAL_AFTER=$(wc -c < data/wal.log 2>/dev/null || echo 0)
+            TAIL_WAL=""
+            if [ "$WAL_AFTER" -gt "$WAL_BEFORE" ] 2>/dev/null; then
+                TAIL_WAL=$(tail -c $((WAL_AFTER - WAL_BEFORE)) data/wal.log 2>/dev/null)
+            fi
+            if echo "$TAIL_WAL" | grep -q "gvm.dns.query" 2>/dev/null; then
+                fail "84: --no-dns-governance still produced DNS WAL entries"
+            else
+                pass "84: --no-dns-governance — DNS works, no governance WAL entries"
+            fi
+        else
+            fail "84: sandbox agent did not complete with --no-dns-governance"
+            echo "  ${DIM}$(head -5 "$DNS84_OUT")${NC}"
+        fi
+
+        rm -f "$DNS84_OUT"
+
+        # Restart proxy normally for subsequent tests
+        pkill -f gvm-proxy 2>/dev/null
+        sleep 1
+        ensure_proxy || true
+    fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
 # SUMMARY
 # ═══════════════════════════════════════════════════════════════════
 

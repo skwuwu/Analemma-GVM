@@ -340,7 +340,9 @@ Policy evaluation must be deterministic. The same operation metadata must always
 - Previous requests from the same agent
 - Internal cache state
 
-The only exception is rate limiting, which is explicitly stateful and documented as such.
+Explicitly stateful exceptions (documented here as required by this rule):
+- **Rate limiter** (`rate_limiter.rs`): per-agent token bucket, decisions depend on recent request history.
+- **DNS governance** (`dns_governance.rs`): per-domain sliding window, decisions depend on recent query patterns. Tier escalation (Tier 2→3→4) and decay (back to Tier 2 on window expiry) are both intentionally stateful. All decision-relevant state (unique_subdomain_count, global_unique_count, window_age_secs) is captured in the WAL event context so auditors can reproduce the classification.
 
 ### 4.2 Decision Ordering
 
@@ -535,10 +537,32 @@ No performance claim in documentation without a benchmark that measures it.
 
 ## 7. Architecture Principles
 
+### 7.0 Governance Layer Model
+
+GVM enforces agent I/O through a layered pipeline. DNS resolution must happen before any HTTP call, so DNS governance naturally precedes HTTP governance:
+
+```
+Agent Process
+  │
+  ├─ Layer 0: DNS Governance (dns_governance.rs)
+  │   └─ UDP 53 → local DNS proxy → classify → delay → upstream resolve
+  │   └─ Tier 1 (known) free pass / Tier 2-4 graduated delay
+  │   └─ No Deny — worst case is 10s delay, never agent termination
+  │
+  ├─ Layer 1: HTTP Governance (proxy.rs + srr.rs + policy.rs)
+  │   └─ HTTP/HTTPS → proxy → SRR check + ABAC eval → max_strict() → forward
+  │   └─ Allow / Delay / RequireApproval / Deny
+  │
+  └─ Layer 2: Filesystem Governance (overlayfs + fs_approve)
+      └─ All writes → overlay → human review → approve/reject
+```
+
+DNS and HTTP share the same WAL for unified audit. `gvm suggest` learns both DNS domains and HTTP hosts from the same watch session.
+
 ### 7.1 Single Execution Path (Pipeline Pattern)
 
 Every agent execution mode (cooperative/sandbox/contained) must go through the same pipeline:
-1. **Pre-launch**: proxy availability, orphan cleanup, CA download
+1. **Pre-launch**: proxy availability, DNS proxy spawn, orphan cleanup, CA download
 2. **Launch**: mode-specific execution (the ONLY branching point)
 3. **Post-exit**: cleanup, audit output
 

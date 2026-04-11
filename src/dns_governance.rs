@@ -17,10 +17,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
 
 // ─── Tier thresholds ───
 
@@ -206,6 +205,24 @@ impl DnsTier {
     }
 }
 
+/// Full classification result with audit-relevant window state.
+/// Satisfies Code Standard 4.5 ("No Hidden State"): every decision-relevant
+/// input is captured so an auditor can reproduce *why* this tier was assigned.
+#[derive(Debug, Clone)]
+pub struct DnsClassification {
+    pub tier: DnsTier,
+    pub domain: String,
+    pub base_domain: String,
+    /// Unique subdomain count on the base domain within the sliding window
+    /// at the moment of classification. 0 for Tier 1/2.
+    pub unique_subdomain_count: usize,
+    /// Global unique query count across all domains within the window.
+    pub global_unique_count: usize,
+    /// Age (seconds) of the oldest entry in the per-domain window.
+    /// Tells the auditor how far into the window the burst extends.
+    pub window_age_secs: u64,
+}
+
 // ─── DNS Governance Engine ───
 
 pub struct DnsGovernance {
@@ -230,36 +247,85 @@ impl DnsGovernance {
         }
     }
 
-    /// Classify a DNS query and return the governance tier.
-    /// This determines how long the response should be delayed.
-    pub async fn classify(&self, domain: &str) -> DnsTier {
+    /// Classify a DNS query and return the full classification with audit state.
+    ///
+    /// This is synchronous (std::sync::Mutex, not tokio::sync::Mutex) because
+    /// no I/O happens under lock — only in-memory HashMap lookups and Vec
+    /// retain/push. Code Standard 5.3 prohibits tokio::sync::Mutex on hot
+    /// paths; DNS classify() is called on every DNS query.
+    pub fn classify(&self, domain: &str) -> DnsClassification {
         let now = Instant::now();
-
-        // Tier 1: known host — free pass
-        if self.is_known(domain) {
-            return DnsTier::Known;
-        }
 
         let (subdomain, base) = split_domain(domain);
 
+        // Tier 1: known host — free pass
+        if self.is_known(domain) {
+            return DnsClassification {
+                tier: DnsTier::Known,
+                domain: domain.to_string(),
+                base_domain: base.to_string(),
+                unique_subdomain_count: 0,
+                global_unique_count: 0,
+                window_age_secs: 0,
+            };
+        }
+
+        // Acquire both locks. Code Standard 5.2 says "never hold two locks
+        // simultaneously." We satisfy this by acquiring global_window first,
+        // extracting the count, then dropping it before acquiring
+        // domain_windows. The two scopes are sequential, not nested.
+        let global_uniques = {
+            let mut global = match self.global_window.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    tracing::error!("DNS global_window mutex poisoned — fail-open");
+                    return DnsClassification {
+                        tier: DnsTier::Unknown,
+                        domain: domain.to_string(),
+                        base_domain: base.to_string(),
+                        unique_subdomain_count: 0,
+                        global_unique_count: 0,
+                        window_age_secs: 0,
+                    };
+                }
+            };
+            global.record(domain, now)
+        }; // global lock dropped here
+
         // Tier 4 check: global unique query flood
-        {
-            let mut global = self.global_window.lock().await;
-            let global_uniques = global.record(domain, now);
-            if global_uniques > TIER4_GLOBAL_THRESHOLD {
-                tracing::warn!(
-                    domain = domain,
-                    unique_queries = global_uniques,
-                    window_secs = WINDOW_DURATION.as_secs(),
-                    "DNS flood detected — Tier 4 (10s delay)"
-                );
-                return DnsTier::Flood;
-            }
+        if global_uniques > TIER4_GLOBAL_THRESHOLD {
+            tracing::warn!(
+                domain = domain,
+                unique_queries = global_uniques,
+                window_secs = WINDOW_DURATION.as_secs(),
+                "DNS flood detected — Tier 4 (10s delay)"
+            );
+            return DnsClassification {
+                tier: DnsTier::Flood,
+                domain: domain.to_string(),
+                base_domain: base.to_string(),
+                unique_subdomain_count: 0,
+                global_unique_count: global_uniques,
+                window_age_secs: 0,
+            };
         }
 
         // Tier 3 check: repeated unique subdomains on the same unknown base domain
         if !subdomain.is_empty() {
-            let mut windows = self.domain_windows.lock().await;
+            let mut windows = match self.domain_windows.lock() {
+                Ok(w) => w,
+                Err(_) => {
+                    tracing::error!("DNS domain_windows mutex poisoned — fail-open");
+                    return DnsClassification {
+                        tier: DnsTier::Unknown,
+                        domain: domain.to_string(),
+                        base_domain: base.to_string(),
+                        unique_subdomain_count: 0,
+                        global_unique_count: global_uniques,
+                        window_age_secs: 0,
+                    };
+                }
+            };
 
             // Periodic cleanup
             let count = self
@@ -274,7 +340,6 @@ impl DnsGovernance {
                         "DNS domain windows cleanup"
                     );
                 }
-                // Hard cap
                 if windows.len() >= MAX_TRACKED_DOMAINS {
                     let oldest: Vec<String> = windows
                         .iter()
@@ -295,6 +360,13 @@ impl DnsGovernance {
                 .or_insert_with(DomainWindow::new);
             let unique_count = window.record(subdomain, now);
 
+            // Window age: how old is the oldest surviving entry?
+            let window_age_secs = window
+                .entries
+                .first()
+                .map(|(_, ts)| now.duration_since(*ts).as_secs())
+                .unwrap_or(0);
+
             if unique_count > TIER3_UNIQUE_THRESHOLD {
                 tracing::warn!(
                     base_domain = base,
@@ -303,16 +375,38 @@ impl DnsGovernance {
                     window_secs = WINDOW_DURATION.as_secs(),
                     "DNS subdomain burst detected — Tier 3 (3s delay)"
                 );
-                return DnsTier::Anomalous;
+                return DnsClassification {
+                    tier: DnsTier::Anomalous,
+                    domain: domain.to_string(),
+                    base_domain: base.to_string(),
+                    unique_subdomain_count: unique_count,
+                    global_unique_count: global_uniques,
+                    window_age_secs,
+                };
             }
+
+            // Tier 2 with subdomain context
+            tracing::info!(domain = domain, "DNS unknown domain — Tier 2 (200ms delay)");
+            return DnsClassification {
+                tier: DnsTier::Unknown,
+                domain: domain.to_string(),
+                base_domain: base.to_string(),
+                unique_subdomain_count: unique_count,
+                global_unique_count: global_uniques,
+                window_age_secs,
+            };
         }
 
-        // Tier 2: unknown domain, first encounter — short delay
-        tracing::info!(
-            domain = domain,
-            "DNS query to unknown domain — Tier 2 (200ms delay)"
-        );
-        DnsTier::Unknown
+        // Tier 2: unknown domain, no subdomain
+        tracing::info!(domain = domain, "DNS unknown domain — Tier 2 (200ms delay)");
+        DnsClassification {
+            tier: DnsTier::Unknown,
+            domain: domain.to_string(),
+            base_domain: base.to_string(),
+            unique_subdomain_count: 0,
+            global_unique_count: global_uniques,
+            window_age_secs: 0,
+        }
     }
 
     /// Check if a domain (or its base domain) is in the known hosts set.
@@ -393,17 +487,28 @@ pub async fn run_dns_proxy(
                 return;
             }
 
-            let tier = governance.classify(&domain).await;
-            let delay = tier.delay();
+            // Layer 0: DNS classification (synchronous — no I/O under lock)
+            let classification = governance.classify(&domain);
+            let delay = classification.tier.delay();
 
-            // WAL audit entry for non-known queries
-            if tier != DnsTier::Known {
-                let event = crate::ledger::build_dns_event(&domain, tier.label(), delay);
-                if matches!(tier, DnsTier::Flood | DnsTier::Anomalous) {
-                    // Durable WAL for high-tier events
+            // WAL audit entry for non-known queries, including window state
+            // snapshot so auditors can reproduce *why* this tier was assigned
+            // (Code Standard 4.5 — No Hidden State).
+            if classification.tier != DnsTier::Known {
+                let event = crate::ledger::build_dns_event(
+                    &classification.domain,
+                    classification.tier.label(),
+                    delay,
+                    classification.unique_subdomain_count,
+                    classification.global_unique_count,
+                    classification.window_age_secs,
+                    &classification.base_domain,
+                );
+                if matches!(classification.tier, DnsTier::Flood | DnsTier::Anomalous) {
+                    // Durable WAL for high-tier events (IC-2)
                     let _ = ledger.append_durable(&event).await;
                 } else {
-                    // Async WAL for Tier 2 (loss tolerated, same as HTTP Allow)
+                    // Async WAL for Tier 2 (IC-1, loss tolerated)
                     ledger.append_async(event).await;
                 }
             }
@@ -560,62 +665,66 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_known_host_free_pass() {
+    #[test]
+    fn test_known_host_free_pass() {
         let hosts = Arc::new(std::sync::RwLock::new(HashSet::from([
             "api.github.com".to_string(),
             "httpbin.org".to_string(),
         ])));
         let gov = DnsGovernance::new(hosts);
 
-        assert_eq!(gov.classify("api.github.com").await, DnsTier::Known);
-        assert_eq!(gov.classify("httpbin.org").await, DnsTier::Known);
+        assert_eq!(gov.classify("api.github.com").tier, DnsTier::Known);
+        assert_eq!(gov.classify("httpbin.org").tier, DnsTier::Known);
         // Suffix match: sub.httpbin.org is known because httpbin.org is
-        assert_eq!(gov.classify("sub.httpbin.org").await, DnsTier::Known);
+        assert_eq!(gov.classify("sub.httpbin.org").tier, DnsTier::Known);
         // Unknown
-        assert_eq!(gov.classify("evil.com").await, DnsTier::Unknown);
+        assert_eq!(gov.classify("evil.com").tier, DnsTier::Unknown);
     }
 
-    #[tokio::test]
-    async fn test_tier3_subdomain_burst() {
+    #[test]
+    fn test_tier3_subdomain_burst() {
         let hosts = Arc::new(std::sync::RwLock::new(HashSet::new()));
         let gov = DnsGovernance::new(hosts);
 
         // Send 6 unique subdomains to the same base domain
         for i in 0..=TIER3_UNIQUE_THRESHOLD {
             let domain = format!("sub{}.attacker.com", i);
-            gov.classify(&domain).await;
+            gov.classify(&domain);
         }
         // Next query should trigger Tier 3
-        let tier = gov.classify("sub99.attacker.com").await;
-        assert_eq!(tier, DnsTier::Anomalous);
+        let c = gov.classify("sub99.attacker.com");
+        assert_eq!(c.tier, DnsTier::Anomalous);
+        assert!(
+            c.unique_subdomain_count > TIER3_UNIQUE_THRESHOLD,
+            "WAL audit context must capture the subdomain count"
+        );
     }
 
-    #[tokio::test]
-    async fn test_tier3_decay_to_tier2() {
+    #[test]
+    fn test_tier3_decay_to_tier2() {
         let hosts = Arc::new(std::sync::RwLock::new(HashSet::new()));
         let gov = DnsGovernance::new(hosts);
 
         // Trigger Tier 3
         for i in 0..=TIER3_UNIQUE_THRESHOLD + 2 {
             let domain = format!("sub{}.attacker.com", i);
-            gov.classify(&domain).await;
+            gov.classify(&domain);
         }
-        let tier = gov.classify("another.attacker.com").await;
-        assert_eq!(tier, DnsTier::Anomalous, "Should be Tier 3 during burst");
+        let c = gov.classify("another.attacker.com");
+        assert_eq!(c.tier, DnsTier::Anomalous, "Should be Tier 3 during burst");
 
         // Manually expire the window entries to simulate time passing
         {
-            let mut windows = gov.domain_windows.lock().await;
+            let mut windows = gov.domain_windows.lock().unwrap();
             if let Some(w) = windows.get_mut("attacker.com") {
                 w.entries.clear(); // simulate full window expiry
             }
         }
 
         // After decay, should be back to Tier 2 (unknown, not anomalous)
-        let tier = gov.classify("fresh.attacker.com").await;
+        let c = gov.classify("fresh.attacker.com");
         assert_eq!(
-            tier,
+            c.tier,
             DnsTier::Unknown,
             "Should decay back to Tier 2 after window expires"
         );
