@@ -347,7 +347,7 @@ impl DnsGovernance {
             let count = self
                 .query_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if count % 500 == 0 {
+            if count.is_multiple_of(500) {
                 let before = windows.len();
                 windows.retain(|_, w| !w.is_idle(now));
                 if windows.len() < before {

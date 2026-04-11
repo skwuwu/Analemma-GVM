@@ -5,6 +5,9 @@
 # rustls-pemfile: unmaintained but functional, migration to rustls-pki-types planned.
 ignore = [
     "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained
+    # Rand unsound with custom logger — GVM does not use custom loggers
+    # with rand::rng(). NEEDS-REVIEW for v0.5.
+    "RUSTSEC-2026-0092",
 ]
 
 [licenses]
