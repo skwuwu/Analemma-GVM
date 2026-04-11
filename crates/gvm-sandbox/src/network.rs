@@ -208,9 +208,27 @@ pub fn setup_host_network(config: &VethConfig) -> Result<String> {
     // The GVM_DNS_LISTEN env var is set by the proxy's DNS governance spawner
     // to communicate the actual listen address. Falls back to the host's
     // upstream resolver if unset (backwards-compatible with --no-dns-governance).
+    // GVM_DNS_LISTEN tells us the DNS governance proxy port. We combine
+    // it with the host veth IP (config.host_ip) because:
+    // 1. The proxy binds to 0.0.0.0:port (all interfaces, including veth)
+    // 2. iptables PREROUTING DNAT cannot target 127.0.0.1 without
+    //    route_localnet=1 (kernel drops the packet). Using the host
+    //    veth IP works because it's a real routable address on the
+    //    host-side of the veth pair.
     let dns_target = if let Ok(dns_listen) = std::env::var("GVM_DNS_LISTEN") {
-        tracing::info!(dns_listen = %dns_listen, "DNS DNAT → governance proxy");
-        dns_listen
+        // Extract port from "ip:port" or just "port"
+        let port = dns_listen
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(5353);
+        let target = format!("{}:{}", config.host_ip, port);
+        tracing::info!(
+            dns_listen = %dns_listen,
+            dnat_target = %target,
+            "DNS DNAT → governance proxy via host veth IP"
+        );
+        target
     } else {
         let upstream = resolve_host_dns();
         tracing::debug!(dns_target = %upstream, "DNS DNAT → upstream (governance disabled)");

@@ -411,9 +411,16 @@ async fn main() {
         let dns_gov = Arc::new(dns_governance::DnsGovernance::new(known_hosts));
         state.dns_governance = Some(dns_gov.clone());
 
-        let dns_listen: std::net::SocketAddr = format!("127.0.0.1:{}", config.dns.listen_port)
-            .parse()
-            .unwrap();
+        // Bind to 0.0.0.0 (all interfaces) instead of 127.0.0.1.
+        // The sandbox's iptables PREROUTING DNAT rewrites packets arriving
+        // on the host-side veth to the DNS proxy. If the proxy binds to
+        // 127.0.0.1, those DNAT'd packets are dropped because
+        // route_localnet=0 (kernel default, and we don't change it —
+        // enabling route_localnet opens a class of SSRF attacks). Binding
+        // to 0.0.0.0 lets the proxy receive packets on any interface,
+        // including the host-side veth.
+        let dns_listen: std::net::SocketAddr =
+            format!("0.0.0.0:{}", config.dns.listen_port).parse().unwrap();
         let dns_upstream = gvm_proxy::dns_governance::resolve_upstream_dns();
         let dns_ledger = state.ledger.clone();
 
