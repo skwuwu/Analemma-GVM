@@ -68,10 +68,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo install cargo-audit --locked || true
       - name: Run cargo audit
-        # Ignore list lives in audit.toml at the repo root, with one
-        # justification comment per RUSTSEC ID. Adding a new ignore
-        # without a comment is a review-blocker (see audit.toml header).
-        run: cargo audit
+        # Ignore list lives in audit.toml at the repo root.
+        # cargo-audit reads from .cargo/audit.toml by default, so we
+        # pass --config explicitly.
+        run: cargo audit -c audit.toml
 
   # Security: license compliance + banned crates + duplicate deps
   deny:
