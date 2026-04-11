@@ -6675,44 +6675,30 @@ if should_run 83; then
         # 83a: DNS works at all inside sandbox (governance proxy is reachable)
         # The first sandbox run starts the proxy + DNS proxy, so allow up to
         # 5 seconds for cold start. This tests the DNAT path works end-to-end.
-        mkdir -p workspace
-        DNS83A_SCRIPT="workspace/dns83a_test.py"
-        cat > "$DNS83A_SCRIPT" << 'PY83A'
-import time, socket
-start = time.monotonic()
-try:
-    socket.getaddrinfo('httpbin.org', 80, socket.AF_INET, socket.SOCK_STREAM)
-    ms = int((time.monotonic() - start) * 1000)
-    print(f'KNOWN_DNS_MS={ms}')
-except Exception as e:
-    ms = int((time.monotonic() - start) * 1000)
-    print(f'KNOWN_DNS_FAIL={e} after {ms}ms')
-PY83A
         DNS83_OUT=$(mktemp /tmp/gvm-dns83-XXXX.txt)
         timeout 30 sudo "$GVM_BIN" run --sandbox --agent-id dns-test \
-            -- python3 /workspace/dns83a_test.py > "$DNS83_OUT" 2>&1 || true
+            -- python3 -c 'import time,socket;s=time.monotonic();r=None
+try:
+ r=socket.getaddrinfo("httpbin.org",80,socket.AF_INET,socket.SOCK_STREAM)
+except Exception as e:
+ print(f"KNOWN_DNS_FAIL={e} after {int((time.monotonic()-s)*1000)}ms")
+if r:
+ print(f"KNOWN_DNS_MS={int((time.monotonic()-s)*1000)}")' > "$DNS83_OUT" 2>&1 || true
 
-        KNOWN_MS=$(grep "KNOWN_DNS_MS=" "$DNS83_OUT" 2>/dev/null | sed 's/.*KNOWN_DNS_MS=\([0-9]*\).*/\1/' | head -1)
+        KNOWN_MS=$(grep "^KNOWN_DNS_MS=" "$DNS83_OUT" 2>/dev/null | sed 's/.*KNOWN_DNS_MS=\([0-9]*\).*/\1/' | head -1)
         if [ -n "$KNOWN_MS" ] && [ "$KNOWN_MS" -lt 5000 ] 2>/dev/null; then
             pass "83a: sandbox DNS resolved httpbin.org in ${KNOWN_MS}ms (DNAT path works)"
         else
             fail "83a: sandbox DNS failed or > 5s (${KNOWN_MS:-?}ms)"
-            echo "  ${DIM}$(head -5 "$DNS83_OUT")${NC}"
+            echo "  ${DIM}$(grep "KNOWN_DNS" "$DNS83_OUT" | head -1)${NC}"
         fi
-        rm -f workspace/dns83a_test.py
 
         # 83b: unknown host should show Tier 2 in proxy.log
-        DNS83B_SCRIPT="workspace/dns83b_test.py"
-        cat > "$DNS83B_SCRIPT" << 'PY83B'
-import socket
-try:
-    socket.getaddrinfo('never-seen-domain-83b.example.test', 80, socket.AF_INET, socket.SOCK_STREAM)
-except: pass
-print('DNS_83B_DONE')
-PY83B
         timeout 30 sudo "$GVM_BIN" run --sandbox --agent-id dns-test \
-            -- python3 /workspace/dns83b_test.py > "$DNS83_OUT" 2>&1 || true
-        rm -f workspace/dns83b_test.py
+            -- python3 -c 'import socket
+try: socket.getaddrinfo("never-seen-domain-83b.example.test",80,socket.AF_INET,socket.SOCK_STREAM)
+except: pass
+print("DNS_83B_DONE")' > "$DNS83_OUT" 2>&1 || true
 
         if grep -q "^DNS_83B_DONE" "$DNS83_OUT" 2>/dev/null; then
             # Tier 2 uses IC-1 append_async which is a NATS stub and does
@@ -6871,40 +6857,22 @@ print('DNS_83E_DONE')
         fi
 
         # 83g: bypass attempt — /etc/hosts write + direct UDP 53
-        # Write the test script to workspace/ so it's visible inside the
-        # sandbox (mount namespace isolates /tmp/).
         sudo "$GVM_BIN" cleanup > /dev/null 2>&1 || true
-        mkdir -p workspace
-        DNS83G_SCRIPT="workspace/dns83g_test.py"
-        cat > "$DNS83G_SCRIPT" << 'PY83G'
-import os, socket, struct
-
-# Attempt 1: write to /etc/hosts
-try:
-    with open('/etc/hosts', 'a') as f:
-        f.write('1.2.3.4 bypass.example.com\n')
-    print('HOSTS_WRITE=ok')
-except Exception as e:
-    print(f'HOSTS_WRITE=blocked:{type(e).__name__}')
-
-# Attempt 2: direct UDP to external DNS (8.8.8.8:53)
-try:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(3)
-    query = struct.pack('>HHHHHH', 0x1234, 0x0100, 1, 0, 0, 0)
-    query += b'\x07example\x03com\x00\x00\x01\x00\x01'
-    s.sendto(query, ('8.8.8.8', 53))
-    data, addr = s.recvfrom(512)
-    print('DIRECT_DNS=reachable')
-    s.close()
-except Exception as e:
-    print(f'DIRECT_DNS=blocked:{type(e).__name__}')
-
-print('DNS_83G_DONE')
-PY83G
         DNS83G_OUT=$(mktemp /tmp/gvm-dns83g-XXXX.txt)
         timeout 20 sudo "$GVM_BIN" run --sandbox --agent-id dns-bypass \
-            -- python3 /workspace/dns83g_test.py > "$DNS83G_OUT" 2>&1 || true
+            -- python3 -c 'import os,socket,struct
+try:
+ open("/etc/hosts","a").write("1.2.3.4 bypass.example.com\n")
+ print("HOSTS_WRITE=ok")
+except Exception as e:
+ print(f"HOSTS_WRITE=blocked:{type(e).__name__}")
+try:
+ s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(3)
+ q=struct.pack(">HHHHHH",0x1234,0x0100,1,0,0,0)+b"\x07example\x03com\x00\x00\x01\x00\x01"
+ s.sendto(q,("8.8.8.8",53));d,a=s.recvfrom(512);print("DIRECT_DNS=reachable");s.close()
+except Exception as e:
+ print(f"DIRECT_DNS=blocked:{type(e).__name__}")
+print("DNS_83G_DONE")' > "$DNS83G_OUT" 2>&1 || true
 
         if grep -q "^DNS_83G_DONE" "$DNS83G_OUT" 2>/dev/null; then
             # Use ^ anchor to avoid matching echo'd Python source lines
@@ -6926,7 +6894,7 @@ PY83G
             fail "83g: sandbox agent did not complete (bypass test)"
             echo "  ${DIM}$(head -5 "$DNS83G_OUT")${NC}"
         fi
-        rm -f "$DNS83G_OUT" workspace/dns83g_test.py
+        rm -f "$DNS83G_OUT"
     fi
 fi
 
