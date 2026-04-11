@@ -71,7 +71,7 @@ jobs:
         # Ignore list lives in audit.toml at the repo root.
         # cargo-audit reads from .cargo/audit.toml by default, so we
         # pass --config explicitly.
-        run: cargo audit -c audit.toml
+        run: cargo audit -f audit.toml
 
   # Security: license compliance + banned crates + duplicate deps
   deny:
