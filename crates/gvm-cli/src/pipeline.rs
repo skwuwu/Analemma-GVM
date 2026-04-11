@@ -83,7 +83,8 @@ pub async fn pre_launch(config: &AgentConfig) -> Result<PreLaunchState> {
     };
 
     // 4. Record WAL position (for post-exit audit)
-    let wal_offset = std::fs::metadata("data/wal.log")
+    let wal_offset = tokio::fs::metadata("data/wal.log")
+        .await
         .map(|m| m.len())
         .unwrap_or(0);
 
