@@ -137,13 +137,16 @@ async fn handle_request(
         Ok(o) => o,
         Err(err_msg) => {
             tracing::error!(error = %err_msg, "MITM classification failed (fail-close)");
+            // SAFETY: Response::builder() with static status + header + body never
+            // returns Err — the only failure mode is an invalid header name/value,
+            // and these are compile-time constants.
             return Ok(Response::builder()
                 .status(500)
                 .header("Content-Type", "application/json")
                 .body(full_body(
                     r#"{"blocked":true,"decision":"Deny","reason":"Internal governance error"}"#,
                 ))
-                .unwrap());
+                .expect("static response builder"));
         }
     };
 
@@ -183,7 +186,7 @@ async fn handle_request(
                 .status(403)
                 .header("Content-Type", "application/json")
                 .body(full_body(body.to_string()))
-                .unwrap());
+                .expect("static response builder"));
         }
         gvm_types::EnforcementDecision::Delay { milliseconds } => {
             tokio::time::sleep(std::time::Duration::from_millis(*milliseconds)).await;
@@ -218,7 +221,7 @@ async fn handle_request(
                     .body(full_body(
                         r#"{"blocked":true,"decision":"Throttle","reason":"Rate limit exceeded"}"#,
                     ))
-                    .unwrap());
+                    .expect("static response builder"));
             }
         }
         _ => {} // Allow, AuditOnly
@@ -303,7 +306,7 @@ async fn handle_request(
             return Ok(Response::builder()
                 .status(502)
                 .body(full_body(format!("Upstream connect failed: {}", e)))
-                .unwrap());
+                .expect("static response builder"));
         }
         Err(_) => {
             tracing::warn!(
@@ -318,7 +321,7 @@ async fn handle_request(
                     upstream_host,
                     CONNECT_TIMEOUT.as_secs()
                 )))
-                .unwrap());
+                .expect("static response builder"));
         }
     };
 
@@ -328,7 +331,7 @@ async fn handle_request(
             return Ok(Response::builder()
                 .status(502)
                 .body(full_body(format!("Invalid server name: {}", e)))
-                .unwrap());
+                .expect("static response builder"));
         }
     };
 
@@ -346,7 +349,7 @@ async fn handle_request(
                 return Ok(Response::builder()
                     .status(502)
                     .body(full_body(format!("Upstream TLS failed: {}", e)))
-                    .unwrap());
+                    .expect("static response builder"));
             }
             Err(_) => {
                 tracing::warn!(
@@ -361,7 +364,7 @@ async fn handle_request(
                         upstream_host,
                         TLS_TIMEOUT.as_secs()
                     )))
-                    .unwrap());
+                    .expect("static response builder"));
             }
         };
 
@@ -377,7 +380,7 @@ async fn handle_request(
             return Ok(Response::builder()
                 .status(502)
                 .body(full_body(format!("Upstream HTTP handshake failed: {}", e)))
-                .unwrap());
+                .expect("static response builder"));
         }
     };
 
@@ -486,7 +489,7 @@ async fn handle_request(
                     upstream_host,
                     UPSTREAM_TIMEOUT.as_secs()
                 )))
-                .unwrap());
+                .expect("static response builder"));
         }
     };
 
@@ -524,7 +527,7 @@ async fn forward_http(
             return Ok(Response::builder()
                 .status(502)
                 .body(full_body(format!("Dev connect failed: {}", e)))
-                .unwrap());
+                .expect("static response builder"));
         }
     };
 
@@ -535,7 +538,7 @@ async fn forward_http(
             return Ok(Response::builder()
                 .status(502)
                 .body(full_body(format!("Dev handshake failed: {}", e)))
-                .unwrap());
+                .expect("static response builder"));
         }
     };
     tokio::spawn(async move {
@@ -581,7 +584,7 @@ async fn forward_http(
                     host,
                     UPSTREAM_TIMEOUT.as_secs()
                 )))
-                .unwrap());
+                .expect("static response builder"));
         }
     };
 

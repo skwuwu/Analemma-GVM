@@ -798,10 +798,30 @@ fn child_entry(
     }
 
     // Build argv: [interpreter, ...args]
-    let c_bin = std::ffi::CString::new(bin_path.clone()).unwrap();
+    // Validate before fork — CString::new fails only on embedded NUL bytes.
+    // After fork() we cannot use Rust runtime, so all allocations must happen here.
+    let c_bin = match std::ffi::CString::new(bin_path.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "gvm-sandbox: interpreter path contains NUL byte: {} ({})",
+                bin_path, e
+            );
+            return 126; // "command not found" convention
+        }
+    };
     let mut c_args: Vec<std::ffi::CString> = vec![c_bin.clone()];
     for arg in &config.interpreter_args {
-        c_args.push(std::ffi::CString::new(arg.as_str()).unwrap());
+        match std::ffi::CString::new(arg.as_str()) {
+            Ok(c) => c_args.push(c),
+            Err(e) => {
+                eprintln!(
+                    "gvm-sandbox: interpreter arg contains NUL byte: {} ({})",
+                    arg, e
+                );
+                return 126;
+            }
+        }
     }
 
     // ── PID 1 init reaper ──

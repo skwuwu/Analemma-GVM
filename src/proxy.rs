@@ -513,7 +513,13 @@ pub async fn proxy_handler(
                         "Shadow PERMISSIVE: no intent — allowing with warning"
                     );
                 }
-                crate::intent_store::ShadowMode::Disabled => unreachable!(),
+                // SAFETY: This branch is unreachable because the enclosing
+                // if-block checks `mode != Disabled` at line 422. However,
+                // Code Standard 1.2 prohibits unreachable!() in runtime paths.
+                // Fail-closed with a warning instead of panicking the proxy.
+                crate::intent_store::ShadowMode::Disabled => {
+                    tracing::error!("Shadow mode Disabled reached in intent check — logic error, failing closed");
+                }
             }
             None
         }
@@ -741,6 +747,34 @@ pub async fn proxy_handler(
 
             // Create oneshot channel for approval decision
             let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+
+            // Capacity guard: reject new approvals if the queue is full.
+            // Prevents unbounded DashMap growth from a flood of IC-3 requests.
+            const MAX_PENDING_APPROVALS: usize = 1_000;
+            if state.pending_approvals.len() >= MAX_PENDING_APPROVALS {
+                tracing::error!(
+                    pending = state.pending_approvals.len(),
+                    "IC-3 approval queue full ({}) — rejecting request (fail-close)",
+                    MAX_PENDING_APPROVALS,
+                );
+                return governance_block_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    GovernanceBlockResponse {
+                        blocked: true,
+                        decision: "Deny".to_string(),
+                        event_id: event_id.clone(),
+                        trace_id: event.trace_id.clone(),
+                        operation: event.operation.clone(),
+                        reason: "IC-3 approval queue capacity exceeded".to_string(),
+                        mode: state.on_block.require_approval.clone(),
+                        next_action: "Reduce concurrent RequireApproval requests or increase approval throughput".to_string(),
+                        retry_after_secs: Some(10),
+                        rollback_hint: Some(event.trace_id.clone()),
+                        matched_rule_id: classification.matched_rule_id.clone(),
+                        ic_level: 3,
+                    },
+                );
+            }
 
             // Register pending approval with metadata for CLI/API display
             state.pending_approvals.insert(
