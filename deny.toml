@@ -8,6 +8,8 @@ ignore = [
     # Rand unsound with custom logger — GVM does not use custom loggers
     # with rand::rng(). NEEDS-REVIEW for v0.5.
     "RUSTSEC-2026-0092",
+    # Additional advisories discovered 2026-04-11 CI.
+    "RUSTSEC-2026-0097",
 ]
 
 [licenses]
