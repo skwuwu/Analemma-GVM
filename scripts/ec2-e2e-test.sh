@@ -6848,11 +6848,13 @@ print('DNS_83E_DONE')
         fi
 
         # 83g: bypass attempt — /etc/hosts write + direct UDP 53
-        DNS83G_OUT=$(mktemp /tmp/gvm-dns83g-XXXX.txt)
-        timeout 20 sudo "$GVM_BIN" run --sandbox --agent-id dns-bypass -- python3 -c "
-import os, socket
+        # Write the test script to a temp file to avoid inline Python source
+        # being echoed into the output and confusing grep patterns.
+        DNS83G_SCRIPT=$(mktemp /tmp/gvm-dns83g-script-XXXX.py)
+        cat > "$DNS83G_SCRIPT" << 'PY83G'
+import os, socket, struct
 
-# Attempt 1: write to /etc/hosts (should fail — overlayfs or read-only)
+# Attempt 1: write to /etc/hosts
 try:
     with open('/etc/hosts', 'a') as f:
         f.write('1.2.3.4 bypass.example.com\n')
@@ -6861,27 +6863,28 @@ except Exception as e:
     print(f'HOSTS_WRITE=blocked:{type(e).__name__}')
 
 # Attempt 2: direct UDP to external DNS (8.8.8.8:53)
-# Should be blocked by iptables — only host veth IP:53 is allowed
-import struct
 try:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(3)
-    # Minimal DNS query for example.com type A
     query = struct.pack('>HHHHHH', 0x1234, 0x0100, 1, 0, 0, 0)
     query += b'\x07example\x03com\x00\x00\x01\x00\x01'
     s.sendto(query, ('8.8.8.8', 53))
     data, addr = s.recvfrom(512)
-    print('DIRECT_DNS=reachable')  # BAD — bypass succeeded
+    print('DIRECT_DNS=reachable')
     s.close()
 except Exception as e:
     print(f'DIRECT_DNS=blocked:{type(e).__name__}')
 
 print('DNS_83G_DONE')
-" > "$DNS83G_OUT" 2>&1 || true
+PY83G
+        DNS83G_OUT=$(mktemp /tmp/gvm-dns83g-XXXX.txt)
+        timeout 20 sudo "$GVM_BIN" run --sandbox --agent-id dns-bypass \
+            -- python3 "$DNS83G_SCRIPT" > "$DNS83G_OUT" 2>&1 || true
 
-        if grep -q "DNS_83G_DONE" "$DNS83G_OUT" 2>/dev/null; then
-            HOSTS_RESULT=$(grep "HOSTS_WRITE=" "$DNS83G_OUT" 2>/dev/null | head -1)
-            DNS_RESULT=$(grep "DIRECT_DNS=" "$DNS83G_OUT" 2>/dev/null | head -1)
+        if grep -q "^DNS_83G_DONE" "$DNS83G_OUT" 2>/dev/null; then
+            # Use ^ anchor to avoid matching echo'd Python source lines
+            HOSTS_RESULT=$(grep "^HOSTS_WRITE=" "$DNS83G_OUT" 2>/dev/null | head -1)
+            DNS_RESULT=$(grep "^DIRECT_DNS=" "$DNS83G_OUT" 2>/dev/null | head -1)
 
             if echo "$HOSTS_RESULT" | grep -q "blocked" 2>/dev/null; then
                 pass "83g-hosts: /etc/hosts write blocked by sandbox ($HOSTS_RESULT)"
@@ -6898,7 +6901,7 @@ print('DNS_83G_DONE')
             fail "83g: sandbox agent did not complete (bypass test)"
             echo "  ${DIM}$(head -5 "$DNS83G_OUT")${NC}"
         fi
-        rm -f "$DNS83G_OUT"
+        rm -f "$DNS83G_OUT" "$DNS83G_SCRIPT"
     fi
 fi
 

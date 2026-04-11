@@ -611,6 +611,14 @@ async fn main() -> anyhow::Result<()> {
                 }
                 if no_dns_governance {
                     std::env::set_var("GVM_NO_DNS_GOVERNANCE", "1");
+                } else {
+                    // DNS governance enabled: tell the sandbox DNAT setup
+                    // where the local DNS proxy listens. The proxy runs
+                    // inside gvm-proxy (separate daemon), but network.rs
+                    // reads GVM_DNS_LISTEN from the CLI process env to
+                    // configure iptables DNAT. Default port 5353 matches
+                    // DnsGovernanceConfig::default().
+                    std::env::set_var("GVM_DNS_LISTEN", "127.0.0.1:5353");
                 }
                 let agent_exit = run::run_agent(
                     &command,
