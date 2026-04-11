@@ -29,6 +29,45 @@ pub struct ProxyConfig {
     /// When present, overlayfs captures all file changes; patterns determine
     /// which are auto-merged, need manual commit, or discarded.
     pub filesystem: Option<gvm_sandbox::FilesystemPolicy>,
+    /// DNS governance configuration (Delay-Alert, no Deny).
+    /// Default: enabled with standard tier thresholds.
+    /// Disable with `--no-dns-governance` CLI flag or `dns.enabled = false`.
+    #[serde(default)]
+    pub dns: DnsGovernanceConfig,
+}
+
+/// DNS soft governance configuration.
+///
+/// ```toml
+/// [dns]
+/// enabled = true          # false to disable entirely
+/// listen_port = 5353      # local UDP port for the DNS proxy
+/// ```
+#[derive(Deserialize, Clone, Debug)]
+pub struct DnsGovernanceConfig {
+    /// Enable DNS query governance (default: true).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Local UDP port for the DNS governance proxy (default: 5353).
+    #[serde(default = "default_dns_port")]
+    pub listen_port: u16,
+}
+
+impl Default for DnsGovernanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            listen_port: 5353,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_dns_port() -> u16 {
+    5353
 }
 
 /// JWT authentication configuration.
@@ -355,6 +394,7 @@ impl Default for ProxyConfig {
             wal: WalConfig::default(),
             shadow: crate::intent_store::ShadowConfig::default(),
             filesystem: None,
+            dns: DnsGovernanceConfig::default(),
         }
     }
 }

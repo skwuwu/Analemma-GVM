@@ -123,13 +123,26 @@ After sandbox network setup, the agent can only reach: (1) GVM proxy via TCP on 
 
 5. **Sandbox resource cleanup** (v0.3): Per-PID state files (`/run/gvm/gvm-sandbox-{pid}.state`) record all resources created by each sandbox (veth, iptables rules, mounts, cgroups). On normal exit, cleanup + delete. On crash, the next `gvm run --sandbox` detects stale state files (dead PIDs) and auto-cleans orphan resources before proceeding. `gvm cleanup` provides manual recovery. Defense-in-depth: heuristic scan removes `veth-gvm-*` interfaces without corresponding state files. State files are stored in `/run/gvm/` (root-owned tmpfs) rather than `/tmp` to prevent symlink-based TOCTOU attacks.
 
-**Known limitation — DNS tunneling**: DNS queries are allowed through the host's upstream resolver for name resolution. An agent could encode data in DNS query hostnames (e.g., `base64-data.attacker.com`) to exfiltrate information at low bandwidth (~50 bytes/query).
+**DNS governance (v0.5)**: DNS queries from sandboxed agents pass through a built-in DNS governance proxy that classifies each query and applies graduated delay.
 
-GVM's scope is HTTP action governance — what the agent calls, not how it might exfiltrate data through side channels. DNS-level exfiltration prevention is a DLP (Data Loss Prevention) concern and belongs to network-layer DNS security tools: Route 53 DNS Firewall, Cloudflare Gateway, Cisco Umbrella. These solutions have threat intelligence feeds, overkill detection, and false-positive management that a governance proxy should not replicate.
+**Position change (v0.5)**: This section previously stated "DNS filtering is a DLP concern — building it into GVM would create more problems than it solves." That position is revised. GVM's direction has shifted from "governance proxy" to "secure runtime." As a runtime that claims to isolate agent I/O, leaving DNS as an unmonitored bypass channel is a gap the project can't justify. AWS Route 53 DNS Firewall and similar products demonstrate that full DNS threat-intelligence filtering requires massive surface area (feed management, CDN rotation handling, mDNS/LLMNR compatibility) that would bloat GVM's scope. However, doing nothing is also untenable.
 
-Building a DNS filter into GVM would create more problems than it solves: SRR-allowlisted stub resolvers would need to handle CDN rotation, subdomain queries for legitimate APIs, mDNS, LLMNR — every false positive would halt the agent. That's not governance, that's an outage.
+**Approach — Delay-Alert, no Deny**: DNS denial kills the entire agent, and one false positive becomes a service outage. Instead, GVM uses a tiered delay gradient:
 
-**GVM's role**: all DNS queries go through DNAT to the host resolver, enabling WAL audit logging of DNS activity for forensic purposes. The infrastructure layer handles blocking. GVM and DNS security tools are complementary — the same way GVM and prompt guards (Lakera) are complementary.
+| Tier | Condition | Action |
+|------|-----------|--------|
+| **1 (known)** | Domain in SRR known_hosts (learned via `gvm suggest`) | Free pass, 0ms |
+| **2 (unknown)** | First-seen domain | Delay 200ms + WAL log |
+| **3 (anomalous)** | >5 unique subdomains on same unknown base domain in 60s window | Delay 3s + alert |
+| **4 (flood)** | >20 global unique subdomain queries in 60s window | Delay 10s + alert |
+
+**Decay**: When the anomalous pattern stops, the sliding window expires and the domain falls back to Tier 2. The system never permanently escalates — it adapts in both directions.
+
+**Why delay, not deny**: (1) False positive resilience — a new legitimate API domain costs 200ms, not an outage. (2) Attacker deception — the agent (or attacker) sees "network is slow," not "blocked," and wastes time instead of immediately pivoting. (3) Human intervention window — 3-10 seconds of delay is enough for an operator to see the alert and decide.
+
+**Disable**: `--no-dns-governance` CLI flag or `dns.enabled = false` in proxy.toml. Use this when dedicated DNS security tools (Route 53 Firewall, Cloudflare Gateway, Cisco Umbrella) are already in place.
+
+**Remaining limitation**: DNS-over-HTTPS (DoH) to a provider the agent already has HTTPS access to (e.g., `https://dns.google/resolve?name=...`) bypasses the UDP DNS proxy entirely. This is mitigated by the HTTP governance layer — the DoH request itself is an HTTP call that hits SRR rules. A Deny rule on known DoH endpoints (`dns.google`, `cloudflare-dns.com/dns-query`) closes this gap.
 
 **Environment compatibility**:
 

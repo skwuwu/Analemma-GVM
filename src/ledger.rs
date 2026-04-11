@@ -668,7 +668,54 @@ impl Ledger {
     pub fn emergency_write_count(&self) -> u64 {
         self.emergency_writes.load(Ordering::Relaxed)
     }
+}
 
+/// Build a WAL event for a DNS governance decision.
+/// Kept outside the Ledger impl block so dns_governance.rs can call it
+/// without needing a Ledger reference.
+pub fn build_dns_event(domain: &str, tier_label: &str, delay: std::time::Duration) -> GVMEvent {
+    GVMEvent {
+        event_id: uuid::Uuid::new_v4().to_string(),
+        trace_id: uuid::Uuid::new_v4().to_string(),
+        parent_event_id: None,
+        agent_id: "unknown".to_string(),
+        tenant_id: None,
+        session_id: "dns".to_string(),
+        timestamp: chrono::Utc::now(),
+        operation: "gvm.dns.query".to_string(),
+        resource: crate::types::ResourceDescriptor::default(),
+        context: {
+            let mut ctx = std::collections::HashMap::new();
+            ctx.insert(
+                "dns_tier".to_string(),
+                serde_json::Value::String(tier_label.to_string()),
+            );
+            ctx.insert(
+                "delay_ms".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(delay.as_millis() as u64)),
+            );
+            ctx
+        },
+        transport: Some(crate::types::TransportInfo {
+            method: "DNS".to_string(),
+            host: domain.to_string(),
+            path: "".to_string(),
+            status_code: None,
+        }),
+        decision: format!("Delay {{ milliseconds: {} }}", delay.as_millis()),
+        decision_source: "dns-governance".to_string(),
+        matched_rule_id: None,
+        enforcement_point: "dns-proxy".to_string(),
+        status: crate::types::EventStatus::Confirmed,
+        payload: crate::types::PayloadDescriptor::default(),
+        nats_sequence: None,
+        event_hash: None,
+        llm_trace: None,
+        default_caution: true,
+    }
+}
+
+impl Ledger {
     /// IC-1 / Allow: async append with no durability guarantee.
     /// WAL is skipped (IC-1 is reversible, loss tolerated at < 0.1%).
     pub async fn append_async(&self, event: GVMEvent) {

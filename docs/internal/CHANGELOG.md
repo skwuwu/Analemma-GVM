@@ -55,6 +55,37 @@ v0.2 shipped: Shadow Mode + intent store, CONNECT tunnel, SRR hot-reload, eBPF u
 
 ## Implementation Log
 
+### 2026-04-11: v0.5.0 — DNS soft governance (Delay-Alert, no Deny)
+
+**Position change**: security-model.md previously stated "DNS filtering is a DLP concern — building it into GVM would create more problems than it solves." This position is revised.
+
+**Why**: GVM's direction shifted from "governance proxy" to "secure runtime." As a runtime that claims to isolate agent I/O, leaving DNS as an unmonitored bypass channel contradicts that claim. AWS Route 53 DNS Firewall and similar products demonstrate that full DNS threat-intelligence filtering requires massive surface area (feed management, CDN rotation handling, mDNS/LLMNR compatibility) — scope that would bloat GVM beyond its lightweight positioning. However, doing nothing is untenable. The compromise: minimal control surface with maximum survivability.
+
+**Design**: Delay-Alert gradient, no Deny. DNS denial kills the entire agent (one FP = outage), so enforcement uses graduated delay only:
+- Tier 1 (known): free pass 0ms — domains learned via `gvm suggest`
+- Tier 2 (unknown): 200ms delay + WAL log — first-seen domains
+- Tier 3 (anomalous): 3s delay + alert — >5 unique subdomains on same unknown base in 60s
+- Tier 4 (flood): 10s delay + alert — >20 global unique subdomain queries in 60s
+
+Decay: sliding window expiry returns classification to Tier 2 when the anomalous pattern stops. The system never permanently escalates.
+
+Disable: `--no-dns-governance` CLI flag or `dns.enabled = false` in proxy.toml, for environments already using dedicated DNS security tools.
+
+**Implementation**:
+- [src/dns_governance.rs](../../src/dns_governance.rs): DNS governance engine (tiered classification, sliding window, UDP proxy, upstream forwarding)
+- [src/config.rs](../../src/config.rs): `DnsGovernanceConfig` struct (`[dns]` section in proxy.toml)
+- [src/main.rs](../../src/main.rs): DNS proxy spawning, known_hosts sync from SRR, `GVM_DNS_LISTEN` env var
+- [src/proxy.rs](../../src/proxy.rs): `dns_governance` field on AppState
+- [src/ledger.rs](../../src/ledger.rs): `build_dns_event()` for WAL audit entries
+- [src/lib.rs](../../src/lib.rs): module registration
+- [crates/gvm-sandbox/src/network.rs](../../crates/gvm-sandbox/src/network.rs): DNAT target changed from upstream resolver to local DNS proxy when `GVM_DNS_LISTEN` is set
+- [crates/gvm-cli/src/main.rs](../../crates/gvm-cli/src/main.rs): `--no-dns-governance` CLI flag → `GVM_NO_DNS_GOVERNANCE=1` env var
+- [docs/security-model.md](../../docs/security-model.md): position change documented with rationale
+
+**Risk**: Low-medium. DNS proxy is a new network listener but fail-open by design (unparseable packets forwarded without delay). Disableable via CLI flag. No Deny means worst case is a 10-second delay on legitimate queries during a burst misclassification — not an outage. Known hosts from SRR are free-pass, so learned domains are never delayed.
+
+---
+
 ### 2026-04-10: v0.4.7 -- fuzzing CI hardening + cargo-audit ignore review process
 
 Four CI weaknesses called out during a security review of the fuzzing pipeline. None of them are exploitable bugs in the runtime, but together they meant fuzzing was producing far less assurance than the README implied and the audit-ignore list was opaque.

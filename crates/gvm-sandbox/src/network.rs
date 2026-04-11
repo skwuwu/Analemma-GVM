@@ -198,14 +198,24 @@ pub fn setup_host_network(config: &VethConfig) -> Result<String> {
         &config.proxy_addr.to_string(),
     ])?;
 
-    // 5b. DNAT: DNS queries from sandbox → host's upstream DNS resolver
-    // The sandbox resolv.conf points to host_ip, but no DNS server listens there.
-    // PREROUTING DNAT redirects UDP 53 to the actual upstream DNS resolver.
+    // 5b. DNAT: DNS queries from sandbox → DNS governance proxy or upstream
     //
-    // Cannot use 127.0.0.53 (systemd-resolved stub) because it binds to lo only —
-    // packets arriving on veth with DNAT to 127.0.0.53 are delivered via INPUT on
-    // the veth interface, but the socket only accepts packets on lo.
-    let dns_target = resolve_host_dns();
+    // When DNS governance is enabled (default), DNAT to the local governance
+    // proxy (127.0.0.1:5353) so every query is classified and delayed
+    // according to its tier. When disabled, DNAT directly to the upstream
+    // resolver as before.
+    //
+    // The GVM_DNS_LISTEN env var is set by the proxy's DNS governance spawner
+    // to communicate the actual listen address. Falls back to the host's
+    // upstream resolver if unset (backwards-compatible with --no-dns-governance).
+    let dns_target = if let Ok(dns_listen) = std::env::var("GVM_DNS_LISTEN") {
+        tracing::info!(dns_listen = %dns_listen, "DNS DNAT → governance proxy");
+        dns_listen
+    } else {
+        let upstream = resolve_host_dns();
+        tracing::debug!(dns_target = %upstream, "DNS DNAT → upstream (governance disabled)");
+        format!("{}:53", upstream)
+    };
     run_iptables(&[
         "-t",
         "nat",
@@ -220,7 +230,7 @@ pub fn setup_host_network(config: &VethConfig) -> Result<String> {
         "-j",
         "DNAT",
         "--to-destination",
-        &format!("{}:53", dns_target),
+        &dns_target,
     ])?;
     tracing::debug!(dns_target = %dns_target, "DNS DNAT configured");
 

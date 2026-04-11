@@ -5,6 +5,7 @@ use gvm_proxy::api;
 use gvm_proxy::api_keys::APIKeyStore;
 use gvm_proxy::auth;
 use gvm_proxy::config::ProxyConfig;
+use gvm_proxy::dns_governance;
 use gvm_proxy::ledger::Ledger;
 use gvm_proxy::policy::PolicyEngine;
 use gvm_proxy::proxy::{proxy_handler, AppState};
@@ -346,7 +347,7 @@ async fn main() {
     print_startup_summary(&srr, &policy, &registry, &api_keys);
 
     // 11. Compose shared state
-    let state = AppState {
+    let mut state = AppState {
         srr: Arc::new(std::sync::RwLock::new(srr)),
         policy: Arc::new(std::sync::RwLock::new(policy)),
         registry: Arc::new(std::sync::RwLock::new(registry)),
@@ -390,7 +391,54 @@ async fn main() {
         start_time: std::time::Instant::now(),
         request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ca_expires_days: mitm_ca_expires_days,
+        dns_governance: None, // populated below if enabled
     };
+
+    // 11a. DNS governance proxy (Delay-Alert, no Deny)
+    let dns_governance_enabled = config.dns.enabled
+        && std::env::var("GVM_NO_DNS_GOVERNANCE")
+            .map(|v| v != "1")
+            .unwrap_or(true);
+
+    if dns_governance_enabled {
+        // Build known_hosts set from SRR for free-pass tier
+        let known_set: std::collections::HashSet<String> = state
+            .srr
+            .read()
+            .map(|srr| srr.known_hosts().into_iter().collect())
+            .unwrap_or_default();
+        let known_hosts = Arc::new(std::sync::RwLock::new(known_set));
+        let dns_gov = Arc::new(dns_governance::DnsGovernance::new(known_hosts));
+        state.dns_governance = Some(dns_gov.clone());
+
+        let dns_listen: std::net::SocketAddr = format!("127.0.0.1:{}", config.dns.listen_port)
+            .parse()
+            .unwrap();
+        let dns_upstream = gvm_proxy::dns_governance::resolve_upstream_dns();
+        let dns_ledger = state.ledger.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) =
+                dns_governance::run_dns_proxy(dns_listen, dns_upstream, dns_gov, dns_ledger).await
+            {
+                tracing::error!(error = %e, "DNS governance proxy exited with error");
+            }
+        });
+
+        // Tell the sandbox DNAT setup where to redirect DNS queries.
+        // network.rs reads GVM_DNS_LISTEN to decide the DNAT target.
+        std::env::set_var("GVM_DNS_LISTEN", dns_listen.to_string());
+
+        tracing::info!(
+            listen = %dns_listen,
+            upstream = %dns_upstream,
+            "DNS governance proxy enabled (Delay-Alert, no Deny)"
+        );
+    } else {
+        // Clear so sandbox falls back to upstream resolver
+        std::env::remove_var("GVM_DNS_LISTEN");
+        tracing::info!("DNS governance disabled (--no-dns-governance or dns.enabled=false)");
+    }
 
     // Clone state for CONNECT handler before moving into axum router
     let connect_state = state.clone();

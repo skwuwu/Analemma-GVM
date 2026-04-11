@@ -178,6 +178,8 @@ pub struct AppState {
     /// Days until the MITM CA certificate expires (computed at startup from
     /// `not_after`). `None` when MITM is not active.
     pub ca_expires_days: Option<i64>,
+    /// DNS governance engine (None when `--no-dns-governance` or `dns.enabled = false`).
+    pub dns_governance: Option<Arc<crate::dns_governance::DnsGovernance>>,
 }
 
 /// Derive event status from upstream HTTP response.

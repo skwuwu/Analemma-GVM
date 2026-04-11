@@ -133,6 +133,14 @@ enum Commands {
         #[arg(long)]
         fs_governance: bool,
 
+        /// Disable DNS governance (allow unchecked DNS queries from sandbox).
+        /// By default, DNS queries from sandboxed agents pass through a local
+        /// governance proxy that delays unknown domains and alerts on anomalous
+        /// patterns. Use this flag if you already have dedicated DNS security
+        /// tools (Route 53 Firewall, Cloudflare Gateway, etc.).
+        #[arg(long)]
+        no_dns_governance: bool,
+
         /// Sandbox filesystem profile.
         /// minimal: interpreter + ldd libraries only (maximum isolation).
         /// standard: /usr, /lib, /bin read-only (default, Docker-like).
@@ -570,6 +578,7 @@ async fn main() -> anyhow::Result<()> {
             contained,
             no_mitm,
             fs_governance,
+            no_dns_governance,
             sandbox_profile,
             shadow_mode,
             sandbox_timeout,
@@ -599,6 +608,9 @@ async fn main() -> anyhow::Result<()> {
                 }
                 if let Some(timeout) = sandbox_timeout {
                     std::env::set_var("GVM_SANDBOX_TIMEOUT", timeout.to_string());
+                }
+                if no_dns_governance {
+                    std::env::set_var("GVM_NO_DNS_GOVERNANCE", "1");
                 }
                 let agent_exit = run::run_agent(
                     &command,
