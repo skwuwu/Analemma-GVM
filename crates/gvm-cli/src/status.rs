@@ -113,7 +113,10 @@ pub async fn run_status_json(proxy_url: &str) -> Result<()> {
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
             // Pass through the proxy's JSON directly — it already contains
             // all fields (pid, version, srr_rules, tls_ready, etc.)
-            println!("{}", serde_json::to_string_pretty(&body).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&body).unwrap_or_default()
+            );
             Ok(())
         }
         Err(_) => {
