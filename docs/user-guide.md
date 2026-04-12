@@ -485,26 +485,63 @@ gvm stop                         # graceful shutdown + sandbox cleanup
 
 ## CLI Reference
 
-| Command | Purpose |
-|---------|---------|
-| `gvm init --industry <finance\|saas>` | Initialize a starter `config/` directory from a template |
-| `gvm run [--sandbox] [--] <cmd>` | Run agent with governance |
-| `gvm watch [--with-rules] [--] <cmd>` | Observe traffic without enforcement |
-| `gvm run -i <cmd>` | Interactive rule suggestion |
-| `gvm check --host H --method M` | Dry-run policy test |
-| `gvm suggest --from F` | Generate rules from watch log |
-| `gvm approve [--auto-deny]` | Drain the `RequireApproval` queue (interactive or CI) |
-| `gvm events list` | Query audit trail |
-| `gvm audit verify` | Check WAL integrity |
-| `gvm stats tokens` | Token usage per agent |
-| `gvm status` | Show proxy health, SRR rules, WAL state, sandboxes |
-| `gvm reload` | Hot-reload SRR rules and policies |
-| `gvm preflight` | Check environment and available modes |
-| `gvm cleanup [--dry-run]` | Remove orphaned sandbox resources (veth, iptables, mounts, cgroups) |
-| `gvm fs approve [--list\|--accept-all\|--reject-all]` | Drain pending overlayfs staging dirs (`--fs-governance`) |
-| `gvm stop` | Gracefully stop the proxy daemon and release sandbox state |
+### Quick Reference
 
-Full flags: `gvm <command> --help`
+The commands you use every day:
+
+| Command | Intent | Example |
+|---------|--------|---------|
+| `gvm run` | Run an agent under governance — watch, enforce, or sandbox | `gvm run --sandbox agent.py` |
+| `gvm status` | Is the proxy alive? How many rules? Any problems? | `gvm status --json \| jq .srr_rules` |
+| `gvm suggest` | Auto-generate security rules from a recorded session — no manual TOML editing | `gvm suggest --from session.jsonl > config/srr_network.toml` |
+| `gvm reload` | Apply rule changes without restarting the proxy or killing running agents | `gvm reload` |
+| `gvm stop` | Shut down the proxy cleanly, flush the audit trail, release all sandbox resources | `gvm stop` |
+
+### Full Command List
+
+**Agent Execution**
+
+| Command | Intent | Key flags |
+|---------|--------|-----------|
+| `gvm run [--] <cmd>` | Run agent with governance. Starts proxy automatically if not running. | `--sandbox` (kernel isolation), `--watch` (observe only), `-i` (interactive rule discovery), `--fs-governance` (overlayfs), `--no-dns-governance`, `--no-mitm` |
+| `gvm demo` | Run built-in demo scenarios to see GVM in action without writing an agent | `--scenario finance\|assistant\|devops\|data` |
+
+**Policy Management**
+
+| Command | Intent | Key flags |
+|---------|--------|-----------|
+| `gvm suggest` | Convert a watch session into SRR rules. Eliminates manual rule writing — the agent teaches GVM what it needs. | `--from <jsonl>`, `--decision allow\|delay\|deny` |
+| `gvm check` | Dry-run: "would this request be allowed?" Test rules before deploying them to production. | `--host H`, `--method M`, `--path P`, `--operation O`, `--json` |
+| `gvm reload` | Hot-reload rules from disk. Edit `config/srr_network.toml`, run this, new rules take effect on the next request. | — |
+| `gvm approve` | Human-in-the-loop: review and approve/deny requests that hit RequireApproval rules. | `--auto-deny` (CI: reject all after timeout) |
+
+**Monitoring & Audit**
+
+| Command | Intent | Key flags |
+|---------|--------|-----------|
+| `gvm status` | Proxy health dashboard — version, SRR rules, WAL state, TLS, DNS governance, active sandboxes. | `--json` (machine-readable, includes PID) |
+| `gvm events` | Query individual audit events from the WAL. "Show me what happened." | `list --agent <id>`, `trace --trace-id <id>` |
+| `gvm stats` | Aggregate statistics — token usage per agent, cost tracking, blocked action counts. | `tokens` |
+| `gvm audit` | Verify WAL Merkle chain integrity. "Has anyone tampered with the audit log?" | `verify` |
+
+`gvm events` shows individual log entries (who called what, when, what decision). `gvm stats` shows aggregate numbers (total tokens, total blocked, cost per agent). They don't overlap — one is the raw journal, the other is the summary dashboard.
+
+**Operations**
+
+| Command | Intent | Key flags |
+|---------|--------|-----------|
+| `gvm stop` | Graceful shutdown. Flushes WAL, releases sandbox state (veth, iptables, mounts, cgroups), removes PID file. Use this instead of `kill`. | — |
+| `gvm cleanup` | Remove orphaned sandbox resources left behind by crashes or `kill -9`. The "janitor" for when things go wrong. | `--dry-run` |
+| `gvm fs approve` | Review file changes from `--fs-governance` sandboxes. Agent wrote files — do you accept them into the real workspace? | `--list`, `--accept-all`, `--reject-all` |
+
+**Setup**
+
+| Command | Intent | Key flags |
+|---------|--------|-----------|
+| `gvm init` | Generate starter config files from industry templates. First command after install. | `--industry saas\|fintech\|healthcare` |
+| `gvm preflight` | "Can I run sandbox on this machine?" Checks namespaces, iptables, seccomp availability. | — |
+
+Full flags for any command: `gvm <command> --help`
 
 ---
 
