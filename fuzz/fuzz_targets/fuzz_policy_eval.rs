@@ -24,44 +24,20 @@ fn get_policy() -> &'static gvm_proxy::policy::PolicyEngine {
             let dir = tempfile::tempdir().expect("temp dir");
             let policy_dir = dir.path().join("policies");
             std::fs::create_dir_all(&policy_dir).expect("create dir");
-            // Match the actual policy format used in config/policies/global.toml:
-            // [[rules.conditions]] (array of tables), [rules.decision] (separate table)
-            std::fs::write(
-                policy_dir.join("global.toml"),
-                concat!(
-                    "[[rules]]\n",
-                    "id = 'fuzz-allow-read'\n",
-                    "priority = 10\n",
-                    "layer = 'Global'\n",
-                    "[[rules.conditions]]\n",
-                    "field = 'operation'\n",
-                    "operator = 'Regex'\n",
-                    "value = '.*read.*'\n",
-                    "[rules.decision]\n",
-                    "type = 'Allow'\n",
-                    "\n",
-                    "[[rules]]\n",
-                    "id = 'fuzz-deny-delete'\n",
-                    "priority = 20\n",
-                    "layer = 'Global'\n",
-                    "[[rules.conditions]]\n",
-                    "field = 'operation'\n",
-                    "operator = 'Contains'\n",
-                    "value = 'delete'\n",
-                    "[rules.decision]\n",
-                    "type = 'Deny'\n",
-                    "reason = 'delete blocked'\n",
-                    "\n",
-                    "[[rules]]\n",
-                    "id = 'fuzz-delay-default'\n",
-                    "priority = 50\n",
-                    "layer = 'Global'\n",
-                    "[rules.decision]\n",
-                    "type = 'Delay'\n",
-                    "milliseconds = 300\n",
-                ),
-            )
-            .expect("write policy");
+            // Copy the actual production policy file — guaranteed to parse.
+            // This avoids inline TOML formatting issues that broke CI 3 times.
+            let src_policy = std::path::Path::new("config/policies/global.toml");
+            if src_policy.exists() {
+                std::fs::copy(src_policy, policy_dir.join("global.toml"))
+                    .expect("copy policy");
+            } else {
+                // Fallback: minimal policy that matches the real format
+                std::fs::write(
+                    policy_dir.join("global.toml"),
+                    "[[rules]]\nid = \"fuzz-default\"\npriority = 50\nlayer = \"Global\"\n\n[rules.decision]\ntype = \"Delay\"\nmilliseconds = 300\n",
+                )
+                .expect("write policy");
+            }
             let policy =
                 gvm_proxy::policy::PolicyEngine::load(&policy_dir).expect("load policy");
             PolicyFixture {
