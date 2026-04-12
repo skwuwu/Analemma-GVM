@@ -114,3 +114,43 @@ pub async fn run_check(
 
     Ok(())
 }
+
+/// Machine-readable JSON output for scripts and CI.
+/// Outputs the proxy's check response directly to stdout.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_check_json(
+    operation: &str,
+    agent_id: &str,
+    service: &str,
+    tier: &str,
+    sensitivity: &str,
+    host: &str,
+    path: &str,
+    method: &str,
+    proxy_url: &str,
+) -> Result<()> {
+    let client = reqwest::Client::new();
+    let check_url = format!("{}/gvm/check", proxy_url);
+
+    let resp = client
+        .post(&check_url)
+        .json(&serde_json::json!({
+            "operation": operation,
+            "agent_id": agent_id,
+            "resource": {
+                "service": service,
+                "tier": tier,
+                "sensitivity": sensitivity,
+            },
+            "target_host": host,
+            "target_path": path,
+            "method": method,
+        }))
+        .send()
+        .await
+        .context("Failed to reach proxy — is it running?")?;
+
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    println!("{}", serde_json::to_string(&body).unwrap_or_default());
+    Ok(())
+}

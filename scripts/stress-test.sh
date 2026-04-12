@@ -188,9 +188,9 @@ setup() {
         exit 1
     fi
 
-    # PID file is written by proxy_manager.rs — read it for metrics only.
-    # This is read-only observation, not lifecycle management.
-    PROXY_PID=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null || echo "0")
+    # Code Standard 6.1: use CLI for PID, not direct file access.
+    PROXY_PID=$("$GVM_BIN" status --json 2>/dev/null \
+        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('pid','0'))" 2>/dev/null || echo "0")
     echo "$PROXY_PID" > "$RESULTS_DIR/proxy.pid"
     echo -e "  ${GREEN}Proxy started via gvm CLI (PID $PROXY_PID)${NC}"
 
@@ -229,7 +229,9 @@ get_merkle_batches() {
 collect_metric() {
     local elapsed=$1
     local pid
-    pid=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null || cat "$RESULTS_DIR/proxy.pid" 2>/dev/null || echo "0")
+    pid=$("$GVM_BIN" status --json 2>/dev/null \
+        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('pid','0'))" 2>/dev/null \
+        || cat "$RESULTS_DIR/proxy.pid" 2>/dev/null || echo "0")
 
     local rss fd wal veth healthy pending agents batches
     rss=$(get_rss "$pid")
@@ -392,8 +394,12 @@ chaos_log() {
 }
 
 chaos_proxy_kill() {
+    # 6.1-exception: PID obtained via CLI; kill -9 is intentional chaos injection.
+    # Direct gvm-proxy restart below is a 6.1 violation — tracked for future migration.
     local old_pid
-    old_pid=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null || cat "$RESULTS_DIR/proxy.pid" 2>/dev/null || echo "0")
+    old_pid=$("$GVM_BIN" status --json 2>/dev/null \
+        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('pid','0'))" 2>/dev/null \
+        || cat "$RESULTS_DIR/proxy.pid" 2>/dev/null || echo "0")
     chaos_log "INJECT: kill -9 proxy (PID $old_pid)"
     kill -9 "$old_pid" 2>/dev/null
 

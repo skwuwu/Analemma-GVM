@@ -341,6 +341,10 @@ enum Commands {
         /// Proxy URL
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         proxy: String,
+
+        /// Output as JSON (machine-readable, for scripts and CI).
+        #[arg(long)]
+        json: bool,
     },
 
     /// Hot-reload SRR rules and ABAC policies from disk.
@@ -803,19 +807,35 @@ async fn main() -> anyhow::Result<()> {
             method,
             path,
             proxy,
+            json,
         } => {
-            check::run_check(
-                &operation,
-                &agent_id,
-                &service,
-                &tier,
-                &sensitivity,
-                &host,
-                &path,
-                &method,
-                &proxy,
-            )
-            .await?;
+            if json {
+                check::run_check_json(
+                    &operation,
+                    &agent_id,
+                    &service,
+                    &tier,
+                    &sensitivity,
+                    &host,
+                    &path,
+                    &method,
+                    &proxy,
+                )
+                .await?;
+            } else {
+                check::run_check(
+                    &operation,
+                    &agent_id,
+                    &service,
+                    &tier,
+                    &sensitivity,
+                    &host,
+                    &path,
+                    &method,
+                    &proxy,
+                )
+                .await?;
+            }
         }
 
         Commands::Reload { proxy } => {

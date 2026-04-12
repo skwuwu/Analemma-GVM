@@ -121,7 +121,24 @@ for d in "$REPO_DIR/../analemma-gvm-openclaw" "$HOME/analemma-gvm-openclaw"; do
     [ -d "$d/mcp-server" ] && MCP_DIR="$(cd "$d" && pwd)" && break
 done
 
-# ── Proxy lifecycle helpers ──
+# ── Proxy lifecycle + policy check helpers ──
+# Code Standard 6.1: all proxy interaction via CLI, never curl to internal APIs.
+
+# gvm_check_decision METHOD HOST PATH → prints decision string (Allow/Delay/Deny)
+# Uses gvm check --json to avoid curl /gvm/check (6.1 violation).
+gvm_check_decision() {
+    local METHOD="$1" HOST="$2" URLPATH="${3:-/}"
+    "$GVM_BIN" check --operation test --method "$METHOD" --host "$HOST" \
+        --path "$URLPATH" --json 2>/dev/null \
+        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null
+}
+
+# gvm_check_raw METHOD HOST PATH → prints full JSON response
+gvm_check_raw() {
+    local METHOD="$1" HOST="$2" URLPATH="${3:-/}"
+    "$GVM_BIN" check --operation test --method "$METHOD" --host "$HOST" \
+        --path "$URLPATH" --json 2>/dev/null
+}
 
 ensure_proxy() {
     # Code Standard 6.1: use CLI commands, not internal APIs or PID files.
@@ -397,7 +414,7 @@ print(f'  {len(parts)} rulesets loaded')
     sleep 1
     ensure_proxy
 
-    STATUS=$(curl -sf "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null || echo "failed")
+    STATUS=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status',"?"))" 2>/dev/null || echo "failed")
     [ "$STATUS" = "healthy" ] && pass "2: proxy health ($STATUS)" || fail "2: proxy health ($STATUS)"
 fi
 
@@ -486,11 +503,11 @@ fi
 if should_run 5; then
     header "5: SRR Policy Decisions"
 
+    # Code Standard 6.1: use CLI, not curl to internal APIs
     check_policy() {
         local METHOD="$1" HOST="$2" URLPATH="$3" EXPECTED="$4" LABEL="$5"
-        local DECISION=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-            -H "Content-Type: application/json" \
-            -d "{\"method\":\"$METHOD\",\"target_host\":\"$HOST\",\"target_path\":\"$URLPATH\",\"operation\":\"test\"}" \
+        local DECISION=$("$GVM_BIN" check --operation test --method "$METHOD" \
+            --host "$HOST" --path "$URLPATH" --json 2>/dev/null \
             | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
         if echo "$DECISION" | grep -q "$EXPECTED"; then
             pass "5: $LABEL = $DECISION"
@@ -709,7 +726,7 @@ if should_run 9; then
     fi
 
     # Proxy should still be healthy
-    HEALTH=$(curl -sf "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null || echo "failed")
+    HEALTH=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status',"?"))" 2>/dev/null || echo "failed")
     [ "$HEALTH" = "healthy" ] && pass "9b: proxy healthy after 200 requests" || fail "9b: proxy unhealthy"
     fi # PROXY_PID check
 fi
@@ -726,7 +743,7 @@ if should_run 10; then
 
     # Before: only _default ruleset (github = delay)
     cat "$RULESETS_DIR/_default.toml" > $SRR_NETWORK_PATH 2>/dev/null
-    curl -sf -X POST "$ADMIN_URL/gvm/reload" > /dev/null
+    "$GVM_BIN" reload > /dev/null 2>&1
 
     BEFORE=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
         -H "Content-Type: application/json" \
@@ -742,7 +759,8 @@ for f in ['$RULESETS_DIR/_default.toml', '$RULESETS_DIR/github.toml']:
     except: pass
 open('$SRR_NETWORK_PATH', 'w').write('\n'.join(parts))
 "
-    RELOAD_RESP=$(curl -sf -X POST "$ADMIN_URL/gvm/reload" | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('rules','?'))" 2>/dev/null)
+    "$GVM_BIN" reload > /dev/null 2>&1
+    RELOAD_RESP=$("$GVM_BIN" status --json 2>/dev/null | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('srr_rules','?'))" 2>/dev/null)
     echo -e "  Reload: $RELOAD_RESP rules"
 
     AFTER=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
@@ -766,7 +784,7 @@ open('$SRR_NETWORK_PATH', 'w').write('\n'.join(parts))
             -H "Content-Type: application/json" \
             -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' 2>/dev/null || echo "000")
         [ "$RESP" = "200" ] || LOST=$((LOST + 1))
-        [ $((i % 5)) -eq 0 ] && curl -sf -X POST "$ADMIN_URL/gvm/reload" > /dev/null 2>&1
+        [ $((i % 5)) -eq 0 ] && "$GVM_BIN" reload > /dev/null 2>&1
     done
     [ "$LOST" -eq 0 ] && pass "10b: zero requests lost during reload" || fail "10b: $LOST requests lost during reload"
 
@@ -778,7 +796,7 @@ for f in ['_default.toml', 'github.toml', 'slack.toml', 'web-browsing.toml']:
     except: pass
 open('$SRR_NETWORK_PATH', 'w').write('\n'.join(parts))
 "
-    curl -sf -X POST "$ADMIN_URL/gvm/reload" > /dev/null
+    "$GVM_BIN" reload > /dev/null 2>&1
 fi
 
 # ═══════════════════════════════════════════════════════════════════
@@ -827,7 +845,7 @@ except Exception as e:
     [ "$CONNECT_COUNT" -gt 0 ] 2>/dev/null && pass "11b: CONNECT logged ($CONNECT_COUNT in proxy log)" || fail "11b: no CONNECT in proxy log"
 
     # Health check after concurrent load
-    HEALTH=$(curl -sf "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null || echo "failed")
+    HEALTH=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status',"?"))" 2>/dev/null || echo "failed")
     [ "$HEALTH" = "healthy" ] && pass "11c: proxy healthy after concurrent load" || fail "11c: proxy unhealthy"
 fi
 
@@ -865,7 +883,7 @@ if should_run 13; then
     header "13: Burst Traffic (100 rapid requests)"
     ensure_proxy || { fail "13: proxy not available"; }
 
-    HEALTH_BEFORE=$(curl -sf "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null)
+    HEALTH_BEFORE=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status',"?"))" 2>/dev/null)
     WAL_BEFORE=$(wc -l < data/wal.log 2>/dev/null || echo 0)
 
     # Fire 100 requests sequentially (background & causes hang on EC2)
@@ -877,7 +895,7 @@ if should_run 13; then
         [ $((i % 25)) -eq 0 ] && echo -e "    $i/100..."
     done
 
-    HEALTH_AFTER=$(curl -sf "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null)
+    HEALTH_AFTER=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status',"?"))" 2>/dev/null)
     WAL_AFTER=$(wc -l < data/wal.log 2>/dev/null || echo 0)
 
     [ "$HEALTH_AFTER" = "healthy" ] && pass "13a: proxy survived 100 burst requests" || fail "13a: proxy unhealthy after burst"
@@ -992,12 +1010,12 @@ if should_run 16; then
     done
     echo -e "  Sent $LOOP_COUNT requests in 10 seconds"
 
-    HEALTH_DURING=$(curl -sf --connect-timeout 3 "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null || echo "unresponsive")
+    HEALTH_DURING=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status',"?"))" 2>/dev/null || echo "unresponsive")
     echo -e "  Health during loop: $HEALTH_DURING"
     sleep 1
 
     # Check proxy survived
-    HEALTH_AFTER=$(curl -sf --connect-timeout 3 "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null || echo "dead")
+    HEALTH_AFTER=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status',"?"))" 2>/dev/null || echo "dead")
     MEM_AFTER=$(ps -o rss= -p "$PROXY_PID" 2>/dev/null | tr -d ' ')
     MEM_DIFF=$(( (${MEM_AFTER:-0} - ${MEM_BEFORE:-0}) ))
 
@@ -1199,7 +1217,7 @@ except Exception as e:
 
     # Restart proxy for remaining tests
     ensure_proxy || echo -e "  ${YELLOW}Proxy restart failed${NC}"
-    curl -sf "$PROXY_URL/gvm/health" > /dev/null 2>&1 && echo -e "  Proxy restarted" || echo -e "  ${RED}Proxy restart failed${NC}"
+    "$GVM_BIN" status --json > /dev/null 2>&1 && echo -e "  Proxy restarted" || echo -e "  ${RED}Proxy restart failed${NC}"
 fi
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1238,7 +1256,7 @@ except Exception as e:
     echo -e "  Proxy SIGCONTed (resumed)"
 
     # Verify proxy recovered
-    HEALTH=$(curl -sf --connect-timeout 3 "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null || echo "dead")
+    HEALTH=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status',"?"))" 2>/dev/null || echo "dead")
 
     if echo "$HANG_RESULT" | grep -q "TIMEOUT"; then
         pass "20a: hanging proxy → timeout (fail-safe triggers Deny)"
@@ -1293,7 +1311,7 @@ if should_run 21; then
         [ "${MEM_DROP:-0}" -lt 500 ] && pass "21b: memory stable under uprobe burst (delta ${MEM_DROP}MB)" || fail "21b: memory dropped ${MEM_DROP}MB"
 
         # Proxy health after burst
-        HEALTH=$(curl -sf --connect-timeout 3 "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null || echo "dead")
+        HEALTH=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status',"?"))" 2>/dev/null || echo "dead")
         [ "$HEALTH" = "healthy" ] && pass "21c: proxy healthy after trace pipe burst" || fail "21c: proxy unhealthy"
 
         sudo bash -c "
@@ -1341,7 +1359,7 @@ if should_run 22; then
     ensure_proxy
 
     # Step 5: Health check
-    HEALTH=$(curl -sf --connect-timeout 3 "$PROXY_URL/gvm/health" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['status'])" 2>/dev/null || echo "dead")
+    HEALTH=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status',"?"))" 2>/dev/null || echo "dead")
     [ "$HEALTH" = "healthy" ] && pass "22b: proxy restarted healthy" || fail "22b: proxy failed to restart ($HEALTH)"
 
     # Step 6: Verify SRR rules re-loaded (test via policy check, not info API)
@@ -1732,7 +1750,7 @@ for f in sorted(os.listdir(rulesets)):
 open('$SRR_NETWORK_PATH', 'w').write('\n'.join(parts))
 print(f'  {len(parts)} rulesets loaded (all)')
 "
-        curl -sf -X POST "$ADMIN_URL/gvm/reload" > /dev/null 2>&1
+        "$GVM_BIN" reload > /dev/null 2>&1
         sleep 1
     fi
 
@@ -2880,7 +2898,7 @@ if should_run 45; then
     ensure_proxy || { fail "45: proxy not available"; }
 
     # 45a: Health endpoint returns 200 with status field
-    HEALTH=$(curl -sf "$PROXY_URL/gvm/health")
+    HEALTH=$("$GVM_BIN" status --json 2>/dev/null)
     if echo "$HEALTH" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['status'] in ('healthy','degraded')" 2>/dev/null; then
         STATUS=$(echo "$HEALTH" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
         pass "45a: /gvm/health returns status=$STATUS"
@@ -2914,7 +2932,7 @@ if should_run 45; then
         sleep 2
 
         # Verify proxy is actually dead
-        if curl -sf "$PROXY_URL/gvm/health" >/dev/null 2>&1; then
+        if "$GVM_BIN" status --json >/dev/null 2>&1; then
             fail "45c: proxy still alive after kill -9"
         else
             pass "45c: proxy confirmed dead after SIGKILL"
@@ -2925,7 +2943,7 @@ if should_run 45; then
         sleep 2
 
         # Verify proxy is back and healthy
-        HEALTH_AFTER=$(curl -sf "$PROXY_URL/gvm/health" 2>/dev/null)
+        HEALTH_AFTER=$("$GVM_BIN" status --json 2>/dev/null)
         if echo "$HEALTH_AFTER" | grep -q '"healthy"'; then
             pass "45d: proxy restarted and healthy after SIGKILL"
         else
@@ -3211,7 +3229,7 @@ DENYSRR
             OLD_SRR_CONTENT=$(cat $SRR_NETWORK_PATH)
         fi
         cp "$DENY_SRR" $SRR_NETWORK_PATH 2>/dev/null || true
-        curl -sf -X POST "$ADMIN_URL/gvm/reload" >/dev/null 2>&1
+        "$GVM_BIN" reload >/dev/null 2>&1
 
         # Clear log
         > "$PROXY_LOG" 2>/dev/null || true
@@ -3251,7 +3269,7 @@ DENYSRR
         if [ -n "$OLD_SRR_CONTENT" ]; then
             echo "$OLD_SRR_CONTENT" > $SRR_NETWORK_PATH
         fi
-        curl -sf -X POST "$ADMIN_URL/gvm/reload" >/dev/null 2>&1
+        "$GVM_BIN" reload >/dev/null 2>&1
 
         rm -f "$DENY_SRR"
     fi
@@ -3558,7 +3576,7 @@ if should_run 52; then
     fi
 
     # 52b: Verify health endpoint shows current policy
-    HEALTH=$(curl -sf "$PROXY_URL/gvm/health" 2>/dev/null)
+    HEALTH=$("$GVM_BIN" status --json 2>/dev/null)
     if echo "$HEALTH" | grep -q '"status"'; then
         pass "52b: Health endpoint accessible with policy active"
     else
@@ -4464,7 +4482,7 @@ method = "*"
 pattern = "{any}"
 decision = { type = "Delay", milliseconds = 100 }
 IC3SRR
-        curl -sf -X POST "$ADMIN_URL/gvm/reload" > /dev/null 2>&1
+        "$GVM_BIN" reload > /dev/null 2>&1
         sleep 1
 
         # 64a: Verify RequireApproval is configured
@@ -4479,7 +4497,7 @@ IC3SRR
             fail "64a: Expected RequireApproval, got: $IC3_CHECK"
             # Restore and skip remaining
             mv $TEST_CONFIG_DIR/srr_network.toml.ic3bak $SRR_NETWORK_PATH
-            curl -sf -X POST "$ADMIN_URL/gvm/reload" > /dev/null 2>&1
+            "$GVM_BIN" reload > /dev/null 2>&1
         fi
 
         # 64b: Agent sends request that triggers IC-3 hold
@@ -4576,7 +4594,7 @@ if items:
 
         # Restore SRR rules
         mv $TEST_CONFIG_DIR/srr_network.toml.ic3bak $SRR_NETWORK_PATH
-        curl -sf -X POST "$ADMIN_URL/gvm/reload" > /dev/null 2>&1
+        "$GVM_BIN" reload > /dev/null 2>&1
     fi
 fi
 
@@ -6386,7 +6404,7 @@ IC3SRR2
         # runs and produced duplicate ghostcheck entries on every
         # subsequent script invocation. We rely on the script-level
         # injection now and only need to hot-reload SRR.
-        curl -sf -X POST "$ADMIN_URL/gvm/reload" >/dev/null 2>&1
+        "$GVM_BIN" reload >/dev/null 2>&1
         sleep 1
 
         # Spawn the agent. 3-second HTTP timeout — short enough that
@@ -6475,7 +6493,7 @@ except: print(0)
         rm -f "$AGENT81_OUT"
         # Restore SRR
         mv $TEST_CONFIG_DIR/srr_network.toml.ic3guardbak $SRR_NETWORK_PATH
-        curl -sf -X POST "$ADMIN_URL/gvm/reload" >/dev/null 2>&1
+        "$GVM_BIN" reload >/dev/null 2>&1
     fi
 fi
 
@@ -6530,7 +6548,7 @@ if should_run 82; then
 # Test 82 placeholder — overwritten by `gvm suggest` mid-test.
 rules = []
 PLACEHOLDEREOF
-        curl -sf -X POST "$ADMIN_URL/gvm/reload" >/dev/null 2>&1 || true
+        "$GVM_BIN" reload >/dev/null 2>&1 || true
 
         # Tiny stdlib agent — three GETs against httpbin paths to give
         # `gvm suggest` enough material to emit at least one rule.
@@ -6627,7 +6645,7 @@ PYEOF
         if [ -s "$SRR_BAK_82" ]; then
             cp "$SRR_BAK_82" "$SRR_LIVE_PATH"
         fi
-        curl -sf -X POST "$ADMIN_URL/gvm/reload" >/dev/null 2>&1 || true
+        "$GVM_BIN" reload >/dev/null 2>&1 || true
 
         rm -f "$AGENT_82" "$SESSION_82" "$SESSION_CLEAN" "$WATCH_82" \
               "$SUGGEST_OUT" "$SUGGEST_ERR" "$ENFORCE_82" "$SRR_BAK_82"
