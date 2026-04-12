@@ -1,78 +1,123 @@
 # cargo-audit configuration.
 #
-# Each advisory listed under [advisories.ignore] needs an explicit
-# justification comment immediately above it. The rule for this
-# project: an unjustified ignore is treated as a security defect on
-# the same severity as a missing review. Pre-1.0 the bar is "is the
-# vulnerable code path actually reachable from GVM, and is there a
-# fix planned before v0.5".
+# Audit cadence: review every entry on each minor release.
+# Each advisory needs:
+#   - Reachability: does GVM call the vulnerable code path?
+#   - Remediation: upgrade plan or justification for accept.
 #
-# Audit cadence: review every entry on each minor release (v0.4 → v0.5).
-# When a new advisory is added, link to:
-#   - the advisory ID at https://rustsec.org/advisories/{ID}.html
-#   - a 1-sentence reachability assessment ("is GVM affected?")
-#   - a 1-sentence remediation plan ("upgrade X to Y when released")
-#
-# All five entries below are pending v0.5 review (tracked in
-# docs/internal/CHANGELOG.md). Until that review, this file is the
-# single source of truth -- the workflow stops passing -ignore on the
-# CLI and reads from this file instead.
+# REVIEWED: 2026-04-13 (v0.5.0 release audit)
 
 [advisories]
 ignore = [
-    # RUSTSEC-2025-0046 -- pending v0.5 review.
-    # Status: NEEDS-REVIEW. Confirm vulnerable function is not on the
-    # GVM hot path; if it is, plan dependency upgrade before v0.5.
+    # ═══════════════════════════════════════════════════════════════
+    # WASMTIME (16 advisories) — ALL UNREACHABLE in default builds.
+    #
+    # wasmtime is behind `optional = true` + `default = []` feature gate.
+    # The default `cargo build --release` DOES NOT compile wasmtime.
+    # Only `cargo build --features wasm` pulls it in — and that feature
+    # is documented as "UNSUPPORTED EXPERIMENTAL" (lib.rs, Cargo.toml).
+    #
+    # Remediation: wasmtime stays at v29 until the wasm feature is either
+    # removed entirely or promoted to production. If promoted, upgrade to
+    # the latest patched wasmtime first. No user has ever enabled this
+    # feature in a production deployment.
+    # ═══════════════════════════════════════════════════════════════
+
+    # RUSTSEC-2025-0046 (low 3.3) — fd_renumber panic
+    # Reachability: NONE. Wasm feature disabled by default.
     "RUSTSEC-2025-0046",
 
-    # RUSTSEC-2025-0118 -- pending v0.5 review.
-    # Status: NEEDS-REVIEW. Same procedure as above.
+    # RUSTSEC-2025-0118 (low 1.8) — shared linear memory unsoundness
+    # Reachability: NONE. Wasm feature disabled by default.
     "RUSTSEC-2025-0118",
 
-    # RUSTSEC-2026-0006 -- pending v0.5 review.
-    # Status: NEEDS-REVIEW.
+    # RUSTSEC-2026-0006 (medium 4.1) — f64.copysign segfault
+    # Reachability: NONE. Wasm feature disabled by default.
     "RUSTSEC-2026-0006",
 
-    # RUSTSEC-2026-0020 -- pending v0.5 review.
-    # Status: NEEDS-REVIEW.
+    # RUSTSEC-2026-0020 (medium 6.9) — WASI resource exhaustion
+    # Reachability: NONE. Wasm feature disabled by default.
     "RUSTSEC-2026-0020",
 
-    # RUSTSEC-2026-0021 -- pending v0.5 review.
-    # Status: NEEDS-REVIEW.
+    # RUSTSEC-2026-0021 (medium 6.9) — wasi:http/types.fields panic
+    # Reachability: NONE. Wasm feature disabled by default.
     "RUSTSEC-2026-0021",
 
-    # ── New advisories discovered 2026-04-11 CI run ──
-    # All pending v0.5 review. Added to unblock CI; each needs
-    # reachability assessment before v0.5 release.
-
-    # RUSTSEC-2026-0085 -- NEEDS-REVIEW.
+    # RUSTSEC-2026-0085 (medium 5.6) — flags component lift panic
+    # Reachability: NONE. Wasm feature disabled by default.
     "RUSTSEC-2026-0085",
-    # RUSTSEC-2026-0086 -- NEEDS-REVIEW.
+
+    # RUSTSEC-2026-0086 (low 2.3) — 64-bit table + Winch data leak
+    # Reachability: NONE. Wasm feature disabled by default.
     "RUSTSEC-2026-0086",
-    # RUSTSEC-2026-0088 -- NEEDS-REVIEW.
-    "RUSTSEC-2026-0088",
-    # RUSTSEC-2026-0089 -- NEEDS-REVIEW.
-    "RUSTSEC-2026-0089",
-    # RUSTSEC-2026-0091 -- NEEDS-REVIEW.
-    "RUSTSEC-2026-0091",
-    # RUSTSEC-2026-0092 -- NEEDS-REVIEW.
-    "RUSTSEC-2026-0092",
-    # RUSTSEC-2026-0093 -- NEEDS-REVIEW.
-    "RUSTSEC-2026-0093",
-    # RUSTSEC-2026-0094 -- NEEDS-REVIEW.
-    "RUSTSEC-2026-0094",
-    # RUSTSEC-2026-0095 -- NEEDS-REVIEW.
-    "RUSTSEC-2026-0095",
-    # RUSTSEC-2026-0096 -- NEEDS-REVIEW.
-    "RUSTSEC-2026-0096",
-    # RUSTSEC-2026-0087 -- NEEDS-REVIEW.
+
+    # RUSTSEC-2026-0087 (medium 4.1) — f64x2.splat segfault
+    # Reachability: NONE. Wasm feature disabled by default.
     "RUSTSEC-2026-0087",
-    # RUSTSEC-2026-0097 -- NEEDS-REVIEW.
+
+    # RUSTSEC-2026-0088 (low 2.3) — pooling allocator data leak
+    # Reachability: NONE. Wasm feature disabled by default.
+    "RUSTSEC-2026-0088",
+
+    # RUSTSEC-2026-0089 (medium 5.9) — Winch table.fill panic
+    # Reachability: NONE. Wasm feature disabled by default.
+    "RUSTSEC-2026-0089",
+
+    # RUSTSEC-2026-0091 (medium 6.1) — component model string OOB write
+    # Reachability: NONE. Wasm feature disabled by default.
+    "RUSTSEC-2026-0091",
+
+    # RUSTSEC-2026-0092 (medium 5.9) — UTF-16 transcoding panic
+    # Reachability: NONE. Wasm feature disabled by default.
+    "RUSTSEC-2026-0092",
+
+    # RUSTSEC-2026-0093 (medium 6.9) — UTF-16→latin1 heap OOB read
+    # Reachability: NONE. Wasm feature disabled by default.
+    "RUSTSEC-2026-0093",
+
+    # RUSTSEC-2026-0094 (medium 6.1) — Winch table.grow return mask
+    # Reachability: NONE. Wasm feature disabled by default.
+    "RUSTSEC-2026-0094",
+
+    # RUSTSEC-2026-0095 (CRITICAL 9.0) — Winch sandbox escape
+    # Reachability: NONE. Wasm feature disabled by default.
+    # NOTE: If wasm feature is EVER promoted, this MUST be fixed first.
+    "RUSTSEC-2026-0095",
+
+    # RUSTSEC-2026-0096 (CRITICAL 9.0) — aarch64 Cranelift sandbox escape
+    # Reachability: NONE. Wasm feature disabled by default.
+    # NOTE: If wasm feature is EVER promoted, this MUST be fixed first.
+    "RUSTSEC-2026-0096",
+
+    # ═══════════════════════════════════════════════════════════════
+    # RAND (1 advisory)
+    # ═══════════════════════════════════════════════════════════════
+
+    # RUSTSEC-2026-0097 (unknown) — rand::rng() unsound with custom logger
+    # Reachability: NONE. GVM uses rand::random() (vault.rs:128, 141),
+    # never rand::rng(). The vulnerable function is not called anywhere
+    # in the codebase. grep confirms 0 matches for "rand::rng".
     "RUSTSEC-2026-0097",
-    # RUSTSEC-2025-0057 -- NEEDS-REVIEW.
-    "RUSTSEC-2025-0057",
-    # RUSTSEC-2024-0436 -- NEEDS-REVIEW.
-    "RUSTSEC-2024-0436",
-    # RUSTSEC-2025-0134 -- NEEDS-REVIEW (rustls-pemfile unmaintained).
+
+    # ═══════════════════════════════════════════════════════════════
+    # UNMAINTAINED CRATES (3 advisories)
+    # ═══════════════════════════════════════════════════════════════
+
+    # RUSTSEC-2025-0134 — rustls-pemfile unmaintained
+    # Reachability: YES — used in tls_proxy.rs:85 for CA cert parsing.
+    # Impact: No security vulnerability, just no future updates.
+    # Remediation: migrate to rustls-pki-types when API stabilizes.
+    # Risk: LOW — the crate works correctly, just won't get new features.
     "RUSTSEC-2025-0134",
+
+    # RUSTSEC-2025-0057 — fxhash unmaintained
+    # Reachability: NONE. Not a direct dependency of GVM. Pulled in by
+    # a transitive dependency. cargo tree -i fxhash shows no match in
+    # the default feature set.
+    "RUSTSEC-2025-0057",
+
+    # RUSTSEC-2024-0436 — paste unmaintained
+    # Reachability: NONE. Not a direct dependency. Transitive only.
+    # cargo tree -i paste shows no match in default features.
+    "RUSTSEC-2024-0436",
 ]

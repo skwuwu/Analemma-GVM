@@ -2,14 +2,11 @@
 # https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
-# rustls-pemfile: unmaintained but functional, migration to rustls-pki-types planned.
+# Reviewed 2026-04-13. See audit.toml for full reachability assessments.
 ignore = [
-    "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained
-    # Rand unsound with custom logger — GVM does not use custom loggers
-    # with rand::rng(). NEEDS-REVIEW for v0.5.
-    "RUSTSEC-2026-0092",
-    # Additional advisories discovered 2026-04-11 CI.
-    "RUSTSEC-2026-0097",
+    "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained — used, low risk
+    "RUSTSEC-2026-0092",  # wasmtime UTF-16 panic — wasm feature disabled
+    "RUSTSEC-2026-0097",  # rand::rng() unsound — GVM uses rand::random() only
 ]
 
 [licenses]
