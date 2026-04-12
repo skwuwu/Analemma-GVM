@@ -24,19 +24,29 @@ fn get_policy() -> &'static gvm_proxy::policy::PolicyEngine {
             let dir = tempfile::tempdir().expect("temp dir");
             let policy_dir = dir.path().join("policies");
             std::fs::create_dir_all(&policy_dir).expect("create dir");
-            // Copy the actual production policy file — guaranteed to parse.
-            // This avoids inline TOML formatting issues that broke CI 3 times.
-            let src_policy = std::path::Path::new("config/policies/global.toml");
-            if src_policy.exists() {
-                std::fs::copy(src_policy, policy_dir.join("global.toml"))
-                    .expect("copy policy");
-            } else {
-                // Fallback: minimal policy that matches the real format
+            // Copy the production policy file — guaranteed to parse.
+            // Try both CWD=repo-root and CWD=fuzz/ (CI runs `cd fuzz` before cargo fuzz run).
+            let candidates = [
+                "config/policies/global.toml",
+                "../config/policies/global.toml",
+            ];
+            let mut copied = false;
+            for src in &candidates {
+                let p = std::path::Path::new(src);
+                if p.exists() {
+                    std::fs::copy(p, policy_dir.join("global.toml")).expect("copy policy");
+                    copied = true;
+                    break;
+                }
+            }
+            if !copied {
+                // Minimal valid policy — no conditions, just a default delay
                 std::fs::write(
                     policy_dir.join("global.toml"),
-                    "[[rules]]\nid = \"fuzz-default\"\npriority = 50\nlayer = \"Global\"\n\n[rules.decision]\ntype = \"Delay\"\nmilliseconds = 300\n",
+                    "[[rules]]\nid = \"fuzz-default\"\npriority = 50\nlayer = \"Global\"\n\n\
+                     [rules.decision]\ntype = \"Delay\"\nmilliseconds = 300\n",
                 )
-                .expect("write policy");
+                .expect("write fallback policy");
             }
             let policy =
                 gvm_proxy::policy::PolicyEngine::load(&policy_dir).expect("load policy");
