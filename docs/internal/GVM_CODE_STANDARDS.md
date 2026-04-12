@@ -465,35 +465,45 @@ let result = some_async_op(&snapshot).await;
 
 ## 6. Testing Standards
 
-### 6.1 CLI-Only Testing Principle
+### 6.1 Interface-Driven Testing
 
-Stress tests and E2E tests must interact with GVM **exclusively through CLI commands**:
+**Principle**: System lifecycle control (Start, Stop, Status) and governance workflows (Approve, Reload) must be performed exclusively through CLI commands.
 
 ```
 gvm run --sandbox -- <agent command>   # Agent execution
-gvm status                              # Proxy health
+gvm status --json                       # Proxy health (machine-readable)
+gvm check --json --host H --method M    # Policy dry-run
+gvm reload                              # Hot-reload SRR rules
+gvm approve                             # IC-3 approval workflow
+gvm stop                                # Graceful proxy shutdown
+gvm cleanup                             # Orphan resource cleanup
 gvm events list                         # WAL event query
 gvm audit verify                        # Merkle chain verification
-gvm check --host <host> --method GET    # Policy dry-run
-gvm reload                              # Hot-reload SRR rules
-gvm cleanup                             # Orphan resource cleanup
 gvm preflight                           # Environment check
 ```
 
-**Never** in test scripts:
-- Invoke proxy binaries directly (`gvm-proxy`, `target/release/gvm-proxy`)
-- Manipulate PID files (`data/proxy.pid`)
-- Call internal APIs (`curl http://127.0.0.1:8080/gvm/...`)
-- Use `tmux`, `nsenter`, `pkill`, or `sudo env` to manage GVM internals
-- Set up proxy environment manually (proxy_manager handles this)
-- Manage CA certificates manually (persistent CA handles this)
+**Exception (Internal API)**: The following cases permit direct HTTP protocol verification via `curl`:
 
-**Allowed** external operations in test scripts:
-- Chaos injection: `kill -9 <proxy_pid>`, `tc netem`, `mount -t tmpfs` — these simulate external failures that GVM cannot control
-- Sending prompts to the agent (via Telegram Bot API or CLI)
+- **Communication integrity tests**: Verifying the proxy engine's HTTP/gRPC response specification itself (e.g., `GET /gvm/ca.pem` returns valid PEM, `POST /gvm/intent` accepts the correct JSON schema).
+- **Internal logic probing**: Validating experimental features not exposed to users (e.g., `/gvm/intent` for Shadow Mode 2-phase verification).
+- **Payload precision tests**: Testing scenarios where CLI arguments are inadequate for the data involved (e.g., `/gvm/check` with a large base64-encoded body field for payload inspection rules).
+- **Throughput measurement**: Burst/stress tests where CLI process spawn overhead would measure startup latency rather than proxy throughput (e.g., 100 sequential `curl /gvm/check` in a tight loop).
+
+Mark all such exceptions with `# 6.1-exception: <reason>` inline comments for traceability.
+
+**Prohibited** (no exceptions):
+- `cat data/proxy.pid` or any direct PID file access → use `gvm status --json | jq .pid`
+- `curl /gvm/health` for lifecycle checks → use `gvm status --json`
+- `curl -X POST /gvm/reload` for rule changes → use `gvm reload`
+- Direct `gvm-proxy` binary invocation for lifecycle → use `gvm run` or `gvm stop`
+- `pkill -f gvm-proxy` for lifecycle → use `gvm stop` (chaos `kill -9` is allowed)
+
+**Allowed** external operations:
+- Chaos injection: `kill -9 $(gvm status --json | jq .pid)`, `tc netem`, `mount -t tmpfs` — PID obtained via CLI, kill is OS-level
 - Reading result files (`results/*/summary.txt`, `data/proxy.log`)
+- Sending prompts to agents (via OpenClaw CLI or Telegram Bot API)
 
-**Rationale**: If a test script reimplements what GVM does internally (proxy startup, env setup, CA management), it tests the script's implementation rather than GVM's. Script-specific bugs become indistinguishable from GVM bugs. The stress test must verify that `gvm run --sandbox` handles everything automatically — that's what users run in production.
+**Rationale**: Lifecycle management via CLI tests the same code path users run in production. Internal API tests via curl are acceptable because they verify the API contract itself — the distinction is whether the test is checking "does GVM work" (CLI) or "does this specific endpoint respond correctly" (curl).
 
 ### 6.2 Test Categories
 
