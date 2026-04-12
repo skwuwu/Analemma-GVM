@@ -26,28 +26,18 @@ fn get_policy() -> &'static gvm_proxy::policy::PolicyEngine {
             std::fs::create_dir_all(&policy_dir).expect("create dir");
             std::fs::write(
                 policy_dir.join("global.toml"),
-                r#"
-                [[rules]]
-                name = "fuzz-allow-read"
-                priority = 10
-                decision = { type = "Allow" }
-                [rules.conditions]
-                operation = { operator = "Regex", value = ".*\\.read$" }
-
-                [[rules]]
-                name = "fuzz-deny-delete"
-                priority = 20
-                decision = { type = "Deny", reason = "delete blocked" }
-                [rules.conditions]
-                operation = { operator = "Contains", value = "delete" }
-
-                [[rules]]
-                name = "fuzz-delay-default"
-                priority = 50
-                decision = { type = "Delay", milliseconds = 300 }
-                [rules.conditions]
-                operation = { operator = "Regex", value = ".*" }
-            "#,
+                "[[rules]]\nname = \"fuzz-allow-read\"\npriority = 10\n\
+                 decision = { type = \"Allow\" }\n\
+                 [rules.conditions]\n\
+                 operation = { operator = \"Regex\", value = \".*\\\\.read$\" }\n\n\
+                 [[rules]]\nname = \"fuzz-deny-delete\"\npriority = 20\n\
+                 decision = { type = \"Deny\", reason = \"delete blocked\" }\n\
+                 [rules.conditions]\n\
+                 operation = { operator = \"Contains\", value = \"delete\" }\n\n\
+                 [[rules]]\nname = \"fuzz-delay-default\"\npriority = 50\n\
+                 decision = { type = \"Delay\", milliseconds = 300 }\n\
+                 [rules.conditions]\n\
+                 operation = { operator = \"Regex\", value = \".*\" }\n",
             )
             .expect("write policy");
             let policy =
