@@ -640,21 +640,13 @@ if should_run 8; then
 
         # Test: Proxy returns Deny for uprobe context
         echo -e "  Testing Deny decision path via proxy /gvm/check..."
-        DENY_RESULT=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-            -H "Content-Type: application/json" \
-            -H "X-GVM-Uprobe-Token: internal" \
-            -d '{"method":"DELETE","target_host":"api.github.com","target_path":"/repos/t/t/git/refs/heads/main","operation":"uprobe"}' \
-            | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('decision','?'))" 2>/dev/null)
+        DENY_RESULT=$(gvm_check_decision DELETE "api.github.com" "/repos/t/t/git/refs/heads/main")
 
         echo -e "  Proxy response to uprobe Deny check: $DENY_RESULT"
         [ "$DENY_RESULT" = "Deny" ] && pass "8a: uprobe policy returns Deny" || fail "8a: expected Deny, got $DENY_RESULT"
 
         # Test: Allow path works (use operation:"test" for SRR-only check)
-        ALLOW_RESULT=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-            -H "Content-Type: application/json" \
-            -H "X-GVM-Uprobe-Token: internal" \
-            -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' \
-            | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('decision','?'))" 2>/dev/null)
+        ALLOW_RESULT=$(gvm_check_decision GET "api.github.com" "/repos/t/t/issues")
 
         [ "$ALLOW_RESULT" = "Allow" ] && pass "8b: uprobe policy returns Allow" || fail "8b: expected Allow, got $ALLOW_RESULT"
 
@@ -702,9 +694,7 @@ if should_run 9; then
     echo -e "  Sending 200 sequential requests..."
     FAIL_COUNT=0
     for i in $(seq 1 200); do
-        HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" -X POST "$PROXY_URL/gvm/check" \
-            -H "Content-Type: application/json" \
-            -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' 2>/dev/null || echo "000")
+        HTTP_CODE=$(gvm_check_raw GET "api.github.com" "/repos/t/t/issues" > /dev/null 2>&1 && echo "200" || echo "000")
         [ "$HTTP_CODE" != "200" ] && FAIL_COUNT=$((FAIL_COUNT + 1))
         [ $((i % 50)) -eq 0 ] && echo -e "    $i/200..."
     done
@@ -745,10 +735,7 @@ if should_run 10; then
     cat "$RULESETS_DIR/_default.toml" > $SRR_NETWORK_PATH 2>/dev/null
     "$GVM_BIN" reload > /dev/null 2>&1
 
-    BEFORE=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-        -H "Content-Type: application/json" \
-        -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' \
-        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+    BEFORE=$(gvm_check_decision GET "api.github.com" "/repos/t/t/issues")
     echo -e "  Before reload (default only): github read = $BEFORE"
 
     # Apply github ruleset via hot-reload
@@ -763,10 +750,7 @@ open('$SRR_NETWORK_PATH', 'w').write('\n'.join(parts))
     RELOAD_RESP=$("$GVM_BIN" status --json 2>/dev/null | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('srr_rules','?'))" 2>/dev/null)
     echo -e "  Reload: $RELOAD_RESP rules"
 
-    AFTER=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-        -H "Content-Type: application/json" \
-        -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' \
-        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+    AFTER=$(gvm_check_decision GET "api.github.com" "/repos/t/t/issues")
     echo -e "  After reload (github ruleset): github read = $AFTER"
 
     # Verify transition: Delay → Allow
@@ -780,9 +764,7 @@ open('$SRR_NETWORK_PATH', 'w').write('\n'.join(parts))
     echo -e "  Testing request continuity during reload..."
     LOST=0
     for i in $(seq 1 20); do
-        RESP=$(curl -sf -o /dev/null -w "%{http_code}" -X POST "$PROXY_URL/gvm/check" \
-            -H "Content-Type: application/json" \
-            -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' 2>/dev/null || echo "000")
+        RESP=$(gvm_check_raw GET "api.github.com" "/repos/t/t/issues" > /dev/null 2>&1 && echo "200" || echo "000")
         [ "$RESP" = "200" ] || LOST=$((LOST + 1))
         [ $((i % 5)) -eq 0 ] && "$GVM_BIN" reload > /dev/null 2>&1
     done
@@ -858,15 +840,9 @@ if should_run 12; then
     ensure_proxy || { fail "12: proxy not available"; }
 
     # Simulate: agent reads issues (Allow), then tries to delete branch (Deny)
-    READ=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-        -H "Content-Type: application/json" \
-        -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' \
-        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+    READ=$(gvm_check_decision GET "api.github.com" "/repos/t/t/issues")
 
-    DELETE=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-        -H "Content-Type: application/json" \
-        -d '{"method":"DELETE","target_host":"api.github.com","target_path":"/repos/t/t/git/refs/heads/admin","operation":"test"}' \
-        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+    DELETE=$(gvm_check_decision DELETE "api.github.com" "/repos/t/t/git/refs/heads/admin")
 
     if [ "$READ" = "Allow" ] && [ "$DELETE" = "Deny" ]; then
         pass "12: semantic violation blocked (read=$READ, delete=$DELETE)"
@@ -887,11 +863,13 @@ if should_run 13; then
     WAL_BEFORE=$(wc -l < data/wal.log 2>/dev/null || echo 0)
 
     # Fire 100 requests sequentially (background & causes hang on EC2)
+    # 6.1-exception: burst test uses curl for throughput measurement —
+    # spawning gvm check 100 times would measure process startup, not proxy.
     echo -e "  Sending 100 sequential requests..."
     for i in $(seq 1 100); do
         curl -sf -X POST "$PROXY_URL/gvm/check" \
             -H "Content-Type: application/json" \
-            -d '{"method":"POST","target_host":"slack.com","target_path":"/api/chat.postMessage","operation":"test"}' > /dev/null 2>&1
+            -d '{"method":"POST","target_host":"slack.com","target_path":"/api/chat.postMessage","operation":"test"}' > /dev/null 2>&1  # 6.1-exception: burst throughput
         [ $((i % 25)) -eq 0 ] && echo -e "    $i/100..."
     done
 
@@ -999,13 +977,14 @@ if should_run 16; then
     MEM_BEFORE=$(ps -o rss= -p "$PROXY_PID" 2>/dev/null | tr -d ' ')
 
     # Hammer proxy with sequential requests for 10 seconds
+    # 6.1-exception: infinite-loop stress test measures proxy throughput, not CLI
     echo -e "  Hammering proxy for 10 seconds..."
     LOOP_END=$((SECONDS + 10))
     LOOP_COUNT=0
     while [ $SECONDS -lt $LOOP_END ]; do
         curl -sf -X POST "$PROXY_URL/gvm/check" \
             -H "Content-Type: application/json" \
-            -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' > /dev/null 2>&1
+            -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' > /dev/null 2>&1  # 6.1-exception: throughput
         LOOP_COUNT=$((LOOP_COUNT + 1))
     done
     echo -e "  Sent $LOOP_COUNT requests in 10 seconds"
@@ -1057,10 +1036,7 @@ if should_run 17; then
     fi
 
     # 17b: Verify SRR decision on the exfiltration host via /gvm/check
-    RESULT=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-        -H "Content-Type: application/json" \
-        -d '{"method":"POST","target_host":"evil-exfil.attacker.com","target_path":"/receive","operation":"test"}' \
-        | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('decision','?'))" 2>/dev/null)
+    RESULT=$(gvm_check_decision POST "evil-exfil.attacker.com" "/receive")
     echo -e "  SRR decision for exfil host: $RESULT"
 
     if [ "$RESULT" = "Deny" ] || [ "$RESULT" = "RequireApproval" ] || [ "$RESULT" = "Delay" ]; then
@@ -1072,11 +1048,13 @@ if should_run 17; then
     fi
 
     # 17c: Verify /gvm/check with base64 body field
+    # 6.1-exception: gvm check CLI doesn't support --body flag; payload inspection
+    # requires the raw JSON API. Track for future gvm check --body addition.
     B64_KEY=$(echo -n 'ghp_secrettoken123' | base64 -w0)
     RESULT2=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
         -H "Content-Type: application/json" \
         -d "{\"method\":\"POST\",\"target_host\":\"api.bank.com\",\"target_path\":\"/graphql\",\"operation\":\"test\",\"body\":\"$B64_KEY\"}" \
-        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)  # 6.1-exception: body field
     echo -e "  Base64 body field check: $RESULT2"
 
     if [ -n "$RESULT2" ] && [ "$RESULT2" != "?" ]; then
@@ -1335,9 +1313,7 @@ if should_run 22; then
 
     # Step 1: Generate some WAL events before kill
     for i in $(seq 1 5); do
-        curl -sf -X POST "$PROXY_URL/gvm/check" \
-            -H "Content-Type: application/json" \
-            -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' > /dev/null 2>&1
+        gvm_check_raw GET "api.github.com" "/repos/t/t/issues" > /dev/null 2>&1
     done
     sleep 1
 
@@ -1363,18 +1339,12 @@ if should_run 22; then
     [ "$HEALTH" = "healthy" ] && pass "22b: proxy restarted healthy" || fail "22b: proxy failed to restart ($HEALTH)"
 
     # Step 6: Verify SRR rules re-loaded (test via policy check, not info API)
-    SRR_CHECK=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-        -H "Content-Type: application/json" \
-        -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' \
-        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+    SRR_CHECK=$(gvm_check_decision GET "api.github.com" "/repos/t/t/issues")
     echo -e "  SRR check after restart: $SRR_CHECK"
     [ "$SRR_CHECK" != "?" ] && pass "22c: SRR rules active after restart ($SRR_CHECK)" || fail "22c: SRR not responding after restart"
 
     # Step 7: New request works correctly
-    DECISION=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-        -H "Content-Type: application/json" \
-        -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' \
-        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+    DECISION=$(gvm_check_decision GET "api.github.com" "/repos/t/t/issues")
     [ "$DECISION" = "Allow" ] && pass "22d: post-restart policy check works ($DECISION)" || fail "22d: post-restart check failed ($DECISION)"
 
     # Step 8: WAL continues appending (not truncated)
@@ -1401,10 +1371,7 @@ if should_run 23; then
     # Verifies GVM doesn't break multi-step auth flows.
 
     # Step 1: Auth endpoint (unknown domain → Default-to-Caution, not Deny)
-    AUTH=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-        -H "Content-Type: application/json" \
-        -d '{"method":"POST","target_host":"auth.example.com","target_path":"/oauth/token","operation":"test"}' \
-        | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('decision','?'))" 2>/dev/null)
+    AUTH=$(gvm_check_decision POST "auth.example.com" "/oauth/token")
     echo -e "  Login (POST /oauth/token): $AUTH"
 
     # Auth should NOT be Deny — Default-to-Caution (Delay) is acceptable
@@ -1415,17 +1382,11 @@ if should_run 23; then
     fi
 
     # Step 2: Read with token (GitHub issues → Allow)
-    READ=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-        -H "Content-Type: application/json" \
-        -d '{"method":"GET","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' \
-        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+    READ=$(gvm_check_decision GET "api.github.com" "/repos/t/t/issues")
     [ "$READ" = "Allow" ] && pass "23b: read with token ($READ)" || fail "23b: read failed ($READ)"
 
     # Step 3: Token refresh (same auth endpoint → should still not Deny)
-    REFRESH=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-        -H "Content-Type: application/json" \
-        -d '{"method":"POST","target_host":"auth.example.com","target_path":"/oauth/token","operation":"test"}' \
-        | python3 -c "import sys,json; d=json.loads(sys.stdin.read()); print(d.get('decision','?'))" 2>/dev/null)
+    REFRESH=$(gvm_check_decision POST "auth.example.com" "/oauth/token")
     if echo "$REFRESH" | grep -qv "Deny"; then
         pass "23c: token refresh not denied ($REFRESH)"
     else
@@ -1433,17 +1394,11 @@ if should_run 23; then
     fi
 
     # Step 4: Write after refresh (GitHub create issue → Delay)
-    WRITE=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-        -H "Content-Type: application/json" \
-        -d '{"method":"POST","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' \
-        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+    WRITE=$(gvm_check_decision POST "api.github.com" "/repos/t/t/issues")
     echo "$WRITE" | grep -q "Delay" && pass "23d: write after refresh ($WRITE)" || fail "23d: write failed ($WRITE)"
 
     # Step 5: Destructive action (Deny — policy still enforced after auth flow)
-    DELETE=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-        -H "Content-Type: application/json" \
-        -d '{"method":"DELETE","target_host":"api.github.com","target_path":"/repos/t/t/git/refs/heads/main","operation":"test"}' \
-        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+    DELETE=$(gvm_check_decision DELETE "api.github.com" "/repos/t/t/git/refs/heads/main")
     [ "$DELETE" = "Deny" ] && pass "23e: destructive action still denied after auth ($DELETE)" || fail "23e: expected Deny, got $DELETE"
 fi
 
@@ -1668,10 +1623,7 @@ for line in sys.stdin:
         # 27d: MCP create_issue attempt (should be caught by GVM policy)
         echo -e "  Calling GitHub MCP: create_issue (policy check)..."
         # We don't actually create an issue — just verify the proxy would see it
-        ISSUE_CHECK=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-            -H "Content-Type: application/json" \
-            -d '{"method":"POST","target_host":"api.github.com","target_path":"/repos/skwuwu/Analemma-GVM/issues","operation":"test"}' \
-            | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+        ISSUE_CHECK=$(gvm_check_decision POST "api.github.com" "/repos/skwuwu/Analemma-GVM/issues")
 
         echo "$ISSUE_CHECK" | grep -q "Delay" && pass "27d: MCP create_issue would be Delayed ($ISSUE_CHECK)" || fail "27d: unexpected decision ($ISSUE_CHECK)"
     fi
@@ -1718,10 +1670,7 @@ if should_run 28 && [ "$SKIP_OPENCLAW" = false ]; then
         fi
 
         # Verify: webhook.site would get Default-to-Caution (Delay) — not a clean Allow
-        WEBHOOK_CHECK=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-            -H "Content-Type: application/json" \
-            -d '{"method":"POST","target_host":"webhook.site","target_path":"/test-endpoint","operation":"test"}' \
-            | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+        WEBHOOK_CHECK=$(gvm_check_decision POST "webhook.site" "/test-endpoint")
         echo -e "  webhook.site policy: $WEBHOOK_CHECK"
         echo "$WEBHOOK_CHECK" | grep -qv "Allow" && pass "28c: exfil target not freely allowed ($WEBHOOK_CHECK)" || fail "28c: webhook.site is Allow — data exfil not blocked"
     fi
@@ -1756,10 +1705,7 @@ print(f'  {len(parts)} rulesets loaded (all)')
 
     check_svc() {
         local METHOD="$1" HOST="$2" URLPATH="$3" EXPECTED="$4" LABEL="$5"
-        local DECISION=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-            -H "Content-Type: application/json" \
-            -d "{\"method\":\"$METHOD\",\"target_host\":\"$HOST\",\"target_path\":\"$URLPATH\",\"operation\":\"test\"}" \
-            | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+        local DECISION=$(gvm_check_decision "$METHOD" "$HOST" "$URLPATH")
         if echo "$DECISION" | grep -q "$EXPECTED"; then
             pass "29: $LABEL = $DECISION"
         else
@@ -1897,28 +1843,16 @@ if should_run 31; then
     ensure_proxy || { fail "31: proxy not available"; }
 
     # Policy checks (works without bot token)
-    TREAD=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-        -H "Content-Type: application/json" \
-        -d '{"method":"POST","target_host":"api.telegram.org","target_path":"/bot123/getUpdates","operation":"test"}' \
-        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+    TREAD=$(gvm_check_decision POST "api.telegram.org" "/bot123/getUpdates")
     [ "$TREAD" = "Allow" ] && pass "31a: telegram read = Allow" || fail "31a: telegram read = $TREAD"
 
-    TSEND=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-        -H "Content-Type: application/json" \
-        -d '{"method":"POST","target_host":"api.telegram.org","target_path":"/bot123/sendMessage","operation":"test"}' \
-        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+    TSEND=$(gvm_check_decision POST "api.telegram.org" "/bot123/sendMessage")
     echo "$TSEND" | grep -q "Delay" && pass "31b: telegram send = Delay" || fail "31b: telegram send = $TSEND"
 
-    TDEL=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-        -H "Content-Type: application/json" \
-        -d '{"method":"POST","target_host":"api.telegram.org","target_path":"/bot123/deleteMessage","operation":"test"}' \
-        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+    TDEL=$(gvm_check_decision POST "api.telegram.org" "/bot123/deleteMessage")
     [ "$TDEL" = "Deny" ] && pass "31c: telegram delete = Deny" || fail "31c: telegram delete = $TDEL"
 
-    TBAN=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-        -H "Content-Type: application/json" \
-        -d '{"method":"POST","target_host":"api.telegram.org","target_path":"/bot123/banChatMember","operation":"test"}' \
-        | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+    TBAN=$(gvm_check_decision POST "api.telegram.org" "/bot123/banChatMember")
     [ "$TBAN" = "Deny" ] && pass "31d: telegram ban = Deny" || fail "31d: telegram ban = $TBAN"
 
     # Real Telegram API test (if bot token available)
@@ -1986,24 +1920,16 @@ if should_run 32 && [ "$SKIP_OPENCLAW" = false ]; then
         fi
 
         # Verify policy decisions are correct
-        SLACK_D=$(curl -sf -X POST "$PROXY_URL/gvm/check" -H "Content-Type: application/json" \
-            -d '{"method":"POST","target_host":"slack.com","target_path":"/api/chat.postMessage","operation":"test"}' \
-            | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+        SLACK_D=$(gvm_check_decision POST "slack.com" "/api/chat.postMessage")
         echo "$SLACK_D" | grep -q "Delay" && pass "32c: slack post = Delay (audit before send)" || fail "32c: slack = $SLACK_D"
 
-        BRANCH_D=$(curl -sf -X POST "$PROXY_URL/gvm/check" -H "Content-Type: application/json" \
-            -d '{"method":"DELETE","target_host":"api.github.com","target_path":"/repos/t/t/git/refs/heads/main","operation":"test"}' \
-            | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+        BRANCH_D=$(gvm_check_decision DELETE "api.github.com" "/repos/t/t/git/refs/heads/main")
         [ "$BRANCH_D" = "Deny" ] && pass "32d: github branch delete = Deny" || fail "32d: branch delete = $BRANCH_D"
 
-        TGSEND_D=$(curl -sf -X POST "$PROXY_URL/gvm/check" -H "Content-Type: application/json" \
-            -d '{"method":"POST","target_host":"api.telegram.org","target_path":"/bot123/sendMessage","operation":"test"}' \
-            | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+        TGSEND_D=$(gvm_check_decision POST "api.telegram.org" "/bot123/sendMessage")
         echo "$TGSEND_D" | grep -q "Delay" && pass "32e: telegram send = Delay" || fail "32e: telegram = $TGSEND_D"
 
-        DISCORD_D=$(curl -sf -X POST "$PROXY_URL/gvm/check" -H "Content-Type: application/json" \
-            -d '{"method":"DELETE","target_host":"discord.com","target_path":"/api/v10/channels/123","operation":"test"}' \
-            | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+        DISCORD_D=$(gvm_check_decision DELETE "discord.com" "/api/v10/channels/123")
         [ "$DISCORD_D" = "Deny" ] && pass "32f: discord delete channel = Deny" || fail "32f: discord = $DISCORD_D"
 
         echo -e "\n  ${BOLD}Multi-service summary:${NC}"
@@ -2820,7 +2746,7 @@ if should_run 44; then
         ensure_proxy || { fail "44: proxy not available"; }
 
         # 44a: Verify CA is available via endpoint
-        CA_RESP=$(curl -sf "$PROXY_URL/gvm/ca.pem" | head -1)
+        CA_RESP=$(curl -sf "$PROXY_URL/gvm/ca.pem" | head -1)  # 6.1-exception: no CLI equivalent yet
         if echo "$CA_RESP" | grep -q "BEGIN CERTIFICATE"; then
             pass "44a: GET /gvm/ca.pem returns valid PEM"
         else
@@ -2873,7 +2799,7 @@ except Exception as e:
         fi
 
         # 44f: Certificate validity — verify the ephemeral CA has backdated not_before
-        CA_PEM=$(curl -sf "$PROXY_URL/gvm/ca.pem")
+        CA_PEM=$(curl -sf "$PROXY_URL/gvm/ca.pem")  # 6.1-exception: no CLI equivalent yet
         if [ -n "$CA_PEM" ]; then
             NOT_BEFORE=$(echo "$CA_PEM" | openssl x509 -noout -startdate 2>/dev/null | sed 's/notBefore=//')
             NOT_AFTER=$(echo "$CA_PEM" | openssl x509 -noout -enddate 2>/dev/null | sed 's/notAfter=//')
@@ -3944,16 +3870,20 @@ key_env = "GVM_VAULT_KEY"
 path = "${DISKFULL_WAL_DIR}/wal.log"
 CFGEOF
 
-        # Start separate proxy with WAL on tiny tmpfs
+        # 6.1-exception: Test 57 requires a SEPARATE proxy instance on a
+        # different port with a tiny WAL partition to simulate disk-full.
+        # gvm run always uses the primary proxy; there's no CLI for spawning
+        # a second isolated instance. Track for future `gvm run --port` or
+        # `gvm test-proxy` addition.
         GVM_CONFIG="$DISKFULL_CONFIG" \
         GVM_WAL_PATH="${DISKFULL_WAL_DIR}/wal.log" \
-            ./target/release/gvm-proxy > "$DISKFULL_LOG" 2>&1 &
+            ./target/release/gvm-proxy > "$DISKFULL_LOG" 2>&1 &  # 6.1-exception: disk-full test
         DISKFULL_PID=$!
 
         # Wait for disk-full proxy to start (CA generation takes time)
         DISKFULL_READY=false
         for i in $(seq 1 15); do
-            if curl -sf --connect-timeout 2 "http://127.0.0.1:${DISKFULL_PORT}/gvm/health" >/dev/null 2>&1; then
+            if curl -sf --connect-timeout 2 "http://127.0.0.1:${DISKFULL_PORT}/gvm/health" >/dev/null 2>&1; then  # 6.1-exception: no CLI equivalent yet
                 DISKFULL_READY=true
                 break
             fi
@@ -3979,7 +3909,7 @@ CFGEOF
                 fi
             done
 
-            HEALTH=$(curl -sf --connect-timeout 2 "http://127.0.0.1:${DISKFULL_PORT}/gvm/health" 2>/dev/null)
+            HEALTH=$(curl -sf --connect-timeout 2 "http://127.0.0.1:${DISKFULL_PORT}/gvm/health" 2>/dev/null)  # 6.1-exception: no CLI equivalent yet
             echo "$HEALTH" | grep -q "degraded\|primary_failed" && DEGRADED=true
             # Also check emergency_writes > 0 (WAL failover active)
             EMERG=$(echo "$HEALTH" | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('emergency_writes',0))" 2>/dev/null)
@@ -4133,6 +4063,7 @@ if should_run 59; then
 
     # 59a: Request WITHOUT prior intent declaration (strict mode should block)
     # First, check if shadow mode is enabled
+    # 6.1-exception: no CLI equivalent for this internal API call
     SHADOW_CHECK=$(curl -sf "$ADMIN_URL/gvm/info" 2>/dev/null | \
         python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('shadow_mode','disabled'))" 2>/dev/null)
 
@@ -4150,6 +4081,7 @@ if should_run 59; then
         fi
 
         # 59b: Declare intent, then send request within TTL → should succeed
+        # 6.1-exception: no CLI equivalent for this internal API call
         INTENT_ID=$(curl -sf -X POST "$PROXY_URL/gvm/intent" \
             -H "Content-Type: application/json" \
             -d '{"agent_id":"shadow-test","operation":"gvm.storage.read","target_host":"shadow-with-intent.example.com","target_method":"GET"}' \
@@ -4172,6 +4104,7 @@ if should_run 59; then
         fi
 
         # 59c: Declare intent, wait for TTL to expire, then send request → should block
+        # 6.1-exception: no CLI equivalent for this internal API call
         LATE_INTENT_ID=$(curl -sf -X POST "$PROXY_URL/gvm/intent" \
             -H "Content-Type: application/json" \
             -d '{"agent_id":"shadow-late","operation":"gvm.storage.read","target_host":"shadow-late.example.com","target_method":"GET"}' \
@@ -4486,10 +4419,7 @@ IC3SRR
         sleep 1
 
         # 64a: Verify RequireApproval is configured
-        IC3_CHECK=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-            -H "Content-Type: application/json" \
-            -d '{"method":"POST","target_host":"api.github.com","target_path":"/repos/t/t/issues","operation":"test"}' \
-            | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('decision','?'))" 2>/dev/null)
+        IC3_CHECK=$(gvm_check_decision POST "api.github.com" "/repos/t/t/issues")
 
         if echo "$IC3_CHECK" | grep -q "RequireApproval"; then
             pass "64a: IC-3 RequireApproval configured for issue creation"
@@ -4521,7 +4451,7 @@ except Exception as e:
         # 64c: Check pending approvals on admin port
         PENDING=""
         for i in $(seq 1 10); do
-            PENDING=$(curl -sf "$ADMIN_URL/gvm/pending" 2>/dev/null)
+            PENDING=$(curl -sf "$ADMIN_URL/gvm/pending" 2>/dev/null)  # 6.1-exception: no CLI equivalent yet
             if echo "$PENDING" | python3 -c "
 import sys,json
 d=json.loads(sys.stdin.read())
@@ -4555,6 +4485,7 @@ if items:
 
             if [ -n "$EVENT_ID" ]; then
                 echo -e "  ${DIM}Approving event: ${EVENT_ID:0:16}...${NC}"
+                # 6.1-exception: no CLI equivalent for this internal API call
                 APPROVE_RESP=$(curl -sf -X POST "$ADMIN_URL/gvm/approve" \
                     -H "Content-Type: application/json" \
                     -d "{\"event_id\":\"$EVENT_ID\",\"approved\":true}" 2>/dev/null)
@@ -4649,7 +4580,7 @@ if should_run 65; then
             FIRSTRUN_PID=$!
             sleep 5
 
-            FIRSTRUN_HEALTH=$(curl -sf --connect-timeout 2 "http://127.0.0.1:8080/gvm/health" 2>/dev/null)
+            FIRSTRUN_HEALTH=$(curl -sf --connect-timeout 2 "http://127.0.0.1:8080/gvm/health" 2>/dev/null)  # 6.1-exception: no CLI equivalent yet
             if echo "$FIRSTRUN_HEALTH" | grep -q "healthy"; then
                 pass "65c: Proxy starts healthy after gvm init"
             else
@@ -4820,9 +4751,7 @@ except:
     fi
 
     # 67b: /gvm/check response includes actionable next_action field
-    CHECK_DENY=$(curl -sf -X POST "$PROXY_URL/gvm/check" \
-        -H "Content-Type: application/json" \
-        -d '{"method":"DELETE","target_host":"api.github.com","target_path":"/repos/t/t/git/refs/heads/main","operation":"test"}')
+    CHECK_DENY=$(gvm_check_raw DELETE "api.github.com" "/repos/t/t/git/refs/heads/main")
 
     HAS_ACTION=$(echo "$CHECK_DENY" | python3 -c "
 import sys,json
@@ -6429,6 +6358,7 @@ except Exception as e:
         # classify and insert.
         SAW_PENDING=false
         for i in 1 2 3 4 5 6 7 8; do
+            # 6.1-exception: no CLI equivalent for this internal API call
             PENDING_NOW=$(curl -sf "$ADMIN_URL/gvm/pending" 2>/dev/null | \
                 python3 -c "
 import sys,json
@@ -6462,6 +6392,7 @@ except: print(0)
         # contain the entry. This is the ApprovalGuard regression
         # assertion — without the guard, the entry would persist for
         # ~5 minutes (the proxy's IC-3 timeout).
+        # 6.1-exception: no CLI equivalent for this internal API call
         PENDING_AFTER=$(curl -sf "$ADMIN_URL/gvm/pending" 2>/dev/null | \
             python3 -c "
 import sys,json

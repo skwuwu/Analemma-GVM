@@ -406,10 +406,12 @@ chaos_proxy_kill() {
     # Save WAL backup before restart (chaos recovery evidence)
     cp "$REPO_DIR/data/wal.log" "$RESULTS_DIR/wal-before-chaos.log" 2>/dev/null || true
 
-    # Restart proxy as daemon (same pattern as setup)
+    # 6.1-exception: chaos recovery restarts proxy directly because
+    # gvm run spawns a full agent session, not just the daemon. Track
+    # for future `gvm proxy restart` or equivalent CLI.
     sleep 2
     cd "$REPO_DIR"
-    setsid "$PROXY_BIN" >> "$REPO_DIR/data/proxy.log" 2>&1 &
+    setsid "$PROXY_BIN" >> "$REPO_DIR/data/proxy.log" 2>&1 &  # 6.1-exception: chaos restart
     local new_pid=$!
     echo "$new_pid" > "$REPO_DIR/data/proxy.pid"
     echo "$new_pid" > "$RESULTS_DIR/proxy.pid"
