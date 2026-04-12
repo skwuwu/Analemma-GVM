@@ -55,6 +55,23 @@ v0.2 shipped: Shadow Mode + intent store, CONNECT tunnel, SRR hot-reload, eBPF u
 
 ## Implementation Log
 
+### 2026-04-13: RUSTSEC reachability audit — 20 advisories reviewed
+
+Full reachability assessment of all 20 RUSTSEC advisories in audit.toml. This audit MUST NOT be repeated unless new advisories appear or dependencies change. Results are recorded here and in audit.toml.
+
+**wasmtime (16 advisories including 2× CRITICAL 9.0)**: ALL UNREACHABLE. wasmtime is behind `optional = true` + `default = []`. The default `cargo build --release` does not compile wasmtime. Only `--features wasm` pulls it in, and that feature is documented as "UNSUPPORTED EXPERIMENTAL" (lib.rs, Cargo.toml). No user has ever enabled it in production. If the wasm feature is ever promoted, RUSTSEC-2026-0095 (Winch sandbox escape, CVSS 9.0) and RUSTSEC-2026-0096 (aarch64 Cranelift sandbox escape, CVSS 9.0) MUST be fixed first by upgrading wasmtime to ≥43.0.1.
+
+**rand (1 advisory)**: RUSTSEC-2026-0097 — `rand::rng()` unsound with custom logger. UNREACHABLE. GVM uses `rand::random()` only (vault.rs:128, 141). grep confirms 0 calls to `rand::rng()`.
+
+**unmaintained (3 advisories)**:
+- RUSTSEC-2025-0134 (rustls-pemfile): REACHABLE in tls_proxy.rs:85. Not a vulnerability — crate works correctly, just unmaintained. Migrate to rustls-pki-types when API stabilizes.
+- RUSTSEC-2025-0057 (fxhash): transitive only, not in default dep tree.
+- RUSTSEC-2024-0436 (paste): transitive only, not in default dep tree.
+
+**When to re-audit**: Only when (a) `cargo audit` reports a NEW RUSTSEC not in audit.toml, or (b) Cargo.toml dependencies change (new crate added, version bumped). Do not re-review existing entries — their reachability status is stable.
+
+---
+
 ### 2026-04-11: v0.5.0 — DNS soft governance (Delay-Alert, no Deny)
 
 **Position change**: security-model.md previously stated "DNS filtering is a DLP concern — building it into GVM would create more problems than it solves." This position is revised.

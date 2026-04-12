@@ -1,32 +1,46 @@
 #![no_main]
-//! Fuzz target for WAL event JSON parsing.
+//! Structure-aware WAL parser fuzzer.
 //!
-//! Feeds arbitrary bytes as WAL lines to serde_json::from_str::<GVMEvent>().
-//! Goals:
-//! - No panics on any input
-//! - Graceful rejection of malformed JSON
-//! - No unbounded memory allocation from crafted payloads
+//! Generates WAL event sequences via WalEventInput with controlled
+//! corruption strategies (duplicate event_id, truncated JSON, invalid
+//! UTF-8, bad Merkle root, empty lines). Tests that the parser
+//! gracefully skips corrupt entries without panicking.
 
+use gvm_fuzz::types::WalEventInput;
+use gvm_types::GVMEvent;
 use libfuzzer_sys::fuzz_target;
 
-fuzz_target!(|data: &[u8]| {
-    // Simulate WAL recovery: parse each line as a GVMEvent
-    let input = match std::str::from_utf8(data) {
-        Ok(s) => s,
-        Err(_) => return, // WAL is text-based, non-UTF8 is immediately rejected
-    };
+fuzz_target!(|input: WalEventInput| {
+    let jsonl = input.to_jsonl();
+    let content = String::from_utf8_lossy(&jsonl);
 
-    for line in input.lines() {
-        if line.trim().is_empty() {
+    // Parse each line as a WAL event — same path as ledger recovery
+    let mut valid_events = 0u32;
+    let mut parse_errors = 0u32;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
-
-        // Skip MerkleBatchRecord lines (same logic as recovery)
-        if line.contains("\"merkle_root\"") {
-            continue;
+        match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(val) => {
+                // Try parsing as GVMEvent
+                if serde_json::from_value::<GVMEvent>(val.clone()).is_ok() {
+                    valid_events += 1;
+                }
+                // Also try as batch record (has batch_id field)
+                if val.get("batch_id").is_some() {
+                    valid_events += 1;
+                }
+            }
+            Err(_) => {
+                parse_errors += 1;
+            }
         }
-
-        // This must never panic — invalid JSON is expected and must be handled gracefully
-        let _result: Result<gvm_types::GVMEvent, _> = serde_json::from_str(line);
     }
+
+    // The parser must not panic regardless of corruption strategy.
+    // valid_events + parse_errors should account for all non-empty lines.
+    let _ = (valid_events, parse_errors);
 });

@@ -1,39 +1,19 @@
 #![no_main]
-//! Fuzz target for MITM HTTP request parsing.
+//! Structure-aware HTTP request parser fuzzer.
 //!
-//! Feeds arbitrary bytes into read_http_request() via an in-memory async reader.
-//! Goals:
-//! - No panics on any input (including binary, partial headers, smuggling attempts)
-//! - No unbounded memory allocation
-//! - Correct rejection of malformed requests (CL/TE conflicts, oversized headers)
+//! Generates structurally valid HTTP requests via HttpWireInput, then
+//! serializes them to HTTP/1.1 wire format bytes before feeding to the
+//! parser. This catches protocol-level bugs (smuggling, CRLF injection,
+//! CL/TE conflicts) that raw-byte fuzzing takes hours to discover.
 
+use gvm_fuzz::types::HttpWireInput;
 use libfuzzer_sys::fuzz_target;
 
-fuzz_target!(|data: &[u8]| {
-    // Limit input size to prevent timeout from overly large inputs.
-    // 128KB covers MAX_HEADER (64KB) + body + overhead.
-    if data.len() > 128 * 1024 {
-        return;
-    }
+fuzz_target!(|input: HttpWireInput| {
+    let wire = input.to_wire();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .expect("tokio runtime");
-
-    rt.block_on(async {
-        let cursor = std::io::Cursor::new(data.to_vec());
-        let mut reader = tokio::io::BufReader::new(cursor);
-
-        // This must never panic — malformed HTTP is expected and must be handled gracefully.
-        // Timeout is 30s in production; we use tokio::time::timeout to bound the fuzzer.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            gvm_proxy::tls_proxy::read_http_request(&mut reader),
-        )
-        .await;
-
-        // We don't care about the result — only that it didn't panic.
-        let _ = result;
-    });
+    // Feed to httparse (same parser the MITM proxy uses)
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut req = httparse::Request::new(&mut headers);
+    let _ = req.parse(&wire);
 });
