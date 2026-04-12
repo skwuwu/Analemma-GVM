@@ -24,30 +24,41 @@ fn get_policy() -> &'static gvm_proxy::policy::PolicyEngine {
             let dir = tempfile::tempdir().expect("temp dir");
             let policy_dir = dir.path().join("policies");
             std::fs::create_dir_all(&policy_dir).expect("create dir");
-            // Use TOML literal strings (single quotes) to avoid backslash escaping issues
+            // Match the actual policy format used in config/policies/global.toml:
+            // [[rules.conditions]] (array of tables), [rules.decision] (separate table)
             std::fs::write(
                 policy_dir.join("global.toml"),
                 concat!(
                     "[[rules]]\n",
-                    "name = 'fuzz-allow-read'\n",
+                    "id = 'fuzz-allow-read'\n",
                     "priority = 10\n",
-                    "decision = { type = 'Allow' }\n",
-                    "[rules.conditions]\n",
-                    "operation = { operator = 'Regex', value = '.*\\.read$' }\n",
+                    "layer = 'Global'\n",
+                    "[[rules.conditions]]\n",
+                    "field = 'operation'\n",
+                    "operator = 'Regex'\n",
+                    "value = '.*read.*'\n",
+                    "[rules.decision]\n",
+                    "type = 'Allow'\n",
                     "\n",
                     "[[rules]]\n",
-                    "name = 'fuzz-deny-delete'\n",
+                    "id = 'fuzz-deny-delete'\n",
                     "priority = 20\n",
-                    "decision = { type = 'Deny', reason = 'delete blocked' }\n",
-                    "[rules.conditions]\n",
-                    "operation = { operator = 'Contains', value = 'delete' }\n",
+                    "layer = 'Global'\n",
+                    "[[rules.conditions]]\n",
+                    "field = 'operation'\n",
+                    "operator = 'Contains'\n",
+                    "value = 'delete'\n",
+                    "[rules.decision]\n",
+                    "type = 'Deny'\n",
+                    "reason = 'delete blocked'\n",
                     "\n",
                     "[[rules]]\n",
-                    "name = 'fuzz-delay-default'\n",
+                    "id = 'fuzz-delay-default'\n",
                     "priority = 50\n",
-                    "decision = { type = 'Delay', milliseconds = 300 }\n",
-                    "[rules.conditions]\n",
-                    "operation = { operator = 'Regex', value = '.*' }\n",
+                    "layer = 'Global'\n",
+                    "[rules.decision]\n",
+                    "type = 'Delay'\n",
+                    "milliseconds = 300\n",
                 ),
             )
             .expect("write policy");
