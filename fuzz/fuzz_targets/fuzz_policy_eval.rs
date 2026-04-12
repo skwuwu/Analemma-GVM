@@ -24,20 +24,31 @@ fn get_policy() -> &'static gvm_proxy::policy::PolicyEngine {
             let dir = tempfile::tempdir().expect("temp dir");
             let policy_dir = dir.path().join("policies");
             std::fs::create_dir_all(&policy_dir).expect("create dir");
+            // Use TOML literal strings (single quotes) to avoid backslash escaping issues
             std::fs::write(
                 policy_dir.join("global.toml"),
-                "[[rules]]\nname = \"fuzz-allow-read\"\npriority = 10\n\
-                 decision = { type = \"Allow\" }\n\
-                 [rules.conditions]\n\
-                 operation = { operator = \"Regex\", value = \".*\\\\.read$\" }\n\n\
-                 [[rules]]\nname = \"fuzz-deny-delete\"\npriority = 20\n\
-                 decision = { type = \"Deny\", reason = \"delete blocked\" }\n\
-                 [rules.conditions]\n\
-                 operation = { operator = \"Contains\", value = \"delete\" }\n\n\
-                 [[rules]]\nname = \"fuzz-delay-default\"\npriority = 50\n\
-                 decision = { type = \"Delay\", milliseconds = 300 }\n\
-                 [rules.conditions]\n\
-                 operation = { operator = \"Regex\", value = \".*\" }\n",
+                concat!(
+                    "[[rules]]\n",
+                    "name = 'fuzz-allow-read'\n",
+                    "priority = 10\n",
+                    "decision = { type = 'Allow' }\n",
+                    "[rules.conditions]\n",
+                    "operation = { operator = 'Regex', value = '.*\\.read$' }\n",
+                    "\n",
+                    "[[rules]]\n",
+                    "name = 'fuzz-deny-delete'\n",
+                    "priority = 20\n",
+                    "decision = { type = 'Deny', reason = 'delete blocked' }\n",
+                    "[rules.conditions]\n",
+                    "operation = { operator = 'Contains', value = 'delete' }\n",
+                    "\n",
+                    "[[rules]]\n",
+                    "name = 'fuzz-delay-default'\n",
+                    "priority = 50\n",
+                    "decision = { type = 'Delay', milliseconds = 300 }\n",
+                    "[rules.conditions]\n",
+                    "operation = { operator = 'Regex', value = '.*' }\n",
+                ),
             )
             .expect("write policy");
             let policy =
