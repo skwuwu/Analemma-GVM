@@ -358,10 +358,18 @@ enum Commands {
     /// Show proxy status: health, SRR rules, WAL state.
     ///
     ///   gvm status
+    ///   gvm status --json          # machine-readable output for scripts
+    ///   gvm status --json | jq .pid
     Status {
         /// Proxy URL
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         proxy: String,
+
+        /// Output as JSON (machine-readable, for scripts and CI).
+        /// Includes: healthy, version, pid, listen, uptime_secs,
+        /// total_requests, srr_rules, tls_ready, dns_governance.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Stop the GVM proxy daemon and clean up sandbox resources.
@@ -814,8 +822,12 @@ async fn main() -> anyhow::Result<()> {
             reload::run_reload(&proxy).await?;
         }
 
-        Commands::Status { proxy } => {
-            status::run_status(&proxy).await?;
+        Commands::Status { proxy, json } => {
+            if json {
+                status::run_status_json(&proxy).await?;
+            } else {
+                status::run_status(&proxy).await?;
+            }
         }
 
         Commands::Stop {} => {

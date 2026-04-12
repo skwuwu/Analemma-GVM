@@ -1043,11 +1043,14 @@ pub async fn health(State(state): State<AppState>) -> Response<Body> {
         ("healthy", "ok")
     };
 
+    let dns_governance = state.dns_governance.is_some();
+
     json_response(
         StatusCode::OK,
         &serde_json::json!({
             "status": status,
             "version": env!("CARGO_PKG_VERSION"),
+            "pid": std::process::id(),
             "srr_rules": srr_rules,
             "tls_ready": tls_ready,
             "wal": wal_status,
@@ -1057,6 +1060,7 @@ pub async fn health(State(state): State<AppState>) -> Response<Body> {
             "uptime_secs": uptime_secs,
             "total_requests": total_requests,
             "ca_expires_days": state.ca_expires_days,
+            "dns_governance": dns_governance,
         }),
     )
 }

@@ -90,11 +90,18 @@ else
     GVM_BIN=""
 fi
 
-# Auto-detect PROXY_PID — prefer the daemon PID written by proxy_manager.rs
-# over pgrep, which can match unrelated processes whose cmdline contains
-# "gvm-proxy" and lead chaos kill tests to SIGKILL the wrong process.
-PROXY_PID=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null \
-    || pgrep -f "gvm-proxy" | head -1 || true)
+# Auto-detect PROXY_PID via CLI (Code Standard 6.1: no direct PID file access).
+# Falls back to pgrep only if gvm status is unavailable (proxy not running yet).
+get_proxy_pid() {
+    local pid
+    pid=$("$GVM_BIN" status --json 2>/dev/null | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('pid',''))" 2>/dev/null)
+    if [ -n "$pid" ] && [ "$pid" != "None" ] && [ "$pid" != "" ]; then
+        echo "$pid"
+        return
+    fi
+    pgrep -f "gvm-proxy" | head -1 || true
+}
+PROXY_PID=$(get_proxy_pid)
 
 # Auto-detect rulesets directory (clone if missing)
 RULESETS_DIR=""
@@ -117,27 +124,16 @@ done
 # ── Proxy lifecycle helpers ──
 
 ensure_proxy() {
-    # CLI-only proxy lifecycle (CLAUDE.md): never invoke gvm-proxy directly.
-    # Layered on top of 8668d30's SRR isolation: GVM_CONFIG already points
-    # at $TEST_CONFIG_DIR/proxy.toml, and `gvm run` inherits that env so the
-    # proxy_manager-spawned daemon reads from the isolated /tmp config.
-    #
-    # `gvm run -- /bin/true` is a no-op primer that triggers
-    # proxy_manager::ensure_available, which spawns the daemon (writing
-    # data/proxy.pid), waits for /gvm/health, then exits the primer command.
-    # The daemon stays alive across script steps and across the
-    # fault-injection tests below that SIGKILL/SIGSTOP/SIGTERM the proxy.
-    if curl -sf --connect-timeout 2 "$PROXY_URL/gvm/health" > /dev/null 2>&1; then
-        PROXY_PID=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null \
-            || pgrep -f "gvm-proxy" | head -1 || true)
+    # Code Standard 6.1: use CLI commands, not internal APIs or PID files.
+    # `gvm status --json` checks proxy health; `gvm run -- /bin/true` starts it.
+
+    # Fast check: is proxy already running?
+    if "$GVM_BIN" status --json > /dev/null 2>&1; then
+        PROXY_PID=$(get_proxy_pid)
         return 0
     fi
 
     cd "$REPO_DIR"
-    # Note: don't `rm -f "$PROXY_LOG"` — that's data/proxy.log which the
-    # already-spawned (or about-to-be-spawned) proxy_manager appends to.
-    # Truncating a live append-mode log races with the daemon. Capture
-    # primer output to a separate file instead.
     PRIMER_LOG="$(mktemp /tmp/gvm-primer-XXXXXX.log)"
     if ! "$GVM_BIN" run -- /bin/true > "$PRIMER_LOG" 2>&1; then
         echo -e "  ${RED}Proxy failed to start via 'gvm run' primer${NC}"
@@ -147,14 +143,10 @@ ensure_proxy() {
     fi
     rm -f "$PRIMER_LOG"
 
-    # Verify SRR engine readiness (not just /gvm/health up)
+    # Verify readiness via CLI (gvm check is a dry-run policy test)
     for i in $(seq 1 10); do
-        CHECK=$(curl -sf --max-time 2 -X POST "$PROXY_URL/gvm/check" \
-            -H "Content-Type: application/json" \
-            -d '{"method":"GET","target_host":"localhost","target_path":"/","operation":"test"}' 2>/dev/null)
-        if echo "$CHECK" | python3 -c "import sys,json; json.loads(sys.stdin.read())" 2>/dev/null; then
-            PROXY_PID=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null \
-                || pgrep -f "gvm-proxy" | head -1 || true)
+        if "$GVM_BIN" check --operation test --host localhost --method GET > /dev/null 2>&1; then
+            PROXY_PID=$(get_proxy_pid)
             return 0
         fi
         sleep 0.5
@@ -2388,8 +2380,7 @@ if should_run 37; then
     VETH_BEFORE=$(ip link show 2>/dev/null | grep -c "gvm_" || true)
 
     # SIGKILL the proxy
-    PROXY_PID_PRE=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null \
-        || pgrep -f "gvm-proxy" | head -1 || true)
+    PROXY_PID_PRE=$(get_proxy_pid)
     if [ -n "$PROXY_PID_PRE" ]; then
         kill -9 "$PROXY_PID_PRE" 2>/dev/null || true
         sleep 2
@@ -2917,8 +2908,7 @@ if should_run 45; then
     # the PID here causes the chaos kill below to SIGKILL the wrong
     # process — observed in 2026-04-08 EC2 run where it killed the parent
     # bash and tore down the tmux session mid-suite.
-    PROXY_PID=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null \
-        || pgrep -f "gvm-proxy" | head -1 || true)
+    PROXY_PID=$(get_proxy_pid)
     if [ -n "$PROXY_PID" ]; then
         kill -9 "$PROXY_PID" 2>/dev/null || true
         sleep 2
@@ -2952,8 +2942,7 @@ if should_run 45; then
     # the PID here causes the chaos kill below to SIGKILL the wrong
     # process — observed in 2026-04-08 EC2 run where it killed the parent
     # bash and tore down the tmux session mid-suite.
-    PROXY_PID=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null \
-        || pgrep -f "gvm-proxy" | head -1 || true)
+    PROXY_PID=$(get_proxy_pid)
     if [ -n "$PROXY_PID" ]; then
         kill -TERM "$PROXY_PID" 2>/dev/null || true
         sleep 3
@@ -3613,8 +3602,7 @@ if should_run 53; then
     # the PID here causes the chaos kill below to SIGKILL the wrong
     # process — observed in 2026-04-08 EC2 run where it killed the parent
     # bash and tore down the tmux session mid-suite.
-    PROXY_PID=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null \
-        || pgrep -f "gvm-proxy" | head -1 || true)
+    PROXY_PID=$(get_proxy_pid)
     if [ -n "$PROXY_PID" ]; then
         kill -TERM "$PROXY_PID" 2>/dev/null
         sleep 3
@@ -4052,8 +4040,7 @@ if should_run 58; then
     # the PID here causes the chaos kill below to SIGKILL the wrong
     # process — observed in 2026-04-08 EC2 run where it killed the parent
     # bash and tore down the tmux session mid-suite.
-    PROXY_PID=$(cat "$REPO_DIR/data/proxy.pid" 2>/dev/null \
-        || pgrep -f "gvm-proxy" | head -1 || true)
+    PROXY_PID=$(get_proxy_pid)
     if [ -n "$PROXY_PID" ]; then
         kill -9 "$PROXY_PID" 2>/dev/null || true
         sleep 2

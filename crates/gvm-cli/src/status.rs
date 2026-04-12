@@ -97,6 +97,40 @@ fn print_proxy_health(body: &serde_json::Value, proxy_url: &str) {
     }
 }
 
+/// Machine-readable JSON status output for scripts and CI.
+///
+/// Outputs a single JSON object to stdout (not stderr) with all proxy
+/// state fields. Exit code 0 = proxy reachable, 1 = not reachable.
+/// The JSON structure is a stable interface — test scripts depend on it.
+pub async fn run_status_json(proxy_url: &str) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+
+    let health_url = format!("{}/gvm/health", proxy_url);
+    match client.get(&health_url).send().await {
+        Ok(resp) => {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            // Pass through the proxy's JSON directly — it already contains
+            // all fields (pid, version, srr_rules, tls_ready, etc.)
+            println!("{}", serde_json::to_string_pretty(&body).unwrap_or_default());
+            Ok(())
+        }
+        Err(_) => {
+            // Proxy unreachable — output a minimal JSON with healthy=false
+            println!(
+                "{}",
+                serde_json::json!({
+                    "healthy": false,
+                    "status": "unreachable",
+                    "error": format!("Proxy not reachable at {}", proxy_url),
+                })
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Format seconds as "2h 15m" / "5m 12s" / "42s".
 fn format_uptime(secs: u64) -> String {
     let h = secs / 3600;
