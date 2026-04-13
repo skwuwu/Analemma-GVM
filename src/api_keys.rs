@@ -36,7 +36,7 @@ pub enum MissingCredentialPolicy {
 
 /// API Key Store — holds credentials keyed by host.
 /// The proxy injects the appropriate credential into forwarded requests (Layer 3).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct APIKeyStore {
     credentials: HashMap<String, Credential>,
 }

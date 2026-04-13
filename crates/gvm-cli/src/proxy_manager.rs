@@ -265,6 +265,15 @@ async fn start_daemon(proxy: &str, workspace: &Path, require_tls: bool) -> Resul
     std::fs::create_dir_all(&data_dir).ok();
     fix_data_dir_ownership(&data_dir);
 
+    // Fix config/secrets.toml ownership — when tests run as sudo,
+    // scripts may create/append to this file as root. Since the proxy
+    // drops to SUDO_UID, it needs read access. chmod 600 by api_keys.rs
+    // makes this fatal when owner != proxy user.
+    let secrets_path = workspace.join("config/secrets.toml");
+    if secrets_path.exists() {
+        fix_file_ownership(&secrets_path);
+    }
+
     // Log file (append mode)
     let log_path = data_dir.join("proxy.log");
     let log_file = std::fs::OpenOptions::new()

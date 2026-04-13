@@ -257,9 +257,19 @@ label = "prod-stress-hotreload"\
 # ── Evaluation ──
 evaluate_results() {
     echo "" >> "$SUMMARY"
-    echo "���══ Pass/Fail Evaluation ═══" >> "$SUMMARY"
-    echo "elapsed_sec=$(( $(date +%s) - START_TIME ))" >> "$SUMMARY"
+    echo "=== Pass/Fail Evaluation ===" >> "$SUMMARY"
+    local actual_elapsed=$(( $(date +%s) - START_TIME ))
+    echo "elapsed_sec=$actual_elapsed" >> "$SUMMARY"
     local pass=true
+
+    # 0. Minimum duration (must run at least 80% of requested time)
+    local min_required=$(( DURATION_SEC * 80 / 100 ))
+    if [ "$actual_elapsed" -lt "$min_required" ]; then
+        echo "FAIL: early exit (${actual_elapsed}s < ${min_required}s minimum)" >> "$SUMMARY"
+        pass=false
+    else
+        echo "PASS: duration met (${actual_elapsed}s >= ${min_required}s)" >> "$SUMMARY"
+    fi
 
     # 1. Kernel panic
     local panics
@@ -284,7 +294,10 @@ evaluate_results() {
     # 4. WAL integrity
     run_checkpoint "final_audit" "$GVM_BIN" audit verify --wal "$WAL" || true
     grep -q "final_audit|0" "$CHECKPOINT_LOG" 2>/dev/null && echo "PASS: WAL integrity" >> "$SUMMARY" || echo "WARN: WAL inconclusive" >> "$SUMMARY"
-    echo "wal_events: $(wc -l < "$WAL" 2>/dev/null || echo 0)" >> "$SUMMARY"
+    local wal_total wal_new
+    wal_total=$(wc -l < "$WAL" 2>/dev/null || echo "0")
+    wal_new=$(( wal_total - WAL_BASELINE ))
+    echo "wal_events: $wal_new (new during this run)" >> "$SUMMARY"
 
     # 5. Agent activity (LLM calls through MITM)
     local ac
@@ -292,10 +305,11 @@ evaluate_results() {
     echo "llm_calls: $ac" >> "$SUMMARY"
     [ "$ac" -gt 0 ] && echo "PASS: LLM calls via MITM ($ac)" >> "$SUMMARY" || { echo "FAIL: no LLM calls" >> "$SUMMARY"; pass=false; }
 
-    # 6. Prompts completed
+    # 6. Prompts completed (must be > 0 to prove the agent actually ran)
     local pc
     pc=$(grep -c "^PROMPT #" "$SANDBOX_LOG" 2>/dev/null || echo "0")
     echo "prompts_completed: $pc" >> "$SUMMARY"
+    [ "$pc" -gt 0 ] && echo "PASS: prompts completed ($pc)" >> "$SUMMARY" || { echo "FAIL: zero prompts completed" >> "$SUMMARY"; pass=false; }
 
     # 7. Connection errors
     local ce
@@ -403,6 +417,10 @@ echo "name|exit_code|timestamp" > "$CHECKPOINT_LOG"
 # Backup SRR config (hot-reload appends rules)
 cp "$REPO_DIR/config/srr_network.toml" "$RESULTS_DIR/srr_network.toml.backup"
 
+# Clear stale data from previous runs so evaluation doesn't count old events
+: > "$REPO_DIR/data/proxy.log"
+WAL_BASELINE=$(wc -l < "$WAL" 2>/dev/null || echo "0")
+
 START_TIME=$(date +%s)
 cat > "$SUMMARY" << EOF
 start_time=$START_TIME
@@ -441,9 +459,35 @@ echo -e "\n${BOLD}Monitoring (health every ${HEALTH_INTERVAL}s, chaos $CHAOS_ENA
 monitor_loop &
 MONITOR_PID=$!
 
-# Wait for sandbox to finish (or duration to expire)
-wait "$SANDBOX_PID" 2>/dev/null || true
-SANDBOX_EXIT=$?
+# Wait for sandbox — but enforce minimum duration.
+# If sandbox dies early, detect it immediately and FAIL instead of silently
+# evaluating stale data from a previous run.
+SANDBOX_DIED_EARLY=false
+while true; do
+    elapsed=$(( $(date +%s) - START_TIME ))
+    if [ "$elapsed" -ge "$DURATION_SEC" ]; then
+        # Duration reached — kill sandbox if still running
+        if kill -0 "$SANDBOX_PID" 2>/dev/null; then
+            echo -e "\n  ${DIM}Duration reached (${DURATION_MIN}m). Stopping sandbox...${NC}"
+            kill "$SANDBOX_PID" 2>/dev/null || true
+            wait "$SANDBOX_PID" 2>/dev/null || true
+        fi
+        break
+    fi
+    if ! kill -0 "$SANDBOX_PID" 2>/dev/null; then
+        wait "$SANDBOX_PID" 2>/dev/null || true
+        SANDBOX_EXIT=$?
+        remaining=$(( DURATION_SEC - elapsed ))
+        echo -e "\n  ${RED}Sandbox died at +${elapsed}s (${remaining}s remaining, exit=$SANDBOX_EXIT)${NC}"
+        SANDBOX_DIED_EARLY=true
+        break
+    fi
+    sleep 5
+done
+if ! $SANDBOX_DIED_EARLY; then
+    wait "$SANDBOX_PID" 2>/dev/null || true
+    SANDBOX_EXIT=$?
+fi
 echo -e "\n  ${DIM}Sandbox exited with code $SANDBOX_EXIT${NC}"
 
 # Stop monitor

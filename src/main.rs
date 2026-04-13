@@ -139,9 +139,19 @@ async fn main() {
         .expect("Failed to load policy engine");
     tracing::info!("ABAC policy engine loaded");
 
-    // 5. Load API key store (graceful: missing file → empty store with warning)
-    let api_keys =
-        APIKeyStore::load(Path::new(&config.secrets.file)).expect("Failed to load API key store");
+    // 5. Load API key store (graceful: missing or unreadable → empty store with warning)
+    let api_keys = match APIKeyStore::load(Path::new(&config.secrets.file)) {
+        Ok(keys) => keys,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                path = %config.secrets.file,
+                "Failed to load API key store — starting with empty store. \
+                 Layer 3 (API key isolation) is INACTIVE."
+            );
+            APIKeyStore::default()
+        }
+    };
     if api_keys.is_empty() {
         tracing::warn!(
             "No API keys configured. Running in passthrough mode. \
@@ -510,9 +520,30 @@ async fn main() {
         );
 
     // 12. Start server with CONNECT tunnel support
-    let listener = tokio::net::TcpListener::bind(&config.server.listen)
-        .await
-        .expect("Failed to bind to listen address");
+    // Use TcpSocket with SO_REUSEADDR so the proxy can restart immediately
+    // after a crash without waiting for TIME_WAIT to expire.
+    let listen_addr: std::net::SocketAddr = config
+        .server
+        .listen
+        .parse()
+        .unwrap_or_else(|_| "0.0.0.0:8080".parse().unwrap());
+    let socket = tokio::net::TcpSocket::new_v4()
+        .expect("Failed to create TCP socket");
+    socket
+        .set_reuseaddr(true)
+        .expect("Failed to set SO_REUSEADDR");
+    socket
+        .bind(listen_addr)
+        .unwrap_or_else(|e| {
+            eprintln!("Fatal: cannot bind to {listen_addr}: {e}");
+            std::process::exit(1);
+        });
+    let listener = socket
+        .listen(1024)
+        .unwrap_or_else(|e| {
+            eprintln!("Fatal: listen on {listen_addr} failed: {e}");
+            std::process::exit(1);
+        });
 
     tracing::info!(address = %config.server.listen, "GVM Proxy listening (HTTP)");
 

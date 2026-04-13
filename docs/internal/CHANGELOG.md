@@ -55,6 +55,21 @@ v0.2 shipped: Shadow Mode + intent store, CONNECT tunnel, SRR hot-reload, eBPF u
 
 ## Implementation Log
 
+### 2026-04-13: Fix proxy crash-recovery + prod-stress false PASS
+
+**What changed:**
+1. `main.rs:144` — Replaced `expect()` with graceful fallback on API key store load failure. Proxy logs ERROR and starts with empty store instead of panicking. Fixes CLAUDE.md "No Panic" violation.
+2. `main.rs:522` — TCP listener now uses `TcpSocket` with `SO_REUSEADDR` so proxy can restart immediately after crash without waiting for TIME_WAIT. Replaced `expect()` with `process::exit(1)`.
+3. `api_keys.rs:39` — Added `Default` derive to `APIKeyStore` for graceful fallback.
+4. `proxy_manager.rs:267` — `start_daemon` now fixes ownership of `config/secrets.toml` to `SUDO_UID:SUDO_GID`, matching existing `data/` ownership fix. Root cause: E2E test creates secrets.toml as root, `chmod 600` makes it unreadable by the privilege-dropped proxy.
+5. `prod-stress-test.sh` — Fixed false PASS: added minimum duration gate (80% of requested), `prompts_completed > 0` gate, stale data clearing (`proxy.log` truncate + WAL baseline), and duration-aware sandbox wait loop instead of bare `wait`.
+
+**Why:** Proxy panicked on every restart during E2E tests (8 failures, all "proxy unhealthy/dead"). Root cause: `config/secrets.toml` owned by root:0600, proxy running as non-root. Prod stress test reported PASS in 40 seconds with 0 prompts completed due to sandbox early exit + stale data from previous runs.
+
+**Affected files:** `src/main.rs`, `src/api_keys.rs`, `crates/gvm-cli/src/proxy_manager.rs`, `scripts/prod-stress-test.sh`
+
+**Risk:** Low. Ownership fix matches existing pattern (data/ files). `SO_REUSEADDR` is standard for server sockets. Graceful fallback is defense-in-depth — primary fix is the ownership correction.
+
 ### 2026-04-13: RUSTSEC reachability audit — 20 advisories reviewed
 
 Full reachability assessment of all 20 RUSTSEC advisories in audit.toml. This audit MUST NOT be repeated unless new advisories appear or dependencies change. Results are recorded here and in audit.toml.
