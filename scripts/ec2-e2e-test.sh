@@ -414,7 +414,7 @@ print(f'  {len(parts)} rulesets loaded')
     sleep 1
     ensure_proxy
 
-    STATUS=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status',"?"))" 2>/dev/null || echo "failed")
+    STATUS=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status','?'))" 2>/dev/null || echo "failed")
     [ "$STATUS" = "healthy" ] && pass "2: proxy health ($STATUS)" || fail "2: proxy health ($STATUS)"
 fi
 
@@ -716,7 +716,7 @@ if should_run 9; then
     fi
 
     # Proxy should still be healthy
-    HEALTH=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status',"?"))" 2>/dev/null || echo "failed")
+    HEALTH=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status','?'))" 2>/dev/null || echo "failed")
     [ "$HEALTH" = "healthy" ] && pass "9b: proxy healthy after 200 requests" || fail "9b: proxy unhealthy"
     fi # PROXY_PID check
 fi
@@ -827,7 +827,7 @@ except Exception as e:
     [ "$CONNECT_COUNT" -gt 0 ] 2>/dev/null && pass "11b: CONNECT logged ($CONNECT_COUNT in proxy log)" || fail "11b: no CONNECT in proxy log"
 
     # Health check after concurrent load
-    HEALTH=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status',"?"))" 2>/dev/null || echo "failed")
+    HEALTH=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status','?'))" 2>/dev/null || echo "failed")
     [ "$HEALTH" = "healthy" ] && pass "11c: proxy healthy after concurrent load" || fail "11c: proxy unhealthy"
 fi
 
@@ -859,7 +859,7 @@ if should_run 13; then
     header "13: Burst Traffic (100 rapid requests)"
     ensure_proxy || { fail "13: proxy not available"; }
 
-    HEALTH_BEFORE=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status',"?"))" 2>/dev/null)
+    HEALTH_BEFORE=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status','?'))" 2>/dev/null)
     WAL_BEFORE=$(wc -l < data/wal.log 2>/dev/null || echo 0)
 
     # Fire 100 requests sequentially (background & causes hang on EC2)
@@ -873,7 +873,7 @@ if should_run 13; then
         [ $((i % 25)) -eq 0 ] && echo -e "    $i/100..."
     done
 
-    HEALTH_AFTER=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status',"?"))" 2>/dev/null)
+    HEALTH_AFTER=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status','?'))" 2>/dev/null)
     WAL_AFTER=$(wc -l < data/wal.log 2>/dev/null || echo 0)
 
     [ "$HEALTH_AFTER" = "healthy" ] && pass "13a: proxy survived 100 burst requests" || fail "13a: proxy unhealthy after burst"
@@ -989,12 +989,12 @@ if should_run 16; then
     done
     echo -e "  Sent $LOOP_COUNT requests in 10 seconds"
 
-    HEALTH_DURING=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status',"?"))" 2>/dev/null || echo "unresponsive")
+    HEALTH_DURING=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status','?'))" 2>/dev/null || echo "unresponsive")
     echo -e "  Health during loop: $HEALTH_DURING"
     sleep 1
 
     # Check proxy survived
-    HEALTH_AFTER=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status',"?"))" 2>/dev/null || echo "dead")
+    HEALTH_AFTER=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status','?'))" 2>/dev/null || echo "dead")
     MEM_AFTER=$(ps -o rss= -p "$PROXY_PID" 2>/dev/null | tr -d ' ')
     MEM_DIFF=$(( (${MEM_AFTER:-0} - ${MEM_BEFORE:-0}) ))
 
@@ -1234,7 +1234,7 @@ except Exception as e:
     echo -e "  Proxy SIGCONTed (resumed)"
 
     # Verify proxy recovered
-    HEALTH=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status',"?"))" 2>/dev/null || echo "dead")
+    HEALTH=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status','?'))" 2>/dev/null || echo "dead")
 
     if echo "$HANG_RESULT" | grep -q "TIMEOUT"; then
         pass "20a: hanging proxy → timeout (fail-safe triggers Deny)"
@@ -1289,7 +1289,7 @@ if should_run 21; then
         [ "${MEM_DROP:-0}" -lt 500 ] && pass "21b: memory stable under uprobe burst (delta ${MEM_DROP}MB)" || fail "21b: memory dropped ${MEM_DROP}MB"
 
         # Proxy health after burst
-        HEALTH=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status',"?"))" 2>/dev/null || echo "dead")
+        HEALTH=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status','?'))" 2>/dev/null || echo "dead")
         [ "$HEALTH" = "healthy" ] && pass "21c: proxy healthy after trace pipe burst" || fail "21c: proxy unhealthy"
 
         sudo bash -c "
@@ -1335,7 +1335,7 @@ if should_run 22; then
     ensure_proxy
 
     # Step 5: Health check
-    HEALTH=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status',"?"))" 2>/dev/null || echo "dead")
+    HEALTH=$("$GVM_BIN" status --json | python3 -c "import sys,json; print(json.loads(sys.stdin.read()).get('status','?'))" 2>/dev/null || echo "dead")
     [ "$HEALTH" = "healthy" ] && pass "22b: proxy restarted healthy" || fail "22b: proxy failed to restart ($HEALTH)"
 
     # Step 6: Verify SRR rules re-loaded (test via policy check, not info API)
