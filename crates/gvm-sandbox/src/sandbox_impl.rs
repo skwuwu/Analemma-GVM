@@ -797,6 +797,20 @@ fn child_entry(
         std::env::set_var("CURL_CA_BUNDLE", ca_path);
     }
 
+    // Placeholder credential env vars — satisfy agent startup validation
+    // while the proxy holds the real keys. The proxy strips these placeholders
+    // and injects real credentials post-enforcement via secrets.toml.
+    for (key, value) in &config.extra_env {
+        std::env::set_var(key, value);
+    }
+    if !config.extra_env.is_empty() {
+        tracing::info!(
+            count = config.extra_env.len(),
+            "Injected {} placeholder credential env var(s) for agent startup",
+            config.extra_env.len()
+        );
+    }
+
     // Build argv: [interpreter, ...args]
     // Validate before fork — CString::new fails only on embedded NUL bytes.
     // After fork() we cannot use Rust runtime, so all allocations must happen here.

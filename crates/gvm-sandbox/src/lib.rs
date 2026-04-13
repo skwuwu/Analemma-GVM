@@ -68,6 +68,10 @@ pub struct SandboxConfig {
     /// When set, overlayfs is used to capture all file changes, and Trust-on-Pattern
     /// rules determine which changes are auto-merged, need manual commit, or discarded.
     pub fs_policy: Option<FilesystemPolicy>,
+    /// Extra environment variables to inject into the sandbox child process.
+    /// Used for placeholder API keys that satisfy agent startup validation
+    /// while the real credentials are held by the proxy (secrets.toml).
+    pub extra_env: Vec<(String, String)>,
     /// PEM-encoded CA certificate for MITM trust store injection.
     /// Downloaded from the proxy's `GET /gvm/ca.pem` endpoint. The proxy holds the
     /// private key; the sandbox only receives the public certificate. This ensures

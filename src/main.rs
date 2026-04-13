@@ -527,23 +527,18 @@ async fn main() {
         .listen
         .parse()
         .unwrap_or_else(|_| "0.0.0.0:8080".parse().unwrap());
-    let socket = tokio::net::TcpSocket::new_v4()
-        .expect("Failed to create TCP socket");
+    let socket = tokio::net::TcpSocket::new_v4().expect("Failed to create TCP socket");
     socket
         .set_reuseaddr(true)
         .expect("Failed to set SO_REUSEADDR");
-    socket
-        .bind(listen_addr)
-        .unwrap_or_else(|e| {
-            eprintln!("Fatal: cannot bind to {listen_addr}: {e}");
-            std::process::exit(1);
-        });
-    let listener = socket
-        .listen(1024)
-        .unwrap_or_else(|e| {
-            eprintln!("Fatal: listen on {listen_addr} failed: {e}");
-            std::process::exit(1);
-        });
+    socket.bind(listen_addr).unwrap_or_else(|e| {
+        eprintln!("Fatal: cannot bind to {listen_addr}: {e}");
+        std::process::exit(1);
+    });
+    let listener = socket.listen(1024).unwrap_or_else(|e| {
+        eprintln!("Fatal: listen on {listen_addr} failed: {e}");
+        std::process::exit(1);
+    });
 
     tracing::info!(address = %config.server.listen, "GVM Proxy listening (HTTP)");
 

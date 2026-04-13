@@ -125,6 +125,79 @@ impl APIKeyStore {
         self.credentials.keys().map(|s| s.as_str()).collect()
     }
 
+    /// Generate placeholder environment variables for sandbox agent startup.
+    ///
+    /// Many agent frameworks (OpenClaw, LangChain, CrewAI) validate API keys at
+    /// startup — if the env var is missing, the agent refuses to start. But giving
+    /// the agent the real key defeats credential isolation.
+    ///
+    /// This method generates dummy values that satisfy startup validation (non-empty
+    /// string, correct prefix format) while being obviously invalid for actual API
+    /// calls. The proxy strips these placeholders and injects real credentials
+    /// post-enforcement via secrets.toml.
+    ///
+    /// The env var name is derived from the host: `api.stripe.com` → `STRIPE_API_KEY`.
+    /// Well-known hosts get their conventional env var names. Unknown hosts get a
+    /// generic `GVM_CRED_{HOST}` pattern.
+    pub fn placeholder_env_vars(&self) -> Vec<(String, String)> {
+        let mut env_vars = Vec::new();
+
+        for (host, cred) in &self.credentials {
+            let (env_name, placeholder) = match host.as_str() {
+                // Well-known API services → their conventional env var names
+                h if h.contains("stripe.com") => (
+                    "STRIPE_API_KEY".to_string(),
+                    "sk_test_gvm_placeholder_do_not_use".to_string(),
+                ),
+                h if h.contains("openai.com") => (
+                    "OPENAI_API_KEY".to_string(),
+                    "sk-gvm-placeholder-do-not-use".to_string(),
+                ),
+                h if h.contains("anthropic.com") => (
+                    "ANTHROPIC_API_KEY".to_string(),
+                    "sk-ant-gvm-placeholder-do-not-use".to_string(),
+                ),
+                h if h.contains("slack.com") => (
+                    "SLACK_BOT_TOKEN".to_string(),
+                    "xoxb-gvm-placeholder-do-not-use".to_string(),
+                ),
+                h if h.contains("sendgrid.") => (
+                    "SENDGRID_API_KEY".to_string(),
+                    "SG.gvm-placeholder-do-not-use".to_string(),
+                ),
+                h if h.contains("github.com") => (
+                    "GITHUB_TOKEN".to_string(),
+                    "ghp_gvm_placeholder_do_not_use_000000".to_string(),
+                ),
+                h if h.contains("twilio.com") => (
+                    "TWILIO_AUTH_TOKEN".to_string(),
+                    "gvm_placeholder_do_not_use".to_string(),
+                ),
+                // Generic: derive env var name from hostname
+                _ => {
+                    // api.example.com → EXAMPLE_API_KEY
+                    let name = host
+                        .replace("api.", "")
+                        .replace(".com", "")
+                        .replace(".io", "")
+                        .replace(['.', '-'], "_")
+                        .to_uppercase();
+                    let env_name = format!("{}_API_KEY", name);
+                    let placeholder = match cred {
+                        Credential::Bearer { .. } => format!("gvm-placeholder-bearer-{}", name),
+                        Credential::OAuth2 { .. } => format!("gvm-placeholder-oauth2-{}", name),
+                        Credential::ApiKey { .. } => format!("gvm-placeholder-apikey-{}", name),
+                    };
+                    (env_name, placeholder)
+                }
+            };
+
+            env_vars.push((env_name, placeholder));
+        }
+
+        env_vars
+    }
+
     /// Inject the appropriate credential into the request for the given host.
     /// This is Layer 3 (Capability Token) — the agent never has direct access to API keys.
     ///

@@ -35,5 +35,6 @@ gvm-sandbox = { path = "../gvm-sandbox" }
 url = "2"
 which = "7"
 tempfile = "3"
+toml = "0.8"
 glob = "0.3"
 libc = "0.2"

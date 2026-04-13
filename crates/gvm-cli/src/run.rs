@@ -288,6 +288,11 @@ pub(crate) fn assemble_sandbox_config(
     cpu_limit: Option<f64>,
     mitm_ca_cert: Option<Vec<u8>>,
 ) -> gvm_sandbox::SandboxConfig {
+    // Generate placeholder API key env vars from secrets.toml so agents that
+    // validate credentials at startup don't refuse to start. The proxy strips
+    // these placeholders and injects real credentials post-enforcement.
+    let extra_env = load_placeholder_env_vars();
+
     gvm_sandbox::SandboxConfig {
         script_path,
         workspace_dir,
@@ -300,13 +305,86 @@ pub(crate) fn assemble_sandbox_config(
         proxy_url: Some(proxy.to_string()),
         memory_limit,
         cpu_limit,
-        // fs_policy: None = legacy mode (workspace/output/ only, no overlayfs)
-        // fs_policy: Some = overlayfs Trust-on-Pattern governance
-        // Controlled by --fs-governance CLI flag.
         fs_policy: None, // Caller sets this via pipeline based on fs_governance flag
         mitm_ca_cert,
         sandbox_profile: gvm_sandbox::SandboxProfile::default(),
+        extra_env,
     }
+}
+
+/// Load secrets.toml and generate placeholder env vars for agent startup.
+///
+/// Parses credential host names from secrets.toml and generates dummy
+/// values that satisfy agent startup validation (non-empty, correct prefix)
+/// without exposing real keys. The proxy strips these and injects real
+/// credentials post-enforcement.
+fn load_placeholder_env_vars() -> Vec<(String, String)> {
+    let secrets_path = std::path::Path::new("config/secrets.toml");
+    if !secrets_path.exists() {
+        return Vec::new();
+    }
+    let content = match std::fs::read_to_string(secrets_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let parsed: toml::Value = match toml::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    let credentials = match parsed.get("credentials").and_then(|c| c.as_table()) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+
+    let mut env_vars = Vec::new();
+    for (host, cred) in credentials {
+        let cred_type = cred
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("Bearer");
+
+        let (env_name, placeholder) = match host.as_str() {
+            h if h.contains("stripe.com") => (
+                "STRIPE_API_KEY".into(),
+                "sk_test_gvm_placeholder_do_not_use".into(),
+            ),
+            h if h.contains("openai.com") => (
+                "OPENAI_API_KEY".into(),
+                "sk-gvm-placeholder-do-not-use".into(),
+            ),
+            h if h.contains("anthropic.com") => (
+                "ANTHROPIC_API_KEY".into(),
+                "sk-ant-gvm-placeholder-do-not-use".into(),
+            ),
+            h if h.contains("slack.com") => (
+                "SLACK_BOT_TOKEN".into(),
+                "xoxb-gvm-placeholder-do-not-use".into(),
+            ),
+            h if h.contains("sendgrid.") => (
+                "SENDGRID_API_KEY".into(),
+                "SG.gvm-placeholder-do-not-use".into(),
+            ),
+            h if h.contains("github.com") => (
+                "GITHUB_TOKEN".into(),
+                "ghp_gvm_placeholder_do_not_use_000000".into(),
+            ),
+            _ => {
+                let name = host
+                    .replace("api.", "")
+                    .replace(".com", "")
+                    .replace(".io", "")
+                    .replace(['.', '-'], "_")
+                    .to_uppercase();
+                (
+                    format!("{}_API_KEY", name),
+                    format!("gvm-placeholder-{}-{}", cred_type.to_lowercase(), name),
+                )
+            }
+        };
+        env_vars.push((env_name, placeholder));
+    }
+    env_vars
 }
 
 pub(crate) async fn proxy_healthy(proxy: &str) -> bool {
