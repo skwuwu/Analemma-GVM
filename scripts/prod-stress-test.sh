@@ -441,9 +441,11 @@ WS_DIR=$(prepare_workspace)
 
 # Start sandbox in background (gvm run handles everything:
 #   proxy startup, CA management, namespace setup, env vars)
+# CWD must be workspace-stress/ so it becomes /workspace in the sandbox.
+# GVM_WORKSPACE tells the proxy where to find config/ (repo root).
 echo -e "  ${CYAN}Starting sandbox...${NC}"
 cd "$WS_DIR"
-"$GVM_BIN" run --sandbox \
+GVM_WORKSPACE="$REPO_DIR" "$GVM_BIN" run --sandbox \
     --sandbox-timeout "$((DURATION_SEC + 300))" \
     -- bash /workspace/run-stress.sh \
     > "$SANDBOX_LOG" 2>&1 &
