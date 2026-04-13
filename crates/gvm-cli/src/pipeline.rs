@@ -175,7 +175,6 @@ async fn launch_sandbox(config: &AgentConfig, pre: &PreLaunchState) -> Result<i3
             args.iter().map(|s| s.to_string()).collect(),
             proxy_addr,
             &config.agent_id,
-            &config.proxy,
             config.memory_limit,
             config.cpu_limit,
             pre.mitm_ca.clone(),
@@ -206,7 +205,6 @@ async fn launch_sandbox(config: &AgentConfig, pre: &PreLaunchState) -> Result<i3
             interpreter_args,
             proxy_addr,
             &config.agent_id,
-            &config.proxy,
             config.memory_limit,
             config.cpu_limit,
             pre.mitm_ca.clone(),
@@ -622,7 +620,7 @@ fn print_banner(config: &AgentConfig) {
         }
         LaunchMode::Sandbox => {
             eprintln!("{BOLD}Analemma GVM \u{2014} Sandbox Mode (Layer 2 + 3){RESET}");
-            eprintln!("{DIM}Kernel isolation: namespace + seccomp + veth + uprobe.{RESET}");
+            eprintln!("{DIM}Kernel isolation: namespace + seccomp + veth + TC filter.{RESET}");
         }
         LaunchMode::Contained { .. } => {
             eprintln!("{BOLD}Analemma-GVM \u{2014} Agent Containment (Layer 3){RESET}");

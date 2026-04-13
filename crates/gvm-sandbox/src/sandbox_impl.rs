@@ -4,7 +4,7 @@
 //! and seccomp application into a single launch sequence.
 
 use crate::capability::which_interpreter;
-use crate::ebpf::{self, EbpfAttachResult};
+use crate::tc_filter::{self, TcAttachResult};
 use crate::mount::setup_mount_namespace;
 use crate::namespace::{
     coordination_pipe, sandbox_clone_flags, signal_child_ready, wait_for_parent, write_uid_map,
@@ -214,24 +214,24 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     //      If TC filter is unavailable, iptables provides baseline enforcement and
     //      seccomp AF_NETLINK blocking prevents iptables modification (defense-in-depth).
     // RAII guard: dropping this detaches the TC filter. Kept alive for sandbox duration.
-    let _ebpf_guard = if network_result.is_ok() {
+    let _tc_guard = if network_result.is_ok() {
         let proxy_ip: std::net::Ipv4Addr = veth_config
             .host_ip
             .parse()
             .unwrap_or(std::net::Ipv4Addr::new(10, 200, 0, 1));
-        match ebpf::try_attach_tc_filter(
+        match tc_filter::try_attach_tc_filter(
             &veth_config.host_iface,
             proxy_ip,
             veth_config.proxy_addr.port(),
         ) {
-            EbpfAttachResult::Attached { interface, guard } => {
+            TcAttachResult::Attached { interface, guard } => {
                 tracing::info!(
                     interface = %interface,
                     "TC ingress filter ACTIVE — unbypassable proxy enforcement"
                 );
                 Some(guard)
             }
-            EbpfAttachResult::Unavailable { reason } => {
+            TcAttachResult::Unavailable { reason } => {
                 tracing::warn!(
                     reason = %reason,
                     "TC ingress filter unavailable — using iptables with seccomp defense-in-depth"
@@ -285,112 +285,6 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         setup_ms = setup_ms,
         "Sandbox setup complete, waiting for agent"
     );
-
-    // 3.5. TLS uprobe (experimental, observation-only — gated behind `uprobe` feature flag)
-    //
-    // The uprobe attaches to SSL_write_ex and captures plaintext before encryption.
-    // MITM (transparent TLS proxy on port 8443) is the primary HTTPS inspection mechanism.
-    // The uprobe is an optional defense-in-depth layer for environments where MITM is not
-    // available or as a secondary observation channel.
-    //
-    // Enable at compile time: cargo build --features uprobe
-    #[cfg(feature = "uprobe")]
-    let _tls_probe_handle = {
-        let child_raw = child_pid.as_raw() as u32;
-        let probe_mode = &config.tls_probe_mode;
-        let audit_only = matches!(probe_mode, crate::TlsProbeMode::Audit);
-        let disabled = matches!(probe_mode, crate::TlsProbeMode::Disabled);
-
-        if disabled {
-            tracing::debug!("TLS probe disabled by config");
-            None
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-
-            let policy_callback: crate::tls_probe::PolicyCheckFn = if let Some(ref proxy_url) =
-                config.proxy_url
-            {
-                let check_url = format!("{}/gvm/check", proxy_url.trim_end_matches('/'));
-                let agent = ureq::AgentBuilder::new()
-                    .timeout_connect(std::time::Duration::from_millis(50))
-                    .timeout_read(std::time::Duration::from_millis(50))
-                    .timeout_write(std::time::Duration::from_millis(50))
-                    .build();
-                Box::new(move |method: &str, host: &str, path: &str| {
-                    let body = serde_json::json!({
-                        "method": method,
-                        "target_host": host,
-                        "target_path": path,
-                        "operation": "uprobe",
-                    });
-                    match agent
-                        .post(&check_url)
-                        .set("Content-Type", "application/json")
-                        .set("X-GVM-Uprobe-Token", "internal")
-                        .send_string(&body.to_string())
-                    {
-                        Ok(resp) => {
-                            let text = resp.into_string().unwrap_or_default();
-                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                                let decision = json
-                                    .get("decision")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("Deny");
-                                match decision {
-                                    d if d.contains("Allow") => {
-                                        crate::tls_probe::PolicyDecision::Allow
-                                    }
-                                    d if d.contains("Delay") => {
-                                        let ms = json
-                                            .get("delay_ms")
-                                            .and_then(|v| v.as_u64())
-                                            .unwrap_or(300);
-                                        crate::tls_probe::PolicyDecision::Delay { milliseconds: ms }
-                                    }
-                                    _ => {
-                                        let reason = json
-                                            .get("next_action")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("blocked by policy")
-                                            .to_string();
-                                        crate::tls_probe::PolicyDecision::Deny { reason }
-                                    }
-                                }
-                            } else {
-                                crate::tls_probe::PolicyDecision::Deny {
-                                    reason: "uprobe: unparseable proxy response".into(),
-                                }
-                            }
-                        }
-                        Err(_e) => crate::tls_probe::PolicyDecision::Deny {
-                            reason: "uprobe: proxy unreachable — fail-closed".into(),
-                        },
-                    }
-                })
-            } else {
-                Box::new(|_method: &str, _host: &str, _path: &str| {
-                    crate::tls_probe::PolicyDecision::Allow
-                })
-            };
-
-            match crate::tls_probe::start_tls_probe_thread(child_raw, policy_callback, audit_only) {
-                Ok(handle) => {
-                    let mode = if audit_only { "audit" } else { "enforce" };
-                    tracing::info!(pid = child_raw, mode, "TLS uprobe started (experimental)");
-                    Some(handle)
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        pid = child_raw, error = %e,
-                        "TLS probe not available — MITM is primary HTTPS inspection"
-                    );
-                    None
-                }
-            }
-        }
-    };
-    #[cfg(not(feature = "uprobe"))]
-    let _tls_probe_handle: Option<()> = None;
 
     // 4. Wait for child to exit with timeout + termination signal awareness.
     //
@@ -629,7 +523,7 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     crate::mount::cleanup_workspace_overlay(my_pid);
     // Drop TC filter guard first — this detaches the filter via RAII Drop.
     // Must happen before cleanup_host_network which deletes the veth interface.
-    drop(_ebpf_guard);
+    drop(_tc_guard);
 
     if network_result.is_ok() {
         cleanup_host_network(&veth_config, dns_target.as_deref());

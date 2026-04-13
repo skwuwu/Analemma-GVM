@@ -51,13 +51,6 @@ pub struct SandboxConfig {
     pub agent_id: String,
     /// Optional seccomp profile override (None = default whitelist).
     pub seccomp_profile: Option<SeccompProfile>,
-    /// TLS probe mode: "enforce" (block denied requests), "audit" (log only), "disabled".
-    /// Default: "audit". Requires Linux 5.5+ and root/CAP_BPF.
-    pub tls_probe_mode: TlsProbeMode,
-    /// GVM proxy URL for uprobe policy enforcement (e.g., "http://127.0.0.1:8080").
-    /// When set, uprobe queries the proxy's /gvm/check endpoint for SRR decisions.
-    /// When None, uprobe uses allow-all (audit-only regardless of tls_probe_mode).
-    pub proxy_url: Option<String>,
     /// Memory limit for the sandboxed agent (bytes). None = no limit.
     /// Applied via cgroup v2 `memory.max`. Example: Some(512 * 1024 * 1024) = 512MB.
     pub memory_limit: Option<u64>,
@@ -176,20 +169,6 @@ impl Default for FilesystemPolicy {
     }
 }
 
-/// TLS probe operating mode.
-///
-/// Default: Disabled. The uprobe is experimental and gated behind the `uprobe` feature flag.
-/// MITM (transparent TLS proxy) is the primary HTTPS inspection mechanism.
-#[derive(Debug, Clone, Default)]
-pub enum TlsProbeMode {
-    /// Log HTTPS plaintext but don't block.
-    Audit,
-    /// Log and block denied HTTPS requests via SIGSTOP.
-    Enforce,
-    /// Disable TLS probing entirely (default).
-    #[default]
-    Disabled,
-}
 
 /// Seccomp profile selection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -312,7 +291,7 @@ mod capability;
 #[cfg(target_os = "linux")]
 mod cgroup;
 #[cfg(target_os = "linux")]
-pub mod ebpf;
+pub mod tc_filter;
 #[cfg(target_os = "linux")]
 mod mount;
 #[cfg(target_os = "linux")]
@@ -321,8 +300,6 @@ mod namespace;
 mod network;
 #[cfg(target_os = "linux")]
 mod seccomp;
-#[cfg(all(target_os = "linux", feature = "uprobe"))]
-pub mod tls_probe;
 
 #[cfg(target_os = "linux")]
 mod sandbox_impl;

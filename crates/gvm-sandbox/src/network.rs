@@ -1077,7 +1077,7 @@ fn cleanup_state_resources(state: &SandboxState) -> StateCleanupCounts {
         };
         // TC filter must be detached BEFORE veth deletion (cleanup_host_network
         // deletes the veth). Reversing this order makes detach a no-op.
-        crate::ebpf::detach_tc_filter(&state.veth_host);
+        crate::tc_filter::detach_tc_filter(&state.veth_host);
         cleanup_host_network(&veth_config, state.dns_target.as_deref());
         counts.veth = true;
         // Per-sandbox iptables chain GVM-{veth_host} + DNAT/MASQUERADE rules.
@@ -1290,7 +1290,7 @@ pub fn cleanup_all_orphans_report() -> Result<CleanupReport> {
                         slot: 0, // Legacy — slot not recorded, only used for cleanup
                     };
                     cleanup_host_network(&config, None);
-                    crate::ebpf::detach_tc_filter(host_iface);
+                    crate::tc_filter::detach_tc_filter(host_iface);
                     report.veth_interfaces += 1;
                     report.veth_names.push(host_iface.to_string());
                     report.iptables_chains += 1;

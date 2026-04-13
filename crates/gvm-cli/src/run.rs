@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 ///
 /// Three isolation levels:
 /// - Default (no flags): runs locally with HTTP_PROXY set to GVM proxy.
-/// - --sandbox: Linux-native isolation (namespaces + seccomp + veth + uprobe).
+/// - --sandbox: Linux-native isolation (namespaces + seccomp + veth + TC filter).
 /// - --contained: Docker-based isolation. Dev/CI or non-Linux platforms.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_agent(
@@ -283,7 +283,6 @@ pub(crate) fn assemble_sandbox_config(
     interpreter_args: Vec<String>,
     proxy_addr: std::net::SocketAddr,
     agent_id: &str,
-    proxy: &str,
     memory_limit: Option<u64>,
     cpu_limit: Option<f64>,
     mitm_ca_cert: Option<Vec<u8>>,
@@ -301,8 +300,6 @@ pub(crate) fn assemble_sandbox_config(
         proxy_addr,
         agent_id: agent_id.to_string(),
         seccomp_profile: None,
-        tls_probe_mode: gvm_sandbox::TlsProbeMode::Disabled,
-        proxy_url: Some(proxy.to_string()),
         memory_limit,
         cpu_limit,
         fs_policy: None, // Caller sets this via pipeline based on fs_governance flag

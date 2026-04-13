@@ -8,21 +8,18 @@
 
 ## Roadmap
 
-### Current (v1.0 MVP)
+### Current (v0.5.0)
 
-HTTP enforcement proxy (Rust/axum/tower) with 3-layer architecture (ABAC + SRR + API key isolation), IC classification (Allow/Delay/RequireApproval/Deny), Merkle tree audit ledger with WAL group commit, AES-256-GCM encrypted state cache, Wasm runtime (optional, behind `--features wasm`), rate limiter, JWT agent identity, TC ingress filter (kernel-level proxy enforcement), seccomp BPF sandbox with dual filter stacking. Python SDK (experimental) with `@ic` decorators, checkpoint/rollback with Merkle verification, LangChain integration. 329 tests (322 passing + 7 wasm-gated), 19 benchmarks.
+HTTP enforcement proxy (Rust/axum/tower) with 3-layer architecture (ABAC + SRR + API key isolation), IC classification (Allow/Delay/RequireApproval/Deny), Merkle tree audit ledger with WAL group commit, AES-256-GCM encrypted state cache, Wasm runtime (optional, behind `--features wasm`), rate limiter, JWT agent identity, TC ingress filter (kernel-level proxy enforcement), seccomp BPF sandbox with dual filter stacking, DNS soft governance (4-tier delay + alert), filesystem governance (overlayfs Trust-on-Pattern), IC-3 human approval workflow (admin port separation), MITM TLS proxy (sole HTTPS inspection mechanism — uprobe removed).
 
-v0.2 shipped: Shadow Mode + intent store, CONNECT tunnel, SRR hot-reload, eBPF uprobe TLS capture, transparent MITM (ephemeral CA, DNAT, per-domain leaf certs), `gvm run` binary mode, MCP integration, Telegram/Discord rulesets.
+**Release history**: v0.2 (Shadow Mode, CONNECT tunnel, SRR hot-reload, MITM), v0.3 (sandbox cleanup, overlayfs, seccomp audit), v0.4 (IC-3 approval, stress testing, contained mode), v0.5 (DNS governance, placeholder credentials, proxy hardening).
 
 ### Planned
 
-**v0.3**
-- Multi-PID uprobe (multi-process TLS capture)
-- Chunked transfer body reassembly
-- Anomaly detection (low-and-slow exfiltration)
+**v0.6**
+- Anomaly detection (low-and-slow exfiltration — cumulative volume tracking)
 - WebSocket proxy support
 - Overlayfs periodic scan (long-running agents): tokio timer → scan_upper_layer() at interval
-- `gvm fs` CLI: `approve`, `reject`, `diff`, `list` for staged ManualCommit files
 - Overlayfs inotify-based real-time scan (event-driven alternative to periodic)
 
 **v1.1 — Hardening**
@@ -84,6 +81,16 @@ Full reachability assessment of all 20 RUSTSEC advisories in audit.toml. This au
 - RUSTSEC-2024-0436 (paste): transitive only, not in default dep tree.
 
 **When to re-audit**: Only when (a) `cargo audit` reports a NEW RUSTSEC not in audit.toml, or (b) Cargo.toml dependencies change (new crate added, version bumped). Do not re-review existing entries — their reachability status is stable.
+
+---
+
+### 2026-04-14: uprobe removal + ebpf.rs → tc_filter.rs rename
+
+**What**: Removed the experimental uprobe-based TLS interception feature (SSL_write_ex hooking) and its `--features uprobe` compile flag. MITM (transparent TLS proxy) is the sole HTTPS inspection mechanism. Renamed `ebpf.rs` → `tc_filter.rs` with types: `EbpfAttachResult` → `TcAttachResult`, `EbpfGuard` → `TcFilterGuard`, `check_ebpf_support` → `check_tc_support`. Removed `TlsProbeMode` and `proxy_url` from `SandboxConfig`. Removed `ureq` dependency (only used by uprobe). Updated all docs: security-model.md "Planned v0.3" uprobe sections removed, CHANGELOG roadmap updated to v0.5.0, linux-e2e-test.md uprobe tests marked deprecated, test-report.md uprobe entries struck through.
+
+**Why**: uprobe was never on the default build path (`#[cfg(feature = "uprobe")]`, disabled by default). MITM provides complete L7 HTTPS inspection. The uprobe code was dead weight — experimental, observation-only, and its three planned extensions (Multi-PID, Chunked reassembly, Low-and-slow) were stale since v0.3. The `ebpf.rs` filename was misleading (uses tc u32 classifiers, not eBPF bytecode).
+
+Files: `crates/gvm-sandbox/src/{tls_probe.rs (deleted), ebpf.rs→tc_filter.rs, lib.rs, sandbox_impl.rs, capability.rs, network.rs}`, `crates/gvm-sandbox/{Cargo.toml, tests/security.rs}`, `crates/gvm-cli/src/{run.rs, pipeline.rs, preflight.rs, status.rs}`, `docs/{security-model.md, reference.md, test-report.md, internal/CHANGELOG.md, internal/GVM_CODE_STANDARDS.md, internal/linux-e2e-test.md}` | Risk: Low (uprobe was never in default build; TC filter is rename-only with preserved behavior)
 
 ---
 
@@ -577,7 +584,7 @@ Files: `crates/gvm-sandbox/src/{mount,sandbox_impl}.rs`, `crates/gvm-cli/src/{ma
 
 ### 2026-04-03: Security audit fixes + naming correction
 
-**eBPF → TC filter naming**: Renamed all user-facing references from "eBPF TC filter" to "TC ingress filter". The implementation uses `tc u32` classifiers, not eBPF bytecode — the old naming misrepresented the enforcement mechanism. `PreflightReport.ebpf_available` → `tc_filter_available`. File `ebpf.rs` retained to avoid import chain breakage; header comment explains the naming.
+**eBPF → TC filter naming**: Renamed all user-facing references from "eBPF TC filter" to "TC ingress filter". The implementation uses `tc u32` classifiers, not eBPF bytecode — the old naming misrepresented the enforcement mechanism. `PreflightReport.ebpf_available` → `tc_filter_available`. File renamed from `ebpf.rs` → `tc_filter.rs` in v0.5.0; types renamed: `EbpfAttachResult` → `TcAttachResult`, `EbpfGuard` → `TcFilterGuard`, `check_ebpf_support` → `check_tc_support`.
 
 **Cgroup OOM group kill** (`cgroup.rs`): Added `memory.oom.group = 1` when memory limits are configured. Without this, OOM killer selects individual processes — forked agent children could survive and escape governance. With group kill, the entire cgroup is terminated atomically.
 

@@ -159,13 +159,12 @@ fn gather_sandbox_checks() -> SandboxCapabilities {
             proxy_addr: "127.0.0.1:8080".parse().unwrap(),
             agent_id: "preflight".to_string(),
             seccomp_profile: None,
-            tls_probe_mode: gvm_sandbox::TlsProbeMode::Disabled,
-            proxy_url: None,
             memory_limit: None,
             cpu_limit: None,
             fs_policy: None,
             mitm_ca_cert: None,
             sandbox_profile: gvm_sandbox::SandboxProfile::default(),
+            extra_env: vec![],
         };
 
         let report = gvm_sandbox::preflight_check(&dummy_config);

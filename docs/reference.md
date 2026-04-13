@@ -300,7 +300,7 @@ When the argument after `--` is not a recognized script file (`.py`, `.js`, `.ts
 
 Binary mode provides **Layer 2 enforcement only** (SRR URL-based rules). No SDK headers are injected, so ABAC policy evaluation is not available. All audit output goes to stderr to keep stdout clean for piping.
 
-With `--sandbox`, binary mode uses Linux-native isolation (namespaces + seccomp + veth + uprobe) — the same security layers as script sandbox mode.
+With `--sandbox`, binary mode uses Linux-native isolation (namespaces + seccomp + veth + TC filter) — the same security layers as script sandbox mode.
 
 ---
 
@@ -383,23 +383,6 @@ Configuration fields for `gvm run --sandbox` (Linux-native isolation). Defined i
 | `proxy_addr` | `SocketAddr` | GVM proxy address for the veth network route |
 | `agent_id` | `String` | Agent ID injected as environment variable |
 | `seccomp_profile` | `Option<SeccompProfile>` | Seccomp profile override (None = default whitelist) |
-| `tls_probe_mode` | `TlsProbeMode` | TLS probe mode: `Audit` (default), `Enforce`, `Disabled` |
-| `proxy_url` | `Option<String>` | Proxy URL for uprobe `/gvm/check` queries (None = allow-all) |
-
-### `tls_probe_mode`
-
-Controls uprobe-based TLS plaintext inspection inside the sandbox. Requires Linux 5.5+ and root/CAP_BPF.
-
-| Mode | Behavior |
-|------|----------|
-| `Audit` | Log HTTPS plaintext but do not block (default, safe for v0.1) |
-| `Enforce` | Log and block denied HTTPS requests via SIGSTOP |
-| `Disabled` | Disable TLS probing entirely |
-
-### `proxy_url`
-
-When set (e.g., `"http://127.0.0.1:8080"`), the uprobe queries the proxy's `/gvm/check` endpoint for SRR decisions on observed TLS connections. When `None`, uprobe uses allow-all mode (audit-only regardless of `tls_probe_mode`).
-
 ---
 
 ## Platform Support

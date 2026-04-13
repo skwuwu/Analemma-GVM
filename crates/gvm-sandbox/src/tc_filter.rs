@@ -1,8 +1,7 @@
 //! TC ingress filter for unbypassable proxy enforcement.
 //!
-//! Historically named `ebpf.rs` — the implementation uses **tc u32 classifiers**,
-//! not actual eBPF bytecode. No BPF verifier, clang/LLVM, or bpf() syscall involved.
-//! File retained as `ebpf.rs` to avoid breaking the import chain across the crate.
+//! Uses **tc u32 classifiers** — not eBPF bytecode. No BPF verifier, clang/LLVM,
+//! or bpf() syscall involved.
 //!
 //! Attaches a TC (Traffic Control) u32 classifier to the HOST-side veth interface.
 //! This filter runs in the host's network namespace, completely outside the
@@ -43,14 +42,14 @@ const MIN_KERNEL_MAJOR: u32 = 4;
 const MIN_KERNEL_MINOR: u32 = 15;
 
 /// Result of TC filter attachment attempt.
-pub enum EbpfAttachResult {
+pub enum TcAttachResult {
     /// TC filter attached successfully. Holds a guard that detaches on drop.
     /// Caller must keep the guard alive for the sandbox duration and drop it on cleanup.
     Attached {
         /// Interface name the filter is attached to.
         interface: String,
         /// RAII guard — dropping this detaches the TC filter.
-        guard: EbpfGuard,
+        guard: TcFilterGuard,
     },
     /// TC filter is unavailable; system should use iptables fallback.
     Unavailable {
@@ -60,18 +59,18 @@ pub enum EbpfAttachResult {
 }
 
 /// TC filter guard that detaches the filter on drop.
-pub struct EbpfGuard {
+pub struct TcFilterGuard {
     interface: String,
 }
 
-impl Drop for EbpfGuard {
+impl Drop for TcFilterGuard {
     fn drop(&mut self) {
         detach_tc_filter(&self.interface);
     }
 }
 
 /// Check if the current system supports TC clsact filters.
-pub fn check_ebpf_support() -> Result<(), String> {
+pub fn check_tc_support() -> Result<(), String> {
     // 1. Check kernel version
     let (major, minor) =
         kernel_version().map_err(|e| format!("Cannot read kernel version: {}", e))?;
@@ -102,8 +101,8 @@ pub fn check_ebpf_support() -> Result<(), String> {
 /// 1. Add a clsact qdisc to the interface
 /// 2. Attach u32 match rules as an ingress filter (ingress = traffic FROM sandbox)
 ///
-/// Returns an EbpfGuard that removes the filter on drop.
-pub fn attach_tc_filter(interface: &str, proxy_ip: Ipv4Addr, proxy_port: u16) -> Result<EbpfGuard> {
+/// Returns an TcFilterGuard that removes the filter on drop.
+pub fn attach_tc_filter(interface: &str, proxy_ip: Ipv4Addr, proxy_port: u16) -> Result<TcFilterGuard> {
     // 1. Add clsact qdisc (multi-attach qdisc for ingress/egress classification)
     let output = Command::new("tc")
         .args(["qdisc", "add", "dev", interface, "clsact"])
@@ -226,7 +225,7 @@ pub fn attach_tc_filter(interface: &str, proxy_ip: Ipv4Addr, proxy_port: u16) ->
         "TC ingress filter attached (unbypassable proxy enforcement)"
     );
 
-    Ok(EbpfGuard {
+    Ok(TcFilterGuard {
         interface: interface.to_string(),
     })
 }
@@ -236,10 +235,10 @@ pub fn try_attach_tc_filter(
     interface: &str,
     proxy_ip: Ipv4Addr,
     proxy_port: u16,
-) -> EbpfAttachResult {
+) -> TcAttachResult {
     // Pre-check environment
-    if let Err(reason) = check_ebpf_support() {
-        return EbpfAttachResult::Unavailable { reason };
+    if let Err(reason) = check_tc_support() {
+        return TcAttachResult::Unavailable { reason };
     }
 
     match attach_tc_filter(interface, proxy_ip, proxy_port) {
@@ -247,12 +246,12 @@ pub fn try_attach_tc_filter(
             // Return the guard to the caller — caller must keep it alive for the
             // sandbox duration. Dropping the guard detaches the TC filter.
             // Previously used mem::forget (unsafe, leak-prone); now RAII-managed.
-            EbpfAttachResult::Attached {
+            TcAttachResult::Attached {
                 interface: interface.to_string(),
                 guard,
             }
         }
-        Err(e) => EbpfAttachResult::Unavailable {
+        Err(e) => TcAttachResult::Unavailable {
             reason: format!("TC filter attachment failed: {}", e),
         },
     }
@@ -335,9 +334,9 @@ mod tests {
     }
 
     #[test]
-    fn ebpf_support_check_does_not_panic() {
+    fn tc_support_check_does_not_panic() {
         // This should never panic, just return Ok or Err
-        let _ = check_ebpf_support();
+        let _ = check_tc_support();
     }
 
     #[test]
@@ -345,16 +344,16 @@ mod tests {
         // Verify enum variants compile correctly.
         // Guard's Drop calls detach_tc_filter("test0") which harmlessly fails
         // on nonexistent interface (tc command returns error, silently ignored).
-        let attached = EbpfAttachResult::Attached {
+        let attached = TcAttachResult::Attached {
             interface: "test0".to_string(),
-            guard: EbpfGuard {
+            guard: TcFilterGuard {
                 interface: "test0".to_string(),
             },
         };
-        let unavailable = EbpfAttachResult::Unavailable {
+        let unavailable = TcAttachResult::Unavailable {
             reason: "test".to_string(),
         };
-        assert!(matches!(attached, EbpfAttachResult::Attached { .. }));
-        assert!(matches!(unavailable, EbpfAttachResult::Unavailable { .. }));
+        assert!(matches!(attached, TcAttachResult::Attached { .. }));
+        assert!(matches!(unavailable, TcAttachResult::Unavailable { .. }));
     }
 }

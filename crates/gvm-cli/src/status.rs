@@ -353,12 +353,11 @@ fn dummy_sandbox_config() -> gvm_sandbox::SandboxConfig {
         proxy_addr: "127.0.0.1:8080".parse().unwrap(),
         agent_id: "status-probe".to_string(),
         seccomp_profile: None,
-        tls_probe_mode: gvm_sandbox::TlsProbeMode::Disabled,
-        proxy_url: None,
         memory_limit: None,
         cpu_limit: None,
         fs_policy: None,
         mitm_ca_cert: None,
         sandbox_profile: gvm_sandbox::SandboxProfile::Standard,
+        extra_env: vec![],
     }
 }

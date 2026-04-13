@@ -96,13 +96,12 @@ fn preflight_report_non_linux_has_tc_filter_false() {
             proxy_addr: "127.0.0.1:8080".parse().unwrap(),
             agent_id: "test-agent".to_string(),
             seccomp_profile: None,
-            tls_probe_mode: TlsProbeMode::Disabled,
-            proxy_url: None,
             memory_limit: None,
             cpu_limit: None,
             fs_policy: None,
             mitm_ca_cert: None,
             sandbox_profile: gvm_sandbox::SandboxProfile::default(),
+            extra_env: vec![],
         };
         let report = preflight_check(&config);
         assert!(
@@ -124,13 +123,12 @@ fn sandbox_config_clone() {
         proxy_addr: "10.200.0.1:8080".parse().unwrap(),
         agent_id: "agent-001".to_string(),
         seccomp_profile: Some(SeccompProfile::Default),
-        tls_probe_mode: TlsProbeMode::Disabled,
-        proxy_url: None,
         memory_limit: None,
         cpu_limit: None,
         fs_policy: None,
         mitm_ca_cert: None,
         sandbox_profile: gvm_sandbox::SandboxProfile::Standard,
+        extra_env: vec![],
     };
 
     let cloned = config.clone();
@@ -138,27 +136,27 @@ fn sandbox_config_clone() {
     assert_eq!(cloned.proxy_addr, config.proxy_addr);
 }
 
-// ─── TC filter module tests (historically named ebpf.rs, uses tc u32 classifier) ───
+// ─── TC filter module tests (tc u32 classifier) ───
 
 #[cfg(target_os = "linux")]
-mod ebpf_tests {
-    use gvm_sandbox::ebpf::*;
+mod tc_filter_tests {
+    use gvm_sandbox::tc_filter::*;
 
     #[test]
-    fn ebpf_support_check_does_not_panic() {
+    fn tc_support_check_does_not_panic() {
         // Must never panic, just return Ok/Err
-        let _ = check_ebpf_support();
+        let _ = check_tc_support();
     }
 
     #[test]
-    fn ebpf_attach_result_unavailable_variant() {
-        // EbpfAttachResult::Attached requires an EbpfGuard which can only be
+    fn tc_attach_result_unavailable_variant() {
+        // TcAttachResult::Attached requires a TcFilterGuard which can only be
         // created by actually attaching to a real interface. We test the
         // Unavailable variant and verify try_attach on a fake interface.
-        let unavailable = EbpfAttachResult::Unavailable {
+        let unavailable = TcAttachResult::Unavailable {
             reason: "kernel too old".to_string(),
         };
-        assert!(matches!(unavailable, EbpfAttachResult::Unavailable { .. }));
+        assert!(matches!(unavailable, TcAttachResult::Unavailable { .. }));
     }
 
     #[test]
@@ -172,14 +170,14 @@ mod ebpf_tests {
         // Either Unavailable (no TC filter support) or the attach will fail
         // Either way, it must NOT panic
         match result {
-            EbpfAttachResult::Attached { .. } => {
+            TcAttachResult::Attached { .. } => {
                 detach_tc_filter("nonexistent-iface-12345");
                 panic!(
                     "TC filter attached to non-existent interface — this should never happen \
                      and indicates a bug in the TC filter attachment logic"
                 );
             }
-            EbpfAttachResult::Unavailable { reason } => {
+            TcAttachResult::Unavailable { reason } => {
                 assert!(!reason.is_empty(), "Unavailable reason must not be empty");
             }
         }
@@ -235,13 +233,12 @@ fn launch_on_non_linux_returns_error() {
         proxy_addr: "127.0.0.1:8080".parse().unwrap(),
         agent_id: "test".to_string(),
         seccomp_profile: None,
-        tls_probe_mode: TlsProbeMode::Disabled,
-        proxy_url: None,
         memory_limit: None,
         cpu_limit: None,
         fs_policy: None,
         mitm_ca_cert: None,
         sandbox_profile: gvm_sandbox::SandboxProfile::Standard,
+        extra_env: vec![],
     };
 
     let result = launch_sandboxed(config);

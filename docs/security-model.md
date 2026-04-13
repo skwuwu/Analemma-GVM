@@ -645,57 +645,26 @@ Fuzz targets (`fuzz/fuzz_targets/`):
 
 ---
 
-### Non-Standard TLS Implementations (Known Limitation)
+### TLS Inspection (MITM-Only, uprobe Deprecated)
 
-**Limitation**: The uprobe targets `SSL_write_ex` in the system's `libssl.so` (OpenSSL). Some runtimes use alternative TLS implementations:
+As of v0.5.0, the experimental uprobe-based TLS interception (SSL_write_ex hooking) has been removed. MITM (transparent TLS proxy) is the sole HTTPS inspection mechanism.
 
-| Runtime | TLS Library | Uprobe Coverage |
-|---------|------------|-----------------|
-| Python (requests, urllib3) | System libssl.so (dynamic) | Covered |
-| Node.js | OpenSSL (static linked) | Covered (symbol in binary) |
-| Go | crypto/tls (custom, no libssl) | Partial (symbol search) |
-| Rust (reqwest) | rustls or native-tls | Detected but not yet integrated |
-| BoringSSL | Custom libssl fork | Not covered |
+**HTTPS enforcement layers**:
+- **L4 (proxy CONNECT tunnel)**: Domain-level enforcement — all agents, all TLS libraries.
+- **L7 (MITM TLS proxy)**: Full request inspection (method, path, headers, body) — requires CA trust injection.
+- **TC ingress filter**: Kernel-level u32 classifier on host-side veth ensures all sandbox traffic routes through the proxy. Unbypassable by the agent.
 
-**Impact**: Agents using BoringSSL or custom TLS stacks bypass uprobe plaintext capture. They are still governed by the proxy CONNECT tunnel (domain-level enforcement) and iptables (network isolation).
-
-**Mitigation**: Document in README: "Agents using non-OpenSSL TLS (BoringSSL, custom stacks) are protected at L4 (proxy CONNECT) only, not L7 (uprobe path inspection)."
+**Known limitation**: Agents that bypass HTTP_PROXY environment variables and use hardcoded DNS can reach external hosts only if they also bypass the TC filter + iptables DNAT chain. In sandbox mode, this is prevented by the network namespace + TC filter combination.
 
 ---
 
-### Low-and-Slow Data Exfiltration (Planned v0.3)
+### Low-and-Slow Data Exfiltration (Known Limitation)
 
 **Attack**: An agent exfiltrates data by sending 1KB per request across 1,000 requests to an allowed endpoint, staying under any per-request size threshold. Each individual request appears normal.
 
 **Impact**: SRR evaluates each request independently. Without cumulative tracking, the aggregate exfiltration is invisible to policy enforcement.
 
-**Planned mitigation (v0.3)**: Anomaly detection layer that tracks per-agent cumulative data volume, request frequency, and destination diversity over sliding windows. Flags unusual patterns (e.g., 500 POST requests to the same endpoint in 10 minutes) for review or automatic throttling.
-
-**Current defense**: WAL records all events. Post-hoc forensic analysis via `gvm audit list` can detect the pattern. Real-time prevention requires the anomaly detection layer.
-
----
-
-### Chunked Transfer Body Reassembly (Planned v0.3)
-
-**Limitation**: The uprobe captures each `SSL_write_ex` call individually. HTTP headers (method+path+host) are in the first write and always captured. However, if request body data is sent across multiple SSL_write calls (chunked transfer encoding), the uprobe does not reassemble them into a complete body for pattern matching.
-
-**Impact**: An agent could split sensitive data (API keys, PII) across multiple SSL_write calls to avoid per-write pattern detection. Each individual chunk may not contain a recognizable pattern.
-
-**Current defense**: The proxy CONNECT tunnel enforces domain-level policy (the primary gate). SRR `payload_match` works on bodies passed to `/gvm/check` in non-tunnel mode. The uprobe captures the HTTP request line (method+path) which is sufficient for path-level enforcement.
-
-**Planned mitigation (v0.3)**: Uprobe event aggregator that buffers SSL_write events per TID within a configurable window (e.g., 100ms), reassembles the HTTP request, and runs SRR payload inspection on the complete body.
-
----
-
-### Multi-PID Uprobe (Planned v0.3)
-
-**Limitation**: The current TLS uprobe attaches to a single PID (the sandbox child process). If the agent spawns sub-processes (e.g., Node.js agent calls a Python MCP tool), the child processes load separate libssl.so instances. Their SSL_write_ex calls are not captured.
-
-**Impact**: In multi-runtime scenarios (Node.js + Python in one session), only the main process's HTTPS traffic is monitored by uprobe. Sub-process traffic is still governed by the proxy CONNECT tunnel (domain-level enforcement) but not by path-level uprobe inspection.
-
-**Planned mitigation (v0.3)**: Scan `/proc/*/maps` for all processes that load libssl.so within the sandbox PID namespace. Auto-attach uprobe to each discovered TLS library. Re-scan periodically or on `fork()`/`exec()` detection via proc connector.
-
-**Current coverage**: The gateway process's uprobe covers the core traffic (LLM API calls), which is the primary enforcement target.
+**Current defense**: WAL records all events. Post-hoc forensic analysis via `gvm audit list` can detect the pattern. Real-time anomaly detection (per-agent cumulative volume tracking, destination diversity scoring) is not yet implemented.
 
 ---
 
@@ -789,8 +758,8 @@ Use `--no-mitm` to disable MITM and fall back to CONNECT relay (domain-level onl
 
 | Limitation | Impact | Mitigation |
 |-----------|--------|------------|
-| **Batch scan only** | File changes are scanned at session end, not during execution | Long-running agents may produce files that aren't visible until exit. Periodic scan planned for v0.3 |
+| **Batch scan only** | File changes are scanned at session end, not during execution | Long-running agents may produce files that aren't visible until exit. Periodic inotify-based scan is a future consideration |
 | **tmpfs volatility** | Upper layer lives in tmpfs — lost if sandbox crashes before scan | SIGTERM handler ensures scan+merge on graceful termination. SIGKILL = files lost. Staging fallback planned |
-| **No real-time governance** | Files are classified post-hoc, not at write time | inotify-based scan planned for v0.3. Current model is analogous to git commit review |
+| **No real-time governance** | Files are classified post-hoc, not at write time | Current model is analogous to git commit review. inotify-based real-time scan is a future consideration |
 | **Modified files never auto-merged** | Any modification to existing workspace files requires manual approval | By design — prevents agent from silently altering host files. Use ManualCommit review prompt |
 | **Deletions not executed** | Agent cannot delete host files through overlayfs | By design — whiteouts classified as ManualCommit. Future `--allow-delete` opt-in |

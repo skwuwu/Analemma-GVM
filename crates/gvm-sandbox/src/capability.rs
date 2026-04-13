@@ -78,7 +78,7 @@ pub fn check(config: &SandboxConfig) -> PreflightReport {
         );
     }
 
-    let tc_filter_available = crate::ebpf::check_ebpf_support().is_ok();
+    let tc_filter_available = crate::tc_filter::check_tc_support().is_ok();
     if !tc_filter_available {
         issues.push(
             "TC ingress filter unavailable — falling back to iptables \

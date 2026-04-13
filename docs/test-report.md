@@ -645,8 +645,8 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 
 | Benchmark | Result | Description |
 |-----------|--------|-------------|
-| `ebpf_kernel/tc_attach_detach_cycle` | **10.7 ms** | clsact qdisc add + tc filter rules + qdisc del |
-| `ebpf_kernel/tc_attach_only` | **5.2 ms** | clsact qdisc + tc filter rules (setup cost) |
+| `tc_filter/tc_attach_detach_cycle` | **10.7 ms** | clsact qdisc add + tc filter rules + qdisc del |
+| `tc_filter/tc_attach_only` | **5.2 ms** | clsact qdisc + tc filter rules (setup cost) |
 
 **Note**: One-time sandbox setup costs, not per-packet overhead. TC filtering runs entirely in kernel space.
 
@@ -672,7 +672,7 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 | **Decision Correctness** | [hostile:5-6](tests/hostile.rs), [edge:10-11](tests/edge_cases.rs), [boundary:6,14](tests/boundary.rs) |
 | **Wasm Isolation** | [boundary:1-7](tests/boundary.rs), [wasm_engine](src/wasm_engine.rs) (4) |
 | **Encryption Integrity** | [vault](src/vault.rs) (7), [boundary:21-23,26](tests/boundary.rs) |
-| **uprobe TLS Capture** | tls_probe tests (10), EC2 tests 4, 8, 21, 30b |
+| **~~uprobe TLS Capture~~** | ~~tls_probe tests (10), EC2 tests 4, 8, 21, 30b~~ (removed in v0.5.0 — MITM is sole HTTPS inspection) |
 | **CONNECT Tunnel** | EC2 tests 3, 11, 24 |
 | **Shadow Mode** | EC2 tests 7 (intent verification) |
 | **SRR Hot-Reload** | EC2 tests 10, 15 |
@@ -716,7 +716,7 @@ cargo bench --bench pipeline -- "wal"               # WAL benchmarks only
 cargo bench --bench pipeline -- "rate_limiter/"     # Rate limiter only
 cargo bench --bench pipeline -- "vault_contention"  # Vault p99 tail latency
 cargo bench --bench pipeline -- "wasm_cold_start"   # Wasm module cold start
-cargo bench --bench pipeline -- "ebpf_kernel"       # TC ingress filter setup (Linux only)
+cargo bench --bench pipeline -- "tc_filter"          # TC ingress filter setup (Linux only)
 ```
 
 ---
@@ -731,11 +731,11 @@ cargo bench --bench pipeline -- "ebpf_kernel"       # TC ingress filter setup (L
 | 1 | Native Build | cargo build on Linux |
 | 2 | Proxy Health | Start + /gvm/health |
 | 3 | CONNECT Tunnel | Real HTTPS to GitHub + Anthropic |
-| 4 | uprobe Capture | SSL_write_ex plaintext |
+| 4 | ~~uprobe Capture~~ | ~~SSL_write_ex plaintext~~ (removed v0.5.0) |
 | 5 | SRR Policy (7) | Allow/Delay/Deny accuracy |
 | 6 | MCP Integration (8) | gvm_status, policy_check, fetch, rulesets, audit |
 | 7 | OpenClaw Agent | LLM call through proxy |
-| 8 | uprobe Enforcement | SIGSTOP + fail-closed |
+| 8 | ~~uprobe Enforcement~~ | ~~SIGSTOP + fail-closed~~ (removed v0.5.0) |
 | 9 | Long-Running | 200 requests, memory stable |
 | 10 | Hot-Reload | Delay→Allow + zero loss |
 | 11 | Concurrent CONNECT | 10 parallel tunnels |
@@ -748,7 +748,7 @@ cargo bench --bench pipeline -- "ebpf_kernel"       # TC ingress filter setup (L
 | 18 | Multi-Session (20) | 20 concurrent decisions correct |
 | 19 | Proxy Crash | kill -9 → fail-closed |
 | 20 | Proxy Hang | SIGSTOP → timeout → Deny |
-| 21 | Trace Pipe Stress | 10 uprobe events, 0 lost |
+| 21 | ~~Trace Pipe Stress~~ | ~~10 uprobe events, 0 lost~~ (removed v0.5.0) |
 | 22 | Restart Recovery | WAL preserved + rules re-loaded |
 | 23 | Auth Session | login→refresh→write→deny flow |
 | 24 | Real Allow/Deny | Actual HTTP 200 through proxy |
@@ -757,7 +757,7 @@ cargo bench --bench pipeline -- "ebpf_kernel"       # TC ingress filter setup (L
 | 27 | GitHub MCP Server | npx MCP through proxy |
 | 28 | Kill Chain | read→summarize→exfil blocked |
 | 29 | All-Service Matrix | GitHub/Slack/Discord/Gmail/Telegram/Brave/Tavily (22) |
-| 30 | gog Proxy Bypass | uprobe catches direct HTTPS |
+| 30 | ~~gog Proxy Bypass~~ | ~~uprobe catches direct HTTPS~~ (removed v0.5.0 — TC filter + MITM cover this) |
 | 31 | Telegram API | Bot API Allow/Delay/Deny + real getMe |
 | 32 | Multi-Service Workflow | OpenClaw + multi-service policy |
 | 33 | gvm run Binary | curl/python3/openclaw via gvm run |
