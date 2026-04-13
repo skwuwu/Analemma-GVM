@@ -442,4 +442,74 @@ mod tests {
             "No headers should be added for unknown host"
         );
     }
+
+    #[test]
+    fn placeholder_env_vars_for_known_hosts() {
+        let mut creds = HashMap::new();
+        creds.insert(
+            "api.stripe.com".to_string(),
+            Credential::Bearer {
+                token: "sk_live_real_secret".to_string(),
+            },
+        );
+        creds.insert(
+            "api.slack.com".to_string(),
+            Credential::Bearer {
+                token: "xoxb-real-slack-token".to_string(),
+            },
+        );
+        creds.insert(
+            "api.custom-service.io".to_string(),
+            Credential::ApiKey {
+                header: "x-api-key".to_string(),
+                value: "real-custom-key".to_string(),
+            },
+        );
+
+        let store = APIKeyStore::from_map(creds);
+        let env_vars = store.placeholder_env_vars();
+
+        // Should have 3 env vars
+        assert_eq!(env_vars.len(), 3);
+
+        // Find each by env var name
+        let stripe = env_vars.iter().find(|(k, _)| k == "STRIPE_API_KEY");
+        let slack = env_vars.iter().find(|(k, _)| k == "SLACK_BOT_TOKEN");
+        let custom = env_vars.iter().find(|(k, _)| k.contains("CUSTOM"));
+
+        // Stripe: correct prefix, NOT the real key
+        let (_, stripe_val) = stripe.expect("STRIPE_API_KEY should exist");
+        assert!(
+            stripe_val.starts_with("sk_test_gvm"),
+            "Stripe placeholder should have sk_test prefix: {}",
+            stripe_val
+        );
+        assert!(
+            !stripe_val.contains("real_secret"),
+            "Placeholder must NOT contain the real key"
+        );
+
+        // Slack: correct prefix
+        let (_, slack_val) = slack.expect("SLACK_BOT_TOKEN should exist");
+        assert!(
+            slack_val.starts_with("xoxb-gvm"),
+            "Slack placeholder should have xoxb- prefix: {}",
+            slack_val
+        );
+
+        // Custom: generic pattern
+        let (key, val) = custom.expect("Custom service env var should exist");
+        assert!(key.ends_with("_API_KEY"), "Generic key: {}", key);
+        assert!(
+            val.contains("placeholder"),
+            "Generic value should contain 'placeholder': {}",
+            val
+        );
+    }
+
+    #[test]
+    fn placeholder_env_vars_empty_store() {
+        let store = APIKeyStore::from_map(HashMap::new());
+        assert!(store.placeholder_env_vars().is_empty());
+    }
 }
