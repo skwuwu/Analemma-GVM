@@ -103,7 +103,8 @@ Use cooperative mode for agents you trust or wrote yourself (Python `requests`, 
 - Sandbox startup: ~928ms one-time (comparable to `docker run`)
 - Policy evaluation < 1μs (SRR + ABAC, Criterion benchmark)
 - WAL with Merkle chain, size-based rotation (100MB x 10 segments). Local storage — bring your own retention (S3, GCS, etc)
-- 329 tests, 60-min chaos stress test (proxy kill, network partition, disk pressure) — [PASS](docs/test-report.md#910-chaos-stress-test-60-minutes)
+- 329 tests, 30-min chaos stress test (proxy kill, network partition, disk pressure) — [PASS](docs/test-report.md#hermes-agent-validation-2026-04-15-ec2-t3medium)
+- Tested with [OpenClaw](https://github.com/openclaw/openclaw) and [hermes-agent](https://github.com/NousResearch/hermes-agent) — GVM is framework-independent; any agent that makes HTTP calls is governed
 - seccomp-BPF with ~130 whitelisted syscalls, ENOSYS default for unknown
 - All data stays local. No telemetry, no phone-home.
 

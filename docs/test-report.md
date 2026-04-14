@@ -1015,20 +1015,24 @@ Full pipeline verified with hermes in sandbox MITM mode:
 
 Before rules: all requests hit Default-to-Caution (300ms delay). After rules: all Allow. Pipeline works identically to OpenClaw.
 
-#### Stress Test (5 minutes, sandbox + chaos)
+#### Stress Test (30 minutes, sandbox + chaos)
 
 **VERDICT: PASS**
 
 | Metric | Value |
 |--------|-------|
-| Duration | 310s (>= 240s minimum) |
-| Prompts completed | 11 |
-| LLM calls via proxy | 881 |
-| WAL events (new) | 142 |
+| Duration | 1480s (24.7min, >= 24min minimum) |
+| Prompts completed | 51/51 (all prompts exhausted) |
+| LLM calls via proxy | 3,786 |
+| WAL events (new) | 976 |
 | Connection errors | 0 |
+| CLI checkpoints | 11/11 PASS |
 | Kernel panic | 0 |
 | Orphan veth | 0 |
 | WAL integrity | PASS |
+| Proxy kill recovery | PASS (auto-restart) |
+| Disk pressure | PASS (inject + release) |
+| Network partition | PASS (5s delay + 20% loss, inject + release) |
 
 #### Key Findings
 
