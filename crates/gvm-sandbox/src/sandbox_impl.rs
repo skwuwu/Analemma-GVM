@@ -908,7 +908,9 @@ fn rewrite_shebang_if_needed(bin_path: &str, original_args: &[String]) -> (Strin
                         std::path::Path::new(shebang.split_whitespace().next().unwrap_or(shebang)),
                         shebang,
                     );
-                    let mut args = vec![remapped.clone(), bin_path.to_string()];
+                    // Return: exec_bin = remapped interpreter,
+                    // args = [script_path, ...original_args] (no exec_bin — caller prepends argv[0])
+                    let mut args = vec![bin_path.to_string()];
                     args.extend(original_args.iter().cloned());
                     return (remapped, args);
                 }
