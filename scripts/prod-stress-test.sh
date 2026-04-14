@@ -94,8 +94,8 @@ run_prompt() {
                 2>&1
             ;;
         hermes)
-            timeout 120 "$GVM_BIN" run \
-                -- uv run --project "$HOME/hermes-agent" hermes chat \
+            timeout 120 "$GVM_BIN" run --sandbox \
+                -- "$HOME/hermes-agent/.venv/bin/hermes" chat \
                 -q "$prompt" \
                 --provider anthropic \
                 -m "anthropic/claude-sonnet-4-20250514" \
