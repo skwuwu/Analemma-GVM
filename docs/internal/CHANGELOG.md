@@ -52,6 +52,21 @@ HTTP enforcement proxy (Rust/axum/tower) with 3-layer architecture (ABAC + SRR +
 
 ## Implementation Log
 
+### 2026-04-15: hermes-agent validation + sandbox path remapping
+
+**What changed:**
+1. `sandbox_impl.rs` — Added `remap_path_for_sandbox()` to translate `/home/<user>/` → `/home/agent/` for execv binary paths. Sandbox overlays home directory but previously passed host-absolute paths to execv → "exec failed" for any venv-installed agent.
+2. `sandbox_impl.rs` — Added `rewrite_shebang_if_needed()` to detect venv shebangs with host home paths and rewrite execv to invoke the remapped interpreter directly, bypassing kernel shebang resolution.
+3. `prod-stress-test.sh` — Refactored to CLI-only user workflow pattern. Removed internal script generation (heredoc run-stress.sh), gateway lifecycle management, and agent internals. Each prompt is now a separate `gvm run --sandbox -- <agent> <prompt>` invocation. Added `--agent openclaw|hermes` flag.
+
+**Why:** hermes-agent (Python/LiteLLM) installed via `uv` uses venv with shebangs pointing to `/home/ubuntu/.venv/bin/python`. Sandbox remaps home to `/home/agent/` but execv received the host path. This blocked any venv-installed agent from running in sandbox mode. The stress test script was also generating internal scripts and managing agent internals instead of reproducing real user CLI commands.
+
+**Affected files:** `crates/gvm-sandbox/src/sandbox_impl.rs`, `scripts/prod-stress-test.sh`
+
+**Risk:** Low. Path remapping only activates for `/home/` prefixes. System binaries (`/usr/bin/python3`, `/bin/bash`) pass through unchanged. Shebang rewrite only triggers when shebang references a home directory — system shebangs (e.g., `#!/usr/bin/env python3`) are unaffected.
+
+**Verification:** hermes-agent E2E 444 PASS / 0 FAIL, watch→suggest→govern pipeline PASS, sandbox+chaos stress 5min PASS (11 prompts, 881 LLM calls, 142 WAL events).
+
 ### 2026-04-13: Fix proxy crash-recovery + prod-stress false PASS
 
 **What changed:**

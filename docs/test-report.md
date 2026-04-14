@@ -1,6 +1,6 @@
 # Test & Benchmark Report
 
-**Last Verified: 2026-04-11**
+**Last Verified: 2026-04-15**
 
 > Test count grows with each feature. Run `cargo test` to verify current count.
 
@@ -16,6 +16,7 @@
 | **Ghost stress** | 9 verification checks | Autonomous agent + 5 attack tools | Per-release on EC2 |
 | **Benchmarks** | 19 functions (Criterion) | Latency, throughput, tail latency | On demand |
 | **Fuzzing** | 6 targets (libFuzzer) | Crash resistance, coverage growth | Daily CI (Mon-Sat 5min, Sun 30min) |
+| **Multi-agent validation** | 2 frameworks (OpenClaw, hermes-agent) | Framework-independent governance | Per-release on EC2 |
 
 ## Document Structure
 
@@ -765,6 +766,15 @@ cargo bench --bench pipeline -- "tc_filter"          # TC ingress filter setup (
 
 ---
 
+### E2E Results by Agent Framework
+
+The E2E suite is framework-independent (Tests 1–6, 8–84 test proxy, SRR, WAL, MITM, sandbox, DNS — no agent framework involved). Test 7 is OpenClaw-specific and skipped for other frameworks.
+
+| Agent | PASS | FAIL | SKIP | Date | Notes |
+|-------|------|------|------|------|-------|
+| (framework-independent) | 214 | 0 | 29 | 2026-04-13 | `--skip-openclaw` |
+| hermes-agent | 444 | 0 | 58 | 2026-04-15 | `--skip-openclaw`, full suite |
+
 ## B.3 DNS Governance E2E (Test 83 + 84, 2026-04-11, EC2 t3.medium)
 
 **Script**: [`scripts/ec2-e2e-test.sh`](../scripts/ec2-e2e-test.sh) Tests 83–84.
@@ -967,6 +977,65 @@ This validates the discovery-to-enforcement pipeline: operator observes agent tr
 | 13 | Load kernel module | No file + cap dropped | CAP_SYS_MODULE removed |
 | 14 | /proc/1/root access | Permission denied | hidepid=2 + PID namespace |
 | 15 | DNS exfiltration | ENOSYS | seccomp + DNS DNAT |
+
+### hermes-agent Validation (2026-04-15, EC2 t3.medium)
+
+**Agent**: [hermes-agent](https://github.com/NousResearch/hermes-agent) v0.9.0 (Nous Research)
+**Stack**: Python 3.12 + LiteLLM + httpx → Anthropic API
+**Install**: `uv pip install --link-mode copy .` (non-editable, required for sandbox overlayfs compatibility)
+
+hermes-agent is a Python-based AI agent framework, architecturally different from OpenClaw (Node.js). Testing hermes validates that GVM governance is framework-independent: any agent that makes HTTPS calls through the proxy is governed identically.
+
+#### Sandbox Path Remapping
+
+GVM sandbox overlays `/home/<user>/` → `/home/agent/`. Python venv shebangs (e.g., `#!/home/ubuntu/.venv/bin/python`) contain hardcoded host paths that break after `pivot_root`. Two fixes were required:
+
+- `remap_path_for_sandbox()`: translates `/home/<user>/X` → `/home/agent/X` for `execv` binary paths
+- `rewrite_shebang_if_needed()`: reads script shebang post-pivot_root, detects home-directory interpreter, rewrites `execv` to invoke the remapped interpreter with the script as argument
+
+These fixes are generic — they enable any venv-installed agent to work in sandbox mode without wrapper scripts or PYTHONPATH hacks.
+
+#### Mode Verification
+
+| Mode | Command | Result |
+|------|---------|--------|
+| Cooperative | `gvm run -- hermes chat -q "Say hello"` | **PASS** — CONNECT tunnel, proxy.log records |
+| Sandbox | `gvm run --sandbox -- ~/.venv/bin/hermes chat -q "Say hello"` | **PASS** — 4 MITM events, L7 inspection |
+| Watch | `gvm run --watch --output json --sandbox -- hermes chat ...` | **PASS** — 4 JSONL events |
+| Suggest | `gvm suggest --from session.jsonl --decision allow` | **PASS** — 2 rules generated |
+| Govern | `gvm run --sandbox` with suggested rules applied | **PASS** — 2 allowed, 0 delayed |
+
+#### Watch → Suggest → Govern Pipeline
+
+Full pipeline verified with hermes in sandbox MITM mode:
+
+1. **Watch**: `gvm run --watch --output json --sandbox` → 4 WAL events captured (GET raw.githubusercontent.com, POST api.anthropic.com)
+2. **Suggest**: `gvm suggest --from session.jsonl --decision allow` → 2 SRR rules generated
+3. **Govern**: `gvm run --sandbox` with rules applied → 2 allowed, 0 delayed, 0 blocked
+
+Before rules: all requests hit Default-to-Caution (300ms delay). After rules: all Allow. Pipeline works identically to OpenClaw.
+
+#### Stress Test (5 minutes, sandbox + chaos)
+
+**VERDICT: PASS**
+
+| Metric | Value |
+|--------|-------|
+| Duration | 310s (>= 240s minimum) |
+| Prompts completed | 11 |
+| LLM calls via proxy | 881 |
+| WAL events (new) | 142 |
+| Connection errors | 0 |
+| Kernel panic | 0 |
+| Orphan veth | 0 |
+| WAL integrity | PASS |
+
+#### Key Findings
+
+- **httpx respects HTTP_PROXY/HTTPS_PROXY**: LiteLLM uses httpx for Anthropic API calls. All traffic routed through GVM proxy without configuration.
+- **CA trust works**: `SSL_CERT_FILE=/etc/ssl/certs/gvm-ca.crt` (injected by sandbox) is recognized by httpx via Python's `ssl` module. No certificate errors.
+- **`--link-mode copy` required**: `uv sync` default uses hardlinks, which break across overlayfs filesystem boundaries. `uv pip install --link-mode copy .` creates real copies that survive the overlay mount.
+- **Non-editable install required for sandbox**: Editable installs write host-absolute paths into `__editable__` finder Python files. Sandbox path remapping doesn't cover these Python-internal paths. Non-editable install copies all modules into site-packages.
 
 ### Chaos Stress Test (30 minutes, 2026-04-05)
 
