@@ -87,7 +87,7 @@ run_prompt() {
     local idx="$2"
     case "$AGENT_TYPE" in
         openclaw)
-            timeout 120 "$GVM_BIN" run \
+            timeout 120 "$GVM_BIN" run --sandbox \
                 -- openclaw agent --local \
                 --session-id "stress-$idx" \
                 --message "$prompt" \
