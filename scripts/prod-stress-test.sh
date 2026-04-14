@@ -2,18 +2,20 @@
 # ═══════════════════════════════════════════════════════════════════
 # Analemma GVM — Production Stress Test
 #
-# CLI-only: all GVM interactions use `gvm` commands exclusively.
-# No tmux, nsenter, pkill, sudo env, or internal API calls.
-# Proxy startup, environment setup, CA management are automatic.
+# Reproduces real user workflows: runs agent prompts through GVM
+# exactly as a user would from the CLI, then checks results via
+# gvm commands. No internal script generation, no agent internals.
 #
-# Structure:
-#   Foreground: gvm run --sandbox (gateway + agent prompt loop)
-#   Background: health checks + chaos injection + CLI checkpoints
+# What this script does (and nothing more):
+#   1. Runs `gvm run -- <agent> <prompt>` for each prompt (foreground)
+#   2. Runs `gvm status`, `gvm events`, `gvm audit` to verify (CLI)
+#   3. Injects external chaos: kill proxy, disk pressure, tc netem
+#   4. Evaluates proxy.log + WAL at the end
 #
 # Usage:
-#   sudo bash scripts/prod-stress-test.sh                 # 30 min
-#   sudo bash scripts/prod-stress-test.sh --duration 15   # 15 min
-#   sudo bash scripts/prod-stress-test.sh --no-chaos      # no chaos
+#   sudo bash scripts/prod-stress-test.sh --agent hermes --duration 5
+#   sudo bash scripts/prod-stress-test.sh --agent openclaw --duration 15
+#   sudo bash scripts/prod-stress-test.sh --agent hermes --no-chaos
 # ═══════════════════════════════════════════════════════════════════
 
 set -o pipefail
@@ -27,6 +29,7 @@ CHAOS_DISK_MIN=15
 CHAOS_DISK_RELEASE_MIN=17
 CHAOS_NETWORK_MIN=20
 CHAOS_NETWORK_RESTORE_MIN=22
+AGENT_TYPE="openclaw"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
@@ -42,8 +45,8 @@ HEALTH_LOG="$RESULTS_DIR/health.log"
 CHAOS_LOG="$RESULTS_DIR/chaos.log"
 CHECKPOINT_LOG="$RESULTS_DIR/checkpoints.csv"
 SUMMARY="$RESULTS_DIR/summary.txt"
+AGENT_LOG="$RESULTS_DIR/agent.log"
 WAL="$REPO_DIR/data/wal.log"
-SANDBOX_LOG="$RESULTS_DIR/sandbox.log"
 PROMPT_FILE="$SCRIPT_DIR/stress-workloads/telegram-prompts.txt"
 
 BOLD='\033[1m'; GREEN='\033[0;32m'; RED='\033[0;31m'
@@ -53,25 +56,74 @@ CHAOS_KILL_DONE=false; CHAOS_NETWORK_DONE=false; CHAOS_DISK_DONE=false
 CHAOS_DISK_RELEASED=false; CHAOS_NETWORK_RESTORED=false
 DISK_PRESSURE_TMPFS=""
 HOTRELOAD_DONE=false
-SANDBOX_PID=""
+MONITOR_PID=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --duration) DURATION_MIN="$2"; shift 2 ;;
         --no-chaos) CHAOS_ENABLED=false; shift ;;
+        --agent) AGENT_TYPE="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 DURATION_SEC=$((DURATION_MIN * 60))
+
+# ── Agent command builder ──
+# Returns the exact command a user would type to send one prompt.
+agent_cmd() {
+    local prompt="$1"
+    case "$AGENT_TYPE" in
+        openclaw)
+            echo "openclaw agent --local --session-id stress --message"
+            ;;
+        hermes)
+            echo "uv run --project $HOME/hermes-agent hermes chat -q"
+            ;;
+    esac
+}
+
+run_prompt() {
+    local prompt="$1"
+    local idx="$2"
+    case "$AGENT_TYPE" in
+        openclaw)
+            timeout 120 "$GVM_BIN" run \
+                -- openclaw agent --local \
+                --session-id "stress-$idx" \
+                --message "$prompt" \
+                2>&1
+            ;;
+        hermes)
+            timeout 120 "$GVM_BIN" run \
+                -- uv run --project "$HOME/hermes-agent" hermes chat \
+                -q "$prompt" \
+                --provider anthropic \
+                -m "anthropic/claude-sonnet-4-20250514" \
+                --max-turns 1 \
+                2>&1
+            ;;
+    esac
+}
 
 # ── Prereqs ──
 check_prereqs() {
     local fail=false
     [ ! -f "$GVM_BIN" ] && echo -e "${RED}CLI not built: $GVM_BIN${NC}" && fail=true
     [ ! -f "$PROMPT_FILE" ] && echo -e "${RED}Prompt file: $PROMPT_FILE${NC}" && fail=true
-    command -v openclaw >/dev/null 2>&1 || {
-        echo -e "${RED}OpenClaw not found${NC}"; fail=true
-    }
+    case "$AGENT_TYPE" in
+        openclaw)
+            command -v openclaw >/dev/null 2>&1 || {
+                echo -e "${RED}OpenClaw not found${NC}"; fail=true
+            } ;;
+        hermes)
+            command -v uv >/dev/null 2>&1 || {
+                echo -e "${RED}uv not found (needed for hermes-agent)${NC}"; fail=true
+            }
+            [ ! -d "$HOME/hermes-agent" ] && {
+                echo -e "${RED}hermes-agent not found at ~/hermes-agent${NC}"; fail=true
+            } ;;
+        *) echo -e "${RED}Unknown agent: $AGENT_TYPE (use openclaw or hermes)${NC}"; fail=true ;;
+    esac
     [ "$(id -u)" -ne 0 ] && echo -e "${RED}Must run as root (sudo)${NC}" && fail=true
     $fail && exit 1
 }
@@ -100,7 +152,6 @@ run_checkpoint() {
 
 # ── Health Check (CLI only) ──
 check_health() {
-    # 1. gvm status
     local status_out
     status_out=$("$GVM_BIN" status --proxy "$PROXY_URL" 2>&1) || true
     if echo "$status_out" | grep -q "not reachable"; then
@@ -109,35 +160,20 @@ check_health() {
         log_health "OK: proxy healthy"
     fi
 
-    # 2. Kernel panic
     local kp
     kp=$(dmesg --time-format iso 2>/dev/null | tail -50 | grep -ciE "kernel panic|BUG:|Oops:" || echo "0")
     [ "$kp" -gt 0 ] 2>/dev/null && log_health "CRITICAL: kernel panic ($kp)"
 
-    # 3. Sandbox process
-    if [ -n "$SANDBOX_PID" ] && kill -0 "$SANDBOX_PID" 2>/dev/null; then
-        log_health "sandbox: alive (PID $SANDBOX_PID)"
-    else
-        log_health "ALERT: sandbox process dead"
-    fi
-
-    # 4. WAL size
     local ws
     ws=$(stat -c%s "$WAL" 2>/dev/null || echo "0")
     log_health "WAL: ${ws} bytes"
 
-    # 5. Prompt progress (from sandbox log)
     local pc
-    pc=$(grep -c "^PROMPT #" "$SANDBOX_LOG" 2>/dev/null || echo "0")
+    pc=$(grep -c "^PROMPT #" "$AGENT_LOG" 2>/dev/null || echo "0")
     log_health "prompts_completed: $pc"
-
-    # 6. Connection errors
-    local ce
-    ce=$(grep -c "Connection error\|Network request failed" "$SANDBOX_LOG" 2>/dev/null || echo "0")
-    log_health "connection_errors: $ce"
 }
 
-# ── Chaos (external fault injection — not GVM CLI) ──
+# ── Chaos ──
 chaos_log() {
     local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     echo "[$ts] $1" >> "$CHAOS_LOG"
@@ -150,8 +186,7 @@ chaos_proxy_kill() {
     chaos_log "INJECT: kill -9 proxy (PID $pid)"
     kill -9 "$pid" 2>/dev/null || true
     sleep 5
-    # proxy_manager in the sandbox will auto-restart on next request
-    chaos_log "Proxy killed. proxy_manager will restart automatically."
+    chaos_log "Proxy killed. Next gvm run will auto-restart."
     run_checkpoint "post_kill_status" "$GVM_BIN" status --proxy "$PROXY_URL" || true
 }
 
@@ -193,7 +228,6 @@ chaos_disk_release() {
 
 # ── Background Monitor ──
 monitor_loop() {
-    local check_count=0
     while true; do
         local now elapsed_sec elapsed_min
         now=$(date +%s)
@@ -202,9 +236,8 @@ monitor_loop() {
         [ $elapsed_sec -ge $DURATION_SEC ] && break
 
         check_health
-        check_count=$((check_count + 1))
 
-        # Chaos
+        # Chaos injection at scheduled times
         if $CHAOS_ENABLED; then
             [ $elapsed_min -ge $CHAOS_KILL_MIN ] && ! $CHAOS_KILL_DONE && { CHAOS_KILL_DONE=true; chaos_proxy_kill; }
             [ $elapsed_min -ge $CHAOS_DISK_MIN ] && ! $CHAOS_DISK_DONE && { CHAOS_DISK_DONE=true; chaos_disk_pressure; }
@@ -227,7 +260,6 @@ monitor_loop() {
         # Hot-reload (T+8m)
         if [ $elapsed_min -ge 8 ] && [ "$HOTRELOAD_DONE" = "false" ]; then
             HOTRELOAD_DONE=true
-            # SRR is first-match — insert BEFORE catch-all so specific rule wins
             log_health "HOT-RELOAD: inserting httpbin.org Delay at top of SRR"
             sed -i '1i\
 # Hot-reload test rule (inserted by stress test)\
@@ -242,7 +274,7 @@ label = "prod-stress-hotreload"\
             local co
             co=$("$GVM_BIN" check --host httpbin.org --method GET --operation test --proxy "$PROXY_URL" 2>&1) || true
             if echo "$co" | grep -qi "Delay"; then
-                log_health "HOT-RELOAD VERIFY: PASS (httpbin.org → Delay)"
+                log_health "HOT-RELOAD VERIFY: PASS (httpbin.org -> Delay)"
                 echo "hotreload_verify|0|$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$CHECKPOINT_LOG"
             else
                 log_health "HOT-RELOAD VERIFY: FAIL (expected Delay)"
@@ -299,34 +331,24 @@ evaluate_results() {
     wal_new=$(( wal_total - WAL_BASELINE ))
     echo "wal_events: $wal_new (new during this run)" >> "$SUMMARY"
 
-    # 5. Agent activity (LLM calls through MITM)
+    # 5. Agent activity (LLM calls through proxy)
     local ac
     ac=$(grep -c "anthropic\|openrouter" "$REPO_DIR/data/proxy.log" 2>/dev/null || echo "0")
     echo "llm_calls: $ac" >> "$SUMMARY"
-    [ "$ac" -gt 0 ] && echo "PASS: LLM calls via MITM ($ac)" >> "$SUMMARY" || { echo "FAIL: no LLM calls" >> "$SUMMARY"; pass=false; }
+    [ "$ac" -gt 0 ] && echo "PASS: LLM calls via proxy ($ac)" >> "$SUMMARY" || { echo "FAIL: no LLM calls" >> "$SUMMARY"; pass=false; }
 
-    # 6. Prompts completed (must be > 0 to prove the agent actually ran)
+    # 6. Prompts completed
     local pc
-    pc=$(grep -c "^PROMPT #" "$SANDBOX_LOG" 2>/dev/null || echo "0")
+    pc=$(grep -c "^PROMPT #" "$AGENT_LOG" 2>/dev/null || echo "0")
     echo "prompts_completed: $pc" >> "$SUMMARY"
     [ "$pc" -gt 0 ] && echo "PASS: prompts completed ($pc)" >> "$SUMMARY" || { echo "FAIL: zero prompts completed" >> "$SUMMARY"; pass=false; }
 
     # 7. Connection errors
     local ce
-    ce=$(grep -c "Connection error\|Network request failed" "$SANDBOX_LOG" 2>/dev/null || echo "0")
+    ce=$(grep -c "Connection error\|Network request failed" "$AGENT_LOG" 2>/dev/null || echo "0")
     echo "connection_errors: $ce" >> "$SUMMARY"
 
-    # 8. TLS errors
-    local te
-    te=$(grep -c "tls handshake" "$REPO_DIR/data/proxy.log" 2>/dev/null || echo "0")
-    echo "tls_errors: $te" >> "$SUMMARY"
-
-    # 9. MITM traffic
-    local mt
-    mt=$(grep -c "MITM: inspecting" "$REPO_DIR/data/proxy.log" 2>/dev/null || echo "0")
-    echo "mitm_inspected: $mt" >> "$SUMMARY"
-
-    # 10. CLI checkpoints
+    # 8. CLI checkpoints
     local ct cp
     ct=$(awk -F'|' 'NR>1' "$CHECKPOINT_LOG" 2>/dev/null | wc -l || echo "0")
     cp=$(awk -F'|' 'NR>1 && $2==0' "$CHECKPOINT_LOG" 2>/dev/null | wc -l || echo "0")
@@ -344,10 +366,6 @@ evaluate_results() {
 cleanup() {
     echo -e "\n${BOLD}Cleaning up...${NC}"
 
-    # Kill sandbox if still running
-    [ -n "$SANDBOX_PID" ] && kill "$SANDBOX_PID" 2>/dev/null || true
-
-    # Kill monitor
     [ -n "$MONITOR_PID" ] && kill "$MONITOR_PID" 2>/dev/null || true
 
     # Restore chaos
@@ -357,52 +375,11 @@ cleanup() {
     # Restore SRR config
     [ -f "$RESULTS_DIR/srr_network.toml.backup" ] && cp "$RESULTS_DIR/srr_network.toml.backup" "$REPO_DIR/config/srr_network.toml"
 
-    # GVM cleanup (orphan veth, mounts)
     "$GVM_BIN" cleanup 2>/dev/null || true
 
     echo -e "${GREEN}Cleanup done${NC}"
 }
 trap cleanup EXIT
-
-# ── Prepare workspace with prompt loop script ──
-prepare_workspace() {
-    local ws_dir="$REPO_DIR/workspace-stress"
-    mkdir -p "$ws_dir"
-    cp "$PROMPT_FILE" "$ws_dir/prompts.txt"
-
-    cat > "$ws_dir/run-stress.sh" << 'INNER'
-#!/bin/bash
-OC_MJS="/usr/lib/node_modules/openclaw/openclaw.mjs"
-
-# Start gateway in background (Telegram polling + WebSocket server)
-node "$OC_MJS" gateway run &
-GW_PID=$!
-echo "Gateway PID=$GW_PID"
-sleep 30
-
-# Run agent prompts via embedded mode (--local).
-# Each prompt makes LLM calls through HTTP_PROXY → GVM MITM proxy.
-# Gateway runs alongside for Telegram polling (concurrent proxy load).
-IDX=0
-while IFS= read -r prompt; do
-    [ -z "$prompt" ] && continue
-    IDX=$((IDX + 1))
-    echo "PROMPT #$IDX: ${prompt:0:60}..."
-    timeout 120 node "$OC_MJS" agent --local \
-        --session-id "stress-$IDX" \
-        --message "$prompt" \
-        2>&1 || echo "PROMPT #$IDX: error (exit $?)"
-    sleep 5
-done < /workspace/prompts.txt
-
-echo "All prompts done. Stopping gateway..."
-kill $GW_PID 2>/dev/null
-wait $GW_PID 2>/dev/null
-echo "STRESS COMPLETE"
-INNER
-    chmod +x "$ws_dir/run-stress.sh"
-    echo "$ws_dir"
-}
 
 # ═══════════════════════════════════════
 # Main
@@ -417,7 +394,7 @@ echo "name|exit_code|timestamp" > "$CHECKPOINT_LOG"
 # Backup SRR config (hot-reload appends rules)
 cp "$REPO_DIR/config/srr_network.toml" "$RESULTS_DIR/srr_network.toml.backup"
 
-# Clear stale data from previous runs so evaluation doesn't count old events
+# Clear stale data from previous runs
 : > "$REPO_DIR/data/proxy.log"
 WAL_BASELINE=$(wc -l < "$WAL" 2>/dev/null || echo "0")
 
@@ -426,75 +403,58 @@ cat > "$SUMMARY" << EOF
 start_time=$START_TIME
 duration_min=$DURATION_MIN
 chaos=$CHAOS_ENABLED
-mode=sandbox-gateway-embedded
+agent=$AGENT_TYPE
 EOF
 
-echo -e "${BOLD}${CYAN}═══ GVM Stress Test ═══${NC}"
+echo -e "${BOLD}${CYAN}=== GVM Stress Test ===${NC}"
+echo -e "  Agent:       $AGENT_TYPE"
 echo -e "  Duration:    ${DURATION_MIN}m"
 echo -e "  Chaos:       $CHAOS_ENABLED"
 echo -e "  Prompts:     $(wc -l < "$PROMPT_FILE") prompts"
 echo -e "  Results:     $RESULTS_DIR"
 echo ""
 
-# Prepare workspace
-WS_DIR=$(prepare_workspace)
-
-# Start sandbox in background (gvm run handles everything:
-#   proxy startup, CA management, namespace setup, env vars)
-# CWD must be workspace-stress/ so it becomes /workspace in the sandbox.
-# GVM_WORKSPACE tells the proxy where to find config/ (repo root).
-echo -e "  ${CYAN}Starting sandbox...${NC}"
-cd "$WS_DIR"
-GVM_WORKSPACE="$REPO_DIR" "$GVM_BIN" run --sandbox \
-    --sandbox-timeout "$((DURATION_SEC + 300))" \
-    -- bash /workspace/run-stress.sh \
-    > "$SANDBOX_LOG" 2>&1 &
-SANDBOX_PID=$!
-echo -e "  ${GREEN}Sandbox started (PID $SANDBOX_PID)${NC}"
-
-# Wait for gateway initialization
-echo -e "  ${DIM}Waiting for gateway init (40s)...${NC}"
-sleep 40
-
-# Start monitor in background
-echo -e "\n${BOLD}Monitoring (health every ${HEALTH_INTERVAL}s, chaos $CHAOS_ENABLED)...${NC}\n"
+# Start background monitor (health checks + chaos + CLI checkpoints)
 monitor_loop &
 MONITOR_PID=$!
 
-# Wait for sandbox — but enforce minimum duration.
-# If sandbox dies early, detect it immediately and FAIL instead of silently
-# evaluating stale data from a previous run.
-SANDBOX_DIED_EARLY=false
-while true; do
+# ── Foreground: run prompts through GVM exactly as a user would ──
+# Each prompt is a separate `gvm run -- <agent> <prompt>` invocation.
+# This is the same command a user types in a terminal.
+cd "$REPO_DIR"
+IDX=0
+while IFS= read -r prompt; do
+    [ -z "$prompt" ] && continue
+
+    # Time check — stop sending prompts after duration expires
     elapsed=$(( $(date +%s) - START_TIME ))
-    if [ "$elapsed" -ge "$DURATION_SEC" ]; then
-        # Duration reached — kill sandbox if still running
-        if kill -0 "$SANDBOX_PID" 2>/dev/null; then
-            echo -e "\n  ${DIM}Duration reached (${DURATION_MIN}m). Stopping sandbox...${NC}"
-            kill "$SANDBOX_PID" 2>/dev/null || true
-            wait "$SANDBOX_PID" 2>/dev/null || true
-        fi
+    [ "$elapsed" -ge "$DURATION_SEC" ] && {
+        echo -e "  ${DIM}Duration reached. Stopping prompt loop.${NC}"
         break
+    }
+
+    IDX=$((IDX + 1))
+    echo -e "  ${CYAN}PROMPT #$IDX${NC}: ${prompt:0:60}..."
+
+    # Run the agent command through GVM — identical to user CLI usage
+    run_prompt "$prompt" "$IDX" >> "$AGENT_LOG" 2>&1
+    rc=$?
+
+    if [ $rc -eq 0 ]; then
+        echo "PROMPT #$IDX: OK" >> "$AGENT_LOG"
+    else
+        echo "PROMPT #$IDX: error (exit $rc)" >> "$AGENT_LOG"
     fi
-    if ! kill -0 "$SANDBOX_PID" 2>/dev/null; then
-        wait "$SANDBOX_PID" 2>/dev/null || true
-        SANDBOX_EXIT=$?
-        remaining=$(( DURATION_SEC - elapsed ))
-        echo -e "\n  ${RED}Sandbox died at +${elapsed}s (${remaining}s remaining, exit=$SANDBOX_EXIT)${NC}"
-        SANDBOX_DIED_EARLY=true
-        break
-    fi
+
     sleep 5
-done
-if ! $SANDBOX_DIED_EARLY; then
-    wait "$SANDBOX_PID" 2>/dev/null || true
-    SANDBOX_EXIT=$?
-fi
-echo -e "\n  ${DIM}Sandbox exited with code $SANDBOX_EXIT${NC}"
+done < "$PROMPT_FILE"
+
+echo -e "\n  ${DIM}Prompt loop finished ($IDX prompts sent)${NC}"
 
 # Stop monitor
 kill "$MONITOR_PID" 2>/dev/null || true
 wait "$MONITOR_PID" 2>/dev/null || true
+MONITOR_PID=""
 
 # Evaluate
 evaluate_results
