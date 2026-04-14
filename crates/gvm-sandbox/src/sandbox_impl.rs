@@ -638,13 +638,13 @@ fn child_entry(
         config.proxy_addr.port()
     );
 
-    // Build exec arguments
-    let interpreter_name = interpreter_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(&config.interpreter);
-
-    let bin_path = format!("/bin/{}", interpreter_name);
+    // Build exec arguments.
+    // Remap host paths to sandbox paths. The sandbox overlay mounts the
+    // user's home directory under /home/agent, so host paths like
+    // /home/ubuntu/hermes-agent/.venv/bin/hermes must become
+    // /home/agent/hermes-agent/.venv/bin/hermes.
+    // System binaries (in /usr, /bin, /sbin) keep their original paths.
+    let bin_path = remap_path_for_sandbox(interpreter_path, &config.interpreter);
 
     // Set environment and exec
     std::env::set_var("HTTP_PROXY", &proxy_url);
@@ -705,21 +705,27 @@ fn child_entry(
         );
     }
 
+    // Shebang rewriting: if bin_path points to a script whose shebang
+    // references a home-directory interpreter (e.g., #!/home/ubuntu/.venv/bin/python),
+    // the kernel will fail to exec it because sandbox remapped /home/ubuntu → /home/agent.
+    // Detect this and invoke the remapped interpreter directly with the script as arg.
+    let (exec_bin, exec_args) = rewrite_shebang_if_needed(&bin_path, &config.interpreter_args);
+
     // Build argv: [interpreter, ...args]
     // Validate before fork — CString::new fails only on embedded NUL bytes.
     // After fork() we cannot use Rust runtime, so all allocations must happen here.
-    let c_bin = match std::ffi::CString::new(bin_path.clone()) {
+    let c_bin = match std::ffi::CString::new(exec_bin.clone()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
                 "gvm-sandbox: interpreter path contains NUL byte: {} ({})",
-                bin_path, e
+                exec_bin, e
             );
             return 126; // "command not found" convention
         }
     };
     let mut c_args: Vec<std::ffi::CString> = vec![c_bin.clone()];
-    for arg in &config.interpreter_args {
+    for arg in &exec_args {
         match std::ffi::CString::new(arg.as_str()) {
             Ok(c) => c_args.push(c),
             Err(e) => {
@@ -845,6 +851,74 @@ fn child_entry(
 /// lower=$HOME + blocklist masking .ssh/.aws/.gnupg). Within that boundary,
 /// the agent has full read access. Write access is controlled by overlayfs
 /// (writes go to tmpfs upper layer, host is unmodified).
+/// Remap a host binary path to its sandbox-internal equivalent.
+///
+/// The sandbox overlay remounts the user's home directory under `/home/agent`.
+/// Host paths like `/home/ubuntu/hermes-agent/.venv/bin/hermes` must become
+/// `/home/agent/hermes-agent/.venv/bin/hermes` for execv to find them.
+///
+/// System paths (`/usr/bin/python3`, `/bin/bash`) are already correct and
+/// pass through unchanged. If the binary is a bare name (`python3`), fall
+/// back to `/bin/{name}` for backward compatibility with script-mode
+/// interpreter resolution.
+fn remap_path_for_sandbox(host_path: &std::path::Path, interpreter_name: &str) -> String {
+    let path_str = host_path.to_str().unwrap_or(interpreter_name);
+
+    // Detect home directory prefix: /home/<username>/...
+    // The sandbox always mounts the user's home under /home/agent.
+    if path_str.starts_with("/home/") {
+        // /home/ubuntu/X → /home/agent/X
+        // Find the second slash after /home/ to skip the username component.
+        if let Some(rest) = path_str
+            .strip_prefix("/home/")
+            .and_then(|s| s.find('/').map(|i| &s[i..]))
+        {
+            return format!("/home/agent{}", rest);
+        }
+    }
+
+    // System paths (/usr/bin/python3, /bin/bash, /usr/local/bin/uv) — keep as-is.
+    if path_str.starts_with('/') {
+        return path_str.to_string();
+    }
+
+    // Bare interpreter name (e.g., "python3") — legacy fallback.
+    format!("/bin/{}", interpreter_name)
+}
+
+/// If `bin_path` is a script with a shebang that points into a home directory,
+/// rewrite it so the sandbox can find the interpreter. Returns the actual
+/// binary to exec and the full argument list.
+///
+/// Example: bin_path = `/home/agent/hermes-agent/.venv/bin/hermes`
+///   shebang: `#!/home/ubuntu/hermes-agent/.venv/bin/python`
+///   → exec_bin = `/home/agent/hermes-agent/.venv/bin/python`
+///   → args = [exec_bin, bin_path, ...original_args]
+fn rewrite_shebang_if_needed(bin_path: &str, original_args: &[String]) -> (String, Vec<String>) {
+    // Try reading the first line to check for shebang.
+    // This happens before fork, so Rust I/O is safe.
+    if let Ok(content) = std::fs::read(bin_path) {
+        if content.starts_with(b"#!") {
+            if let Some(newline_pos) = content.iter().position(|&b| b == b'\n') {
+                let shebang = String::from_utf8_lossy(&content[2..newline_pos]);
+                let shebang = shebang.trim();
+                // Check if shebang points to a home directory path
+                if shebang.starts_with("/home/") && !shebang.starts_with("/home/agent/") {
+                    let remapped = remap_path_for_sandbox(
+                        std::path::Path::new(shebang.split_whitespace().next().unwrap_or(shebang)),
+                        shebang,
+                    );
+                    let mut args = vec![remapped.clone(), bin_path.to_string()];
+                    args.extend(original_args.iter().cloned());
+                    return (remapped, args);
+                }
+            }
+        }
+    }
+    // Not a script or shebang doesn't need rewriting — exec bin_path directly.
+    (bin_path.to_string(), original_args.to_vec())
+}
+
 fn drop_all_capabilities() -> anyhow::Result<()> {
     // Capabilities to KEEP for filesystem access inside sandbox.
     // These allow root to bypass DAC permission checks (read/traverse).
