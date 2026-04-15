@@ -311,7 +311,7 @@ enum Commands {
     /// Dry-run policy check without calling external APIs.
     ///
     /// Tests what decision the proxy would make for a given request
-    /// without actually sending it. Shows decision path (ABAC + SRR → final).
+    /// without actually sending it. Shows decision path (SRR → final).
     ///
     ///   gvm check --operation gvm.payment.charge --host api.bank.com
     ///   gvm check --operation test --host api.github.com --method GET --path /repos/foo/bar
@@ -324,7 +324,7 @@ enum Commands {
         #[arg(long)]
         operation: String,
 
-        /// Agent ID for ABAC policy evaluation (test agent-specific policies)
+        /// Agent ID for governance evaluation
         #[arg(long, default_value = "dry-run")]
         agent_id: String,
 
@@ -361,7 +361,7 @@ enum Commands {
         json: bool,
     },
 
-    /// Hot-reload SRR rules and ABAC policies from disk.
+    /// Hot-reload SRR rules and registry from disk.
     ///
     /// After editing config/srr_network.toml or config/policies/,
     /// run this command to apply changes without restarting the proxy.

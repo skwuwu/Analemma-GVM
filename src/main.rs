@@ -7,7 +7,6 @@ use gvm_proxy::auth;
 use gvm_proxy::config::ProxyConfig;
 use gvm_proxy::dns_governance;
 use gvm_proxy::ledger::Ledger;
-use gvm_proxy::policy::PolicyEngine;
 use gvm_proxy::proxy::{proxy_handler, AppState};
 use gvm_proxy::token_budget::TokenBudget;
 use gvm_proxy::registry::OperationRegistry;
@@ -134,12 +133,7 @@ async fn main() {
     };
     srr.set_default_decision(default_unknown_decision);
 
-    // 4. Load ABAC policy engine (graceful: empty dir → empty policy set)
-    let policy = PolicyEngine::load(Path::new(&config.policies.directory))
-        .expect("Failed to load policy engine");
-    tracing::info!("ABAC policy engine loaded");
-
-    // 5. Load API key store (graceful: missing or unreadable → empty store with warning)
+    // 4. Load API key store (graceful: missing or unreadable → empty store with warning)
     let api_keys = match APIKeyStore::load(Path::new(&config.secrets.file)) {
         Ok(keys) => keys,
         Err(e) => {
@@ -199,30 +193,13 @@ async fn main() {
 
     // 7.5. Record config file hashes in Merkle chain (tamper detection)
     {
-        let policy_dir = Path::new(&config.policies.directory);
-
-        let mut all_config_files: Vec<(String, std::path::PathBuf)> = vec![
+        let all_config_files: Vec<(String, std::path::PathBuf)> = vec![
             ("srr_network".to_string(), srr_path.to_path_buf()),
             (
                 "operation_registry".to_string(),
                 registry_path.to_path_buf(),
             ),
         ];
-
-        if policy_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(policy_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().is_some_and(|ext| ext == "toml") {
-                        let label = format!(
-                            "policy/{}",
-                            path.file_name().unwrap_or_default().to_string_lossy()
-                        );
-                        all_config_files.push((label, path));
-                    }
-                }
-            }
-        }
 
         let config_refs: Vec<(&str, &Path)> = all_config_files
             .iter()
@@ -354,12 +331,11 @@ async fn main() {
     );
 
     // 10. Print startup policy summary
-    print_startup_summary(&srr, &policy, &registry, &api_keys);
+    print_startup_summary(&srr, &registry, &api_keys);
 
     // 11. Compose shared state
     let mut state = AppState {
         srr: Arc::new(std::sync::RwLock::new(srr)),
-        policy: Arc::new(std::sync::RwLock::new(policy)),
         registry: Arc::new(std::sync::RwLock::new(registry)),
         api_keys: Arc::new(api_keys),
         ledger,
@@ -380,7 +356,6 @@ async fn main() {
             config.shadow.intent_ttl_secs,
         )),
         srr_config_path: config.srr.network_file.clone(),
-        policy_dir: config.policies.directory.clone(),
         registry_path: config.operations.registry_file.clone(),
         mitm_ca_pem: Some(mitm_ca_cert_pem.clone()),
         payload_inspection: config.srr.payload_inspection,
@@ -1072,12 +1047,10 @@ async fn handle_tls_connection(
 /// traffic starts flowing through the proxy.
 fn print_startup_summary(
     srr: &gvm_proxy::srr::NetworkSRR,
-    policy: &gvm_proxy::policy::PolicyEngine,
     registry: &gvm_proxy::registry::OperationRegistry,
     api_keys: &gvm_proxy::api_keys::APIKeyStore,
 ) {
     let srr_info = srr.summary();
-    let (global_rules, tenant_count, agent_count) = policy.summary();
 
     eprintln!();
     eprintln!("  \x1b[1m\x1b[36m╔══════════════════════════════════════════╗\x1b[0m");
@@ -1087,8 +1060,8 @@ fn print_startup_summary(
     eprintln!("  \x1b[1m\x1b[36m╚══════════════════════════════════════════╝\x1b[0m");
     eprintln!();
 
-    // Layer 2: SRR (Network rules)
-    eprintln!("  \x1b[1mLayer 2 — Network SRR\x1b[0m");
+    // Network SRR rules
+    eprintln!("  \x1b[1mNetwork SRR\x1b[0m");
     eprintln!("    Rules loaded:     {}", srr_info.total_rules);
     eprintln!(
         "    \x1b[31mDeny:  {}\x1b[0m   \x1b[33mDelay: {}\x1b[0m   \x1b[32mAllow: {}\x1b[0m",
@@ -1107,17 +1080,6 @@ fn print_startup_summary(
     }
     eprintln!();
 
-    // Layer 1: ABAC (Policy engine)
-    eprintln!("  \x1b[1mLayer 1 — ABAC Policy\x1b[0m  \x1b[2m(requires SDK)\x1b[0m");
-    eprintln!(
-        "    Global rules: {}   Tenants: {}   Agent policies: {}",
-        global_rules, tenant_count, agent_count
-    );
-    if global_rules == 0 && tenant_count == 0 && agent_count == 0 {
-        eprintln!("    \x1b[2mNo ABAC policies loaded — SRR-only mode\x1b[0m");
-    }
-    eprintln!();
-
     // Operations registry
     eprintln!("  \x1b[1mOperation Registry\x1b[0m");
     eprintln!(
@@ -1127,8 +1089,8 @@ fn print_startup_summary(
     );
     eprintln!();
 
-    // Layer 3: API key isolation
-    eprintln!("  \x1b[1mLayer 3 — API Key Isolation\x1b[0m");
+    // API key isolation
+    eprintln!("  \x1b[1mAPI Key Isolation\x1b[0m");
     if api_keys.is_empty() {
         eprintln!("    \x1b[33m⚠ No API keys configured — passthrough mode\x1b[0m");
         eprintln!("    \x1b[2mAgents can call APIs directly without credential isolation.\x1b[0m");
@@ -1141,9 +1103,8 @@ fn print_startup_summary(
     // How decisions work
     eprintln!("  \x1b[2m┌─────────────────────────────────────────────┐\x1b[0m");
     eprintln!("  \x1b[2m│  Request flow:                              │\x1b[0m");
-    eprintln!("  \x1b[2m│  Agent → [SRR check] → [ABAC check*] →     │\x1b[0m");
-    eprintln!("  \x1b[2m│         [API key inject] → Upstream         │\x1b[0m");
-    eprintln!("  \x1b[2m│  * ABAC only with SDK (X-GVM-Agent-Id)      │\x1b[0m");
+    eprintln!("  \x1b[2m│  Agent → [SRR check] → [API key inject]    │\x1b[0m");
+    eprintln!("  \x1b[2m│         → Upstream                          │\x1b[0m");
     eprintln!("  \x1b[2m│  Unknown URLs → Delay(300ms) + audit trail  │\x1b[0m");
     eprintln!("  \x1b[2m└─────────────────────────────────────────────┘\x1b[0m");
     eprintln!();

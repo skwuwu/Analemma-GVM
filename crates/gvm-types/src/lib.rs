@@ -15,7 +15,7 @@ pub struct OperationMetadata {
     /// Acting subject (agent)
     pub subject: SubjectDescriptor,
 
-    /// Execution context (ABAC attributes)
+    /// Execution context attributes
     pub context: OperationContext,
 
     /// Payload summary for audit (not the raw payload)
@@ -70,7 +70,6 @@ pub struct SubjectDescriptor {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct OperationContext {
     /// Additional context attributes (amount, region, customer tier, etc.)
-    /// Referenced by ABAC policies
     pub attributes: HashMap<String, serde_json::Value>,
 }
 
@@ -216,9 +215,7 @@ pub struct TransportInfo {
 /// Classification source — which enforcement layer produced the final decision
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ClassificationSource {
-    /// Layer 1: ABAC policy engine (semantic operation matching)
-    ABAC,
-    /// Layer 2: Network SRR (host/path/method matching)
+    /// Network SRR (host/path/method matching)
     SRR,
 }
 

@@ -6,7 +6,7 @@
 //!
 //! Architecture:
 //!   Client TLS stream → hyper server (parse request)
-//!                     → classify (SRR + ABAC)
+//!                     → classify (SRR)
 //!                     → hyper client (forward to upstream, stream response)
 //!                     → hyper server (relay response to client)
 

@@ -1,7 +1,7 @@
 use crate::ui::{BOLD, GREEN, RED, RESET};
 use anyhow::{Context, Result};
 
-/// Hot-reload SRR rules and ABAC policies from disk.
+/// Hot-reload SRR rules and registry from disk.
 /// Sends POST /gvm/reload to the proxy (localhost only).
 pub async fn run_reload(proxy_url: &str) -> Result<()> {
     let client = reqwest::Client::new();

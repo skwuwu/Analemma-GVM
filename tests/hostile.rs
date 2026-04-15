@@ -11,7 +11,6 @@
 
 use gvm_proxy::srr::NetworkSRR;
 use gvm_proxy::types::EnforcementDecision;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -1184,21 +1183,7 @@ fn config_poisoning_malformed_toml_rejected() {
     let _r = result;
 }
 
-#[test]
-fn config_poisoning_policy_malformed_toml_rejected() {
-    use gvm_proxy::policy::PolicyEngine;
-
-    let dir = tempfile::tempdir().expect("temp dir");
-    let policy_dir = dir.path().join("policies");
-    std::fs::create_dir(&policy_dir).expect("create dir");
-
-    // Write a malformed global.toml
-    let global_path = policy_dir.join("global.toml");
-    std::fs::write(&global_path, "[[rules]]\nid = broken\n{{{{").expect("write");
-
-    let result = PolicyEngine::load(&policy_dir);
-    assert!(result.is_err(), "Malformed policy TOML must fail to load");
-}
+// Test: config_poisoning_policy_malformed_toml_rejected removed — ABAC system deleted.
 
 #[test]
 fn config_srr_catch_all_deny_blocks_everything() {
@@ -1295,114 +1280,6 @@ fn upstream_xgvm_headers_are_stripped() {
     );
 }
 
-// ─── Test 21: ABAC Attribute Omission Bypass ───
-//
-// Attacker omits context attributes (e.g., context.amount) so that
-// amount-based ABAC rules do not fire. The test proves:
-// 1. With context.amount present: rule matches → Deny
-// 2. Without context.amount: rule does NOT match → falls to Allow
-// 3. SRR catch-all provides defense-in-depth regardless
-
-#[test]
-fn abac_attribute_omission_bypasses_policy_rule() {
-    use gvm_proxy::policy::PolicyEngine;
-    use gvm_proxy::types::*;
-
-    let dir = tempfile::tempdir().expect("temp dir");
-    let policy_dir = dir.path().join("policies");
-    std::fs::create_dir(&policy_dir).expect("create dir");
-
-    // Global rule: context.amount > 500 → Deny
-    std::fs::write(
-        policy_dir.join("global.toml"),
-        r#"
-        [[rules]]
-        id = "high-value-deny"
-        priority = 1
-        layer = "Global"
-        description = "Block high-value operations"
-        conditions = [
-            { field = "context.amount", operator = "Gt", value = 500 }
-        ]
-        [rules.decision]
-        type = "Deny"
-        reason = "High-value operation blocked"
-    "#,
-    )
-    .expect("write");
-
-    let engine = PolicyEngine::load(&policy_dir).expect("policy load");
-
-    // Case 1: With context.amount = 1000 → rule matches → Deny
-    let mut attrs_with_amount = HashMap::new();
-    attrs_with_amount.insert("amount".to_string(), serde_json::json!(1000));
-
-    let op_with_amount = OperationMetadata {
-        operation: "gvm.finance.transfer".to_string(),
-        resource: Default::default(),
-        subject: SubjectDescriptor {
-            agent_id: "agent-1".to_string(),
-            tenant_id: None,
-            session_id: "session-1".to_string(),
-        },
-        context: OperationContext {
-            attributes: attrs_with_amount,
-        },
-        payload: PayloadDescriptor::default(),
-    };
-
-    let (decision, _) = engine.evaluate(&op_with_amount);
-    assert!(
-        matches!(decision, EnforcementDecision::Deny { .. }),
-        "With context.amount=1000, rule must fire → Deny, got {:?}",
-        decision
-    );
-
-    // Case 2: Omit context.amount → rule does NOT fire → Allow
-    let op_without_amount = OperationMetadata {
-        operation: "gvm.finance.transfer".to_string(),
-        resource: Default::default(),
-        subject: SubjectDescriptor {
-            agent_id: "agent-1".to_string(),
-            tenant_id: None,
-            session_id: "session-1".to_string(),
-        },
-        context: OperationContext {
-            attributes: HashMap::new(), // No amount attribute
-        },
-        payload: PayloadDescriptor::default(),
-    };
-
-    let (decision, _) = engine.evaluate(&op_without_amount);
-    assert!(
-        matches!(decision, EnforcementDecision::Allow),
-        "Without context.amount, Gt condition evaluates as false (Null > 500 fails) → Allow. \
-         This is the known bypass documented in security-model. Got {:?}",
-        decision
-    );
-
-    // Case 3: SRR catch-all provides defense-in-depth via max_strict
-    let srr = srr_from_toml(
-        r#"
-        [[rules]]
-        method = "POST"
-        pattern = "api.bank.com/transfer/{any}"
-        decision = { type = "Deny", reason = "Wire transfer blocked" }
-
-        [[rules]]
-        method = "*"
-        pattern = "{any}"
-        decision = { type = "Delay", milliseconds = 300 }
-    "#,
-    );
-
-    let srr_result = srr.check("POST", "api.bank.com", "/transfer/123", None);
-    let combined = gvm_proxy::types::max_strict(decision, srr_result.decision);
-    assert!(
-        matches!(combined, EnforcementDecision::Deny { .. }),
-        "SRR must catch what ABAC missed via max_strict → Deny, got {:?}",
-        combined
-    );
-}
+// Test 21 (ABAC Attribute Omission Bypass) removed — ABAC system deleted.
 
 // ─── Rate limiter bucket exhaustion test removed (replaced by token_budget) ───

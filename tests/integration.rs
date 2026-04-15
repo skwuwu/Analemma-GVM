@@ -2,7 +2,7 @@
 //!
 //! Test 1: EventStatus state transitions (Pending → Confirmed/Failed/Expired)
 //! Test 2: WAL → NATS async ordering + crash recovery re-publish
-//! Test 3: ABAC policy hierarchy enforcement (Global > Tenant > Agent)
+//! Test 3: (removed — ABAC deleted)
 //! Test 4: API key injection into forwarded requests
 //! Test 5: SDK @ic headers → Proxy classification → enforcement decision
 //! Test 6: Checkpoint save → read → Merkle verification round-trip
@@ -10,7 +10,6 @@
 
 use gvm_proxy::api_keys::APIKeyStore;
 use gvm_proxy::ledger::Ledger;
-use gvm_proxy::policy::PolicyEngine;
 use gvm_proxy::proxy::{proxy_handler, AppState};
 use gvm_proxy::token_budget::TokenBudget;
 use gvm_proxy::registry::OperationRegistry;
@@ -227,201 +226,7 @@ async fn wal_nats_sequence_ordering_and_crash_recovery() {
     );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Test 3: ABAC Policy Hierarchy (Global > Tenant > Agent)
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn policy_hierarchy_global_tenant_agent_strictness() {
-    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
-    let policy_dir = dir.path().join("policies");
-    std::fs::create_dir_all(&policy_dir).expect("policy directory creation must succeed");
-
-    // ── Global: Allow all reads, Delay all writes ──
-    std::fs::write(
-        policy_dir.join("global.toml"),
-        r#"
-[[rules]]
-id = "global-allow-read"
-priority = 10
-layer = "Global"
-description = "Allow read operations"
-[[rules.conditions]]
-field = "operation"
-operator = "EndsWith"
-value = ".read"
-[rules.decision]
-type = "Allow"
-
-[[rules]]
-id = "global-delay-write"
-priority = 20
-layer = "Global"
-description = "Delay write operations"
-[[rules.conditions]]
-field = "operation"
-operator = "EndsWith"
-value = ".write"
-[rules.decision]
-type = "Delay"
-milliseconds = 300
-
-[[rules]]
-id = "global-deny-delete"
-priority = 1
-layer = "Global"
-description = "Deny all delete operations"
-[[rules.conditions]]
-field = "operation"
-operator = "EndsWith"
-value = ".delete"
-[rules.decision]
-type = "Deny"
-reason = "Delete operations forbidden by global policy"
-
-[[rules]]
-id = "global-fallback"
-priority = 999
-layer = "Global"
-description = "Default fallback"
-[rules.decision]
-type = "Delay"
-milliseconds = 300
-"#,
-    )
-    .expect("writing global policy config must succeed");
-
-    // ── Tenant "acme": Escalate writes to RequireApproval ──
-    std::fs::write(
-        policy_dir.join("tenant-acme.toml"),
-        r#"
-[[rules]]
-id = "acme-approve-write"
-priority = 10
-layer = "Tenant"
-description = "Acme tenant requires approval for writes"
-[[rules.conditions]]
-field = "operation"
-operator = "EndsWith"
-value = ".write"
-[rules.decision]
-type = "RequireApproval"
-urgency = "Standard"
-
-[[rules]]
-id = "acme-delay-read"
-priority = 20
-layer = "Tenant"
-description = "Acme delays reads (stricter than global Allow)"
-[[rules.conditions]]
-field = "operation"
-operator = "EndsWith"
-value = ".read"
-[rules.decision]
-type = "Delay"
-milliseconds = 100
-"#,
-    )
-    .expect("writing tenant-acme policy config must succeed");
-
-    // ── Agent "restricted-bot": Deny everything ──
-    std::fs::write(
-        policy_dir.join("agent-restricted-bot.toml"),
-        r#"
-[[rules]]
-id = "restricted-deny-all"
-priority = 1
-layer = "Agent"
-description = "Restricted bot denied all operations"
-[rules.decision]
-type = "Deny"
-reason = "Agent restricted-bot is fully blocked"
-"#,
-    )
-    .expect("writing agent-restricted-bot policy config must succeed");
-
-    let engine =
-        PolicyEngine::load(&policy_dir).expect("valid policy files must parse successfully");
-
-    // ── Scenario A: Agent without tenant — only Global rules apply ──
-    let op_read = make_policy_operation("gvm.storage.read", None, "normal-agent");
-    let (decision, rule_id) = engine.evaluate(&op_read);
-    assert!(
-        matches!(decision, EnforcementDecision::Allow),
-        "Global: read should be Allow, got {:?}",
-        decision
-    );
-    assert_eq!(
-        rule_id.expect("global read must match a rule"),
-        "global-allow-read"
-    );
-
-    let op_write = make_policy_operation("gvm.storage.write", None, "normal-agent");
-    let (decision, _) = engine.evaluate(&op_write);
-    assert!(
-        matches!(decision, EnforcementDecision::Delay { milliseconds: 300 }),
-        "Global: write should be Delay 300ms, got {:?}",
-        decision
-    );
-
-    // ── Scenario B: Agent in tenant "acme" — Tenant rules escalate ──
-    let op_read_acme = make_policy_operation("gvm.storage.read", Some("acme"), "normal-agent");
-    let (decision, rule_id) = engine.evaluate(&op_read_acme);
-    // Tenant says Delay 100ms for reads, Global says Allow
-    // Delay (strictness 3) > Allow (strictness 0) → Delay wins
-    assert!(
-        matches!(decision, EnforcementDecision::Delay { .. }),
-        "Acme tenant: read should be Delay (stricter than global Allow), got {:?}",
-        decision
-    );
-    assert_eq!(
-        rule_id.expect("acme read must match a tenant rule"),
-        "acme-delay-read"
-    );
-
-    let op_write_acme = make_policy_operation("gvm.storage.write", Some("acme"), "normal-agent");
-    let (decision, rule_id) = engine.evaluate(&op_write_acme);
-    // Tenant says RequireApproval for writes, Global says Delay
-    // RequireApproval (strictness 4) > Delay (strictness 3) → RequireApproval wins
-    assert!(
-        matches!(decision, EnforcementDecision::RequireApproval { .. }),
-        "Acme tenant: write should be RequireApproval (stricter than Delay), got {:?}",
-        decision
-    );
-    assert_eq!(
-        rule_id.expect("acme write must match a tenant rule"),
-        "acme-approve-write"
-    );
-
-    // ── Scenario C: Global Deny cannot be weakened by Tenant ──
-    let op_delete_acme = make_policy_operation("gvm.storage.delete", Some("acme"), "normal-agent");
-    let (decision, rule_id) = engine.evaluate(&op_delete_acme);
-    // Global Deny short-circuits — tenant rules never evaluated
-    assert!(
-        matches!(decision, EnforcementDecision::Deny { .. }),
-        "Global Deny must not be weakened by tenant: got {:?}",
-        decision
-    );
-    assert_eq!(
-        rule_id.expect("global deny must match a rule"),
-        "global-deny-delete"
-    );
-
-    // ── Scenario D: Agent-level Deny overrides everything ──
-    let op_read_restricted =
-        make_policy_operation("gvm.storage.read", Some("acme"), "restricted-bot");
-    let (decision, rule_id) = engine.evaluate(&op_read_restricted);
-    // Agent "restricted-bot" denies everything
-    assert!(
-        matches!(decision, EnforcementDecision::Deny { .. }),
-        "Agent-level Deny must override all: got {:?}",
-        decision
-    );
-    assert_eq!(
-        rule_id.expect("agent-level deny must match a rule"),
-        "restricted-deny-all"
-    );
-}
+// Test 3 (ABAC Policy Hierarchy) removed — ABAC system deleted.
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Test 4: API Key Injection into Forwarded Requests
@@ -679,9 +484,6 @@ milliseconds = 300
     let srr = Arc::new(std::sync::RwLock::new(
         NetworkSRR::load(&srr_path).expect("valid SRR config must parse"),
     ));
-    let policy = Arc::new(std::sync::RwLock::new(
-        PolicyEngine::load(&policy_dir).expect("valid policy files must parse"),
-    ));
     let registry = Arc::new(std::sync::RwLock::new(
         OperationRegistry::load(&registry_path).expect("valid registry config must parse"),
     ));
@@ -701,7 +503,7 @@ milliseconds = 300
 
     let state = AppState {
         srr,
-        policy,
+
         registry,
         api_keys,
         ledger,
@@ -716,7 +518,7 @@ milliseconds = 300
         jwt_config: None,
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
         srr_config_path: String::new(),
-        policy_dir: String::new(),
+
         registry_path: String::new(),
         mitm_ca_pem: None,
         payload_inspection: false,
@@ -1127,9 +929,6 @@ token = "sk_test_proxy_injected_key"
     let srr = Arc::new(std::sync::RwLock::new(
         NetworkSRR::load(&srr_path).expect("valid SRR config must parse"),
     ));
-    let policy = Arc::new(std::sync::RwLock::new(
-        PolicyEngine::load(&policy_dir).expect("valid policy must parse"),
-    ));
     let registry = Arc::new(std::sync::RwLock::new(
         OperationRegistry::load(&registry_path).expect("valid registry must parse"),
     ));
@@ -1154,7 +953,7 @@ token = "sk_test_proxy_injected_key"
 
     let state = gvm_proxy::proxy::AppState {
         srr,
-        policy,
+
         registry,
         api_keys,
         ledger: ledger.clone(),
@@ -1169,7 +968,7 @@ token = "sk_test_proxy_injected_key"
         jwt_config: None,
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
         srr_config_path: String::new(),
-        policy_dir: String::new(),
+
         registry_path: String::new(),
         mitm_ca_pem: None,
         payload_inspection: false,
@@ -1417,9 +1216,6 @@ token = "sk_test_proxy_injected_bearer"
     let srr = Arc::new(std::sync::RwLock::new(
         NetworkSRR::load(&srr_path).expect("valid SRR config must parse"),
     ));
-    let policy = Arc::new(std::sync::RwLock::new(
-        PolicyEngine::load(&policy_dir).expect("valid policy must parse"),
-    ));
     let registry = Arc::new(std::sync::RwLock::new(
         OperationRegistry::load(&registry_path).expect("valid registry must parse"),
     ));
@@ -1447,7 +1243,7 @@ token = "sk_test_proxy_injected_bearer"
 
     let state = gvm_proxy::proxy::AppState {
         srr,
-        policy,
+
         registry,
         api_keys,
         ledger: ledger.clone(),
@@ -1462,7 +1258,7 @@ token = "sk_test_proxy_injected_bearer"
         jwt_config: None,
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
         srr_config_path: String::new(),
-        policy_dir: String::new(),
+
         registry_path: String::new(),
         mitm_ca_pem: None,
         payload_inspection: false,
@@ -1632,9 +1428,6 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
     let srr = Arc::new(std::sync::RwLock::new(
         NetworkSRR::load(&srr_path).expect("valid SRR config must parse"),
     ));
-    let policy = Arc::new(std::sync::RwLock::new(
-        PolicyEngine::load(&policy_dir).expect("valid policy must parse"),
-    ));
     let registry = Arc::new(std::sync::RwLock::new(
         OperationRegistry::load(&registry_path).expect("valid registry must parse"),
     ));
@@ -1652,7 +1445,7 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
 
     let state = gvm_proxy::proxy::AppState {
         srr,
-        policy,
+
         registry,
         api_keys,
         ledger,
@@ -1667,7 +1460,7 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
         jwt_config: None,
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
         srr_config_path: String::new(),
-        policy_dir: String::new(),
+
         registry_path: String::new(),
         mitm_ca_pem: None,
         payload_inspection: false,
@@ -1783,7 +1576,7 @@ async fn sdk_proxy_header_contract_resource_and_context_json() {
 
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
 
-    // Policy: check resource tier attribute via ABAC
+    // Policy: check resource tier attribute via SRR
     let srr_path = dir.path().join("srr.toml");
     std::fs::write(
         &srr_path,
@@ -1836,9 +1629,6 @@ type = "Allow"
     let srr = Arc::new(std::sync::RwLock::new(
         NetworkSRR::load(&srr_path).expect("valid SRR config must parse"),
     ));
-    let policy = Arc::new(std::sync::RwLock::new(
-        PolicyEngine::load(&policy_dir).expect("valid policy must parse"),
-    ));
     let registry = Arc::new(std::sync::RwLock::new(
         OperationRegistry::load(&registry_path).expect("valid registry must parse"),
     ));
@@ -1856,7 +1646,7 @@ type = "Allow"
 
     let state = gvm_proxy::proxy::AppState {
         srr,
-        policy,
+
         registry,
         api_keys,
         ledger,
@@ -1871,7 +1661,7 @@ type = "Allow"
         jwt_config: None,
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
         srr_config_path: String::new(),
-        policy_dir: String::new(),
+
         registry_path: String::new(),
         mitm_ca_pem: None,
         payload_inspection: false,
@@ -1932,7 +1722,7 @@ type = "Allow"
     assert_eq!(
         response.status(),
         StatusCode::FORBIDDEN,
-        "Critical sensitivity resource must be denied by ABAC policy"
+        "Critical sensitivity resource must be denied by governance policy"
     );
 
     // ── Scenario B: Same operation but Medium sensitivity → allowed ──
@@ -1994,89 +1784,7 @@ type = "Allow"
     );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Test 11: Policy Conflict Detection — Regex vs StartsWith false negative
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn policy_conflict_regex_vs_startswith_overlap_is_documented_false_negative() {
-    // validate_conflicts and WarningKind are called internally by PolicyEngine::load
-
-    // The conflict detector uses heuristics that cannot detect overlap between
-    // Regex and StartsWith operators. This test documents the known limitation.
-    let policy_dir = tempfile::tempdir().expect("temp dir creation must succeed");
-    std::fs::write(
-        policy_dir.path().join("global.toml"),
-        r#"
-[[rules]]
-id = "regex-payment"
-priority = 1
-layer = "Global"
-description = "Regex match for payment ops"
-[[rules.conditions]]
-field = "operation"
-operator = "Regex"
-value = "gvm\\.(payment|identity)\\..*"
-[rules.decision]
-type = "Deny"
-reason = "Sensitive operation"
-
-[[rules]]
-id = "startswith-payment"
-priority = 2
-layer = "Global"
-description = "StartsWith match for payment ops"
-[[rules.conditions]]
-field = "operation"
-operator = "StartsWith"
-value = "gvm.payment"
-[rules.decision]
-type = "Allow"
-"#,
-    )
-    .expect("writing policy config must succeed");
-
-    let engine =
-        PolicyEngine::load(policy_dir.path()).expect("policy with regex and startswith must load");
-
-    // Access rules through the engine to call validate_conflicts
-    // PolicyEngine::load already calls validate_conflicts internally and logs warnings.
-    // We re-validate to check the result programmatically.
-    // Since we can't access internal fields directly, load the rules manually:
-    let rules_content = std::fs::read_to_string(policy_dir.path().join("global.toml"))
-        .expect("reading policy file must succeed");
-    let _parsed: toml::Value = rules_content.parse().expect("TOML must parse");
-    // Use validate_conflicts with the engine's loaded rules.
-    // We'll just test the evaluate path since we can't easily extract rules.
-
-    // The key assertion: despite the overlap, the engine correctly enforces
-    // the stricter decision because first-match-wins with priority ordering.
-    let meta = make_policy_operation("gvm.payment.charge", None, "any-agent");
-    let (decision, _rule_id) = engine.evaluate(&meta);
-    let decision_str = format!("{:?}", decision);
-    assert!(
-        decision_str.contains("Deny"),
-        "Priority-1 Deny must fire before priority-2 Allow for gvm.payment.charge"
-    );
-
-    // Also verify the reverse: gvm.identity.delete matches regex but not StartsWith "gvm.payment"
-    let meta2 = make_policy_operation("gvm.identity.delete", None, "any-agent");
-    let (decision2, _) = engine.evaluate(&meta2);
-    let decision_str2 = format!("{:?}", decision2);
-    assert!(
-        decision_str2.contains("Deny"),
-        "Regex must also catch gvm.identity.delete (not just gvm.payment.*)"
-    );
-
-    // Verify known limitation: operations NOT matching either rule get Allow (default)
-    let meta3 = make_policy_operation("gvm.storage.read", None, "any-agent");
-    let (decision3, _) = engine.evaluate(&meta3);
-    let decision_str3 = format!("{:?}", decision3);
-    assert!(
-        decision_str3.contains("Allow"),
-        "Unmatched operations must fall through to default Allow"
-    );
-}
+// Test 11 (Policy Conflict Detection) removed — ABAC system deleted.
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Test 12: Emergency WAL → Primary Recovery Path
@@ -2227,30 +1935,6 @@ fn make_test_event(event_id: &str, operation: &str) -> GVMEvent {
     }
 }
 
-fn make_policy_operation(
-    operation: &str,
-    tenant_id: Option<&str>,
-    agent_id: &str,
-) -> OperationMetadata {
-    OperationMetadata {
-        operation: operation.to_string(),
-        resource: ResourceDescriptor {
-            service: "test".to_string(),
-            identifier: None,
-            tier: ResourceTier::External,
-            sensitivity: Sensitivity::Medium,
-        },
-        subject: SubjectDescriptor {
-            agent_id: agent_id.to_string(),
-            tenant_id: tenant_id.map(String::from),
-            session_id: "test-session".to_string(),
-        },
-        context: OperationContext {
-            attributes: std::collections::HashMap::new(),
-        },
-        payload: PayloadDescriptor::default(),
-    }
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Test 6: Checkpoint Save → Read → Merkle Verification Round-Trip
@@ -2288,9 +1972,6 @@ async fn checkpoint_save_restore_merkle_verified() {
     let srr = Arc::new(std::sync::RwLock::new(
         NetworkSRR::load(&srr_path).expect("empty SRR must parse"),
     ));
-    let policy = Arc::new(std::sync::RwLock::new(
-        PolicyEngine::load(&policy_dir).expect("empty policy must parse"),
-    ));
     let registry = Arc::new(std::sync::RwLock::new(
         OperationRegistry::load(&registry_path).expect("minimal registry must parse"),
     ));
@@ -2308,7 +1989,7 @@ async fn checkpoint_save_restore_merkle_verified() {
 
     let state = AppState {
         srr,
-        policy,
+
         registry,
         api_keys,
         ledger,
@@ -2323,7 +2004,7 @@ async fn checkpoint_save_restore_merkle_verified() {
         jwt_config: None,
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
         srr_config_path: String::new(),
-        policy_dir: String::new(),
+
         registry_path: String::new(),
         mitm_ca_pem: None,
         payload_inspection: false,
@@ -2766,9 +2447,6 @@ type = "Allow"
     let srr = Arc::new(std::sync::RwLock::new(
         NetworkSRR::load(&srr_path).expect("SRR must parse"),
     ));
-    let policy = Arc::new(std::sync::RwLock::new(
-        PolicyEngine::load(&policy_dir).expect("policy must parse"),
-    ));
     let registry = Arc::new(std::sync::RwLock::new(
         OperationRegistry::load(&registry_path).expect("registry must parse"),
     ));
@@ -2787,7 +2465,7 @@ type = "Allow"
 
     let state = AppState {
         srr,
-        policy,
+
         registry,
         api_keys,
         ledger,
@@ -2802,7 +2480,7 @@ type = "Allow"
         jwt_config: None,
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
         srr_config_path: String::new(),
-        policy_dir: String::new(),
+
         registry_path: String::new(),
         mitm_ca_pem: None,
         payload_inspection: false,
@@ -2940,9 +2618,6 @@ decision = { type = "Allow" }
     let wal_path = dir.path().join("wal.log");
 
     let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).unwrap()));
-    let policy = Arc::new(std::sync::RwLock::new(
-        PolicyEngine::load(&policy_dir).unwrap(),
-    ));
     let registry = Arc::new(std::sync::RwLock::new(
         OperationRegistry::load(&registry_path).unwrap(),
     ));
@@ -2955,7 +2630,7 @@ decision = { type = "Allow" }
 
     let state = AppState {
         srr,
-        policy,
+
         registry,
         api_keys,
         ledger,
@@ -2970,7 +2645,7 @@ decision = { type = "Allow" }
         jwt_config: None,
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
         srr_config_path: String::new(),
-        policy_dir: String::new(),
+
         registry_path: String::new(),
         mitm_ca_pem: None,
         payload_inspection: false,
@@ -3073,9 +2748,6 @@ decision = { type = "Allow" }
     let wal_path = dir.path().join("wal.log");
 
     let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).unwrap()));
-    let policy = Arc::new(std::sync::RwLock::new(
-        PolicyEngine::load(&policy_dir).unwrap(),
-    ));
     let registry = Arc::new(std::sync::RwLock::new(
         OperationRegistry::load(&registry_path).unwrap(),
     ));
@@ -3088,7 +2760,7 @@ decision = { type = "Allow" }
 
     let state = AppState {
         srr,
-        policy,
+
         registry,
         api_keys,
         ledger,
@@ -3103,7 +2775,7 @@ decision = { type = "Allow" }
         jwt_config: None,
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
         srr_config_path: String::new(),
-        policy_dir: String::new(),
+
         registry_path: String::new(),
         mitm_ca_pem: None,
         payload_inspection: true, // ENABLED for this test
@@ -3210,9 +2882,6 @@ decision = { type = "Allow" }
     let wal_path = dir.path().join("wal.log");
 
     let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).unwrap()));
-    let policy = Arc::new(std::sync::RwLock::new(
-        PolicyEngine::load(&policy_dir).unwrap(),
-    ));
     let registry = Arc::new(std::sync::RwLock::new(
         OperationRegistry::load(&registry_path).unwrap(),
     ));
@@ -3225,7 +2894,7 @@ decision = { type = "Allow" }
 
     let state = AppState {
         srr,
-        policy,
+
         registry,
         api_keys,
         ledger,
@@ -3240,7 +2909,7 @@ decision = { type = "Allow" }
         jwt_config: None,
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
         srr_config_path: String::new(),
-        policy_dir: String::new(),
+
         registry_path: String::new(),
         mitm_ca_pem: None,
         payload_inspection: false, // DISABLED — body should NOT be inspected
@@ -3315,9 +2984,6 @@ async fn ic3_self_approval_blocked_on_proxy_port() {
     let wal_path = dir.path().join("wal.log");
 
     let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).unwrap()));
-    let policy = Arc::new(std::sync::RwLock::new(
-        PolicyEngine::load(&policy_dir).unwrap(),
-    ));
     let registry = Arc::new(std::sync::RwLock::new(
         OperationRegistry::load(&registry_path).unwrap(),
     ));
@@ -3330,7 +2996,7 @@ async fn ic3_self_approval_blocked_on_proxy_port() {
 
     let state = AppState {
         srr,
-        policy,
+
         registry,
         api_keys,
         ledger,
@@ -3345,7 +3011,7 @@ async fn ic3_self_approval_blocked_on_proxy_port() {
         jwt_config: None,
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
         srr_config_path: String::new(),
-        policy_dir: String::new(),
+
         registry_path: String::new(),
         mitm_ca_pem: None,
         payload_inspection: false,

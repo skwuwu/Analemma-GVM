@@ -3,7 +3,6 @@ use crate::auth;
 use crate::config::OnBlockConfig;
 use crate::ledger::Ledger;
 use crate::llm_trace;
-use crate::policy::PolicyEngine;
 use crate::token_budget::TokenBudget;
 use crate::registry::OperationRegistry;
 use crate::srr::NetworkSRR;
@@ -109,7 +108,6 @@ const CIRCUIT_BREAKER_RETRY_SECS: u64 = 30;
 #[derive(Clone)]
 pub struct AppState {
     pub srr: Arc<std::sync::RwLock<NetworkSRR>>,
-    pub policy: Arc<std::sync::RwLock<PolicyEngine>>,
     pub registry: Arc<std::sync::RwLock<OperationRegistry>>,
     pub api_keys: Arc<APIKeyStore>,
     pub ledger: Arc<Ledger>,
@@ -140,8 +138,6 @@ pub struct AppState {
     pub shadow_config: crate::intent_store::ShadowConfig,
     /// SRR config file path (for hot-reload).
     pub srr_config_path: String,
-    /// ABAC policy directory path (for hot-reload).
-    pub policy_dir: String,
     /// Operation registry file path (for hot-reload).
     pub registry_path: String,
     /// MITM CA certificate PEM (for sandbox trust store download via GET /gvm/ca.pem).
@@ -289,22 +285,8 @@ pub async fn proxy_handler(
         *request.body_mut() = Body::from(bytes.clone());
     }
 
-    // ── Step 2: Classify (IC determination) ──
-    let (mut classification, mut is_default_caution) = if let Some(ref headers) = gvm_headers {
-        // SDK-routed: Layer 1 Semantic classification via ABAC policy engine
-        let operation = build_operation_metadata(headers, &target);
-        let (policy_decision, matched_rule) = match state.policy.read() {
-            Ok(p) => p.evaluate(&operation),
-            Err(_) => {
-                tracing::error!("Policy lock poisoned — denying (fail-close)");
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Internal governance error — request denied (fail-close)",
-                );
-            }
-        };
-
-        // Also check network SRR (Deny in SRR overrides policy)
+    // ── Step 2: Classify (IC determination) via SRR ──
+    let (classification, is_default_caution) = {
         let srr = match state.srr.read() {
             Ok(guard) => guard,
             Err(_) => {
@@ -330,71 +312,18 @@ pub async fn proxy_handler(
             &target.path,
             body_for_srr,
         );
-        drop(srr);
+        // srr guard dropped at end of block — ensures future is Send
 
-        // Determine which layer won (max_strict picks the strictest)
-        let final_decision = max_strict(srr_result.decision.clone(), policy_decision.clone());
-        let srr_won = srr_result.decision.strictness() > policy_decision.strictness();
-        let source = if srr_won {
-            ClassificationSource::SRR
-        } else {
-            ClassificationSource::ABAC
-        };
+        let operation = gvm_headers.as_ref().map(|headers| build_operation_metadata(headers, &target));
 
-        // Use SRR description as matched_rule_id when SRR produced the stricter decision
-        let rule_id = if srr_won {
-            srr_result.matched_description.clone()
-        } else {
-            matched_rule
-        };
-
-        (
-            Classification {
-                decision: final_decision,
-                source,
-                operation: Some(operation),
-                matched_rule_id: rule_id,
-            },
-            srr_result.is_catch_all,
-        )
-    } else {
-        // Direct HTTP: Layer 2 Network SRR classification
-        let srr = match state.srr.read() {
-            Ok(guard) => guard,
-            Err(_) => {
-                tracing::error!("SRR lock poisoned — denying request (fail-close)");
-                append_proxy_wal_event(
-                    &state,
-                    request.method().as_str(),
-                    &target.host,
-                    &target.path,
-                    "unknown",
-                    "Deny (SRR lock poisoned)",
-                    500,
-                );
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Internal governance error — request denied (fail-close)",
-                );
-            }
-        };
-        let srr_result = srr.check(
-            request.method().as_str(),
-            &target.host,
-            &target.path,
-            body_for_srr,
-        );
-        drop(srr);
-
-        let is_catch_all = srr_result.is_catch_all;
         (
             Classification {
                 decision: srr_result.decision,
                 source: ClassificationSource::SRR,
-                operation: None,
+                operation,
                 matched_rule_id: srr_result.matched_description,
             },
-            is_catch_all,
+            srr_result.is_catch_all,
         )
     };
 
@@ -428,50 +357,6 @@ pub async fn proxy_handler(
                 .claim(&request_method, &target.host, &target.path, Some(agent_id));
 
         if claim.verified {
-            // ABAC re-evaluation with declared operation from intent
-            if let Some(ref operation_name) = claim.operation {
-                let shadow_agent_id = claim.agent_id.as_deref().unwrap_or(agent_id);
-                let shadow_op = OperationMetadata {
-                    operation: operation_name.clone(),
-                    resource: ResourceDescriptor::default(),
-                    subject: SubjectDescriptor {
-                        agent_id: shadow_agent_id.to_string(),
-                        tenant_id: None,
-                        session_id: shadow_agent_id.to_string(),
-                    },
-                    context: OperationContext {
-                        attributes: Default::default(),
-                    },
-                    payload: PayloadDescriptor::default(),
-                };
-                let (abac_decision, abac_rule) = match state.policy.read() {
-                    Ok(p) => p.evaluate(&shadow_op),
-                    Err(_) => (
-                        EnforcementDecision::Deny {
-                            reason: "Policy lock poisoned".into(),
-                        },
-                        None,
-                    ),
-                };
-
-                let combined = max_strict(classification.decision.clone(), abac_decision.clone());
-                if combined.strictness() > classification.decision.strictness() {
-                    tracing::warn!(
-                        operation = %operation_name,
-                        abac_decision = ?abac_decision,
-                        srr_decision = ?classification.decision,
-                        combined = ?combined,
-                        "Shadow ABAC re-evaluation upgraded decision"
-                    );
-                    classification = Classification {
-                        decision: combined,
-                        source: ClassificationSource::ABAC,
-                        operation: Some(shadow_op),
-                        matched_rule_id: abac_rule,
-                    };
-                    is_default_caution = false;
-                }
-            }
             Some(claim) // Pass to WAL write for confirm/release
         } else {
             match state.shadow_config.mode {
@@ -586,7 +471,7 @@ pub async fn proxy_handler(
     }
 
     // ── Step 4: Token budget check (LLM providers only) ──
-    // Budget enforcement is independent of SRR/ABAC — applies to all LLM requests.
+    // Budget enforcement is independent of SRR — applies to all LLM requests.
     let is_llm = llm_trace::identify_llm_provider(&target.host).is_some();
     if is_llm && state.token_budget.is_enabled() {
         if let Err(exceeded) = state.token_budget.check_and_reserve() {
@@ -952,7 +837,6 @@ fn inject_gvm_response_headers(
 ) {
     let decision_str = format!("{:?}", classification.decision);
     let source_str = match classification.source {
-        ClassificationSource::ABAC => "ABAC",
         ClassificationSource::SRR => "SRR",
     };
 
@@ -984,7 +868,7 @@ fn inject_gvm_response_headers(
     }
 }
 
-/// Build OperationMetadata from SDK headers for ABAC policy evaluation.
+/// Build OperationMetadata from SDK headers for audit trail recording.
 fn build_operation_metadata(headers: &GVMHeaders, _target: &Target) -> OperationMetadata {
     OperationMetadata {
         operation: headers.operation.clone(),
@@ -1063,7 +947,6 @@ fn build_event(
         decision_source: format!("{:?}", classification.source),
         matched_rule_id: classification.matched_rule_id.clone(),
         enforcement_point: match classification.source {
-            ClassificationSource::ABAC => "both".to_string(),
             ClassificationSource::SRR => "proxy".to_string(),
         },
         status: EventStatus::Pending,
@@ -1863,7 +1746,7 @@ mod tests {
             context: HashMap::new(),
             transport: None,
             decision: "Delay".to_string(),
-            decision_source: "ABAC".to_string(),
+            decision_source: "SRR".to_string(),
             matched_rule_id: None,
             enforcement_point: "proxy".to_string(),
             status: EventStatus::Pending,

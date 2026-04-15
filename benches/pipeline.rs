@@ -4,39 +4,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use gvm_proxy::ledger::Ledger;
-use gvm_proxy::policy::PolicyEngine;
 use gvm_proxy::srr::NetworkSRR;
 use gvm_proxy::types::*;
 use gvm_proxy::vault::Vault;
 
 // ─── Helpers ───
-
-fn make_operation(
-    op: &str,
-    sensitivity: Sensitivity,
-    tier: ResourceTier,
-    tenant: Option<&str>,
-    agent: &str,
-) -> OperationMetadata {
-    OperationMetadata {
-        operation: op.to_string(),
-        resource: ResourceDescriptor {
-            service: "bench".to_string(),
-            identifier: None,
-            tier,
-            sensitivity,
-        },
-        subject: SubjectDescriptor {
-            agent_id: agent.to_string(),
-            tenant_id: tenant.map(|s| s.to_string()),
-            session_id: "bench-session".to_string(),
-        },
-        context: OperationContext {
-            attributes: HashMap::new(),
-        },
-        payload: PayloadDescriptor::default(),
-    }
-}
 
 fn make_test_event(id: &str) -> GVMEvent {
     GVMEvent {
@@ -120,74 +92,7 @@ fn bench_srr(c: &mut Criterion) {
     group.finish();
 }
 
-// ═══════════════════════════════════════════════
-// 2. Policy Engine Benchmarks
-// ═══════════════════════════════════════════════
-
-fn bench_policy(c: &mut Criterion) {
-    let engine = PolicyEngine::load(Path::new("config/policies"))
-        .expect("valid policy configs must exist at config/policies");
-
-    let mut group = c.benchmark_group("policy");
-
-    // Simple Allow (read operation)
-    let op_read = make_operation(
-        "gvm.storage.read",
-        Sensitivity::Low,
-        ResourceTier::Internal,
-        None,
-        "bench-agent",
-    );
-    group.bench_function("allow_read", |b| {
-        b.iter(|| {
-            black_box(engine.evaluate(&op_read));
-        });
-    });
-
-    // Deny (delete critical)
-    let op_delete = make_operation(
-        "gvm.storage.delete",
-        Sensitivity::Critical,
-        ResourceTier::Internal,
-        None,
-        "bench-agent",
-    );
-    group.bench_function("deny_critical_delete", |b| {
-        b.iter(|| {
-            black_box(engine.evaluate(&op_delete));
-        });
-    });
-
-    // Payment (RequireApproval)
-    let op_payment = make_operation(
-        "gvm.payment.charge",
-        Sensitivity::High,
-        ResourceTier::External,
-        None,
-        "bench-agent",
-    );
-    group.bench_function("payment_require_approval", |b| {
-        b.iter(|| {
-            black_box(engine.evaluate(&op_payment));
-        });
-    });
-
-    // No match (falls through all rules)
-    let op_custom = make_operation(
-        "custom.vendor.obscure.action",
-        Sensitivity::Low,
-        ResourceTier::Internal,
-        None,
-        "bench-agent",
-    );
-    group.bench_function("no_match_fallthrough", |b| {
-        b.iter(|| {
-            black_box(engine.evaluate(&op_custom));
-        });
-    });
-
-    group.finish();
-}
+// bench_policy removed — ABAC system deleted.
 
 // ═══════════════════════════════════════════════
 // 3. max_strict() Benchmarks
@@ -351,54 +256,23 @@ fn bench_wal(c: &mut Criterion) {
 fn bench_classification(c: &mut Criterion) {
     let srr = NetworkSRR::load(Path::new("config/srr_network.toml"))
         .expect("valid SRR config must exist at config/srr_network.toml");
-    let policy = PolicyEngine::load(Path::new("config/policies"))
-        .expect("valid policy configs must exist at config/policies");
 
     let mut group = c.benchmark_group("classification_e2e");
 
-    // SDK-routed: ABAC + SRR + max_strict
-    group.bench_function("sdk_routed_full_pipeline", |b| {
-        let op = make_operation(
-            "gvm.payment.refund",
-            Sensitivity::High,
-            ResourceTier::External,
-            None,
-            "bench-agent",
-        );
-        b.iter(|| {
-            // Layer 1: ABAC
-            let (policy_decision, _rule_id) = policy.evaluate(&op);
-            // Layer 2: SRR
-            let srr_decision = srr.check("POST", "api.stripe.com", "/v1/refunds", None);
-            // Combine
-            let final_decision = max_strict(policy_decision, srr_decision.decision);
-            black_box(final_decision);
-        });
-    });
-
-    // Direct HTTP: SRR only
-    group.bench_function("direct_http_srr_only", |b| {
+    // SRR classification (deny path)
+    group.bench_function("srr_deny_path", |b| {
         b.iter(|| {
             let decision = srr.check("POST", "api.bank.com", "/transfer", None);
             black_box(decision);
         });
     });
 
-    // Full pipeline with payload
-    group.bench_function("full_pipeline_with_payload", |b| {
-        let op = make_operation(
-            "gvm.messaging.send",
-            Sensitivity::Medium,
-            ResourceTier::External,
-            None,
-            "bench-agent",
-        );
+    // SRR classification with payload
+    group.bench_function("srr_with_payload", |b| {
         let payload = br#"{"to":"user@example.com","subject":"Hello","body":"Test message"}"#;
         b.iter(|| {
-            let (policy_decision, _) = policy.evaluate(&op);
-            let srr_decision = srr.check("POST", "smtp.gmail.com", "/send", Some(payload));
-            let final_decision = max_strict(policy_decision, srr_decision.decision);
-            black_box(final_decision);
+            let decision = srr.check("POST", "smtp.gmail.com", "/send", Some(payload));
+            black_box(decision);
         });
     });
 
@@ -514,85 +388,7 @@ fn bench_srr_scale(c: &mut Criterion) {
     group.finish();
 }
 
-// ═══════════════════════════════════════════════
-// 9. Policy Scale Benchmarks (100/1K rules)
-// ═══════════════════════════════════════════════
-
-fn bench_policy_scale(c: &mut Criterion) {
-    let mut group = c.benchmark_group("policy_scale");
-
-    for rule_count in [100, 500, 1_000] {
-        let dir = tempfile::tempdir().expect("temp directory must be creatable for bench setup");
-        let policy_dir = dir.path().join("policies");
-        std::fs::create_dir(&policy_dir)
-            .expect("policy subdirectory must be creatable in temp dir");
-
-        let mut toml = String::new();
-        for i in 0..rule_count {
-            toml.push_str(&format!(
-                r#"
-[[rules]]
-id = "rule-{i}"
-priority = {i}
-layer = "Global"
-description = "Rule {i}"
-conditions = [
-    {{ field = "operation", operator = "Eq", value = "gvm.test.op{i}" }}
-]
-[rules.decision]
-type = "Deny"
-reason = "Matched {i}"
-"#,
-            ));
-        }
-        toml.push_str(
-            r#"
-[[rules]]
-id = "catch-all"
-priority = 99999
-layer = "Global"
-description = "Default"
-[rules.decision]
-type = "Allow"
-"#,
-        );
-
-        std::fs::write(policy_dir.join("global.toml"), &toml)
-            .expect("generated policy config must be writable to temp file");
-        let engine = PolicyEngine::load(&policy_dir)
-            .expect("generated policy config must parse as valid rules");
-
-        // Best case: first rule match
-        let op_first = make_operation(
-            "gvm.test.op0",
-            Sensitivity::Low,
-            ResourceTier::Internal,
-            None,
-            "bench",
-        );
-        group.bench_function(BenchmarkId::new("first_rule_match", rule_count), |b| {
-            b.iter(|| {
-                black_box(engine.evaluate(&op_first));
-            });
-        });
-
-        // Worst case: no match, falls through
-        let op_nomatch = make_operation(
-            "gvm.nomatch.ever",
-            Sensitivity::Low,
-            ResourceTier::Internal,
-            None,
-            "bench",
-        );
-        group.bench_function(BenchmarkId::new("fallthrough_all", rule_count), |b| {
-            b.iter(|| {
-                black_box(engine.evaluate(&op_nomatch));
-            });
-        });
-    }
-
-    group.finish();
-}
+// bench_policy_scale removed — ABAC system deleted.
 
 // ═══════════════════════════════════════════════
 // 10. IC-2 Delay Accuracy Benchmark
@@ -805,15 +601,6 @@ fn bench_wasm_vs_native(c: &mut Criterion) {
         // ── End-to-end latency breakdown: Wasm evaluate as % of full pipeline ──
         let srr = NetworkSRR::load(Path::new("config/srr_network.toml"))
             .expect("valid SRR config must exist for e2e bench");
-        let policy = PolicyEngine::load(Path::new("config/policies"))
-            .expect("valid policy configs must exist for e2e bench");
-        let op = make_operation(
-            "gvm.messaging.send",
-            Sensitivity::Medium,
-            ResourceTier::External,
-            None,
-            "bench-agent",
-        );
 
         // Full pipeline with Wasm: SRR + Wasm policy + max_strict
         group.bench_function("e2e_with_wasm", |b| {
@@ -824,16 +611,6 @@ fn bench_wasm_vs_native(c: &mut Criterion) {
                     .expect("wasm engine must evaluate valid request in e2e pipeline");
                 let (wasm_decision, _) = WasmEngine::response_to_decision(&wasm_resp);
                 let final_d = max_strict(wasm_decision, srr_decision.decision);
-                black_box(final_d);
-            });
-        });
-
-        // Full pipeline with Native: SRR + Native policy + max_strict
-        group.bench_function("e2e_with_native", |b| {
-            b.iter(|| {
-                let srr_decision = srr.check("POST", "smtp.gmail.com", "/send", None);
-                let (policy_decision, _) = policy.evaluate(&op);
-                let final_d = max_strict(policy_decision, srr_decision.decision);
                 black_box(final_d);
             });
         });
@@ -1480,14 +1257,12 @@ fn bench_ebpf_setup(c: &mut Criterion) {
 criterion_group!(
     native_benches,
     bench_srr,
-    bench_policy,
     bench_max_strict,
     bench_vault,
     bench_wal,
     bench_wal_group_commit,
     bench_classification,
     bench_srr_scale,
-    bench_policy_scale,
     bench_ic2_delay_accuracy,
     bench_vault_large,
     bench_rate_limiter,

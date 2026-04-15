@@ -10,7 +10,7 @@
 
 ### Current (v0.5.0)
 
-HTTP enforcement proxy (Rust/axum/tower) with 3-layer architecture (ABAC + SRR + API key isolation), IC classification (Allow/Delay/RequireApproval/Deny), Merkle tree audit ledger with WAL group commit, AES-256-GCM encrypted state cache, Wasm runtime (optional, behind `--features wasm`), rate limiter, JWT agent identity, TC ingress filter (kernel-level proxy enforcement), seccomp BPF sandbox with dual filter stacking, DNS soft governance (4-tier delay + alert), filesystem governance (overlayfs Trust-on-Pattern), IC-3 human approval workflow (admin port separation), MITM TLS proxy (sole HTTPS inspection mechanism — uprobe removed).
+HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key isolation, IC classification (Allow/Delay/RequireApproval/Deny), Merkle tree audit ledger with WAL group commit, AES-256-GCM encrypted state cache, Wasm runtime (optional, behind `--features wasm`), JWT agent identity, TC ingress filter (kernel-level proxy enforcement), seccomp BPF sandbox with dual filter stacking, DNS soft governance (4-tier delay + alert), filesystem governance (overlayfs Trust-on-Pattern), IC-3 human approval workflow (admin port separation), MITM TLS proxy (sole HTTPS inspection mechanism — uprobe removed).
 
 **Release history**: v0.2 (Shadow Mode, CONNECT tunnel, SRR hot-reload, MITM), v0.3 (sandbox cleanup, overlayfs, seccomp audit), v0.4 (IC-3 approval, stress testing, contained mode), v0.5 (DNS governance, placeholder credentials, proxy hardening).
 
@@ -23,7 +23,7 @@ HTTP enforcement proxy (Rust/axum/tower) with 3-layer architecture (ABAC + SRR +
 - Overlayfs inotify-based real-time scan (event-driven alternative to periodic)
 
 **v1.1 — Hardening**
-- ABAC hot-path execution via Wasm engine
+- SRR hot-path execution via Wasm engine
 - Ed25519 module signature verification + hash pinning
 - Decimal-based numeric comparison for financial precision
 - HashMap/Trie index for O(1) SRR host+method lookup
@@ -51,6 +51,26 @@ HTTP enforcement proxy (Rust/axum/tower) with 3-layer architecture (ABAC + SRR +
 ---
 
 ## Implementation Log
+
+### 2026-04-16: Remove ABAC (PolicyEngine) system entirely
+
+**What changed:**
+1. Deleted `src/policy.rs` and `config/policies/` directory.
+2. Removed `ABAC` variant from `ClassificationSource` enum in `gvm-types` (only `SRR` remains).
+3. Removed `policy` and `policy_dir` fields from `AppState`.
+4. Rewrote `enforcement.rs` to SRR-only classification (removed ABAC+SRR max_strict merging).
+5. Simplified `proxy_handler` in `proxy.rs`: unified SRR-only classification block, removed shadow ABAC re-evaluation.
+6. Removed PolicyEngine::load from `main.rs` startup and `api.rs` reload handler.
+7. Made `PoliciesConfig` optional in `config.rs` (backward-compatible with existing proxy.toml).
+8. Deleted all ABAC-specific tests (policy hierarchy, attribute omission bypass, policy conflict detection, 1K rule stress, 100-tenant hierarchy).
+9. Removed ABAC benchmark functions from `benches/pipeline.rs`.
+10. Updated all comments, CLI help text, and startup banner to remove ABAC references.
+
+**Why:** ABAC provides no value over SRR because SRR already inspects actual outbound traffic (method+host+path+payload). ABAC relies on agent self-declaration via SDK headers which can be spoofed or omitted. Removing it simplifies the codebase and eliminates a false sense of security.
+
+**Affected files:** `src/policy.rs` (deleted), `src/lib.rs`, `src/proxy.rs`, `src/enforcement.rs`, `src/main.rs`, `src/api.rs`, `src/config.rs`, `src/tls_proxy.rs`, `src/tls_proxy_hyper.rs`, `crates/gvm-types/src/lib.rs`, `crates/gvm-cli/src/main.rs`, `crates/gvm-cli/src/reload.rs`, `benches/pipeline.rs`, `tests/integration.rs`, `tests/hostile.rs`, `tests/edge_cases.rs`, `tests/stress.rs`, `tests/boundary.rs`, `config/policies/` (deleted).
+
+**Risk:** Medium. This is a large structural refactor touching enforcement, proxy, API, CLI, tests, and benchmarks. All compilation verified. No behavioral change for SRR-only enforcement (which was already the primary path for all non-SDK traffic). Existing proxy.toml files with `[policies]` section will parse without error (field made optional).
 
 ### 2026-04-15: hermes-agent validation + sandbox path remapping
 

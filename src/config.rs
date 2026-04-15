@@ -12,7 +12,9 @@ pub struct ProxyConfig {
     pub nats: NatsConfig,
     pub redis: RedisConfig,
     pub srr: SrrConfig,
-    pub policies: PoliciesConfig,
+    /// Legacy ABAC policy config. Ignored (ABAC removed). Kept as optional
+    /// so existing proxy.toml files with [policies] section still parse.
+    pub policies: Option<PoliciesConfig>,
     pub operations: OperationsConfig,
     pub secrets: SecretsConfig,
     pub dev: Option<DevConfig>,
@@ -408,10 +410,7 @@ impl Default for ProxyConfig {
                 payload_inspection: false,
                 max_body_bytes: default_max_body_bytes(),
             },
-            policies: PoliciesConfig {
-                directory: "config/policies/".to_string(),
-                hot_reload: true,
-            },
+            policies: None,
             operations: OperationsConfig {
                 registry_file: "config/operation_registry.toml".to_string(),
             },

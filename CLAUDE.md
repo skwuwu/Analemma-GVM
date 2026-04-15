@@ -43,9 +43,9 @@ Full specification: `docs/internal/GVM_CODE_STANDARDS.md`
 
 ### Deterministic Design
 
-- **Same input → same decision**: Policy evaluation is pure. No time/cache/history dependence (except rate limiter, which is explicitly stateful).
-- **Layer independence**: ABAC and SRR evaluate independently. Combine only via `max_strict()`. This enables semantic forgery detection.
-- **Decision ordering**: Allow(0) < AuditOnly(1) < Throttle(2) < Delay(3) < RequireApproval(4) < Deny(5). Total, deterministic, documented.
+- **Same input → same decision**: Policy evaluation is pure. No time/cache/history dependence (except token budget, which is explicitly stateful).
+- **SRR is the sole enforcement layer**: All governance decisions come from SRR (network pattern matching on actual outbound traffic). No reliance on agent self-declaration.
+- **Decision ordering**: Allow(0) < AuditOnly(1) < Delay(2) < RequireApproval(3) < Deny(4). Total, deterministic, documented.
 - **No hidden state**: Every decision-relevant input must appear in the WAL event.
 
 ### Concurrency
@@ -67,7 +67,7 @@ Full specification: `docs/internal/GVM_CODE_STANDARDS.md`
 ### Code Reuse & Anti-Fragmentation
 
 - **Single source of truth**: Before adding new logic, search for existing implementations of the same or similar functionality. Reuse and extend, never duplicate.
-- **Enforcement parity**: Any governance logic (ABAC, SRR, rate limiter, WAL audit, IC-3 approval) must be implemented in ONE shared function callable from all request paths (HTTP proxy, MITM TLS, future gRPC). Never copy enforcement code between handlers.
+- **Enforcement parity**: Any governance logic (SRR, token budget, WAL audit, IC-3 approval) must be implemented in ONE shared function callable from all request paths (HTTP proxy, MITM TLS, future gRPC). Never copy enforcement code between handlers.
 - **Interpreter/config detection**: Use shared utility functions (e.g., `detect_interpreter()`, `resolve_host_dns()`). New call sites must call the existing function, not re-implement the logic.
 - **Pipeline pattern**: Agent launch flows (cooperative, sandbox, contained) should go through `pipeline.rs` (`pre_launch` → `launch` → `post_exit_audit`). Do not add new launch paths that bypass the pipeline.
 - **State file contract**: All sandbox resources (veth, mounts, iptables, cgroups, DNS target) must be recorded in the per-PID state file for deterministic cleanup. Never rely on re-resolving runtime state during cleanup.

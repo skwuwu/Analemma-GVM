@@ -657,7 +657,7 @@ async fn handle_mitm_stream_legacy<S: tokio::io::AsyncRead + tokio::io::AsyncWri
             break;
         }
 
-        // 2. Unified classification (ABAC + SRR via enforcement::classify).
+        // 2. Unified classification (SRR via enforcement::classify).
         // This ensures MITM path has the same enforcement logic as proxy_handler.
         let body_ref = if req.body.is_empty() {
             None

@@ -3,11 +3,10 @@
 //! Categories:
 //! 1. Input boundaries: empty body, binary body, null bytes, unicode, huge headers
 //! 2. Missing/partial GVM headers: Layer 2 fallback behavior
-//! 3. Policy edge cases: no match, conflicting layers, SRR vs policy disagreement
+//! 3. Enforcement edge cases: max_strict ordering, SRR disagreement
 //! 4. EventStatus transitions: concurrent updates, forward failure simulation
 
 use gvm_proxy::ledger::Ledger;
-use gvm_proxy::policy::PolicyEngine;
 use gvm_proxy::srr::NetworkSRR;
 use gvm_proxy::types::*;
 use std::collections::HashMap;
@@ -22,32 +21,6 @@ fn srr_from_toml(toml_str: &str) -> NetworkSRR {
     NetworkSRR::load(&path).expect("valid SRR toml must parse")
 }
 
-fn make_operation(
-    op: &str,
-    sensitivity: Sensitivity,
-    tier: ResourceTier,
-    tenant: Option<&str>,
-    agent: &str,
-) -> OperationMetadata {
-    OperationMetadata {
-        operation: op.to_string(),
-        resource: ResourceDescriptor {
-            service: "test".to_string(),
-            identifier: None,
-            tier,
-            sensitivity,
-        },
-        subject: SubjectDescriptor {
-            agent_id: agent.to_string(),
-            tenant_id: tenant.map(|s| s.to_string()),
-            session_id: "test-session".to_string(),
-        },
-        context: OperationContext {
-            attributes: HashMap::new(),
-        },
-        payload: PayloadDescriptor::default(),
-    }
-}
 
 // ═══════════════════════════════════════════════════════════════════
 // 1. INPUT BOUNDARIES — SRR
@@ -152,46 +125,7 @@ decision = { type = "Delay", milliseconds = 300 }
     );
 }
 
-/// Unicode operation name — policy evaluation must handle safely.
-#[test]
-fn edge_unicode_operation_name() {
-    let dir = tempfile::tempdir().expect("temp directory creation must succeed");
-    let policy_dir = dir.path().join("policies");
-    std::fs::create_dir(&policy_dir).expect("policy directory creation must succeed");
-
-    std::fs::write(
-        policy_dir.join("global.toml"),
-        r#"
-[[rules]]
-id = "catch-all"
-priority = 999
-layer = "Global"
-description = "Default delay"
-[rules.decision]
-type = "Delay"
-milliseconds = 300
-"#,
-    )
-    .expect("writing policy toml to temp file must succeed");
-
-    let engine = PolicyEngine::load(&policy_dir).expect("valid policy directory must load");
-
-    // Unicode operation name (Korean + emoji)
-    let op = make_operation(
-        "custom.vendor.한글.작업",
-        Sensitivity::Low,
-        ResourceTier::Internal,
-        None,
-        "agent",
-    );
-
-    // Should not panic, should hit catch-all
-    let (decision, _) = engine.evaluate(&op);
-    assert!(
-        matches!(decision, EnforcementDecision::Delay { .. }),
-        "Unicode operation should safely fall through to catch-all"
-    );
-}
+// edge_unicode_operation_name removed — ABAC system deleted.
 
 /// SRR with very long host and path — no allocation panic.
 #[test]
@@ -258,112 +192,8 @@ decision = { type = "Delay", milliseconds = 300 }
 // 3. POLICY EDGE CASES
 // ═══════════════════════════════════════════════════════════════════
 
-/// No rules match any condition — engine should return Allow (default).
-#[test]
-fn edge_policy_no_match_returns_allow() {
-    let dir = tempfile::tempdir().expect("temp directory creation must succeed");
-    let policy_dir = dir.path().join("policies");
-    std::fs::create_dir(&policy_dir).expect("policy directory creation must succeed");
-
-    // Only very specific rules that won't match our test operation
-    std::fs::write(
-        policy_dir.join("global.toml"),
-        r#"
-[[rules]]
-id = "very-specific"
-priority = 1
-layer = "Global"
-description = "Only matches one specific operation"
-conditions = [
-    { field = "operation", operator = "Eq", value = "gvm.very.specific.op.that.nobody.calls" }
-]
-[rules.decision]
-type = "Deny"
-reason = "Blocked"
-"#,
-    )
-    .expect("writing policy toml to temp file must succeed");
-
-    let engine = PolicyEngine::load(&policy_dir).expect("valid policy directory must load");
-
-    let op = make_operation(
-        "gvm.storage.read",
-        Sensitivity::Low,
-        ResourceTier::Internal,
-        None,
-        "agent",
-    );
-    let (decision, rule_id) = engine.evaluate(&op);
-
-    // No match → default Allow
-    assert!(
-        matches!(decision, EnforcementDecision::Allow),
-        "No-match should return Allow, got: {:?}",
-        decision
-    );
-    assert!(rule_id.is_none(), "No rule should match");
-}
-
-/// Global says Allow, Tenant says Deny — Deny must win (strictness rule).
-#[test]
-fn edge_policy_conflicting_layers_deny_wins() {
-    let dir = tempfile::tempdir().expect("temp directory creation must succeed");
-    let policy_dir = dir.path().join("policies");
-    std::fs::create_dir(&policy_dir).expect("policy directory creation must succeed");
-
-    std::fs::write(
-        policy_dir.join("global.toml"),
-        r#"
-[[rules]]
-id = "global-allow-read"
-priority = 50
-layer = "Global"
-description = "Allow all reads"
-conditions = [
-    { field = "operation", operator = "EndsWith", value = ".read" }
-]
-[rules.decision]
-type = "Allow"
-"#,
-    )
-    .expect("writing global policy toml must succeed");
-
-    std::fs::write(
-        policy_dir.join("tenant-restricted.toml"),
-        r#"
-[[rules]]
-id = "tenant-deny-all"
-priority = 1
-layer = "Tenant"
-description = "Deny everything for restricted tenant"
-[rules.decision]
-type = "Deny"
-reason = "Tenant suspended"
-"#,
-    )
-    .expect("writing tenant policy toml must succeed");
-
-    let engine = PolicyEngine::load(&policy_dir).expect("valid policy directory must load");
-
-    let op = make_operation(
-        "gvm.storage.read",
-        Sensitivity::Low,
-        ResourceTier::Internal,
-        Some("restricted"),
-        "agent",
-    );
-    let (decision, rule_id) = engine.evaluate(&op);
-
-    assert!(
-        matches!(decision, EnforcementDecision::Deny { .. }),
-        "Tenant Deny must override Global Allow, got: {:?}",
-        decision
-    );
-    assert_eq!(
-        rule_id.expect("tenant deny rule must match"),
-        "tenant-deny-all"
-    );
-}
+// edge_policy_no_match_returns_allow and edge_policy_conflicting_layers_deny_wins
+// removed — ABAC system deleted.
 
 /// SRR says Allow, Policy says Deny — max_strict should pick Deny.
 #[test]
@@ -441,59 +271,8 @@ fn edge_max_strict_strictness_ordering_complete() {
     }
 }
 
-/// Empty policy directory — PolicyEngine returns Allow (no rules = no restrictions).
-///
-/// This is intentional and NOT a Fail-Open gap: the system-level decision is
-/// max_strict(policy_decision, srr_decision). SRR provides Default-to-Caution
-/// (Delay 300ms) for uncategorized hosts, so the overall system remains Fail-Close
-/// even when PolicyEngine has zero rules. The PolicyEngine itself only evaluates
-/// ABAC rules and correctly returns "no match = Allow" for its layer.
-#[test]
-fn edge_empty_policy_directory() {
-    let dir = tempfile::tempdir().expect("temp directory creation must succeed");
-    let policy_dir = dir.path().join("policies");
-    std::fs::create_dir(&policy_dir).expect("policy directory creation must succeed");
-
-    // Empty directory — no TOML files
-    let engine = PolicyEngine::load(&policy_dir).expect("empty policy directory must load");
-
-    let op = make_operation(
-        "gvm.storage.delete",
-        Sensitivity::Critical,
-        ResourceTier::External,
-        None,
-        "agent",
-    );
-    let (decision, _) = engine.evaluate(&op);
-
-    assert!(
-        matches!(decision, EnforcementDecision::Allow),
-        "Empty policy should return Allow, got: {:?}",
-        decision
-    );
-}
-
-/// Non-existent policy directory — engine should handle gracefully.
-#[test]
-fn edge_nonexistent_policy_directory() {
-    let dir = tempfile::tempdir().expect("temp directory creation must succeed");
-    let policy_dir = dir.path().join("does-not-exist");
-
-    // Should not panic — returns empty engine
-    let engine = PolicyEngine::load(&policy_dir)
-        .expect("nonexistent policy directory must return empty engine");
-
-    let op = make_operation(
-        "gvm.storage.read",
-        Sensitivity::Low,
-        ResourceTier::Internal,
-        None,
-        "agent",
-    );
-    let (decision, _) = engine.evaluate(&op);
-
-    assert!(matches!(decision, EnforcementDecision::Allow));
-}
+// edge_empty_policy_directory and edge_nonexistent_policy_directory
+// removed — ABAC system deleted.
 
 // ═══════════════════════════════════════════════════════════════════
 // 4. EVENT STATUS EDGE CASES

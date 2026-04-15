@@ -640,7 +640,7 @@ pub struct CheckRequest {
     pub target_path: String,
     #[serde(default = "default_method")]
     pub method: String,
-    /// Agent ID for ABAC evaluation. Defaults to "dry-run".
+    /// Agent ID for governance evaluation. Defaults to "dry-run".
     #[serde(default = "default_agent_id")]
     pub agent_id: String,
 }
@@ -671,7 +671,7 @@ pub async fn check(
 ) -> Response<Body> {
     let t0 = std::time::Instant::now();
 
-    // Build GVM headers for ABAC evaluation (if operation is meaningful)
+    // Build GVM headers for governance evaluation (if operation is meaningful)
     let gvm_headers = if body.operation != "unknown" && body.operation != "test" {
         Some(crate::types::GVMHeaders {
             agent_id: body.agent_id.clone(),
@@ -717,31 +717,6 @@ pub async fn check(
     let decision = &output.classification.decision;
     let source = &output.classification.source;
 
-    // Reconstruct per-layer decisions for decision path visualization
-    // (read locks are cheap — already released by classify())
-    let policy_decision_str = if let Some(gvm_h) = gvm_headers.as_ref() {
-        let op = crate::types::OperationMetadata {
-            operation: gvm_h.operation.clone(),
-            resource: gvm_h.resource.clone().unwrap_or_default(),
-            subject: crate::types::SubjectDescriptor {
-                agent_id: gvm_h.agent_id.clone(),
-                tenant_id: None,
-                session_id: "dry-run".to_string(),
-            },
-            context: crate::types::OperationContext {
-                attributes: Default::default(),
-            },
-            payload: crate::types::PayloadDescriptor::default(),
-        };
-        state
-            .policy
-            .read()
-            .ok()
-            .map(|p| format!("{:?}", p.evaluate(&op).0))
-            .unwrap_or_else(|| "error".to_string())
-    } else {
-        "N/A (no operation)".to_string()
-    };
     let srr_decision_str = state
         .srr
         .read()
@@ -774,17 +749,12 @@ pub async fn check(
         _ => (format!("{:?}", decision), None),
     };
 
-    // Decision path: shows how max_strict() combined the per-layer decisions.
-    let decision_path = format!(
-        "Policy({}) + SRR({}) → Final({})",
-        policy_decision_str, srr_decision_str, decision_str
-    );
+    let decision_path = format!("SRR({}) → Final({})", srr_decision_str, decision_str);
 
     let mut resp = serde_json::json!({
         "decision": decision_str,
         "decision_source": format!("{:?}", source),
         "decision_path": decision_path,
-        "policy_decision": policy_decision_str,
         "srr_decision": srr_decision_str,
         "engine_us": (elapsed * 1000.0).round(), // microseconds for precision
         "engine_ms": (elapsed * 10.0).round() / 10.0,
@@ -916,11 +886,10 @@ pub async fn register_intent(
 
 /// POST /gvm/reload — Reload SRR rules from config file without restarting.
 ///
-/// Atomically reloads all governance components: SRR rules, ABAC policies,
-/// and operation registry. If any component fails to parse, ALL existing
-/// configurations are preserved (atomic: all-or-nothing).
+/// Atomically reloads all governance components: SRR rules and operation registry.
+/// If any component fails to parse, ALL existing configurations are preserved
+/// (atomic: all-or-nothing).
 pub async fn reload_srr(State(state): State<AppState>) -> Response<Body> {
-    use crate::policy::PolicyEngine;
     use crate::registry::OperationRegistry;
     use crate::srr::NetworkSRR;
     use std::path::Path;
@@ -936,20 +905,6 @@ pub async fn reload_srr(State(state): State<AppState>) -> Response<Body> {
                 &serde_json::json!({
                     "reloaded": false,
                     "error": format!("SRR parse failed: {}. All configs preserved.", e),
-                }),
-            );
-        }
-    };
-
-    let new_policy = match PolicyEngine::load(Path::new(&state.policy_dir)) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!(error = %e, "Policy reload parse failed — all configs preserved");
-            return json_response(
-                StatusCode::BAD_REQUEST,
-                &serde_json::json!({
-                    "reloaded": false,
-                    "error": format!("Policy parse failed: {}. All configs preserved.", e),
                 }),
             );
         }
@@ -984,33 +939,27 @@ pub async fn reload_srr(State(state): State<AppState>) -> Response<Body> {
         Ok(g) => g,
         Err(_) => return lock_err("SRR"),
     };
-    let mut policy_guard = match state.policy.write() {
-        Ok(g) => g,
-        Err(_) => return lock_err("Policy"),
-    };
     let mut registry_guard = match state.registry.write() {
         Ok(g) => g,
         Err(_) => return lock_err("Registry"),
     };
 
     *srr_guard = new_srr;
-    *policy_guard = new_policy;
     *registry_guard = new_registry;
 
     drop(srr_guard);
-    drop(policy_guard);
     drop(registry_guard);
 
     tracing::info!(
         srr_rules = srr_count,
-        "Governance hot-reloaded (SRR + ABAC + Registry)"
+        "Governance hot-reloaded (SRR + Registry)"
     );
     json_response(
         StatusCode::OK,
         &serde_json::json!({
             "reloaded": true,
             "srr_rules": srr_count,
-            "components": ["srr", "policy", "registry"],
+            "components": ["srr", "registry"],
         }),
     )
 }
@@ -1192,7 +1141,7 @@ pub async fn info(State(state): State<AppState>) -> Response<Body> {
             "version": env!("CARGO_PKG_VERSION"),
             "components": {
                 "srr": "loaded",
-                "policy_engine": "loaded",
+                "srr_engine": "loaded",
                 "registry": "loaded",
                 "vault": "active",
                 "ledger": "active",

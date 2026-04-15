@@ -627,7 +627,7 @@ fn ssrf_cloud_metadata_blocked_by_srr() {
 
 #[test]
 fn ssrf_max_strict_srr_deny_overrides_policy_allow() {
-    // Even if the ABAC policy says Allow (e.g., read_inbox is safe),
+    // Even if a policy says Allow (e.g., read_inbox is safe),
     // SRR Deny for localhost must win via max_strict.
     let srr_deny = EnforcementDecision::Deny {
         reason: "SSRF blocked".to_string(),

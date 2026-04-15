@@ -34,7 +34,7 @@ pub struct EvalRequest {
     pub resource: ResourceAttrs,
     /// Subject (who is performing the operation)
     pub subject: SubjectAttrs,
-    /// Context attributes for ABAC condition matching (e.g., amount, currency).
+    /// Context attributes for condition matching (e.g., amount, currency).
     #[serde(default)]
     pub context: ContextAttrs,
     /// Rules to evaluate against
@@ -55,7 +55,7 @@ pub struct SubjectAttrs {
     pub tenant_id: Option<String>,
 }
 
-/// Context attributes for ABAC condition matching (e.g., amount, currency, time_of_day).
+/// Context attributes for condition matching (e.g., amount, currency, time_of_day).
 /// Flattened into the field map with "context." prefix so policies can match on
 /// `context.amount > 500` or `context.currency == "USD"`.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -271,7 +271,7 @@ fn condition_matches(cond: &Condition, fields: &HashMap<String, serde_json::Valu
     };
 
     // Normalize operator to lowercase for case-insensitive matching.
-    // The host policy.rs uses PascalCase ("Eq", "StartsWith") while the
+    // The host enforcement uses PascalCase ("Eq", "StartsWith") while the
     // canonical Wasm format is snake_case ("eq", "starts_with"). Accepting
     // both prevents silent Fail-Close when operators are passed without
     // case conversion.
