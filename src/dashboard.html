@@ -69,9 +69,9 @@ tailwind.config = { theme: { extend: { fontFamily: { mono: ['JetBrains Mono', 'm
       <div class="text-[10px] text-slate-600 uppercase tracking-wider mb-2">Requests</div>
       <div class="text-xl font-semibold text-slate-200 mono" id="m-total">0</div>
     </div>
-    <div class="bg-slate-900/40 border border-slate-800/40 rounded-lg px-5 py-4">
-      <div class="text-[10px] text-slate-600 uppercase tracking-wider mb-2">Throughput</div>
-      <div class="text-xl font-semibold text-slate-200 mono" id="m-rps">0.0 <span class="text-xs text-slate-600">req/s</span></div>
+    <div class="bg-slate-900/40 border border-green-900/20 rounded-lg px-5 py-4">
+      <div class="text-[10px] text-slate-600 uppercase tracking-wider mb-2">Allowed</div>
+      <div class="text-xl font-semibold text-green-500 mono" id="m-allowed">0</div>
     </div>
     <div class="bg-slate-900/40 border border-red-900/30 rounded-lg px-5 py-4">
       <div class="text-[10px] text-slate-600 uppercase tracking-wider mb-2">Blocked</div>
@@ -246,8 +246,14 @@ function renderStats(s){
   const up=s.uptime_secs||0,rps=up>0?(s.total_requests/up).toFixed(1):'0.0';
   const dec=s.decisions||{},al=dec.Allow||0,dl=dec.Delay||0,dn=dec.Deny||0,tot=al+dl+dn;
 
-  document.getElementById('m-total').textContent=tot;
-  document.getElementById('m-rps').innerHTML=`${rps} <span class="text-xs text-slate-600">req/s</span>`;
+  // proxy_total includes all requests (including Allow/IC-1 not in WAL)
+  const proxyTotal = s.proxy_total || tot;
+  // Allowed = proxy total minus delayed/denied (which are in WAL)
+  const walDelayDeny = (dl + dn);
+  const allowed = proxyTotal > walDelayDeny ? proxyTotal - walDelayDeny : al;
+
+  document.getElementById('m-total').textContent=proxyTotal;
+  document.getElementById('m-allowed').textContent=allowed;
   document.getElementById('m-cost').textContent=`$${(s.llm?.estimated_cost_usd||0).toFixed(4)}`;
   document.getElementById('subtitle').textContent=`Uptime ${fmtDur(up)}`;
 

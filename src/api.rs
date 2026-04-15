@@ -1469,7 +1469,8 @@ pub async fn dashboard_stats(
         },
         "denied_rules": denied_rules,
         "uptime_secs": state.start_time.elapsed().as_secs_f64(),
-        "wal_offset": file_len
+        "wal_offset": file_len,
+        "proxy_total": state.request_counter.load(std::sync::atomic::Ordering::Relaxed)
     }))
 }
 
