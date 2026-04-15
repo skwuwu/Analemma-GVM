@@ -26,6 +26,13 @@
   #events-body tr { transition: background 0.12s, opacity 0.2s; }
   #events-body tr:hover { opacity: 1 !important; background: rgba(148,163,184,0.04); }
 
+  /* Dark scrollbar for events panel */
+  #events-container::-webkit-scrollbar { width: 6px; }
+  #events-container::-webkit-scrollbar-track { background: transparent; }
+  #events-container::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 3px; }
+  #events-container::-webkit-scrollbar-thumb:hover { background: #334155; }
+  #events-container { scrollbar-width: thin; scrollbar-color: #1e293b transparent; }
+
   /* Flash animation for blocked counter */
   @keyframes flash-red { 0%{color:#ef4444;text-shadow:0 0 8px rgba(239,68,68,0.6)} 100%{color:#f87171;text-shadow:none} }
   .flash-blocked { animation: flash-red 0.6s ease-out; }
