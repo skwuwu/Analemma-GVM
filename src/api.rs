@@ -1221,3 +1221,263 @@ fn json_response(status: StatusCode, body: &serde_json::Value) -> Response<Body>
                 .expect("fallback 500 response with empty body cannot fail")
         })
 }
+
+// ─── Dashboard ───
+
+/// Serve the dashboard HTML page.
+pub async fn dashboard() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/html; charset=utf-8")
+        .body(Body::from(include_str!("dashboard.html")))
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("dashboard unavailable"))
+                .expect("fallback response")
+        })
+}
+
+#[derive(Deserialize)]
+pub struct DashboardEventsQuery {
+    since_offset: Option<u64>,
+    limit: Option<usize>,
+}
+
+/// Return WAL events as JSON, incrementally from a byte offset.
+pub async fn dashboard_events(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<DashboardEventsQuery>,
+) -> Json<serde_json::Value> {
+    let offset = query.since_offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(100).min(500);
+
+    let wal_path = &state.wal_path;
+    let file = match std::fs::File::open(wal_path) {
+        Ok(f) => f,
+        Err(_) => {
+            return Json(serde_json::json!({
+                "events": [],
+                "next_offset": 0,
+                "total_in_wal": 0
+            }));
+        }
+    };
+
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if file_len <= offset {
+        return Json(serde_json::json!({
+            "events": [],
+            "next_offset": offset,
+            "total_in_wal": file_len
+        }));
+    }
+
+    use std::io::{BufRead, Seek, SeekFrom};
+    let mut reader = std::io::BufReader::new(file);
+    if offset > 0 {
+        let _ = reader.seek(SeekFrom::Start(offset));
+    }
+
+    let mut events = Vec::new();
+    let mut current_offset = offset;
+    let mut current_batch_id: Option<u64> = None;
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        current_offset += line.len() as u64 + 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            // Track batch IDs from MerkleBatchRecord lines
+            if parsed.get("batch_id").is_some() && parsed.get("merkle_root").is_some() {
+                current_batch_id = parsed.get("batch_id").and_then(|v| v.as_u64());
+                continue;
+            }
+
+            // Skip non-event lines
+            if parsed.get("event_id").is_none() {
+                continue;
+            }
+
+            // Attach batch_id from the preceding batch record
+            let mut event = parsed;
+            if let Some(bid) = current_batch_id {
+                event
+                    .as_object_mut()
+                    .map(|o| o.insert("batch_id".to_string(), serde_json::json!(bid)));
+            }
+
+            events.push(event);
+            if events.len() >= limit {
+                break;
+            }
+        }
+    }
+
+    Json(serde_json::json!({
+        "events": events,
+        "next_offset": current_offset,
+        "total_in_wal": file_len
+    }))
+}
+
+/// Return aggregated WAL statistics as JSON.
+pub async fn dashboard_stats(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let wal_path = &state.wal_path;
+    let file = match std::fs::File::open(wal_path) {
+        Ok(f) => f,
+        Err(_) => {
+            return Json(serde_json::json!({
+                "total_requests": 0,
+                "hosts": {},
+                "decisions": {},
+                "status_codes": {},
+                "llm": { "total_tokens": 0, "estimated_cost_usd": 0.0, "models": [], "calls": 0 },
+                "denied_rules": {},
+                "uptime_secs": state.start_time.elapsed().as_secs_f64(),
+                "wal_offset": 0
+            }));
+        }
+    };
+
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+
+    use std::io::BufRead;
+    let reader = std::io::BufReader::new(file);
+
+    let mut total: u64 = 0;
+    let mut hosts: HashMap<String, u64> = HashMap::new();
+    let mut decisions: HashMap<String, u64> = HashMap::new();
+    let mut status_codes: HashMap<String, u64> = HashMap::new();
+    let mut denied_rules: HashMap<String, u64> = HashMap::new();
+    let mut llm_tokens: u64 = 0;
+    let mut llm_calls: u64 = 0;
+    let mut llm_cost: f64 = 0.0;
+    let mut models: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Skip batch records
+        if parsed.get("batch_id").is_some() && parsed.get("merkle_root").is_some() {
+            continue;
+        }
+
+        // Dedup by event_id
+        let event_id = parsed.get("event_id").and_then(|v| v.as_str()).unwrap_or("");
+        if event_id.is_empty() || !seen_ids.insert(event_id.to_string()) {
+            continue;
+        }
+
+        total += 1;
+
+        if let Some(host) = parsed.pointer("/transport/host").and_then(|v| v.as_str()) {
+            *hosts.entry(host.to_string()).or_default() += 1;
+        }
+
+        if let Some(decision) = parsed.get("decision").and_then(|v| v.as_str()) {
+            let bucket = if decision.contains("Allow") {
+                "Allow"
+            } else if decision.contains("Delay") {
+                "Delay"
+            } else if decision.contains("Deny") {
+                "Deny"
+            } else {
+                "Other"
+            };
+            *decisions.entry(bucket.to_string()).or_default() += 1;
+
+            if decision.contains("Deny") {
+                let rule = parsed
+                    .get("matched_rule_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(unknown)");
+                *denied_rules.entry(rule.to_string()).or_default() += 1;
+            }
+        }
+
+        if let Some(code) = parsed.pointer("/transport/status_code").and_then(|v| v.as_u64()) {
+            *status_codes.entry(code.to_string()).or_default() += 1;
+        }
+
+        if let Some(trace) = parsed.get("llm_trace") {
+            llm_calls += 1;
+            if let Some(model) = trace.get("model").and_then(|v| v.as_str()) {
+                models.insert(model.to_string());
+            }
+            if let Some(usage) = trace.get("usage") {
+                let prompt = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                let completion = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                llm_tokens += prompt + completion;
+
+                let provider = trace.get("provider").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let model_name = trace.get("model").and_then(|v| v.as_str());
+                llm_cost += estimate_llm_cost(provider, model_name, prompt, completion);
+            }
+        }
+    }
+
+    Json(serde_json::json!({
+        "total_requests": total,
+        "hosts": hosts,
+        "decisions": decisions,
+        "status_codes": status_codes,
+        "llm": {
+            "total_tokens": llm_tokens,
+            "estimated_cost_usd": llm_cost,
+            "models": models.into_iter().collect::<Vec<_>>(),
+            "calls": llm_calls
+        },
+        "denied_rules": denied_rules,
+        "uptime_secs": state.start_time.elapsed().as_secs_f64(),
+        "wal_offset": file_len
+    }))
+}
+
+/// Approximate LLM cost estimation (same logic as gvm-cli watch).
+fn estimate_llm_cost(provider: &str, model: Option<&str>, prompt: u64, completion: u64) -> f64 {
+    let (input_rate, output_rate) = match provider {
+        "openai" => match model {
+            Some(m) if m.contains("gpt-4o") && !m.contains("mini") => (2.50, 10.00),
+            Some(m) if m.contains("gpt-4o-mini") => (0.15, 0.60),
+            Some(m) if m.contains("o1") => (15.00, 60.00),
+            Some(m) if m.contains("o3") => (10.00, 40.00),
+            _ => (0.50, 1.50),
+        },
+        "anthropic" => match model {
+            Some(m) if m.contains("opus") => (15.00, 75.00),
+            Some(m) if m.contains("sonnet") => (3.00, 15.00),
+            Some(m) if m.contains("haiku") => (0.25, 1.25),
+            _ => (3.00, 15.00),
+        },
+        "gemini" => match model {
+            Some(m) if m.contains("pro") => (1.25, 5.00),
+            Some(m) if m.contains("flash") => (0.075, 0.30),
+            _ => (1.25, 5.00),
+        },
+        _ => (1.00, 3.00),
+    };
+    (prompt as f64 * input_rate + completion as f64 * output_rate) / 1_000_000.0
+}

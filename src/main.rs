@@ -402,6 +402,7 @@ async fn main() {
         request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ca_expires_days: mitm_ca_expires_days,
         dns_governance: None, // populated below if enabled
+        wal_path: std::env::var("GVM_WAL_PATH").unwrap_or_else(|_| config.wal.path.clone()),
     };
 
     // 11a. DNS governance proxy (Delay-Alert, no Deny)
@@ -512,6 +513,15 @@ async fn main() {
         .route("/gvm/pending", axum::routing::get(api::pending_approvals))
         .route("/gvm/approve", axum::routing::post(api::approve_request))
         .route("/gvm/reload", axum::routing::post(api::reload_srr))
+        .route("/gvm/dashboard", axum::routing::get(api::dashboard))
+        .route(
+            "/gvm/dashboard/events",
+            axum::routing::get(api::dashboard_events),
+        )
+        .route(
+            "/gvm/dashboard/stats",
+            axum::routing::get(api::dashboard_stats),
+        )
         .with_state(state)
         .layer(
             ServiceBuilder::new()

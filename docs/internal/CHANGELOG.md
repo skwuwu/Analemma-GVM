@@ -99,6 +99,14 @@ Full reachability assessment of all 20 RUSTSEC advisories in audit.toml. This au
 
 ---
 
+### 2026-04-15: Web dashboard (`GET /gvm/dashboard`)
+
+Added browser-based WAL visualization dashboard served from admin API (port 9090). Single HTML file embedded in binary via `include_str!`. Design: Inter + JetBrains Mono fonts, Tailwind CSS, Chart.js, slate-900 palette, no emoji. Features: doughnut chart (Allow/Delay/Deny), horizontal bar host stats, live event timeline with deny row highlighting and human-readable security translations, anomaly detection (burst/loop/deny count), trace view with matched_rule_id + event_hash + batch_id, Merkle-DAG policy tree canvas (deny paths highlighted in red), Share button for standalone HTML snapshot export. Three new endpoints: `GET /gvm/dashboard` (HTML), `GET /gvm/dashboard/events` (incremental WAL JSON), `GET /gvm/dashboard/stats` (aggregated stats JSON).
+
+Files: `src/api.rs`, `src/main.rs`, `src/proxy.rs` (+wal_path field), `src/dashboard.html` (new) | Risk: Low (additive feature on admin API, no enforcement path changes)
+
+---
+
 ### 2026-04-15: Watch mode TUI dashboard (`--output tui`)
 
 Added ratatui + crossterm based terminal dashboard for `gvm watch --output tui`. Event-centric debugging UX with 5 panels: Live Event Timeline (scrollable, color-coded by Allow/Delay/Deny), Anomaly panel (burst/loop/unknown host warnings), Policy Decision distribution (horizontal bar chart), Host Stats (top hosts by request count), LLM Usage (tokens, cost, models). Trace correlation view: press `t` on a timeline entry to group all events sharing the same `trace_id` into a tree view. Keyboard: `q` quit, `↑↓` scroll, `t` trace toggle, `Esc` back. Existing `--output text` and `--output json` modes unchanged.

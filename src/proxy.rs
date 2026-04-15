@@ -180,6 +180,8 @@ pub struct AppState {
     pub ca_expires_days: Option<i64>,
     /// DNS governance engine (None when `--no-dns-governance` or `dns.enabled = false`).
     pub dns_governance: Option<Arc<crate::dns_governance::DnsGovernance>>,
+    /// WAL file path for dashboard read-only access.
+    pub wal_path: String,
 }
 
 /// Derive event status from upstream HTTP response.

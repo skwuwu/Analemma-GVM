@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en" class="bg-slate-950">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Analemma GVM Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  body { font-family: 'Inter', system-ui, sans-serif; }
+  .mono { font-family: 'JetBrains Mono', monospace; }
+  .deny-row { background: rgba(239, 68, 68, 0.06); border-left: 3px solid #ef4444; }
+  .delay-row { border-left: 3px solid transparent; }
+  .allow-row { border-left: 3px solid transparent; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
+  .dot-allow { background: #22c55e; }
+  .dot-delay { background: #eab308; }
+  .dot-deny { background: #ef4444; }
+  #timeline-table tbody tr { transition: background 0.15s; }
+  #timeline-table tbody tr:hover { background: rgba(148, 163, 184, 0.06); }
+  canvas#policyTree { image-rendering: auto; }
+</style>
+<script>
+tailwind.config = {
+  theme: { extend: { fontFamily: { mono: ['JetBrains Mono', 'monospace'] } } }
+}
+</script>
+</head>
+<body class="bg-slate-950 text-slate-300 min-h-screen">
+
+<div class="max-w-7xl mx-auto px-6 py-8 space-y-6">
+
+  <!-- Header -->
+  <div class="flex items-center justify-between">
+    <div>
+      <h1 class="text-lg font-semibold text-slate-100 tracking-tight">Analemma GVM</h1>
+      <p class="text-sm text-slate-500 mt-1" id="subtitle">Connecting...</p>
+    </div>
+    <button onclick="exportSnapshot()" class="text-sm text-slate-500 hover:text-slate-300 underline underline-offset-4 decoration-slate-700">Share</button>
+  </div>
+
+  <!-- Stats bar -->
+  <div class="flex items-center gap-8 text-sm">
+    <span class="flex items-center gap-2">
+      <span class="dot dot-allow" id="live-dot"></span>
+      <span class="text-slate-400" id="stat-status">Live</span>
+    </span>
+    <span class="mono text-slate-100 font-medium" id="stat-reqs">0 requests</span>
+    <span class="mono text-slate-500" id="stat-rps">0.0 req/s</span>
+    <span class="mono text-slate-500" id="stat-cost"></span>
+  </div>
+
+  <!-- Charts row -->
+  <div class="grid grid-cols-2 gap-6">
+    <!-- Decision doughnut -->
+    <div class="bg-slate-900 border border-slate-800 rounded-lg p-6">
+      <h2 class="text-xs font-medium text-slate-500 uppercase tracking-wider mb-4">Policy Decisions</h2>
+      <div class="flex items-center gap-6">
+        <div class="w-32 h-32"><canvas id="decisionChart"></canvas></div>
+        <div class="space-y-2 text-sm mono" id="decision-legend"></div>
+      </div>
+    </div>
+    <!-- Top hosts bar -->
+    <div class="bg-slate-900 border border-slate-800 rounded-lg p-6">
+      <h2 class="text-xs font-medium text-slate-500 uppercase tracking-wider mb-4">Top Hosts</h2>
+      <div id="host-list" class="space-y-1.5 text-sm mono"></div>
+    </div>
+  </div>
+
+  <!-- Live Events -->
+  <div class="bg-slate-900 border border-slate-800 rounded-lg p-6">
+    <h2 class="text-xs font-medium text-slate-500 uppercase tracking-wider mb-4">Live Events</h2>
+    <div class="overflow-y-auto max-h-96" id="timeline-container">
+      <table class="w-full text-sm" id="timeline-table">
+        <thead>
+          <tr class="text-xs text-slate-600 uppercase tracking-wider border-b border-slate-800">
+            <th class="text-left py-2 w-20">Time</th>
+            <th class="text-left py-2 w-16">Method</th>
+            <th class="text-left py-2 w-48">Host</th>
+            <th class="text-left py-2">Path</th>
+            <th class="text-left py-2 w-10">St</th>
+            <th class="text-left py-2 w-16">Decision</th>
+            <th class="text-left py-2 w-32">Rule</th>
+          </tr>
+        </thead>
+        <tbody id="timeline-body" class="mono text-xs"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Anomalies -->
+  <div class="bg-slate-900 border border-slate-800 rounded-lg p-6" id="anomaly-section" style="display:none">
+    <h2 class="text-xs font-medium text-slate-500 uppercase tracking-wider mb-3">Anomalies</h2>
+    <div id="anomaly-list" class="space-y-1 text-sm"></div>
+  </div>
+
+  <!-- Trace + Policy Tree -->
+  <div class="grid grid-cols-2 gap-6" id="trace-section" style="display:none">
+    <div class="bg-slate-900 border border-slate-800 rounded-lg p-6">
+      <h2 class="text-xs font-medium text-slate-500 uppercase tracking-wider mb-3">Trace <span class="mono text-slate-400" id="trace-id"></span></h2>
+      <div id="trace-tree" class="mono text-xs space-y-1"></div>
+    </div>
+    <div class="bg-slate-900 border border-slate-800 rounded-lg p-6">
+      <h2 class="text-xs font-medium text-slate-500 uppercase tracking-wider mb-3">Policy Tree</h2>
+      <canvas id="policyTree" class="w-full" height="200"></canvas>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ─── State ───
+let allEvents = [];
+let currentStats = {};
+let walOffset = 0;
+let seenIds = new Set();
+let decisionChart = null;
+let selectedTraceId = null;
+
+// ─── Anomaly detection (JS-side sliding window) ───
+const requestTimes = [];
+const loopDetector = {};
+const anomalies = [];
+
+function detectAnomalies(event) {
+  const now = Date.now();
+  const method = event.transport?.method || '';
+  const host = event.transport?.host || '';
+  const path = event.transport?.path || '';
+
+  // Burst: >10 requests in 2s
+  requestTimes.push(now);
+  while (requestTimes.length > 0 && now - requestTimes[0] > 2000) requestTimes.shift();
+  if (requestTimes.length > 10) {
+    const msg = `Burst: ${requestTimes.length} requests in 2s`;
+    if (!anomalies.some(a => a.startsWith('Burst'))) anomalies.push(msg);
+  }
+
+  // Loop: same endpoint >5 times in 10s
+  const key = `${method}:${host}:${path}`;
+  if (!loopDetector[key]) loopDetector[key] = [];
+  loopDetector[key].push(now);
+  loopDetector[key] = loopDetector[key].filter(t => now - t < 10000);
+  if (loopDetector[key].length > 5) {
+    const msg = `Loop: ${method} ${host}${path} called ${loopDetector[key].length} times in 10s`;
+    const existing = anomalies.findIndex(a => a.includes(key));
+    if (existing >= 0) anomalies[existing] = msg; else anomalies.push(msg);
+  }
+
+  // Deny count
+  const decision = event.decision || '';
+  if (decision.includes('Deny')) {
+    const deniedCount = allEvents.filter(e => (e.decision||'').includes('Deny')).length;
+    const msg = `${deniedCount} request(s) denied by policy`;
+    const existing = anomalies.findIndex(a => a.includes('denied by policy'));
+    if (existing >= 0) anomalies[existing] = msg; else anomalies.push(msg);
+  }
+}
+
+// ─── Human-readable deny translation ───
+function translateDeny(event) {
+  const rule = event.matched_rule_id || 'policy';
+  const host = event.transport?.host || '';
+  const method = event.transport?.method || '';
+  if (event.operation === 'gvm.dns.query')
+    return 'Blocked connection to suspicious unknown domain';
+  if ((event.decision||'').includes('RequireApproval'))
+    return `Agent attempted ${method} without human approval`;
+  if (rule.includes('destructive'))
+    return `Blocked destructive operation on ${host}`;
+  return `Blocked by rule "${rule}"`;
+}
+
+// ─── Rendering ───
+function decisionColor(d) {
+  if (d.includes('Allow')) return { dot: 'dot-allow', text: 'text-green-500', row: 'allow-row' };
+  if (d.includes('Delay')) return { dot: 'dot-delay', text: 'text-yellow-500', row: 'delay-row' };
+  if (d.includes('Deny')) return { dot: 'dot-deny', text: 'text-red-400', row: 'deny-row' };
+  return { dot: '', text: 'text-slate-500', row: '' };
+}
+
+function decisionLabel(d) {
+  if (d.includes('Allow')) return 'Allow';
+  if (d.includes('Delay')) return 'Delay';
+  if (d.includes('Deny')) return 'Deny';
+  return d.slice(0, 12);
+}
+
+function timeShort(ts) {
+  if (!ts || ts.length < 19) return ts || '';
+  return ts.slice(11, 19);
+}
+
+function truncate(s, max) {
+  return s && s.length > max ? s.slice(0, max - 2) + '..' : (s || '');
+}
+
+function renderTimeline() {
+  const tbody = document.getElementById('timeline-body');
+  // Show latest first, limit to 200
+  const recent = allEvents.slice(-200).reverse();
+  const rows = recent.map(ev => {
+    const d = ev.decision || '';
+    const c = decisionColor(d);
+    const st = ev.transport?.status_code || '';
+    const rule = ev.matched_rule_id || (ev.default_caution ? '(default)' : '');
+    const traceAttr = ev.trace_id ? `data-trace="${ev.trace_id}"` : '';
+
+    let row = `<tr class="${c.row} cursor-pointer" ${traceAttr} onclick="showTrace('${ev.trace_id||''}')">
+      <td class="py-1.5 text-slate-500">${timeShort(ev.timestamp)}</td>
+      <td class="py-1.5">${ev.transport?.method||''}</td>
+      <td class="py-1.5 text-slate-400">${truncate(ev.transport?.host, 35)}</td>
+      <td class="py-1.5 text-slate-500">${truncate(ev.transport?.path, 40)}</td>
+      <td class="py-1.5 ${st >= 400 ? 'text-red-400' : 'text-slate-500'}">${st}</td>
+      <td class="py-1.5"><span class="dot ${c.dot} mr-1.5"></span><span class="${c.text}">${decisionLabel(d)}</span></td>
+      <td class="py-1.5 text-slate-600">${truncate(rule, 24)}</td>
+    </tr>`;
+
+    // Deny: add human-readable explanation row
+    if (d.includes('Deny')) {
+      row += `<tr class="deny-row"><td colspan="7" class="py-1 pl-20 text-slate-500 italic text-xs">${translateDeny(ev)}</td></tr>`;
+    }
+    return row;
+  }).join('');
+
+  tbody.innerHTML = rows;
+}
+
+function renderStats(stats) {
+  if (!stats) return;
+  currentStats = stats;
+
+  const uptime = stats.uptime_secs || 0;
+  const rps = uptime > 0 ? (stats.total_requests / uptime).toFixed(1) : '0.0';
+
+  document.getElementById('stat-reqs').textContent = `${stats.total_requests} requests`;
+  document.getElementById('stat-rps').textContent = `${rps} req/s`;
+  document.getElementById('subtitle').textContent = `Uptime ${formatDuration(uptime)}`;
+
+  const cost = stats.llm?.estimated_cost_usd;
+  document.getElementById('stat-cost').textContent = cost > 0 ? `$${cost.toFixed(4)}` : '';
+
+  // Decision chart
+  const dec = stats.decisions || {};
+  const allow = dec.Allow || 0, delay = dec.Delay || 0, deny = dec.Deny || 0;
+  if (decisionChart) {
+    decisionChart.data.datasets[0].data = [allow, delay, deny];
+    decisionChart.update('none');
+  }
+
+  // Decision legend
+  document.getElementById('decision-legend').innerHTML = `
+    <div class="flex items-center gap-2"><span class="dot dot-allow"></span><span class="text-green-500">Allow</span> <span class="text-slate-400 ml-auto">${allow}</span></div>
+    <div class="flex items-center gap-2"><span class="dot dot-delay"></span><span class="text-yellow-500">Delay</span> <span class="text-slate-400 ml-auto">${delay}</span></div>
+    <div class="flex items-center gap-2"><span class="dot dot-deny"></span><span class="text-red-400">Deny</span> <span class="text-slate-400 ml-auto">${deny}</span></div>`;
+
+  // Host list
+  const hosts = Object.entries(stats.hosts || {}).sort((a,b) => b[1] - a[1]).slice(0, 8);
+  const maxCount = hosts[0]?.[1] || 1;
+  document.getElementById('host-list').innerHTML = hosts.map(([h, c]) => {
+    const pct = (c / maxCount * 100).toFixed(0);
+    return `<div class="flex items-center gap-3">
+      <span class="text-slate-400 w-48 truncate">${h}</span>
+      <div class="flex-1 bg-slate-800 rounded-full h-1.5"><div class="bg-slate-500 rounded-full h-1.5" style="width:${pct}%"></div></div>
+      <span class="text-slate-500 w-10 text-right">${c}</span>
+    </div>`;
+  }).join('');
+}
+
+function renderAnomalies() {
+  const section = document.getElementById('anomaly-section');
+  const list = document.getElementById('anomaly-list');
+  if (anomalies.length === 0) { section.style.display = 'none'; return; }
+  section.style.display = '';
+  list.innerHTML = anomalies.map(a => {
+    const isDeny = a.includes('denied');
+    return `<div class="${isDeny ? 'text-red-400' : 'text-yellow-500'}">${a}</div>`;
+  }).join('');
+}
+
+// ─── Trace view ───
+function showTrace(traceId) {
+  if (!traceId) return;
+  selectedTraceId = traceId;
+  const section = document.getElementById('trace-section');
+  section.style.display = '';
+  document.getElementById('trace-id').textContent = traceId.slice(0, 12) + '...';
+
+  const traceEvents = allEvents.filter(e => e.trace_id === traceId);
+  const tree = document.getElementById('trace-tree');
+  tree.innerHTML = traceEvents.map((ev, i) => {
+    const isLast = i === traceEvents.length - 1;
+    const prefix = isLast ? '\u2514' : '\u251c';
+    const d = ev.decision || '';
+    const c = decisionColor(d);
+    const rule = ev.matched_rule_id || '(none)';
+    const hash = ev.event_hash ? ev.event_hash.slice(0, 10) + '...' : '';
+    const batch = ev.batch_id != null ? `Batch #${ev.batch_id}` : '';
+    return `<div>
+      <span class="text-slate-600">${prefix}</span>
+      <span class="${c.text}">${ev.transport?.method||''} ${ev.transport?.host||''} ${truncate(ev.transport?.path,30)}</span>
+      <span class="text-slate-600 ml-2">\u2192 ${decisionLabel(d)}</span>
+      <div class="pl-5 text-slate-600">Rule: ${rule} (${ev.decision_source||''})</div>
+      ${hash ? `<div class="pl-5 text-slate-700">Hash: ${hash}  ${batch}</div>` : ''}
+    </div>`;
+  }).join('');
+
+  renderPolicyTree(traceEvents);
+}
+
+// ─── Merkle-DAG Policy Tree (Canvas) ───
+function renderPolicyTree(traceEvents) {
+  const canvas = document.getElementById('policyTree');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width = canvas.offsetWidth * (window.devicePixelRatio || 1);
+  const H = canvas.height = 200 * (window.devicePixelRatio || 1);
+  ctx.scale(window.devicePixelRatio || 1, window.devicePixelRatio || 1);
+  const w = canvas.offsetWidth, h = 200;
+  ctx.clearRect(0, 0, w, h);
+
+  // Tree: Root -> ABAC / SRR -> matched rules -> decision
+  const hasDeny = traceEvents.some(e => (e.decision||'').includes('Deny'));
+  const sources = [...new Set(traceEvents.map(e => e.decision_source || 'SRR'))];
+  const rules = traceEvents.map(e => ({
+    rule: e.matched_rule_id || '(default)',
+    deny: (e.decision||'').includes('Deny'),
+    source: e.decision_source || 'SRR'
+  }));
+
+  const nodeR = 6;
+  const levels = [
+    [{ x: w/2, y: 24, label: 'Policy', deny: hasDeny }],
+    sources.map((s, i) => ({ x: w/(sources.length+1) * (i+1), y: 72, label: s, deny: rules.some(r => r.source === s && r.deny) })),
+    rules.map((r, i) => ({ x: w/(rules.length+1) * (i+1), y: 130, label: r.rule, deny: r.deny })),
+  ];
+
+  // Draw edges
+  for (let l = 0; l < levels.length - 1; l++) {
+    for (const parent of levels[l]) {
+      for (const child of levels[l+1]) {
+        const isDenyPath = parent.deny && child.deny;
+        ctx.beginPath();
+        ctx.moveTo(parent.x, parent.y + nodeR);
+        ctx.lineTo(child.x, child.y - nodeR);
+        ctx.strokeStyle = isDenyPath ? '#ef4444' : '#334155';
+        ctx.lineWidth = isDenyPath ? 2.5 : 1;
+        ctx.stroke();
+      }
+    }
+  }
+
+  // Draw nodes
+  for (const level of levels) {
+    for (const node of level) {
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, nodeR, 0, Math.PI * 2);
+      ctx.fillStyle = node.deny ? '#ef4444' : '#475569';
+      ctx.fill();
+      ctx.strokeStyle = node.deny ? '#ef4444' : '#64748b';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      ctx.fillStyle = node.deny ? '#fca5a5' : '#94a3b8';
+      ctx.font = '10px Inter, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(truncate(node.label, 18), node.x, node.y + nodeR + 14);
+    }
+  }
+}
+
+// ─── Share / Export ───
+function exportSnapshot() {
+  const state = { events: allEvents.slice(-500), stats: currentStats, anomalies, exportedAt: new Date().toISOString() };
+  const selfHtml = document.documentElement.outerHTML
+    .replace(/setInterval\(poll[\s\S]*?(?=<\/script>)/, `
+      // Static snapshot — polling disabled
+      const SNAPSHOT = ${JSON.stringify(state)};
+      allEvents = SNAPSHOT.events;
+      currentStats = SNAPSHOT.stats;
+      anomalies.push(...(SNAPSHOT.anomalies||[]));
+      document.getElementById('stat-status').textContent = 'Snapshot ' + SNAPSHOT.exportedAt.slice(0,19);
+      document.getElementById('live-dot').className = 'dot';
+      document.getElementById('live-dot').style.background = '#64748b';
+      initChart();
+      renderStats(SNAPSHOT.stats);
+      renderTimeline();
+      renderAnomalies();
+    `);
+  const blob = new Blob([selfHtml], { type: 'text/html' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'gvm-snapshot-' + new Date().toISOString().slice(0,16).replace(':','-') + '.html';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ─── Polling ───
+async function poll() {
+  try {
+    const [evResp, stResp] = await Promise.all([
+      fetch(`/gvm/dashboard/events?since_offset=${walOffset}&limit=100`),
+      fetch('/gvm/dashboard/stats')
+    ]);
+    const evData = await evResp.json();
+    const stData = await stResp.json();
+
+    // Process new events
+    for (const ev of (evData.events || [])) {
+      const eid = ev.event_id;
+      if (eid && !seenIds.has(eid)) {
+        seenIds.add(eid);
+        allEvents.push(ev);
+        detectAnomalies(ev);
+      }
+    }
+    walOffset = evData.next_offset || walOffset;
+
+    renderStats(stData);
+    renderTimeline();
+    renderAnomalies();
+  } catch (e) {
+    document.getElementById('stat-status').textContent = 'Disconnected';
+    document.getElementById('live-dot').style.background = '#64748b';
+  }
+}
+
+function formatDuration(secs) {
+  if (secs < 60) return Math.floor(secs) + 's';
+  if (secs < 3600) return Math.floor(secs/60) + 'm ' + Math.floor(secs%60) + 's';
+  return Math.floor(secs/3600) + 'h ' + Math.floor((secs%3600)/60) + 'm';
+}
+
+function initChart() {
+  const ctx = document.getElementById('decisionChart').getContext('2d');
+  decisionChart = new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels: ['Allow', 'Delay', 'Deny'],
+      datasets: [{ data: [0, 0, 0], backgroundColor: ['#22c55e', '#eab308', '#ef4444'], borderWidth: 0 }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: true, cutout: '65%',
+      plugins: { legend: { display: false } }
+    }
+  });
+}
+
+// ─── Init ───
+initChart();
+poll();
+setInterval(poll, 2000);
+</script>
+
+</body>
+</html>
