@@ -232,8 +232,8 @@ function renderTimeline(){
       <td class="py-2.5 text-slate-600 truncate">${tr(ev.transport?.path,40)}</td>
       <td class="py-2.5 ${sc}">${st||''}</td>
       <td class="py-2.5"><span class="dot mr-1" style="background:${b==='Deny'?'#ef4444':b==='Delay'?'#a16207':'#166534'}"></span><span class="${dc}">${b}</span></td>
-      <td class="py-2.5 text-slate-700 truncate">${tr(si,30)}</td>
-      <td class="py-2.5 text-slate-800">${res}</td>
+      <td class="py-2.5 text-slate-500 truncate">${tr(si,30)}</td>
+      <td class="py-2.5 text-slate-500">${res}</td>
     </tr>`;
     if(b==='Deny')row+=`<tr class="deny-row deny-new"><td colspan="8" class="py-1.5 pl-10 text-red-400/60 text-[11px] italic">${translateDeny(ev)}</td></tr>`;
     return row;
@@ -280,7 +280,7 @@ function renderStats(s){
     let bc='bg-green-900/40',tc='text-slate-500';
     if(d.deny>0){bc='bg-red-500/30';tc='text-red-400'}
     else if(d.delay>d.allow){bc='bg-amber-900/30';tc='text-amber-600'}
-    return`<div class="flex items-center gap-3"><span class="${tc} w-52 truncate text-[11px] font-medium">${h}</span><div class="flex-1 bg-slate-800/30 rounded-full h-1.5 overflow-hidden"><div class="${bc} rounded-full h-1.5 transition-all" style="width:${pct}%"></div></div><span class="text-slate-700 w-8 text-right text-[11px]">${d.total}</span>${d.deny>0?`<span class="text-red-400/50 text-[9px]">${d.deny} blocked</span>`:''}</div>`;
+    return`<div class="flex items-center gap-3"><span class="${tc} w-52 truncate text-[11px] font-medium">${h}</span><div class="flex-1 bg-slate-800/30 rounded-full h-1.5 overflow-hidden"><div class="${bc} rounded-full h-1.5 transition-all" style="width:${pct}%"></div></div><span class="text-slate-400 w-8 text-right text-[11px]">${d.total}</span>${d.deny>0?`<span class="text-red-400/50 text-[9px]">${d.deny} blocked</span>`:''}</div>`;
   }).join('');
 }
 
@@ -301,19 +301,19 @@ function showTrace(tid){
   const evs=allEvents.filter(e=>e.trace_id===tid);
   document.getElementById('trace-tree').innerHTML=evs.map((ev,i)=>{
     const last=i===evs.length-1,pfx=last?'\u2514':'\u251c',d=ev.decision||'',b=bucket(d);
-    const c=b==='Deny'?'text-red-400':b==='Delay'?'text-amber-600':'text-green-700';
+    const c=b==='Deny'?'text-red-400':b==='Delay'?'text-amber-600':'text-green-500';
     const rule=ev.matched_rule_id||'(none)',hash=ev.event_hash?ev.event_hash.slice(0,12)+'...':'';
     const batch=ev.batch_id!=null?`Batch #${ev.batch_id}`:'';
     const ep=ev.enforcement_point||'',sens=ev.resource?.sensitivity||'';
-    const dn=b==='Deny'?`<div class="pl-6 text-red-400/50 italic text-[10px]">${translateDeny(ev)}</div>`:'';
-    const llm=ev.llm_trace?`<div class="pl-6 text-slate-700 text-[10px]">LLM: ${ev.llm_trace.provider||''} ${ev.llm_trace.model||''} | ${ev.llm_trace.usage?.total_tokens||0} tokens</div>`:'';
+    const dn=b==='Deny'?`<div class="pl-6 text-red-400/60 italic text-[10px]">${translateDeny(ev)}</div>`:'';
+    const llm=ev.llm_trace?`<div class="pl-6 text-slate-400 text-[10px]">LLM: ${ev.llm_trace.provider||''} ${ev.llm_trace.model||''} | ${ev.llm_trace.usage?.total_tokens||0} tokens</div>`:'';
     return`<div class="py-1.5 ${b==='Deny'?'bg-red-500/5 rounded':''}">
-      <span class="text-slate-800">${pfx}</span>
+      <span class="text-slate-500">${pfx}</span>
       <span class="font-medium ${c}">${ev.transport?.method||''} ${ev.transport?.host||''}</span>
-      <span class="text-slate-600 ml-1">${tr(ev.transport?.path,30)}</span>
-      <span class="text-slate-700 ml-2">\u2192 ${b}</span>
-      <div class="pl-6 text-slate-700 text-[10px]">Rule: ${rule} (${ev.decision_source||''}) | Point: ${ep} | ${sens}</div>
-      ${hash?`<div class="pl-6 text-slate-800 text-[10px]">Hash: ${hash}  ${batch}</div>`:''}${llm}${dn}
+      <span class="text-slate-400 ml-1">${tr(ev.transport?.path,30)}</span>
+      <span class="text-slate-500 ml-2">\u2192 ${b}</span>
+      <div class="pl-6 text-slate-400 text-[10px]">Rule: ${rule} (${ev.decision_source||''}) | Point: ${ep} | ${sens}</div>
+      ${hash?`<div class="pl-6 text-slate-500 text-[10px]">Hash: ${hash}  ${batch}</div>`:''}${llm}${dn}
     </div>`;
   }).join('');
   renderPolicyTree(evs);
@@ -334,12 +334,12 @@ function renderPolicyTree(evs){
   ];
   for(let l=0;l<lvls.length-1;l++)for(const p of lvls[l])for(const c of lvls[l+1]){
     const dn=p.deny&&c.deny;x.beginPath();x.moveTo(p.x,p.y+R);x.lineTo(c.x,c.y-R);
-    x.strokeStyle=dn?'#ef4444':'#0f172a';x.lineWidth=dn?2.5:0.5;x.stroke();
+    x.strokeStyle=dn?'#ef4444':'#334155';x.lineWidth=dn?2.5:0.8;x.stroke();
   }
   for(const lv of lvls)for(const n of lv){
     x.beginPath();x.arc(n.x,n.y,R,0,Math.PI*2);
-    x.fillStyle=n.deny?'#ef4444':'#1e293b';x.fill();
-    x.fillStyle=n.deny?'#fca5a5':'#475569';
+    x.fillStyle=n.deny?'#ef4444':'#475569';x.fill();
+    x.fillStyle=n.deny?'#fca5a5':'#94a3b8';
     x.font='10px Inter,sans-serif';x.textAlign='center';
     x.fillText(tr(n.label,16),n.x,n.y+R+14);
   }
