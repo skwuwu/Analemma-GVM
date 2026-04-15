@@ -430,47 +430,6 @@ required_context = ["amount"]
     .expect("writing registry config must succeed");
 
     // Policy: allow reads, require approval for payments
-    let policy_dir = dir.path().join("policies");
-    std::fs::create_dir_all(&policy_dir).expect("policy directory creation must succeed");
-    std::fs::write(
-        policy_dir.join("global.toml"),
-        r#"
-[[rules]]
-id = "allow-reads"
-priority = 10
-layer = "Global"
-description = "Allow reads"
-[[rules.conditions]]
-field = "operation"
-operator = "EndsWith"
-value = ".read"
-[rules.decision]
-type = "Allow"
-
-[[rules]]
-id = "approve-payments"
-priority = 5
-layer = "Global"
-description = "Require approval for payments"
-[[rules.conditions]]
-field = "operation"
-operator = "StartsWith"
-value = "gvm.payment"
-[rules.decision]
-type = "RequireApproval"
-urgency = "Standard"
-
-[[rules]]
-id = "fallback"
-priority = 999
-layer = "Global"
-description = "Default delay"
-[rules.decision]
-type = "Delay"
-milliseconds = 300
-"#,
-    )
-    .expect("writing policy config must succeed");
 
     // Empty secrets
     let secrets_path = dir.path().join("secrets.toml");
@@ -705,15 +664,15 @@ async fn config_file_hashes_recorded_in_merkle_chain() {
     let wal_path = dir.path().join("wal.log");
 
     // Create sample config files with known content
-    let policy_path = dir.path().join("global.toml");
+    let registry_path = dir.path().join("registry.toml");
     let srr_path = dir.path().join("srr.toml");
-    let policy_content = b"[[rules]]\nid = \"test\"\npriority = 1\n";
+    let registry_content = b"[[operations]]\nname = \"test\"\nic_level = 1\n";
     let srr_content = b"[[rules]]\nmethod = \"GET\"\npattern = \"*\"\n";
-    std::fs::write(&policy_path, policy_content).expect("writing test policy file must succeed");
+    std::fs::write(&registry_path, registry_content).expect("writing test registry file must succeed");
     std::fs::write(&srr_path, srr_content).expect("writing test SRR file must succeed");
 
     // Compute expected hashes
-    let expected_policy_hash = format!("{:x}", Sha256::digest(policy_content));
+    let expected_registry_hash = format!("{:x}", Sha256::digest(registry_content));
     let expected_srr_hash = format!("{:x}", Sha256::digest(srr_content));
 
     let ledger = Arc::new(
@@ -724,7 +683,7 @@ async fn config_file_hashes_recorded_in_merkle_chain() {
 
     // Record config load
     let config_files: Vec<(&str, &std::path::Path)> = vec![
-        ("policy:global.toml", policy_path.as_path()),
+        ("registry:registry.toml", registry_path.as_path()),
         ("srr:srr.toml", srr_path.as_path()),
     ];
     ledger
@@ -754,14 +713,14 @@ async fn config_file_hashes_recorded_in_merkle_chain() {
     assert!(matches!(event.status, EventStatus::Confirmed));
 
     // Verify SHA-256 hashes in context field
-    let policy_hash = event
+    let registry_hash = event
         .context
-        .get("policy:global.toml")
+        .get("registry:registry.toml")
         .and_then(|v| v.as_str())
-        .expect("policy hash must be present in context");
+        .expect("registry hash must be present in context");
     assert_eq!(
-        policy_hash, expected_policy_hash,
-        "policy file hash must match SHA-256"
+        registry_hash, expected_registry_hash,
+        "registry file hash must match SHA-256"
     );
 
     let srr_hash = event
@@ -799,7 +758,7 @@ async fn config_hash_records_unavailable_for_missing_files() {
     // Reference a file that does not exist
     let missing_path = dir.path().join("nonexistent.toml");
     let config_files: Vec<(&str, &std::path::Path)> =
-        vec![("policy:missing.toml", missing_path.as_path())];
+        vec![("config:missing.toml", missing_path.as_path())];
     ledger
         .record_config_load(&config_files)
         .await
@@ -816,7 +775,7 @@ async fn config_hash_records_unavailable_for_missing_files() {
     assert_eq!(entries.len(), 1);
     let hash = entries[0]
         .context
-        .get("policy:missing.toml")
+        .get("config:missing.toml")
         .and_then(|v| v.as_str())
         .expect("missing file hash must still be recorded");
     assert_eq!(
@@ -896,22 +855,6 @@ decision = { type = "Delay", milliseconds = 10 }
 
     let registry_path = dir.path().join("registry.toml");
     std::fs::write(&registry_path, "").expect("writing empty registry must succeed");
-
-    let policy_dir = dir.path().join("policies");
-    std::fs::create_dir_all(&policy_dir).expect("creating policy dir must succeed");
-    std::fs::write(
-        policy_dir.join("global.toml"),
-        r#"
-[[rules]]
-id = "allow-all"
-priority = 999
-layer = "Global"
-description = "Allow everything"
-[rules.decision]
-type = "Allow"
-"#,
-    )
-    .expect("writing global policy must succeed");
 
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(
@@ -1177,22 +1120,6 @@ decision = { type = "Allow" }
     let registry_path = dir.path().join("registry.toml");
     std::fs::write(&registry_path, "").expect("writing empty registry must succeed");
 
-    let policy_dir = dir.path().join("policies");
-    std::fs::create_dir_all(&policy_dir).expect("creating policy dir must succeed");
-    std::fs::write(
-        policy_dir.join("global.toml"),
-        r#"
-[[rules]]
-id = "allow-all"
-priority = 999
-layer = "Global"
-description = "Allow everything"
-[rules.decision]
-type = "Allow"
-"#,
-    )
-    .expect("writing global policy must succeed");
-
     // Two hosts: one with ApiKey type (custom header), one with Bearer.
     // Both will be remapped to the same local upstream via host_overrides.
     let secrets_path = dir.path().join("secrets.toml");
@@ -1415,11 +1342,6 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
     let registry_path = dir.path().join("registry.toml");
     std::fs::write(&registry_path, "").expect("writing empty registry must succeed");
 
-    let policy_dir = dir.path().join("policies");
-    std::fs::create_dir_all(&policy_dir).expect("creating policy dir must succeed");
-    std::fs::write(policy_dir.join("global.toml"), "rules = []\n")
-        .expect("writing empty policy must succeed");
-
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(&secrets_path, "[credentials]\n").expect("writing empty secrets must succeed");
 
@@ -1591,35 +1513,6 @@ decision = { type = "Allow" }
 
     let registry_path = dir.path().join("registry.toml");
     std::fs::write(&registry_path, "").expect("writing empty registry must succeed");
-
-    let policy_dir = dir.path().join("policies");
-    std::fs::create_dir_all(&policy_dir).expect("creating policy dir must succeed");
-    std::fs::write(
-        policy_dir.join("global.toml"),
-        r#"
-[[rules]]
-id = "deny-critical"
-priority = 1
-layer = "Global"
-description = "Deny operations on critical resources"
-[[rules.conditions]]
-field = "resource.sensitivity"
-operator = "Eq"
-value = "Critical"
-[rules.decision]
-type = "Deny"
-reason = "Critical resource access denied"
-
-[[rules]]
-id = "allow-rest"
-priority = 999
-layer = "Global"
-description = "Allow everything else"
-[rules.decision]
-type = "Allow"
-"#,
-    )
-    .expect("writing policy must succeed");
 
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(&secrets_path, "[credentials]\n").expect("writing empty secrets must succeed");
@@ -1961,8 +1854,6 @@ async fn checkpoint_save_restore_merkle_verified() {
     // Minimal config files for component initialization
     let srr_path = dir.path().join("srr.toml");
     std::fs::write(&srr_path, "rules = []\n").unwrap();
-    let policy_dir = dir.path().join("policies");
-    std::fs::create_dir_all(&policy_dir).unwrap();
     let registry_path = dir.path().join("registry.toml");
     std::fs::write(&registry_path, "[namespaces]\n").unwrap();
     let secrets_path = dir.path().join("secrets.toml");
@@ -2424,22 +2315,6 @@ decision = { type = "Allow" }
     let registry_path = dir.path().join("registry.toml");
     std::fs::write(&registry_path, "").unwrap();
 
-    let policy_dir = dir.path().join("policies");
-    std::fs::create_dir_all(&policy_dir).unwrap();
-    std::fs::write(
-        policy_dir.join("global.toml"),
-        r#"
-[[rules]]
-id = "fallback"
-priority = 999
-layer = "Global"
-description = "Default allow"
-[rules.decision]
-type = "Allow"
-"#,
-    )
-    .unwrap();
-
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(&secrets_path, "[credentials]\n").unwrap();
 
@@ -2606,13 +2481,6 @@ decision = { type = "Allow" }
 
     let registry_path = dir.path().join("registry.toml");
     std::fs::write(&registry_path, "").unwrap();
-    let policy_dir = dir.path().join("policies");
-    std::fs::create_dir_all(&policy_dir).unwrap();
-    std::fs::write(
-        policy_dir.join("global.toml"),
-        "[[rules]]\nid = \"f\"\npriority = 999\nlayer = \"Global\"\ndescription = \"fallback\"\n[rules.decision]\ntype = \"Allow\"\n",
-    )
-    .unwrap();
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(&secrets_path, "[credentials]\n").unwrap();
     let wal_path = dir.path().join("wal.log");
@@ -2736,13 +2604,6 @@ decision = { type = "Allow" }
 
     let registry_path = dir.path().join("registry.toml");
     std::fs::write(&registry_path, "").unwrap();
-    let policy_dir = dir.path().join("policies");
-    std::fs::create_dir_all(&policy_dir).unwrap();
-    std::fs::write(
-        policy_dir.join("global.toml"),
-        "[[rules]]\nid = \"f\"\npriority = 999\nlayer = \"Global\"\ndescription = \"fallback\"\n[rules.decision]\ntype = \"Allow\"\n",
-    )
-    .unwrap();
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(&secrets_path, "[credentials]\n").unwrap();
     let wal_path = dir.path().join("wal.log");
@@ -2870,13 +2731,6 @@ decision = { type = "Allow" }
 
     let registry_path = dir.path().join("registry.toml");
     std::fs::write(&registry_path, "").unwrap();
-    let policy_dir = dir.path().join("policies");
-    std::fs::create_dir_all(&policy_dir).unwrap();
-    std::fs::write(
-        policy_dir.join("global.toml"),
-        "[[rules]]\nid = \"f\"\npriority = 999\nlayer = \"Global\"\ndescription = \"fallback\"\n[rules.decision]\ntype = \"Allow\"\n",
-    )
-    .unwrap();
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(&secrets_path, "[credentials]\n").unwrap();
     let wal_path = dir.path().join("wal.log");
@@ -2972,13 +2826,6 @@ async fn ic3_self_approval_blocked_on_proxy_port() {
     .unwrap();
     let registry_path = dir.path().join("registry.toml");
     std::fs::write(&registry_path, "").unwrap();
-    let policy_dir = dir.path().join("policies");
-    std::fs::create_dir_all(&policy_dir).unwrap();
-    std::fs::write(
-        policy_dir.join("global.toml"),
-        "[[rules]]\nid = \"f\"\npriority = 999\nlayer = \"Global\"\ndescription = \"fallback\"\n[rules.decision]\ntype = \"Allow\"\n",
-    )
-    .unwrap();
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(&secrets_path, "[credentials]\n").unwrap();
     let wal_path = dir.path().join("wal.log");
