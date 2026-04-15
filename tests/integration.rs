@@ -505,42 +505,7 @@ decision = { type = "Delay", milliseconds = 300 }
         body_str
     );
 
-    // ── Scenario B: IC-3 RequireApproval — payment operation ──
-    // SDK sends: operation=gvm.payment.refund
-    // Target: api.stripe.com/refund (no SRR deny rule for this URL)
-    // Policy: RequireApproval for payments
-    // Expected: HTTP 403 with RequireApproval message
-    let request = Request::builder()
-        .method("POST")
-        .uri("/v1/refund")
-        .header("X-GVM-Agent-Id", "finance-agent")
-        .header("X-GVM-Operation", "gvm.payment.refund")
-        .header("X-GVM-Target-Host", "api.stripe.com")
-        .header("X-GVM-Trace-Id", "trace-test-002")
-        .header("X-GVM-Event-Id", "evt-test-002")
-        .body(Body::empty())
-        .expect("valid HTTP request must build");
-
-    let response = app
-        .clone()
-        .oneshot(request)
-        .await
-        .expect("proxy must handle payment request");
-    assert_eq!(
-        response.status(),
-        StatusCode::FORBIDDEN,
-        "Payment operation must be blocked with RequireApproval"
-    );
-
-    let body_bytes = axum::body::to_bytes(response.into_body(), 10240)
-        .await
-        .expect("response body must be readable");
-    let body_str = String::from_utf8_lossy(&body_bytes);
-    assert!(
-        body_str.contains("approval required") || body_str.contains("IC-3"),
-        "Response should mention approval requirement, got: {}",
-        body_str
-    );
+    // Scenario B (RequireApproval via ABAC) removed — ABAC system deleted.
 
     // ── Scenario C: IC-1 Allow — safe read operation on safe URL ──
     // SDK sends: operation=gvm.storage.read
@@ -1425,7 +1390,10 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
 //          what the proxy expects to parse
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Test: SDK resource/context header contract — removed (ABAC system deleted,
+// SRR does not use X-GVM-Resource or X-GVM-Context headers).
 #[tokio::test]
+#[ignore] // ABAC removed — this test validated ABAC attribute matching
 async fn sdk_proxy_header_contract_resource_and_context_json() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
