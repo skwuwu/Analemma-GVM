@@ -685,6 +685,100 @@ impl Ledger {
         Ok(context_hash)
     }
 
+    /// Verify the integrity context chain in the WAL.
+    ///
+    /// Scans all `gvm.system.config_load` events and checks that each
+    /// `previous_state` field matches the `config_hash` of the preceding
+    /// config_load event. Detects manual WAL edits, truncation, or
+    /// unexpected restarts that broke the chain.
+    ///
+    /// Returns (valid_count, first_break) — number of valid links and
+    /// the event_id where the chain first broke (None if intact).
+    pub fn check_chain_integrity(wal_path: &std::path::Path) -> (usize, Option<String>) {
+        use std::io::BufRead;
+
+        let file = match std::fs::File::open(wal_path) {
+            Ok(f) => f,
+            Err(_) => return (0, None),
+        };
+
+        let reader = std::io::BufReader::new(file);
+        let mut prev_config_hash: Option<String> = None;
+        let mut valid_links = 0usize;
+        let mut first_break: Option<String> = None;
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            // Only check config_load events
+            if parsed.get("operation").and_then(|v| v.as_str()) != Some("gvm.system.config_load") {
+                continue;
+            }
+
+            // Extract integrity context from the event
+            let context = parsed
+                .pointer("/context/_integrity_context")
+                .cloned();
+
+            if let Some(ctx) = context {
+                let current_hash = ctx.get("config_hash").and_then(|v| v.as_str());
+                let claimed_prev = ctx.get("previous_state").and_then(|v| v.as_str());
+
+                // Verify chain link
+                match (&prev_config_hash, claimed_prev) {
+                    (None, None) => {
+                        // First config_load — no previous state expected
+                        valid_links += 1;
+                    }
+                    (None, Some(_)) => {
+                        // First we see, but claims a previous — can't verify (WAL truncated?)
+                        // Treat as valid (we don't have the earlier state to compare)
+                        valid_links += 1;
+                    }
+                    (Some(expected), Some(claimed)) if expected == claimed => {
+                        valid_links += 1;
+                    }
+                    (Some(expected), claimed) => {
+                        // Chain break: expected != claimed
+                        if first_break.is_none() {
+                            let event_id = parsed
+                                .get("event_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            tracing::warn!(
+                                event_id = %event_id,
+                                expected = %expected,
+                                claimed = ?claimed,
+                                "Integrity chain break detected"
+                            );
+                            first_break = Some(event_id);
+                        }
+                    }
+                }
+
+                // Update previous hash for next iteration
+                if let Some(hash) = current_hash {
+                    prev_config_hash = Some(hash.to_string());
+                }
+            }
+        }
+
+        (valid_links, first_break)
+    }
+
     /// Return the number of consecutive primary WAL failures.
     /// Used by the circuit breaker to determine degraded state.
     pub fn primary_failure_count(&self) -> u64 {

@@ -243,7 +243,26 @@ async fn main() {
         }
     }
 
-    // 7.5. Record config file hashes in Merkle chain (tamper detection)
+    let active_integrity_ref: Arc<std::sync::RwLock<Option<String>>> =
+        Arc::new(std::sync::RwLock::new(None));
+
+    // 7.5a. Verify integrity chain from previous sessions
+    {
+        let wal_path_str = std::env::var("GVM_WAL_PATH").unwrap_or_else(|_| config.wal.path.clone());
+        let wal_file = std::path::Path::new(&wal_path_str);
+        let (valid, first_break) = Ledger::check_chain_integrity(wal_file);
+        if let Some(ref broken_at) = first_break {
+            tracing::warn!(
+                valid_links = valid,
+                broken_at = %broken_at,
+                "Integrity chain break detected — config history may have been tampered with"
+            );
+        } else if valid > 0 {
+            tracing::info!(valid_links = valid, "Integrity chain verified");
+        }
+    }
+
+    // 7.5b. Record config file hashes in Merkle chain (tamper detection)
     {
         let mut all_config_files: Vec<(String, std::path::PathBuf)> = Vec::new();
 
@@ -261,9 +280,12 @@ async fn main() {
         match ledger.record_config_load(&config_refs, None).await {
             Ok(hash) => {
                 tracing::info!(context_hash = %hash, "Integrity context recorded");
+                if let Ok(mut guard) = active_integrity_ref.write() {
+                    *guard = Some(hash);
+                }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to record config proof in WAL");
+                tracing::warn!(error = %e, "Failed to record integrity context in WAL");
             }
         }
     }
@@ -438,6 +460,7 @@ async fn main() {
         ca_expires_days: mitm_ca_expires_days,
         dns_governance: None, // populated below if enabled
         wal_path: std::env::var("GVM_WAL_PATH").unwrap_or_else(|_| config.wal.path.clone()),
+        active_integrity_ref: active_integrity_ref.clone(),
     };
 
     // 11a. DNS governance proxy (Delay-Alert, no Deny)

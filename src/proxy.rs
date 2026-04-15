@@ -176,6 +176,10 @@ pub struct AppState {
     pub dns_governance: Option<Arc<crate::dns_governance::DnsGovernance>>,
     /// WAL file path for dashboard read-only access.
     pub wal_path: String,
+    /// Active integrity context hash. Updated on config load/reload.
+    /// Behavioral events reference this to map "which config version
+    /// was active when this event happened" without per-event overhead.
+    pub active_integrity_ref: Arc<std::sync::RwLock<Option<String>>>,
 }
 
 /// Derive event status from upstream HTTP response.
