@@ -99,6 +99,24 @@ Full reachability assessment of all 20 RUSTSEC advisories in audit.toml. This au
 
 ---
 
+### 2026-04-15: Watch mode TUI dashboard (`--output tui`)
+
+Added ratatui + crossterm based terminal dashboard for `gvm watch --output tui`. Event-centric debugging UX with 5 panels: Live Event Timeline (scrollable, color-coded by Allow/Delay/Deny), Anomaly panel (burst/loop/unknown host warnings), Policy Decision distribution (horizontal bar chart), Host Stats (top hosts by request count), LLM Usage (tokens, cost, models). Trace correlation view: press `t` on a timeline entry to group all events sharing the same `trace_id` into a tree view. Keyboard: `q` quit, `↑↓` scroll, `t` trace toggle, `Esc` back. Existing `--output text` and `--output json` modes unchanged.
+
+**Why**: Watch mode's line-by-line output lacks visual debugging context. Developers need "what just happened" at a glance — timeline + anomaly + trace correlation, not metrics dashboards.
+
+Files: `crates/gvm-cli/Cargo.toml` (+ratatui, +crossterm), `crates/gvm-cli/src/{watch.rs, tui/mod.rs, tui/ui.rs, tui/trace.rs, main.rs}` | Risk: Low (additive feature behind `--output tui` flag; existing modes untouched)
+
+---
+
+### 2026-04-15: WAL recording points reference documentation
+
+Added section 4.11 to `docs/architecture/ledger.md` documenting all 7 WAL recording points (proxy, CONNECT, MITM, DNS, vault, system, LLM trace), `enforcement_point` field values, `decision_source` field values, full `GVMEvent` field reference, durability-by-decision table, DNS governance context fields, and vault event operations. Previously undocumented: enforcement_point values, decision_source values, MITM recording point, vault recording details, and the integrated recording points map.
+
+Files: `docs/architecture/ledger.md` | Risk: None (docs only)
+
+---
+
 ### 2026-04-14: uprobe removal + ebpf.rs → tc_filter.rs rename
 
 **What**: Removed the experimental uprobe-based TLS interception feature (SSL_write_ex hooking) and its `--features uprobe` compile flag. MITM (transparent TLS proxy) is the sole HTTPS inspection mechanism. Renamed `ebpf.rs` → `tc_filter.rs` with types: `EbpfAttachResult` → `TcAttachResult`, `EbpfGuard` → `TcFilterGuard`, `check_ebpf_support` → `check_tc_support`. Removed `TlsProbeMode` and `proxy_url` from `SandboxConfig`. Removed `ureq` dependency (only used by uprobe). Updated all docs: security-model.md "Planned v0.3" uprobe sections removed, CHANGELOG roadmap updated to v0.5.0, linux-e2e-test.md uprobe tests marked deprecated, test-report.md uprobe entries struck through.

@@ -16,6 +16,7 @@ mod stats;
 mod status;
 mod suggest;
 mod ui;
+mod tui;
 mod watch;
 
 #[derive(Parser)]

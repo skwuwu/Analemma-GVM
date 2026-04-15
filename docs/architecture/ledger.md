@@ -276,4 +276,125 @@ Auditor: compare context fields across config_load events → hash mismatch dete
 
 ---
 
+## 4.11 WAL Recording Points
+
+Every governance decision is recorded to WAL at one of seven enforcement points. Each point populates the same `GVMEvent` schema but with different field values.
+
+### Recording Points
+
+| # | Enforcement Point | Source File | Trigger | operation | decision_source | Durability |
+|---|-------------------|-------------|---------|-----------|-----------------|------------|
+| 1 | `proxy` / `both` | `proxy.rs` | HTTP request through proxy | From `X-GVM-Operation` header | `SRR` → `proxy`, `ABAC` → `both` | IC-1: async, IC-2/3/Deny: durable |
+| 2 | `proxy` | `proxy.rs` | CONNECT tunnel request | `connect:{host}` | `SRR` | async (loss tolerated) |
+| 3 | `mitm` | `tls_proxy.rs` | Decrypted HTTPS request via MITM | From HTTP method + path | `SRR` or `ABAC` | Always durable (IC-2) |
+| 4 | `dns-proxy` | `dns_governance.rs` | DNS query from sandboxed agent | `gvm.dns.query` | `dns-governance` | Known/Unknown: async, Anomalous/Flood: durable |
+| 5 | `proxy` | `vault.rs` | Vault secret operation | `gvm.vault.{op}` | `internal` | Write/Delete: durable, Read/List: async |
+| 6 | `startup` | `ledger.rs` | Proxy start or hot-reload | `gvm.system.config_load` | `system` | Always durable |
+| 7 | `proxy` | `proxy.rs` | LLM response with reasoning trace | (appended to existing event) | (inherited) | Always durable (separate entry) |
+
+### enforcement_point Values
+
+| Value | Meaning |
+|-------|---------|
+| `both` | ABAC (Layer 1) policy matched — semantic operation evaluation |
+| `proxy` | SRR (Layer 2) matched, rate-limit, vault, or fail-close |
+| `mitm` | TLS MITM interception — decrypted HTTPS request |
+| `mitm-ws-upgrade` | WebSocket upgrade detected during MITM |
+| `dns-proxy` | DNS governance engine — UDP query classification |
+| `startup` | System event at proxy startup or config reload |
+
+### decision_source Values
+
+| Value | Meaning |
+|-------|---------|
+| `ABAC` | Layer 1 semantic policy (operation registry + attribute matching) |
+| `SRR` | Layer 2 network policy (host/path/method pattern matching) |
+| `dns-governance` | DNS tier classification (Known/Unknown/Anomalous/Flood) |
+| `system` | Internal system event (config load, startup) |
+| `internal` | Vault operations (always Allow) |
+| `fail-close` | Emergency path — classification failure or circuit breaker |
+
+### GVMEvent Field Reference
+
+```rust
+pub struct GVMEvent {
+    // ── Identification ──
+    event_id: String,                    // UUID, unique per event
+    trace_id: String,                    // Distributed trace correlation
+    parent_event_id: Option<String>,     // Causal chain link
+
+    // ── Subject ──
+    agent_id: String,                    // Acting agent ID
+    tenant_id: Option<String>,           // Multi-tenant org identifier
+    session_id: String,                  // Session identifier
+    timestamp: DateTime<Utc>,            // UTC timestamp
+
+    // ── Operation ──
+    operation: String,                   // Semantic operation name
+    resource: ResourceDescriptor,        // Service, identifier, tier, sensitivity
+    context: HashMap<String, Value>,     // ABAC attributes (DNS: tier, delay_ms, etc.)
+
+    // ── Transport ──
+    transport: Option<TransportInfo>,    // HTTP method, host, path, status_code
+
+    // ── Decision ──
+    decision: String,                    // "Allow", "Delay { milliseconds: 100 }", "Deny { reason: ... }"
+    decision_source: String,             // See table above
+    matched_rule_id: Option<String>,     // SRR/ABAC rule that matched
+    enforcement_point: String,           // See table above
+
+    // ── Lifecycle ──
+    status: EventStatus,                 // Pending → Confirmed / Failed / Expired
+
+    // ── Payload ──
+    payload: PayloadDescriptor,          // content_hash (SHA-256), size, flagged patterns
+
+    // ── Integrity ──
+    event_hash: Option<String>,          // SHA-256 of canonical fields
+    nats_sequence: Option<u64>,          // Monotonic ordering counter
+
+    // ── LLM Trace (IC-2 only, when LLM response detected) ──
+    llm_trace: Option<LLMTrace>,         // provider, model, thinking, token usage
+    default_caution: bool,               // Hit SRR catch-all (no matching rule)?
+}
+```
+
+### Durability by Decision Type
+
+| Decision | IC Level | WAL Write | Status Lifecycle |
+|----------|----------|-----------|------------------|
+| Allow | IC-1 | `append_async` (loss tolerated) | → Confirmed |
+| Delay { ms } | IC-2 | `append_durable` (fsync) | Pending → delay → Confirmed/Failed |
+| RequireApproval | IC-3 | `append_durable` (fsync) | Pending → approval/timeout → Confirmed/Failed |
+| Deny | — | `append_durable` (fsync) | → Failed { reason } |
+| Throttle (passed) | IC-1 | `append_async` | → Confirmed |
+| Throttle (exceeded) | — | `append_durable` | → Failed (429) |
+| AuditOnly | — | `append_durable` (fsync) | Pending → Confirmed/Failed |
+
+### DNS Governance Context Fields
+
+DNS events include additional context attributes for forensic analysis:
+
+| Context Key | Type | Description |
+|-------------|------|-------------|
+| `dns_tier` | string | "Known", "Unknown", "Anomalous", "Flood" |
+| `delay_ms` | number | Applied delay in milliseconds (0/200/3000/10000) |
+| `dns_base_domain` | string | Base domain of the query |
+| `dns_unique_subdomain_count` | number | Unique subdomains seen for this base in window |
+| `dns_global_unique_count` | number | Global unique subdomain count across all domains |
+| `dns_window_age_secs` | number | Age of the sliding window in seconds |
+
+### Vault Event Operations
+
+| operation | Durability | Payload |
+|-----------|-----------|---------|
+| `gvm.vault.vault_write` | Durable | SHA-256 hash of encrypted value |
+| `gvm.vault.vault_read` | Async | None |
+| `gvm.vault.vault_delete` | Durable | None |
+| `gvm.vault.vault_list_keys` | Async | None |
+
+All vault events use `decision: "Allow"`, `decision_source: "internal"`, `resource.sensitivity: High`.
+
+---
+
 [← Part 3: Network SRR](srr.md) | [Part 5: Encrypted Vault →](architecture/vault.md)

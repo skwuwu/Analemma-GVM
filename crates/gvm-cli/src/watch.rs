@@ -10,17 +10,19 @@ use std::time::Instant;
 
 /// Output mode for watch results — designed for future extensibility.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OutputMode {
+pub(crate) enum OutputMode {
     Text,
     Json,
+    Tui,
 }
 
 impl OutputMode {
-    fn parse(s: &str) -> Result<Self> {
+    pub(crate) fn parse(s: &str) -> Result<Self> {
         match s {
             "text" => Ok(Self::Text),
             "json" => Ok(Self::Json),
-            _ => anyhow::bail!("Unknown output format '{}'. Use 'text' or 'json'.", s),
+            "tui" => Ok(Self::Tui),
+            _ => anyhow::bail!("Unknown output format '{}'. Use 'text', 'json', or 'tui'.", s),
         }
     }
 }
@@ -30,7 +32,7 @@ impl OutputMode {
 /// Estimate cost in USD based on provider, model, and token usage.
 /// Prices are approximate as of 2025 — users needing precision should
 /// configure a pricing.toml (planned for a future release).
-fn estimate_cost(
+pub(crate) fn estimate_cost(
     provider: &str,
     model: Option<&str>,
     prompt_tokens: u64,
@@ -64,7 +66,7 @@ fn estimate_cost(
 
 // ─── Anomaly detector ───
 
-struct AnomalyDetector {
+pub(crate) struct AnomalyDetector {
     /// Sliding window for burst detection
     request_times: VecDeque<Instant>,
     /// Track (method:host:path) -> recent timestamps for loop detection
@@ -74,7 +76,7 @@ struct AnomalyDetector {
 }
 
 impl AnomalyDetector {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             request_times: VecDeque::new(),
             loop_detector: HashMap::new(),
@@ -82,8 +84,12 @@ impl AnomalyDetector {
         }
     }
 
+    pub(crate) fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
     /// Record a request and check for anomalies. Returns a warning if detected.
-    fn record_request(
+    pub(crate) fn record_request(
         &mut self,
         method: &str,
         host: &str,
@@ -155,23 +161,23 @@ impl AnomalyDetector {
 
 // ─── Session stats ───
 
-struct SessionStats {
-    total_requests: u64,
-    hosts: HashMap<String, u64>,
-    methods: HashMap<String, u64>,
-    status_codes: HashMap<u16, u64>,
-    decisions: HashMap<String, u64>,
-    decision_sources: HashMap<String, u64>,
-    total_prompt_tokens: u64,
-    total_completion_tokens: u64,
-    total_tokens: u64,
-    llm_calls: u64,
-    models_used: HashSet<String>,
-    providers_used: HashSet<String>,
-    default_caution_count: u64,
-    thinking_count: u64,
-    estimated_cost: f64,
-    start_time: Instant,
+pub(crate) struct SessionStats {
+    pub(crate) total_requests: u64,
+    pub(crate) hosts: HashMap<String, u64>,
+    pub(crate) methods: HashMap<String, u64>,
+    pub(crate) status_codes: HashMap<u16, u64>,
+    pub(crate) decisions: HashMap<String, u64>,
+    pub(crate) decision_sources: HashMap<String, u64>,
+    pub(crate) total_prompt_tokens: u64,
+    pub(crate) total_completion_tokens: u64,
+    pub(crate) total_tokens: u64,
+    pub(crate) llm_calls: u64,
+    pub(crate) models_used: HashSet<String>,
+    pub(crate) providers_used: HashSet<String>,
+    pub(crate) default_caution_count: u64,
+    pub(crate) thinking_count: u64,
+    pub(crate) estimated_cost: f64,
+    pub(crate) start_time: Instant,
     /// event_ids already counted. Each request transitions through the
     /// EventStatus state machine (Pending -> Executed -> Confirmed/Failed),
     /// emitting one WAL line per transition with the SAME event_id. Without
@@ -181,7 +187,7 @@ struct SessionStats {
 }
 
 impl SessionStats {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             total_requests: 0,
             hosts: HashMap::new(),
@@ -203,7 +209,7 @@ impl SessionStats {
         }
     }
 
-    fn record_event(&mut self, event: &serde_json::Value) {
+    pub(crate) fn record_event(&mut self, event: &serde_json::Value) {
         // Dedup state-machine transitions for the same request. See note
         // on `seen_event_ids`.
         if let Some(event_id) = event.get("event_id").and_then(|v| v.as_str()) {
@@ -429,6 +435,7 @@ async fn tail_wal(
                             // In JSON mode, output each event as a JSON line
                             println!("{}", raw_line);
                         }
+                        OutputMode::Tui => {} // TUI mode handled separately
                     }
                 }
             }
@@ -443,7 +450,7 @@ async fn tail_wal(
 
 /// Read new WAL events from a given byte offset.
 /// Returns (parsed events with raw lines, new offset).
-fn read_wal_from_offset(
+pub(crate) fn read_wal_from_offset(
     wal_path: &str,
     offset: u64,
 ) -> Result<(Vec<(serde_json::Value, String)>, u64)> {
@@ -782,7 +789,7 @@ fn print_session_summary_json(stats: &SessionStats, anomaly: &AnomalyDetector) {
 
 // ─── Formatting helpers ───
 
-fn format_number(n: u64) -> String {
+pub(crate) fn format_number(n: u64) -> String {
     if n < 1_000 {
         return n.to_string();
     }
@@ -797,7 +804,7 @@ fn format_number(n: u64) -> String {
     result.chars().rev().collect()
 }
 
-fn format_duration(d: std::time::Duration) -> String {
+pub(crate) fn format_duration(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     if secs < 60 {
         format!("{}s", secs)
@@ -955,87 +962,109 @@ pub async fn run_watch(
     // Give the agent a moment to start, then begin tailing
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    // Tail WAL until agent exits
-    tokio::select! {
-        agent_result = agent_handle => {
-            // Agent finished — stop watchdog and do a final WAL read
-            watchdog_handle.abort();
-            let _ = cancel_tx.send(true);
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    if output_mode == OutputMode::Tui {
+        // ─── TUI dashboard mode ───
+        // Signal agent exit via watch channel
+        let (agent_done_tx, agent_done_rx) = tokio::sync::watch::channel(false);
+        let agent_notify = tokio::spawn(async move {
+            let result = agent_handle.await;
+            let _ = agent_done_tx.send(true);
+            result
+        });
 
-            // Final sweep
-            if let Ok((events, _)) = read_wal_from_offset(wal_path, wal_start_len) {
-                // Re-process all events for stats (tailing may have missed some)
-                stats = SessionStats::new();
-                anomaly = AnomalyDetector::new();
-                for (event, raw_line) in &events {
-                    stats.record_event(event);
-                    let method = event.pointer("/transport/method").and_then(|v| v.as_str()).unwrap_or("");
-                    let host = event.pointer("/transport/host").and_then(|v| v.as_str()).unwrap_or("");
-                    let path = event.pointer("/transport/path").and_then(|v| v.as_str()).unwrap_or("");
-                    let dc = event.get("default_caution").and_then(|v| v.as_bool()).unwrap_or(false);
-                    anomaly.record_request(method, host, path, dc);
+        let tui_state = crate::tui::run_tui(agent_id, wal_path, wal_start_len, agent_done_rx).await?;
 
-                    // Print any events we might have missed during tail
-                    // (This is a simplified approach — in practice the tail loop
-                    // handles most events. This final sweep catches stragglers.)
-                    match output_mode {
-                        OutputMode::Text => print_live_event_text(event, None),
-                        OutputMode::Json => println!("{}", raw_line),
-                    }
-                }
+        watchdog_handle.abort();
+        let _ = agent_notify.abort();
+
+        // Restore SRR before printing summary
+        if !with_rules {
+            let original_srr = config_dir.join("srr_network.toml");
+            if original_srr.exists() {
+                let _ = reload_proxy_srr(&admin_url, &original_srr).await;
             }
+        }
 
-            if output_mode == OutputMode::Text {
-                // Print agent exit status
-                match agent_result {
-                    Ok(Ok(code)) => {
-                        eprintln!();
-                        if code == 0 {
-                            eprintln!("  {GREEN}Agent completed successfully{RESET}");
-                        } else {
-                            eprintln!("  {YELLOW}Agent exited with code: {}{RESET}", code);
+        // Print text summary after TUI exits (terminal is restored)
+        print_session_summary_text(&tui_state.stats, &tui_state.anomaly);
+    } else {
+        // ─── Text / JSON mode (existing behavior) ───
+        // Tail WAL until agent exits
+        tokio::select! {
+            agent_result = agent_handle => {
+                // Agent finished — stop watchdog and do a final WAL read
+                watchdog_handle.abort();
+                let _ = cancel_tx.send(true);
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+                // Final sweep
+                if let Ok((events, _)) = read_wal_from_offset(wal_path, wal_start_len) {
+                    stats = SessionStats::new();
+                    anomaly = AnomalyDetector::new();
+                    for (event, raw_line) in &events {
+                        stats.record_event(event);
+                        let method = event.pointer("/transport/method").and_then(|v| v.as_str()).unwrap_or("");
+                        let host = event.pointer("/transport/host").and_then(|v| v.as_str()).unwrap_or("");
+                        let path = event.pointer("/transport/path").and_then(|v| v.as_str()).unwrap_or("");
+                        let dc = event.get("default_caution").and_then(|v| v.as_bool()).unwrap_or(false);
+                        anomaly.record_request(method, host, path, dc);
+
+                        match output_mode {
+                            OutputMode::Text => print_live_event_text(event, None),
+                            OutputMode::Json => println!("{}", raw_line),
+                            OutputMode::Tui => unreachable!(),
                         }
                     }
-                    Ok(Err(e)) => {
-                        eprintln!();
-                        eprintln!("  {RED}Agent failed: {}{RESET}", e);
-                    }
-                    Err(e) => {
-                        eprintln!();
-                        eprintln!("  {RED}Agent task panicked: {}{RESET}", e);
+                }
+
+                if output_mode == OutputMode::Text {
+                    match agent_result {
+                        Ok(Ok(code)) => {
+                            eprintln!();
+                            if code == 0 {
+                                eprintln!("  {GREEN}Agent completed successfully{RESET}");
+                            } else {
+                                eprintln!("  {YELLOW}Agent exited with code: {}{RESET}", code);
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            eprintln!();
+                            eprintln!("  {RED}Agent failed: {}{RESET}", e);
+                        }
+                        Err(e) => {
+                            eprintln!();
+                            eprintln!("  {RED}Agent task panicked: {}{RESET}", e);
+                        }
                     }
                 }
             }
+            _ = async {
+                tail_wal(wal_path, wal_start_len, &mut stats, &mut anomaly, output_mode, cancel_rx).await;
+            } => {}
         }
-        _ = async {
-            // Tail loop runs concurrently
-            tail_wal(wal_path, wal_start_len, &mut stats, &mut anomaly, output_mode, cancel_rx).await;
-        } => {}
-    }
 
-    // --- Restore original SRR if we used allow-all ---
-    if !with_rules {
-        // Reload proxy with original config
-        let original_srr = config_dir.join("srr_network.toml");
-        if original_srr.exists() {
-            let _ = reload_proxy_srr(&admin_url, &original_srr).await;
+        // Restore original SRR
+        if !with_rules {
+            let original_srr = config_dir.join("srr_network.toml");
+            if original_srr.exists() {
+                let _ = reload_proxy_srr(&admin_url, &original_srr).await;
+            }
         }
-    }
 
-    // --- Session summary ---
-    match output_mode {
-        OutputMode::Text => print_session_summary_text(&stats, &anomaly),
-        OutputMode::Json => print_session_summary_json(&stats, &anomaly),
-    }
+        // Session summary
+        match output_mode {
+            OutputMode::Text => print_session_summary_text(&stats, &anomaly),
+            OutputMode::Json => print_session_summary_json(&stats, &anomaly),
+            OutputMode::Tui => unreachable!(),
+        }
 
-    // Interactive rule suggestions (text mode only)
-    if output_mode == OutputMode::Text && stats.default_caution_count > 0 {
-        eprintln!();
-        eprintln!(
-            "  {DIM}Tip: Run {CYAN}gvm run --interactive my_agent.py{RESET}{DIM} to create rules for unknown hosts.{RESET}"
-        );
-        eprintln!();
+        if output_mode == OutputMode::Text && stats.default_caution_count > 0 {
+            eprintln!();
+            eprintln!(
+                "  {DIM}Tip: Run {CYAN}gvm run --interactive my_agent.py{RESET}{DIM} to create rules for unknown hosts.{RESET}"
+            );
+            eprintln!();
+        }
     }
 
     Ok(())
