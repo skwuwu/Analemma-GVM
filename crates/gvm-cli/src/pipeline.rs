@@ -181,11 +181,49 @@ async fn launch_sandbox(config: &AgentConfig, pre: &PreLaunchState) -> Result<i3
         let args = &config.command[1..];
         let binary_path =
             which::which(binary).with_context(|| format!("Binary not found: {}", binary))?;
+        // Remap script arguments to sandbox paths. In binary mode
+        // (e.g. `gvm run --sandbox -- python3 agent.py`), the interpreter
+        // is resolved via which() but script file args still reference host
+        // paths. The sandbox bind-mounts script_dir → /workspace, so any
+        // arg that looks like a file in the workspace must become
+        // /workspace/{filename}.
+        let remapped_args: Vec<String> = args
+            .iter()
+            .map(|arg| {
+                let p = std::path::Path::new(arg);
+                if run::looks_like_script(arg) {
+                    // Extract filename and remap to /workspace/
+                    let resolved = run::resolve_script(arg).ok();
+                    if let Some(ref abs) = resolved {
+                        let name = abs
+                            .file_name()
+                            .and_then(|f| f.to_str())
+                            .unwrap_or(arg);
+                        format!("/workspace/{}", name)
+                    } else if let Some(name) = p.file_name().and_then(|f| f.to_str()) {
+                        format!("/workspace/{}", name)
+                    } else {
+                        arg.to_string()
+                    }
+                } else {
+                    arg.to_string()
+                }
+            })
+            .collect();
+        // workspace_dir: for binary mode, use the directory of the first
+        // script-like argument (so it gets bind-mounted as /workspace).
+        // Falls back to CWD if no script args found.
+        let workspace_dir = args
+            .iter()
+            .find(|a| run::looks_like_script(a))
+            .and_then(|a| run::resolve_script(a).ok())
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         run::assemble_sandbox_config(
             binary_path.clone(),
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            workspace_dir,
             binary_path.to_str().unwrap_or(binary).to_string(),
-            args.iter().map(|s| s.to_string()).collect(),
+            remapped_args,
             proxy_addr,
             &config.agent_id,
             config.memory_limit,
