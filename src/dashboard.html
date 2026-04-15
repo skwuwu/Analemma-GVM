@@ -147,19 +147,13 @@ tailwind.config = { theme: { extend: { fontFamily: { mono: ['JetBrains Mono', 'm
     </div>
   </div>
 
-  <!-- Trace + Policy Tree -->
-  <div class="grid grid-cols-5 gap-6" id="trace-section" style="display:none">
-    <div class="col-span-3 bg-slate-900/40 border border-slate-800/40 rounded-lg px-6 py-6">
-      <div class="flex items-center justify-between mb-4">
-        <div class="text-[10px] text-slate-600 uppercase tracking-wider">Trace <span class="mono text-slate-500" id="trace-id"></span></div>
-        <button class="text-[10px] text-slate-700 hover:text-slate-400 transition" onclick="closeTrace()">close</button>
-      </div>
-      <div id="trace-tree" class="mono text-xs space-y-2"></div>
+  <!-- Event detail (inline, shown below clicked row) -->
+  <div class="bg-slate-900/40 border border-slate-800/40 rounded-lg px-6 py-5" id="detail-section" style="display:none">
+    <div class="flex items-center justify-between mb-4">
+      <div class="text-[10px] text-slate-600 uppercase tracking-wider">Event Detail</div>
+      <button class="text-[10px] text-slate-600 hover:text-slate-400 transition" onclick="closeDetail()">close</button>
     </div>
-    <div class="col-span-2 bg-slate-900/40 border border-slate-800/40 rounded-lg px-6 py-6">
-      <div class="text-[10px] text-slate-600 uppercase tracking-wider mb-4">Policy Tree</div>
-      <canvas id="policyTree" class="w-full" height="200"></canvas>
-    </div>
+    <div id="detail-content" class="mono text-xs"></div>
   </div>
 
 </div>
@@ -232,7 +226,7 @@ function renderTimeline(){
     const sens=ev.resource?.sensitivity||'';
     const res=[tier,sens].filter(Boolean).join(' / ');
 
-    let row=`<tr class="${rc} cursor-pointer" onclick="showTrace('${ev.trace_id||''}')">
+    let row=`<tr class="${rc} cursor-pointer" onclick="showDetail('${ev.event_id||''}')">
       <td class="py-2.5 pl-3 text-slate-700">${ts(ev.timestamp)}</td>
       <td class="py-2.5 font-medium text-slate-400">${ev.transport?.method||''}</td>
       <td class="py-2.5 font-medium text-slate-300 truncate">${tr(ev.transport?.host,28)}</td>
@@ -300,56 +294,61 @@ function renderAnomalies(){
   ).join('');
 }
 
-// ─── Trace ───
-function showTrace(tid){
-  if(!tid)return;
-  document.getElementById('trace-section').style.display='';
-  document.getElementById('trace-id').textContent=tid.slice(0,16)+'...';
-  const evs=allEvents.filter(e=>e.trace_id===tid);
-  document.getElementById('trace-tree').innerHTML=evs.map((ev,i)=>{
-    const last=i===evs.length-1,pfx=last?'\u2514':'\u251c',d=ev.decision||'',b=bucket(d);
-    const c=b==='Deny'?'text-red-400':b==='Delay'?'text-amber-600':'text-green-500';
-    const rule=ev.matched_rule_id||'(none)',hash=ev.event_hash?ev.event_hash.slice(0,12)+'...':'';
-    const batch=ev.batch_id!=null?`Batch #${ev.batch_id}`:'';
-    const ep=ev.enforcement_point||'',sens=ev.resource?.sensitivity||'';
-    const dn=b==='Deny'?`<div class="pl-6 text-red-400/60 italic text-[10px]">${translateDeny(ev)}</div>`:'';
-    const llm=ev.llm_trace?`<div class="pl-6 text-slate-400 text-[10px]">LLM: ${ev.llm_trace.provider||''} ${ev.llm_trace.model||''} | ${ev.llm_trace.usage?.total_tokens||0} tokens</div>`:'';
-    return`<div class="py-1.5 ${b==='Deny'?'bg-red-500/5 rounded':''}">
-      <span class="text-slate-500">${pfx}</span>
-      <span class="font-medium ${c}">${ev.transport?.method||''} ${ev.transport?.host||''}</span>
-      <span class="text-slate-400 ml-1">${tr(ev.transport?.path,30)}</span>
-      <span class="text-slate-500 ml-2">\u2192 ${b}</span>
-      <div class="pl-6 text-slate-400 text-[10px]">Rule: ${rule} (${ev.decision_source||''}) | Point: ${ep} | ${sens}</div>
-      ${hash?`<div class="pl-6 text-slate-500 text-[10px]">Hash: ${hash}  ${batch}</div>`:''}${llm}${dn}
-    </div>`;
-  }).join('');
-  renderPolicyTree(evs);
-}
-function closeTrace(){document.getElementById('trace-section').style.display='none'}
+// ─── Event detail ───
+let selectedEventId = null;
 
-function renderPolicyTree(evs){
-  const c=document.getElementById('policyTree'),dpr=window.devicePixelRatio||1;
-  const w=c.offsetWidth,h=200;c.width=w*dpr;c.height=h*dpr;
-  const x=c.getContext('2d');x.scale(dpr,dpr);x.clearRect(0,0,w,h);
-  const hasDeny=evs.some(e=>(e.decision||'').includes('Deny'));
-  const srcs=[...new Set(evs.map(e=>e.decision_source||'SRR'))];
-  const rules=evs.map(e=>({rule:e.matched_rule_id||'(default)',deny:(e.decision||'').includes('Deny'),src:e.decision_source||'SRR'}));
-  const R=5,lvls=[
-    [{x:w/2,y:22,label:'Policy',deny:hasDeny}],
-    srcs.map((s,i)=>({x:w/(srcs.length+1)*(i+1),y:75,label:s,deny:rules.some(r=>r.src===s&&r.deny)})),
-    rules.map((r,i)=>({x:w/(rules.length+1)*(i+1),y:135,label:r.rule,deny:r.deny}))
-  ];
-  for(let l=0;l<lvls.length-1;l++)for(const p of lvls[l])for(const c of lvls[l+1]){
-    const dn=p.deny&&c.deny;x.beginPath();x.moveTo(p.x,p.y+R);x.lineTo(c.x,c.y-R);
-    x.strokeStyle=dn?'#ef4444':'#334155';x.lineWidth=dn?2.5:0.8;x.stroke();
-  }
-  for(const lv of lvls)for(const n of lv){
-    x.beginPath();x.arc(n.x,n.y,R,0,Math.PI*2);
-    x.fillStyle=n.deny?'#ef4444':'#475569';x.fill();
-    x.fillStyle=n.deny?'#fca5a5':'#94a3b8';
-    x.font='10px Inter,sans-serif';x.textAlign='center';
-    x.fillText(tr(n.label,16),n.x,n.y+R+14);
-  }
+function showDetail(eventId) {
+  if (!eventId) return;
+  const ev = allEvents.find(e => e.event_id === eventId);
+  if (!ev) return;
+  selectedEventId = eventId;
+
+  const sec = document.getElementById('detail-section');
+  sec.style.display = '';
+
+  const d = ev.decision || '';
+  const b = bucket(d);
+  const dc = b === 'Deny' ? 'text-red-400' : b === 'Delay' ? 'text-amber-500' : 'text-green-500';
+  const rule = ev.matched_rule_id || '(none)';
+  const src = ev.decision_source || '';
+  const ep = ev.enforcement_point || '';
+  const st = ev.status;
+  const statusStr = typeof st === 'object' ? JSON.stringify(st) : (st || '');
+  const hash = ev.event_hash ? ev.event_hash.slice(0, 20) + '...' : '';
+  const batch = ev.batch_id != null ? `#${ev.batch_id}` : '';
+  const tier = ev.resource?.tier || '';
+  const sens = ev.resource?.sensitivity || '';
+  const sc = ev.transport?.status_code;
+  const denyNote = b === 'Deny' ? `<tr><td class="pr-4 text-slate-600 py-1">Reason</td><td class="text-red-400/80 italic">${translateDeny(ev)}</td></tr>` : '';
+  const llm = ev.llm_trace && typeof ev.llm_trace === 'object'
+    ? `<tr><td class="pr-4 text-slate-600 py-1">LLM Provider</td><td class="text-slate-300">${ev.llm_trace.provider || ''}</td></tr>
+       <tr><td class="pr-4 text-slate-600 py-1">Model</td><td class="text-slate-300">${ev.llm_trace.model || ''}</td></tr>
+       <tr><td class="pr-4 text-slate-600 py-1">Tokens</td><td class="text-slate-300">${ev.llm_trace.usage?.prompt_tokens||0} in + ${ev.llm_trace.usage?.completion_tokens||0} out = ${ev.llm_trace.usage?.total_tokens||0}</td></tr>`
+    : '';
+
+  document.getElementById('detail-content').innerHTML = `
+    <table class="w-full">
+      <tr><td class="pr-4 text-slate-600 py-1 w-32">Request</td><td class="text-slate-200 font-medium">${ev.transport?.method||''} ${ev.transport?.host||''}${ev.transport?.path||''}</td></tr>
+      <tr><td class="pr-4 text-slate-600 py-1">Decision</td><td class="${dc} font-medium">${b}${d.includes('milliseconds') ? ' (' + d.match(/\\d+/)?.[0] + 'ms)' : ''}</td></tr>
+      <tr><td class="pr-4 text-slate-600 py-1">Rule</td><td class="text-slate-300">${rule}</td></tr>
+      <tr><td class="pr-4 text-slate-600 py-1">Source</td><td class="text-slate-400">${src}</td></tr>
+      <tr><td class="pr-4 text-slate-600 py-1">Enforcement</td><td class="text-slate-400">${ep}</td></tr>
+      <tr><td class="pr-4 text-slate-600 py-1">Status Code</td><td class="text-slate-400">${sc || 'pending'}</td></tr>
+      <tr><td class="pr-4 text-slate-600 py-1">Event Status</td><td class="text-slate-400">${statusStr}</td></tr>
+      <tr><td class="pr-4 text-slate-600 py-1">Resource</td><td class="text-slate-400">${[tier, sens].filter(Boolean).join(' / ') || '-'}</td></tr>
+      ${denyNote}
+      ${llm}
+      <tr><td class="pr-4 text-slate-600 py-1">Event ID</td><td class="text-slate-600">${ev.event_id || ''}</td></tr>
+      <tr><td class="pr-4 text-slate-600 py-1">Trace ID</td><td class="text-slate-600">${ev.trace_id || ''}</td></tr>
+      ${hash ? `<tr><td class="pr-4 text-slate-600 py-1">Integrity</td><td class="text-slate-600">Hash: ${hash}  Batch: ${batch}</td></tr>` : ''}
+      <tr><td class="pr-4 text-slate-600 py-1">Agent</td><td class="text-slate-500">${ev.agent_id || ''}</td></tr>
+      <tr><td class="pr-4 text-slate-600 py-1">Timestamp</td><td class="text-slate-500">${ev.timestamp || ''}</td></tr>
+    </table>`;
+}
+
+function closeDetail() {
+  document.getElementById('detail-section').style.display = 'none';
+  selectedEventId = null;
 }
 
 function exportSnapshot(){
