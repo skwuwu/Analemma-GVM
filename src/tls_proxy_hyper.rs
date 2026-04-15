@@ -406,9 +406,20 @@ async fn handle_request(
     // explicitly — without it the upstream sees an empty Host header and
     // may close the connection mid-response, surfacing as
     // "connection closed before message completed" in our error path.
+    // Inject API credentials from secrets.toml (same as proxy.rs Layer 3).
+    // Strips agent-supplied auth headers and replaces with proxy-managed credentials.
+    let mut injected_headers = original_headers.clone();
+    let credential_policy = crate::api_keys::MissingCredentialPolicy::default();
+    if let Err(e) = state
+        .api_keys
+        .inject(&mut injected_headers, &host, &credential_policy)
+    {
+        tracing::warn!(error = %e, host = %host, "MITM: credential injection failed (passthrough)");
+    }
+
     let mut upstream_req = Request::builder().method(method.as_str()).uri(&path);
 
-    for (k, v) in original_headers.iter() {
+    for (k, v) in injected_headers.iter() {
         let name = k.as_str().to_lowercase();
         // Skip hop-by-hop headers per RFC 7230 §6.1, plus:
         //   host             — rewritten below to the real upstream
