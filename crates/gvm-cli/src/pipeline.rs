@@ -31,6 +31,9 @@ pub struct AgentConfig {
     pub memory_limit: Option<u64>,
     pub cpu_limit: Option<f64>,
     pub interactive: bool,
+    /// Suppress agent stdout/stderr (redirect to /dev/null). Used by TUI mode
+    /// to prevent child process output from corrupting the terminal UI.
+    pub suppress_output: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -122,9 +125,14 @@ async fn launch_cooperative_binary(config: &AgentConfig) -> Result<i32> {
     let mut cmd = tokio::process::Command::new(binary);
     cmd.args(args);
     run::inject_proxy_env(&mut cmd, &config.proxy, &config.agent_id);
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
+    cmd.stdin(std::process::Stdio::null());
+    if config.suppress_output {
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+    } else {
+        cmd.stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
+    }
 
     let status = cmd
         .status()
@@ -149,9 +157,14 @@ async fn launch_cooperative_script(config: &AgentConfig) -> Result<i32> {
     }
     cmd.current_dir(script_dir);
     run::inject_proxy_env(&mut cmd, &config.proxy, &config.agent_id);
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
+    cmd.stdin(std::process::Stdio::null());
+    if config.suppress_output {
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+    } else {
+        cmd.stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
+    }
 
     let status = cmd
         .status()

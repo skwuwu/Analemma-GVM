@@ -81,6 +81,7 @@ pub async fn run_agent(
         memory_limit: parse_memory_limit(memory),
         cpu_limit: cpus.parse::<f64>().ok(),
         interactive,
+        suppress_output: false,
     };
 
     crate::pipeline::run_full(config).await

@@ -934,6 +934,7 @@ pub async fn run_watch(
         memory_limit: None,
         cpu_limit: None,
         interactive: false,
+        suppress_output: output_mode == OutputMode::Tui,
     };
 
     // Pre-launch (ensure proxy, orphan cleanup, CA download)
