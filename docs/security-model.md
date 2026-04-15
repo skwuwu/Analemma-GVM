@@ -668,6 +668,45 @@ As of v0.5.0, the experimental uprobe-based TLS interception (SSL_write_ex hooki
 
 ---
 
+## Integrity Context (GIC)
+
+Every configuration load event records a `GvmIntegrityContext` — an immutable snapshot of the execution environment at that point in time. This enables reproducible debugging, tamper detection, and configuration drift prevention.
+
+### Why it exists
+
+- **Reproducible debugging**: When an incident occurs, the `config_hash` field tells you exactly which ruleset was active at that moment.
+- **Change history chaining**: `previous_state` links each config version to its predecessor. A gap or hash mismatch proves the chain was tampered with.
+- **Collaboration accountability**: In team environments, `origin_id` and `signature` record who authorized the configuration, preventing unattributed changes.
+
+### Privacy and trust model
+
+All integrity contexts are generated locally by default. Nothing is transmitted externally. No personal data is collected — `origin_id` is a logical system identifier (e.g., "local-default"), not a user identity. The `trust_model` field lets operators choose the verification level appropriate for their environment — from local hash-only development to hardware-backed signing in regulated deployments.
+
+### Field reference
+
+| Field | Purpose |
+|-------|---------|
+| `spec_version` | Schema version for log format backward compatibility |
+| `trust_model` | Verification mechanism for the environment's security requirements (`Local`, `Static`, `Remote`) |
+| `origin_id` | Logical identifier for the log origin in distributed environments (not personal data — e.g., "local-default") |
+| `algorithm` | Cryptographic algorithm used for signing (`None` for local hash-only, `Ed25519` for keypair) |
+| `config_hash` | SHA-256 snapshot guaranteeing execution directive integrity |
+| `signature` | Digital signature over `config_hash` (empty when `algorithm = None`) |
+| `timestamp` | Unix epoch seconds when the context was created (numeric format avoids timezone ambiguity) |
+| `previous_state` | Cryptographic link to the prior config state for gap/tamper detection |
+| `checkpoint_id` | WAL batch anchor for point-in-time recovery queries |
+| `opaque_extensions` | Extension slot for vendor-specific security features (HSM, TPM) or custom metadata |
+
+### How it works
+
+1. On config load (startup or hot-reload), GVM computes SHA-256 of the config content.
+2. A `GvmIntegrityContext` is created with the hash, timestamp, and link to the previous state.
+3. The full context is embedded in the WAL `config_load` event (inside the Merkle chain).
+4. Subsequent behavioral events carry only a `config_integrity_ref` — a SHA-256 reference to the active context — so per-event overhead is zero beyond a 64-byte string.
+5. An auditor can reconstruct which config governed any event by matching `config_integrity_ref` to the corresponding `config_load` event.
+
+---
+
 ## Versioning
 
 This document will be updated as:

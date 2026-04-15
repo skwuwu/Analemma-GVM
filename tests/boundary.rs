@@ -1500,6 +1500,6 @@ fn make_test_event(event_id: &str) -> GVMEvent {
         nats_sequence: None,
         event_hash: None,
         llm_trace: None,
-        default_caution: false, config_proof_hash: None,
+        default_caution: false, config_integrity_ref: None,
     }
 }

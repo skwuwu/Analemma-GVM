@@ -192,7 +192,7 @@ pub struct GVMEvent {
     /// without embedding the full context in every event (performance).
     /// Only config_load events carry the full GvmIntegrityContext.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config_proof_hash: Option<String>,
+    pub config_integrity_ref: Option<String>,
 }
 
 // ─── Integrity Context (execution environment reproducibility) ───
@@ -293,7 +293,7 @@ impl GvmIntegrityContext {
         }
     }
 
-    /// SHA-256 hash of this context (used as config_proof_hash in behavioral events).
+    /// SHA-256 hash of this context (used as config_integrity_ref in behavioral events).
     pub fn context_hash(&self) -> String {
         use sha2::{Digest, Sha256};
         let canonical = format!(

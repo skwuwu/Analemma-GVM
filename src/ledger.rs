@@ -605,7 +605,7 @@ impl Ledger {
     ///
     /// Creates an integrity context that records the config state for
     /// reproducibility and tamper detection.
-    /// Behavioral events reference this context via `config_proof_hash`.
+    /// Behavioral events reference this context via `config_integrity_ref`.
     ///
     /// Returns the context hash (for attaching to subsequent behavioral events).
     pub async fn record_config_load(
@@ -672,7 +672,7 @@ impl Ledger {
             event_hash: None,
             llm_trace: None,
             default_caution: false,
-            config_proof_hash: Some(context_hash.clone()),
+            config_integrity_ref: Some(context_hash.clone()),
         };
 
         self.append_durable(&event).await?;
@@ -765,7 +765,7 @@ pub fn build_dns_event(
         nats_sequence: None,
         event_hash: None,
         llm_trace: None,
-        default_caution: true, config_proof_hash: None,
+        default_caution: true, config_integrity_ref: None,
     }
 }
 
