@@ -246,6 +246,19 @@ enum Commands {
         output: String,
     },
 
+    /// Open the governance dashboard in a browser.
+    ///
+    /// Starts the proxy if not running, then opens the dashboard at
+    /// http://localhost:9090/gvm/dashboard.
+    ///
+    ///   gvm dashboard                   # open in default browser
+    ///   gvm dashboard --proxy http://127.0.0.1:8080
+    Dashboard {
+        /// GVM proxy URL
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        proxy: String,
+    },
+
     /// Clean up orphaned sandbox resources (veth, iptables, mounts, cgroups).
     ///
     /// Scans for state files from previously crashed sandbox sessions and
@@ -783,6 +796,40 @@ async fn main() -> anyhow::Result<()> {
                         Err(e) => eprintln!("Cleanup error: {:#}", e),
                     }
                 }
+            }
+        }
+
+        Commands::Dashboard { proxy } => {
+            let admin_url = run::derive_admin_url(&proxy);
+            let dashboard_url = format!("{}/gvm/dashboard", admin_url);
+
+            // Ensure proxy is running
+            let workspace = run::workspace_root_for_proxy();
+            proxy_manager::ensure_available(&proxy, &workspace, false).await?;
+
+            eprintln!(
+                "  {}Dashboard:{} {}{}{}",
+                ui::GREEN, ui::RESET, ui::CYAN, dashboard_url, ui::RESET
+            );
+
+            // Open browser
+            #[cfg(target_os = "linux")]
+            {
+                let _ = std::process::Command::new("xdg-open")
+                    .arg(&dashboard_url)
+                    .spawn();
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("open")
+                    .arg(&dashboard_url)
+                    .spawn();
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let _ = std::process::Command::new("cmd")
+                    .args(["/C", "start", &dashboard_url])
+                    .spawn();
             }
         }
 
