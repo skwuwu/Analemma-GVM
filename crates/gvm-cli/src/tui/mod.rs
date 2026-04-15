@@ -31,6 +31,7 @@ const MAX_TIMELINE_ENTRIES: usize = 500;
 #[derive(Clone)]
 pub(crate) struct TimelineEntry {
     pub(crate) index: usize,
+    pub(crate) event_id: String,
     pub(crate) time_short: String,
     pub(crate) method: String,
     pub(crate) host: String,
@@ -104,7 +105,7 @@ impl TuiState {
             .timeline
             .iter_mut()
             .rev()
-            .find(|e| e.trace_id == event_id)
+            .find(|e| e.event_id == event_id)
         {
             // Update status code if now available
             if let Some(code) = event
@@ -167,6 +168,7 @@ impl TuiState {
 
         let entry = TimelineEntry {
             index: idx,
+            event_id: event_id.to_string(),
             time_short,
             method,
             host,
