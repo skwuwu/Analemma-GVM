@@ -155,6 +155,84 @@ curl -s http://localhost:8080/gvm/info | python3 -m json.tool
 > The uprobe security model table and related properties are no longer applicable.
 > MITM TLS proxy is the sole HTTPS inspection mechanism as of v0.5.0.
 
+## Test 7: Watch Mode TUI Dashboard
+
+Tests the `--output tui` terminal dashboard for agent debugging.
+
+### Prerequisites
+
+API keys must be loaded from the project's `.env` file:
+
+```bash
+# .env file in project root (not committed to git)
+ANTHROPIC_API_KEY=sk-ant-...
+
+# Load into current shell
+export $(cat .env | xargs)
+
+# For sandbox mode (sudo), pass env with -E:
+sudo -E target/release/gvm watch --output tui --sandbox -- python3 agent.py
+```
+
+### 7a: Cooperative mode (HTTP traffic)
+
+```bash
+cd ~/Analemma-GVM
+export $(cat .env | xargs)
+
+# TUI mode — interactive terminal dashboard
+target/release/gvm watch --output tui -- python3 agent.py
+
+# Text mode — line-by-line output (for scripted tests)
+target/release/gvm watch --output text -- python3 agent.py
+```
+
+**What to verify**: Timeline shows HTTP requests. Host stats, decision distribution, anomaly detection all update in real-time. HTTPS requests appear only as CONNECT events (domain-level, no path/body inspection without MITM).
+
+### 7b: Sandbox mode (MITM HTTPS inspection)
+
+```bash
+sudo -E target/release/gvm watch --output text --sandbox -- python3 agent.py
+```
+
+**What to verify**: HTTPS requests (e.g., `POST api.anthropic.com /v1/messages`) appear in Timeline with method + path. MITM CA injected. LLM Usage panel shows token counts and estimated cost.
+
+**Note**: Sandbox MITM strips and re-injects API credentials. For Anthropic API calls to succeed, configure `config/secrets.toml`:
+
+```toml
+[credentials."api.anthropic.com"]
+type = "ApiKey"
+header = "x-api-key"
+value = "sk-ant-..."
+```
+
+### 7c: TUI keyboard interaction
+
+| Key | Action | Verify |
+|-----|--------|--------|
+| `↑↓` | Scroll timeline | Selected row highlights |
+| `t` | Toggle trace view | Events grouped by trace_id in tree format |
+| `Esc` | Exit trace view | Returns to flat timeline |
+| `q` | Quit TUI | Terminal restored cleanly |
+
+### 7d: Known limitations
+
+- **sudo without `-E`**: TUI fails with `ENXIO` (errno 6) because `sudo` doesn't inherit the PTY. Always use `sudo -E` or run without sudo (cooperative mode).
+- **Cooperative HTTPS**: Only domain-level CONNECT events recorded. Use `--sandbox` for full L7 HTTPS inspection.
+- **asciinema**: Cannot capture alternate screen output. Use `tmux capture-pane` or direct SSH for visual verification.
+
+### Test Results (2026-04-15)
+
+| Test | Mode | Result |
+|------|------|--------|
+| TUI rendering | Cooperative | PASS — 5 panels, clean layout |
+| Timeline dedup | Cooperative | PASS — N events = N rows |
+| Agent stdout suppression | Cooperative | PASS — no header corruption |
+| Anomaly detection | Cooperative | PASS — loop/burst detected |
+| MITM HTTPS inspection | Sandbox | PASS — api.anthropic.com visible |
+| LLM token tracking | Sandbox | Pending — requires secrets.toml |
+| Text mode regression | Cooperative | PASS — unchanged behavior |
+
 ## Known Issues
 
 - **rustc 1.94.0 ICE**: hyper service_fn closures trigger compiler panic on Linux. Use `rustup default 1.85.0`.
