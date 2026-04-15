@@ -980,3 +980,111 @@ mod tests {
         assert_eq!(usage.computed_total(), None);
     }
 }
+
+// ─── Tap-stream: shared between proxy.rs and tls_proxy_hyper.rs ───
+
+/// Maximum JSON response body bytes to capture for trace extraction.
+pub const TAP_MAX_JSON_BYTES: usize = 256 * 1024;
+/// Maximum SSE response body bytes to capture for trace extraction.
+pub const TAP_MAX_SSE_BYTES: usize = 1024 * 1024;
+
+/// Wrap a response body stream with bounded capture for LLM trace extraction.
+///
+/// Returns a new stream that **yields chunks immediately** (no TTFB penalty)
+/// while capturing up to `capture_limit` bytes in a side buffer. After the
+/// stream ends, extracts the LLM trace and spawns a WAL write via `tokio::spawn`.
+///
+/// Error type is `String` — callers convert their body's error type via `map_err`.
+/// This makes the function usable from both axum (proxy.rs) and hyper (tls_proxy_hyper.rs).
+///
+/// If trace extraction fails or the stream errors, only a warning is logged.
+/// The proxy never crashes due to trace extraction.
+pub fn tap_response_stream(
+    body_stream: impl futures_util::Stream<Item = Result<hyper::body::Bytes, String>> + Send + 'static,
+    provider: &str,
+    is_sse: bool,
+    event: gvm_types::GVMEvent,
+    ledger: std::sync::Arc<crate::ledger::Ledger>,
+) -> impl futures_util::Stream<Item = Result<hyper::body::Bytes, String>> + Send + 'static {
+    let capture_limit = if is_sse {
+        TAP_MAX_SSE_BYTES
+    } else {
+        TAP_MAX_JSON_BYTES
+    };
+    let provider_name = provider.to_string();
+
+    async_stream::stream! {
+        use futures_util::StreamExt;
+        let mut upstream = std::pin::pin!(body_stream);
+        let mut capture = Vec::with_capacity(16 * 1024);
+        let mut capture_overflow = false;
+        let mut stream_failed = false;
+
+        while let Some(next) = upstream.next().await {
+            match next {
+                Ok(chunk) => {
+                    if capture.len() < capture_limit {
+                        let remaining = capture_limit - capture.len();
+                        let take_len = remaining.min(chunk.len());
+                        capture.extend_from_slice(&chunk[..take_len]);
+                        if take_len < chunk.len() {
+                            capture_overflow = true;
+                        }
+                    } else {
+                        capture_overflow = true;
+                    }
+                    yield Ok(chunk);
+                }
+                Err(err) => {
+                    stream_failed = true;
+                    tracing::warn!(
+                        provider = provider_name.as_str(),
+                        error = %err,
+                        "Upstream stream interrupted during trace tap"
+                    );
+                    yield Err(err);
+                    break;
+                }
+            }
+        }
+
+        if stream_failed {
+            return;
+        }
+
+        // Extract trace from captured bytes after stream completes
+        let mut trace = if is_sse {
+            match extract_thinking_trace_from_sse(provider_name.as_str(), &capture) {
+                Some(t) => t,
+                None => return,
+            }
+        } else {
+            match extract_thinking_trace(provider_name.as_str(), &capture) {
+                Some(t) => t,
+                None => return,
+            }
+        };
+
+        if capture_overflow {
+            trace.truncated = true;
+        }
+
+        tracing::info!(
+            provider = provider_name.as_str(),
+            model = ?trace.model,
+            has_thinking = trace.thinking.is_some(),
+            truncated = trace.truncated,
+            streaming = is_sse,
+            "LLM thinking trace extracted"
+        );
+
+        let mut trace_event = event;
+        trace_event.llm_trace = Some(trace);
+
+        tokio::spawn(async move {
+            if let Err(e) = ledger.append_durable(&trace_event).await {
+                tracing::warn!(error = %e, "Failed to persist LLM trace WAL entry");
+            }
+        });
+    }
+}

@@ -1206,18 +1206,9 @@ async fn forward_request(
 /// Buffer or tap response body to extract LLM thinking trace.
 /// Called only for IC-2 paths targeting known LLM providers.
 ///
-/// Both SSE and non-SSE responses use the same tap-stream pattern:
-/// chunks are forwarded immediately (no full buffering before first byte),
-/// while a bounded capture accumulates bytes for post-stream trace extraction.
-/// This prevents memory exhaustion under concurrent load (N requests × buffer_size)
-/// and eliminates the latency penalty of full buffering before forwarding.
-const MAX_JSON_TRACE_CAPTURE_BYTES: usize = 256 * 1024;
-const MAX_SSE_TRACE_CAPTURE_BYTES: usize = 1024 * 1024;
-
-/// Trace extraction is deferred to stream completion. The extracted trace
-/// is persisted as a separate WAL entry via `tokio::spawn`, so the caller's
-/// `event` is not modified in-place. The caller should still persist the
-/// original event (without llm_trace) for the enforcement decision record.
+/// Wrap an LLM provider response with trace extraction tap-stream.
+/// Delegates to the shared `llm_trace::tap_response_stream()`.
+/// Returns the response with a tapped body that extracts traces post-stream.
 async fn extract_llm_trace_from_response(
     response: Response<Body>,
     provider: &str,
@@ -1226,7 +1217,6 @@ async fn extract_llm_trace_from_response(
 ) -> Response<Body> {
     let (parts, body) = response.into_parts();
 
-    // Detect SSE streaming from content-type header
     let is_sse = parts
         .headers
         .get(hyper::header::CONTENT_TYPE)
@@ -1234,97 +1224,22 @@ async fn extract_llm_trace_from_response(
         .map(llm_trace::is_sse_content_type)
         .unwrap_or(false);
 
-    let capture_limit = if is_sse {
-        MAX_SSE_TRACE_CAPTURE_BYTES
-    } else {
-        MAX_JSON_TRACE_CAPTURE_BYTES
-    };
+    // Convert axum Body to Stream<Item=Result<Bytes, String>> for the shared tap function
+    let body_stream =
+        http_body_util::BodyDataStream::new(body).map(|r| r.map_err(|e| e.to_string()));
 
-    // Unified tap-stream: forward chunks immediately, capture bounded bytes
-    // for post-stream trace extraction. Same pattern for SSE and JSON responses.
-    let provider_name = provider.to_string();
-    let trace_event = event.clone();
-    let mut upstream_stream = http_body_util::BodyDataStream::new(body);
+    let tapped = llm_trace::tap_response_stream(
+        body_stream,
+        provider,
+        is_sse,
+        event.clone(),
+        ledger,
+    );
 
-    let tapped_stream = async_stream::stream! {
-        let mut capture = Vec::with_capacity(16 * 1024);
-        let mut capture_overflow = false;
-        let mut stream_failed = false;
-
-        while let Some(next) = upstream_stream.next().await {
-            match next {
-                Ok(chunk) => {
-                    if capture.len() < capture_limit {
-                        let remaining = capture_limit - capture.len();
-                        let take_len = remaining.min(chunk.len());
-                        capture.extend_from_slice(&chunk[..take_len]);
-                        if take_len < chunk.len() {
-                            capture_overflow = true;
-                        }
-                    } else {
-                        capture_overflow = true;
-                    }
-
-                    yield Ok::<Bytes, axum::Error>(chunk);
-                }
-                Err(err) => {
-                    stream_failed = true;
-                    tracing::warn!(
-                        provider = provider_name.as_str(),
-                        error = %err,
-                        "Upstream stream interrupted during trace tap"
-                    );
-                    yield Err(err);
-                    break;
-                }
-            }
-        }
-
-        if stream_failed {
-            return;
-        }
-
-        // Extract trace from captured bytes after stream completes
-        let mut trace = if is_sse {
-            match llm_trace::extract_thinking_trace_from_sse(provider_name.as_str(), &capture) {
-                Some(trace) => trace,
-                None => return,
-            }
-        } else {
-            match llm_trace::extract_thinking_trace(provider_name.as_str(), &capture) {
-                Some(trace) => trace,
-                None => return,
-            }
-        };
-
-        if capture_overflow {
-            trace.truncated = true;
-        }
-
-        tracing::info!(
-            provider = provider_name.as_str(),
-            model = ?trace.model,
-            has_thinking = trace.thinking.is_some(),
-            truncated = trace.truncated,
-            streaming = is_sse,
-            "LLM thinking trace extracted"
-        );
-
-        let mut trace_event = trace_event;
-        trace_event.llm_trace = Some(trace);
-
-        tokio::spawn(async move {
-            if let Err(e) = ledger.append_durable(&trace_event).await {
-                tracing::warn!(error = %e, "Failed to persist LLM trace update");
-            }
-        });
-    };
-
-    Response::from_parts(parts, Body::from_stream(tapped_stream))
+    Response::from_parts(parts, Body::from_stream(tapped.map(|r| r.map_err(|e| {
+        axum::Error::new(std::io::Error::new(std::io::ErrorKind::Other, e))
+    }))))
 }
-
-// extract_llm_trace_from_sse_stream removed: unified into extract_llm_trace_from_response
-// using the same tap-stream pattern for both SSE and non-SSE responses.
 
 /// Parse GVM-specific headers from an SDK-routed request.
 /// When a verified JWT identity is provided, it overrides the self-declared

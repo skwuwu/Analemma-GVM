@@ -1354,16 +1354,11 @@ pub async fn dashboard_stats(
     use std::io::BufRead;
     let reader = std::io::BufReader::new(file);
 
-    let mut total: u64 = 0;
-    let mut hosts: HashMap<String, u64> = HashMap::new();
-    let mut decisions: HashMap<String, u64> = HashMap::new();
-    let mut status_codes: HashMap<String, u64> = HashMap::new();
-    let mut denied_rules: HashMap<String, u64> = HashMap::new();
-    let mut llm_tokens: u64 = 0;
-    let mut llm_calls: u64 = 0;
-    let mut llm_cost: f64 = 0.0;
-    let mut models: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Two-phase: collect latest state per event_id (upsert), then aggregate.
+    // WAL may contain multiple entries per event_id (Pending → Confirmed + llm_trace).
+    // We want the latest (most complete) version of each event.
+    let mut latest: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
 
     for line in reader.lines() {
         let line = match line {
@@ -1374,23 +1369,36 @@ pub async fn dashboard_stats(
         if trimmed.is_empty() {
             continue;
         }
-
         let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
             Err(_) => continue,
         };
-
-        // Skip batch records
         if parsed.get("batch_id").is_some() && parsed.get("merkle_root").is_some() {
             continue;
         }
-
-        // Dedup by event_id
-        let event_id = parsed.get("event_id").and_then(|v| v.as_str()).unwrap_or("");
-        if event_id.is_empty() || !seen_ids.insert(event_id.to_string()) {
+        let event_id = parsed
+            .get("event_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if event_id.is_empty() {
             continue;
         }
+        // Upsert: later WAL entries for same event_id overwrite earlier ones
+        latest.insert(event_id.to_string(), parsed);
+    }
 
+    // Phase 2: aggregate from deduplicated events
+    let mut total: u64 = 0;
+    let mut hosts: HashMap<String, u64> = HashMap::new();
+    let mut decisions: HashMap<String, u64> = HashMap::new();
+    let mut status_codes: HashMap<String, u64> = HashMap::new();
+    let mut denied_rules: HashMap<String, u64> = HashMap::new();
+    let mut llm_tokens: u64 = 0;
+    let mut llm_calls: u64 = 0;
+    let mut llm_cost: f64 = 0.0;
+    let mut models: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for parsed in latest.values() {
         total += 1;
 
         if let Some(host) = parsed.pointer("/transport/host").and_then(|v| v.as_str()) {
@@ -1423,18 +1431,27 @@ pub async fn dashboard_stats(
         }
 
         if let Some(trace) = parsed.get("llm_trace") {
-            llm_calls += 1;
-            if let Some(model) = trace.get("model").and_then(|v| v.as_str()) {
-                models.insert(model.to_string());
-            }
-            if let Some(usage) = trace.get("usage") {
-                let prompt = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                let completion = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                llm_tokens += prompt + completion;
+            if !trace.is_null() {
+                llm_calls += 1;
+                if let Some(model) = trace.get("model").and_then(|v| v.as_str()) {
+                    models.insert(model.to_string());
+                }
+                if let Some(usage) = trace.get("usage") {
+                    let prompt = usage
+                        .get("prompt_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let completion = usage
+                        .get("completion_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    llm_tokens += prompt + completion;
 
-                let provider = trace.get("provider").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let model_name = trace.get("model").and_then(|v| v.as_str());
-                llm_cost += estimate_llm_cost(provider, model_name, prompt, completion);
+                    let provider =
+                        trace.get("provider").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let model_name = trace.get("model").and_then(|v| v.as_str());
+                    llm_cost += estimate_llm_cost(provider, model_name, prompt, completion);
+                }
             }
         }
     }

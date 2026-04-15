@@ -531,7 +531,13 @@ pub async fn append_enforcement_event(
         decision_source: format!("{:?}", classify_output.classification.source),
         matched_rule_id: classify_output.classification.matched_rule_id.clone(),
         enforcement_point: "mitm".to_string(),
-        status: gvm_types::EventStatus::Confirmed,
+        status: if decision_str.contains("Deny") {
+            gvm_types::EventStatus::Failed {
+                reason: format!("Denied: {}", decision_str),
+            }
+        } else {
+            gvm_types::EventStatus::Confirmed
+        },
         payload: gvm_types::PayloadDescriptor::default(),
         nats_sequence: None,
         event_hash: None,

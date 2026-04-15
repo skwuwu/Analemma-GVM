@@ -227,45 +227,43 @@ async fn handle_request(
         _ => {} // Allow, AuditOnly
     }
 
-    // ── WAL audit ──
-    {
-        let event = gvm_types::GVMEvent {
-            event_id: uuid::Uuid::new_v4().to_string(),
-            trace_id: uuid::Uuid::new_v4().to_string(),
-            parent_event_id: None,
-            agent_id: classify_output.agent_id.clone(),
-            tenant_id: None,
-            session_id: host.clone(),
-            timestamp: chrono::Utc::now(),
-            operation: format!("{} {}", method, path),
-            resource: gvm_types::ResourceDescriptor {
-                service: host.clone(),
-                identifier: Some(path.clone()),
-                tier: gvm_types::ResourceTier::External,
-                sensitivity: gvm_types::Sensitivity::Medium,
-            },
-            context: std::collections::HashMap::new(),
-            transport: Some(gvm_types::TransportInfo {
-                method: method.clone(),
-                host: host.clone(),
-                path: path.clone(),
-                status_code: None,
-            }),
-            decision: format!("{:?}", classify_output.classification.decision),
-            decision_source: format!("{:?}", classify_output.classification.source),
-            matched_rule_id: classify_output.classification.matched_rule_id.clone(),
-            enforcement_point: "mitm".to_string(),
-            status: gvm_types::EventStatus::Pending,
-            payload: gvm_types::PayloadDescriptor::default(),
-            nats_sequence: None,
-            event_hash: None,
-            llm_trace: None,
-            default_caution: is_default_caution,
-        };
-        match state.ledger.append_durable(&event).await {
-            Ok(()) => tracing::info!(host = %host, path = %path, "MITM WAL event recorded"),
-            Err(e) => tracing::error!(error = %e, "MITM WAL append FAILED"),
-        }
+    // ── WAL audit (Pending — updated after response) ──
+    let wal_event = gvm_types::GVMEvent {
+        event_id: uuid::Uuid::new_v4().to_string(),
+        trace_id: uuid::Uuid::new_v4().to_string(),
+        parent_event_id: None,
+        agent_id: classify_output.agent_id.clone(),
+        tenant_id: None,
+        session_id: host.clone(),
+        timestamp: chrono::Utc::now(),
+        operation: format!("{} {}", method, path),
+        resource: gvm_types::ResourceDescriptor {
+            service: host.clone(),
+            identifier: Some(path.clone()),
+            tier: gvm_types::ResourceTier::External,
+            sensitivity: gvm_types::Sensitivity::Medium,
+        },
+        context: std::collections::HashMap::new(),
+        transport: Some(gvm_types::TransportInfo {
+            method: method.clone(),
+            host: host.clone(),
+            path: path.clone(),
+            status_code: None,
+        }),
+        decision: format!("{:?}", classify_output.classification.decision),
+        decision_source: format!("{:?}", classify_output.classification.source),
+        matched_rule_id: classify_output.classification.matched_rule_id.clone(),
+        enforcement_point: "mitm".to_string(),
+        status: gvm_types::EventStatus::Pending,
+        payload: gvm_types::PayloadDescriptor::default(),
+        nats_sequence: None,
+        event_hash: None,
+        llm_trace: None,
+        default_caution: is_default_caution,
+    };
+    match state.ledger.append_durable(&wal_event).await {
+        Ok(()) => tracing::info!(host = %host, path = %path, "MITM WAL event recorded (Pending)"),
+        Err(e) => tracing::error!(error = %e, "MITM WAL append FAILED"),
     }
 
     // ── Forward to upstream ──
@@ -495,14 +493,72 @@ async fn handle_request(
 
     match send_result {
         Ok(resp) => {
-            tracing::info!(status = %resp.status(), host = %upstream_host, "MITM: upstream response");
-            // Stream response directly to client — hyper handles framing.
-            // No buffering, no custom chunked parser, no manual content-length.
+            let resp_status = resp.status().as_u16();
+            tracing::info!(status = resp_status, host = %upstream_host, "MITM: upstream response");
+
+            // WAL status update (second write — Pending → Confirmed/Failed)
+            let mut updated = wal_event.clone();
+            updated.status = if resp.status().is_success() {
+                gvm_types::EventStatus::Confirmed
+            } else {
+                gvm_types::EventStatus::Failed {
+                    reason: format!("HTTP {}", resp_status),
+                }
+            };
+            if let Some(ref mut t) = updated.transport {
+                t.status_code = Some(resp_status);
+            }
+            let _ = state.ledger.append_durable(&updated).await;
+
+            // LLM trace extraction via tap-stream (non-blocking, no TTFB penalty)
+            let llm_provider = crate::llm_trace::identify_llm_provider(&host);
+            if let Some(provider) = llm_provider {
+                if resp.status().is_success() {
+                    let (parts, body) = resp.into_parts();
+                    let is_sse = parts
+                        .headers
+                        .get(hyper::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(crate::llm_trace::is_sse_content_type)
+                        .unwrap_or(false);
+
+                    use futures_util::StreamExt;
+
+                    // Convert hyper Incoming → Stream<Result<Bytes, String>>
+                    let body_stream = http_body_util::BodyDataStream::new(body)
+                        .map(|r| r.map_err(|e| e.to_string()));
+
+                    let tapped = crate::llm_trace::tap_response_stream(
+                        body_stream,
+                        provider,
+                        is_sse,
+                        updated,
+                        state.ledger.clone(),
+                    );
+
+                    // Wrap tapped stream back into BoxBody for hyper response
+                    let tapped_body = BodyExt::boxed(
+                        http_body_util::StreamBody::new(
+                            tapped.map(|r| r.map(hyper::body::Frame::data))
+                        )
+                    );
+                    return Ok(Response::from_parts(parts, tapped_body));
+                }
+            }
+
+            // Non-LLM or non-2xx: forward as-is
             let (parts, body) = resp.into_parts();
             let boxed = body.map_err(|e| e.to_string()).boxed();
             Ok(Response::from_parts(parts, boxed))
         }
         Err(e) => {
+            // WAL: mark as Failed on connection error
+            let mut failed = wal_event;
+            failed.status = gvm_types::EventStatus::Failed {
+                reason: format!("upstream error: {}", e),
+            };
+            let _ = state.ledger.append_durable(&failed).await;
+
             tracing::warn!(error = %e, host = %upstream_host, "MITM: upstream request failed");
             Ok(Response::builder()
                 .status(502)
