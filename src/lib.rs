@@ -13,7 +13,6 @@ pub mod llm_trace;
 pub mod merkle;
 pub mod policy;
 pub mod proxy;
-pub mod rate_limiter;
 pub mod token_budget;
 pub mod registry;
 pub mod srr;

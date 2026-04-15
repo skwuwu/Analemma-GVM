@@ -194,6 +194,32 @@ async fn handle_request(
         _ => {} // Allow, AuditOnly
     }
 
+    // ── Token budget check (LLM providers only) ──
+    let is_llm = crate::llm_trace::identify_llm_provider(&host).is_some();
+    if is_llm && state.token_budget.is_enabled() {
+        if let Err(exceeded) = state.token_budget.check_and_reserve() {
+            let reason = format!(
+                "Token budget exceeded: {}/{} tokens/hr (${:.2}/${:.2})",
+                exceeded.tokens_used,
+                exceeded.tokens_limit,
+                exceeded.cost_used_usd(),
+                exceeded.cost_limit_usd(),
+            );
+            return Ok(Response::builder()
+                .status(429)
+                .header("Content-Type", "application/json")
+                .header("X-GVM-Block-Reason", "Token budget exceeded")
+                .header("Retry-After", "60")
+                .body(full_body(serde_json::json!({
+                    "blocked": true,
+                    "decision": "BudgetExceeded",
+                    "reason": reason,
+                    "next_action": "wait for budget window to slide"
+                }).to_string()))
+                .expect("static response builder"));
+        }
+    }
+
     // ── WAL audit (Pending — updated after response) ──
     let wal_event = gvm_types::GVMEvent {
         event_id: uuid::Uuid::new_v4().to_string(),
@@ -528,6 +554,7 @@ async fn handle_request(
                         encoding,
                         updated,
                         state.ledger.clone(),
+                        Some(state.token_budget.clone()),
                     );
 
                     // Wrap tapped stream back into BoxBody for hyper response

@@ -1456,6 +1456,8 @@ pub async fn dashboard_stats(
         }
     }
 
+    let budget_json = budget_status_json(&state);
+
     Json(serde_json::json!({
         "total_requests": total,
         "hosts": hosts,
@@ -1470,8 +1472,23 @@ pub async fn dashboard_stats(
         "denied_rules": denied_rules,
         "uptime_secs": state.start_time.elapsed().as_secs_f64(),
         "wal_offset": file_len,
-        "proxy_total": state.request_counter.load(std::sync::atomic::Ordering::Relaxed)
+        "proxy_total": state.request_counter.load(std::sync::atomic::Ordering::Relaxed),
+        "budget": budget_json
     }))
+}
+
+fn budget_status_json(state: &crate::proxy::AppState) -> serde_json::Value {
+    let bs = state.token_budget.status();
+    serde_json::json!({
+        "enabled": state.token_budget.is_enabled(),
+        "tokens_used": bs.tokens_used,
+        "tokens_limit": bs.tokens_limit,
+        "cost_used_usd": bs.cost_used_usd(),
+        "cost_limit_usd": bs.cost_limit_usd(),
+        "pending_reservations": bs.pending_reservations,
+        "tokens_pct": bs.tokens_pct(),
+        "cost_pct": bs.cost_pct()
+    })
 }
 
 /// Approximate LLM cost estimation (same logic as gvm-cli watch).

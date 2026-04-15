@@ -585,6 +585,42 @@ pub async fn proxy_handler(
         t.method = request_method.clone();
     }
 
+    // ── Step 4: Token budget check (LLM providers only) ──
+    // Budget enforcement is independent of SRR/ABAC — applies to all LLM requests.
+    let is_llm = llm_trace::identify_llm_provider(&target.host).is_some();
+    if is_llm && state.token_budget.is_enabled() {
+        if let Err(exceeded) = state.token_budget.check_and_reserve() {
+            let reason = format!(
+                "Token budget exceeded: {}/{} tokens/hr (${:.2}/${:.2})",
+                exceeded.tokens_used,
+                exceeded.tokens_limit,
+                exceeded.cost_used_usd(),
+                exceeded.cost_limit_usd(),
+            );
+            let operation = gvm_headers
+                .as_ref()
+                .map(|h| h.operation.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            return governance_block_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                GovernanceBlockResponse {
+                    blocked: true,
+                    decision: "BudgetExceeded".to_string(),
+                    event_id: event.event_id.clone(),
+                    trace_id: event.trace_id.clone(),
+                    operation,
+                    reason,
+                    mode: state.on_block.deny.clone(),
+                    next_action: "wait for budget window to slide".to_string(),
+                    retry_after_secs: Some(60),
+                    rollback_hint: None,
+                    matched_rule_id: None,
+                    ic_level: 2,
+                },
+            );
+        }
+    }
+
     // Measure engine processing time (classification was already done above)
     let engine_start = std::time::Instant::now();
 
@@ -655,6 +691,7 @@ pub async fn proxy_handler(
                         provider,
                         &event,
                         state.ledger.clone(),
+                        state.token_budget.clone(),
                     )
                     .await;
                 }
@@ -1149,6 +1186,7 @@ async fn extract_llm_trace_from_response(
     provider: &str,
     event: &GVMEvent,
     ledger: Arc<Ledger>,
+    token_budget: Arc<crate::token_budget::TokenBudget>,
 ) -> Response<Body> {
     let (parts, body) = response.into_parts();
 
@@ -1170,6 +1208,7 @@ async fn extract_llm_trace_from_response(
         llm_trace::ContentEncoding::Identity, // axum auto-decompresses
         event.clone(),
         ledger,
+        Some(token_budget),
     );
 
     Response::from_parts(parts, Body::from_stream(tapped.map(|r| r.map_err(|e| {
@@ -1856,7 +1895,7 @@ mod tests {
 
         let (ledger, _wal_path) = make_test_ledger().await;
         let event = make_event();
-        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
+        let response = extract_llm_trace_from_response(response, "openai", &event, ledger, std::sync::Arc::new(crate::token_budget::TokenBudget::new(0, 0.0, 0))).await;
 
         let bytes = http_body_util::BodyExt::collect(response.into_body())
             .await
@@ -1894,7 +1933,7 @@ mod tests {
         let mut event = make_event();
         event.event_id = format!("evt-json-trace-{}", uuid::Uuid::new_v4());
 
-        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
+        let response = extract_llm_trace_from_response(response, "openai", &event, ledger, std::sync::Arc::new(crate::token_budget::TokenBudget::new(0, 0.0, 0))).await;
 
         // Body must be forwarded immediately via tap-stream
         let bytes = http_body_util::BodyExt::collect(response.into_body())
@@ -1946,7 +1985,7 @@ mod tests {
 
         let (ledger, _wal_path) = make_test_ledger().await;
         let event = make_event();
-        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
+        let response = extract_llm_trace_from_response(response, "openai", &event, ledger, std::sync::Arc::new(crate::token_budget::TokenBudget::new(0, 0.0, 0))).await;
 
         // Body must be preserved (streamed through) even if oversized
         let bytes = http_body_util::BodyExt::collect(response.into_body())
@@ -1976,7 +2015,7 @@ mod tests {
 
         let (ledger, _wal_path) = make_test_ledger().await;
         let event = make_event();
-        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
+        let response = extract_llm_trace_from_response(response, "openai", &event, ledger, std::sync::Arc::new(crate::token_budget::TokenBudget::new(0, 0.0, 0))).await;
 
         // The response status is preserved (200 OK from upstream headers).
         // The body stream itself will yield the error when consumed.
@@ -2012,7 +2051,7 @@ mod tests {
         let event = make_event();
 
         let start = Instant::now();
-        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
+        let response = extract_llm_trace_from_response(response, "openai", &event, ledger, std::sync::Arc::new(crate::token_budget::TokenBudget::new(0, 0.0, 0))).await;
         assert!(
             start.elapsed() < Duration::from_millis(150),
             "tap-stream extraction must not block on upstream stream completion"
@@ -2047,7 +2086,7 @@ mod tests {
         let mut event = make_event();
         event.event_id = format!("evt-test-{}", uuid::Uuid::new_v4());
 
-        let response = extract_llm_trace_from_response(response, "openai", &event, ledger).await;
+        let response = extract_llm_trace_from_response(response, "openai", &event, ledger, std::sync::Arc::new(crate::token_budget::TokenBudget::new(0, 0.0, 0))).await;
 
         let bytes = http_body_util::BodyExt::collect(response.into_body())
             .await

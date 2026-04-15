@@ -7,7 +7,6 @@
 
 use gvm_proxy::ledger::{GroupCommitConfig, Ledger};
 use gvm_proxy::policy::PolicyEngine;
-use gvm_proxy::rate_limiter::RateLimiter;
 use gvm_proxy::srr::NetworkSRR;
 use gvm_proxy::types::*;
 use gvm_proxy::vault::Vault;
@@ -748,75 +747,5 @@ decision = { type = "Delay", milliseconds = 300 }
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// 6. RATE LIMITER PRECISION
-// ═══════════════════════════════════════════════════════════════════
-
-/// 5 agents, each with 100/min limit, each sending 200 requests.
-/// Exactly 100 should be allowed, 100 denied (within tolerance).
-#[test]
-fn rate_limiter_exact_enforcement() {
-    let limiter = RateLimiter::new();
-
-    for agent_num in 0..5 {
-        let agent_id = format!("agent-{}", agent_num);
-        let mut allowed = 0u32;
-        let mut denied = 0u32;
-
-        for _ in 0..200 {
-            if limiter.check(&agent_id, 100) {
-                allowed += 1;
-            } else {
-                denied += 1;
-            }
-        }
-
-        // First 100 should be allowed (bucket starts full), rest denied
-        assert_eq!(
-            allowed, 100,
-            "Agent {} should have exactly 100 allowed, got {}",
-            agent_id, allowed
-        );
-        assert_eq!(
-            denied, 100,
-            "Agent {} should have exactly 100 denied, got {}",
-            agent_id, denied
-        );
-    }
-}
-
-/// Rate limiter window boundary: verify no double-counting at refill boundaries.
-#[test]
-fn rate_limiter_window_boundary_no_double_count() {
-    let limiter = RateLimiter::new();
-
-    // Exhaust the bucket (10 tokens)
-    for _ in 0..10 {
-        assert!(limiter.check("boundary-agent", 10));
-    }
-    // Bucket empty
-    assert!(!limiter.check("boundary-agent", 10));
-
-    // Wait for partial refill (100ms = ~1/600th of a minute ≈ 0.017 tokens for 10/min)
-    std::thread::sleep(Duration::from_millis(100));
-
-    // After 100ms with 10/min rate = 0.167 tokens/sec, so ~0.017 tokens.
-    // Should still be denied (less than 1 token refilled)
-    assert!(
-        !limiter.check("boundary-agent", 10),
-        "Should still be denied after 100ms (insufficient refill)"
-    );
-
-    // Wait 6.5 seconds = ~1.08 tokens refilled
-    std::thread::sleep(Duration::from_millis(6500));
-
-    // Should now have ~1 token
-    assert!(
-        limiter.check("boundary-agent", 10),
-        "Should be allowed after sufficient refill time"
-    );
-    // But only 1
-    assert!(
-        !limiter.check("boundary-agent", 10),
-        "Should be denied again after consuming the refilled token"
-    );
-}
+// 6. RATE LIMITER — removed (replaced by token_budget in src/token_budget.rs)
+// Token budget unit tests are in src/token_budget.rs

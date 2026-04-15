@@ -999,6 +999,41 @@ pub const TAP_MAX_SSE_BYTES: usize = 1024 * 1024;
 ///
 /// If trace extraction fails or the stream errors, only a warning is logged.
 /// The proxy never crashes due to trace extraction.
+/// Estimate cost from an LLMTrace using provider+model pricing.
+pub fn estimate_cost_from_trace(trace: &LLMTrace) -> f64 {
+    let usage = match &trace.usage {
+        Some(u) => u,
+        None => return 0.0,
+    };
+    let prompt = usage.prompt_tokens.unwrap_or(0);
+    let completion = usage.completion_tokens.unwrap_or(0);
+    let provider = trace.provider.as_str();
+    let model = trace.model.as_deref();
+
+    let (input_rate, output_rate) = match provider {
+        "openai" => match model {
+            Some(m) if m.contains("gpt-4o") && !m.contains("mini") => (2.50, 10.00),
+            Some(m) if m.contains("gpt-4o-mini") => (0.15, 0.60),
+            Some(m) if m.contains("o1") => (15.00, 60.00),
+            Some(m) if m.contains("o3") => (10.00, 40.00),
+            _ => (0.50, 1.50),
+        },
+        "anthropic" => match model {
+            Some(m) if m.contains("opus") => (15.00, 75.00),
+            Some(m) if m.contains("sonnet") => (3.00, 15.00),
+            Some(m) if m.contains("haiku") => (0.25, 1.25),
+            _ => (3.00, 15.00),
+        },
+        "gemini" => match model {
+            Some(m) if m.contains("pro") => (1.25, 5.00),
+            Some(m) if m.contains("flash") => (0.075, 0.30),
+            _ => (1.25, 5.00),
+        },
+        _ => (1.00, 3.00),
+    };
+    (prompt as f64 * input_rate + completion as f64 * output_rate) / 1_000_000.0
+}
+
 /// Decompress a gzip buffer. Returns the decompressed bytes or an error.
 /// Used post-stream to decompress the bounded capture buffer before trace parsing.
 fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>, String> {
@@ -1025,6 +1060,7 @@ pub fn tap_response_stream(
     encoding: ContentEncoding,
     event: gvm_types::GVMEvent,
     ledger: std::sync::Arc<crate::ledger::Ledger>,
+    token_budget: Option<std::sync::Arc<crate::token_budget::TokenBudget>>,
 ) -> impl futures_util::Stream<Item = Result<hyper::body::Bytes, String>> + Send + 'static {
     let capture_limit = if is_sse {
         TAP_MAX_SSE_BYTES
@@ -1069,17 +1105,17 @@ pub fn tap_response_stream(
         }
 
         if stream_failed {
+            if let Some(ref b) = token_budget { b.release_reservation(); }
             return;
         }
 
         // Decompress capture buffer if gzip-encoded.
-        // Agent receives the original compressed bytes (already yielded); only
-        // our internal capture is decompressed for trace extraction.
         let plaintext = if encoding == ContentEncoding::Gzip {
             match decompress_gzip(&capture) {
                 Ok(decompressed) => decompressed,
                 Err(e) => {
                     tracing::warn!(provider = provider_name.as_str(), error = %e, "gzip decompression failed for trace capture");
+                    if let Some(ref b) = token_budget { b.release_reservation(); }
                     return;
                 }
             }
@@ -1091,17 +1127,32 @@ pub fn tap_response_stream(
         let mut trace = if is_sse {
             match extract_thinking_trace_from_sse(provider_name.as_str(), &plaintext) {
                 Some(t) => t,
-                None => return,
+                None => {
+                    if let Some(ref b) = token_budget { b.release_reservation(); }
+                    return;
+                }
             }
         } else {
             match extract_thinking_trace(provider_name.as_str(), &plaintext) {
                 Some(t) => t,
-                None => return,
+                None => {
+                    if let Some(ref b) = token_budget { b.release_reservation(); }
+                    return;
+                }
             }
         };
 
         if capture_overflow {
             trace.truncated = true;
+        }
+
+        // Record actual token usage to budget (release reservation + add real cost)
+        if let Some(ref b) = token_budget {
+            let tokens = trace.usage.as_ref()
+                .and_then(|u| u.computed_total())
+                .unwrap_or(0);
+            let cost = crate::llm_trace::estimate_cost_from_trace(&trace);
+            b.record(tokens, cost);
         }
 
         tracing::info!(
