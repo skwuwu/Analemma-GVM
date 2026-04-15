@@ -953,6 +953,7 @@ fn build_event(
         event_hash: None, // Computed by Ledger during WAL write
         llm_trace: None,
         default_caution: false, // Set by caller after build_event
+        config_proof_hash: None,
     }
 }
 
@@ -1296,7 +1297,7 @@ fn append_proxy_wal_event(
         nats_sequence: None,
         event_hash: None,
         llm_trace: None,
-        default_caution: false,
+        default_caution: false, config_proof_hash: None,
     };
     // Spawn background task for durable WAL write. Cannot .await in sync fn context,
     // and append_async only writes to NATS (not WAL file). tokio::spawn ensures the
@@ -1548,7 +1549,7 @@ async fn handle_connect_inner(
                 nats_sequence: None,
                 event_hash: None,
                 llm_trace: None,
-                default_caution: false,
+                default_caution: false, config_proof_hash: None,
                 tenant_id: None,
                 parent_event_id: None,
                 session_id: String::new(),
@@ -1589,7 +1590,7 @@ async fn handle_connect_inner(
         nats_sequence: None,
         event_hash: None,
         llm_trace: None,
-        default_caution: srr_result_catch_all,
+        default_caution: srr_result_catch_all, config_proof_hash: None,
         tenant_id: None,
         parent_event_id: None,
         session_id: String::new(),
@@ -1752,7 +1753,7 @@ mod tests {
             nats_sequence: None,
             event_hash: None,
             llm_trace: None,
-            default_caution: false,
+            default_caution: false, config_proof_hash: None,
         }
     }
 

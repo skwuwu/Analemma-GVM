@@ -1549,9 +1549,11 @@ dependencies = [
 name = "gvm-types"
 version = "0.5.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

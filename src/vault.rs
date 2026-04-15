@@ -472,7 +472,7 @@ fn build_vault_event(
         nats_sequence: None,
         event_hash: None,
         llm_trace: None, // Computed by Ledger during WAL write
-        default_caution: false,
+        default_caution: false, config_proof_hash: None,
     }
 }
 

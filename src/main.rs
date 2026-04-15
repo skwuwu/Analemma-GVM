@@ -258,8 +258,13 @@ async fn main() {
             .map(|(label, path)| (label.as_str(), path.as_path()))
             .collect();
 
-        if let Err(e) = ledger.record_config_load(&config_refs).await {
-            tracing::warn!(error = %e, "Failed to record config hashes in WAL — continuing without config integrity record");
+        match ledger.record_config_load(&config_refs, None).await {
+            Ok(hash) => {
+                tracing::info!(context_hash = %hash, "Integrity context recorded");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to record config proof in WAL");
+            }
         }
     }
 

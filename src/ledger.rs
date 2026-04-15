@@ -601,13 +601,23 @@ impl Ledger {
     ///
     /// Called at proxy startup (after config load) and on policy hot-reload.
     // COLD PATH: blocking std::fs::read() acceptable — called at startup/reload, not per-request.
+    /// Record config file hashes + GvmIntegrityContext in the Merkle chain.
+    ///
+    /// Creates an integrity context that records the config state for
+    /// reproducibility and tamper detection.
+    /// Behavioral events reference this context via `config_proof_hash`.
+    ///
+    /// Returns the context hash (for attaching to subsequent behavioral events).
     pub async fn record_config_load(
         &self,
         config_files: &[(&str, &std::path::Path)],
-    ) -> Result<()> {
+        prev_config_hash: Option<String>,
+    ) -> Result<String> {
         use sha2::{Digest, Sha256};
 
         let mut file_hashes: HashMap<String, serde_json::Value> = HashMap::new();
+        let mut combined_hash_input = String::new();
+
         for (label, path) in config_files {
             let hash = match std::fs::read(path) {
                 Ok(bytes) => {
@@ -623,8 +633,22 @@ impl Ledger {
                     "unavailable".to_string()
                 }
             };
+            combined_hash_input.push_str(&hash);
             file_hashes.insert(label.to_string(), serde_json::Value::String(hash));
         }
+
+        // Combined config hash (all files concatenated then hashed)
+        let config_hash = format!("{:x}", Sha256::digest(combined_hash_input.as_bytes()));
+
+        // Create integrity context (Local hash-only for standalone users)
+        let integrity = gvm_types::GvmIntegrityContext::local(config_hash, prev_config_hash);
+        let context_hash = integrity.context_hash();
+
+        // Embed full context in config_load event (behavioral events only carry the hash)
+        file_hashes.insert(
+            "_integrity_context".to_string(),
+            serde_json::to_value(&integrity).unwrap_or(serde_json::Value::Null),
+        );
 
         let event = GVMEvent {
             event_id: format!("sys-config-{}", uuid::Uuid::new_v4()),
@@ -648,14 +672,17 @@ impl Ledger {
             event_hash: None,
             llm_trace: None,
             default_caution: false,
+            config_proof_hash: Some(context_hash.clone()),
         };
 
         self.append_durable(&event).await?;
         tracing::info!(
             files = config_files.len(),
-            "Config file hashes recorded in Merkle chain"
+            context_hash = %context_hash,
+            auth_type = "local",
+            "Integrity context recorded in Merkle chain"
         );
-        Ok(())
+        Ok(context_hash)
     }
 
     /// Return the number of consecutive primary WAL failures.
@@ -738,7 +765,7 @@ pub fn build_dns_event(
         nats_sequence: None,
         event_hash: None,
         llm_trace: None,
-        default_caution: true,
+        default_caution: true, config_proof_hash: None,
     }
 }
 

@@ -454,7 +454,7 @@ async fn ledger_concurrent_spawns_stay_bounded() {
                 nats_sequence: None,
                 event_hash: None,
                 llm_trace: None,
-                default_caution: false,
+                default_caution: false, config_proof_hash: None,
             };
             ledger
                 .append_durable(&event)
@@ -583,7 +583,7 @@ async fn group_commit_primary_fail_emergency_wal_catches() {
             nats_sequence: None,
             event_hash: None,
             llm_trace: None,
-            default_caution: false,
+            default_caution: false, config_proof_hash: None,
         };
         ledger
             .append_durable(&event)
@@ -620,7 +620,7 @@ async fn group_commit_primary_fail_emergency_wal_catches() {
                 nats_sequence: None,
                 event_hash: None,
                 llm_trace: None,
-                default_caution: false,
+                default_caution: false, config_proof_hash: None,
             };
             ledger.append_durable(&event).await
         }));
@@ -680,7 +680,7 @@ async fn group_commit_primary_fail_emergency_wal_catches() {
         nats_sequence: None,
         event_hash: None,
         llm_trace: None,
-        default_caution: false,
+        default_caution: false, config_proof_hash: None,
     };
     // After disabling error injection, writes should succeed via primary WAL again
     ledger
@@ -1043,7 +1043,7 @@ async fn emergency_wal_catches_events_when_primary_fails() {
             nats_sequence: None,
             event_hash: None,
             llm_trace: None,
-            default_caution: false,
+            default_caution: false, config_proof_hash: None,
         };
         // With emergency WAL, this should succeed even though primary is broken
         ledger
@@ -1119,7 +1119,7 @@ async fn emergency_wal_catches_events_when_primary_fails() {
         nats_sequence: None,
         event_hash: None,
         llm_trace: None,
-        default_caution: false,
+        default_caution: false, config_proof_hash: None,
     };
     ledger
         .append_durable(&event)

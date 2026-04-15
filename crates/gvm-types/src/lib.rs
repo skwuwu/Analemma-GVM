@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 // ─── Operation Namespace (PART 1) ───
 
@@ -186,6 +186,153 @@ pub struct GVMEvent {
     /// Used by the CLI to suggest adding explicit rules in interactive mode.
     #[serde(default)]
     pub default_caution: bool,
+
+    /// Hash of the active integrity context at the time of this event.
+    /// Links behavioral events to the config state that governed them
+    /// without embedding the full context in every event (performance).
+    /// Only config_load events carry the full GvmIntegrityContext.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_proof_hash: Option<String>,
+}
+
+// ─── Integrity Context (execution environment reproducibility) ───
+
+/// Records the state of the execution environment at a point in time.
+///
+/// Design principles:
+/// - **Reproducibility**: config hash + timestamp enable exact environment reconstruction
+/// - **Pluggable trust architecture**: from local dev (hash-only) to HSM-backed signing
+/// - **Immutable chain**: previous_state links create tamper-evident config history
+///
+/// Local environments: trust_model=Local, algorithm=None, signature empty.
+/// Regulated environments: Ed25519 keypair over config_hash.
+/// Hardware-backed: HSM/TPM attestation via opaque_extensions.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct GvmIntegrityContext {
+    /// Schema version for forward compatibility.
+    pub spec_version: u8,
+
+    /// How the system should trust this integrity record.
+    pub trust_model: TrustModel,
+
+    /// Origin identifier — where this config state was produced.
+    /// Key ID, organizational unit, or "local-default".
+    pub origin_id: String,
+
+    /// Signing algorithm. None for local hash-only mode.
+    pub algorithm: Algorithm,
+
+    /// SHA-256 hash of the config content. Always computed regardless of trust model.
+    pub config_hash: String,
+
+    /// Digital signature over config_hash. Empty when algorithm=None.
+    #[serde(default, with = "base64_bytes")]
+    pub signature: Vec<u8>,
+
+    /// Unix timestamp (seconds since epoch). Single numeric format avoids
+    /// clock-skew ambiguity and timezone parsing overhead.
+    pub timestamp: u64,
+
+    /// Hash of the previous config state. Creates an immutable chain:
+    /// context N points to context N-1's config_hash.
+    /// None for the first config load after fresh install.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_state: Option<String>,
+
+    /// WAL checkpoint at the time of this context. Enables point-in-time
+    /// queries: "which config was active when event X happened".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_id: Option<u64>,
+
+    /// Vendor-neutral extension space for hardware security modules (Intel SGX,
+    /// ARM TrustZone), external attestation services, or organization-specific
+    /// metadata. Keys are string identifiers; values are opaque byte payloads.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub opaque_extensions: BTreeMap<String, Vec<u8>>,
+}
+
+/// Trust model — how the system should treat this integrity record.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum TrustModel {
+    /// Local standalone — hash only, no cryptographic signature.
+    Local,
+    /// Static keypair — Ed25519 or similar offline signature.
+    Static,
+    /// Remote verification — central governance server or third-party authority.
+    Remote,
+}
+
+/// Signing algorithm for integrity context.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum Algorithm {
+    /// No signature — hash-only integrity (local development).
+    None,
+    /// Ed25519 digital signature.
+    Ed25519,
+}
+
+impl GvmIntegrityContext {
+    /// Create a local integrity context (default for standalone users).
+    /// config_hash is always computed; no signature.
+    pub fn local(config_hash: String, previous_state: Option<String>) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self {
+            spec_version: 1,
+            trust_model: TrustModel::Local,
+            origin_id: "local-default".to_string(),
+            algorithm: Algorithm::None,
+            config_hash,
+            signature: Vec::new(),
+            timestamp: now,
+            previous_state,
+            checkpoint_id: None,
+            opaque_extensions: BTreeMap::new(),
+        }
+    }
+
+    /// SHA-256 hash of this context (used as config_proof_hash in behavioral events).
+    pub fn context_hash(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let canonical = format!(
+            "v{}:{}:{}:{}:{}:{}",
+            self.spec_version,
+            self.trust_model_str(),
+            self.origin_id,
+            self.config_hash,
+            self.timestamp,
+            self.previous_state.as_deref().unwrap_or("none"),
+        );
+        format!("{:x}", Sha256::digest(canonical.as_bytes()))
+    }
+
+    fn trust_model_str(&self) -> &str {
+        match self.trust_model {
+            TrustModel::Local => "local",
+            TrustModel::Static => "static",
+            TrustModel::Remote => "remote",
+        }
+    }
+}
+
+/// Serde helper for Vec<u8> as base64 in JSON.
+mod base64_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
+        use base64::Engine;
+        s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        use base64::Engine;
+        let s = String::deserialize(d)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(&s)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 /// Event status machine — prevents phantom records

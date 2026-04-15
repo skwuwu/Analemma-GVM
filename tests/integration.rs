@@ -616,7 +616,7 @@ async fn config_file_hashes_recorded_in_merkle_chain() {
         ("srr:srr.toml", srr_path.as_path()),
     ];
     ledger
-        .record_config_load(&config_files)
+        .record_config_load(&config_files, None)
         .await
         .expect("recording config hashes must succeed");
 
@@ -679,7 +679,7 @@ async fn config_hash_records_unavailable_for_missing_files() {
     let config_files: Vec<(&str, &std::path::Path)> =
         vec![("config:missing.toml", missing_path.as_path())];
     ledger
-        .record_config_load(&config_files)
+        .record_config_load(&config_files, None)
         .await
         .expect("recording config hashes for missing files must succeed (graceful)");
 
@@ -1722,7 +1722,7 @@ fn make_test_event(event_id: &str, operation: &str) -> GVMEvent {
         nats_sequence: None,
         event_hash: None,
         llm_trace: None,
-        default_caution: false,
+        default_caution: false, config_proof_hash: None,
     }
 }
 

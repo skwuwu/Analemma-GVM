@@ -252,7 +252,7 @@ async fn handle_request(
         nats_sequence: None,
         event_hash: None,
         llm_trace: None,
-        default_caution: is_default_caution,
+        default_caution: is_default_caution, config_proof_hash: None,
     };
     match state.ledger.append_durable(&wal_event).await {
         Ok(()) => tracing::info!(host = %host, path = %path, "MITM WAL event recorded (Pending)"),
