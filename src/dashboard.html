@@ -98,7 +98,7 @@ tailwind.config = { theme: { extend: { fontFamily: { mono: ['JetBrains Mono', 'm
       <div class="text-[10px] text-slate-600 uppercase tracking-wider mb-6">Policy Decisions</div>
       <div class="flex items-center justify-center mb-6">
         <div class="relative" style="width:160px;height:160px">
-          <canvas id="decisionChart"></canvas>
+          <canvas id="decisionChart" width="160" height="160"></canvas>
           <div class="absolute inset-0 flex flex-col items-center justify-center">
             <div class="text-lg font-semibold text-slate-300 mono" id="donut-total">0</div>
             <div class="text-[9px] text-slate-700 uppercase tracking-widest">total</div>
@@ -263,12 +263,15 @@ function renderStats(s){
   document.getElementById('leg-deny').textContent=dn;
   if(decisionChart){
     if(tot===0){
-      // Show grey ring when no data
+      decisionChart.data.labels=['No data'];
       decisionChart.data.datasets[0].data=[1];
       decisionChart.data.datasets[0].backgroundColor=['#1e293b'];
+      decisionChart.options.plugins.tooltip.enabled=false;
     }else{
+      decisionChart.data.labels=['Allow','Delay','Deny'];
       decisionChart.data.datasets[0].data=[al,dl,dn];
       decisionChart.data.datasets[0].backgroundColor=['#22c55e','#eab308','#ef4444'];
+      decisionChart.options.plugins.tooltip.enabled=true;
     }
     decisionChart.update('none');
   }
@@ -320,10 +323,22 @@ function showDetail(eventId) {
   const sens = ev.resource?.sensitivity || '';
   const sc = ev.transport?.status_code;
   const denyNote = b === 'Deny' ? `<tr><td class="pr-4 text-slate-600 py-1">Reason</td><td class="text-red-400/80 italic">${translateDeny(ev)}</td></tr>` : '';
-  const llm = ev.llm_trace && typeof ev.llm_trace === 'object'
-    ? `<tr><td class="pr-4 text-slate-600 py-1">LLM Provider</td><td class="text-slate-300">${ev.llm_trace.provider || ''}</td></tr>
-       <tr><td class="pr-4 text-slate-600 py-1">Model</td><td class="text-slate-300">${ev.llm_trace.model || ''}</td></tr>
-       <tr><td class="pr-4 text-slate-600 py-1">Tokens</td><td class="text-slate-300">${ev.llm_trace.usage?.prompt_tokens||0} in + ${ev.llm_trace.usage?.completion_tokens||0} out = ${ev.llm_trace.usage?.total_tokens||0}</td></tr>`
+  const lt = ev.llm_trace;
+  const hasLlm = lt && typeof lt === 'object' && (lt.provider || lt.model);
+  const thinkingModels = ['o1','o3','opus','sonnet-4','gemini-2.5-pro'];
+  const supportsThinking = hasLlm && lt.model && thinkingModels.some(m => lt.model.includes(m));
+  const thinkingDisplay = hasLlm
+    ? (lt.thinking
+        ? `<span class="text-slate-300">${lt.thinking.startsWith('sha256:') ? lt.thinking : lt.thinking.slice(0,80)+'...'}</span>`
+        : supportsThinking
+          ? '<span class="text-slate-500">Not captured (enable with store_raw)</span>'
+          : `<span class="text-slate-600">Not supported by ${lt.model || 'this model'}</span>`)
+    : '';
+  const llm = hasLlm
+    ? `<tr><td class="pr-4 text-slate-600 py-1">LLM Provider</td><td class="text-slate-300">${lt.provider || ''}</td></tr>
+       <tr><td class="pr-4 text-slate-600 py-1">Model</td><td class="text-slate-300">${lt.model || ''}</td></tr>
+       <tr><td class="pr-4 text-slate-600 py-1">Tokens</td><td class="text-slate-300">${lt.usage?.prompt_tokens||0} in + ${lt.usage?.completion_tokens||0} out = ${(lt.usage?.prompt_tokens||0)+(lt.usage?.completion_tokens||0)} total</td></tr>
+       <tr><td class="pr-4 text-slate-600 py-1">Thinking</td><td>${thinkingDisplay}</td></tr>`
     : '';
 
   document.getElementById('detail-content').innerHTML = `
@@ -364,8 +379,8 @@ function fmtDur(s){if(s<60)return Math.floor(s)+'s';if(s<3600)return Math.floor(
 function initChart(){
   decisionChart=new Chart(document.getElementById('decisionChart').getContext('2d'),{
     type:'doughnut',
-    data:{labels:['Allow','Delay','Deny'],datasets:[{data:[0,0,0],backgroundColor:['#22c55e','#eab308','#ef4444'],borderWidth:0,hoverOffset:4}]},
-    options:{responsive:true,maintainAspectRatio:true,cutout:'72%',plugins:{legend:{display:false},tooltip:{enabled:true}},elements:{arc:{borderWidth:0}}}
+    data:{labels:['No data'],datasets:[{data:[1],backgroundColor:['#1e293b'],borderWidth:0}]},
+    options:{responsive:false,maintainAspectRatio:false,cutout:'72%',animation:false,plugins:{legend:{display:false},tooltip:{enabled:false}},elements:{arc:{borderWidth:0}}}
   });
 }
 
