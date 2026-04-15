@@ -1232,6 +1232,7 @@ async fn extract_llm_trace_from_response(
         body_stream,
         provider,
         is_sse,
+        llm_trace::ContentEncoding::Identity, // axum auto-decompresses
         event.clone(),
         ledger,
     );

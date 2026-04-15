@@ -533,6 +533,21 @@ async fn handle_request(
                         .map(crate::llm_trace::is_sse_content_type)
                         .unwrap_or(false);
 
+                    // Detect content-encoding for transparent decompression
+                    // of the capture buffer (agent receives original compressed bytes)
+                    let encoding = parts
+                        .headers
+                        .get(hyper::header::CONTENT_ENCODING)
+                        .and_then(|v| v.to_str().ok())
+                        .map(|v| {
+                            if v.contains("gzip") {
+                                crate::llm_trace::ContentEncoding::Gzip
+                            } else {
+                                crate::llm_trace::ContentEncoding::Identity
+                            }
+                        })
+                        .unwrap_or(crate::llm_trace::ContentEncoding::Identity);
+
                     use futures_util::StreamExt;
 
                     // Convert hyper Incoming → Stream<Result<Bytes, String>>
@@ -543,6 +558,7 @@ async fn handle_request(
                         body_stream,
                         provider,
                         is_sse,
+                        encoding,
                         updated,
                         state.ledger.clone(),
                     );

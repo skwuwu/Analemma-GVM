@@ -999,10 +999,30 @@ pub const TAP_MAX_SSE_BYTES: usize = 1024 * 1024;
 ///
 /// If trace extraction fails or the stream errors, only a warning is logged.
 /// The proxy never crashes due to trace extraction.
+/// Decompress a gzip buffer. Returns the decompressed bytes or an error.
+/// Used post-stream to decompress the bounded capture buffer before trace parsing.
+fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut decoder = flate2::read::GzDecoder::new(data);
+    let mut decompressed = Vec::new();
+    decoder
+        .read_to_end(&mut decompressed)
+        .map_err(|e| format!("gzip decode: {}", e))?;
+    Ok(decompressed)
+}
+
+/// Content encoding of the response body (for transparent decompression).
+#[derive(Clone, Copy, PartialEq)]
+pub enum ContentEncoding {
+    Identity,
+    Gzip,
+}
+
 pub fn tap_response_stream(
     body_stream: impl futures_util::Stream<Item = Result<hyper::body::Bytes, String>> + Send + 'static,
     provider: &str,
     is_sse: bool,
+    encoding: ContentEncoding,
     event: gvm_types::GVMEvent,
     ledger: std::sync::Arc<crate::ledger::Ledger>,
 ) -> impl futures_util::Stream<Item = Result<hyper::body::Bytes, String>> + Send + 'static {
@@ -1052,14 +1072,29 @@ pub fn tap_response_stream(
             return;
         }
 
-        // Extract trace from captured bytes after stream completes
+        // Decompress capture buffer if gzip-encoded.
+        // Agent receives the original compressed bytes (already yielded); only
+        // our internal capture is decompressed for trace extraction.
+        let plaintext = if encoding == ContentEncoding::Gzip {
+            match decompress_gzip(&capture) {
+                Ok(decompressed) => decompressed,
+                Err(e) => {
+                    tracing::warn!(provider = provider_name.as_str(), error = %e, "gzip decompression failed for trace capture");
+                    return;
+                }
+            }
+        } else {
+            capture
+        };
+
+        // Extract trace from (decompressed) captured bytes after stream completes
         let mut trace = if is_sse {
-            match extract_thinking_trace_from_sse(provider_name.as_str(), &capture) {
+            match extract_thinking_trace_from_sse(provider_name.as_str(), &plaintext) {
                 Some(t) => t,
                 None => return,
             }
         } else {
-            match extract_thinking_trace(provider_name.as_str(), &capture) {
+            match extract_thinking_trace(provider_name.as_str(), &plaintext) {
                 Some(t) => t,
                 None => return,
             }
