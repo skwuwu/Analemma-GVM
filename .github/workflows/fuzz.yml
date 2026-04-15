@@ -55,6 +55,10 @@ jobs:
           - fuzz_path_normalize
           - fuzz_llm_trace
           - fuzz_policy_eval
+          - fuzz_dns_parse
+          - fuzz_vault_crypto
+          - fuzz_jwt_auth
+          - fuzz_credential_inject
     steps:
       - uses: actions/checkout@v4
 
@@ -97,11 +101,12 @@ jobs:
           # Map fuzz target to dictionary file. Targets without a
           # dedicated dictionary fall back to no -dict flag.
           case "${{ matrix.target }}" in
-            fuzz_srr)            echo "path=../fuzz/dictionaries/srr.dict"  >> $GITHUB_OUTPUT ;;
-            fuzz_wal_parse)      echo "path=../fuzz/dictionaries/wal.dict"  >> $GITHUB_OUTPUT ;;
-            fuzz_http_parse)     echo "path=../fuzz/dictionaries/http.dict" >> $GITHUB_OUTPUT ;;
-            fuzz_path_normalize) echo "path=../fuzz/dictionaries/http.dict" >> $GITHUB_OUTPUT ;;
-            *)                   echo "path=" >> $GITHUB_OUTPUT ;;
+            fuzz_srr)               echo "path=../fuzz/dictionaries/srr.dict"  >> $GITHUB_OUTPUT ;;
+            fuzz_wal_parse)         echo "path=../fuzz/dictionaries/wal.dict"  >> $GITHUB_OUTPUT ;;
+            fuzz_http_parse)        echo "path=../fuzz/dictionaries/http.dict" >> $GITHUB_OUTPUT ;;
+            fuzz_path_normalize)    echo "path=../fuzz/dictionaries/http.dict" >> $GITHUB_OUTPUT ;;
+            fuzz_credential_inject) echo "path=../fuzz/dictionaries/http.dict" >> $GITHUB_OUTPUT ;;
+            *)                      echo "path=" >> $GITHUB_OUTPUT ;;
           esac
 
       - name: Run fuzzer

@@ -54,7 +54,10 @@ const MAX_TRACKED_DOMAINS: usize = 5_000;
 
 /// Extract the queried domain name from a raw DNS packet.
 /// Returns None if the packet is too short or malformed.
-fn parse_dns_question(packet: &[u8]) -> Option<String> {
+/// Extract the queried domain name from a raw DNS packet.
+/// Returns None if the packet is too short or malformed.
+/// Public for fuzz target access.
+pub fn parse_dns_question(packet: &[u8]) -> Option<String> {
     // DNS header is 12 bytes. Question section starts after that.
     if packet.len() < 13 {
         return None;

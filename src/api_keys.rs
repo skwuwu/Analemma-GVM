@@ -48,8 +48,7 @@ struct SecretsFile {
 }
 
 impl APIKeyStore {
-    /// Create a store from a pre-built credential map. Used in tests.
-    #[cfg(test)]
+    /// Create a store from a pre-built credential map. Used in tests and fuzz targets.
     pub fn from_map(credentials: HashMap<String, Credential>) -> Self {
         Self { credentials }
     }

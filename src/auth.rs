@@ -34,6 +34,13 @@ pub struct JwtSecret {
     key: Vec<u8>,
 }
 
+impl JwtSecret {
+    /// Create a JwtSecret from raw bytes. Used by tests and fuzz targets.
+    pub fn from_bytes(key: Vec<u8>) -> Self {
+        Self { key }
+    }
+}
+
 /// JWT configuration: secret + token parameters.
 pub struct JwtConfig {
     pub secret: JwtSecret,
