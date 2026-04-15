@@ -28,6 +28,16 @@ ssh <host>
 tmux attach -t gvm
 ```
 
+## Default Execution Mode
+
+Unless explicitly stated otherwise, **all tests run in sandbox mode** (`--sandbox`). Sandbox provides:
+- Full MITM HTTPS inspection (L7 path/body visibility)
+- Network namespace isolation (veth + TC filter)
+- Seccomp-BPF syscall whitelist
+- WAL records all enforcement decisions including HTTPS
+
+Cooperative mode (`gvm run` without `--sandbox`) only captures HTTP traffic and HTTPS CONNECT tunnels (domain-level, no path/body). Use sandbox for complete visibility.
+
 ## Prerequisites
 
 ```bash
@@ -232,6 +242,79 @@ value = "sk-ant-..."
 | MITM HTTPS inspection | Sandbox | PASS — api.anthropic.com visible |
 | LLM token tracking | Sandbox | Pending — requires secrets.toml |
 | Text mode regression | Cooperative | PASS — unchanged behavior |
+
+## Test 8: Web Dashboard
+
+Tests the browser-based governance dashboard served from admin API (port 9090).
+
+### 8a: CLI command
+
+```bash
+gvm dashboard                   # opens browser to localhost:9090/gvm/dashboard
+gvm dashboard --proxy http://127.0.0.1:8080   # custom proxy URL
+```
+
+Starts proxy if not running, derives admin URL (port +1010), opens default browser. On headless servers, access `http://localhost:9090/gvm/dashboard` directly.
+
+### 8b: Dashboard with real agent traffic (sandbox)
+
+```bash
+# 1. Ensure secrets.toml has API credentials
+cat config/secrets.toml
+# [credentials."api.anthropic.com"]
+# type = "ApiKey"
+# header = "x-api-key"
+# value = "sk-ant-..."
+
+# 2. Run agent in sandbox (MITM captures HTTPS)
+sudo gvm run --sandbox agent.py
+
+# 3. Open dashboard in another terminal
+gvm dashboard
+# Or: curl http://localhost:9090/gvm/dashboard > snapshot.html
+```
+
+### 8c: API endpoints
+
+```bash
+# Dashboard HTML
+curl http://localhost:9090/gvm/dashboard
+
+# Events (incremental, offset-based polling)
+curl 'http://localhost:9090/gvm/dashboard/events?since_offset=0&limit=100'
+
+# Aggregated stats
+curl http://localhost:9090/gvm/dashboard/stats
+```
+
+### 8d: Polling verification
+
+The dashboard polls every 2 seconds. Verify by watching the stats endpoint before and after generating traffic:
+
+```bash
+# Before
+curl -s http://localhost:9090/gvm/dashboard/stats | python3 -c "import sys,json; print(json.load(sys.stdin)['total_requests'])"
+
+# Generate traffic
+curl -x http://127.0.0.1:8080 http://httpbin.org/get
+
+# After (wait 2s for poll cycle)
+curl -s http://localhost:9090/gvm/dashboard/stats | python3 -c "import sys,json; print(json.load(sys.stdin)['total_requests'])"
+```
+
+### Test Results (2026-04-15)
+
+| Test | Result |
+|------|--------|
+| `gvm dashboard` CLI | PASS — prints URL, opens browser |
+| Dashboard HTML (GET /gvm/dashboard) | PASS — HTTP 200, 21KB |
+| Events API with sandbox agent | PASS — api.anthropic.com captured via MITM |
+| Stats API | PASS — hosts, decisions, WAL offset correct |
+| Polling (2s interval) | PASS — new events detected between polls |
+| Filter buttons (Allow/Delay/Deny) | PASS — exclusive select |
+| Share button | PASS — standalone HTML export |
+
+**Known limitation**: MITM WAL currently writes Pending status only (no Confirmed update with llm_trace). LLM token/cost tracking requires the MITM response-phase WAL update to be implemented.
 
 ## Known Issues
 
