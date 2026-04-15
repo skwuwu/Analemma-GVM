@@ -12,7 +12,6 @@ use gvm_proxy::api_keys::APIKeyStore;
 use gvm_proxy::ledger::Ledger;
 use gvm_proxy::proxy::{proxy_handler, AppState};
 use gvm_proxy::token_budget::TokenBudget;
-use gvm_proxy::registry::OperationRegistry;
 use gvm_proxy::srr::NetworkSRR;
 use gvm_proxy::types::*;
 use gvm_proxy::vault::Vault;
@@ -405,32 +404,6 @@ decision = { type = "Delay", milliseconds = 300 }
     )
     .expect("writing SRR config must succeed");
 
-    // Operation registry
-    let registry_path = dir.path().join("registry.toml");
-    std::fs::write(
-        &registry_path,
-        r#"
-[[core]]
-name = "gvm.storage.read"
-description = "Read storage"
-version = 1
-status = "stable"
-default_ic = 1
-required_context = []
-
-[[core]]
-name = "gvm.payment.refund"
-description = "Process refund"
-version = 1
-status = "stable"
-default_ic = 3
-required_context = ["amount"]
-"#,
-    )
-    .expect("writing registry config must succeed");
-
-    // Policy: allow reads, require approval for payments
-
     // Empty secrets
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(&secrets_path, "[credentials]\n")
@@ -442,9 +415,6 @@ required_context = ["amount"]
     // Build components
     let srr = Arc::new(std::sync::RwLock::new(
         NetworkSRR::load(&srr_path).expect("valid SRR config must parse"),
-    ));
-    let registry = Arc::new(std::sync::RwLock::new(
-        OperationRegistry::load(&registry_path).expect("valid registry config must parse"),
     ));
     let api_keys =
         Arc::new(APIKeyStore::load(&secrets_path).expect("valid secrets config must parse"));
@@ -463,7 +433,6 @@ required_context = ["amount"]
     let state = AppState {
         srr,
 
-        registry,
         api_keys,
         ledger,
         vault,
@@ -478,7 +447,7 @@ required_context = ["amount"]
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
         srr_config_path: String::new(),
 
-        registry_path: String::new(),
+        gvm_toml_path: None,
         mitm_ca_pem: None,
         payload_inspection: false,
         max_body_bytes: 65536,
@@ -664,15 +633,11 @@ async fn config_file_hashes_recorded_in_merkle_chain() {
     let wal_path = dir.path().join("wal.log");
 
     // Create sample config files with known content
-    let registry_path = dir.path().join("registry.toml");
     let srr_path = dir.path().join("srr.toml");
-    let registry_content = b"[[operations]]\nname = \"test\"\nic_level = 1\n";
     let srr_content = b"[[rules]]\nmethod = \"GET\"\npattern = \"*\"\n";
-    std::fs::write(&registry_path, registry_content).expect("writing test registry file must succeed");
     std::fs::write(&srr_path, srr_content).expect("writing test SRR file must succeed");
 
-    // Compute expected hashes
-    let expected_registry_hash = format!("{:x}", Sha256::digest(registry_content));
+    // Compute expected hash
     let expected_srr_hash = format!("{:x}", Sha256::digest(srr_content));
 
     let ledger = Arc::new(
@@ -681,9 +646,8 @@ async fn config_file_hashes_recorded_in_merkle_chain() {
             .expect("ledger must initialize"),
     );
 
-    // Record config load
+    // Record config load (SRR only — registry removed)
     let config_files: Vec<(&str, &std::path::Path)> = vec![
-        ("registry:registry.toml", registry_path.as_path()),
         ("srr:srr.toml", srr_path.as_path()),
     ];
     ledger
@@ -712,17 +676,7 @@ async fn config_file_hashes_recorded_in_merkle_chain() {
     assert_eq!(event.trace_id, "system");
     assert!(matches!(event.status, EventStatus::Confirmed));
 
-    // Verify SHA-256 hashes in context field
-    let registry_hash = event
-        .context
-        .get("registry:registry.toml")
-        .and_then(|v| v.as_str())
-        .expect("registry hash must be present in context");
-    assert_eq!(
-        registry_hash, expected_registry_hash,
-        "registry file hash must match SHA-256"
-    );
-
+    // Verify SHA-256 hash in context field
     let srr_hash = event
         .context
         .get("srr:srr.toml")
@@ -853,8 +807,6 @@ decision = { type = "Delay", milliseconds = 10 }
     )
     .expect("writing SRR config must succeed");
 
-    let registry_path = dir.path().join("registry.toml");
-    std::fs::write(&registry_path, "").expect("writing empty registry must succeed");
 
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(
@@ -871,9 +823,6 @@ token = "sk_test_proxy_injected_key"
 
     let srr = Arc::new(std::sync::RwLock::new(
         NetworkSRR::load(&srr_path).expect("valid SRR config must parse"),
-    ));
-    let registry = Arc::new(std::sync::RwLock::new(
-        OperationRegistry::load(&registry_path).expect("valid registry must parse"),
     ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("valid secrets must parse"));
     let ledger = Arc::new(
@@ -897,7 +846,6 @@ token = "sk_test_proxy_injected_key"
     let state = gvm_proxy::proxy::AppState {
         srr,
 
-        registry,
         api_keys,
         ledger: ledger.clone(),
         vault,
@@ -912,7 +860,7 @@ token = "sk_test_proxy_injected_key"
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
         srr_config_path: String::new(),
 
-        registry_path: String::new(),
+        gvm_toml_path: None,
         mitm_ca_pem: None,
         payload_inspection: false,
         max_body_bytes: 65536,
@@ -1117,8 +1065,6 @@ decision = { type = "Allow" }
     )
     .expect("writing SRR config must succeed");
 
-    let registry_path = dir.path().join("registry.toml");
-    std::fs::write(&registry_path, "").expect("writing empty registry must succeed");
 
     // Two hosts: one with ApiKey type (custom header), one with Bearer.
     // Both will be remapped to the same local upstream via host_overrides.
@@ -1142,9 +1088,6 @@ token = "sk_test_proxy_injected_bearer"
 
     let srr = Arc::new(std::sync::RwLock::new(
         NetworkSRR::load(&srr_path).expect("valid SRR config must parse"),
-    ));
-    let registry = Arc::new(std::sync::RwLock::new(
-        OperationRegistry::load(&registry_path).expect("valid registry must parse"),
     ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("valid secrets must parse"));
     let ledger = Arc::new(
@@ -1171,7 +1114,6 @@ token = "sk_test_proxy_injected_bearer"
     let state = gvm_proxy::proxy::AppState {
         srr,
 
-        registry,
         api_keys,
         ledger: ledger.clone(),
         vault,
@@ -1186,7 +1128,7 @@ token = "sk_test_proxy_injected_bearer"
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
         srr_config_path: String::new(),
 
-        registry_path: String::new(),
+        gvm_toml_path: None,
         mitm_ca_pem: None,
         payload_inspection: false,
         max_body_bytes: 65536,
@@ -1339,8 +1281,6 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
     )
     .expect("writing SRR config must succeed");
 
-    let registry_path = dir.path().join("registry.toml");
-    std::fs::write(&registry_path, "").expect("writing empty registry must succeed");
 
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(&secrets_path, "[credentials]\n").expect("writing empty secrets must succeed");
@@ -1349,9 +1289,6 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
 
     let srr = Arc::new(std::sync::RwLock::new(
         NetworkSRR::load(&srr_path).expect("valid SRR config must parse"),
-    ));
-    let registry = Arc::new(std::sync::RwLock::new(
-        OperationRegistry::load(&registry_path).expect("valid registry must parse"),
     ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("valid secrets must parse"));
     let ledger = Arc::new(
@@ -1368,7 +1305,6 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
     let state = gvm_proxy::proxy::AppState {
         srr,
 
-        registry,
         api_keys,
         ledger,
         vault,
@@ -1383,7 +1319,7 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
         srr_config_path: String::new(),
 
-        registry_path: String::new(),
+        gvm_toml_path: None,
         mitm_ca_pem: None,
         payload_inspection: false,
         max_body_bytes: 65536,
@@ -1511,8 +1447,6 @@ decision = { type = "Allow" }
     )
     .expect("writing SRR config must succeed");
 
-    let registry_path = dir.path().join("registry.toml");
-    std::fs::write(&registry_path, "").expect("writing empty registry must succeed");
 
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(&secrets_path, "[credentials]\n").expect("writing empty secrets must succeed");
@@ -1521,9 +1455,6 @@ decision = { type = "Allow" }
 
     let srr = Arc::new(std::sync::RwLock::new(
         NetworkSRR::load(&srr_path).expect("valid SRR config must parse"),
-    ));
-    let registry = Arc::new(std::sync::RwLock::new(
-        OperationRegistry::load(&registry_path).expect("valid registry must parse"),
     ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("valid secrets must parse"));
     let ledger = Arc::new(
@@ -1540,7 +1471,6 @@ decision = { type = "Allow" }
     let state = gvm_proxy::proxy::AppState {
         srr,
 
-        registry,
         api_keys,
         ledger,
         vault,
@@ -1555,7 +1485,7 @@ decision = { type = "Allow" }
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
         srr_config_path: String::new(),
 
-        registry_path: String::new(),
+        gvm_toml_path: None,
         mitm_ca_pem: None,
         payload_inspection: false,
         max_body_bytes: 65536,
@@ -1854,17 +1784,12 @@ async fn checkpoint_save_restore_merkle_verified() {
     // Minimal config files for component initialization
     let srr_path = dir.path().join("srr.toml");
     std::fs::write(&srr_path, "rules = []\n").unwrap();
-    let registry_path = dir.path().join("registry.toml");
-    std::fs::write(&registry_path, "[namespaces]\n").unwrap();
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(&secrets_path, "[credentials]\n").unwrap();
     let wal_path = dir.path().join("wal.log");
 
     let srr = Arc::new(std::sync::RwLock::new(
         NetworkSRR::load(&srr_path).expect("empty SRR must parse"),
-    ));
-    let registry = Arc::new(std::sync::RwLock::new(
-        OperationRegistry::load(&registry_path).expect("minimal registry must parse"),
     ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("empty secrets must parse"));
     let ledger = Arc::new(
@@ -1881,7 +1806,6 @@ async fn checkpoint_save_restore_merkle_verified() {
     let state = AppState {
         srr,
 
-        registry,
         api_keys,
         ledger,
         vault,
@@ -1896,7 +1820,7 @@ async fn checkpoint_save_restore_merkle_verified() {
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
         srr_config_path: String::new(),
 
-        registry_path: String::new(),
+        gvm_toml_path: None,
         mitm_ca_pem: None,
         payload_inspection: false,
         max_body_bytes: 65536,
@@ -2312,8 +2236,6 @@ decision = { type = "Allow" }
     )
     .unwrap();
 
-    let registry_path = dir.path().join("registry.toml");
-    std::fs::write(&registry_path, "").unwrap();
 
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(&secrets_path, "[credentials]\n").unwrap();
@@ -2321,9 +2243,6 @@ decision = { type = "Allow" }
     let wal_path = dir.path().join("wal.log");
     let srr = Arc::new(std::sync::RwLock::new(
         NetworkSRR::load(&srr_path).expect("SRR must parse"),
-    ));
-    let registry = Arc::new(std::sync::RwLock::new(
-        OperationRegistry::load(&registry_path).expect("registry must parse"),
     ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("secrets must parse"));
     let ledger = Arc::new(
@@ -2341,7 +2260,6 @@ decision = { type = "Allow" }
     let state = AppState {
         srr,
 
-        registry,
         api_keys,
         ledger,
         vault,
@@ -2356,7 +2274,7 @@ decision = { type = "Allow" }
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
         srr_config_path: String::new(),
 
-        registry_path: String::new(),
+        gvm_toml_path: None,
         mitm_ca_pem: None,
         payload_inspection: false,
         max_body_bytes: 65536,
@@ -2479,16 +2397,11 @@ decision = { type = "Allow" }
     )
     .unwrap();
 
-    let registry_path = dir.path().join("registry.toml");
-    std::fs::write(&registry_path, "").unwrap();
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(&secrets_path, "[credentials]\n").unwrap();
     let wal_path = dir.path().join("wal.log");
 
     let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).unwrap()));
-    let registry = Arc::new(std::sync::RwLock::new(
-        OperationRegistry::load(&registry_path).unwrap(),
-    ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).unwrap());
     let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
     let vault = Arc::new(Vault::new(ledger.clone()).unwrap());
@@ -2499,7 +2412,6 @@ decision = { type = "Allow" }
     let state = AppState {
         srr,
 
-        registry,
         api_keys,
         ledger,
         vault,
@@ -2514,7 +2426,7 @@ decision = { type = "Allow" }
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
         srr_config_path: String::new(),
 
-        registry_path: String::new(),
+        gvm_toml_path: None,
         mitm_ca_pem: None,
         payload_inspection: false,
         max_body_bytes: 65536,
@@ -2602,16 +2514,11 @@ decision = { type = "Allow" }
     )
     .unwrap();
 
-    let registry_path = dir.path().join("registry.toml");
-    std::fs::write(&registry_path, "").unwrap();
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(&secrets_path, "[credentials]\n").unwrap();
     let wal_path = dir.path().join("wal.log");
 
     let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).unwrap()));
-    let registry = Arc::new(std::sync::RwLock::new(
-        OperationRegistry::load(&registry_path).unwrap(),
-    ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).unwrap());
     let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
     let vault = Arc::new(Vault::new(ledger.clone()).unwrap());
@@ -2622,7 +2529,6 @@ decision = { type = "Allow" }
     let state = AppState {
         srr,
 
-        registry,
         api_keys,
         ledger,
         vault,
@@ -2637,7 +2543,7 @@ decision = { type = "Allow" }
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
         srr_config_path: String::new(),
 
-        registry_path: String::new(),
+        gvm_toml_path: None,
         mitm_ca_pem: None,
         payload_inspection: true, // ENABLED for this test
         max_body_bytes: 65536,
@@ -2729,16 +2635,11 @@ decision = { type = "Allow" }
     )
     .unwrap();
 
-    let registry_path = dir.path().join("registry.toml");
-    std::fs::write(&registry_path, "").unwrap();
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(&secrets_path, "[credentials]\n").unwrap();
     let wal_path = dir.path().join("wal.log");
 
     let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).unwrap()));
-    let registry = Arc::new(std::sync::RwLock::new(
-        OperationRegistry::load(&registry_path).unwrap(),
-    ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).unwrap());
     let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
     let vault = Arc::new(Vault::new(ledger.clone()).unwrap());
@@ -2749,7 +2650,6 @@ decision = { type = "Allow" }
     let state = AppState {
         srr,
 
-        registry,
         api_keys,
         ledger,
         vault,
@@ -2764,7 +2664,7 @@ decision = { type = "Allow" }
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
         srr_config_path: String::new(),
 
-        registry_path: String::new(),
+        gvm_toml_path: None,
         mitm_ca_pem: None,
         payload_inspection: false, // DISABLED — body should NOT be inspected
         max_body_bytes: 65536,
@@ -2824,16 +2724,11 @@ async fn ic3_self_approval_blocked_on_proxy_port() {
         "[[rules]]\nmethod = \"*\"\npattern = \"{any}\"\ndecision = { type = \"Allow\" }\n",
     )
     .unwrap();
-    let registry_path = dir.path().join("registry.toml");
-    std::fs::write(&registry_path, "").unwrap();
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(&secrets_path, "[credentials]\n").unwrap();
     let wal_path = dir.path().join("wal.log");
 
     let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).unwrap()));
-    let registry = Arc::new(std::sync::RwLock::new(
-        OperationRegistry::load(&registry_path).unwrap(),
-    ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).unwrap());
     let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
     let vault = Arc::new(Vault::new(ledger.clone()).unwrap());
@@ -2844,7 +2739,6 @@ async fn ic3_self_approval_blocked_on_proxy_port() {
     let state = AppState {
         srr,
 
-        registry,
         api_keys,
         ledger,
         vault,
@@ -2859,7 +2753,7 @@ async fn ic3_self_approval_blocked_on_proxy_port() {
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
         srr_config_path: String::new(),
 
-        registry_path: String::new(),
+        gvm_toml_path: None,
         mitm_ca_pem: None,
         payload_inspection: false,
         max_body_bytes: 65536,

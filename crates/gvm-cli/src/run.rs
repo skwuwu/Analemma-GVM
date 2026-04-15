@@ -310,13 +310,31 @@ pub(crate) fn assemble_sandbox_config(
     }
 }
 
-/// Load secrets.toml and generate placeholder env vars for agent startup.
+/// Load credentials and generate placeholder env vars for agent startup.
 ///
-/// Parses credential host names from secrets.toml and generates dummy
-/// values that satisfy agent startup validation (non-empty, correct prefix)
-/// without exposing real keys. The proxy strips these and injects real
-/// credentials post-enforcement.
+/// Checks gvm.toml first (unified config), then falls back to secrets.toml.
+/// Generates dummy values that satisfy agent startup validation (non-empty,
+/// correct prefix) without exposing real keys. The proxy strips these and
+/// injects real credentials post-enforcement.
 fn load_placeholder_env_vars() -> Vec<(String, String)> {
+    // Try gvm.toml first
+    let gvm_candidates = ["gvm.toml", "config/gvm.toml"];
+    for gvm_path in &gvm_candidates {
+        let path = std::path::Path::new(gvm_path);
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Ok(parsed) = toml::from_str::<toml::Value>(&content) {
+                    if let Some(credentials) = parsed.get("credentials").and_then(|c| c.as_table()) {
+                        if !credentials.is_empty() {
+                            return generate_placeholder_vars(credentials);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback to secrets.toml
     let secrets_path = std::path::Path::new("config/secrets.toml");
     if !secrets_path.exists() {
         return Vec::new();
@@ -334,6 +352,12 @@ fn load_placeholder_env_vars() -> Vec<(String, String)> {
         Some(t) => t,
         None => return Vec::new(),
     };
+
+    generate_placeholder_vars(credentials)
+}
+
+/// Generate placeholder env vars from a credential table.
+fn generate_placeholder_vars(credentials: &toml::map::Map<String, toml::Value>) -> Vec<(String, String)> {
 
     let mut env_vars = Vec::new();
     for (host, cred) in credentials {
@@ -404,24 +428,34 @@ pub(crate) async fn proxy_healthy(proxy: &str) -> bool {
 /// distributed artifact (e.g. GitHub Actions runner paths leaking into the
 /// Windows release zip). Resolution is now fully runtime-driven.
 pub(crate) fn workspace_root_for_proxy() -> std::path::PathBuf {
-    let marker = std::path::Path::new("config").join("operation_registry.toml");
+    // Detect workspace by presence of gvm.toml or config/srr_network.toml
+    let markers: &[&str] = &[
+        "gvm.toml",
+        "config/gvm.toml",
+        "config/srr_network.toml",
+        "config/proxy.toml",
+    ];
+
+    let has_marker = |dir: &std::path::Path| -> bool {
+        markers.iter().any(|m| dir.join(m).exists())
+    };
 
     if let Ok(p) = std::env::var("GVM_WORKSPACE") {
         let path = std::path::PathBuf::from(p);
-        if path.join(&marker).exists() {
+        if has_marker(&path) {
             return path;
         }
     }
 
     if let Ok(cwd) = std::env::current_dir() {
-        if cwd.join(&marker).exists() {
+        if has_marker(&cwd) {
             return cwd;
         }
     }
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            if dir.join(&marker).exists() {
+            if has_marker(dir) {
                 return dir.to_path_buf();
             }
         }

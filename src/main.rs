@@ -4,12 +4,11 @@ use axum::Router;
 use gvm_proxy::api;
 use gvm_proxy::api_keys::APIKeyStore;
 use gvm_proxy::auth;
-use gvm_proxy::config::ProxyConfig;
+use gvm_proxy::config::{self, ProxyConfig};
 use gvm_proxy::dns_governance;
 use gvm_proxy::ledger::Ledger;
 use gvm_proxy::proxy::{proxy_handler, AppState};
 use gvm_proxy::token_budget::TokenBudget;
-use gvm_proxy::registry::OperationRegistry;
 use gvm_proxy::srr::NetworkSRR;
 use gvm_proxy::vault::Vault;
 #[cfg(feature = "wasm")]
@@ -39,67 +38,84 @@ async fn main() {
     // 1. Load configuration (tries GVM_CONFIG env, CWD, home dir, then defaults)
     let mut config = ProxyConfig::load_or_default();
 
+    // 1.5. Try loading unified gvm.toml (takes priority over separate config files)
+    let gvm_config = config::load_gvm_toml();
+    let gvm_toml_path: Option<String> = if gvm_config.is_some() {
+        // Determine which path was loaded (re-check candidates)
+        let candidates = [
+            std::env::var("GVM_TOML").ok(),
+            Some("gvm.toml".to_string()),
+            Some("config/gvm.toml".to_string()),
+        ];
+        candidates.into_iter().flatten().find(|c| Path::new(c).exists())
+    } else {
+        None
+    };
+
     // 2. First-run detection: if config files are missing, offer interactive setup.
     //    After setup, reload config so template proxy.toml settings take effect.
-    let registry_path_str = config.operations.registry_file.clone();
     let srr_path_str = config.srr.network_file.clone();
-    if !Path::new(&registry_path_str).exists()
+    if gvm_config.is_none()
         && !Path::new(&srr_path_str).exists()
         && offer_first_run_setup()
     {
         // Template applied — reload config to pick up template's proxy.toml
         config = ProxyConfig::load_or_default();
     }
-    let registry_path = Path::new(&config.operations.registry_file);
     let srr_path = Path::new(&config.srr.network_file);
 
-    // 3. Load Operation Registry (Fail-Close: invalid registry → abort with guidance)
-    let registry = match OperationRegistry::load(registry_path) {
-        Ok(r) => {
-            tracing::info!("Operation registry loaded and validated");
-            r
+    // 3. Load Network SRR rules — from gvm.toml if available, else from separate file.
+    let mut srr = if let Some(ref gvm) = gvm_config {
+        if !gvm.rules.is_empty() {
+            match NetworkSRR::from_rule_configs(gvm.rules.clone()) {
+                Ok(s) => {
+                    tracing::info!(rules = gvm.rules.len(), "Network SRR rules loaded from gvm.toml");
+                    s
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to compile SRR rules from gvm.toml");
+                    eprintln!();
+                    eprintln!("  ERROR: gvm.toml contains invalid SRR rules.");
+                    eprintln!("  Error: {}", e);
+                    eprintln!();
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            // gvm.toml exists but has no rules — try legacy file
+            match NetworkSRR::load(srr_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "No rules in gvm.toml and legacy SRR file failed — starting with empty rules");
+                    NetworkSRR::from_rule_configs(vec![]).unwrap_or_else(|_| {
+                        eprintln!("  FATAL: Cannot create empty SRR engine");
+                        std::process::exit(1);
+                    })
+                }
+            }
         }
-        Err(e) => {
-            tracing::error!(
-                path = %registry_path.display(),
-                error = %e,
-                "Failed to load operation registry"
-            );
-            eprintln!();
-            eprintln!("  ERROR: Cannot start — operation registry not found or invalid.");
-            eprintln!("  Expected: {}", registry_path.display());
-            eprintln!();
-            eprintln!("  Quick fix:");
-            eprintln!("    git clone https://github.com/skwuwu/Analemma-GVM && cd Analemma-GVM");
-            eprintln!("    cargo run   # config/ directory is included in the repo");
-            eprintln!();
-            eprintln!("  Or run: gvm init --industry saas");
-            eprintln!();
-            std::process::exit(1);
-        }
-    };
-
-    // 4. Load Network SRR rules (Fail-Close: invalid SRR → abort with guidance)
-    let mut srr = match NetworkSRR::load(srr_path) {
-        Ok(s) => {
-            tracing::info!("Network SRR rules loaded");
-            s
-        }
-        Err(e) => {
-            tracing::error!(
-                path = %srr_path.display(),
-                error = %e,
-                "Failed to load network SRR rules"
-            );
-            eprintln!();
-            eprintln!("  ERROR: Cannot start — network SRR rules not found or invalid.");
-            eprintln!("  Expected: {}", srr_path.display());
-            eprintln!();
-            eprintln!("  Quick fix:");
-            eprintln!("    Ensure config/srr_network.toml exists in the working directory.");
-            eprintln!("    Or run: gvm init --industry saas");
-            eprintln!();
-            std::process::exit(1);
+    } else {
+        match NetworkSRR::load(srr_path) {
+            Ok(s) => {
+                tracing::info!("Network SRR rules loaded");
+                s
+            }
+            Err(e) => {
+                tracing::error!(
+                    path = %srr_path.display(),
+                    error = %e,
+                    "Failed to load network SRR rules"
+                );
+                eprintln!();
+                eprintln!("  ERROR: Cannot start — network SRR rules not found or invalid.");
+                eprintln!("  Expected: {}", srr_path.display());
+                eprintln!();
+                eprintln!("  Quick fix:");
+                eprintln!("    Create a gvm.toml in the working directory.");
+                eprintln!("    Or run: gvm init --industry saas");
+                eprintln!();
+                std::process::exit(1);
+            }
         }
     };
 
@@ -133,19 +149,55 @@ async fn main() {
     };
     srr.set_default_decision(default_unknown_decision);
 
-    // 4. Load API key store (graceful: missing or unreadable → empty store with warning)
-    let api_keys = match APIKeyStore::load(Path::new(&config.secrets.file)) {
-        Ok(keys) => keys,
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                path = %config.secrets.file,
-                "Failed to load API key store — starting with empty store. \
-                 Layer 3 (API key isolation) is INACTIVE."
+    // 4. Load API key store — from gvm.toml if available, else from secrets.toml.
+    let api_keys = if let Some(ref gvm) = gvm_config {
+        if !gvm.credentials.is_empty() {
+            tracing::info!(
+                count = gvm.credentials.len(),
+                "API credentials loaded from gvm.toml"
             );
-            APIKeyStore::default()
+            APIKeyStore::from_map(gvm.credentials.clone())
+        } else {
+            // gvm.toml exists but no credentials — try legacy file
+            match APIKeyStore::load(Path::new(&config.secrets.file)) {
+                Ok(keys) => keys,
+                Err(e) => {
+                    tracing::warn!(error = %e, "No credentials in gvm.toml and legacy secrets file failed");
+                    APIKeyStore::default()
+                }
+            }
+        }
+    } else {
+        match APIKeyStore::load(Path::new(&config.secrets.file)) {
+            Ok(keys) => keys,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    path = %config.secrets.file,
+                    "Failed to load API key store — starting with empty store. \
+                     Layer 3 (API key isolation) is INACTIVE."
+                );
+                APIKeyStore::default()
+            }
         }
     };
+
+    // 4.5. Override budget from gvm.toml if present
+    if let Some(ref gvm) = gvm_config {
+        // Only override if the gvm.toml budget has non-default values
+        if gvm.budget.max_tokens_per_hour > 0 || gvm.budget.max_cost_per_hour > 0.0 {
+            config.budget = gvm.budget.clone();
+            tracing::info!("Budget configuration loaded from gvm.toml");
+        }
+    }
+
+    // 4.6. Override filesystem policy from gvm.toml if present
+    if let Some(ref gvm) = gvm_config {
+        if gvm.filesystem.is_some() {
+            config.filesystem = gvm.filesystem.clone();
+            tracing::info!("Filesystem policy loaded from gvm.toml");
+        }
+    }
     if api_keys.is_empty() {
         tracing::warn!(
             "No API keys configured. Running in passthrough mode. \
@@ -193,13 +245,13 @@ async fn main() {
 
     // 7.5. Record config file hashes in Merkle chain (tamper detection)
     {
-        let all_config_files: Vec<(String, std::path::PathBuf)> = vec![
-            ("srr_network".to_string(), srr_path.to_path_buf()),
-            (
-                "operation_registry".to_string(),
-                registry_path.to_path_buf(),
-            ),
-        ];
+        let mut all_config_files: Vec<(String, std::path::PathBuf)> = Vec::new();
+
+        if let Some(ref gvm_path) = gvm_toml_path {
+            all_config_files.push(("gvm_toml".to_string(), std::path::PathBuf::from(gvm_path)));
+        } else {
+            all_config_files.push(("srr_network".to_string(), srr_path.to_path_buf()));
+        }
 
         let config_refs: Vec<(&str, &Path)> = all_config_files
             .iter()
@@ -331,12 +383,11 @@ async fn main() {
     );
 
     // 10. Print startup policy summary
-    print_startup_summary(&srr, &registry, &api_keys);
+    print_startup_summary(&srr, &api_keys);
 
     // 11. Compose shared state
     let mut state = AppState {
         srr: Arc::new(std::sync::RwLock::new(srr)),
-        registry: Arc::new(std::sync::RwLock::new(registry)),
         api_keys: Arc::new(api_keys),
         ledger,
         vault: Arc::new(vault),
@@ -356,7 +407,7 @@ async fn main() {
             config.shadow.intent_ttl_secs,
         )),
         srr_config_path: config.srr.network_file.clone(),
-        registry_path: config.operations.registry_file.clone(),
+        gvm_toml_path: gvm_toml_path.clone(),
         mitm_ca_pem: Some(mitm_ca_cert_pem.clone()),
         payload_inspection: config.srr.payload_inspection,
         max_body_bytes: config.srr.max_body_bytes,
@@ -1047,7 +1098,6 @@ async fn handle_tls_connection(
 /// traffic starts flowing through the proxy.
 fn print_startup_summary(
     srr: &gvm_proxy::srr::NetworkSRR,
-    registry: &gvm_proxy::registry::OperationRegistry,
     api_keys: &gvm_proxy::api_keys::APIKeyStore,
 ) {
     let srr_info = srr.summary();
@@ -1078,15 +1128,6 @@ fn print_startup_summary(
             eprintln!("      \x1b[31m✗\x1b[0m {}", deny);
         }
     }
-    eprintln!();
-
-    // Operations registry
-    eprintln!("  \x1b[1mOperation Registry\x1b[0m");
-    eprintln!(
-        "    Core: {}   Custom: {}",
-        registry.core_count(),
-        registry.custom_count()
-    );
     eprintln!();
 
     // API key isolation
@@ -1188,7 +1229,6 @@ fn offer_first_run_setup() -> bool {
     let files_to_copy = [
         "proxy.toml",
         "srr_network.toml",
-        "operation_registry.toml",
         "policies/global.toml",
     ];
 

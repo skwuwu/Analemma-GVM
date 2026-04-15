@@ -149,6 +149,10 @@ enum Commands {
         #[arg(long, value_parser = ["minimal", "standard", "full"], default_value = "standard")]
         sandbox_profile: String,
 
+        /// Seccomp profile: default (HTTP-capable), strict (no network), custom.
+        #[arg(long, value_parser = ["default", "strict"], default_value = "default")]
+        seccomp: String,
+
         /// Shadow Mode: verify agent intent before execution.
         /// disabled = off (default), observe = log violations, strict = deny without intent.
         #[arg(long, value_parser = ["disabled", "observe", "strict"])]
@@ -606,6 +610,7 @@ async fn main() -> anyhow::Result<()> {
             fs_governance,
             no_dns_governance,
             sandbox_profile,
+            seccomp,
             shadow_mode,
             sandbox_timeout,
             image,
@@ -634,6 +639,9 @@ async fn main() -> anyhow::Result<()> {
                 }
                 if let Some(timeout) = sandbox_timeout {
                     std::env::set_var("GVM_SANDBOX_TIMEOUT", timeout.to_string());
+                }
+                if seccomp != "default" {
+                    std::env::set_var("GVM_SECCOMP_PROFILE", &seccomp);
                 }
                 if no_dns_governance {
                     std::env::set_var("GVM_NO_DNS_GOVERNANCE", "1");

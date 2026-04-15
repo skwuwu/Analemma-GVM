@@ -52,6 +52,28 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
+### 2026-04-13: Unified gvm.toml configuration system
+
+**What changed:**
+1. Added `GvmConfig` struct and `load_gvm_toml()` to `src/config.rs` — single-file configuration for rules, credentials, budget, filesystem, and seccomp.
+2. Made `NetworkRuleConfig` and `NetworkDecisionConfig` pub in `src/srr.rs`; added `NetworkSRR::from_rule_configs()` for loading rules from parsed configs.
+3. Updated `src/main.rs` to try gvm.toml first, falling back to legacy separate files (srr_network.toml, secrets.toml).
+4. Removed `OperationRegistry` entirely: deleted `src/registry.rs`, removed from `src/lib.rs`, `src/proxy.rs` (AppState), `src/api.rs` (reload + info), `src/main.rs`, `src/config.rs`.
+5. Updated `src/api.rs` reload handler to reload from gvm.toml when present.
+6. Updated CLI: `gvm init` generates gvm.toml template; `gvm run` reads credentials from gvm.toml; added `--seccomp` flag; `gvm reload` simplified.
+7. Updated `crates/gvm-cli/src/run.rs` placeholder env var generation to check gvm.toml first.
+8. Updated `crates/gvm-cli/src/proxy_manager.rs` tracked config files to include gvm.toml.
+9. Updated `crates/gvm-cli/src/preflight.rs` credential checks to include gvm.toml.
+10. Applied 0600 permission check to gvm.toml (same security as secrets.toml).
+11. Removed all registry references from integration and edge-case tests.
+12. `OperationsConfig` made optional in `ProxyConfig` for backward compatibility.
+
+**Why:** Single-file configuration reduces user confusion and error surface. Users previously had to manage 4+ files (proxy.toml, srr_network.toml, secrets.toml, operation_registry.toml). The operation registry was not used in the enforcement path and added complexity without value.
+
+**Affected files:** `src/config.rs`, `src/srr.rs`, `src/main.rs`, `src/lib.rs`, `src/proxy.rs`, `src/api.rs`, `src/registry.rs` (deleted), `crates/gvm-cli/src/init.rs`, `crates/gvm-cli/src/run.rs`, `crates/gvm-cli/src/main.rs`, `crates/gvm-cli/src/reload.rs`, `crates/gvm-cli/src/proxy_manager.rs`, `crates/gvm-cli/src/preflight.rs`, `tests/integration.rs`, `tests/edge_cases.rs`.
+
+**Risk:** Medium. Backward compatible (gvm.toml is optional; legacy files still work). Breaking only for code that imported `gvm_proxy::registry::OperationRegistry`.
+
 ### 2026-04-16: Remove ABAC (PolicyEngine) system entirely
 
 **What changed:**

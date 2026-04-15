@@ -4,6 +4,152 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
+// ─── Unified gvm.toml Configuration ───
+
+/// Unified user-facing configuration (gvm.toml).
+///
+/// All governance settings in one file: network rules, API credentials,
+/// budget limits, filesystem patterns, and seccomp profile.
+/// When gvm.toml exists, it takes priority over separate config files.
+/// When absent, the proxy falls back to legacy separate-file loading.
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct GvmConfig {
+    /// Network rules (SRR) — replaces config/srr_network.toml.
+    #[serde(default)]
+    pub rules: Vec<crate::srr::NetworkRuleConfig>,
+
+    /// API credentials keyed by host — replaces config/secrets.toml.
+    #[serde(default)]
+    pub credentials: HashMap<String, crate::api_keys::Credential>,
+
+    /// Token budget limits.
+    #[serde(default)]
+    pub budget: BudgetConfig,
+
+    /// Filesystem governance patterns (Trust-on-Pattern).
+    #[serde(default)]
+    pub filesystem: Option<gvm_sandbox::FilesystemPolicy>,
+
+    /// Seccomp profile selection.
+    #[serde(default)]
+    pub seccomp: SeccompConfig,
+}
+
+/// Seccomp profile configuration within gvm.toml.
+#[derive(Deserialize, Clone, Debug)]
+pub struct SeccompConfig {
+    /// Profile name: "default", "strict", or "custom".
+    #[serde(default = "default_seccomp_profile")]
+    pub profile: String,
+    /// Path to custom seccomp JSON profile (only when profile = "custom").
+    pub custom_path: Option<String>,
+}
+
+impl Default for SeccompConfig {
+    fn default() -> Self {
+        Self {
+            profile: "default".to_string(),
+            custom_path: None,
+        }
+    }
+}
+
+fn default_seccomp_profile() -> String {
+    "default".to_string()
+}
+
+/// Search for gvm.toml in standard locations and load it.
+///
+/// Search order:
+///   1. GVM_TOML env var (explicit path)
+///   2. gvm.toml in current working directory
+///   3. config/gvm.toml
+///   4. ~/.config/gvm/gvm.toml
+///
+/// Returns None if no gvm.toml is found — triggers legacy fallback.
+pub fn load_gvm_toml() -> Option<GvmConfig> {
+    let candidates = [
+        std::env::var("GVM_TOML").ok(),
+        Some("gvm.toml".to_string()),
+        Some("config/gvm.toml".to_string()),
+        dirs_home().map(|h| format!("{}/.config/gvm/gvm.toml", h)),
+    ];
+
+    for candidate in candidates.iter().flatten() {
+        let path = Path::new(candidate);
+        if path.exists() {
+            // Security: gvm.toml may contain API keys. Apply permission check.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(path) {
+                    let mode = meta.permissions().mode();
+                    if mode & 0o077 != 0 {
+                        tracing::warn!(
+                            path = %path.display(),
+                            mode = format!("{:04o}", mode & 0o777),
+                            "gvm.toml has insecure permissions — group/other can read API keys"
+                        );
+                        match std::fs::set_permissions(
+                            path,
+                            std::fs::Permissions::from_mode(0o600),
+                        ) {
+                            Ok(()) => tracing::info!(
+                                path = %path.display(),
+                                "Fixed gvm.toml permissions to 0600"
+                            ),
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                "Cannot fix gvm.toml permissions — ensure only the proxy user can read this file"
+                            ),
+                        }
+                    }
+                }
+            }
+
+            match std::fs::read_to_string(path) {
+                Ok(content) => match toml::from_str::<GvmConfig>(&content) {
+                    Ok(config) => {
+                        tracing::info!(
+                            path = %path.display(),
+                            rules = config.rules.len(),
+                            credentials = config.credentials.len(),
+                            "Unified configuration loaded from gvm.toml"
+                        );
+                        return Some(config);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            path = %path.display(),
+                            error = %e,
+                            "Failed to parse gvm.toml"
+                        );
+                        // Fail-close: do not silently fall back to legacy config
+                        // if gvm.toml exists but is malformed.
+                        eprintln!();
+                        eprintln!("  ERROR: gvm.toml exists but failed to parse.");
+                        eprintln!("  Path: {}", path.display());
+                        eprintln!("  Error: {}", e);
+                        eprintln!();
+                        eprintln!("  Fix the file or remove it to use legacy config files.");
+                        eprintln!();
+                        std::process::exit(1);
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(
+                        path = %path.display(),
+                        error = %e,
+                        "Failed to read gvm.toml"
+                    );
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Top-level proxy configuration (proxy.toml)
 #[derive(Deserialize, Clone, Debug)]
 pub struct ProxyConfig {
@@ -15,7 +161,9 @@ pub struct ProxyConfig {
     /// Legacy ABAC policy config. Ignored (ABAC removed). Kept as optional
     /// so existing proxy.toml files with [policies] section still parse.
     pub policies: Option<PoliciesConfig>,
-    pub operations: OperationsConfig,
+    /// Legacy operation registry config. Ignored (registry removed in gvm.toml unification).
+    /// Kept as optional so existing proxy.toml files with [operations] section still parse.
+    pub operations: Option<OperationsConfig>,
     pub secrets: SecretsConfig,
     pub dev: Option<DevConfig>,
     /// JWT authentication configuration (optional).
@@ -411,9 +559,7 @@ impl Default for ProxyConfig {
                 max_body_bytes: default_max_body_bytes(),
             },
             policies: None,
-            operations: OperationsConfig {
-                registry_file: "config/operation_registry.toml".to_string(),
-            },
+            operations: None,
             secrets: SecretsConfig {
                 file: "config/secrets.toml".to_string(),
                 key_env: "GVM_SECRETS_KEY".to_string(),

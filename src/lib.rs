@@ -13,7 +13,6 @@ pub mod llm_trace;
 pub mod merkle;
 pub mod proxy;
 pub mod token_budget;
-pub mod registry;
 pub mod srr;
 pub mod tls_proxy;
 pub mod tls_proxy_hyper;

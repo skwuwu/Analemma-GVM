@@ -890,76 +890,105 @@ pub async fn register_intent(
 /// If any component fails to parse, ALL existing configurations are preserved
 /// (atomic: all-or-nothing).
 pub async fn reload_srr(State(state): State<AppState>) -> Response<Body> {
-    use crate::registry::OperationRegistry;
     use crate::srr::NetworkSRR;
     use std::path::Path;
 
     // Phase 1: Parse all configs BEFORE acquiring any locks.
-    // If any parse fails, we abort without touching state.
-    let new_srr = match NetworkSRR::load(Path::new(&state.srr_config_path)) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, "SRR reload parse failed — all configs preserved");
-            return json_response(
-                StatusCode::BAD_REQUEST,
-                &serde_json::json!({
-                    "reloaded": false,
-                    "error": format!("SRR parse failed: {}. All configs preserved.", e),
-                }),
-            );
+    // If gvm.toml exists, reload from it. Otherwise fallback to separate files.
+    let new_srr = if let Some(ref gvm_path) = state.gvm_toml_path {
+        // Reload from gvm.toml
+        match crate::config::load_gvm_toml() {
+            Some(gvm) if !gvm.rules.is_empty() => {
+                match NetworkSRR::from_rule_configs(gvm.rules) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(error = %e, "SRR reload from gvm.toml failed — config preserved");
+                        return json_response(
+                            StatusCode::BAD_REQUEST,
+                            &serde_json::json!({
+                                "reloaded": false,
+                                "error": format!("gvm.toml SRR parse failed: {}. Config preserved.", e),
+                            }),
+                        );
+                    }
+                }
+            }
+            Some(_) => {
+                // gvm.toml exists but no rules — try legacy file
+                match NetworkSRR::load(Path::new(&state.srr_config_path)) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(error = %e, "SRR reload fallback failed — config preserved");
+                        return json_response(
+                            StatusCode::BAD_REQUEST,
+                            &serde_json::json!({
+                                "reloaded": false,
+                                "error": format!("SRR parse failed: {}. Config preserved.", e),
+                            }),
+                        );
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(path = %gvm_path, "gvm.toml disappeared during reload — trying legacy file");
+                match NetworkSRR::load(Path::new(&state.srr_config_path)) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(error = %e, "SRR reload failed — config preserved");
+                        return json_response(
+                            StatusCode::BAD_REQUEST,
+                            &serde_json::json!({
+                                "reloaded": false,
+                                "error": format!("SRR parse failed: {}. Config preserved.", e),
+                            }),
+                        );
+                    }
+                }
+            }
+        }
+    } else {
+        match NetworkSRR::load(Path::new(&state.srr_config_path)) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "SRR reload parse failed — config preserved");
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({
+                        "reloaded": false,
+                        "error": format!("SRR parse failed: {}. Config preserved.", e),
+                    }),
+                );
+            }
         }
     };
 
-    let new_registry = match OperationRegistry::load(Path::new(&state.registry_path)) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!(error = %e, "Registry reload parse failed — all configs preserved");
-            return json_response(
-                StatusCode::BAD_REQUEST,
-                &serde_json::json!({
-                    "reloaded": false,
-                    "error": format!("Registry parse failed: {}. All configs preserved.", e),
-                }),
-            );
-        }
-    };
-
-    // Phase 2: All parsed successfully. Acquire write locks and swap atomically.
+    // Phase 2: Acquire write lock and swap atomically.
     let srr_count = new_srr.rule_count();
-
-    let lock_err = |name: &str| {
-        tracing::error!("{name} write lock poisoned during reload");
-        json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &serde_json::json!({"error": format!("{name} lock poisoned")}),
-        )
-    };
 
     let mut srr_guard = match state.srr.write() {
         Ok(g) => g,
-        Err(_) => return lock_err("SRR"),
-    };
-    let mut registry_guard = match state.registry.write() {
-        Ok(g) => g,
-        Err(_) => return lock_err("Registry"),
+        Err(_) => {
+            tracing::error!("SRR write lock poisoned during reload");
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({"error": "SRR lock poisoned"}),
+            );
+        }
     };
 
     *srr_guard = new_srr;
-    *registry_guard = new_registry;
-
     drop(srr_guard);
-    drop(registry_guard);
 
     tracing::info!(
         srr_rules = srr_count,
-        "Governance hot-reloaded (SRR + Registry)"
+        "Governance hot-reloaded (SRR)"
     );
     json_response(
         StatusCode::OK,
         &serde_json::json!({
             "reloaded": true,
             "srr_rules": srr_count,
-            "components": ["srr", "registry"],
+            "components": ["srr"],
         }),
     )
 }
@@ -1126,14 +1155,7 @@ pub async fn approve_request(
 ///
 /// Security: returns summary counts only, not internal rule details.
 pub async fn info(State(state): State<AppState>) -> Response<Body> {
-    // Single read lock so both counts come from the same snapshot — a concurrent
-    // reload cannot slip a different version of the registry between the two
-    // fields. Fail-closed to (0, 0) on poison.
-    let (core_ops, custom_ops) = state
-        .registry
-        .read()
-        .map(|r| (r.core_count(), r.custom_count()))
-        .unwrap_or((0, 0));
+    let srr_rules = state.srr.read().map(|s| s.rule_count()).unwrap_or(0);
 
     json_response(
         StatusCode::OK,
@@ -1142,14 +1164,11 @@ pub async fn info(State(state): State<AppState>) -> Response<Body> {
             "components": {
                 "srr": "loaded",
                 "srr_engine": "loaded",
-                "registry": "loaded",
                 "vault": "active",
                 "ledger": "active",
             },
-            "registry": {
-                "core_operations": core_ops,
-                "custom_operations": custom_ops,
-            },
+            "config_source": if state.gvm_toml_path.is_some() { "gvm.toml" } else { "legacy" },
+            "srr_rules": srr_rules,
             "shadow": {
                 "mode": format!("{:?}", state.shadow_config.mode),
                 "active_intents": state.intent_store.stats().1,

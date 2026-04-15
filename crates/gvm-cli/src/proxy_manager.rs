@@ -44,9 +44,10 @@ pub async fn proxy_healthy_with_tls(proxy: &str, require_tls: bool) -> bool {
 /// Edits to any of these after the proxy started should trigger a reload
 /// so the new rules actually take effect.
 const TRACKED_CONFIG_FILES: &[&str] = &[
+    "gvm.toml",
+    "config/gvm.toml",
     "config/srr_network.toml",
     "config/proxy.toml",
-    "config/operation_registry.toml",
     "config/secrets.toml",
 ];
 
@@ -96,7 +97,7 @@ fn config_changed_since_proxy_start(workspace: &Path) -> bool {
         if let Some(parent) = gvm_config.parent() {
             candidates.push(gvm_config.clone());
             candidates.push(parent.join("srr_network.toml"));
-            candidates.push(parent.join("operation_registry.toml"));
+            candidates.push(parent.join("gvm.toml"));
             candidates.push(parent.join("secrets.toml"));
             if let Ok(entries) = std::fs::read_dir(parent.join("policies")) {
                 for entry in entries.flatten() {

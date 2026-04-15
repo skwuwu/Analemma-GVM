@@ -404,46 +404,5 @@ async fn edge_recovery_no_pending_events() {
 // 5. REGISTRY EDGE CASES
 // ═══════════════════════════════════════════════════════════════════
 
-/// Empty registry file — should load without error.
-#[test]
-fn edge_empty_registry_file() {
-    use gvm_proxy::registry::OperationRegistry;
-
-    let dir = tempfile::tempdir().expect("temp directory creation must succeed");
-    let path = dir.path().join("empty_registry.toml");
-    std::fs::write(&path, "").expect("writing empty registry file must succeed");
-
-    let result = OperationRegistry::load(&path);
-    assert!(
-        result.is_ok(),
-        "Empty registry should load without error: {:?}",
-        result.err()
-    );
-}
-
-/// Registry with only custom operations (no core) — should be valid.
-#[test]
-fn edge_registry_custom_only() {
-    use gvm_proxy::registry::OperationRegistry;
-
-    let dir = tempfile::tempdir().expect("temp directory creation must succeed");
-    let path = dir.path().join("custom_only.toml");
-    std::fs::write(
-        &path,
-        r#"
-[[custom]]
-name = "custom.acme.billing.charge"
-description = "Charge a customer"
-vendor = "acme"
-version = 1
-status = "stable"
-default_ic = 2
-required_context = ["amount"]
-"#,
-    )
-    .expect("writing custom registry toml must succeed");
-
-    let registry = OperationRegistry::load(&path).expect("valid custom-only registry must parse");
-    let info = registry.lookup("custom.acme.billing.charge");
-    assert!(info.is_some(), "Custom operation should be found");
-}
+// Operation registry tests removed — registry was removed in gvm.toml unification.
+// SRR rules handle all governance policy; operations are no longer a separate registry.

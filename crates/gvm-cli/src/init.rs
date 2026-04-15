@@ -67,55 +67,28 @@ pub fn run_init(industry: &str, config_dir: &str) -> Result<()> {
         copied += 1;
     }
 
-    // Copy operation_registry.toml from template if it exists, otherwise leave existing
-    let registry_src = template_dir.join("operation_registry.toml");
-    let registry_dst = config_path.join("operation_registry.toml");
-    if registry_src.exists() {
-        if registry_dst.exists() {
-            let backup = registry_dst.with_extension("toml.bak");
-            std::fs::copy(&registry_dst, &backup)?;
-            println!(
-                "  {YELLOW}\u{21bb}{RESET}  {:<30} {DIM}(backed up to .bak){RESET}",
-                "operation_registry.toml",
-            );
-        } else {
-            println!("  {GREEN}\u{2713}{RESET}  operation_registry.toml");
-        }
-        std::fs::copy(&registry_src, &registry_dst)?;
+    // Generate gvm.toml template (unified config) in project root
+    let gvm_toml_dst = Path::new("gvm.toml");
+    if !gvm_toml_dst.exists() {
+        let gvm_template = generate_gvm_toml_template(industry);
+        std::fs::write(gvm_toml_dst, gvm_template)?;
+        println!("  {GREEN}\u{2713}{RESET}  gvm.toml {DIM}(unified config — add API keys here){RESET}");
         copied += 1;
-    } else if !registry_dst.exists() {
-        println!(
-            "  {DIM}skip{RESET}  operation_registry.toml {DIM}(using default from repo){RESET}"
-        );
+    } else {
+        println!("  {DIM}skip{RESET}  gvm.toml {DIM}(already exists — not overwriting){RESET}");
     }
 
-    // Ensure secrets.toml exists (don't overwrite — user's credentials)
+    // Legacy: ensure secrets.toml exists for backward compatibility
     let secrets_dst = config_path.join("secrets.toml");
     if !secrets_dst.exists() {
-        let secrets_example = template_dir
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|root| root.join("secrets.toml.example"));
-
-        if let Some(ref example) = secrets_example {
-            if example.exists() {
-                std::fs::copy(example, &secrets_dst)?;
-                println!("  {GREEN}\u{2713}{RESET}  secrets.toml {DIM}(from template — add your API keys){RESET}");
-                copied += 1;
-            }
-        }
-
-        if !secrets_dst.exists() {
-            // Create minimal empty secrets
-            std::fs::write(
-                &secrets_dst,
-                "# API credentials — see secrets.toml.example for format\n",
-            )?;
-            println!(
-                "  {GREEN}\u{2713}{RESET}  secrets.toml {DIM}(empty — add API keys later){RESET}"
-            );
-            copied += 1;
-        }
+        std::fs::write(
+            &secrets_dst,
+            "# Legacy credentials file. Prefer gvm.toml [credentials] section instead.\n",
+        )?;
+        println!(
+            "  {GREEN}\u{2713}{RESET}  secrets.toml {DIM}(legacy — prefer gvm.toml){RESET}"
+        );
+        copied += 1;
     } else {
         println!("  {DIM}skip{RESET}  secrets.toml {DIM}(already exists — not overwriting credentials){RESET}");
     }
@@ -146,15 +119,164 @@ pub fn run_init(industry: &str, config_dir: &str) -> Result<()> {
 
     println!();
     println!("  {BOLD}Next steps:{RESET}");
-    println!(
-        "    1. Add API keys:    {CYAN}edit {}/secrets.toml{RESET}",
-        config_dir
-    );
+    println!("    1. Add API keys:    {CYAN}edit gvm.toml{RESET}");
     println!("    2. Start proxy:     {CYAN}cargo run{RESET}");
     println!("    3. Point agent:     {CYAN}HTTP_PROXY=http://localhost:8080{RESET}");
     println!();
 
     Ok(())
+}
+
+/// Generate a gvm.toml template for the given industry.
+fn generate_gvm_toml_template(industry: &str) -> String {
+    match industry {
+        "finance" => r#"# Analemma GVM — Unified Configuration (Finance template)
+# All governance rules, credentials, and settings in one file.
+
+# ─── Network Rules (SRR) ───
+# Rules are evaluated in order (first match wins).
+# decision.type: Allow, Delay, Deny, RequireApproval
+
+[[rules]]
+method = "POST"
+pattern = "api.bank.com/v1/transfers"
+description = "Wire transfers require human approval"
+[rules.decision]
+type = "RequireApproval"
+reason = "Financial transfer requires IC-3 approval"
+
+[[rules]]
+method = "DELETE"
+pattern = "*.database.com/*"
+description = "Critical data deletion blocked"
+[rules.decision]
+type = "Deny"
+reason = "Data deletion prohibited by governance policy"
+
+[[rules]]
+method = "POST"
+pattern = "*.stripe.com/v1/charges"
+description = "Payment charges require approval"
+[rules.decision]
+type = "RequireApproval"
+reason = "Payment operation requires IC-3 approval"
+
+[[rules]]
+method = "*"
+pattern = "{any}"
+description = "Default-to-Caution: delay unrecognized APIs"
+[rules.decision]
+type = "Delay"
+milliseconds = 500
+
+# ─── API Credentials ───
+# Keys are injected by the proxy post-enforcement. Agent never sees real keys.
+
+# [credentials."api.stripe.com"]
+# type = "Bearer"
+# token = "sk_live_your_stripe_key_here"
+
+# [credentials."api.openai.com"]
+# type = "Bearer"
+# token = "sk-your-openai-key-here"
+
+# ─── Budget ───
+[budget]
+max_tokens_per_hour = 50000
+max_cost_per_hour = 5.00
+reserve_per_request = 500
+
+# ─── Filesystem Governance ───
+# [filesystem]
+# auto_merge = ["*.csv", "*.pdf", "*.txt"]
+# manual_commit = ["*.sh", "*.py", "*.js", "*.json"]
+# discard = ["/tmp/*", "*.log", "__pycache__/*"]
+# default = "manual_commit"
+# upper_size_mb = 256
+
+# ─── Seccomp ───
+[seccomp]
+profile = "default"
+"#
+        .to_string(),
+
+        "saas" | _ => r#"# Analemma GVM — Unified Configuration (SaaS template)
+# All governance rules, credentials, and settings in one file.
+
+# ─── Network Rules (SRR) ───
+# Rules are evaluated in order (first match wins).
+# decision.type: Allow, Delay, Deny, RequireApproval
+
+[[rules]]
+method = "POST"
+pattern = "api.sendgrid.com/v3/mail/send"
+description = "Email sending monitored"
+[rules.decision]
+type = "Delay"
+milliseconds = 200
+
+[[rules]]
+method = "POST"
+pattern = "api.slack.com/api/chat.postMessage"
+description = "Slack messages monitored"
+[rules.decision]
+type = "Delay"
+milliseconds = 100
+
+[[rules]]
+method = "DELETE"
+pattern = "*.database.com/*"
+description = "Database deletions blocked"
+[rules.decision]
+type = "Deny"
+reason = "Storage deletion prohibited by governance policy"
+
+[[rules]]
+method = "GET"
+pattern = "{any}"
+description = "Read operations allowed"
+[rules.decision]
+type = "Allow"
+
+[[rules]]
+method = "*"
+pattern = "{any}"
+description = "Default-to-Caution: delay unrecognized APIs"
+[rules.decision]
+type = "Delay"
+milliseconds = 300
+
+# ─── API Credentials ───
+# Keys are injected by the proxy post-enforcement. Agent never sees real keys.
+
+# [credentials."api.openai.com"]
+# type = "Bearer"
+# token = "sk-your-openai-key-here"
+
+# [credentials."api.anthropic.com"]
+# type = "Bearer"
+# token = "sk-ant-your-anthropic-key-here"
+
+# ─── Budget ───
+[budget]
+max_tokens_per_hour = 100000
+max_cost_per_hour = 10.00
+reserve_per_request = 500
+
+# ─── Filesystem Governance ───
+# [filesystem]
+# auto_merge = ["*.csv", "*.pdf", "*.txt"]
+# manual_commit = ["*.sh", "*.py", "*.js", "*.json"]
+# discard = ["/tmp/*", "*.log", "__pycache__/*"]
+# default = "manual_commit"
+# upper_size_mb = 256
+
+# ─── Seccomp ───
+[seccomp]
+profile = "default"
+"#
+        .to_string(),
+    }
 }
 
 /// Find the template directory — checks relative to CWD and common install paths.

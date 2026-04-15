@@ -55,18 +55,22 @@ pub fn run_preflight(config_dir: &str) {
         },
     });
 
-    // 3. Credentials
+    // 3. Credentials (check gvm.toml first, then secrets.toml)
+    let gvm_toml_creds = count_gvm_toml_credentials();
     let secrets_path = config_path.join("secrets.toml");
-    let cred_count = count_credentials(&secrets_path);
+    let legacy_cred_count = count_credentials(&secrets_path);
+    let cred_count = if gvm_toml_creds > 0 { gvm_toml_creds } else { legacy_cred_count };
     checks.push(Check {
         ok: cred_count > 0,
         label: "Credentials",
-        detail: if cred_count > 0 {
-            format!("{} hosts configured", cred_count)
-        } else if secrets_path.exists() {
-            "secrets.toml exists but no credentials".to_string()
+        detail: if gvm_toml_creds > 0 {
+            format!("{} hosts configured (gvm.toml)", gvm_toml_creds)
+        } else if cred_count > 0 {
+            format!("{} hosts configured (secrets.toml)", cred_count)
+        } else if std::path::Path::new("gvm.toml").exists() || secrets_path.exists() {
+            "config exists but no credentials".to_string()
         } else {
-            "no secrets.toml (optional)".to_string()
+            "no gvm.toml or secrets.toml (optional)".to_string()
         },
     });
 
@@ -395,6 +399,22 @@ fn count_srr_rules(path: &Path) -> usize {
         Err(_) => return 0,
     };
     content.lines().filter(|l| l.trim() == "[[rules]]").count()
+}
+
+/// Count [credentials."host"] entries in gvm.toml.
+fn count_gvm_toml_credentials() -> usize {
+    for candidate in &["gvm.toml", "config/gvm.toml"] {
+        let path = Path::new(candidate);
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                return content
+                    .lines()
+                    .filter(|l| l.trim().starts_with("[credentials."))
+                    .count();
+            }
+        }
+    }
+    0
 }
 
 /// Count [credentials."host"] entries in secrets.toml.

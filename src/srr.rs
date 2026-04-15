@@ -10,31 +10,31 @@ use std::path::Path;
 
 /// Network-level SRR rule from TOML config
 #[derive(Deserialize, Clone, Debug)]
-struct NetworkRuleConfig {
-    method: String,
-    pattern: String,
-    decision: NetworkDecisionConfig,
+pub struct NetworkRuleConfig {
+    pub method: String,
+    pub pattern: String,
+    pub decision: NetworkDecisionConfig,
     /// Optional regex pattern for path matching (overrides path portion of `pattern`).
     /// Compiled at load time using Rust's `regex` crate (automata-based, O(n) guaranteed).
     /// Example: `"^/api/v[1-3]/users/.*"` matches /api/v1/users/, /api/v2/users/foo, etc.
-    path_regex: Option<String>,
+    pub path_regex: Option<String>,
     /// Optional payload field for GraphQL/gRPC defense
-    payload_field: Option<String>,
+    pub payload_field: Option<String>,
     /// Payload values to match against
-    payload_match: Option<Vec<String>>,
+    pub payload_match: Option<Vec<String>>,
     /// Max body bytes to inspect (default 64KB)
-    max_body_bytes: Option<usize>,
-    description: Option<String>,
+    pub max_body_bytes: Option<usize>,
+    pub description: Option<String>,
     /// Human-readable label (used in warnings and logs)
-    label: Option<String>,
+    pub label: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
-struct NetworkDecisionConfig {
+pub struct NetworkDecisionConfig {
     #[serde(rename = "type")]
-    decision_type: String,
-    milliseconds: Option<u64>,
-    reason: Option<String>,
+    pub decision_type: String,
+    pub milliseconds: Option<u64>,
+    pub reason: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -302,6 +302,67 @@ impl NetworkSRR {
         }
 
         tracing::info!(rules = rules.len(), "Network SRR rules compiled");
+
+        Ok(Self {
+            rules,
+            default_decision: EnforcementDecision::Delay { milliseconds: 300 },
+        })
+    }
+
+    /// Build a NetworkSRR engine from pre-parsed rule configs (e.g. from gvm.toml).
+    /// Same compilation logic as `load()` but takes configs instead of reading a file.
+    pub fn from_rule_configs(rule_configs: Vec<NetworkRuleConfig>) -> Result<Self> {
+        let mut rules = Vec::new();
+
+        for rule_cfg in &rule_configs {
+            let decision = parse_decision(&rule_cfg.decision)?;
+            let (host_pattern, path_pattern) = parse_pattern(&rule_cfg.pattern);
+
+            let compiled_path_regex = match &rule_cfg.path_regex {
+                Some(pattern) => {
+                    const MAX_REGEX_LEN: usize = 10_000;
+                    if pattern.len() > MAX_REGEX_LEN {
+                        anyhow::bail!(
+                            "path_regex too long in SRR rule: {} > {} bytes",
+                            pattern.len(),
+                            MAX_REGEX_LEN
+                        );
+                    }
+                    let re = Regex::new(pattern)
+                        .with_context(|| format!("Invalid path_regex '{}' in SRR rule", pattern))?;
+                    Some(re)
+                }
+                None => None,
+            };
+
+            let methods = if rule_cfg.method == "*" {
+                vec!["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
+            } else {
+                vec![rule_cfg.method.as_str()]
+            };
+
+            let is_catch_all = rule_cfg.method == "*"
+                && matches!(host_pattern, HostPattern::Any)
+                && (path_pattern == "/*" || path_pattern == "*")
+                && compiled_path_regex.is_none();
+
+            for method in methods {
+                rules.push(NetworkRule {
+                    method: method.to_uppercase(),
+                    host_pattern: host_pattern.clone(),
+                    path_pattern: path_pattern.clone(),
+                    compiled_path_regex: compiled_path_regex.clone(),
+                    decision: decision.clone(),
+                    description: rule_cfg.description.clone().unwrap_or_default(),
+                    payload_field: rule_cfg.payload_field.clone(),
+                    payload_match: rule_cfg.payload_match.clone(),
+                    max_body_bytes: rule_cfg.max_body_bytes.unwrap_or(65536),
+                    is_catch_all,
+                });
+            }
+        }
+
+        tracing::info!(rules = rules.len(), "Network SRR rules compiled from gvm.toml");
 
         Ok(Self {
             rules,

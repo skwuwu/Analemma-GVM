@@ -4,7 +4,6 @@ use crate::config::OnBlockConfig;
 use crate::ledger::Ledger;
 use crate::llm_trace;
 use crate::token_budget::TokenBudget;
-use crate::registry::OperationRegistry;
 use crate::srr::NetworkSRR;
 use crate::types::*;
 use crate::vault::Vault;
@@ -108,7 +107,6 @@ const CIRCUIT_BREAKER_RETRY_SECS: u64 = 30;
 #[derive(Clone)]
 pub struct AppState {
     pub srr: Arc<std::sync::RwLock<NetworkSRR>>,
-    pub registry: Arc<std::sync::RwLock<OperationRegistry>>,
     pub api_keys: Arc<APIKeyStore>,
     pub ledger: Arc<Ledger>,
     pub vault: Arc<Vault>,
@@ -138,8 +136,8 @@ pub struct AppState {
     pub shadow_config: crate::intent_store::ShadowConfig,
     /// SRR config file path (for hot-reload).
     pub srr_config_path: String,
-    /// Operation registry file path (for hot-reload).
-    pub registry_path: String,
+    /// Path to gvm.toml (for hot-reload). Empty if using legacy config.
+    pub gvm_toml_path: Option<String>,
     /// MITM CA certificate PEM (for sandbox trust store download via GET /gvm/ca.pem).
     /// None when TLS MITM is not active.
     pub mitm_ca_pem: Option<Arc<Vec<u8>>>,

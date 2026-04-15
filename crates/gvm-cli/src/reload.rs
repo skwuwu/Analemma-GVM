@@ -18,10 +18,8 @@ pub async fn run_reload(proxy_url: &str) -> Result<()> {
 
     if status.is_success() {
         let srr_count = body["srr_rules"].as_u64().unwrap_or(0);
-        let policy_count = body["policy_rules"].as_u64().unwrap_or(0);
         eprintln!("  {GREEN}\u{2713}{RESET} {BOLD}Rules reloaded{RESET}");
         eprintln!("    SRR rules:    {srr_count}");
-        eprintln!("    Policy rules: {policy_count}");
     } else {
         let error = body["error"].as_str().unwrap_or("unknown error");
         eprintln!("  {RED}\u{2717}{RESET} {BOLD}Reload failed{RESET}: {error}");
