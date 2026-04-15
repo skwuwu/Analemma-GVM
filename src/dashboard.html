@@ -9,113 +9,130 @@
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
   body { font-family: 'Inter', system-ui, sans-serif; }
-  .mono { font-family: 'JetBrains Mono', monospace; font-size: 0.8125rem; }
-  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; }
-  .dot-allow { background: #22c55e; }
-  .dot-delay { background: #eab308; }
-  .dot-deny { background: #ef4444; }
-  .deny-row { background: rgba(239, 68, 68, 0.05); border-left: 3px solid #ef4444; }
-  .delay-row { border-left: 3px solid #eab308; }
-  .allow-row { border-left: 3px solid #22c55e; }
+  .mono { font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; }
+
+  /* Decision row styles — Allow/Delay are subdued, only Deny pops */
+  .allow-row { border-left: 2px solid #16532d; opacity: 0.7; }
+  .allow-row:hover { opacity: 1; }
+  .delay-row { border-left: 2px solid #78650d; opacity: 0.85; }
+  .delay-row:hover { opacity: 1; }
+  .deny-row  { border-left: 3px solid #ef4444; background: rgba(239,68,68,0.06); }
+
+  .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; }
   .filter-btn { transition: all 0.15s; }
-  .filter-btn.active { border-color: currentColor; opacity: 1; }
-  .filter-btn:not(.active) { opacity: 0.4; }
-  #events-body tr { transition: background 0.12s; }
-  #events-body tr:hover { background: rgba(148, 163, 184, 0.05); }
+  .filter-btn.active { opacity: 1; }
+  .filter-btn:not(.active) { opacity: 0.35; }
+
+  #events-body tr { transition: background 0.12s, opacity 0.2s; }
+  #events-body tr:hover { opacity: 1 !important; background: rgba(148,163,184,0.04); }
+
+  /* Flash animation for blocked counter */
+  @keyframes flash-red { 0%{color:#ef4444;text-shadow:0 0 8px rgba(239,68,68,0.6)} 100%{color:#f87171;text-shadow:none} }
+  .flash-blocked { animation: flash-red 0.6s ease-out; }
+
+  /* New deny row entrance */
+  @keyframes slide-in { from{background:rgba(239,68,68,0.15)} to{background:rgba(239,68,68,0.06)} }
+  .deny-new { animation: slide-in 1s ease-out; }
 </style>
 <script>
 tailwind.config = { theme: { extend: { fontFamily: { mono: ['JetBrains Mono', 'monospace'] } } } }
 </script>
 </head>
 <body class="bg-slate-950 text-slate-300 min-h-screen">
-<div class="max-w-[1400px] mx-auto px-8 py-8 space-y-8">
+<div class="max-w-[1440px] mx-auto px-10 py-10 space-y-8">
 
   <!-- Header -->
   <div class="flex items-center justify-between">
     <div>
-      <h1 class="text-xl font-semibold text-slate-100 tracking-tight">Analemma GVM</h1>
-      <p class="text-xs text-slate-600 mt-0.5" id="subtitle">Connecting...</p>
+      <h1 class="text-lg font-semibold text-slate-100 tracking-tight">Analemma GVM</h1>
+      <p class="text-[11px] text-slate-600 mt-0.5" id="subtitle">Connecting...</p>
     </div>
     <div class="flex items-center gap-6">
       <div class="flex items-center gap-2">
-        <span class="dot dot-allow" id="live-dot"></span>
-        <span class="text-xs text-slate-500" id="stat-status">Live</span>
+        <span class="dot" style="background:#22c55e" id="live-dot"></span>
+        <span class="text-[11px] text-slate-500" id="stat-status">Live</span>
       </div>
-      <button onclick="exportSnapshot()" class="text-xs text-slate-600 hover:text-slate-400 underline underline-offset-4 decoration-slate-800 transition">Share</button>
+      <button onclick="exportSnapshot()" class="text-[11px] text-slate-600 hover:text-slate-400 underline underline-offset-4 decoration-slate-800 transition">Share</button>
     </div>
   </div>
 
-  <!-- Metric strip -->
-  <div class="grid grid-cols-4 gap-4">
-    <div class="bg-slate-900/50 border border-slate-800/50 rounded-lg px-5 py-4">
-      <div class="text-xs text-slate-600 mb-1">Total Requests</div>
-      <div class="text-2xl font-semibold text-slate-100 mono" id="m-total">0</div>
+  <!-- Metrics -->
+  <div class="grid grid-cols-4 gap-5">
+    <div class="bg-slate-900/40 border border-slate-800/40 rounded-lg px-5 py-4">
+      <div class="text-[10px] text-slate-600 uppercase tracking-wider mb-2">Requests</div>
+      <div class="text-xl font-semibold text-slate-200 mono" id="m-total">0</div>
     </div>
-    <div class="bg-slate-900/50 border border-slate-800/50 rounded-lg px-5 py-4">
-      <div class="text-xs text-slate-600 mb-1">Throughput</div>
-      <div class="text-2xl font-semibold text-slate-100 mono" id="m-rps">0.0 <span class="text-sm text-slate-500">req/s</span></div>
+    <div class="bg-slate-900/40 border border-slate-800/40 rounded-lg px-5 py-4">
+      <div class="text-[10px] text-slate-600 uppercase tracking-wider mb-2">Throughput</div>
+      <div class="text-xl font-semibold text-slate-200 mono" id="m-rps">0.0 <span class="text-xs text-slate-600">req/s</span></div>
     </div>
-    <div class="bg-slate-900/50 border border-slate-800/50 rounded-lg px-5 py-4">
-      <div class="text-xs text-slate-600 mb-1">Blocked</div>
-      <div class="text-2xl font-semibold text-red-400 mono" id="m-denied">0</div>
+    <div class="bg-slate-900/40 border border-red-900/30 rounded-lg px-5 py-4">
+      <div class="text-[10px] text-slate-600 uppercase tracking-wider mb-2">Blocked</div>
+      <div class="text-xl font-semibold text-red-400 mono" id="m-denied">0</div>
     </div>
-    <div class="bg-slate-900/50 border border-slate-800/50 rounded-lg px-5 py-4">
-      <div class="text-xs text-slate-600 mb-1">LLM Cost</div>
-      <div class="text-2xl font-semibold text-slate-100 mono" id="m-cost">$0.00</div>
+    <div class="bg-slate-900/40 border border-slate-800/40 rounded-lg px-5 py-4">
+      <div class="text-[10px] text-slate-600 uppercase tracking-wider mb-2">LLM Cost</div>
+      <div class="text-xl font-semibold text-slate-200 mono" id="m-cost">$0.00</div>
     </div>
   </div>
 
-  <!-- Charts row: Doughnut (large) + Host bars -->
+  <!-- Anomalies (promoted to top — most actionable info) -->
+  <div class="bg-red-950/20 border border-red-900/30 rounded-lg px-6 py-4" id="anomaly-section" style="display:none">
+    <div class="flex items-center gap-2 mb-2">
+      <span class="text-red-400 text-sm">&#9888;</span>
+      <span class="text-[10px] text-red-400/80 uppercase tracking-wider font-medium">Anomalies Detected</span>
+    </div>
+    <div id="anomaly-list" class="space-y-1"></div>
+  </div>
+
+  <!-- Charts: Doughnut + Hosts -->
   <div class="grid grid-cols-5 gap-6">
-    <!-- Doughnut: 2 cols -->
-    <div class="col-span-2 bg-slate-900/50 border border-slate-800/50 rounded-lg p-6">
-      <div class="text-xs text-slate-600 uppercase tracking-wider mb-4">Policy Decisions</div>
-      <div class="flex items-center justify-center">
-        <div class="relative" style="width:180px;height:180px">
+    <div class="col-span-2 bg-slate-900/40 border border-slate-800/40 rounded-lg px-6 py-6">
+      <div class="text-[10px] text-slate-600 uppercase tracking-wider mb-6">Policy Decisions</div>
+      <div class="flex items-center justify-center mb-6">
+        <div class="relative" style="width:160px;height:160px">
           <canvas id="decisionChart"></canvas>
           <div class="absolute inset-0 flex flex-col items-center justify-center">
-            <div class="text-3xl font-bold text-slate-100 mono" id="donut-total">0</div>
-            <div class="text-[10px] text-slate-600 uppercase tracking-wider">total</div>
+            <div class="text-lg font-semibold text-slate-300 mono" id="donut-total">0</div>
+            <div class="text-[9px] text-slate-700 uppercase tracking-widest">total</div>
           </div>
         </div>
       </div>
-      <div class="flex justify-center gap-6 mt-4 text-xs">
-        <div class="flex items-center gap-1.5"><span class="dot dot-allow"></span><span class="text-slate-400">Allow <span class="text-slate-100 font-medium" id="leg-allow">0</span></span></div>
-        <div class="flex items-center gap-1.5"><span class="dot dot-delay"></span><span class="text-slate-400">Delay <span class="text-slate-100 font-medium" id="leg-delay">0</span></span></div>
-        <div class="flex items-center gap-1.5"><span class="dot dot-deny"></span><span class="text-slate-400">Deny <span class="text-slate-100 font-medium" id="leg-deny">0</span></span></div>
+      <div class="flex justify-center gap-8 text-[11px]">
+        <div class="flex items-center gap-1.5"><span class="dot" style="background:#166534"></span><span class="text-slate-500">Allow <span class="text-slate-400" id="leg-allow">0</span></span></div>
+        <div class="flex items-center gap-1.5"><span class="dot" style="background:#a16207"></span><span class="text-slate-500">Delay <span class="text-slate-400" id="leg-delay">0</span></span></div>
+        <div class="flex items-center gap-1.5"><span class="dot" style="background:#ef4444"></span><span class="text-slate-500">Deny <span class="text-red-400 font-medium" id="leg-deny">0</span></span></div>
       </div>
     </div>
-
-    <!-- Hosts: 3 cols -->
-    <div class="col-span-3 bg-slate-900/50 border border-slate-800/50 rounded-lg p-6">
-      <div class="text-xs text-slate-600 uppercase tracking-wider mb-4">Top Hosts</div>
-      <div id="host-list" class="space-y-2.5"></div>
+    <div class="col-span-3 bg-slate-900/40 border border-slate-800/40 rounded-lg px-6 py-6">
+      <div class="text-[10px] text-slate-600 uppercase tracking-wider mb-5">Top Hosts</div>
+      <div id="host-list" class="space-y-3"></div>
     </div>
   </div>
 
   <!-- Live Events -->
-  <div class="bg-slate-900/50 border border-slate-800/50 rounded-lg p-6">
-    <div class="flex items-center justify-between mb-4">
-      <div class="text-xs text-slate-600 uppercase tracking-wider">Live Events</div>
-      <div class="flex items-center gap-2" id="filter-bar">
-        <button class="filter-btn active text-xs px-2.5 py-1 rounded border border-slate-700 text-slate-400" data-filter="all" onclick="setFilter('all')">All</button>
-        <button class="filter-btn active text-xs px-2.5 py-1 rounded border border-green-800 text-green-500" data-filter="Allow" onclick="setFilter('Allow')">Allow</button>
-        <button class="filter-btn active text-xs px-2.5 py-1 rounded border border-yellow-800 text-yellow-500" data-filter="Delay" onclick="setFilter('Delay')">Delay</button>
-        <button class="filter-btn active text-xs px-2.5 py-1 rounded border border-red-800 text-red-400" data-filter="Deny" onclick="setFilter('Deny')">Deny</button>
+  <div class="bg-slate-900/40 border border-slate-800/40 rounded-lg px-6 py-6">
+    <div class="flex items-center justify-between mb-5">
+      <div class="text-[10px] text-slate-600 uppercase tracking-wider">Live Events</div>
+      <div class="flex items-center gap-1.5" id="filter-bar">
+        <button class="filter-btn active text-[10px] px-2 py-0.5 rounded border border-slate-800 text-slate-500" data-filter="all" onclick="setFilter('all')">All</button>
+        <button class="filter-btn active text-[10px] px-2 py-0.5 rounded border border-green-900/50 text-green-700" data-filter="Allow" onclick="setFilter('Allow')">Allow</button>
+        <button class="filter-btn active text-[10px] px-2 py-0.5 rounded border border-yellow-900/50 text-yellow-700" data-filter="Delay" onclick="setFilter('Delay')">Delay</button>
+        <button class="filter-btn active text-[10px] px-2 py-0.5 rounded border border-red-900/50 text-red-400" data-filter="Deny" onclick="setFilter('Deny')">Deny</button>
       </div>
     </div>
-    <div class="overflow-y-auto max-h-[28rem]" id="events-container">
-      <table class="w-full">
+    <div class="overflow-y-auto max-h-[26rem]" id="events-container">
+      <table class="w-full table-fixed">
         <thead>
-          <tr class="text-[10px] text-slate-700 uppercase tracking-wider border-b border-slate-800/50">
-            <th class="text-left py-2 pl-3 w-20">Time</th>
-            <th class="text-left py-2 w-16">Method</th>
-            <th class="text-left py-2 w-44">Host</th>
+          <tr class="text-[9px] text-slate-700 uppercase tracking-wider border-b border-slate-800/30">
+            <th class="text-left py-2 pl-3 w-[70px]">Time</th>
+            <th class="text-left py-2 w-[56px]">Method</th>
+            <th class="text-left py-2 w-[200px]">Host</th>
             <th class="text-left py-2">Path</th>
-            <th class="text-left py-2 w-14">Status</th>
-            <th class="text-left py-2 w-20">Decision</th>
-            <th class="text-left py-2 w-32">Source</th>
-            <th class="text-left py-2 w-28">Resource</th>
+            <th class="text-left py-2 w-[44px]">St</th>
+            <th class="text-left py-2 w-[70px]">Decision</th>
+            <th class="text-left py-2 w-[180px]">Rule / Source</th>
+            <th class="text-left py-2 w-[100px]">Resource</th>
           </tr>
         </thead>
         <tbody id="events-body" class="mono"></tbody>
@@ -123,23 +140,17 @@ tailwind.config = { theme: { extend: { fontFamily: { mono: ['JetBrains Mono', 'm
     </div>
   </div>
 
-  <!-- Anomalies -->
-  <div class="bg-slate-900/50 border border-slate-800/50 rounded-lg p-6" id="anomaly-section" style="display:none">
-    <div class="text-xs text-slate-600 uppercase tracking-wider mb-3">Anomalies</div>
-    <div id="anomaly-list" class="space-y-1.5 text-sm"></div>
-  </div>
-
   <!-- Trace + Policy Tree -->
   <div class="grid grid-cols-5 gap-6" id="trace-section" style="display:none">
-    <div class="col-span-3 bg-slate-900/50 border border-slate-800/50 rounded-lg p-6">
-      <div class="flex items-center justify-between mb-3">
-        <div class="text-xs text-slate-600 uppercase tracking-wider">Trace <span class="mono text-slate-500" id="trace-id"></span></div>
-        <button class="text-xs text-slate-700 hover:text-slate-400" onclick="closeTrace()">close</button>
+    <div class="col-span-3 bg-slate-900/40 border border-slate-800/40 rounded-lg px-6 py-6">
+      <div class="flex items-center justify-between mb-4">
+        <div class="text-[10px] text-slate-600 uppercase tracking-wider">Trace <span class="mono text-slate-500" id="trace-id"></span></div>
+        <button class="text-[10px] text-slate-700 hover:text-slate-400 transition" onclick="closeTrace()">close</button>
       </div>
       <div id="trace-tree" class="mono text-xs space-y-2"></div>
     </div>
-    <div class="col-span-2 bg-slate-900/50 border border-slate-800/50 rounded-lg p-6">
-      <div class="text-xs text-slate-600 uppercase tracking-wider mb-3">Policy Tree</div>
+    <div class="col-span-2 bg-slate-900/40 border border-slate-800/40 rounded-lg px-6 py-6">
+      <div class="text-[10px] text-slate-600 uppercase tracking-wider mb-4">Policy Tree</div>
       <canvas id="policyTree" class="w-full" height="200"></canvas>
     </div>
   </div>
@@ -147,313 +158,205 @@ tailwind.config = { theme: { extend: { fontFamily: { mono: ['JetBrains Mono', 'm
 </div>
 
 <script>
-// ─── State ───
-let allEvents = [];
-let currentStats = {};
-let walOffset = 0;
-let seenIds = new Set();
-let decisionChart = null;
-let activeFilters = new Set(['Allow','Delay','Deny']);
-let perHostDecisions = {}; // host -> {allow:N, delay:N, deny:N}
+let allEvents=[], currentStats={}, walOffset=0, seenIds=new Set(), decisionChart=null;
+let activeFilters=new Set(['Allow','Delay','Deny']), perHostDecisions={}, prevDenyCount=0;
+const requestTimes=[], loopDetector={}, anomalies=[];
 
-// ─── Anomaly detection ───
-const requestTimes = [];
-const loopDetector = {};
-const anomalies = [];
-
-function detectAnomalies(event) {
-  const now = Date.now();
-  const method = event.transport?.method || '';
-  const host = event.transport?.host || '';
-  const path = event.transport?.path || '';
-  const decision = event.decision || '';
-
+function detectAnomalies(ev) {
+  const now=Date.now(), m=ev.transport?.method||'', h=ev.transport?.host||'', p=ev.transport?.path||'', d=ev.decision||'';
   requestTimes.push(now);
-  while (requestTimes.length > 0 && now - requestTimes[0] > 2000) requestTimes.shift();
-  if (requestTimes.length > 10) {
-    const msg = `Burst: ${requestTimes.length} requests in 2s`;
-    if (!anomalies.some(a => a.startsWith('Burst'))) anomalies.push(msg);
-  }
-
-  const key = `${method}:${host}:${path}`;
-  if (!loopDetector[key]) loopDetector[key] = [];
+  while(requestTimes.length&&now-requestTimes[0]>2000)requestTimes.shift();
+  if(requestTimes.length>10){const msg=`Burst: ${requestTimes.length} requests in 2s`;if(!anomalies.some(a=>a.startsWith('Burst')))anomalies.push(msg)}
+  const key=`${m}:${h}:${p}`;
+  if(!loopDetector[key])loopDetector[key]=[];
   loopDetector[key].push(now);
-  loopDetector[key] = loopDetector[key].filter(t => now - t < 10000);
-  if (loopDetector[key].length > 5) {
-    const msg = `Loop: ${method} ${host}${path} repeated ${loopDetector[key].length}x in 10s`;
-    const idx = anomalies.findIndex(a => a.includes(key));
-    if (idx >= 0) anomalies[idx] = msg; else anomalies.push(msg);
-  }
-
-  if (decision.includes('Deny')) {
-    const ct = allEvents.filter(e => (e.decision||'').includes('Deny')).length;
-    const msg = `${ct} request(s) denied by policy`;
-    const idx = anomalies.findIndex(a => a.includes('denied'));
-    if (idx >= 0) anomalies[idx] = msg; else anomalies.push(msg);
-  }
-
-  // Track per-host decisions
-  if (host) {
-    if (!perHostDecisions[host]) perHostDecisions[host] = {allow:0,delay:0,deny:0,total:0};
-    perHostDecisions[host].total++;
-    if (decision.includes('Allow')) perHostDecisions[host].allow++;
-    else if (decision.includes('Deny')) perHostDecisions[host].deny++;
-    else if (decision.includes('Delay')) perHostDecisions[host].delay++;
-  }
+  loopDetector[key]=loopDetector[key].filter(t=>now-t<10000);
+  if(loopDetector[key].length>5){const msg=`Loop: ${m} ${h}${p} repeated ${loopDetector[key].length}x in 10s`;const i=anomalies.findIndex(a=>a.includes(key));if(i>=0)anomalies[i]=msg;else anomalies.push(msg)}
+  if(d.includes('Deny')){const ct=allEvents.filter(e=>(e.decision||'').includes('Deny')).length;const msg=`${ct} request(s) blocked by policy`;const i=anomalies.findIndex(a=>a.includes('blocked by policy'));if(i>=0)anomalies[i]=msg;else anomalies.push(msg)}
+  if(h){if(!perHostDecisions[h])perHostDecisions[h]={allow:0,delay:0,deny:0,total:0};perHostDecisions[h].total++;if(d.includes('Allow'))perHostDecisions[h].allow++;else if(d.includes('Deny'))perHostDecisions[h].deny++;else if(d.includes('Delay'))perHostDecisions[h].delay++}
 }
 
-// ─── Human-readable deny ───
-function translateDeny(ev) {
-  const rule = ev.matched_rule_id || 'policy';
-  const host = ev.transport?.host || '';
-  const method = ev.transport?.method || '';
-  if (ev.operation === 'gvm.dns.query') return 'Blocked connection to suspicious unknown domain';
-  if ((ev.decision||'').includes('RequireApproval')) return `Agent attempted ${method} without human approval`;
-  if (rule.includes('destructive')) return `Blocked destructive operation on ${host}`;
-  return `Blocked by rule "${rule}"`;
+function translateDeny(ev){
+  const r=ev.matched_rule_id||'policy',h=ev.transport?.host||'',m=ev.transport?.method||'';
+  if(ev.operation==='gvm.dns.query')return'Blocked connection to suspicious unknown domain';
+  if((ev.decision||'').includes('RequireApproval'))return`Agent attempted ${m} without human approval`;
+  if(r.includes('destructive'))return`Blocked destructive operation on ${h}`;
+  return`Blocked by rule "${r}"`;
 }
 
-// ─── Filters ───
-function setFilter(f) {
-  if (f === 'all') {
-    const allActive = activeFilters.size === 3;
-    activeFilters = allActive ? new Set() : new Set(['Allow','Delay','Deny']);
+function setFilter(f){
+  if(f==='all'){
+    activeFilters=new Set(['Allow','Delay','Deny']);
   } else {
-    activeFilters.has(f) ? activeFilters.delete(f) : activeFilters.add(f);
+    // If clicking the only active filter, show all. Otherwise show only clicked.
+    if(activeFilters.size===1&&activeFilters.has(f)){
+      activeFilters=new Set(['Allow','Delay','Deny']);
+    } else {
+      activeFilters=new Set([f]);
+    }
   }
-  document.querySelectorAll('.filter-btn').forEach(btn => {
-    const df = btn.dataset.filter;
-    if (df === 'all') btn.classList.toggle('active', activeFilters.size === 3);
-    else btn.classList.toggle('active', activeFilters.has(df));
-  });
+  document.querySelectorAll('.filter-btn').forEach(b=>{const d=b.dataset.filter;if(d==='all')b.classList.toggle('active',activeFilters.size===3);else b.classList.toggle('active',activeFilters.has(d))});
   renderTimeline();
 }
 
-function decisionBucket(d) {
-  if (d.includes('Allow')) return 'Allow';
-  if (d.includes('Delay')) return 'Delay';
-  if (d.includes('Deny')) return 'Deny';
-  return 'Other';
-}
+function bucket(d){return d.includes('Allow')?'Allow':d.includes('Delay')?'Delay':d.includes('Deny')?'Deny':'Other'}
+function ts(t){return t?.length>=19?t.slice(11,19):(t||'')}
+function tr(s,n){return s&&s.length>n?s.slice(0,n-2)+'...':(s||'')}
 
-// ─── Rendering ───
-function timeShort(ts) { return ts?.length >= 19 ? ts.slice(11,19) : (ts||''); }
-function trunc(s, n) { return s && s.length > n ? s.slice(0,n-2)+'..' : (s||''); }
+function renderTimeline(){
+  const tb=document.getElementById('events-body');
+  const f=allEvents.filter(e=>activeFilters.has(bucket(e.decision||'')));
+  tb.innerHTML=f.slice(-300).reverse().map(ev=>{
+    const d=ev.decision||'',b=bucket(d);
+    // Subdued colors for Allow/Delay, vivid for Deny
+    const rc=b==='Deny'?'deny-row':b==='Delay'?'delay-row':'allow-row';
+    const dc=b==='Deny'?'text-red-400':b==='Delay'?'text-amber-700':'text-green-800';
+    const st=ev.transport?.status_code;
+    const sc=st>=400?'text-red-400':st>=300?'text-amber-700':'text-slate-700';
+    const src=ev.decision_source||'';
+    const rule=ev.matched_rule_id;
+    const caut=ev.default_caution;
+    const si=rule?`${src}: ${tr(rule,22)}`:caut?`${src} (default-caution)`:src;
+    const tier=ev.resource?.tier||'';
+    const sens=ev.resource?.sensitivity||'';
+    const res=[tier,sens].filter(Boolean).join(' / ');
 
-function renderTimeline() {
-  const tbody = document.getElementById('events-body');
-  const filtered = allEvents.filter(ev => {
-    const b = decisionBucket(ev.decision||'');
-    return activeFilters.has(b);
-  });
-  const recent = filtered.slice(-300).reverse();
-
-  tbody.innerHTML = recent.map(ev => {
-    const d = ev.decision || '';
-    const bucket = decisionBucket(d);
-    const rowClass = bucket === 'Deny' ? 'deny-row' : bucket === 'Delay' ? 'delay-row' : 'allow-row';
-    const dotClass = bucket === 'Deny' ? 'dot-deny' : bucket === 'Delay' ? 'dot-delay' : 'dot-allow';
-    const decColor = bucket === 'Deny' ? 'text-red-400' : bucket === 'Delay' ? 'text-yellow-500' : 'text-green-500';
-    const st = ev.transport?.status_code;
-    const stColor = st >= 400 ? 'text-red-400' : st >= 300 ? 'text-yellow-500' : 'text-slate-500';
-    const source = ev.decision_source || '';
-    const ep = ev.enforcement_point || '';
-    const tier = ev.resource?.tier || '';
-    const sens = ev.resource?.sensitivity || '';
-    const resource = [tier, sens].filter(Boolean).join(' / ');
-    const rule = ev.matched_rule_id;
-    const caution = ev.default_caution;
-    const sourceInfo = rule ? `${source}: ${trunc(rule,20)}` : caution ? `${source} (default-caution)` : source;
-
-    let row = `<tr class="${rowClass} cursor-pointer" onclick="showTrace('${ev.trace_id||''}')">
-      <td class="py-2 pl-3 text-slate-600">${timeShort(ev.timestamp)}</td>
-      <td class="py-2 text-slate-300">${ev.transport?.method||''}</td>
-      <td class="py-2 text-slate-400">${trunc(ev.transport?.host,30)}</td>
-      <td class="py-2 text-slate-600">${trunc(ev.transport?.path,35)}</td>
-      <td class="py-2 ${stColor}">${st||''}</td>
-      <td class="py-2"><span class="dot ${dotClass} mr-1"></span><span class="${decColor}">${bucket}</span></td>
-      <td class="py-2 text-slate-600">${trunc(sourceInfo,28)}</td>
-      <td class="py-2 text-slate-700">${resource}</td>
+    let row=`<tr class="${rc} cursor-pointer" onclick="showTrace('${ev.trace_id||''}')">
+      <td class="py-2.5 pl-3 text-slate-700">${ts(ev.timestamp)}</td>
+      <td class="py-2.5 font-medium text-slate-400">${ev.transport?.method||''}</td>
+      <td class="py-2.5 font-medium text-slate-300 truncate">${tr(ev.transport?.host,28)}</td>
+      <td class="py-2.5 text-slate-600 truncate">${tr(ev.transport?.path,40)}</td>
+      <td class="py-2.5 ${sc}">${st||''}</td>
+      <td class="py-2.5"><span class="dot mr-1" style="background:${b==='Deny'?'#ef4444':b==='Delay'?'#a16207':'#166534'}"></span><span class="${dc}">${b}</span></td>
+      <td class="py-2.5 text-slate-700 truncate">${tr(si,30)}</td>
+      <td class="py-2.5 text-slate-800">${res}</td>
     </tr>`;
-
-    if (bucket === 'Deny') {
-      row += `<tr class="deny-row"><td colspan="8" class="py-1.5 pl-8 text-red-400/70 text-xs italic">${translateDeny(ev)}</td></tr>`;
-    }
+    if(b==='Deny')row+=`<tr class="deny-row deny-new"><td colspan="8" class="py-1.5 pl-10 text-red-400/60 text-[11px] italic">${translateDeny(ev)}</td></tr>`;
     return row;
   }).join('');
 }
 
-function renderStats(stats) {
-  if (!stats) return;
-  currentStats = stats;
-  const up = stats.uptime_secs || 0;
-  const rps = up > 0 ? (stats.total_requests / up).toFixed(1) : '0.0';
-  const dec = stats.decisions || {};
-  const allow = dec.Allow||0, delay = dec.Delay||0, deny = dec.Deny||0;
-  const total = allow + delay + deny;
+function renderStats(s){
+  if(!s)return;currentStats=s;
+  const up=s.uptime_secs||0,rps=up>0?(s.total_requests/up).toFixed(1):'0.0';
+  const dec=s.decisions||{},al=dec.Allow||0,dl=dec.Delay||0,dn=dec.Deny||0,tot=al+dl+dn;
 
-  document.getElementById('m-total').textContent = total;
-  document.getElementById('m-rps').innerHTML = `${rps} <span class="text-sm text-slate-500">req/s</span>`;
-  document.getElementById('m-denied').textContent = deny;
-  document.getElementById('m-cost').textContent = `$${(stats.llm?.estimated_cost_usd||0).toFixed(2)}`;
-  document.getElementById('subtitle').textContent = `Uptime ${formatDur(up)}`;
+  document.getElementById('m-total').textContent=tot;
+  document.getElementById('m-rps').innerHTML=`${rps} <span class="text-xs text-slate-600">req/s</span>`;
+  document.getElementById('m-cost').textContent=`$${(s.llm?.estimated_cost_usd||0).toFixed(4)}`;
+  document.getElementById('subtitle').textContent=`Uptime ${fmtDur(up)}`;
 
-  // Doughnut
-  document.getElementById('donut-total').textContent = total;
-  document.getElementById('leg-allow').textContent = allow;
-  document.getElementById('leg-delay').textContent = delay;
-  document.getElementById('leg-deny').textContent = deny;
-  if (decisionChart) {
-    decisionChart.data.datasets[0].data = [allow, delay, deny];
-    decisionChart.update('none');
-  }
+  // Blocked counter flash
+  const el=document.getElementById('m-denied');
+  if(dn>prevDenyCount&&prevDenyCount>0){el.classList.remove('flash-blocked');void el.offsetWidth;el.classList.add('flash-blocked')}
+  el.textContent=dn;prevDenyCount=dn;
 
-  // Host bars — color by decision profile
-  const hosts = Object.entries(perHostDecisions).sort((a,b) => b[1].total - a[1].total).slice(0,8);
-  const maxC = hosts[0]?.[1].total || 1;
-  document.getElementById('host-list').innerHTML = hosts.map(([h, d]) => {
-    const pct = (d.total / maxC * 100).toFixed(0);
-    // Color: red if any deny, yellow if delays > 50%, green otherwise
-    let barColor = 'bg-green-500/60';
-    let textColor = 'text-slate-400';
-    if (d.deny > 0) { barColor = 'bg-red-500/60'; textColor = 'text-red-400'; }
-    else if (d.delay > d.allow) { barColor = 'bg-yellow-500/40'; textColor = 'text-yellow-500'; }
+  // Doughnut — muted green/amber, vivid red
+  document.getElementById('donut-total').textContent=tot;
+  document.getElementById('leg-allow').textContent=al;
+  document.getElementById('leg-delay').textContent=dl;
+  document.getElementById('leg-deny').textContent=dn;
+  if(decisionChart){decisionChart.data.datasets[0].data=[al,dl,dn];decisionChart.update('none')}
 
-    return `<div class="flex items-center gap-3">
-      <span class="${textColor} w-52 truncate text-xs">${h}</span>
-      <div class="flex-1 bg-slate-800/50 rounded-full h-1.5 overflow-hidden"><div class="${barColor} rounded-full h-1.5 transition-all" style="width:${pct}%"></div></div>
-      <span class="text-slate-600 w-8 text-right text-xs">${d.total}</span>
-      ${d.deny > 0 ? `<span class="text-red-400/60 text-[10px]">${d.deny} blocked</span>` : ''}
-    </div>`;
+  // Host bars
+  const hosts=Object.entries(perHostDecisions).sort((a,b)=>b[1].total-a[1].total).slice(0,8);
+  const mx=hosts[0]?.[1].total||1;
+  document.getElementById('host-list').innerHTML=hosts.map(([h,d])=>{
+    const pct=(d.total/mx*100).toFixed(0);
+    let bc='bg-green-900/40',tc='text-slate-500';
+    if(d.deny>0){bc='bg-red-500/30';tc='text-red-400'}
+    else if(d.delay>d.allow){bc='bg-amber-900/30';tc='text-amber-600'}
+    return`<div class="flex items-center gap-3"><span class="${tc} w-52 truncate text-[11px] font-medium">${h}</span><div class="flex-1 bg-slate-800/30 rounded-full h-1.5 overflow-hidden"><div class="${bc} rounded-full h-1.5 transition-all" style="width:${pct}%"></div></div><span class="text-slate-700 w-8 text-right text-[11px]">${d.total}</span>${d.deny>0?`<span class="text-red-400/50 text-[9px]">${d.deny} blocked</span>`:''}</div>`;
   }).join('');
 }
 
-function renderAnomalies() {
-  const sec = document.getElementById('anomaly-section');
-  if (!anomalies.length) { sec.style.display = 'none'; return; }
-  sec.style.display = '';
-  document.getElementById('anomaly-list').innerHTML = anomalies.map(a =>
-    `<div class="${a.includes('denied') ? 'text-red-400' : 'text-yellow-500'} text-xs">${a}</div>`
+function renderAnomalies(){
+  const sec=document.getElementById('anomaly-section');
+  if(!anomalies.length){sec.style.display='none';return}
+  sec.style.display='';
+  document.getElementById('anomaly-list').innerHTML=anomalies.map(a=>
+    `<div class="text-[11px] ${a.includes('blocked')?'text-red-400':'text-amber-500/80'}">${a}</div>`
   ).join('');
 }
 
 // ─── Trace ───
-function showTrace(traceId) {
-  if (!traceId) return;
-  document.getElementById('trace-section').style.display = '';
-  document.getElementById('trace-id').textContent = traceId.slice(0,16) + '...';
-  const evs = allEvents.filter(e => e.trace_id === traceId);
-  document.getElementById('trace-tree').innerHTML = evs.map((ev, i) => {
-    const last = i === evs.length - 1;
-    const pfx = last ? '\u2514' : '\u251c';
-    const d = ev.decision || '';
-    const bucket = decisionBucket(d);
-    const color = bucket === 'Deny' ? 'text-red-400' : bucket === 'Delay' ? 'text-yellow-500' : 'text-green-500';
-    const rule = ev.matched_rule_id || '(none)';
-    const hash = ev.event_hash ? ev.event_hash.slice(0,12) + '...' : '';
-    const batch = ev.batch_id != null ? `Batch #${ev.batch_id}` : '';
-    const ep = ev.enforcement_point || '';
-    const sens = ev.resource?.sensitivity || '';
-    const denyNote = bucket === 'Deny' ? `<div class="pl-5 text-red-400/60 italic">${translateDeny(ev)}</div>` : '';
-
-    return `<div class="py-1 ${bucket === 'Deny' ? 'bg-red-500/5 rounded' : ''}">
-      <span class="text-slate-700">${pfx}</span>
-      <span class="${color}">${ev.transport?.method||''} ${ev.transport?.host||''} ${trunc(ev.transport?.path,30)}</span>
-      <span class="text-slate-700 ml-1">\u2192 ${bucket}</span>
-      <div class="pl-5 text-slate-700">Rule: ${rule} (${ev.decision_source||''}) | Point: ${ep} | ${sens}</div>
-      ${hash ? `<div class="pl-5 text-slate-800">Hash: ${hash}  ${batch}</div>` : ''}
-      ${denyNote}
+function showTrace(tid){
+  if(!tid)return;
+  document.getElementById('trace-section').style.display='';
+  document.getElementById('trace-id').textContent=tid.slice(0,16)+'...';
+  const evs=allEvents.filter(e=>e.trace_id===tid);
+  document.getElementById('trace-tree').innerHTML=evs.map((ev,i)=>{
+    const last=i===evs.length-1,pfx=last?'\u2514':'\u251c',d=ev.decision||'',b=bucket(d);
+    const c=b==='Deny'?'text-red-400':b==='Delay'?'text-amber-600':'text-green-700';
+    const rule=ev.matched_rule_id||'(none)',hash=ev.event_hash?ev.event_hash.slice(0,12)+'...':'';
+    const batch=ev.batch_id!=null?`Batch #${ev.batch_id}`:'';
+    const ep=ev.enforcement_point||'',sens=ev.resource?.sensitivity||'';
+    const dn=b==='Deny'?`<div class="pl-6 text-red-400/50 italic text-[10px]">${translateDeny(ev)}</div>`:'';
+    const llm=ev.llm_trace?`<div class="pl-6 text-slate-700 text-[10px]">LLM: ${ev.llm_trace.provider||''} ${ev.llm_trace.model||''} | ${ev.llm_trace.usage?.total_tokens||0} tokens</div>`:'';
+    return`<div class="py-1.5 ${b==='Deny'?'bg-red-500/5 rounded':''}">
+      <span class="text-slate-800">${pfx}</span>
+      <span class="font-medium ${c}">${ev.transport?.method||''} ${ev.transport?.host||''}</span>
+      <span class="text-slate-600 ml-1">${tr(ev.transport?.path,30)}</span>
+      <span class="text-slate-700 ml-2">\u2192 ${b}</span>
+      <div class="pl-6 text-slate-700 text-[10px]">Rule: ${rule} (${ev.decision_source||''}) | Point: ${ep} | ${sens}</div>
+      ${hash?`<div class="pl-6 text-slate-800 text-[10px]">Hash: ${hash}  ${batch}</div>`:''}${llm}${dn}
     </div>`;
   }).join('');
   renderPolicyTree(evs);
 }
+function closeTrace(){document.getElementById('trace-section').style.display='none'}
 
-function closeTrace() { document.getElementById('trace-section').style.display = 'none'; }
-
-// ─── Policy Tree (Canvas) ───
-function renderPolicyTree(evs) {
-  const canvas = document.getElementById('policyTree');
-  const dpr = window.devicePixelRatio || 1;
-  const w = canvas.offsetWidth; const h = 200;
-  canvas.width = w * dpr; canvas.height = h * dpr;
-  const ctx = canvas.getContext('2d');
-  ctx.scale(dpr, dpr);
-  ctx.clearRect(0,0,w,h);
-
-  const hasDeny = evs.some(e => (e.decision||'').includes('Deny'));
-  const sources = [...new Set(evs.map(e => e.decision_source || 'SRR'))];
-  const rules = evs.map(e => ({ rule: e.matched_rule_id||'(default)', deny: (e.decision||'').includes('Deny'), src: e.decision_source||'SRR' }));
-  const R = 5;
-  const levels = [
-    [{x:w/2, y:20, label:'Policy', deny:hasDeny}],
-    sources.map((s,i) => ({x:w/(sources.length+1)*(i+1), y:70, label:s, deny:rules.some(r=>r.src===s&&r.deny)})),
-    rules.map((r,i) => ({x:w/(rules.length+1)*(i+1), y:130, label:r.rule, deny:r.deny}))
+function renderPolicyTree(evs){
+  const c=document.getElementById('policyTree'),dpr=window.devicePixelRatio||1;
+  const w=c.offsetWidth,h=200;c.width=w*dpr;c.height=h*dpr;
+  const x=c.getContext('2d');x.scale(dpr,dpr);x.clearRect(0,0,w,h);
+  const hasDeny=evs.some(e=>(e.decision||'').includes('Deny'));
+  const srcs=[...new Set(evs.map(e=>e.decision_source||'SRR'))];
+  const rules=evs.map(e=>({rule:e.matched_rule_id||'(default)',deny:(e.decision||'').includes('Deny'),src:e.decision_source||'SRR'}));
+  const R=5,lvls=[
+    [{x:w/2,y:22,label:'Policy',deny:hasDeny}],
+    srcs.map((s,i)=>({x:w/(srcs.length+1)*(i+1),y:75,label:s,deny:rules.some(r=>r.src===s&&r.deny)})),
+    rules.map((r,i)=>({x:w/(rules.length+1)*(i+1),y:135,label:r.rule,deny:r.deny}))
   ];
-
-  // edges
-  for (let l=0; l<levels.length-1; l++) {
-    for (const p of levels[l]) for (const c of levels[l+1]) {
-      const isDeny = p.deny && c.deny;
-      ctx.beginPath(); ctx.moveTo(p.x, p.y+R); ctx.lineTo(c.x, c.y-R);
-      ctx.strokeStyle = isDeny ? '#ef4444' : '#1e293b'; ctx.lineWidth = isDeny ? 2 : 0.5; ctx.stroke();
-    }
+  for(let l=0;l<lvls.length-1;l++)for(const p of lvls[l])for(const c of lvls[l+1]){
+    const dn=p.deny&&c.deny;x.beginPath();x.moveTo(p.x,p.y+R);x.lineTo(c.x,c.y-R);
+    x.strokeStyle=dn?'#ef4444':'#0f172a';x.lineWidth=dn?2.5:0.5;x.stroke();
   }
-  // nodes + labels
-  for (const level of levels) for (const n of level) {
-    ctx.beginPath(); ctx.arc(n.x, n.y, R, 0, Math.PI*2);
-    ctx.fillStyle = n.deny ? '#ef4444' : '#334155'; ctx.fill();
-    ctx.fillStyle = n.deny ? '#fca5a5' : '#64748b';
-    ctx.font = '10px Inter, sans-serif'; ctx.textAlign = 'center';
-    ctx.fillText(trunc(n.label,16), n.x, n.y + R + 13);
+  for(const lv of lvls)for(const n of lv){
+    x.beginPath();x.arc(n.x,n.y,R,0,Math.PI*2);
+    x.fillStyle=n.deny?'#ef4444':'#1e293b';x.fill();
+    x.fillStyle=n.deny?'#fca5a5':'#475569';
+    x.font='10px Inter,sans-serif';x.textAlign='center';
+    x.fillText(tr(n.label,16),n.x,n.y+R+14);
   }
 }
 
-// ─── Share ───
-function exportSnapshot() {
-  const snap = { events: allEvents.slice(-500), stats: currentStats, anomalies, perHostDecisions, at: new Date().toISOString() };
-  const html = document.documentElement.outerHTML.replace(
-    /\/\/ ─── Init[\s\S]*$/,
-    `// Snapshot\nconst S=${JSON.stringify(snap)};allEvents=S.events;currentStats=S.stats;anomalies.push(...(S.anomalies||[]));perHostDecisions=S.perHostDecisions||{};document.getElementById('stat-status').textContent='Snapshot '+S.at.slice(0,19);document.getElementById('live-dot').style.background='#475569';initChart();renderStats(S.stats);renderTimeline();renderAnomalies();<\/script>`
-  );
-  const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([html],{type:'text/html'}));
-  a.download='gvm-snapshot-'+new Date().toISOString().slice(0,16).replace(':','-')+'.html'; a.click();
+function exportSnapshot(){
+  const snap={events:allEvents.slice(-500),stats:currentStats,anomalies,perHostDecisions,at:new Date().toISOString()};
+  const html=document.documentElement.outerHTML.replace(/\/\/ ─── Init[\s\S]*$/,
+    `// Snapshot\nconst S=${JSON.stringify(snap)};allEvents=S.events;currentStats=S.stats;anomalies.push(...(S.anomalies||[]));perHostDecisions=S.perHostDecisions||{};document.getElementById('stat-status').textContent='Snapshot '+S.at.slice(0,19);document.getElementById('live-dot').style.background='#475569';initChart();renderStats(S.stats);renderTimeline();renderAnomalies();<\/script>`);
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([html],{type:'text/html'}));
+  a.download='gvm-snapshot-'+new Date().toISOString().slice(0,16).replace(':','-')+'.html';a.click();
 }
 
-function formatDur(s) {
-  if (s<60) return Math.floor(s)+'s';
-  if (s<3600) return Math.floor(s/60)+'m '+Math.floor(s%60)+'s';
-  return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';
-}
+function fmtDur(s){if(s<60)return Math.floor(s)+'s';if(s<3600)return Math.floor(s/60)+'m '+Math.floor(s%60)+'s';return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'}
 
-function initChart() {
-  decisionChart = new Chart(document.getElementById('decisionChart').getContext('2d'), {
-    type: 'doughnut',
-    data: { labels:['Allow','Delay','Deny'], datasets:[{data:[0,0,0], backgroundColor:['#22c55e','#eab308','#ef4444'], borderWidth:0, hoverOffset:4}] },
-    options: { responsive:true, maintainAspectRatio:true, cutout:'72%', plugins:{legend:{display:false}, tooltip:{enabled:true}} }
+function initChart(){
+  decisionChart=new Chart(document.getElementById('decisionChart').getContext('2d'),{
+    type:'doughnut',
+    data:{labels:['Allow','Delay','Deny'],datasets:[{data:[0,0,0],backgroundColor:['#166534','#a16207','#ef4444'],borderWidth:0,hoverOffset:4}]},
+    options:{responsive:true,maintainAspectRatio:true,cutout:'72%',plugins:{legend:{display:false},tooltip:{enabled:true}}}
   });
 }
 
-// ─── Polling ───
-async function poll() {
-  try {
-    const [eR, sR] = await Promise.all([
-      fetch(`/gvm/dashboard/events?since_offset=${walOffset}&limit=200`),
-      fetch('/gvm/dashboard/stats')
-    ]);
-    const eD = await eR.json(), sD = await sR.json();
-    for (const ev of (eD.events||[])) {
-      if (ev.event_id && !seenIds.has(ev.event_id)) {
-        seenIds.add(ev.event_id);
-        allEvents.push(ev);
-        detectAnomalies(ev);
-      }
-    }
-    walOffset = eD.next_offset || walOffset;
-    renderStats(sD); renderTimeline(); renderAnomalies();
-  } catch(e) {
-    document.getElementById('stat-status').textContent = 'Disconnected';
-    document.getElementById('live-dot').style.background = '#475569';
-  }
+async function poll(){
+  try{
+    const[eR,sR]=await Promise.all([fetch(`/gvm/dashboard/events?since_offset=${walOffset}&limit=200`),fetch('/gvm/dashboard/stats')]);
+    const eD=await eR.json(),sD=await sR.json();
+    for(const ev of(eD.events||[])){if(ev.event_id&&!seenIds.has(ev.event_id)){seenIds.add(ev.event_id);allEvents.push(ev);detectAnomalies(ev)}}
+    walOffset=eD.next_offset||walOffset;
+    renderStats(sD);renderTimeline();renderAnomalies();
+  }catch(e){document.getElementById('stat-status').textContent='Disconnected';document.getElementById('live-dot').style.background='#475569'}
 }
 
 // ─── Init ───
