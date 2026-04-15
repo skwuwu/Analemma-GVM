@@ -621,3 +621,239 @@ async fn merkle_all_event_hashes_unique() {
         "all event hashes must be unique"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GVM Integrity Context (GIC) Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Verify that record_config_load embeds a GvmIntegrityContext in the WAL
+/// with correct config_hash and config_integrity_ref.
+#[tokio::test]
+async fn integrity_context_recorded_on_config_load() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let wal_path = dir.path().join("wal.log");
+
+    let config_path = dir.path().join("gvm.toml");
+    let config_content = b"[[rules]]\npattern = \"api.example.com\"\nmethod = \"GET\"\n";
+    std::fs::write(&config_path, config_content).expect("write config");
+
+    let expected_hash = {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(format!("{:x}", Sha256::digest(config_content)).as_bytes()))
+    };
+
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "").await.expect("ledger init"),
+    );
+
+    let config_files: Vec<(&str, &std::path::Path)> = vec![
+        ("gvm_toml", config_path.as_path()),
+    ];
+    let context_hash = ledger
+        .record_config_load(&config_files, None)
+        .await
+        .expect("record_config_load must succeed");
+
+    // context_hash should be non-empty
+    assert!(!context_hash.is_empty(), "context_hash must be non-empty");
+
+    // Read WAL and find the config_load event
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let wal = tokio::fs::read_to_string(&wal_path).await.expect("read WAL");
+    let events: Vec<serde_json::Value> = wal
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .filter(|v: &serde_json::Value| {
+            v.get("operation").and_then(|o| o.as_str()) == Some("gvm.system.config_load")
+        })
+        .collect();
+
+    assert_eq!(events.len(), 1, "exactly one config_load event expected");
+
+    let event = &events[0];
+
+    // config_integrity_ref should match returned hash
+    let ref_hash = event
+        .get("config_integrity_ref")
+        .and_then(|v| v.as_str())
+        .expect("config_integrity_ref must be present");
+    assert_eq!(ref_hash, context_hash);
+
+    // _integrity_context should be embedded in context
+    let ic = event
+        .pointer("/context/_integrity_context")
+        .expect("_integrity_context must be in context");
+
+    assert_eq!(
+        ic.get("spec_version").and_then(|v| v.as_u64()),
+        Some(1),
+        "spec_version must be 1"
+    );
+    assert_eq!(
+        ic.get("trust_model").and_then(|v| v.as_str()),
+        Some("Local"),
+        "trust_model must be Local"
+    );
+    assert_eq!(
+        ic.get("origin_id").and_then(|v| v.as_str()),
+        Some("local-default"),
+        "origin_id must be local-default"
+    );
+    assert_eq!(
+        ic.get("algorithm").and_then(|v| v.as_str()),
+        Some("None"),
+        "algorithm must be None for local mode"
+    );
+
+    // config_hash must be present and non-empty
+    let config_hash = ic
+        .get("config_hash")
+        .and_then(|v| v.as_str())
+        .expect("config_hash must be present");
+    assert!(!config_hash.is_empty());
+    assert_eq!(config_hash, expected_hash, "config_hash must match SHA-256 of file content hash");
+
+    // previous_state should be null (first load)
+    assert!(
+        ic.get("previous_state").is_none()
+            || ic.get("previous_state").unwrap().is_null(),
+        "previous_state must be None for first config load"
+    );
+
+    // timestamp must be recent (within 60 seconds)
+    let ts = ic.get("timestamp").and_then(|v| v.as_u64()).expect("timestamp must be present");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(now - ts < 60, "timestamp must be recent");
+}
+
+/// Verify that chain integrity checker detects unbroken chain.
+#[tokio::test]
+async fn chain_integrity_valid_on_single_load() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let wal_path = dir.path().join("wal.log");
+
+    let config_path = dir.path().join("test.toml");
+    std::fs::write(&config_path, b"test = true").expect("write");
+
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "").await.expect("ledger init"),
+    );
+
+    let config_files: Vec<(&str, &std::path::Path)> = vec![
+        ("test", config_path.as_path()),
+    ];
+    ledger.record_config_load(&config_files, None).await.expect("record");
+
+    // Flush
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(ledger);
+
+    let (valid, broken) = Ledger::check_chain_integrity(&wal_path);
+    assert_eq!(valid, 1, "single config_load should be 1 valid link");
+    assert!(broken.is_none(), "no chain break on single load");
+}
+
+/// Verify that GvmIntegrityContext::context_hash is deterministic.
+#[test]
+fn integrity_context_hash_is_deterministic() {
+    let ctx1 = gvm_types::GvmIntegrityContext {
+        spec_version: 1,
+        trust_model: gvm_types::TrustModel::Local,
+        origin_id: "test".to_string(),
+        algorithm: gvm_types::Algorithm::None,
+        config_hash: "abc123".to_string(),
+        signature: Vec::new(),
+        timestamp: 1000000,
+        previous_state: None,
+        checkpoint_id: None,
+        opaque_extensions: std::collections::BTreeMap::new(),
+    };
+
+    let ctx2 = gvm_types::GvmIntegrityContext {
+        spec_version: 1,
+        trust_model: gvm_types::TrustModel::Local,
+        origin_id: "test".to_string(),
+        algorithm: gvm_types::Algorithm::None,
+        config_hash: "abc123".to_string(),
+        signature: Vec::new(),
+        timestamp: 1000000,
+        previous_state: None,
+        checkpoint_id: None,
+        opaque_extensions: std::collections::BTreeMap::new(),
+    };
+
+    assert_eq!(ctx1.context_hash(), ctx2.context_hash(), "same inputs must produce same hash");
+
+    // Different config_hash → different context_hash
+    let ctx3 = gvm_types::GvmIntegrityContext {
+        config_hash: "def456".to_string(),
+        ..ctx1.clone()
+    };
+    assert_ne!(ctx1.context_hash(), ctx3.context_hash(), "different config must produce different hash");
+}
+
+/// Verify that opaque_extensions serializes and deserializes correctly.
+#[test]
+fn opaque_extensions_round_trip() {
+    let mut ctx = gvm_types::GvmIntegrityContext::local("hash123".to_string(), None);
+    ctx.opaque_extensions.insert("tpm_quote".to_string(), vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    ctx.opaque_extensions.insert("sgx_report".to_string(), vec![1, 2, 3, 4, 5]);
+
+    let json = serde_json::to_string(&ctx).expect("serialize");
+    let restored: gvm_types::GvmIntegrityContext =
+        serde_json::from_str(&json).expect("deserialize");
+
+    assert_eq!(restored.opaque_extensions.len(), 2);
+    assert_eq!(
+        restored.opaque_extensions.get("tpm_quote"),
+        Some(&vec![0xDE, 0xAD, 0xBE, 0xEF])
+    );
+    assert_eq!(
+        restored.opaque_extensions.get("sgx_report"),
+        Some(&vec![1, 2, 3, 4, 5])
+    );
+}
+
+/// Verify chain break detection when WAL is manually tampered with.
+#[tokio::test]
+async fn chain_integrity_detects_tampered_wal() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let wal_path = dir.path().join("wal.log");
+
+    let config_path = dir.path().join("test.toml");
+    std::fs::write(&config_path, b"version = 1").expect("write");
+
+    let ledger = Arc::new(
+        Ledger::new(&wal_path, "", "").await.expect("ledger init"),
+    );
+
+    // First load
+    let config_files: Vec<(&str, &std::path::Path)> = vec![
+        ("test", config_path.as_path()),
+    ];
+    let _first_hash = ledger.record_config_load(&config_files, None).await.expect("first load");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Second load with correct chain
+    std::fs::write(&config_path, b"version = 2").expect("write v2");
+    // We need to get the config_hash from the first context to chain properly
+    // For this test, we'll use the context_hash as prev (which is wrong — should be config_hash)
+    // This simulates an incorrect chain
+    let _second_hash = ledger
+        .record_config_load(&config_files, Some("WRONG_HASH_TAMPERED".to_string()))
+        .await
+        .expect("second load");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    drop(ledger);
+
+    let (valid, broken) = Ledger::check_chain_integrity(&wal_path);
+    // First load is valid (no previous), second has wrong previous_state
+    // But check_chain_integrity compares previous_state with the PRIOR event's config_hash
+    // "WRONG_HASH_TAMPERED" won't match the first event's config_hash → break
+    assert!(broken.is_some(), "tampered chain must be detected");
+    assert!(valid >= 1, "at least the first link should be valid");
+}
