@@ -15,8 +15,8 @@ mod run;
 mod stats;
 mod status;
 mod suggest;
-mod ui;
 mod tui;
+mod ui;
 mod watch;
 
 #[derive(Parser)]

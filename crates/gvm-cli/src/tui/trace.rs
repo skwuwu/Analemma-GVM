@@ -27,5 +27,4 @@ impl TraceIndex {
     pub(crate) fn get(&self, trace_id: &str) -> Option<&[usize]> {
         self.traces.get(trace_id).map(|v| v.as_slice())
     }
-
 }

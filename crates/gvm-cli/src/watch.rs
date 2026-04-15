@@ -22,7 +22,10 @@ impl OutputMode {
             "text" => Ok(Self::Text),
             "json" => Ok(Self::Json),
             "tui" => Ok(Self::Tui),
-            _ => anyhow::bail!("Unknown output format '{}'. Use 'text', 'json', or 'tui'.", s),
+            _ => anyhow::bail!(
+                "Unknown output format '{}'. Use 'text', 'json', or 'tui'.",
+                s
+            ),
         }
     }
 }
@@ -973,10 +976,11 @@ pub async fn run_watch(
             result
         });
 
-        let tui_state = crate::tui::run_tui(agent_id, wal_path, wal_start_len, agent_done_rx).await?;
+        let tui_state =
+            crate::tui::run_tui(agent_id, wal_path, wal_start_len, agent_done_rx).await?;
 
         watchdog_handle.abort();
-        let _ = agent_notify.abort();
+        agent_notify.abort();
 
         // Restore SRR before printing summary
         if !with_rules {

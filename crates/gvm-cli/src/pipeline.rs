@@ -195,10 +195,7 @@ async fn launch_sandbox(config: &AgentConfig, pre: &PreLaunchState) -> Result<i3
                     // Extract filename and remap to /workspace/
                     let resolved = run::resolve_script(arg).ok();
                     if let Some(ref abs) = resolved {
-                        let name = abs
-                            .file_name()
-                            .and_then(|f| f.to_str())
-                            .unwrap_or(arg);
+                        let name = abs.file_name().and_then(|f| f.to_str()).unwrap_or(arg);
                         format!("/workspace/{}", name)
                     } else if let Some(name) = p.file_name().and_then(|f| f.to_str()) {
                         format!("/workspace/{}", name)

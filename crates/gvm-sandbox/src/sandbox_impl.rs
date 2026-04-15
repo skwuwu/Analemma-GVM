@@ -4,7 +4,6 @@
 //! and seccomp application into a single launch sequence.
 
 use crate::capability::which_interpreter;
-use crate::tc_filter::{self, TcAttachResult};
 use crate::mount::setup_mount_namespace;
 use crate::namespace::{
     coordination_pipe, sandbox_clone_flags, signal_child_ready, wait_for_parent, write_uid_map,
@@ -14,6 +13,7 @@ use crate::network::{
     setup_sandbox_network, VethConfig,
 };
 use crate::seccomp::{apply_seccomp_filter, count_seccomp_violations};
+use crate::tc_filter::{self, TcAttachResult};
 use crate::{SandboxConfig, SandboxResult};
 use anyhow::{Context, Result};
 use nix::sys::wait::{waitpid, WaitStatus};

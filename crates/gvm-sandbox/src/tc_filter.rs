@@ -102,7 +102,11 @@ pub fn check_tc_support() -> Result<(), String> {
 /// 2. Attach u32 match rules as an ingress filter (ingress = traffic FROM sandbox)
 ///
 /// Returns an TcFilterGuard that removes the filter on drop.
-pub fn attach_tc_filter(interface: &str, proxy_ip: Ipv4Addr, proxy_port: u16) -> Result<TcFilterGuard> {
+pub fn attach_tc_filter(
+    interface: &str,
+    proxy_ip: Ipv4Addr,
+    proxy_port: u16,
+) -> Result<TcFilterGuard> {
     // 1. Add clsact qdisc (multi-attach qdisc for ingress/egress classification)
     let output = Command::new("tc")
         .args(["qdisc", "add", "dev", interface, "clsact"])

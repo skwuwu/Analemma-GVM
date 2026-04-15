@@ -16,11 +16,11 @@ pub(crate) fn render(frame: &mut Frame, state: &TuiState, table_state: &mut Tabl
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),   // Header
-            Constraint::Min(6),      // Top panels (anomaly + decisions)
-            Constraint::Min(4),      // Mid panels (hosts + LLM)
-            Constraint::Fill(1),     // Timeline (fills remaining)
-            Constraint::Length(1),   // Footer
+            Constraint::Length(3), // Header
+            Constraint::Min(6),    // Top panels (anomaly + decisions)
+            Constraint::Min(4),    // Mid panels (hosts + LLM)
+            Constraint::Fill(1),   // Timeline (fills remaining)
+            Constraint::Length(1), // Footer
         ])
         .split(frame.area());
 
@@ -34,7 +34,12 @@ pub(crate) fn render(frame: &mut Frame, state: &TuiState, table_state: &mut Tabl
 fn render_header(frame: &mut Frame, area: Rect, state: &TuiState) {
     let elapsed = format_duration(state.stats.start_time.elapsed());
     let text = Line::from(vec![
-        Span::styled(" Agent Runtime Watch ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " Agent Runtime Watch ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("  "),
         Span::styled(&state.agent_id, Style::default().fg(Color::White)),
         Span::raw("    "),
@@ -42,7 +47,9 @@ fn render_header(frame: &mut Frame, area: Rect, state: &TuiState) {
         Span::raw("    "),
         Span::styled(
             format!("{} reqs", state.stats.total_requests),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         Span::styled(
@@ -50,7 +57,9 @@ fn render_header(frame: &mut Frame, area: Rect, state: &TuiState) {
             Style::default().fg(Color::DarkGray),
         ),
     ]);
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, area);
 }
@@ -123,14 +132,26 @@ fn render_decision_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
     frame.render_widget(paragraph, area);
 }
 
-fn decision_bar_line(label: &str, count: u64, total: f64, bar_width: f64, color: Color) -> Line<'static> {
+fn decision_bar_line(
+    label: &str,
+    count: u64,
+    total: f64,
+    bar_width: f64,
+    color: Color,
+) -> Line<'static> {
     let pct = count as f64 / total;
     let filled = (pct * bar_width) as usize;
     let empty = bar_width as usize - filled;
     Line::from(vec![
-        Span::styled(format!(" {} ", label), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!(" {} ", label),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
         Span::styled("\u{2588}".repeat(filled), Style::default().fg(color)),
-        Span::styled("\u{2591}".repeat(empty), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "\u{2591}".repeat(empty),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::styled(format!(" {}", count), Style::default().fg(Color::White)),
     ])
 }
@@ -160,7 +181,10 @@ fn render_host_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
         .take(max_rows)
         .map(|(host, count)| {
             ListItem::new(Line::from(vec![
-                Span::styled(format!(" {:<28}", truncate(host, 28)), Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!(" {:<28}", truncate(host, 28)),
+                    Style::default().fg(Color::Cyan),
+                ),
                 Span::styled(format!("{:>5}", count), Style::default().fg(Color::White)),
             ]))
         })
@@ -184,7 +208,9 @@ fn render_llm_panel(frame: &mut Frame, area: Rect, state: &TuiState) {
             Span::styled(" Tokens: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 crate::watch::format_number(stats.total_tokens),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("  Cost: ${:.4}", stats.estimated_cost),
@@ -231,7 +257,11 @@ fn render_timeline(frame: &mut Frame, area: Rect, state: &TuiState, table_state:
     let header = Row::new(vec![
         "TIME", "  ", "METHOD", "HOST", "PATH", "ST", "DECISION", "TOKENS",
     ])
-    .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
+    .style(
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
 
     let rows: Vec<Row> = if let Some(ref trace_id) = state.trace_view {
         // Trace view: show events belonging to selected trace as tree
@@ -285,7 +315,7 @@ fn timeline_row(entry: &TimelineEntry) -> Row<'static> {
 
     let tokens = entry
         .total_tokens
-        .map(|t| crate::watch::format_number(t))
+        .map(crate::watch::format_number)
         .unwrap_or_default();
 
     Row::new(vec![
@@ -294,7 +324,10 @@ fn timeline_row(entry: &TimelineEntry) -> Row<'static> {
         entry.method.clone(),
         truncate(&entry.host, 25).to_string(),
         truncate(&entry.path, 30).to_string(),
-        entry.status_code.map(|c| c.to_string()).unwrap_or_else(|| "---".into()),
+        entry
+            .status_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "---".into()),
         decision_short.to_string(),
         tokens,
     ])
@@ -311,7 +344,11 @@ fn render_trace_rows(state: &TuiState, trace_id: &str) -> Vec<Row<'static>> {
     let len = indices.len();
     for (i, &idx) in indices.iter().enumerate() {
         if let Some(entry) = state.timeline.iter().find(|e| e.index == idx) {
-            let prefix = if i == len - 1 { "\u{2514} " } else { "\u{251c} " };
+            let prefix = if i == len - 1 {
+                "\u{2514} "
+            } else {
+                "\u{251c} "
+            };
             let (icon, color) = match entry.decision.as_str() {
                 d if d.contains("Allow") => ("\u{2713}", Color::Green),
                 d if d.contains("Delay") => ("\u{23f1}", Color::Yellow),
@@ -320,7 +357,7 @@ fn render_trace_rows(state: &TuiState, trace_id: &str) -> Vec<Row<'static>> {
             };
             let tokens = entry
                 .total_tokens
-                .map(|t| crate::watch::format_number(t))
+                .map(crate::watch::format_number)
                 .unwrap_or_default();
 
             rows.push(
@@ -330,7 +367,10 @@ fn render_trace_rows(state: &TuiState, trace_id: &str) -> Vec<Row<'static>> {
                     format!("{}{}", prefix, entry.method),
                     truncate(&entry.host, 25).to_string(),
                     truncate(&entry.path, 30).to_string(),
-                    entry.status_code.map(|c| c.to_string()).unwrap_or_else(|| "---".into()),
+                    entry
+                        .status_code
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "---".into()),
                     entry.decision.clone(),
                     tokens,
                 ])
@@ -350,9 +390,15 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &TuiState) {
     let line = Line::from(vec![
         Span::styled(" [q] ", Style::default().fg(Color::DarkGray)),
         Span::styled("quit", Style::default().fg(Color::White)),
-        Span::styled("  [\u{2191}\u{2193}] ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "  [\u{2191}\u{2193}] ",
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::styled("scroll", Style::default().fg(Color::White)),
-        Span::styled(format!("  {}", trace_hint), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("  {}", trace_hint),
+            Style::default().fg(Color::DarkGray),
+        ),
     ]);
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, area);

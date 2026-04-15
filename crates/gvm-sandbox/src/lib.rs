@@ -169,7 +169,6 @@ impl Default for FilesystemPolicy {
     }
 }
 
-
 /// Seccomp profile selection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SeccompProfile {
@@ -291,8 +290,6 @@ mod capability;
 #[cfg(target_os = "linux")]
 mod cgroup;
 #[cfg(target_os = "linux")]
-pub mod tc_filter;
-#[cfg(target_os = "linux")]
 mod mount;
 #[cfg(target_os = "linux")]
 mod namespace;
@@ -300,6 +297,8 @@ mod namespace;
 mod network;
 #[cfg(target_os = "linux")]
 mod seccomp;
+#[cfg(target_os = "linux")]
+pub mod tc_filter;
 
 #[cfg(target_os = "linux")]
 mod sandbox_impl;

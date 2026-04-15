@@ -95,10 +95,7 @@ impl TuiState {
 
         // Skip state-machine duplicate entries (dedup by event_id already in SessionStats).
         // But timeline always shows the latest state for an event_id.
-        let event_id = event
-            .get("event_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let event_id = event.get("event_id").and_then(|v| v.as_str()).unwrap_or("");
 
         // Check if this event_id already exists in timeline (state transition update)
         if let Some(existing) = self
@@ -247,10 +244,10 @@ pub(crate) async fn run_tui(
                 }
 
                 // Check if agent exited
-                if agent_done_rx.has_changed().unwrap_or(false) {
-                    if *agent_done_rx.borrow_and_update() {
-                        agent_exited = true;
-                    }
+                if agent_done_rx.has_changed().unwrap_or(false)
+                    && *agent_done_rx.borrow_and_update()
+                {
+                    agent_exited = true;
                 }
 
                 // Handle crossterm events (non-blocking)
