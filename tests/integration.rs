@@ -12,7 +12,7 @@ use gvm_proxy::api_keys::APIKeyStore;
 use gvm_proxy::ledger::Ledger;
 use gvm_proxy::policy::PolicyEngine;
 use gvm_proxy::proxy::{proxy_handler, AppState};
-use gvm_proxy::rate_limiter::RateLimiter;
+use gvm_proxy::token_budget::TokenBudget;
 use gvm_proxy::registry::OperationRegistry;
 use gvm_proxy::srr::NetworkSRR;
 use gvm_proxy::types::*;
@@ -694,7 +694,7 @@ milliseconds = 300
     );
     let vault =
         Arc::new(Vault::new(ledger.clone()).expect("vault must initialize with valid ledger"));
-    let rate_limiter = Arc::new(RateLimiter::new());
+    let token_budget = Arc::new(TokenBudget::new(0, 0.0, 500));
     let http_client =
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
             .build_http();
@@ -706,7 +706,7 @@ milliseconds = 300
         api_keys,
         ledger,
         vault,
-        rate_limiter,
+        token_budget,
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
@@ -1139,7 +1139,7 @@ token = "sk_test_proxy_injected_key"
             .expect("ledger must init"),
     );
     let vault = Arc::new(Vault::new(ledger.clone()).expect("vault must init"));
-    let rate_limiter = Arc::new(RateLimiter::new());
+    let token_budget = Arc::new(TokenBudget::new(0, 0.0, 500));
     let http_client =
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
             .build_http();
@@ -1158,7 +1158,7 @@ token = "sk_test_proxy_injected_key"
         api_keys,
         ledger: ledger.clone(),
         vault,
-        rate_limiter,
+        token_budget,
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
@@ -1428,7 +1428,7 @@ token = "sk_test_proxy_injected_bearer"
             .expect("ledger must init"),
     );
     let vault = Arc::new(Vault::new(ledger.clone()).expect("vault must init"));
-    let rate_limiter = Arc::new(RateLimiter::new());
+    let token_budget = Arc::new(TokenBudget::new(0, 0.0, 500));
     let http_client =
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
             .build_http();
@@ -1450,7 +1450,7 @@ token = "sk_test_proxy_injected_bearer"
         api_keys,
         ledger: ledger.clone(),
         vault,
-        rate_limiter,
+        token_budget,
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
@@ -1642,7 +1642,7 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
             .expect("ledger must init"),
     );
     let vault = Arc::new(Vault::new(ledger.clone()).expect("vault must init"));
-    let rate_limiter = Arc::new(RateLimiter::new());
+    let token_budget = Arc::new(TokenBudget::new(0, 0.0, 500));
     let http_client =
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
             .build_http();
@@ -1654,7 +1654,7 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
         api_keys,
         ledger,
         vault,
-        rate_limiter,
+        token_budget,
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
@@ -1845,7 +1845,7 @@ type = "Allow"
             .expect("ledger must init"),
     );
     let vault = Arc::new(Vault::new(ledger.clone()).expect("vault must init"));
-    let rate_limiter = Arc::new(RateLimiter::new());
+    let token_budget = Arc::new(TokenBudget::new(0, 0.0, 500));
     let http_client =
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
             .build_http();
@@ -1857,7 +1857,7 @@ type = "Allow"
         api_keys,
         ledger,
         vault,
-        rate_limiter,
+        token_budget,
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
@@ -2296,7 +2296,7 @@ async fn checkpoint_save_restore_merkle_verified() {
             .expect("ledger must init"),
     );
     let vault = Arc::new(Vault::new(ledger.clone()).expect("vault must init"));
-    let rate_limiter = Arc::new(RateLimiter::new());
+    let token_budget = Arc::new(TokenBudget::new(0, 0.0, 500));
     let http_client =
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
             .build_http();
@@ -2308,7 +2308,7 @@ async fn checkpoint_save_restore_merkle_verified() {
         api_keys,
         ledger,
         vault,
-        rate_limiter,
+        token_budget,
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
@@ -2786,7 +2786,7 @@ type = "Allow"
         api_keys,
         ledger,
         vault,
-        rate_limiter: Arc::new(RateLimiter::new()),
+        token_budget: Arc::new(TokenBudget::new(0, 0.0, 500)),
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
@@ -2953,7 +2953,7 @@ decision = { type = "Allow" }
         api_keys,
         ledger,
         vault,
-        rate_limiter: Arc::new(RateLimiter::new()),
+        token_budget: Arc::new(TokenBudget::new(0, 0.0, 500)),
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
@@ -3085,7 +3085,7 @@ decision = { type = "Allow" }
         api_keys,
         ledger,
         vault,
-        rate_limiter: Arc::new(RateLimiter::new()),
+        token_budget: Arc::new(TokenBudget::new(0, 0.0, 500)),
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
@@ -3221,7 +3221,7 @@ decision = { type = "Allow" }
         api_keys,
         ledger,
         vault,
-        rate_limiter: Arc::new(RateLimiter::new()),
+        token_budget: Arc::new(TokenBudget::new(0, 0.0, 500)),
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
@@ -3325,7 +3325,7 @@ async fn ic3_self_approval_blocked_on_proxy_port() {
         api_keys,
         ledger,
         vault,
-        rate_limiter: Arc::new(RateLimiter::new()),
+        token_budget: Arc::new(TokenBudget::new(0, 0.0, 500)),
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),

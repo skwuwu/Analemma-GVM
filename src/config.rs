@@ -34,6 +34,45 @@ pub struct ProxyConfig {
     /// Disable with `--no-dns-governance` CLI flag or `dns.enabled = false`.
     #[serde(default)]
     pub dns: DnsGovernanceConfig,
+    /// Token budget configuration for LLM cost governance.
+    /// Limits total tokens and/or cost per hour across all agents.
+    #[serde(default)]
+    pub budget: BudgetConfig,
+}
+
+/// Token budget configuration for LLM cost governance.
+///
+/// ```toml
+/// [budget]
+/// max_tokens_per_hour = 100000  # 0 = unlimited
+/// max_cost_per_hour = 1.00      # 0.0 = unlimited
+/// reserve_per_request = 500     # estimated tokens reserved per in-flight request
+/// ```
+#[derive(Deserialize, Clone, Debug)]
+pub struct BudgetConfig {
+    /// Maximum tokens per hour across all agents (0 = unlimited).
+    #[serde(default)]
+    pub max_tokens_per_hour: u64,
+    /// Maximum cost in USD per hour (0.0 = unlimited).
+    #[serde(default)]
+    pub max_cost_per_hour: f64,
+    /// Tokens reserved per in-flight LLM request (default: 500).
+    #[serde(default = "default_reserve")]
+    pub reserve_per_request: u64,
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            max_tokens_per_hour: 0,
+            max_cost_per_hour: 0.0,
+            reserve_per_request: 500,
+        }
+    }
+}
+
+fn default_reserve() -> u64 {
+    500
 }
 
 /// DNS soft governance configuration.
@@ -179,7 +218,6 @@ fn default_delay_ms() -> u64 {
 /// [enforcement.on_block]
 /// deny = "halt"
 /// require_approval = "soft_pivot"
-/// throttle = "rollback"
 /// ```
 #[derive(Deserialize, Clone, Debug)]
 pub struct OnBlockConfig {
@@ -189,9 +227,6 @@ pub struct OnBlockConfig {
     /// Mode for RequireApproval decisions (default: soft_pivot)
     #[serde(default = "default_soft_pivot")]
     pub require_approval: BlockResponseMode,
-    /// Mode for Throttle rate-limit blocks (default: rollback)
-    #[serde(default = "default_rollback")]
-    pub throttle: BlockResponseMode,
     /// Mode for WAL/infrastructure failures (default: halt)
     #[serde(default = "default_halt")]
     pub infrastructure_failure: BlockResponseMode,
@@ -202,7 +237,6 @@ impl Default for OnBlockConfig {
         Self {
             deny: BlockResponseMode::Halt,
             require_approval: BlockResponseMode::SoftPivot,
-            throttle: BlockResponseMode::Rollback,
             infrastructure_failure: BlockResponseMode::Halt,
         }
     }
@@ -214,10 +248,6 @@ fn default_halt() -> BlockResponseMode {
 
 fn default_soft_pivot() -> BlockResponseMode {
     BlockResponseMode::SoftPivot
-}
-
-fn default_rollback() -> BlockResponseMode {
-    BlockResponseMode::Rollback
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -395,6 +425,7 @@ impl Default for ProxyConfig {
             shadow: crate::intent_store::ShadowConfig::default(),
             filesystem: None,
             dns: DnsGovernanceConfig::default(),
+            budget: BudgetConfig::default(),
         }
     }
 }

@@ -89,6 +89,9 @@ pub enum EnforcementDecision {
     /// Immediate allow (IC-1)
     Allow,
 
+    /// Allow execution but elevate audit priority (durable WAL)
+    AuditOnly { alert_level: AlertLevel },
+
     /// Delay then allow (IC-2)
     Delay { milliseconds: u64 },
 
@@ -97,24 +100,17 @@ pub enum EnforcementDecision {
 
     /// Unconditional deny
     Deny { reason: String },
-
-    /// Rate limit enforcement
-    Throttle { max_per_minute: u64 },
-
-    /// Allow execution but elevate audit priority
-    AuditOnly { alert_level: AlertLevel },
 }
 
 impl EnforcementDecision {
-    /// Strictness order: Allow < AuditOnly < Throttle < Delay < RequireApproval < Deny
+    /// Strictness order: Allow < AuditOnly < Delay < RequireApproval < Deny
     pub fn strictness(&self) -> u8 {
         match self {
             Self::Allow => 0,
             Self::AuditOnly { .. } => 1,
-            Self::Throttle { .. } => 2,
-            Self::Delay { .. } => 3,
-            Self::RequireApproval { .. } => 4,
-            Self::Deny { .. } => 5,
+            Self::Delay { .. } => 2,
+            Self::RequireApproval { .. } => 3,
+            Self::Deny { .. } => 4,
         }
     }
 }

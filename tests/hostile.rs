@@ -755,7 +755,6 @@ mod proptest_max_strict {
             ]
             .prop_map(|u| EnforcementDecision::RequireApproval { urgency: u }),
             "[a-z]{1,20}".prop_map(|r| EnforcementDecision::Deny { reason: r }),
-            (1u64..=1000).prop_map(|m| EnforcementDecision::Throttle { max_per_minute: m }),
             prop_oneof![
                 Just(AlertLevel::Info),
                 Just(AlertLevel::Warning),

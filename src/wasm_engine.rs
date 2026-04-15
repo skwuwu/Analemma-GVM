@@ -282,7 +282,6 @@ impl WasmEngine {
             "AuditOnly" => EnforcementDecision::AuditOnly {
                 alert_level: AlertLevel::Info,
             },
-            "Throttle" => EnforcementDecision::Throttle { max_per_minute: 60 },
             other => {
                 tracing::warn!(
                     decision = %other,

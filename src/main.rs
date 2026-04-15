@@ -9,7 +9,7 @@ use gvm_proxy::dns_governance;
 use gvm_proxy::ledger::Ledger;
 use gvm_proxy::policy::PolicyEngine;
 use gvm_proxy::proxy::{proxy_handler, AppState};
-use gvm_proxy::rate_limiter::RateLimiter;
+use gvm_proxy::token_budget::TokenBudget;
 use gvm_proxy::registry::OperationRegistry;
 use gvm_proxy::srr::NetworkSRR;
 use gvm_proxy::vault::Vault;
@@ -364,7 +364,11 @@ async fn main() {
         api_keys: Arc::new(api_keys),
         ledger,
         vault: Arc::new(vault),
-        rate_limiter: Arc::new(RateLimiter::new()),
+        token_budget: Arc::new(TokenBudget::new(
+            config.budget.max_tokens_per_hour,
+            config.budget.max_cost_per_hour,
+            config.budget.reserve_per_request,
+        )),
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(wasm_engine),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),

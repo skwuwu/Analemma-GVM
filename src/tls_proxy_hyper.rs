@@ -191,39 +191,6 @@ async fn handle_request(
         gvm_types::EnforcementDecision::Delay { milliseconds } => {
             tokio::time::sleep(std::time::Duration::from_millis(*milliseconds)).await;
         }
-        gvm_types::EnforcementDecision::Throttle { max_per_minute } => {
-            if !state
-                .rate_limiter
-                .check(&classify_output.agent_id, *max_per_minute)
-            {
-                let http_req = HttpRequest {
-                    method: method.clone(),
-                    path: path.clone(),
-                    host: host.clone(),
-                    headers: vec![],
-                    body: vec![],
-                    raw_head: vec![],
-                };
-                crate::tls_proxy::append_enforcement_event(
-                    &state.ledger,
-                    &classify_output,
-                    &host,
-                    &http_req,
-                    "Throttle (rate limit exceeded)",
-                    Some(429),
-                    false,
-                )
-                .await;
-                return Ok(Response::builder()
-                    .status(429)
-                    .header("Content-Type", "application/json")
-                    .header("Retry-After", "60")
-                    .body(full_body(
-                        r#"{"blocked":true,"decision":"Throttle","reason":"Rate limit exceeded"}"#,
-                    ))
-                    .expect("static response builder"));
-            }
-        }
         _ => {} // Allow, AuditOnly
     }
 

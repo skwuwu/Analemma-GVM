@@ -214,7 +214,6 @@ fn wasm_all_decision_types_roundtrip() {
         ("Deny", None, Some("test reason")),
         ("RequireApproval", None, None),
         ("AuditOnly", None, None),
-        ("Throttle", None, None),
     ];
 
     for (decision_type, delay_ms, reason) in &test_cases {
@@ -242,7 +241,6 @@ fn wasm_all_decision_types_roundtrip() {
                 EnforcementDecision::RequireApproval { .. }
             )),
             &"AuditOnly" => assert!(matches!(decision, EnforcementDecision::AuditOnly { .. })),
-            &"Throttle" => assert!(matches!(decision, EnforcementDecision::Throttle { .. })),
             _ => unreachable!(),
         }
     }

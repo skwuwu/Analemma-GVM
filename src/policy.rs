@@ -32,7 +32,6 @@ struct DecisionConfig {
     milliseconds: Option<u64>,
     reason: Option<String>,
     urgency: Option<String>,
-    max_per_minute: Option<u64>,
     alert_level: Option<String>,
 }
 
@@ -667,10 +666,6 @@ fn compile_decision(cfg: &DecisionConfig) -> Result<EnforcementDecision> {
                 .unwrap_or_else(|| "Denied by policy".to_string()),
         }),
 
-        "Throttle" => Ok(EnforcementDecision::Throttle {
-            max_per_minute: cfg.max_per_minute.unwrap_or(60),
-        }),
-
         "AuditOnly" => {
             let alert_level = match cfg.alert_level.as_deref() {
                 Some("Info") | None => AlertLevel::Info,
@@ -949,7 +944,6 @@ fn decision_type_name(decision: &EnforcementDecision) -> &'static str {
         EnforcementDecision::Delay { .. } => "Delay",
         EnforcementDecision::RequireApproval { .. } => "RequireApproval",
         EnforcementDecision::Deny { .. } => "Deny",
-        EnforcementDecision::Throttle { .. } => "Throttle",
         EnforcementDecision::AuditOnly { .. } => "AuditOnly",
     }
 }

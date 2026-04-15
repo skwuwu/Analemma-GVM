@@ -416,7 +416,6 @@ fn edge_max_strict_strictness_ordering_complete() {
         EnforcementDecision::AuditOnly {
             alert_level: AlertLevel::Info,
         },
-        EnforcementDecision::Throttle { max_per_minute: 60 },
         EnforcementDecision::Delay { milliseconds: 300 },
         EnforcementDecision::RequireApproval {
             urgency: ApprovalUrgency::Standard,

@@ -4,7 +4,7 @@ use crate::config::OnBlockConfig;
 use crate::ledger::Ledger;
 use crate::llm_trace;
 use crate::policy::PolicyEngine;
-use crate::rate_limiter::RateLimiter;
+use crate::token_budget::TokenBudget;
 use crate::registry::OperationRegistry;
 use crate::srr::NetworkSRR;
 use crate::types::*;
@@ -114,7 +114,7 @@ pub struct AppState {
     pub api_keys: Arc<APIKeyStore>,
     pub ledger: Arc<Ledger>,
     pub vault: Arc<Vault>,
-    pub rate_limiter: Arc<RateLimiter>,
+    pub token_budget: Arc<TokenBudget>,
     /// Layer 1: Wasm governance engine (immutable policy sandbox).
     /// Only available when compiled with --features wasm.
     #[cfg(feature = "wasm")]
@@ -529,53 +529,7 @@ pub async fn proxy_handler(
         None
     };
 
-    // ── Step 3: Rate Limit check ──
-    if let EnforcementDecision::Throttle { max_per_minute } = &classification.decision {
-        if !state.rate_limiter.check(agent_id, *max_per_minute) {
-            // Release claimed intent
-            if let Some(ref claim) = shadow_claim {
-                state.intent_store.release(claim.claim_id);
-            }
-            let operation_name = gvm_headers
-                .as_ref()
-                .map(|h| h.operation.as_str())
-                .unwrap_or("unknown");
-            append_proxy_wal_event(
-                &state,
-                &request_method,
-                &target.host,
-                &target.path,
-                agent_id,
-                &format!("Throttle (rate limit exceeded: {}/min)", max_per_minute),
-                429,
-            );
-            return governance_block_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                GovernanceBlockResponse {
-                    blocked: true,
-                    decision: "Throttle".to_string(),
-                    event_id: String::new(),
-                    trace_id: gvm_headers
-                        .as_ref()
-                        .map(|h| h.trace_id.clone())
-                        .unwrap_or_default(),
-                    operation: operation_name.to_string(),
-                    reason: format!(
-                        "Rate limit exceeded: {} requests/min maximum",
-                        max_per_minute
-                    ),
-                    mode: state.on_block.throttle.clone(),
-                    next_action: "Wait and retry after the rate limit window resets".to_string(),
-                    retry_after_secs: Some(60),
-                    rollback_hint: None,
-                    matched_rule_id: classification.matched_rule_id.clone(),
-                    ic_level: 2,
-                },
-            );
-        }
-    }
-
-    // ── Step 3.5: Circuit Breaker — WAL health check ──
+    // ── Step 3: Circuit Breaker — WAL health check ──
     // If the primary WAL has too many consecutive failures, reject IC-2
     // requests early with 503 + Retry-After to prevent cascading failures.
     // IC-1 (Allow) is unaffected — it uses async append (loss tolerated).
@@ -618,7 +572,7 @@ pub async fn proxy_handler(
                 );
             }
             _ => {
-                // IC-1 (Allow, AuditOnly, Throttle) — proceed despite WAL issues
+                // IC-1 (Allow, AuditOnly) — proceed despite WAL issues
             }
         }
     }
@@ -910,25 +864,6 @@ pub async fn proxy_handler(
                     ic_level: 4,
                 },
             )
-        }
-
-        EnforcementDecision::Throttle { .. } => {
-            // Rate limit already checked above. If we reach here, request is allowed.
-            let engine_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
-            let mut response = forward_request(&state, request, &target).await;
-            event.status = event_status_from_response(&response);
-            state.ledger.append_async(event.clone()).await;
-            if let Some(ref claim) = shadow_claim {
-                state.intent_store.confirm(claim.claim_id);
-            }
-            inject_gvm_response_headers(
-                response.headers_mut(),
-                &event,
-                &classification,
-                engine_ms,
-                0,
-            );
-            response
         }
 
         EnforcementDecision::AuditOnly { alert_level } => {
@@ -1400,7 +1335,7 @@ fn error_response(status: StatusCode, message: &str) -> Response<Body> {
 }
 
 /// Best-effort WAL append for enforcement decisions in proxy_handler / CONNECT.
-/// Every governance decision (Deny, Throttle, classification error) must be audited.
+/// Every governance decision (Deny, classification error) must be audited.
 fn append_proxy_wal_event(
     state: &AppState,
     method: &str,
@@ -2097,7 +2032,7 @@ mod tests {
             "data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"{}\"}}}}],\"model\":\"o1-preview\"}}\n\n",
             reasoning_fragment
         );
-        let repetitions = (MAX_SSE_TRACE_CAPTURE_BYTES / sse_event.len()) + 128;
+        let repetitions = (crate::llm_trace::TAP_MAX_SSE_BYTES / sse_event.len()) + 128;
 
         let mut body = sse_event.repeat(repetitions);
         body.push_str("data: [DONE]\n\n");

@@ -494,7 +494,7 @@ impl HttpRequest {
 
 /// Handle a MITM TLS stream: read plaintext HTTP, apply SRR, forward to upstream.
 ///
-/// Write an enforcement event (Deny/Throttle/RequireApproval) to WAL.
+/// Write an enforcement event (Deny/RequireApproval) to WAL.
 /// Every blocked or rate-limited request must appear in the audit trail.
 pub async fn append_enforcement_event(
     ledger: &std::sync::Arc<crate::ledger::Ledger>,
@@ -799,34 +799,6 @@ async fn handle_mitm_stream_legacy<S: tokio::io::AsyncRead + tokio::io::AsyncWri
                 )
                 .await;
                 break;
-            }
-            gvm_types::EnforcementDecision::Throttle { max_per_minute } => {
-                // Rate limit check on MITM path
-                if !state
-                    .rate_limiter
-                    .check(&classify_output.agent_id, *max_per_minute)
-                {
-                    let body_str =
-                        r#"{"blocked":true,"decision":"Throttle","reason":"Rate limit exceeded"}"#;
-                    let response = format!(
-                        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 60\r\n\r\n{}",
-                        body_str.len(), body_str
-                    );
-                    tls_stream.write_all(response.as_bytes()).await?;
-                    tls_stream.flush().await?;
-                    append_enforcement_event(
-                        &state.ledger,
-                        &classify_output,
-                        &host,
-                        &req,
-                        "Throttle (rate limit exceeded)",
-                        Some(429),
-                        false,
-                    )
-                    .await;
-                    continue; // Don't break — allow next request in keep-alive
-                }
-                // Rate check passed — allow through
             }
             _ => {} // Allow, AuditOnly — pass through
         }
