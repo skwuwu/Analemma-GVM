@@ -123,7 +123,6 @@ tailwind.config = { theme: { extend: { fontFamily: { mono: ['JetBrains Mono', 'm
       <div class="text-[10px] text-slate-600 uppercase tracking-wider">Live Events</div>
       <div class="flex items-center gap-1.5" id="filter-bar">
         <button class="filter-btn active text-[10px] px-2 py-0.5 rounded border border-slate-800 text-slate-500" data-filter="all" onclick="setFilter('all')">All</button>
-        <button class="filter-btn active text-[10px] px-2 py-0.5 rounded border border-green-900/50 text-green-700" data-filter="Allow" onclick="setFilter('Allow')">Allow</button>
         <button class="filter-btn active text-[10px] px-2 py-0.5 rounded border border-yellow-900/50 text-yellow-700" data-filter="Delay" onclick="setFilter('Delay')">Delay</button>
         <button class="filter-btn active text-[10px] px-2 py-0.5 rounded border border-red-900/50 text-red-400" data-filter="Deny" onclick="setFilter('Deny')">Deny</button>
       </div>
@@ -160,7 +159,7 @@ tailwind.config = { theme: { extend: { fontFamily: { mono: ['JetBrains Mono', 'm
 
 <script>
 let allEvents=[], currentStats={}, walOffset=0, seenIds=new Set(), decisionChart=null;
-let activeFilters=new Set(['Allow','Delay','Deny']), perHostDecisions={}, prevDenyCount=0;
+let activeFilters=new Set(['Delay','Deny','Other']), perHostDecisions={}, prevDenyCount=0;
 const requestTimes=[], loopDetector={}, anomalies=[];
 
 function detectAnomalies(ev) {
@@ -186,17 +185,17 @@ function translateDeny(ev){
 }
 
 function setFilter(f){
+  const allTypes=new Set(['Delay','Deny','Other']);
   if(f==='all'){
-    activeFilters=new Set(['Allow','Delay','Deny']);
+    activeFilters=new Set(allTypes);
   } else {
-    // If clicking the only active filter, show all. Otherwise show only clicked.
     if(activeFilters.size===1&&activeFilters.has(f)){
-      activeFilters=new Set(['Allow','Delay','Deny']);
+      activeFilters=new Set(allTypes);
     } else {
       activeFilters=new Set([f]);
     }
   }
-  document.querySelectorAll('.filter-btn').forEach(b=>{const d=b.dataset.filter;if(d==='all')b.classList.toggle('active',activeFilters.size===3);else b.classList.toggle('active',activeFilters.has(d))});
+  document.querySelectorAll('.filter-btn').forEach(b=>{const d=b.dataset.filter;if(d==='all')b.classList.toggle('active',activeFilters.size>=allTypes.size);else b.classList.toggle('active',activeFilters.has(d))});
   renderTimeline();
 }
 
