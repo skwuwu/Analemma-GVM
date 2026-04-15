@@ -99,8 +99,8 @@ tailwind.config = { theme: { extend: { fontFamily: { mono: ['JetBrains Mono', 'm
         </div>
       </div>
       <div class="flex justify-center gap-8 text-[11px]">
-        <div class="flex items-center gap-1.5"><span class="dot" style="background:#166534"></span><span class="text-slate-500">Allow <span class="text-slate-400" id="leg-allow">0</span></span></div>
-        <div class="flex items-center gap-1.5"><span class="dot" style="background:#a16207"></span><span class="text-slate-500">Delay <span class="text-slate-400" id="leg-delay">0</span></span></div>
+        <div class="flex items-center gap-1.5"><span class="dot" style="background:#22c55e"></span><span class="text-slate-500">Allow <span class="text-slate-400" id="leg-allow">0</span></span></div>
+        <div class="flex items-center gap-1.5"><span class="dot" style="background:#eab308"></span><span class="text-slate-500">Delay <span class="text-slate-400" id="leg-delay">0</span></span></div>
         <div class="flex items-center gap-1.5"><span class="dot" style="background:#ef4444"></span><span class="text-slate-500">Deny <span class="text-red-400 font-medium" id="leg-deny">0</span></span></div>
       </div>
     </div>
@@ -200,7 +200,11 @@ function setFilter(f){
 }
 
 function bucket(d){return d.includes('Allow')?'Allow':d.includes('Delay')?'Delay':d.includes('Deny')?'Deny':'Other'}
-function ts(t){return t?.length>=19?t.slice(11,19):(t||'')}
+function ts(t){
+  if(!t)return'';
+  try{const d=new Date(t);return d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'})}
+  catch(e){return t?.length>=19?t.slice(11,19):''}
+}
 function tr(s,n){return s&&s.length>n?s.slice(0,n-2)+'...':(s||'')}
 
 function renderTimeline(){
@@ -251,12 +255,22 @@ function renderStats(s){
   if(dn>prevDenyCount&&prevDenyCount>0){el.classList.remove('flash-blocked');void el.offsetWidth;el.classList.add('flash-blocked')}
   el.textContent=dn;prevDenyCount=dn;
 
-  // Doughnut — muted green/amber, vivid red
+  // Doughnut
   document.getElementById('donut-total').textContent=tot;
   document.getElementById('leg-allow').textContent=al;
   document.getElementById('leg-delay').textContent=dl;
   document.getElementById('leg-deny').textContent=dn;
-  if(decisionChart){decisionChart.data.datasets[0].data=[al,dl,dn];decisionChart.update('none')}
+  if(decisionChart){
+    if(tot===0){
+      // Show grey ring when no data
+      decisionChart.data.datasets[0].data=[1];
+      decisionChart.data.datasets[0].backgroundColor=['#1e293b'];
+    }else{
+      decisionChart.data.datasets[0].data=[al,dl,dn];
+      decisionChart.data.datasets[0].backgroundColor=['#22c55e','#eab308','#ef4444'];
+    }
+    decisionChart.update('none');
+  }
 
   // Host bars
   const hosts=Object.entries(perHostDecisions).sort((a,b)=>b[1].total-a[1].total).slice(0,8);
@@ -344,8 +358,8 @@ function fmtDur(s){if(s<60)return Math.floor(s)+'s';if(s<3600)return Math.floor(
 function initChart(){
   decisionChart=new Chart(document.getElementById('decisionChart').getContext('2d'),{
     type:'doughnut',
-    data:{labels:['Allow','Delay','Deny'],datasets:[{data:[0,0,0],backgroundColor:['#166534','#a16207','#ef4444'],borderWidth:0,hoverOffset:4}]},
-    options:{responsive:true,maintainAspectRatio:true,cutout:'72%',plugins:{legend:{display:false},tooltip:{enabled:true}}}
+    data:{labels:['Allow','Delay','Deny'],datasets:[{data:[0,0,0],backgroundColor:['#22c55e','#eab308','#ef4444'],borderWidth:0,hoverOffset:4}]},
+    options:{responsive:true,maintainAspectRatio:true,cutout:'72%',plugins:{legend:{display:false},tooltip:{enabled:true}},elements:{arc:{borderWidth:0}}}
   });
 }
 
