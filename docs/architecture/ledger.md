@@ -220,9 +220,7 @@ At proxy startup, the Ledger records SHA-256 hashes of all loaded configuration 
 
 ```rust
 ledger.record_config_load(&[
-    ("srr:srr_network.toml", &srr_path),
-    ("registry:operation_registry.toml", &registry_path),
-    ("policy:global.toml", &policy_path),
+    ("gvm:gvm.toml", &gvm_toml_path),
 ]).await?;
 ```
 
@@ -284,9 +282,9 @@ Every governance decision is recorded to WAL at one of seven enforcement points.
 
 | # | Enforcement Point | Source File | Trigger | operation | decision_source | Durability |
 |---|-------------------|-------------|---------|-----------|-----------------|------------|
-| 1 | `proxy` / `both` | `proxy.rs` | HTTP request through proxy | From `X-GVM-Operation` header | `SRR` → `proxy`, `ABAC` → `both` | IC-1: async, IC-2/3/Deny: durable |
+| 1 | `proxy` | `proxy.rs` | HTTP request through proxy | From HTTP method + host + path | `SRR` | Allow: async, AuditOnly/Delay/RequireApproval/Deny: durable |
 | 2 | `proxy` | `proxy.rs` | CONNECT tunnel request | `connect:{host}` | `SRR` | async (loss tolerated) |
-| 3 | `mitm` | `tls_proxy.rs` | Decrypted HTTPS request via MITM | From HTTP method + path | `SRR` or `ABAC` | Always durable (IC-2) |
+| 3 | `mitm` | `tls_proxy.rs` | Decrypted HTTPS request via MITM | From HTTP method + path | `SRR` | Always durable |
 | 4 | `dns-proxy` | `dns_governance.rs` | DNS query from sandboxed agent | `gvm.dns.query` | `dns-governance` | Known/Unknown: async, Anomalous/Flood: durable |
 | 5 | `proxy` | `vault.rs` | Vault secret operation | `gvm.vault.{op}` | `internal` | Write/Delete: durable, Read/List: async |
 | 6 | `startup` | `ledger.rs` | Proxy start or hot-reload | `gvm.system.config_load` | `system` | Always durable |
@@ -296,8 +294,7 @@ Every governance decision is recorded to WAL at one of seven enforcement points.
 
 | Value | Meaning |
 |-------|---------|
-| `both` | ABAC (Layer 1) policy matched — semantic operation evaluation |
-| `proxy` | SRR (Layer 2) matched, rate-limit, vault, or fail-close |
+| `proxy` | SRR matched, token-budget check, vault, or fail-close |
 | `mitm` | TLS MITM interception — decrypted HTTPS request |
 | `mitm-ws-upgrade` | WebSocket upgrade detected during MITM |
 | `dns-proxy` | DNS governance engine — UDP query classification |
@@ -307,9 +304,9 @@ Every governance decision is recorded to WAL at one of seven enforcement points.
 
 | Value | Meaning |
 |-------|---------|
-| `ABAC` | Layer 1 semantic policy (operation registry + attribute matching) |
-| `SRR` | Layer 2 network policy (host/path/method pattern matching) |
+| `SRR` | Network policy (host/path/method/payload pattern matching) |
 | `dns-governance` | DNS tier classification (Known/Unknown/Anomalous/Flood) |
+| `token-budget` | Per-agent cost/token budget decision |
 | `system` | Internal system event (config load, startup) |
 | `internal` | Vault operations (always Allow) |
 | `fail-close` | Emergency path — classification failure or circuit breaker |
@@ -332,7 +329,7 @@ pub struct GVMEvent {
     // ── Operation ──
     operation: String,                   // Semantic operation name
     resource: ResourceDescriptor,        // Service, identifier, tier, sensitivity
-    context: HashMap<String, Value>,     // ABAC attributes (DNS: tier, delay_ms, etc.)
+    context: HashMap<String, Value>,     // Free-form context (DNS: tier, delay_ms, etc.)
 
     // ── Transport ──
     transport: Option<TransportInfo>,    // HTTP method, host, path, status_code
@@ -340,7 +337,7 @@ pub struct GVMEvent {
     // ── Decision ──
     decision: String,                    // "Allow", "Delay { milliseconds: 100 }", "Deny { reason: ... }"
     decision_source: String,             // See table above
-    matched_rule_id: Option<String>,     // SRR/ABAC rule that matched
+    matched_rule_id: Option<String>,     // SRR rule that matched
     enforcement_point: String,           // See table above
 
     // ── Lifecycle ──
@@ -361,15 +358,14 @@ pub struct GVMEvent {
 
 ### Durability by Decision Type
 
-| Decision | IC Level | WAL Write | Status Lifecycle |
-|----------|----------|-----------|------------------|
-| Allow | IC-1 | `append_async` (loss tolerated) | → Confirmed |
-| Delay { ms } | IC-2 | `append_durable` (fsync) | Pending → delay → Confirmed/Failed |
-| RequireApproval | IC-3 | `append_durable` (fsync) | Pending → approval/timeout → Confirmed/Failed |
-| Deny | — | `append_durable` (fsync) | → Failed { reason } |
-| Throttle (passed) | IC-1 | `append_async` | → Confirmed |
-| Throttle (exceeded) | — | `append_durable` | → Failed (429) |
-| AuditOnly | — | `append_durable` (fsync) | Pending → Confirmed/Failed |
+| Decision | Strictness | WAL Write | Status Lifecycle |
+|----------|------------|-----------|------------------|
+| Allow | 0 | `append_async` (loss tolerated) | → Confirmed |
+| AuditOnly | 1 | `append_durable` (fsync) | Pending → Confirmed/Failed |
+| Delay { ms } | 2 | `append_durable` (fsync) | Pending → delay → Confirmed/Failed |
+| RequireApproval | 3 | `append_durable` (fsync) | Pending → approval/timeout → Confirmed/Failed |
+| Deny | 4 | `append_durable` (fsync) | → Failed { reason } |
+| TokenBudget exceeded | — | `append_durable` (fsync) | → Failed (403, budget_exceeded) |
 
 ### DNS Governance Context Fields
 

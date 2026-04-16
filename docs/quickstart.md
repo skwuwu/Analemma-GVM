@@ -27,20 +27,20 @@ That's it. `gvm run` auto-configures the proxy, routes all HTTP traffic through 
   Checking proxy at http://127.0.0.1:8080... OK
   Agent ID:     agent-001
   Security layers active:
-    ✓ Layer 1: Governance Engine (policy evaluation)
-    ✓ Layer 2: Enforcement Proxy (request interception)
-    ○ Layer 3: OS Containment (add --sandbox or --contained)
+    ✓ SRR enforcement (request pattern matching)
+    ✓ Proxy interception (HTTP + MITM TLS)
+    ○ OS containment (add --sandbox or --contained)
 
   --- Agent output below ---
   ...
 
   GVM Audit Trail — 4 events captured
-  ✓ gvm.messaging.read     Allow       GET gmail.googleapis.com
-  ⏱ gvm.messaging.send     Delay       POST gmail.googleapis.com
-  ✗ gvm.payment.charge      Deny        POST api.bank.com
-  ✗ gvm.storage.delete      Deny        DELETE gmail.googleapis.com
+  ✓ Allow       GET  gmail.googleapis.com
+  ⏱ Delay       POST gmail.googleapis.com
+  ✗ Deny        POST api.bank.com
+  ✗ Deny        DELETE gmail.googleapis.com
 
-  2 allowed  1 delayed  2 blocked
+  1 allowed  1 delayed  2 blocked
 ```
 
 ### Choose Your Isolation Level
@@ -51,7 +51,7 @@ gvm run --sandbox my_agent.py    # Hard:  + Linux namespaces + seccomp (producti
 gvm run --contained my_agent.py  # Docker isolation (experimental — see note)
 ```
 
-> **Non-Linux?** `--sandbox` is Linux-only (production). `--contained` (Docker) is implemented but experimental — unstable on WSL2 and slim images. On Windows/macOS, run without isolation — Layer 2 SRR still enforces governance on all HTTP traffic.
+> **Non-Linux?** `--sandbox` is Linux-only (production). `--contained` (Docker) is implemented but experimental — unstable on WSL2 and slim images. On Windows/macOS, run without isolation — SRR still enforces governance on all HTTP traffic.
 
 ---
 
@@ -59,7 +59,9 @@ gvm run --contained my_agent.py  # Docker isolation (experimental — see note)
 
 Don't put API keys in `.env` files or agent code. Let the proxy inject them at the edge.
 
-**`config/secrets.toml`:**
+GVM uses a **single unified config file** — `gvm.toml` — for rules, credentials, cost budget, filesystem patterns, and seccomp. Here is the credential section:
+
+**`gvm.toml`:**
 
 ```toml
 [credentials."api.slack.com"]
@@ -78,21 +80,21 @@ What happens at runtime:
  Agent sends request          Proxy strips agent auth       Proxy injects managed key
  ───────────────────          ──────────────────────        ────────────────────────
  POST api.stripe.com    →     Removes Authorization,   →   Adds "Bearer sk_test_..."
- Authorization: ???           Cookie, X-API-Key             from secrets.toml
+ Authorization: ???           Cookie, X-API-Key             from gvm.toml
 ```
 
 The agent never sees the secret. Even if its memory is dumped, no credentials are exposed.
 
 **Both patterns work — no migration required:**
 
-| Agent code | secrets.toml has host? | What happens |
-|-----------|----------------------|--------------|
+| Agent code | gvm.toml has host? | What happens |
+|-----------|-------------------|--------------|
 | No auth header | Yes | Proxy injects managed key |
 | Has own auth header | Yes | Proxy **replaces** with managed key |
 | Has own auth header | No | Agent's key passes through unchanged |
 | No auth header | No | Request sent without auth (API rejects) |
 
-This means existing agents with hardcoded keys work immediately — just add them behind the proxy. When you're ready, move keys to `secrets.toml` for centralized management. No code changes needed either way.
+This means existing agents with hardcoded keys work immediately — just add them behind the proxy. When you're ready, move keys to `gvm.toml` (and `chmod 600`) for centralized management. No code changes needed either way.
 
 **Scope and limitations:**
 - Credential injection operates at the **HTTP layer** (headers). It cannot inject credentials into request bodies (e.g., GraphQL variables).
@@ -103,48 +105,21 @@ This means existing agents with hardcoded keys work immediately — just add the
 
 ## 4. Define What's Allowed
 
-### Block by URL Pattern (`config/srr_network.toml`)
+### Block by URL Pattern (`gvm.toml` — `[[rules]]`)
 
 No SDK needed. Works with any language.
 
 ```toml
 [[rules]]
-id = "block-wire-transfer"
-host_pattern = "api.bank.com"
-path_pattern = "/transfer/.*"
+pattern = "api.bank.com"
+path_regex = "/transfer/.*"
 method = "POST"
-decision = "Deny"
-reason = "Wire transfers are blocked"
+decision = { type = "Deny", reason = "Wire transfers are blocked" }
 ```
 
-Rules hot-reload — edit the file, the proxy picks up changes immediately.
+Rules hot-reload — edit `gvm.toml` and run `gvm reload`, the proxy picks up changes immediately.
 
-### Block by Semantic Policy (`config/policies/global.toml`)
-
-Requires the Python SDK (`@ic` decorator injects operation metadata).
-
-```toml
-[[rules]]
-id = "block-critical-external"
-priority = 1
-layer = "Global"
-
-[[rules.conditions]]
-field = "resource.sensitivity"
-operator = "Eq"
-value = "Critical"
-
-[[rules.conditions]]
-field = "resource.tier"
-operator = "Eq"
-value = "External"
-
-[rules.decision]
-type = "Deny"
-reason = "Critical data to external targets is forbidden"
-```
-
-Policies are hierarchical: **Global > Tenant > Agent**. Lower layers can only be stricter, never more permissive.
+Decisions available (strictness order): `Allow < AuditOnly < Delay < RequireApproval < Deny`. When multiple rules match, the strictest wins.
 
 ---
 
@@ -276,13 +251,11 @@ Claude: "I can't delete repositories — that operation is blocked by governance
 | Want to... | Go to |
 |-----------|-------|
 | **Full usage guide** — CLI commands, policy writing, debugging, CI/CD | **[User Guide →](user-guide.md)** |
-| Configure policies, SRR rules, secrets | [Reference Guide →](reference.md) |
-| Understand the 3-layer architecture | [Architecture Overview →](overview.md) |
+| Configure rules, credentials, budget in `gvm.toml` | [Reference Guide →](reference.md) |
+| Understand the architecture | [Architecture Overview →](overview.md) |
 | Connect Claude Desktop / Cursor via MCP | [Section 7 above](#7-mcp-integration--claude-desktop--cursor) |
-| See the full SDK API (`@ic`, `GVMAgent`, errors) | [Python SDK →](architecture/sdk.md) |
+| See the full SDK API | [Python SDK →](architecture/sdk.md) |
 | Write custom SRR rules | [Network SRR →](srr.md) |
-| Write ABAC policies | [ABAC Policy →](policy.md) |
-| Validate policies in CI/CD | [User Guide §7 →](15-user-guide.md#7-cicd-integration) |
-| Debug a blocked agent | [User Guide §3 →](15-user-guide.md#3-debugging--troubleshooting) |
-| Production deployment | [User Guide §8 →](15-user-guide.md#8-production-checklist) |
+| Debug a blocked agent | [User Guide →](user-guide.md) |
+| Production deployment | [User Guide →](user-guide.md) |
 | Run tests | `cargo test --workspace --all-targets` |

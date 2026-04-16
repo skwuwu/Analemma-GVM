@@ -3,6 +3,8 @@
 **Last Verified: 2026-04-15**
 
 > Test count grows with each feature. Run `cargo test` to verify current count.
+>
+> **Historical note:** This report includes benchmark data and test inventories from earlier versions that had an ABAC policy engine, `Throttle` decision type, and `OperationRegistry`. All three have since been removed — SRR is now the sole enforcement layer, `Throttle` is replaced by `TokenBudget`, and the decision set is 5 variants (`Allow < AuditOnly < Delay < RequireApproval < Deny`). Sections referring to ABAC/Throttle/Registry reflect historical results; current tests are in `tests/` and `src/*.rs`.
 
 ## Overview
 
@@ -419,7 +421,7 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 | 8 | [`edge_policy_conflicting_layers_deny_wins`](tests/edge_cases.rs) | Global Allow + Tenant Deny | Deny wins (strictest layer) |
 | 9 | [`edge_srr_and_policy_disagree_deny_wins`](tests/edge_cases.rs) | SRR Deny + ABAC Allow | max_strict → Deny |
 | 10 | [`edge_max_strict_delay_vs_require_approval`](tests/edge_cases.rs) | Delay(300ms) vs RequireApproval | RequireApproval wins (strictness 4 > 3) |
-| 11 | [`edge_max_strict_strictness_ordering_complete`](tests/edge_cases.rs) | All 6 types pairwise (15 combinations) | Strictness order: Allow<AuditOnly<Throttle<Delay<RequireApproval<Deny |
+| 11 | [`edge_max_strict_strictness_ordering_complete`](tests/edge_cases.rs) | All 5 types pairwise (10 combinations) | Strictness order: Allow<AuditOnly<Delay<RequireApproval<Deny |
 | 12 | [`edge_empty_policy_directory`](tests/edge_cases.rs) | Empty config/policies/ dir | PolicyEngine loads with 0 rules, returns Allow |
 | 13 | [`edge_nonexistent_policy_directory`](tests/edge_cases.rs) | Missing policy dir path | Returns error (not panic) |
 | 14 | [`edge_empty_registry_file`](tests/edge_cases.rs) | Empty TOML `""` | Registry loads with 0 operations |

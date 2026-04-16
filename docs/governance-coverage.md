@@ -20,7 +20,7 @@ All agent execution uses `gvm run` with flags:
 
 > **Wasm policy engine** (`--features wasm`) is disabled by default. The native Rust policy engine is used for all enforcement. Wasm support is an **unsupported experimental feature** for future third-party policy plugin scenarios. Enabling it adds ~10MB to the binary and includes 5 known wasmtime CVEs.
 
-All modes share the same SRR rules, ABAC policies, and config files.
+All modes share the same SRR rules and `gvm.toml` config.
 
 ---
 
@@ -80,7 +80,7 @@ The agent runs inside a Docker container with network-level isolation and transp
 |---------|-----------|-----------|
 | HTTP API calls | **Yes** | Routed through proxy via `HTTP_PROXY` |
 | HTTPS API calls | **Full L7** | Ephemeral CA injected, DNAT 443 → MITM listener |
-| API key injection (HTTPS) | **Yes** | MITM strips agent auth headers, injects from `secrets.toml` |
+| API key injection (HTTPS) | **Yes** | MITM strips agent auth headers, injects from `gvm.toml` |
 | Proxy bypass (direct HTTPS) | **Hardened** | Docker `--internal` network + DNAT redirect |
 | File system reads | Read-only root | `--read-only` Docker flag |
 | File system writes | `/tmp` only | tmpfs, destroyed on exit |

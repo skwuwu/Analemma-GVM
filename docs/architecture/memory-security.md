@@ -186,7 +186,7 @@ match serde_json::from_str::<GVMEvent>(line) {
 
 **Why this is not a practical concern**:
 
-- **Rate limiter eliminates statistical attacks**: Timing attacks require thousands of repeated measurements to extract a signal. The per-agent rate limiter (Throttle) caps request volume, preventing an agent from accumulating enough samples. Exceeding the limit triggers 429 responses that are themselves recorded in the audit trail — the attack attempt becomes a detectable event.
+- **Token budget eliminates statistical attacks**: Timing attacks require thousands of repeated measurements to extract a signal. The per-agent `TokenBudget` (60-slot circular buffer over the last hour) caps request/token volume, preventing an agent from accumulating enough samples. Exceeding the budget triggers 403 responses that are themselves recorded in the audit trail — the attack attempt becomes a detectable event.
 - **The timing signal is redundant**: The Deny decision is already explicitly communicated to the agent via the HTTP 403 status code and `X-GVM-Decision: Deny` response header. An agent learns nothing from timing that it doesn't already know from the response.
 - **Constant-time padding would mask intentional enforcement signals**: IC-2 Delay (300+ ms) is a deliberately visible timing signal designed to give the agent feedback. Padding all responses to a fixed time would conflict with this design intent.
 
@@ -337,7 +337,7 @@ gvm run --microvm agent.py          # MicroVM (Firecracker/KVM, ~100ms) [future]
 | **New: rootfs builder** | Create | Per-interpreter rootfs image pipeline |
 | **New: VMM manager** | Create | Firecracker lifecycle, config, health |
 
-The proxy layer (`proxy.rs`) and all enforcement logic (SRR, ABAC, WAL, Vault) remain unchanged — isolation is orthogonal to governance enforcement.
+The proxy layer (`proxy.rs`) and all enforcement logic (SRR, WAL, Vault) remain unchanged — isolation is orthogonal to governance enforcement.
 
 ---
 

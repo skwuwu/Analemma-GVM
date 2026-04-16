@@ -74,12 +74,12 @@ GVM occupies the **action governance** layer — between the agent runtime and e
 ```
 
 **What makes GVM different:**
-- **Graduated enforcement**: Allow → Delay → RequireApproval → Deny. Not just binary allow/deny
+- **Graduated enforcement**: Allow → AuditOnly → Delay → RequireApproval → Deny. Not just binary allow/deny
 - **Credential isolation**: Agent never holds API keys. Proxy injects post-enforcement
 - **Durable audit**: WAL with Merkle chain. Every decision recorded before forwarding
 - **Runtime isolation**: `gvm run --sandbox` provides namespace+seccomp+MITM. The agent physically cannot bypass the proxy
 - **Provider-agnostic**: Works with any LLM, any framework, any language. It's an HTTP proxy
-- **Cross-layer verification** *(requires SDK — experimental)*: ABAC (what the agent declares) vs SRR (what the HTTP actually is). `max_strict()` catches mismatches. Without SDK, SRR (Layer 2) provides full URL-based governance independently
+- **Transport-layer truth**: SRR reads the actual HTTP method, host, path, and body — not agent-declared headers. An agent cannot lie about what URL it contacts
 
 ---
 

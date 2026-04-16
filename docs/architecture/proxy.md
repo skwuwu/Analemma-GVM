@@ -1,12 +1,14 @@
 # Part 6: Proxy Pipeline
 
-**Source**: `src/proxy.rs`, `src/main.rs` | **Config**: `config/proxy.toml`
+**Source**: `src/proxy.rs`, `src/main.rs` | **Config**: `gvm.toml` + optional `config/proxy.toml`
+
+> **Historical note:** Portions of this document still reference ABAC (Layer 1 policy engine) and `Throttle` (legacy rate-limit decision). Both have been removed. SRR is the sole enforcement layer, and per-agent cost/token limits are enforced by `TokenBudget`. Decision set: `Allow < AuditOnly < Delay < RequireApproval < Deny`.
 
 ---
 
 ## 6.1 Overview
 
-The Proxy Pipeline is the central enforcement point. Every HTTP request — whether SDK-routed or direct — passes through a 3-layer security classification, enforcement decision, and conditional forwarding pipeline. The pipeline integrates all components: Policy Engine (Layer 1), Network SRR (Layer 2), Capability Token injection (Layer 3), Ledger, Vault, and Rate Limiter.
+The Proxy Pipeline is the central enforcement point. Every HTTP request — whether SDK-routed or direct — passes through SRR classification, decision, and conditional forwarding. The pipeline integrates: SRR engine, TokenBudget, Credential injection, Ledger (WAL), and Vault.
 
 **Design principle**: The proxy is a transparent enforcement layer. Agent code is unchanged. The agent's HTTP traffic is routed through the proxy (via `HTTP_PROXY` env or SDK configuration), and the proxy enforces governance before forwarding.
 

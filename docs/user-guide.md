@@ -9,7 +9,7 @@ You don't need to write rules. GVM learns from your agent's traffic and suggests
 gvm watch my_agent.py
 
 # 2. Suggest — auto-generate rules from the audit log
-gvm suggest --from data/wal.log > config/srr_network.toml
+gvm suggest --from data/wal.log >> gvm.toml
 
 # 3. Run — enforce the generated rules
 gvm run my_agent.py
@@ -19,7 +19,7 @@ Step 1 records every API call to the audit log (`data/wal.log`). Step 2 reads th
 
 That's the entire workflow. Everything below is optional — use it when you need it.
 
-> **First time on a fresh checkout?** Run `gvm init --industry saas` (or `--industry finance`) to drop a starter `config/` directory with sensible SRR rules, a `proxy.toml`, and an empty `secrets.toml`. Skip this if you already have a `config/` directory you want to keep.
+> **First time on a fresh checkout?** Run `gvm init --industry saas` (or `--industry finance`) to drop a starter `gvm.toml` (unified config: rules + credentials + budget + filesystem + seccomp). Skip this if you already have a config you want to keep.
 
 ---
 
@@ -72,7 +72,7 @@ After the agent finishes, GVM shows each unknown URL and asks whether to Allow o
   ✓ Rule added: catfact.ninja GET → Allow
 ```
 
-Rules are written directly to `srr_network.toml`. No manual editing needed.
+Rules are appended directly to `gvm.toml`. No manual editing needed.
 
 ### `gvm suggest`
 
@@ -85,13 +85,13 @@ gvm watch --output json my_agent.py > session.jsonl
 gvm suggest --from session.jsonl --decision allow > new-rules.toml
 ```
 
-Reads the audit log (or a watch JSON log) and generates TOML rules for every URL that hit Default-to-Caution. Review the file, then merge into `config/srr_network.toml`.
+Reads the audit log (or a watch JSON log) and generates TOML rules for every URL that hit Default-to-Caution. Review the file, then merge into `gvm.toml`.
 
 ---
 
 ## Level 2: Custom — Rules and Secrets
 
-### SRR Rules (`config/srr_network.toml`)
+### SRR Rules (`gvm.toml` — `[[rules]]`)
 
 URL pattern matching. No SDK needed.
 
@@ -118,11 +118,12 @@ decision = { type = "Deny", reason = "Wire transfers blocked" }
 | Type | What happens |
 |------|-------------|
 | `Allow` | Pass immediately |
+| `AuditOnly` | Pass but force synchronous WAL write |
 | `Delay { milliseconds: 300 }` | Pause then pass |
-| `Deny { reason: "..." }` | Block with 403 |
 | `RequireApproval` | Hold for human approval (clear the queue with `gvm approve`) |
-| `Throttle { max_per_minute: 10 }` | Rate limit |
-| `AuditOnly` | Pass but flag |
+| `Deny { reason: "..." }` | Block with 403 |
+
+Strictness order: `Allow (0) < AuditOnly (1) < Delay (2) < RequireApproval (3) < Deny (4)`. When multiple rules match, the strictest wins.
 
 **Hot-reload:** Edit the file → `gvm reload`. No restart needed.
 
@@ -145,7 +146,7 @@ decision = { type = "Allow" }
 
 > **Tip:** Don't write rules by hand. Use `gvm watch` + `gvm suggest` to generate them, then edit as needed.
 
-### Credential Injection (`config/secrets.toml`)
+### Credential Injection (`gvm.toml` — `[credentials.*]`)
 
 ```toml
 [credentials."api.stripe.com"]
@@ -158,14 +159,14 @@ header = "x-api-key"
 value = "SG.your_sendgrid_key"
 ```
 
-| Agent code | secrets.toml has host? | Result |
-|------------|----------------------|--------|
+| Agent code | gvm.toml has host? | Result |
+|------------|-------------------|--------|
 | No auth header | Yes | Proxy injects key |
 | Own auth header | Yes | Proxy **replaces** with managed key |
 | Own auth header | No | Agent's key passes through |
 | No auth header | No | Sent without auth |
 
-Existing agents with hardcoded keys work immediately — no code changes. When ready, move keys to `secrets.toml` for centralized management.
+Existing agents with hardcoded keys work immediately — no code changes. When ready, move keys to `gvm.toml` for centralized management. File permissions must be `0600` (checked at load).
 
 > **Scope:** HTTP headers only. LLM SDKs require keys at initialization — use `ANTHROPIC_API_KEY` env var for that. Credential injection is for tool API calls (Stripe, Slack, GitHub, etc.).
 
@@ -309,31 +310,6 @@ gvm run --sandbox --memory 1g --cpus 0.5 -- node agent.js
 > gvm run --sandbox --sandbox-timeout 0 -- node agent.js   # fresh start
 > ```
 
-### ABAC Policies (`config/policies/`) — Experimental
-
-> Requires the Python SDK (`@ic` decorator), which is experimental. ABAC policies are evaluated only when the SDK injects operation metadata. For most use cases, SRR rules (Level 2) are sufficient.
-
-Semantic rules that go beyond URL matching — evaluates operation type, data sensitivity, and agent identity.
-
-```toml
-# config/policies/global.toml
-[[rules]]
-id = "block-critical-delete"
-priority = 1
-layer = "Global"
-
-[rules.match]
-operation = { starts_with = "gvm.data.delete" }
-[rules.match.context]
-sensitivity = { equals = "Critical" }
-
-[rules.decision]
-type = "Deny"
-reason = "Critical data deletion is forbidden"
-```
-
-Policy hierarchy: `global.toml` → `tenant-{name}.toml` → `agent-{id}.toml`. Lower layers can only be stricter.
-
 ### Shadow Mode
 
 ```bash
@@ -416,7 +392,7 @@ The DNS proxy classifies each query into a tier based on whether the domain is k
 gvm run --sandbox --watch agent.py
 
 # 2. gvm suggest generates rules — these become the "known hosts" for DNS free-pass
-gvm suggest --from session.jsonl > config/srr_network.toml
+gvm suggest --from session.jsonl >> gvm.toml
 
 # 3. Enforce mode — known domains resolve instantly, unknown get 200ms delay
 gvm run --sandbox agent.py
@@ -456,7 +432,7 @@ This is a test-only knob — do not use in production.
 ```bash
 gvm events list --agent my-agent --since 5m      # What happened?
 gvm check --host api.bank.com --method POST       # Dry-run same request
-# Fix: edit config/srr_network.toml → hot-reload
+# Fix: edit gvm.toml → hot-reload
 ```
 
 ### Agent Delayed (300ms)
@@ -493,7 +469,7 @@ The commands you use every day:
 |---------|--------|---------|
 | `gvm run` | Run an agent under governance — watch, enforce, or sandbox | `gvm run --sandbox agent.py` |
 | `gvm status` | Is the proxy alive? How many rules? Any problems? | `gvm status --json \| jq .srr_rules` |
-| `gvm suggest` | Auto-generate security rules from a recorded session — no manual TOML editing | `gvm suggest --from session.jsonl > config/srr_network.toml` |
+| `gvm suggest` | Auto-generate security rules from a recorded session — no manual TOML editing | `gvm suggest --from session.jsonl >> gvm.toml` |
 | `gvm reload` | Apply rule changes without restarting the proxy or killing running agents | `gvm reload` |
 | `gvm stop` | Shut down the proxy cleanly, flush the audit trail, release all sandbox resources | `gvm stop` |
 
@@ -512,7 +488,7 @@ The commands you use every day:
 |---------|--------|-----------|
 | `gvm suggest` | Convert a watch session into SRR rules. Eliminates manual rule writing — the agent teaches GVM what it needs. | `--from <jsonl>`, `--decision allow\|delay\|deny` |
 | `gvm check` | Dry-run: "would this request be allowed?" Test rules before deploying them to production. | `--host H`, `--method M`, `--path P`, `--operation O`, `--json` |
-| `gvm reload` | Hot-reload rules from disk. Edit `config/srr_network.toml`, run this, new rules take effect on the next request. | — |
+| `gvm reload` | Hot-reload rules from disk. Edit `gvm.toml`, run this, new rules take effect on the next request. | — |
 | `gvm approve` | Human-in-the-loop: review and approve/deny requests that hit RequireApproval rules. | `--auto-deny` (CI: reject all after timeout) |
 
 **Monitoring & Audit**
@@ -595,7 +571,7 @@ segfault, etc.), `gvm status` will tell you loudly:
 - [ ] Configure NATS for WAL replication (**critical for long-term audit retention** — without NATS, rotated WAL segments are permanently deleted after 1GB local storage)
 - [ ] Set credential policy to `Deny` (not Passthrough)
 - [ ] Enable `--shadow-mode strict`
-- [ ] `chmod 600 config/secrets.toml`
+- [ ] `chmod 600 gvm.toml`
 - [ ] Review SRR: no catch-all Allow
 - [ ] Set up `gvm stats` + `gvm audit verify` in cron
 - [ ] Test with `gvm check` before deploying policy changes
@@ -725,4 +701,4 @@ matrix, see [`packaging/systemd/README.md`](../packaging/systemd/README.md).
 
 ---
 
-> **Under the hood:** [Architecture](overview.md) | [SRR Rules](srr.md) | [ABAC Policies](policy.md) | [Merkle WAL](architecture/ledger.md) | [Security Model](security-model.md) | [Governance Coverage](governance-coverage.md)
+> **Under the hood:** [Architecture](overview.md) | [SRR Rules](srr.md) | [Merkle WAL](architecture/ledger.md) | [Security Model](security-model.md) | [Governance Coverage](governance-coverage.md)

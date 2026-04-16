@@ -43,13 +43,13 @@ If an attacker has root access to the host, GVM — like any userspace process �
 
 **Two distinct timing signals exist**:
 
-1. **Engine-level** (SRR/ABAC evaluation): Allow ~28 ns, Deny ~63 ns. The ~35 ns difference is 3-5 orders of magnitude below network jitter (0.1-10 ms) — practically unobservable.
+1. **Engine-level** (SRR evaluation): Allow ~28 ns, Deny ~63 ns. The ~35 ns difference is 3-5 orders of magnitude below network jitter (0.1-10 ms) — practically unobservable.
 
 2. **End-to-end** (response time): Deny returns immediate 403 (~3 ms). Allow/Delay forwards to upstream (~50-500 ms). This difference is **architecturally inherent to every proxy-based enforcement system** (Envoy, OPA, Nginx). A blocked request is always faster than a forwarded one because no upstream call is made. This is not a GVM-specific vulnerability.
 
 **Why timing attacks are impractical**:
 
-- **Rate limiter prevents statistical sampling**: Timing attacks require thousands of repeated measurements. Per-agent rate limiting (Throttle) caps request volume, preventing sample accumulation. Rate limit violations (429) are logged as auditable events — the attack attempt is self-documenting.
+- **Token budget caps sample volume**: Timing attacks require thousands of repeated measurements. The per-agent `TokenBudget` (60-slot circular buffer over the last hour) bounds request/token volume; exceeding it produces a 403 with a `budget_exceeded` reason logged to WAL — the attack attempt is self-documenting.
 - **The signal is redundant**: Deny decisions are explicitly communicated via HTTP 403 and `X-GVM-Decision: Deny` headers. Timing reveals nothing the response doesn't already state.
 - **Constant-time padding conflicts with design**: IC-2 Delay (300+ ms) is an intentionally visible timing signal for enforcement feedback.
 
@@ -158,15 +158,14 @@ After sandbox network setup, the agent can only reach: (1) GVM proxy via TCP on 
 
 ### 4. ReDoS in Policy Regex — Non-Issue
 
-**Attack**: A crafted path pattern in `operation_registry.toml` or `srr_network.toml` could cause catastrophic backtracking in the regex engine, leading to CPU exhaustion.
+**Attack**: A crafted path pattern in `gvm.toml` could cause catastrophic backtracking in the regex engine, leading to CPU exhaustion.
 
 **Status**: **Not applicable.** GVM uses Rust's `regex` crate (v1), which is automata-based (Thompson NFA → DFA). It guarantees O(n) linear-time matching regardless of pattern complexity — no backtracking, no catastrophic performance. This is architecturally immune to ReDoS, unlike PCRE/Python `re`/JavaScript regex engines.
 
 Regex usage in GVM:
-- **ABAC policy engine** (`policy.rs`): `Operator::Regex` — pre-compiled at policy load time, `re.is_match()` at runtime
 - **SRR network rules** (`srr.rs`): `path_regex` field — pre-compiled at TOML load time, `re.is_match()` at runtime
 
-Both paths pre-compile regex at config load time (fail-fast on invalid patterns) and reuse compiled patterns at runtime — zero per-request compilation overhead. Policy files are admin-controlled, not agent-controlled, providing an additional layer of defense-in-depth.
+Patterns are pre-compiled at config load time (fail-fast on invalid patterns) and reused at runtime — zero per-request compilation overhead. Config files are admin-controlled, not agent-controlled, providing an additional layer of defense-in-depth.
 
 ---
 
@@ -198,7 +197,7 @@ Both paths pre-compile regex at config load time (fail-fast on invalid patterns)
 
 ### 6.1 Config File Tamper Detection (Implemented)
 
-**Attack**: An attacker modifies policy files (SRR rules, ABAC policies, operation registry) on disk between proxy restarts, weakening governance without leaving an obvious trace.
+**Attack**: An attacker modifies `gvm.toml` (SRR rules, credentials, budget) on disk between proxy restarts, weakening governance without leaving an obvious trace.
 
 **Mitigation (v1)**: At startup, the proxy records SHA-256 hashes of all loaded config files as a `gvm.system.config_load` event in the Merkle chain via `append_durable()`. The hashes are stored in the event's `context` field as `label → hex digest` pairs.
 
@@ -250,7 +249,7 @@ Both paths pre-compile regex at config load time (fail-fast on invalid patterns)
 
 **Planned mitigation (v2)**: GraphQL query parser that inspects the `query` field for mutation names, field names, and aliases. Until then, GraphQL endpoints should be treated as elevated risk — consider Deny-by-default for GraphQL endpoints with allowlisted `operationName` values only.
 
-**Why acceptable now**: Current deployments use the operationName-based rules as defense-in-depth behind ABAC policy layer. The ABAC layer evaluates semantic operation names independently of the HTTP payload, so a GraphQL alias bypass only evades Layer 2 SRR, not Layer 1 policy.
+**Why acceptable now**: Current deployments are expected to pair payload rules with URL-based Deny rules for high-risk GraphQL endpoints. An alias bypass evades the `operationName` match but cannot evade a URL-level Deny on the mutation endpoint itself.
 
 ---
 
@@ -484,7 +483,6 @@ The following issues have been identified and **fixed** as they affect normal op
 | Import chain attack (lazy import in except block) | Move `from gvm.errors import ...` to module top-level in `decorator.py` | Fixed |
 | Checkpoint Merkle verification hardcoded `"true"` | Real content hash + chain verification; proxy computes SHA-256 of plaintext and chains with previous checkpoint | Fixed (v0.2) |
 | `transport.method` always empty in WAL events | Capture `request.method()` before classification and inject into event | Fixed (v0.2.5) |
-| Throttle path always sets `Confirmed` status | Check upstream `response.status().is_success()` before setting EventStatus | Fixed (v0.2.5) |
 | Deny `ic_level` was 3 (same as RequireApproval) | Corrected to `ic_level: 4` matching IC-4 classification | Fixed (v0.2.5) |
 
 ---
@@ -510,42 +508,9 @@ A comprehensive security audit was conducted covering all Rust proxy modules, Py
 
 ## Deployment Guide
 
-### ABAC Context Attribute Policy
-
-ABAC policy rules only match when the referenced context attribute exists. If an agent omits a context attribute (e.g., `context.amount`), rules conditioned on that attribute will not fire.
-
-**This is by design** — ABAC evaluates declared attributes. However, Layer 2 (SRR) independently inspects the actual HTTP target URL, so even if Layer 1 (ABAC) is bypassed via attribute omission, SRR catches the real operation:
-
-```
-Agent omits context.amount → ABAC rule "amount > 500 → Delay" does not fire → Allow
-SRR sees POST api.bank.com/transfer → Deny
-max_strict(Allow, Deny) = Deny ← SRR catches it
-```
-
-**Recommendation**: For critical operations, write SRR rules matching the target URL/method rather than relying solely on ABAC context attributes. If ABAC-only enforcement is required, add a complementary rule:
-
-```toml
-# Deny operations that should declare amount but don't
-[[rules]]
-id = "missing-amount-deny"
-field = "operation"
-operator = "StartsWith"
-value = "gvm.payment"
-decision = { type = "Deny", reason = "Payment operations must declare context.amount" }
-
-# Override: allow if amount is present and within limits
-[[rules]]
-id = "payment-with-amount"
-priority = 1  # higher priority (evaluated first)
-field = "context.amount"
-operator = "Lte"
-value = 500
-decision = { type = "Allow" }
-```
-
 ### Single-Endpoint APIs (GraphQL, gRPC)
 
-Layer 2 (SRR) is not limited to URL-only inspection. For APIs that multiplex operations over a single endpoint (e.g., `POST /graphql`, `POST /grpc`), SRR supports **payload-level inspection** via `payload_field` and `payload_match`:
+SRR is not limited to URL-only inspection. For APIs that multiplex operations over a single endpoint (e.g., `POST /graphql`, `POST /grpc`), SRR supports **payload-level inspection** via `payload_field` and `payload_match`:
 
 ```toml
 # Block dangerous GraphQL mutations at the network layer
@@ -572,29 +537,26 @@ The proxy parses the request body as JSON and checks the specified field against
 - Matching is literal string equality — no regex, no substring, no case-insensitive comparison
 - When a payload rule is skipped (field missing, wrong type, no match, parse failure, body too large), evaluation **continues to the next rule**, not to Default-to-Caution
 
-This scope is sufficient for GraphQL `operationName` and gRPC method fields, which are always top-level strings. For APIs that encode operation identity in nested fields or numeric values, use ABAC (Layer 1) rules via the SDK instead.
+This scope is sufficient for GraphQL `operationName` and gRPC method fields, which are always top-level strings. For APIs that encode operation identity in nested fields or numeric values, add complementary URL-level Deny rules for high-risk endpoints or enforce at the application layer.
 
 **Body size limit**: Each rule has a configurable `max_body_bytes` (default 64 KB). Bodies exceeding this limit skip payload inspection but continue to subsequent rules, where URL-only rules or the Default-to-Caution fallback (Delay 300 ms) apply.
 
 ---
 
-### Cross-Layer Forgery Threat Taxonomy
+### Agent Forgery Threat Taxonomy
 
-GVM's cross-layer architecture (`max_strict(ABAC, SRR)`) is designed to catch agents that misrepresent their actions. The following taxonomy classifies known forgery attack patterns and maps each to GVM's defense mechanism.
+SRR is the sole enforcement layer and evaluates only transport-layer data (HTTP method, host, URL path, request body) — never agent-declared headers. This property defeats most forgery attempts by construction: the agent cannot lie about what URL it is actually contacting.
 
-**Architecture prerequisite**: ABAC (Layer 1) and SRR (Layer 2) have **completely independent input sources**. ABAC evaluates only SDK-declared headers (`X-GVM-Operation`, `X-GVM-Resource`, `X-GVM-Context`). SRR evaluates only transport-layer data (HTTP method, host, URL path, request body). An attacker cannot influence both layers with a single manipulation — fooling Layer 1 does not affect Layer 2, and vice versa.
+| Attack Type | Description | SRR Sees | GVM Defense |
+|------------|-------------|----------|-------------|
+| **URL Spoofing in Headers** | Agent sets custom headers claiming a different target | Actual HTTP request line and Host header | Non-issue — SRR ignores agent-declared operation/resource headers |
+| **Payload Value Forgery** | Agent sends `{"amount": 50000}` to an endpoint a rule assumed was low-value | SRR inspects only top-level string fields; numeric body values are out of scope | **Partial defense** — write URL-level Deny rules for all high-value endpoints |
+| **GraphQL Alias Bypass** | Mutation aliased without setting `operationName` | SRR matches `operationName` literally | **Partial defense** — pair payload rule with URL-level Deny on the mutation endpoint |
+| **Header Injection** | Agent injects `X-GVM-Decision: Allow` | SRR ignores all `X-GVM-*` headers from agents | Non-issue — proxy strips and ignores injected decision headers |
 
-| Attack Type | Description | Layer 1 (ABAC) Sees | Layer 2 (SRR) Sees | GVM Defense |
-|------------|-------------|---------------------|-------------------|-------------|
-| **Operation Downgrade** | Agent declares `gvm.storage.read` (IC-1) but sends `POST api.bank.com/transfer` | `storage.read` → Allow | `POST /transfer` → Deny | `max_strict(Allow, Deny)` = **Deny** |
-| **Resource Spoofing** | Agent declares `resource.service=internal-api` but targets `api.stripe.com/charges` | Resource matches low-risk policy → Allow | Host `api.stripe.com` matches payment rule → Delay/Deny | Stricter SRR decision wins |
-| **Context Manipulation** | Agent declares `context.amount=10` but sends `{"amount": 50000}` in body | `amount=10` passes `< 500` threshold → Allow | SRR does not inspect numeric body fields (scope limitation) | **Partial defense** — ABAC is fooled, SRR catches only if URL matches a Deny rule. Mitigation: write SRR URL rules for all high-value endpoints |
-| **Attribute Omission** | Agent omits `context.amount` entirely to bypass amount-threshold rules | No matching ABAC rule fires → Allow | SRR evaluates URL independently → depends on URL rules | **Partial defense** — documented in Deployment Guide above. Write complementary ABAC rules that deny operations missing required attributes |
-| **Header Injection** | Agent injects `X-GVM-Decision: Allow` to bypass enforcement | `GVMHeaders` struct has no `decision` field — header is ignored | SRR does not read GVM headers | Non-issue — proxy strips and ignores injected decision headers |
+**Key security property**: Because SRR reads the actual transport request, the agent cannot simultaneously satisfy a safe rule and contact a dangerous endpoint. Its defense surface is the set of URL/method/payload-field patterns the operator writes.
 
-**Key security property**: For operation downgrade and resource spoofing (the most common forgery patterns), `max_strict()` provides complete defense because the attacker cannot simultaneously control both the declared semantics (ABAC input) and the actual transport target (SRR input).
-
-**Known gap**: Context manipulation and attribute omission are partially defended. When the agent lies about *values* within a legitimate operation (correct URL, correct operation name, falsified context), SRR has limited visibility because its payload inspection only covers top-level string fields with exact matching. Defense requires complementary SRR URL rules for high-value endpoints and ABAC rules that enforce mandatory attributes.
+**Known gap**: Payload value forgery is only partially defended. When the agent lies about *values* within a legitimate operation (correct URL, correct method), SRR has limited visibility because its payload inspection only covers top-level string fields with exact matching. Defense requires URL-level Deny rules on high-value endpoints or an application-layer check at the server.
 
 ---
 
@@ -635,7 +597,7 @@ Without network-level isolation, any process on the same network can send reques
 | Agent spoofing | 1 | Rate limiter bucket isolation under spoofed agent IDs |
 | Config poisoning | 3 | Malformed TOML rejected; catch-all Deny blocks all traffic |
 | Config integrity | 2 | Config file SHA-256 hashes recorded in Merkle chain; missing files → `"unavailable"` |
-| ABAC bypass | 1 | Attribute omission bypass documented; SRR defense-in-depth verified |
+| Payload forgery | 1 | Payload value forgery bypass documented; URL-level Deny rules required for high-value endpoints |
 | Resource exhaustion | 2 | Rate limiter MAX_BUCKETS overflow + eviction; limits enforced post-cleanup |
 | JWT auth | 17 | Issue/verify roundtrip, expiration, signature tampering, wrong secret, malformed tokens, secret zeroing |
 
@@ -790,7 +752,7 @@ Use `--no-mitm` to disable MITM and fall back to CONNECT relay (domain-level onl
 | **LLM thinking trace** | MITM relay streams response chunks — cannot buffer full body for trace extraction | Thinking hash not captured on MITM path. Use cooperative mode with SDK for full trace capture |
 | **IC-3 RequireApproval** | MITM cannot hold TLS keep-alive stream for human approval | IC-3 treated as Deny on MITM path. Use cooperative mode with SDK for IC-3 approval flow |
 | **Shadow Mode** | MITM has no SDK headers for intent verification | Intent store claim/verify not supported on MITM path. SRR enforcement still active |
-| **WAL coverage gaps (P2 remaining)** | Pre-classification failures (JWT 401, missing host 400) do not record to WAL — these occur before governance classification and have no decision to audit. Circuit breaker (503) is intentionally unrecorded (WAL already failing). All P1 gaps fixed: SRR lock poison, rate limit, shadow STRICT, Deny, RequireApproval, Throttle, classification error — all record to WAL on both MITM and proxy paths. |
+| **WAL coverage gaps (P2 remaining)** | Pre-classification failures (JWT 401, missing host 400) do not record to WAL — these occur before governance classification and have no decision to audit. Circuit breaker (503) is intentionally unrecorded (WAL already failing). All P1 gaps fixed: SRR lock poison, token budget exceeded, shadow STRICT, Deny, RequireApproval, classification error — all record to WAL on both MITM and proxy paths. |
 | **Intermittent CONNECT TLS handshake eof** | Node.js undici HTTP client occasionally resets the 2nd CONNECT before sending ClientHello. Self-recovers on 3rd attempt (~2s delay). No data loss — WAL records all successful requests. | Under investigation. Likely client-side connection pool race condition after CONNECT tunnel close. `Connection: close` header added to CONNECT response to prevent upgrade reuse. Does not affect stress test pass rate (289 API calls, 0 TLS errors in steady state). |
 
 ## Overlayfs Trust-on-Pattern — Known Limitations

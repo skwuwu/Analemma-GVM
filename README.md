@@ -53,7 +53,7 @@ You don't need to write rules by hand. Watch what your agent does, let GVM gener
 gvm run --sandbox --watch agent.py
 
 # 2. Suggest — turn the recorded session into rules
-gvm suggest --from session.jsonl > config/srr_network.toml
+gvm suggest --from session.jsonl >> gvm.toml
 
 # 3. Enforce — apply those rules
 gvm run --sandbox agent.py
@@ -101,7 +101,7 @@ Use cooperative mode for agents you trust or wrote yourself (Python `requests`, 
 - gvm-proxy RSS: ~11MB idle, ~13MB under load (measured on EC2 t3.medium)
 - Sandbox MITM overhead: +14ms TTFB per request ([measured on EC2 t3.medium](docs/test-report.md#912-end-to-end-overhead-benchmark-2026-04-06-ec2-t3medium))
 - Sandbox startup: ~928ms one-time (comparable to `docker run`)
-- Policy evaluation < 1μs (SRR + ABAC, Criterion benchmark)
+- Policy evaluation < 1μs (SRR, Criterion benchmark)
 - WAL with Merkle chain, size-based rotation (100MB x 10 segments). Local storage — bring your own retention (S3, GCS, etc)
 - 329 tests, 30-min chaos stress test (proxy kill, network partition, disk pressure) — [PASS](docs/test-report.md#hermes-agent-validation-2026-04-15-ec2-t3medium)
 - Tested with [OpenClaw](https://github.com/openclaw/openclaw) and [hermes-agent](https://github.com/NousResearch/hermes-agent) — GVM is framework-independent; any agent that makes HTTP calls is governed

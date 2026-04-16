@@ -7,28 +7,80 @@
 
 ## Configuration
 
+GVM uses a single unified config file: `gvm.toml`. Everything the user cares about (rules, credentials, cost budget, filesystem patterns, seccomp) lives there. `proxy.toml` remains as an optional infrastructure-tuning file (server port, WAL paths, NATS, DNS listen port); most users don't need it.
+
 ### Config File Location
 
-The proxy loads configuration in this order (first match wins):
+Load order (first match wins for each concern):
 
-1. `GVM_CONFIG` environment variable
-2. `config/proxy.toml` (current working directory)
-3. `~/.config/gvm/proxy.toml` (home directory)
+1. `GVM_CONFIG` environment variable (points at `gvm.toml`)
+2. `gvm.toml` (current working directory)
+3. `~/.config/gvm/gvm.toml`
 4. Built-in defaults
+
+Optional `proxy.toml` is loaded from `config/proxy.toml` or `~/.config/gvm/proxy.toml` if present. Fields absent from `proxy.toml` use built-in defaults.
 
 ### Environment Variables
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `GVM_CONFIG` | Proxy config file path | `config/proxy.toml` |
+| `GVM_CONFIG` | Path to `gvm.toml` | `gvm.toml` |
 | `GVM_ENV` | `production` disables dev features (host overrides) | `development` |
 | `GVM_VAULT_KEY` | AES-256 key for Vault encryption (64 hex chars) | Random ephemeral key |
-| `GVM_SECRETS_KEY` | Encryption key for `secrets.toml` | None (plaintext) |
+| `GVM_SECRETS_KEY` | Encryption key for credential block in `gvm.toml` | None (plaintext + `0600`) |
 | `GVM_PROXY_URL` | Override proxy URL in Python SDK | `http://127.0.0.1:8080` |
 | `GVM_SHADOW_MODE` | Shadow Mode: `strict`, `cautious`, `permissive`, `disabled` | `disabled` |
 | `RUST_LOG` | Proxy log level | `info` |
 
-### Proxy Configuration (`config/proxy.toml`)
+### Unified Config (`gvm.toml`)
+
+```toml
+# ─── Network rules (SRR) ───
+[[rules]]
+pattern = "api.anthropic.com"
+method = "POST"
+decision = { type = "Allow" }
+
+[[rules]]
+pattern = "api.github.com/repos/*/pulls/*/merge"
+method = "PUT"
+decision = { type = "RequireApproval" }
+
+[[rules]]
+pattern = "api.github.com/repos/*/git/refs/*"
+method = "DELETE"
+decision = { type = "Deny", reason = "Branch deletion blocked" }
+
+# ─── API credentials ───
+[credentials."api.anthropic.com"]
+type = "ApiKey"
+header = "x-api-key"
+value = "sk-ant-..."
+
+[credentials."api.stripe.com"]
+type = "Bearer"
+token = "sk_live_..."
+
+# ─── Cost / token budget ───
+[budget]
+max_tokens_per_hour = 100000
+max_cost_per_hour = 1.00
+
+# ─── Filesystem governance ───
+[filesystem]
+auto_merge = ["*.csv", "*.pdf", "*.txt", "*.png"]
+manual_commit = ["*.sh", "*.py", "*.js", "*.json"]
+discard = ["/tmp/*", "*.log", "__pycache__/*"]
+
+# ─── Seccomp profile ───
+[seccomp]
+profile = "default"    # "default" | "strict" | "custom"
+# custom_path = "./my-seccomp.json"
+```
+
+> **Permissions:** `gvm.toml` must be `0600` when credentials are present (checked at load). Use `GVM_SECRETS_KEY` to encrypt the credential block for production.
+
+### Infrastructure Tuning (`config/proxy.toml`, optional)
 
 ```toml
 [server]
@@ -39,56 +91,34 @@ default_decision = { type = "Delay", milliseconds = 300 }  # Fail-Close default
 ic1_async_ledger = true       # Async WAL for IC-1 reads (higher throughput)
 ic1_loss_threshold = 0.001    # Tolerate 0.1% WAL loss for IC-1
 
-# What agents see when blocked
-[enforcement.on_block]
-deny = "halt"                    # Stop immediately
-require_approval = "soft_pivot"  # Suggest alternatives
-throttle = "rollback"            # Auto-rollback on rate limit
-infrastructure_failure = "halt"  # Halt if WAL fails
-
-[srr]
-network_file = "config/srr_network.toml"
-semantic_file = "config/srr_semantic.toml"  # Optional: semantic SRR rules
-hot_reload = true                # Live-reload without restart
-
-[policies]
-directory = "config/policies/"
-hot_reload = true                # Live-reload without restart
-
-[secrets]
-file = "config/secrets.toml"
-key_env = "GVM_SECRETS_KEY"
-
 # DNS governance (Layer 0). Default: enabled.
-# Disable with --no-dns-governance CLI flag or set enabled = false.
 [dns]
-enabled = true       # Set to false to disable DNS governance entirely
-listen_port = 5353   # Local UDP port for the DNS proxy
+enabled = true
+listen_port = 5353
 
 # Dev-only: remap hosts to local mock server. Ignored when GVM_ENV=production.
 [dev]
 host_overrides = { "gmail.googleapis.com" = "127.0.0.1:9090" }
 ```
 
+Fields not listed here (NATS, Redis URLs, JWT keys, WAL tuning) retain built-in defaults. See `src/config.rs` for the complete schema.
+
 ---
 
-## API Key Management
+## Credential Types
 
-### Credential Types (`config/secrets.toml`)
+Credentials live under `[credentials."<host>"]` in `gvm.toml`:
 
 ```toml
-# Bearer token
 [credentials."api.slack.com"]
 type = "Bearer"
 token = "xoxb-your-slack-token"
 
-# API key with custom header
 [credentials."api.stripe.com"]
 type = "ApiKey"
 header = "Authorization"
 value = "Bearer sk_test_your-stripe-key"
 
-# OAuth2
 [credentials."api.google.com"]
 type = "OAuth2"
 access_token = "ya29.access-token"
@@ -101,50 +131,25 @@ expires_at = "2026-12-31T00:00:00Z"
 - **Development** (default `Passthrough`): No credential configured → request passes through as-is
 - **Production** (`Deny`): No credential → request rejected. Prevents agents from using their own keys.
 
-In production, set `GVM_SECRETS_KEY` to encrypt `secrets.toml`. Plaintext is for development only.
+In production, set `GVM_SECRETS_KEY` to encrypt the credential block. Plaintext is for development only and requires `chmod 600 gvm.toml`.
 
 ---
 
-## Policy Reference
-
-### ABAC Conditions
-
-| Field | Example Values |
-|-------|---------------|
-| `operation` | `gvm.payment.charge`, `gvm.messaging.send` |
-| `resource.sensitivity` | `Low`, `Medium`, `High`, `Critical` |
-| `resource.tier` | `Internal`, `External`, `CustomerFacing` |
-| `resource.service` | `gmail`, `stripe`, `slack` |
-| `agent_id` | `finance-001` |
-| `tenant_id` | `acme` |
-
-### ABAC Operators
-
-`Eq`, `EndsWith`, `StartsWith`, `Contains`
+## Decision Reference
 
 ### Decision Types
 
-| Type | Fields | IC Level | Block response `ic_level` |
-|------|--------|----------|--------------------------|
-| `Allow` | — | IC-1 | — (not blocked) |
-| `Delay` | `milliseconds` | IC-2 | — (forwarded after delay) |
-| `RequireApproval` | `urgency` | IC-3 | 3 |
-| `Deny` | `reason` | — | 4 |
-| `Throttle` | `max_per_minute` | — | 2 (when rate limit exceeded) |
+Strictness order (total): `Allow (0) < AuditOnly (1) < Delay (2) < RequireApproval (3) < Deny (4)`.
 
-### Custom Operations (`config/operation_registry.toml`)
+| Type | Fields | Behavior |
+|------|--------|----------|
+| `Allow` | — | Pass through; async WAL write |
+| `AuditOnly` | — | Pass through; synchronous WAL write before forwarding |
+| `Delay` | `milliseconds` | WAL-first write, wait, then forward |
+| `RequireApproval` | `urgency?` | Hold on admin port; `gvm approve` or timeout (503) |
+| `Deny` | `reason` | Block with 403 |
 
-```toml
-[[custom]]
-name = "custom.acme.banking.wire_transfer"
-vendor = "acme"
-version = 1
-default_ic = 3
-required_context = ["amount", "currency", "destination_bank"]
-maps_to = "gvm.payment.charge"
-```
-
-Custom operations require a vendor prefix (`custom.{vendor}.{name}`) and map to a core operation.
+SRR is the sole enforcement layer on Layer 1. Decisions are deterministic — same request → same decision.
 
 ---
 
@@ -168,25 +173,18 @@ GVMAgent(
 ```python
 @ic(
     operation="gvm.payment.charge",     # Auto-generated if omitted
-    resource=Resource(service="stripe", tier="external", sensitivity="critical"),
-    rate_limit=100,                     # Max invocations/min (optional)
     checkpoint=True,                    # Force checkpoint (optional)
-    amount=None, currency=None,         # Custom ABAC context (optional)
 )
 ```
 
-IC level is inferred from operation name if not explicit:
-- `.read`, `.list` → IC-1
-- `.delete`, `gvm.payment.*`, `gvm.identity.*` → IC-3
-- Everything else → IC-2
+The decorator attaches operation metadata and optionally snapshots agent state for rollback. Enforcement decisions come from SRR on the proxy — the decorator does not evaluate policy.
 
 ### Error Hierarchy
 
 ```
 GVMError                         # Base
 ├── GVMDeniedError               # 403 — Deny decision
-├── GVMApprovalRequiredError     # 403 — RequireApproval (with urgency)
-├── GVMRateLimitError            # 429 — Throttle
+├── GVMApprovalRequiredError     # 403 — RequireApproval
 └── GVMRollbackError             # 403 — Denied + state rolled back
     ├── .operation               # Blocked operation name
     ├── .reason                  # Why it was blocked
@@ -200,8 +198,6 @@ All exceptions include `event_id` for audit trail correlation.
 | Mode | Checkpoints before |
 |------|--------------------|
 | `None` | Never (use `@ic(checkpoint=True)` per-operation) |
-| `"ic2+"` | IC-2 and IC-3 operations |
-| `"ic3"` | IC-3 only |
 | `"all"` | Every `@ic` operation |
 
 Limits: 5MB per checkpoint, 10 retained, conversation history truncated to `max_history_turns`.
@@ -266,7 +262,7 @@ Watch mode runs the agent with all requests allowed through (default). No SRR ru
 - **Cost estimation**: approximate USD cost based on LLM provider/model token pricing
 - **`--output json`**: all events as JSON lines + session summary as JSON object (for piping to `jq`, CI, etc.)
 
-Watch mode generates a temporary allow-all SRR config in the OS temp directory and reloads the proxy via `POST /gvm/reload`. The original SRR rules are restored when watch exits. The user's `srr_network.toml` is never modified.
+Watch mode generates a temporary allow-all SRR config in the OS temp directory and reloads the proxy via `POST /gvm/reload`. The original SRR rules are restored when watch exits. The user's `gvm.toml` is never modified.
 
 ### Agent Execution
 
@@ -298,7 +294,7 @@ Auto-cleanup also runs at the start of every `gvm run --sandbox` — you only ne
 
 When the argument after `--` is not a recognized script file (`.py`, `.js`, `.ts`, `.sh`, `.bash`) or when multiple arguments follow `--`, `gvm run` enters **binary mode**. The specified command is executed with `HTTP_PROXY` and `HTTPS_PROXY` set to route all outbound traffic through the GVM proxy.
 
-Binary mode provides **Layer 2 enforcement only** (SRR URL-based rules). No SDK headers are injected, so ABAC policy evaluation is not available. All audit output goes to stderr to keep stdout clean for piping.
+Binary mode provides full SRR enforcement (URL/method/payload matching). No SDK headers are injected; all audit output goes to stderr to keep stdout clean for piping.
 
 With `--sandbox`, binary mode uses Linux-native isolation (namespaces + seccomp + veth + TC filter) — the same security layers as script sandbox mode.
 
@@ -332,7 +328,7 @@ Register a Shadow Mode intent for pre-flight verification. MCP tools or SDK call
 
 ### `POST /gvm/check`
 
-Dry-run policy evaluation. Evaluates ABAC + SRR without forwarding, WAL writing, or credential injection.
+Dry-run policy evaluation. Evaluates SRR without forwarding, WAL writing, or credential injection.
 
 | Field | Value |
 |-------|-------|
@@ -413,7 +409,7 @@ Proxy-level inspection of LLM API calls — no SDK needed:
 - **Provider allowlist**: Block unauthorized providers
 - **Thinking trace audit**: SHA-256 hash of reasoning content stored in WAL
 
-See [`config/srr_network.toml`](../config/srr_network.toml) for the full rule set.
+See [`gvm.toml`](../gvm.toml) for the full rule set.
 
 ---
 
@@ -553,7 +549,7 @@ Run `gvm check` in CI pipelines to catch unintended permission changes before de
       | grep -q "RequireApproval" || (echo "FAIL: finance agent should require approval" && exit 1)
 ```
 
-This catches policy regressions: adding a new SRR rule that accidentally opens access, or modifying ABAC that changes an agent's permission level.
+This catches policy regressions: adding a new SRR rule that accidentally opens access, or changing rule ordering so a stricter rule becomes unreachable.
 
 ### Proxy Status
 
@@ -577,14 +573,14 @@ Returns proxy health, SRR rule count, WAL status, emergency write count, and Sha
 | `--memory 512m` | cgroup v2 memory limit |
 | `--cpus 1.0` | cgroup v2 CPU limit |
 
-### Secrets File Security
+### Config File Security
 
-On startup, GVM checks `config/secrets.toml` file permissions (Unix only). If group or other users have read access (`mode & 0o077 != 0`), GVM:
-1. Logs a warning: `secrets.toml has insecure permissions`
+On startup, GVM checks `gvm.toml` file permissions (Unix only) when credentials are present. If group or other users have read access (`mode & 0o077 != 0`), GVM:
+1. Logs a warning: `gvm.toml has insecure permissions`
 2. Attempts auto-fix to `0600` (owner read/write only)
 3. If fix fails, continues with a warning (does not block startup)
 
-Best practice: `chmod 600 config/secrets.toml` before first use.
+Best practice: `chmod 600 gvm.toml` before first use.
 
 ---
 

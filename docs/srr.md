@@ -1,12 +1,12 @@
 # Part 3: Network SRR Engine
 
-**Source**: `src/srr.rs` | **Config**: `config/srr_network.toml`
+**Source**: `src/srr.rs` | **Config**: `gvm.toml` (`[[rules]]` section)
 
 ---
 
 ## 3.1 Overview
 
-The Network SRR (Security Rule Router) is Layer 2 of the 3-layer security model. It provides **URL-based defense** independent of semantic operation headers. Even if an agent lies about its operation (header forgery), the SRR inspects the actual HTTP target and enforces rules based on method, host, path, and optionally request body.
+The Network SRR (Simple Request Rules) is the sole enforcement layer in GVM. It provides **transport-layer defense** independent of agent-declared semantics. Even if an agent tries to misrepresent its operation, SRR inspects the actual HTTP target and enforces rules based on method, host, path, and optionally request body.
 
 **Design principle**: The SRR is the bypass-proof safety net. The agent SDK cannot influence SRR evaluation because it operates on transport-layer data (URL, method), not semantic headers.
 
@@ -180,7 +180,7 @@ The SRR rule set can be reloaded at runtime without restarting the proxy via `PO
 **Reload flow**:
 
 1. Proxy receives `POST /gvm/reload`
-2. Loads and parses the SRR config file (`config/srr_network.toml`)
+2. Loads and parses the SRR section of `gvm.toml`
 3. Pre-compiles all regex patterns, validates all rules
 4. On **success**: acquires a write lock on the SRR and atomically swaps the entire rule set. Returns `200 OK` with the new rule count.
 5. On **parse failure**: existing rules are **preserved unchanged**. Returns `400 Bad Request` with the parse error. The proxy continues operating with the previous rules.
@@ -274,4 +274,4 @@ The agent's lie is caught at Layer 2 regardless of what it declared at Layer 1.
 
 ---
 
-[← Part 2: ABAC Policy](policy.md) | [Part 4: WAL-First Ledger →](architecture/ledger.md)
+[← Architecture Overview](overview.md) | [WAL-First Ledger →](architecture/ledger.md)

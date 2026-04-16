@@ -349,7 +349,7 @@ Explicitly stateful exceptions (documented here as required by this rule):
 `max_strict()` defines a total ordering on enforcement decisions:
 
 ```
-Allow (0) < AuditOnly (1) < Throttle (2) < Delay (3) < RequireApproval (4) < Deny (5)
+Allow (0) < AuditOnly (1) < Delay (2) < RequireApproval (3) < Deny (4)
 ```
 
 This ordering must be:

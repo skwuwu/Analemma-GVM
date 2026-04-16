@@ -3,6 +3,8 @@
 **Source**: `sdk/python/gvm/`
 
 > **Experimental**: The Python SDK is not yet stabilized. Checkpoint/rollback, `GVMAgent`, and `@ic` decorator APIs may change. **GVM's core value is zero-code-change governance** — the proxy alone provides URL rules, credential injection, and audit trail without any SDK. Use the SDK only if you need intent verification or checkpoint/rollback, and expect breaking changes.
+>
+> **Historical note:** References to ABAC policy evaluation, `Throttle` / `GVMRateLimitError`, and `max_strict(ABAC, SRR)` in this document reflect an older architecture. ABAC has been removed — SRR is the sole enforcement layer — and rate limiting is now handled by `TokenBudget` (returns 403, not 429). The SDK still provides `@ic` for operation tagging and checkpointing, but policy decisions come from SRR on the proxy.
 
 ---
 
