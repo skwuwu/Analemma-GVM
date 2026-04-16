@@ -317,6 +317,101 @@ impl GvmIntegrityContext {
     }
 }
 
+/// Report of integrity-chain verification over a WAL file.
+pub struct IntegrityChainReport {
+    /// Number of `gvm.system.config_load` events with a valid `previous_state` link.
+    pub valid_links: usize,
+    /// Total number of `gvm.system.config_load` events found.
+    pub total_config_loads: usize,
+    /// First event_id where the chain broke, or `None` if intact.
+    pub first_break: Option<String>,
+}
+
+/// Scan a WAL file for `gvm.system.config_load` events and verify the integrity-context
+/// chain: each event's `previous_state` must equal the preceding event's `config_hash`.
+///
+/// Detects manual WAL edits, truncation of config_load events, or forged
+/// integrity contexts. Pure WAL-parsing — safe to run in both the proxy
+/// (startup) and CLI (`gvm audit verify`) without duplicating logic.
+pub fn verify_integrity_chain(wal_path: &std::path::Path) -> IntegrityChainReport {
+    use std::io::BufRead;
+
+    let file = match std::fs::File::open(wal_path) {
+        Ok(f) => f,
+        Err(_) => {
+            return IntegrityChainReport {
+                valid_links: 0,
+                total_config_loads: 0,
+                first_break: None,
+            }
+        }
+    };
+
+    let reader = std::io::BufReader::new(file);
+    let mut prev_config_hash: Option<String> = None;
+    let mut valid_links = 0usize;
+    let mut total_config_loads = 0usize;
+    let mut first_break: Option<String> = None;
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        if parsed.get("operation").and_then(|v| v.as_str()) != Some("gvm.system.config_load") {
+            continue;
+        }
+
+        let Some(ctx) = parsed.pointer("/context/_integrity_context").cloned() else {
+            continue;
+        };
+
+        total_config_loads += 1;
+        let current_hash = ctx.get("config_hash").and_then(|v| v.as_str());
+        let claimed_prev = ctx.get("previous_state").and_then(|v| v.as_str());
+
+        match (&prev_config_hash, claimed_prev) {
+            (None, _) => {
+                // First config_load we see — cannot verify; accept.
+                valid_links += 1;
+            }
+            (Some(expected), Some(claimed)) if expected == claimed => {
+                valid_links += 1;
+            }
+            (Some(_), _) => {
+                if first_break.is_none() {
+                    let event_id = parsed
+                        .get("event_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    first_break = Some(event_id);
+                }
+            }
+        }
+
+        if let Some(hash) = current_hash {
+            prev_config_hash = Some(hash.to_string());
+        }
+    }
+
+    IntegrityChainReport {
+        valid_links,
+        total_config_loads,
+        first_break,
+    }
+}
+
 /// Serde helper for Vec<u8> as base64 in JSON.
 mod base64_bytes {
     use serde::{Deserialize, Deserializer, Serializer};

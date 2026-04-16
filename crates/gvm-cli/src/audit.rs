@@ -101,17 +101,23 @@ pub async fn verify_wal(wal_file: &str) -> Result<()> {
         }
     }
 
+    let chain = gvm_types::verify_integrity_chain(std::path::Path::new(wal_file));
+
     println!("WAL integrity report: {}", wal_file);
     println!("{}", "-".repeat(50));
-    println!("  Total lines:            {}", total_lines);
-    println!("  Valid events:           {}", valid_events);
-    println!("  Merkle batch records:   {}", merkle_batch_records);
-    println!("  Corrupt/unparseable:    {}", corrupt_lines);
-    println!("  Timestamp out-of-order: {}", out_of_order);
-    println!("  Events with hash:       {}", events_with_hash);
-    println!("  Events without hash:    {}", events_without_hash);
-    println!("  Hash mismatches:        {}", hash_mismatches);
-    println!("  Stuck Pending events:   {}", pending_events);
+    println!("  Total lines:             {}", total_lines);
+    println!("  Valid events:            {}", valid_events);
+    println!("  Merkle batch records:    {}", merkle_batch_records);
+    println!("  Corrupt/unparseable:     {}", corrupt_lines);
+    println!("  Timestamp out-of-order:  {}", out_of_order);
+    println!("  Events with hash:        {}", events_with_hash);
+    println!("  Events without hash:     {}", events_without_hash);
+    println!("  Hash mismatches:         {}", hash_mismatches);
+    println!("  Stuck Pending events:    {}", pending_events);
+    println!(
+        "  Integrity chain (GIC):   {}/{} valid links",
+        chain.valid_links, chain.total_config_loads
+    );
     println!();
 
     if corrupt_lines > 0 {
@@ -138,7 +144,20 @@ pub async fn verify_wal(wal_file: &str) -> Result<()> {
             hash_mismatches
         );
     }
-    if corrupt_lines == 0 && out_of_order == 0 && pending_events == 0 && hash_mismatches == 0 {
+    if let Some(ref broken_at) = chain.first_break {
+        println!(
+            "  TAMPER DETECTED: integrity chain broke at event_id={}. \
+             A gvm.system.config_load event's previous_state does not match the \
+             preceding config_hash. WAL may have been edited or truncated.",
+            broken_at
+        );
+    }
+    if corrupt_lines == 0
+        && out_of_order == 0
+        && pending_events == 0
+        && hash_mismatches == 0
+        && chain.first_break.is_none()
+    {
         println!("  OK: WAL integrity verified. No issues found.");
     }
 
