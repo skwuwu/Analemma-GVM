@@ -5,7 +5,6 @@
 # Reviewed 2026-04-13. See audit.toml for full reachability assessments.
 ignore = [
     "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained — used, low risk
-    "RUSTSEC-2026-0092",  # wasmtime UTF-16 panic — wasm feature disabled
     "RUSTSEC-2026-0097",  # rand::rng() unsound — GVM uses rand::random() only
 ]
 

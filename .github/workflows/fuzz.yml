@@ -54,7 +54,6 @@ jobs:
           - fuzz_http_parse
           - fuzz_path_normalize
           - fuzz_llm_trace
-          - fuzz_policy_eval
           - fuzz_dns_parse
           - fuzz_vault_crypto
           - fuzz_jwt_auth

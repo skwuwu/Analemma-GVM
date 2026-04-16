@@ -1159,9 +1159,9 @@ async fn extract_llm_trace_from_response(
 
     Response::from_parts(
         parts,
-        Body::from_stream(tapped.map(|r| {
-            r.map_err(|e| axum::Error::new(std::io::Error::new(std::io::ErrorKind::Other, e)))
-        })),
+        Body::from_stream(
+            tapped.map(|r| r.map_err(|e| axum::Error::new(std::io::Error::other(e)))),
+        ),
     )
 }
 

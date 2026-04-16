@@ -200,7 +200,7 @@ profile = "default"
 "#
         .to_string(),
 
-        "saas" | _ => r#"# Analemma GVM — Unified Configuration (SaaS template)
+        _ => r#"# Analemma GVM — Unified Configuration (SaaS template)
 # All governance rules, credentials, and settings in one file.
 
 # ─── Network Rules (SRR) ───

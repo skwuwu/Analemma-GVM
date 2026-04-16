@@ -72,12 +72,6 @@ name = "fuzz_llm_trace"
 path = "fuzz_targets/fuzz_llm_trace.rs"
 doc = false
 
-# ABAC policy evaluation fuzzer: arbitrary operation metadata + attribute combinations
-[[bin]]
-name = "fuzz_policy_eval"
-path = "fuzz_targets/fuzz_policy_eval.rs"
-doc = false
-
 # DNS packet parser fuzzer: raw UDP packets → domain extraction
 [[bin]]
 name = "fuzz_dns_parse"

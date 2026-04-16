@@ -98,8 +98,6 @@ pub struct TokenBudget {
 
 impl TokenBudget {
     pub fn new(max_tokens_per_hour: u64, max_cost_per_hour: f64, reserve_per_request: u64) -> Self {
-        // Initialize slots with const fn
-        const EMPTY: Slot = Slot::new();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -107,13 +105,7 @@ impl TokenBudget {
         let minute = (now / 60) % SLOTS as u64;
 
         Self {
-            slots: [
-                EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY,
-                EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY,
-                EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY,
-                EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY,
-                EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY,
-            ],
+            slots: std::array::from_fn(|_| Slot::new()),
             current_minute: AtomicU64::new(minute),
             last_rotation_epoch: AtomicU64::new(now),
             pending_reservations: AtomicU64::new(0),
