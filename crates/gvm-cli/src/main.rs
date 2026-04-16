@@ -973,6 +973,14 @@ fn run_stop() -> anyhow::Result<()> {
         StopOutcome::NotRunning => {
             eprintln!("  {DIM}Proxy not running (no PID file).{RESET}");
         }
+        StopOutcome::OrphanKilled { pid } => {
+            eprintln!(
+                "  {GREEN}\u{2713}{RESET} Killed orphan proxy (PID {pid}) via port-based reclaim"
+            );
+            eprintln!(
+                "  {DIM}No PID file existed — proxy was launched outside CLI or its PID file was wiped.{RESET}"
+            );
+        }
     }
 
     // Sandbox orphan cleanup is independent of proxy stop — always run it.

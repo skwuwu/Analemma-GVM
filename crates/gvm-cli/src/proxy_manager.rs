@@ -559,6 +559,36 @@ fn kill_stale_port_holder(proxy_url: &str) {
 #[cfg(not(unix))]
 fn kill_stale_port_holder(_proxy_url: &str) {}
 
+/// Return the default proxy URL used by `gvm stop` when the PID file is
+/// missing — matches the default used by `ensure_available` so both commands
+/// converge on the same port scope.
+fn default_proxy_url() -> String {
+    std::env::var("GVM_PROXY_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
+}
+
+/// Query lsof for any PID currently holding the proxy port. Used by
+/// `stop_proxy` to detect orphan proxies without a PID file.
+#[cfg(unix)]
+fn find_proxy_port_holder() -> Option<u32> {
+    let proxy_url = default_proxy_url();
+    let port: u16 = proxy_url
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
+        .unwrap_or(8080);
+    let out = std::process::Command::new("lsof")
+        .args(["-ti", &format!(":{port}")])
+        .output()
+        .ok()?;
+    let pids = String::from_utf8_lossy(&out.stdout);
+    pids.split_whitespace().next().and_then(|s| s.parse().ok())
+}
+
+#[cfg(not(unix))]
+fn find_proxy_port_holder() -> Option<u32> {
+    None
+}
+
 /// Kill a process by PID.
 fn kill_process(pid: u32) {
     #[cfg(unix)]
@@ -583,6 +613,10 @@ pub enum StopOutcome {
     AlreadyDead { pid: u32 },
     /// No PID file at all — proxy was never started, or PID file was cleaned.
     NotRunning,
+    /// PID file missing/stale but a gvm-proxy process was found holding the
+    /// proxy port (e.g. started outside proxy_manager, or from a crashed run
+    /// with its PID file wiped). Killed via port-based reclaim.
+    OrphanKilled { pid: u32 },
 }
 
 /// Stop the GVM proxy daemon: read PID file → SIGTERM → poll for exit → SIGKILL fallback.
@@ -590,16 +624,45 @@ pub enum StopOutcome {
 /// Pure lifecycle logic — does NOT touch sandbox cleanup. The CLI handler
 /// orchestrates `stop_proxy()` + `cleanup_all_orphans_report()` separately
 /// so each step is observable.
+///
+/// Port-based fallback: if the PID file is missing or stale BUT a process is
+/// currently holding the proxy port, assume it's an orphan gvm-proxy (crash
+/// wiped the PID file, or it was started outside proxy_manager) and reclaim
+/// the port via `kill_stale_port_holder`. This closes the asymmetry where
+/// `gvm run` always reclaims orphans via port-holder kill but `gvm stop`
+/// historically returned `NotRunning` despite the port being taken.
 pub fn stop_proxy(workspace: &Path) -> StopOutcome {
     let pid_path = workspace.join("data/proxy.pid");
     let pid = match read_pid_file(&pid_path) {
         Some(p) => p,
-        None => return StopOutcome::NotRunning,
+        None => {
+            // No PID file — but is there a proxy holding our port anyway?
+            if let Some(orphan_pid) = find_proxy_port_holder() {
+                eprintln!(
+                    "  {YELLOW}No PID file, but a process is holding the proxy port \
+                     (PID {orphan_pid}) — reclaiming via port-based kill.{RESET}"
+                );
+                kill_stale_port_holder(&default_proxy_url());
+                return StopOutcome::OrphanKilled { pid: orphan_pid };
+            }
+            return StopOutcome::NotRunning;
+        }
     };
 
     if !is_process_alive(pid) {
         // Stale PID file — clean it up so next status query is accurate.
         let _ = std::fs::remove_file(&pid_path);
+        // Recorded PID is dead, but the port might still be held by a
+        // different orphan process (uncommon but possible — port reuse,
+        // or manual proxy launch after the PID-file-owning proxy died).
+        if let Some(orphan_pid) = find_proxy_port_holder() {
+            eprintln!(
+                "  {YELLOW}Recorded PID {pid} is dead but PID {orphan_pid} is holding \
+                 the port — reclaiming.{RESET}"
+            );
+            kill_stale_port_holder(&default_proxy_url());
+            return StopOutcome::OrphanKilled { pid: orphan_pid };
+        }
         return StopOutcome::AlreadyDead { pid };
     }
 
