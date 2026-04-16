@@ -1192,6 +1192,25 @@ fn json_response(status: StatusCode, body: &serde_json::Value) -> Response<Body>
 
 // ─── Dashboard ───
 
+/// True if the event is a proxy-internal system record (e.g., startup
+/// config_load) rather than an agent governance decision. These events
+/// live in the WAL for Merkle audit integrity but do not belong on the
+/// user-facing dashboard timeline or in the "Allowed" metric.
+fn is_internal_system_event(event: &serde_json::Value) -> bool {
+    let enforcement_point = event
+        .get("enforcement_point")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if enforcement_point == "startup" {
+        return true;
+    }
+    let operation = event.get("operation").and_then(|v| v.as_str()).unwrap_or("");
+    if operation.starts_with("gvm.system.") || operation.starts_with("gvm.vault.") {
+        return true;
+    }
+    false
+}
+
 /// Serve the dashboard HTML page.
 pub async fn dashboard() -> Response<Body> {
     Response::builder()
@@ -1271,6 +1290,15 @@ pub async fn dashboard_events(
 
             // Skip non-event lines
             if parsed.get("event_id").is_none() {
+                continue;
+            }
+
+            // Skip proxy-internal system events. They belong in the WAL
+            // (config_load hashes are part of the Merkle audit chain) but
+            // aren't agent governance decisions — showing them in the
+            // dashboard timeline confuses the "Allowed" metric (a bootstrap
+            // record is not an Allow on a request).
+            if is_internal_system_event(&parsed) {
                 continue;
             }
 
@@ -1367,6 +1395,14 @@ pub async fn dashboard_stats(
     let mut models: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for parsed in latest.values() {
+        // Exclude proxy-internal system events (config_load etc.) from
+        // dashboard metrics — they are in the WAL for audit integrity
+        // but do not represent agent traffic and would inflate the
+        // "Allowed" counter.
+        if is_internal_system_event(parsed) {
+            continue;
+        }
+
         total += 1;
 
         if let Some(host) = parsed.pointer("/transport/host").and_then(|v| v.as_str()) {
