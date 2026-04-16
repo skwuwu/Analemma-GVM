@@ -1,12 +1,5 @@
 # Analemma-GVM
 
-> **⚠ Release blocker (2026-04-16)** — v0.5.1 has been yanked. A reproducible
-> repo-directory-destroying bug in `gvm run --sandbox` deletes files from the
-> host workspace during sandbox cleanup when the working directory is the
-> repo root. Do not run any v0.5.x release on a workspace you care about
-> until this is fixed and a new tag is published. Tracking + forensics in
-> `docs/internal/CHANGELOG.md`; use `master` only for development.
-
 **A lightweight secure runtime for autonomous AI agents.** Governs every outbound HTTP call, isolates the filesystem, and locks down syscalls — using a Rust proxy and Linux kernel primitives.
 
 I wanted to run multiple autonomous AI agents (such as OpenClaw) for my personal affairs. But every time I let agents do everything they want, there was always a little anxiety. What if it does something it shouldn't? What if it leaks personal information or deletes important data?
