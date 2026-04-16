@@ -53,12 +53,17 @@ echo "Bridge: ${BRIDGE}  Subnet: ${SUBNET}  Host IP: ${HOST_IP}  Proxy port: ${P
 echo ""
 
 echo "--- 1. Create Docker bridge ---"
+# Pin the Linux interface name to match the Docker network name.
+# Without this, Docker auto-generates `br-<hash>` and our iptables
+# `-i {bridge}` filter never matches.
 docker network create \
   --driver bridge \
   --subnet "${SUBNET}" \
   --gateway "${HOST_IP}" \
+  --opt "com.docker.network.bridge.name=${BRIDGE}" \
   "${BRIDGE}" >/dev/null
-echo "OK: bridge ${BRIDGE} created"
+echo "OK: bridge ${BRIDGE} created (interface: ${BRIDGE})"
+ip link show "${BRIDGE}" | head -1 | sed 's/^/    /'
 
 echo ""
 echo "--- 2. Install iptables rules ---"
@@ -94,27 +99,33 @@ sleep 0.5
 echo "OK: mock listener pid=${MOCK_PID}"
 
 echo ""
-echo "--- 4. Test from container: external HTTPS must FAIL ---"
-# 4a. Direct external connection (e.g., 1.1.1.1:443) must be dropped.
+echo "--- 4. Test from container: external TCP must FAIL ---"
+# Use busybox `nc` (built into alpine, no apk needed).
+# -w 3 = 3s timeout, -z = zero-IO mode (just test connect).
 set +e
 docker run --rm --network "${BRIDGE}" alpine:3.19 \
-  sh -c "apk add --no-cache curl >/dev/null 2>&1 && \
-         timeout 5 curl -s -o /dev/null -w '%{http_code}' https://1.1.1.1 || echo FAIL"
-ext_exit=$?
+  sh -c "nc -w 3 -z 1.1.1.1 443 && echo 'LEAK' || echo 'BLOCKED'"
+ext_status=$?
 set -e
-if [[ "${ext_exit}" -eq 0 ]]; then
-  echo "OK: container could not reach 1.1.1.1 (as expected)"
+ext_out=$(docker run --rm --network "${BRIDGE}" alpine:3.19 \
+  sh -c "nc -w 3 -z 1.1.1.1 443 >/dev/null 2>&1 && echo LEAK || echo BLOCKED")
+if [[ "${ext_out}" == "BLOCKED" ]]; then
+  echo "OK: external TCP 1.1.1.1:443 blocked by host iptables"
 else
-  echo "OK: external connect failed with exit=${ext_exit} (as expected)"
+  echo "FAIL: external TCP reached 1.1.1.1:443 — DROP rule not working"
+  exit 1
 fi
 
 echo ""
 echo "--- 5. Test from container: proxy port must SUCCEED ---"
-# 5a. Direct TCP to HOST_IP:PROXY_PORT must succeed (rule allows it).
-docker run --rm --network "${BRIDGE}" alpine:3.19 \
-  sh -c "apk add --no-cache curl >/dev/null 2>&1 && \
-         curl -v --max-time 5 telnet://${HOST_IP}:${PROXY_PORT} 2>&1 | head -5" || true
-echo "(expect 'Connected to' line above; if not, firewall rule is wrong)"
+prx_out=$(docker run --rm --network "${BRIDGE}" alpine:3.19 \
+  sh -c "nc -w 3 -z ${HOST_IP} ${PROXY_PORT} >/dev/null 2>&1 && echo OK || echo FAIL")
+if [[ "${prx_out}" == "OK" ]]; then
+  echo "OK: proxy port ${HOST_IP}:${PROXY_PORT} reachable from container"
+else
+  echo "FAIL: container could not reach proxy port — ACCEPT rule broken"
+  exit 1
+fi
 
 echo ""
 echo "--- 6. Verify chain still intact after traffic ---"

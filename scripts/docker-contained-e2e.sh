@@ -56,6 +56,10 @@ echo "=== Docker containment E2E ==="
 [[ -x "$GVM_BIN" ]] || { echo "gvm binary not found — build with cargo first"; exit 1; }
 command -v docker >/dev/null || { echo "docker not installed"; exit 1; }
 command -v iptables >/dev/null || { echo "iptables not installed"; exit 1; }
+# gvm reads config/proxy.toml relative to CWD. Without cd'ing to the
+# project root, proxy.log lands in the wrong directory and subsequent
+# `gvm run` invocations cannot detect a running proxy.
+cd "$REPO_DIR"
 
 # Start orphan cleanup first to clear any stale state from prior runs.
 echo ""
@@ -123,7 +127,7 @@ sleep 1
 # ─── Test 1: Python cooperative client routes through proxy ────────
 echo ""
 echo "--- Test 1: Python requests must route through proxy ---"
-OUT_PY=$(sudo "$GVM_BIN" run --contained "$TMP_DIR/agent_py.py" 2>&1 || true)
+OUT_PY=$(sudo "$GVM_BIN" run --contained --image python:3.12-slim "$TMP_DIR/agent_py.py" 2>&1 || true)
 echo "$OUT_PY" | grep -E 'PY-(PROXY|RAW)-' | sed 's/^/    /'
 
 if echo "$OUT_PY" | grep -q 'PY-PROXY-OK'; then
@@ -144,7 +148,7 @@ fi
 echo ""
 echo "--- Test 2: Node.js raw HTTPS must be blocked ---"
 if command -v node >/dev/null 2>&1; then
-    OUT_NODE=$(sudo "$GVM_BIN" run --contained -- node "$TMP_DIR/agent_node.js" 2>&1 || true)
+    OUT_NODE=$(sudo "$GVM_BIN" run --contained --image node:20-alpine "$TMP_DIR/agent_node.js" 2>&1 || true)
     echo "$OUT_NODE" | grep -E 'NODE-RAW-' | sed 's/^/    /'
     if echo "$OUT_NODE" | grep -q 'NODE-RAW-BLOCKED'; then
         pass "Node.js raw https (HTTP_PROXY-ignoring) blocked by host iptables"
@@ -186,7 +190,7 @@ fi
 echo ""
 echo "--- Test 5: Orphan cleanup after SIGKILL ---"
 # Launch a contained run in background, SIGKILL it mid-run, verify cleanup runs.
-sudo "$GVM_BIN" run --contained --detach "$TMP_DIR/agent_py.py" >/dev/null 2>&1 &
+sudo "$GVM_BIN" run --contained --image python:3.12-slim --detach "$TMP_DIR/agent_py.py" >/dev/null 2>&1 &
 GVM_PID=$!
 sleep 1
 sudo kill -9 "$GVM_PID" 2>/dev/null || true

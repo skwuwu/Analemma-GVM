@@ -855,6 +855,7 @@ pub(crate) async fn run_contained_legacy(
     // Build container-visible proxy URL. On Linux with an enforced bridge,
     // the bridge gateway IP is the host's reachable proxy address. On other
     // platforms we fall back to the existing `host.docker.internal` trick.
+    #[cfg(not(target_os = "linux"))]
     let local_proxy_host = matches!(proxy_url.host_str(), Some("127.0.0.1" | "localhost"));
     #[cfg(target_os = "linux")]
     let container_proxy = {
@@ -915,7 +916,14 @@ pub(crate) async fn run_contained_legacy(
     // ── Create the dedicated bridge + install host iptables rules ──
     #[cfg(target_os = "linux")]
     if let Some(cfg) = bridge_cfg.as_ref() {
-        // 1. docker network create --driver bridge --subnet <subnet> --gateway <host_ip>
+        // 1. docker network create with a pinned bridge interface name.
+        //
+        // Critical: without `com.docker.network.bridge.name`, Docker
+        // auto-generates a `br-<hash>` interface name. Our iptables rules
+        // filter by `-i {bridge}`, so without this pin the DROP rule
+        // would never match and non-cooperative clients would silently
+        // bypass — the exact failure mode this refactor exists to fix.
+        let bridge_opt = format!("com.docker.network.bridge.name={}", cfg.bridge);
         let net_create = tokio::process::Command::new("docker")
             .args([
                 "network",
@@ -926,6 +934,8 @@ pub(crate) async fn run_contained_legacy(
                 &cfg.subnet,
                 "--gateway",
                 &cfg.host_ip,
+                "--opt",
+                &bridge_opt,
                 &cfg.bridge,
             ])
             .output()
@@ -1003,7 +1013,11 @@ pub(crate) async fn run_contained_legacy(
     #[cfg(target_os = "linux")]
     if let Some(cfg) = bridge_cfg.as_ref() {
         if let Err(e) = gvm_sandbox::record_docker_state(cfg, &container_name) {
-            tracing::warn!(error = %e, "Failed to record Docker state file — orphan cleanup may miss this run");
+            eprintln!(
+                "  {YELLOW}\u{26a0}{RESET} Failed to record Docker state file: {} \
+                 (orphan cleanup may miss this run)",
+                e
+            );
         }
     }
     let mount_dir = script_dir.to_str().unwrap_or(".");
@@ -1030,12 +1044,17 @@ pub(crate) async fn run_contained_legacy(
         .arg("--tmpfs")
         .arg("/tmp")
         .arg("--security-opt")
-        .arg("no-new-privileges:true")
-        .arg("--memory")
-        .arg(memory)
-        .arg("--cpus")
-        .arg(cpus)
-        .arg("-w")
+        .arg("no-new-privileges:true");
+    // Resource limits are opt-in. Docker rejects `--memory ""` and
+    // `--cpus ""`, so skip the flag entirely when the user didn't
+    // specify a value.
+    if !memory.is_empty() {
+        cmd.arg("--memory").arg(memory);
+    }
+    if !cpus.is_empty() {
+        cmd.arg("--cpus").arg(cpus);
+    }
+    cmd.arg("-w")
         .arg("/home/agent/workspace")
         .arg("-e")
         .arg(format!("GVM_AGENT_ID={}", agent_id));
@@ -1086,7 +1105,7 @@ pub(crate) async fn run_contained_legacy(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = local_proxy_host; // silence unused warning on non-linux
+        let _ = local_proxy_host; // declared above only on non-linux; read here
         cmd.arg("--network")
             .arg("gvm-bridge")
             .arg("--add-host")
