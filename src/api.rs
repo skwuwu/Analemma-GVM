@@ -963,21 +963,77 @@ pub async fn reload_srr(State(state): State<AppState>) -> Response<Body> {
     };
 
     // Phase 2: Acquire write lock and swap atomically.
+    // Scope-isolate the write guard so rustc's async state machine does
+    // not see it living across the Phase-3 `.await` point. Without the
+    // inner block, the std::sync::RwLockWriteGuard (which is !Send)
+    // propagates into the future type and the axum Handler trait fails
+    // to match.
     let srr_count = new_srr.rule_count();
+    {
+        let mut srr_guard = match state.srr.write() {
+            Ok(g) => g,
+            Err(_) => {
+                tracing::error!("SRR write lock poisoned during reload");
+                return json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &serde_json::json!({"error": "SRR lock poisoned"}),
+                );
+            }
+        };
+        *srr_guard = new_srr;
+    } // srr_guard dropped here
 
-    let mut srr_guard = match state.srr.write() {
-        Ok(g) => g,
-        Err(_) => {
-            tracing::error!("SRR write lock poisoned during reload");
-            return json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &serde_json::json!({"error": "SRR lock poisoned"}),
+    // Phase 3: record the post-reload integrity context in the Merkle
+    // chain so auditors can prove exactly which SRR version governed
+    // every behavioral event after this point. Compute the new
+    // config_hash from whatever config files are active (gvm.toml if
+    // present, legacy srr file otherwise), chain it to the prior
+    // integrity ref, and update the AppState cache that event-creation
+    // paths read on every request.
+    //
+    // Reload partial failure policy: if the swap above succeeded but
+    // the integrity recording fails, we do NOT roll back the rule
+    // swap — denying traffic to recover a log write is worse than
+    // running with a slightly stale integrity ref. We log loudly and
+    // continue. The next successful reload or proxy restart will
+    // re-establish the chain.
+    let prev_ref = state.current_integrity_ref();
+    let config_files_owned: Vec<(String, std::path::PathBuf)> =
+        if let Some(ref gvm_path) = state.gvm_toml_path {
+            vec![("gvm_toml".to_string(), std::path::PathBuf::from(gvm_path))]
+        } else {
+            vec![(
+                "srr_network".to_string(),
+                std::path::PathBuf::from(&state.srr_config_path),
+            )]
+        };
+    let config_refs: Vec<(&str, &std::path::Path)> = config_files_owned
+        .iter()
+        .map(|(label, path)| (label.as_str(), path.as_path()))
+        .collect();
+    match state.ledger.record_config_load(&config_refs, prev_ref).await {
+        Ok(new_hash) => {
+            if let Ok(mut guard) = state.active_integrity_ref.write() {
+                *guard = Some(new_hash.clone());
+            } else {
+                tracing::warn!(
+                    "Reload succeeded but active_integrity_ref lock poisoned — \
+                     behavioral events will retain the pre-reload ref until restart"
+                );
+            }
+            tracing::info!(
+                integrity_ref = %new_hash,
+                "Reload recorded new integrity context in WAL"
             );
         }
-    };
-
-    *srr_guard = new_srr;
-    drop(srr_guard);
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "Reload succeeded but config_load WAL append failed — \
+                 behavioral events will retain the pre-reload integrity ref"
+            );
+        }
+    }
 
     tracing::info!(
         srr_rules = srr_count,

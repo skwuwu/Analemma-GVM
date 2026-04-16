@@ -106,6 +106,16 @@ const CIRCUIT_BREAKER_RETRY_SECS: u64 = 30;
 /// Shared application state passed to all handlers
 #[derive(Clone)]
 pub struct AppState {
+    /// SRR rule set, swapped atomically on `POST /gvm/reload`.
+    ///
+    /// CRITICAL: This is a `std::sync::RwLock`, not `tokio::sync::RwLock`.
+    /// NEVER hold either guard across an `.await` point — doing so
+    /// deadlocks a worker thread and fails the axum Handler Send bound
+    /// at compile time. Deliberately synchronous because every request
+    /// takes the read lock on the hot path; `tokio::sync::RwLock`'s
+    /// ~10x overhead (~100-200ns vs ~20ns) is measurable at realistic
+    /// RPS. Safe pattern: read-clone-drop in a tight scope, e.g.
+    /// `state.srr.read().ok().map(|g| g.some_field.clone())`.
     pub srr: Arc<std::sync::RwLock<NetworkSRR>>,
     pub api_keys: Arc<APIKeyStore>,
     pub ledger: Arc<Ledger>,
@@ -179,7 +189,32 @@ pub struct AppState {
     /// Active integrity context hash. Updated on config load/reload.
     /// Behavioral events reference this to map "which config version
     /// was active when this event happened" without per-event overhead.
+    ///
+    /// CRITICAL: This is a `std::sync::RwLock`. NEVER hold this guard
+    /// across an `.await` point — it causes cross-task deadlocks that
+    /// are nearly impossible to diagnose. Read-then-drop pattern only:
+    /// `state.current_integrity_ref()` below does this correctly.
+    ///
+    /// The same rule applies to `srr: Arc<std::sync::RwLock<NetworkSRR>>`
+    /// above. Both are on the request hot path; `tokio::sync::RwLock`
+    /// is rejected here because its ~10x overhead over `std::sync` at
+    /// ~tens of thousands of RPS is measurable.
     pub active_integrity_ref: Arc<std::sync::RwLock<Option<String>>>,
+}
+
+impl AppState {
+    /// Snapshot the current integrity context hash. Takes the read lock,
+    /// clones the `Option<String>`, and drops the guard immediately —
+    /// safe to call before an `.await` in an event-creation path.
+    ///
+    /// Returns `None` if the lock is poisoned or no config has been
+    /// loaded yet (pre-startup, tests).
+    pub fn current_integrity_ref(&self) -> Option<String> {
+        self.active_integrity_ref
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+    }
 }
 
 /// Derive event status from upstream HTTP response.
@@ -467,6 +502,11 @@ pub async fn proxy_handler(
     // ── Step 4: Enforcement with EventStatus lifecycle ──
     let mut event = build_event(&classification, &gvm_headers, &target);
     event.default_caution = is_default_caution;
+    // Bind this event to the config version that was active when the
+    // decision was made. Later auditors can resolve this ref back to the
+    // `gvm.system.config_load` record in the Merkle chain and prove which
+    // policy governed the action.
+    event.config_integrity_ref = state.current_integrity_ref();
     // Populate transport.method (build_event cannot access the request)
     if let Some(ref mut t) = event.transport {
         t.method = request_method.clone();
@@ -1319,7 +1359,8 @@ fn append_proxy_wal_event(
         nats_sequence: None,
         event_hash: None,
         llm_trace: None,
-        default_caution: false, config_integrity_ref: None,
+        default_caution: false,
+        config_integrity_ref: state.current_integrity_ref(),
     };
     // Spawn background task for durable WAL write. Called from a sync
     // context (middleware/panic handler) where we cannot .await directly.
@@ -1572,7 +1613,8 @@ async fn handle_connect_inner(
                 nats_sequence: None,
                 event_hash: None,
                 llm_trace: None,
-                default_caution: false, config_integrity_ref: None,
+                default_caution: false,
+                config_integrity_ref: state.current_integrity_ref(),
                 tenant_id: None,
                 parent_event_id: None,
                 session_id: String::new(),
@@ -1624,7 +1666,8 @@ async fn handle_connect_inner(
         nats_sequence: None,
         event_hash: None,
         llm_trace: None,
-        default_caution: srr_result_catch_all, config_integrity_ref: None,
+        default_caution: srr_result_catch_all,
+        config_integrity_ref: state.current_integrity_ref(),
         tenant_id: None,
         parent_event_id: None,
         session_id: String::new(),

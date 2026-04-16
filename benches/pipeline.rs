@@ -729,35 +729,12 @@ fn bench_vault_p99(c: &mut Criterion) {
 }
 
 // ═══════════════════════════════════════════════
-// 14. Rate Limiter Benchmarks
+// 14. Rate Limiter benchmarks — REMOVED.
+//     The rate_limiter module was deleted when Throttle decision type
+//     was replaced by TokenBudget (see docs/internal/CHANGELOG.md,
+//     "replace Throttle with token budget system"). Token budget
+//     benchmarks live in src/token_budget.rs unit tests.
 // ═══════════════════════════════════════════════
-
-fn bench_rate_limiter(c: &mut Criterion) {
-    use gvm_proxy::rate_limiter::RateLimiter;
-
-    let mut group = c.benchmark_group("rate_limiter");
-
-    // Single agent check (hot path)
-    group.bench_function("single_agent_check", |b| {
-        let limiter = RateLimiter::new();
-        b.iter(|| {
-            black_box(limiter.check("agent-bench", 1000));
-        });
-    });
-
-    // Multiple agents
-    group.bench_function("100_agents_round_robin", |b| {
-        let limiter = RateLimiter::new();
-        let mut i = 0u64;
-        b.iter(|| {
-            let agent_id = format!("agent-{}", i % 100);
-            i += 1;
-            black_box(limiter.check(&agent_id, 60));
-        });
-    });
-
-    group.finish();
-}
 
 // ═══════════════════════════════════════════════
 // 15. Vault Contention P99 — Tail Latency Under Load
@@ -1265,7 +1242,6 @@ criterion_group!(
     bench_srr_scale,
     bench_ic2_delay_accuracy,
     bench_vault_large,
-    bench_rate_limiter,
     bench_vault_p99,
     bench_vault_contention_p99,
     bench_ebpf_setup,
