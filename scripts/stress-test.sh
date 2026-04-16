@@ -284,7 +284,14 @@ launch_agent() {
     local gvm_mode_flag=""
     local gvm_invoker=""
     if [ "$MODE" = "sandbox" ]; then
-        gvm_mode_flag="--sandbox"
+        # `--fs-governance` is REQUIRED in the stress test so the overlayfs
+        # cleanup path (parent-mounted overlay with lowerdir=workspace_dir)
+        # is actually exercised. Plain `--sandbox` falls back to a safe
+        # read-only bind mount which never triggers the overlay cleanup
+        # code — using it here would give a false "PASS" for anything that
+        # only breaks on overlay teardown (e.g. the 2026-04-16 remove_dir_all
+        # race that destroyed host repo files via lazy MNT_DETACH).
+        gvm_mode_flag="--sandbox --fs-governance"
         # Sandbox requires CAP_NET_ADMIN (veth + iptables) and CAP_SYS_ADMIN
         # (mount namespaces). When the stress script is run as a non-root
         # user (the default — operators tmux into ubuntu and start it),

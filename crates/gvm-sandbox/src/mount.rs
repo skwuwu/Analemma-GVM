@@ -354,8 +354,13 @@ pub fn mount_home_overlay(host_home: &Path, pid: u32) -> Option<PathBuf> {
     // upper_base races and returns EBUSY, leaving the tmpfs in /proc/mounts.
     nix::mount::umount2(&merged, nix::mount::MntFlags::MNT_DETACH).ok();
     nix::mount::umount2(&upper_base, nix::mount::MntFlags::MNT_DETACH).ok();
-    std::fs::remove_dir_all(&upper_base).ok();
-    std::fs::remove_dir_all(&merged).ok();
+    // rmdir only — never remove_dir_all. `merged` is an overlay mount
+    // point whose lowerdir is the host repo/home. A lazy MNT_DETACH can
+    // leave the overlay live; recursive delete would walk through it and
+    // destroy host files. rmdir fails harmlessly if the mount is still
+    // active or the dir is non-empty.
+    std::fs::remove_dir(&upper_base).ok();
+    std::fs::remove_dir(&merged).ok();
 
     std::fs::create_dir_all(&merged).ok()?;
     std::fs::create_dir_all(&upper_base).ok()?;
@@ -412,8 +417,13 @@ pub fn cleanup_home_overlay(pid: u32) {
     // MNT_DETACH on both — see mount_home_overlay() for the EBUSY rationale.
     nix::mount::umount2(&merged, nix::mount::MntFlags::MNT_DETACH).ok();
     nix::mount::umount2(&upper_base, nix::mount::MntFlags::MNT_DETACH).ok();
-    std::fs::remove_dir_all(&upper_base).ok();
-    std::fs::remove_dir_all(&merged).ok();
+    // rmdir only — never remove_dir_all. `merged` is an overlay mount
+    // point whose lowerdir is the host repo/home. A lazy MNT_DETACH can
+    // leave the overlay live; recursive delete would walk through it and
+    // destroy host files. rmdir fails harmlessly if the mount is still
+    // active or the dir is non-empty.
+    std::fs::remove_dir(&upper_base).ok();
+    std::fs::remove_dir(&merged).ok();
 }
 
 /// Mount workspace overlayfs in the PARENT process (real root).
@@ -438,8 +448,13 @@ pub fn mount_workspace_overlay(
     // upper_base races and leaves the tmpfs.
     nix::mount::umount2(&merged, nix::mount::MntFlags::MNT_DETACH).ok();
     nix::mount::umount2(&upper_base, nix::mount::MntFlags::MNT_DETACH).ok();
-    std::fs::remove_dir_all(&upper_base).ok();
-    std::fs::remove_dir_all(&merged).ok();
+    // rmdir only — never remove_dir_all. `merged` is an overlay mount
+    // point whose lowerdir is the host repo/home. A lazy MNT_DETACH can
+    // leave the overlay live; recursive delete would walk through it and
+    // destroy host files. rmdir fails harmlessly if the mount is still
+    // active or the dir is non-empty.
+    std::fs::remove_dir(&upper_base).ok();
+    std::fs::remove_dir(&merged).ok();
 
     std::fs::create_dir_all(&merged).ok()?;
     std::fs::create_dir_all(&upper_base).ok()?;
@@ -498,8 +513,13 @@ pub fn cleanup_workspace_overlay(pid: u32) {
     // MNT_DETACH on both — see mount_workspace_overlay() for the EBUSY rationale.
     nix::mount::umount2(&merged, nix::mount::MntFlags::MNT_DETACH).ok();
     nix::mount::umount2(&upper_base, nix::mount::MntFlags::MNT_DETACH).ok();
-    std::fs::remove_dir_all(&upper_base).ok();
-    std::fs::remove_dir_all(&merged).ok();
+    // rmdir only — never remove_dir_all. `merged` is an overlay mount
+    // point whose lowerdir is the host repo/home. A lazy MNT_DETACH can
+    // leave the overlay live; recursive delete would walk through it and
+    // destroy host files. rmdir fails harmlessly if the mount is still
+    // active or the dir is non-empty.
+    std::fs::remove_dir(&upper_base).ok();
+    std::fs::remove_dir(&merged).ok();
 }
 
 /// Mount user's $HOME into sandbox via parent-prepared overlayfs + blocklist.

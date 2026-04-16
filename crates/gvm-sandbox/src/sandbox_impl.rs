@@ -71,8 +71,13 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     let sandbox_root = std::path::PathBuf::from(format!("/run/gvm/sandbox-root-{}", my_pid));
     // Clean up any stale mounts from a previous crashed run.
     // umount2 with MNT_DETACH handles the recursive case (nested mounts).
+    // Use rmdir (not remove_dir_all) — see data-loss bug note below at
+    // the post-run cleanup site. Same reasoning applies here: the
+    // sandbox_root path from a crashed run may still have active
+    // bind/overlay mounts pointing at the host workspace; a recursive
+    // delete would walk through those mounts and destroy the host tree.
     nix::mount::umount2(&sandbox_root, nix::mount::MntFlags::MNT_DETACH).ok();
-    std::fs::remove_dir_all(&sandbox_root).ok();
+    std::fs::remove_dir(&sandbox_root).ok();
     nix::mount::umount(&staging_ws).ok();
     std::fs::create_dir_all(&staging_ws).context("Failed to create workspace staging directory")?;
     nix::mount::mount(
@@ -507,9 +512,27 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     };
 
     // 6. Clean up host-side resources
-    // Unmount sandbox root (lazy detach handles nested mounts from failed runs)
+    // Unmount sandbox root (lazy detach handles nested mounts from failed runs).
+    //
+    // CRITICAL — data-loss bug fixed here (2026-04-16):
+    // Using `remove_dir_all(&sandbox_root)` after a lazy `MNT_DETACH` is a
+    // race that destroys the host workspace. `MNT_DETACH` defers the real
+    // unmount until all references drop; if the recursive delete runs
+    // before the kernel finishes the detach, it descends INTO the still-
+    // mounted `sandbox_root/workspace` (bind to the agent's workspace_dir,
+    // i.e. the user's repo) and deletes real files from the host tree.
+    //
+    // Reproduced 2026-04-16: a single 2-minute `gvm run --sandbox` stress
+    // session destroyed 224 files from the repo (src/, fuzz/, .git/, etc.)
+    // via this path.
+    //
+    // Fix: unmount the recursive tree with MNT_DETACH, then use `rmdir`
+    // (`remove_dir`, not `remove_dir_all`). rmdir fails closed — if the
+    // mount is still live or the directory is non-empty due to the bind
+    // not yet being released, it just returns EBUSY/ENOTEMPTY and we
+    // leave the empty dir for the next launch's defense sweep to pick up.
     nix::mount::umount2(&sandbox_root, nix::mount::MntFlags::MNT_DETACH).ok();
-    std::fs::remove_dir_all(&sandbox_root).ok();
+    std::fs::remove_dir(&sandbox_root).ok();
     // Unmount the staging workspace (pre-mounted before clone for kernel 6.17+ compat).
     // Parent mounted with MS_BIND | MS_REC, so cleanup must use MNT_DETACH to release
     // any nested submounts the recursive bind picked up. A plain umount() leaves the

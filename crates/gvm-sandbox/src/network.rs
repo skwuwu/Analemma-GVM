@@ -1043,14 +1043,56 @@ struct StateCleanupCounts {
 fn cleanup_state_resources(state: &SandboxState) -> StateCleanupCounts {
     let mut counts = StateCleanupCounts::default();
 
-    // 1. Unmount sandbox mount paths (reverse order for nested mounts)
+    // 1. Unmount sandbox mount paths (reverse order for nested mounts).
+    //
+    // CRITICAL — data-loss bug fixed here (2026-04-16):
+    // We deliberately use `rmdir` (via `std::fs::remove_dir`) instead of
+    // `std::fs::remove_dir_all()`.
+    //
+    // Why: `umount2(MNT_DETACH)` is a *lazy* unmount. When the caller's
+    // mount namespace still references the mount (overlays nested inside
+    // the path, bind mounts, open fds), the kernel defers actual unmount
+    // until those references drop. `remove_dir_all()` walks recursively
+    // and in that window it descends INTO the still-mounted filesystem,
+    // deleting real files from the bind/overlay's source directory —
+    // including the host workspace when the sandbox mounted the repo
+    // as an overlay lowerdir.
+    //
+    // Reproduced: a single 2-minute `gvm run --sandbox` stress session
+    // destroyed 224 files from the host repo (src/, fuzz/, .git/, etc.)
+    // because cleanup fired while the ws-merged overlay still pointed
+    // at /home/ubuntu/<repo>.
+    //
+    // `remove_dir` only succeeds when the directory is empty on the
+    // real filesystem (not through a mount). If the mount is still live,
+    // the rmdir fails with ENOTEMPTY / EBUSY and we skip it. The empty
+    // dir is cleaned up by the `cleanup_stale_run_gvm_dirs` defense
+    // sweep on the next launch, which separately verifies the PID is
+    // dead and no live mount references it — safe because that check
+    // is decoupled from the umount call.
     for mount_path in state.mount_paths.iter().rev() {
         let path = std::path::Path::new(mount_path);
-        if path.exists() {
-            nix::mount::umount2(path, nix::mount::MntFlags::MNT_DETACH).ok();
-            std::fs::remove_dir_all(path).ok();
-            counts.mount_paths += 1;
-            tracing::debug!(path = mount_path, "Unmounted orphan mount");
+        if !path.exists() {
+            continue;
+        }
+        // Try to unmount; MNT_DETACH leaves the mount live if references exist.
+        let umount_ok = nix::mount::umount2(path, nix::mount::MntFlags::MNT_DETACH).is_ok();
+        // Only remove the directory itself (rmdir semantics) — never recurse.
+        // If unmount is pending and the path is non-empty through the mount,
+        // rmdir fails cleanly.
+        match std::fs::remove_dir(path) {
+            Ok(()) => {
+                counts.mount_paths += 1;
+                tracing::debug!(path = mount_path, umount = umount_ok, "Removed orphan mount dir");
+            }
+            Err(e) => {
+                tracing::debug!(
+                    path = mount_path,
+                    umount = umount_ok,
+                    error = %e,
+                    "Skipped rmdir — mount still live or dir not empty. Defense sweep will handle later."
+                );
+            }
         }
     }
 
@@ -1598,21 +1640,29 @@ fn cleanup_stale_run_gvm_dirs() -> usize {
         let path = format!("/run/gvm/{}", name);
         // Skip anything still mounted (mount table check is cheaper than
         // a stat-based heuristic and matches what /proc/mounts reports).
-        if mounts.lines().any(|l| {
+        let is_mounted = mounts.lines().any(|l| {
             l.split_whitespace()
                 .nth(1)
                 .map(|m| m == path.as_str())
                 .unwrap_or(false)
-        }) {
-            // Try a lazy unmount first; if it succeeds the next iteration
-            // would see it gone, but we just remove on the next pass.
+        });
+        if is_mounted {
+            // Lazy unmount. Do NOT follow with remove_dir_all — see the
+            // detailed note on the data-loss bug in cleanup_state_resources
+            // above. If the mount is still live at rmdir time, rmdir will
+            // fail (ENOTEMPTY/EBUSY) and we leave the empty dir; the next
+            // sweep handles it after the kernel finishes the detach.
             nix::mount::umount2(
                 std::path::Path::new(&path),
                 nix::mount::MntFlags::MNT_DETACH,
             )
             .ok();
         }
-        if std::fs::remove_dir_all(&path).is_ok() {
+        // Use rmdir (remove_dir), never remove_dir_all: a still-mounted
+        // bind/overlay would let a recursive delete tunnel into the
+        // source filesystem (host repo, home dir) and silently delete
+        // real files. rmdir on a mounted directory is non-destructive.
+        if std::fs::remove_dir(&path).is_ok() {
             cleaned += 1;
             tracing::warn!(path = %path, pid = pid, "Removed stale /run/gvm/ directory");
         }

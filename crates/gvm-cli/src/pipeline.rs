@@ -266,18 +266,28 @@ async fn launch_sandbox(config: &AgentConfig, pre: &PreLaunchState) -> Result<i3
 
     // Filesystem governance mode and sandbox profile.
     //
-    // Overlayfs is ALWAYS on for --sandbox — this is what makes /workspace
-    // writable end-to-end (agents expect a normal writable working dir).
-    // The --fs-governance flag used to gate overlayfs itself, but that left
-    // --sandbox alone in a confusing read-only legacy mode where even
-    // `mkdir /workspace/foo` failed. Now --sandbox means: namespace isolation
-    // + overlayfs + file-pattern classification + diff report on exit.
-    // The --fs-governance flag is retained for backwards compatibility but
-    // no longer changes behaviour when --sandbox is set.
+    // `--fs-governance` is the ORIGINAL opt-in gate for overlayfs. Default
+    // (plain `--sandbox`) uses a read-only workspace bind mount — safe
+    // regardless of cleanup timing because RDONLY makes delete-through
+    // the mount impossible. `--fs-governance` enables overlayfs with
+    // file-pattern classification (auto_merge / manual_commit / discard),
+    // which is needed for agents that legitimately need a writable
+    // workspace — but the overlay cleanup path has to deal with
+    // lowerdir=workspace_dir, so it MUST be paired with the `rmdir`
+    // (not remove_dir_all) cleanup fixes in sandbox_impl / mount.rs.
+    //
+    // Earlier (commit d00b11a, 2026-04-08) the flag was bypassed and
+    // fs_policy was always set to `Some(...)`. That inverted the
+    // intended policy: production runs gained overlayfs semantics
+    // without opt-in, and their cleanup triggered the repo-deletion
+    // bug reproduced on 2026-04-16. Restored to opt-in here.
     let mut sandbox_config = sandbox_config;
-    sandbox_config.fs_policy = Some(gvm_sandbox::FilesystemPolicy::default());
+    sandbox_config.fs_policy = if config.fs_governance {
+        Some(gvm_sandbox::FilesystemPolicy::default())
+    } else {
+        None
+    };
     sandbox_config.sandbox_profile = config.sandbox_profile.clone();
-    let _fs_governance_flag = config.fs_governance; // reserved for future opt-out
 
     // Preflight check (sandbox only)
     let preflight = gvm_sandbox::preflight_check(&sandbox_config);
