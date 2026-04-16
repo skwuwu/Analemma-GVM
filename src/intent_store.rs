@@ -300,7 +300,7 @@ impl IntentStore {
                 true
             })
             .collect();
-        candidates.sort_by(|a, b| b.intent_id.cmp(&a.intent_id)); // newest first
+        candidates.sort_by_key(|b| std::cmp::Reverse(b.intent_id)); // newest first
         let matched = candidates.first().map(|i| i.intent_id);
 
         match matched {

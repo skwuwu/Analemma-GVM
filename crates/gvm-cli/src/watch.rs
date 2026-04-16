@@ -750,7 +750,7 @@ fn print_session_summary_json(stats: &SessionStats, anomaly: &AnomalyDetector) {
     let duration = stats.start_time.elapsed();
 
     let mut hosts: Vec<_> = stats.hosts.iter().map(|(k, v)| (k.clone(), *v)).collect();
-    hosts.sort_by(|a, b| b.1.cmp(&a.1));
+    hosts.sort_by_key(|b| std::cmp::Reverse(b.1));
 
     let real_warnings: Vec<_> = anomaly
         .warnings

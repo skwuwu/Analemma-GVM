@@ -84,7 +84,7 @@ pub async fn show_token_stats(
     println!("{}", "-".repeat(96));
 
     let mut sorted_agents: Vec<_> = agent_map.iter().collect();
-    sorted_agents.sort_by(|a, b| b.1.total_tokens.cmp(&a.1.total_tokens));
+    sorted_agents.sort_by_key(|b| std::cmp::Reverse(b.1.total_tokens));
 
     let mut grand_total_tokens: u64 = 0;
     let mut grand_denied: u64 = 0;

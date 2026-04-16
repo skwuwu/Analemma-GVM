@@ -368,16 +368,14 @@ fn reconstruct_anthropic_sse(chunks: &[serde_json::Value]) -> Option<LLMTrace> {
                     .and_then(|t| t.as_str())
                     == Some("thinking");
             }
-            "content_block_delta" => {
-                if in_thinking_block {
-                    if let Some(thinking) = chunk
-                        .get("delta")
-                        .and_then(|d| d.get("thinking"))
-                        .and_then(|t| t.as_str())
-                    {
-                        if !thinking.is_empty() {
-                            thinking_parts.push(thinking.to_string());
-                        }
+            "content_block_delta" if in_thinking_block => {
+                if let Some(thinking) = chunk
+                    .get("delta")
+                    .and_then(|d| d.get("thinking"))
+                    .and_then(|t| t.as_str())
+                {
+                    if !thinking.is_empty() {
+                        thinking_parts.push(thinking.to_string());
                     }
                 }
             }
