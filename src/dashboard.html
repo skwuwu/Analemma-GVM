@@ -160,7 +160,7 @@ tailwind.config = { theme: { extend: { fontFamily: { mono: ['JetBrains Mono', 'm
 
 <script>
 let allEvents=[], currentStats={}, walOffset=0, seenIds=new Set(), decisionChart=null;
-let activeFilters=new Set(['Delay','Deny','Other']), perHostDecisions={}, prevDenyCount=0;
+let activeFilters=new Set(['Allow','Delay','Deny','Other']), perHostDecisions={}, prevDenyCount=0;
 const requestTimes=[], loopDetector={}, anomalies=[];
 
 function detectAnomalies(ev) {
@@ -186,7 +186,7 @@ function translateDeny(ev){
 }
 
 function setFilter(f){
-  const allTypes=new Set(['Delay','Deny','Other']);
+  const allTypes=new Set(['Allow','Delay','Deny','Other']);
   if(f==='all'){
     activeFilters=new Set(allTypes);
   } else {

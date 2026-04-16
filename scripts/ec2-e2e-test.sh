@@ -6637,17 +6637,18 @@ except: pass
 print("DNS_83B_DONE")' > "$DNS83_OUT" 2>&1 || true
 
         if grep -q "^DNS_83B_DONE" "$DNS83_OUT" 2>/dev/null; then
-            # Tier 2 uses IC-1 append_async which is a NATS stub and does
-            # NOT write to the durable WAL by design. Verify via proxy.log
-            # instead — the DNS governance engine logs every classification.
+            # Tier 2 (Unknown) now writes to the durable WAL
+            # (the "new domain appeared" signal is worth auditing).
+            # Only Tier 1 (Known) remains async/out-of-chain. Prefer WAL
+            # as the canonical source; fall back to proxy.log for older
+            # builds that haven't been rebuilt.
             sleep 1  # small settle for log flush
-            # proxy.log has ANSI escapes; search for both keywords independently
-            if grep "never-seen-domain-83b" data/proxy.log 2>/dev/null | grep -q "unknown\|Tier 2"; then
-                pass "83b: unknown host classified as Tier 2 in proxy.log"
-            elif grep -q "dns_tier.*unknown" data/wal.log 2>/dev/null; then
+            if grep -q "dns_tier.*unknown\|dns_tier\":\"unknown" data/wal.log 2>/dev/null; then
                 pass "83b: unknown host produced Tier 2 WAL entry"
+            elif grep "never-seen-domain-83b" data/proxy.log 2>/dev/null | grep -q "unknown\|Tier 2"; then
+                pass "83b: unknown host classified as Tier 2 in proxy.log"
             else
-                fail "83b: no Tier 2 classification found in proxy.log or WAL"
+                fail "83b: no Tier 2 classification found in WAL or proxy.log"
                 echo "  ${DIM}proxy.log tail: $(grep -i dns data/proxy.log | tail -3)${NC}"
             fi
         else
