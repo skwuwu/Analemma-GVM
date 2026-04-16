@@ -385,11 +385,14 @@ Configuration fields for `gvm run --sandbox` (Linux-native isolation). Defined i
 
 | Platform | Proxy | SDK | `--sandbox` | `--contained` |
 |----------|-------|-----|-------------|---------------|
-| Linux | Native | Native | **Production** | Experimental |
-| Windows | Native | Native | Not supported | Experimental (Docker Desktop) |
-| macOS | Native | Native | Not supported | Experimental (Docker Desktop) |
+| Linux | Native | Native | **Production** (with MITM) | **Production** (no MITM) |
+| Windows (WSL2) | Native | Native | Not supported | **Production** (run gvm from WSL2) |
+| Windows (native) | Native | Native | Not supported | Cooperative fallback |
+| macOS | Native | Native | Not supported | Cooperative fallback |
 
-> **`--contained` status**: Implemented but experimental. Known issues: WSL2 network bridge drops large TCP responses, `python:3.12-slim` lacks iptables, `NET_ADMIN` capability can be abused by agents, Windows path translation failures. Use `--sandbox` on Linux for production. Stabilization planned for a future release.
+> **`--contained` design**: Host-side iptables on a dedicated `gvm-docker-{slot}` bridge force all container egress through the proxy port. Non-cooperative HTTP clients (Node.js raw `https`, raw sockets) that would bypass `HTTP_PROXY` are dropped at the host. No MITM — use `--sandbox` on Linux for HTTPS payload inspection.
+>
+> **Cooperative fallback** (native Windows / macOS): Docker Desktop's host VM iptables is inaccessible to `gvm`, so Docker mode sets `HTTP_PROXY` only. Non-cooperative clients can bypass — the same caveat as plain cooperative mode. For guaranteed enforcement on Windows, run `gvm` from WSL2.
 
 ### Sandbox Prerequisites (Linux only)
 

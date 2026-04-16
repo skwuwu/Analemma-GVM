@@ -829,6 +829,21 @@ pub struct SandboxState {
     /// session owns it.
     #[serde(default)]
     pub tmux_session: Option<String>,
+    /// Docker bridge network name (`gvm-docker-{slot}`). Set only for
+    /// `--contained` (Docker) mode. `None` for `--sandbox` (veth) mode.
+    /// Cleanup uses this to `docker network rm`.
+    #[serde(default)]
+    pub docker_bridge: Option<String>,
+    /// Docker container name. Set only for `--contained` mode.
+    /// Cleanup uses this to `docker stop` + `docker rm`.
+    #[serde(default)]
+    pub docker_container: Option<String>,
+    /// Dedicated iptables chain that DOCKER-USER jumps to for this bridge.
+    /// Named `GVM-{bridge_name}` (e.g., `GVM-gvm-docker-0`). Separate from
+    /// `forward_chain` (sandbox/veth) because the two modes are mutually
+    /// exclusive per state file, but cleanup must know which chain to remove.
+    #[serde(default)]
+    pub docker_chain: Option<String>,
 }
 
 /// Get the state file path for a given PID.
@@ -849,10 +864,12 @@ pub fn record_sandbox_state(
 ) -> Result<()> {
     let parent_pid = std::process::id();
     let state = SandboxState {
-        // Bumped to 3 with the addition of `pid_starttime` /
-        // `child_pid_starttime` / `tmux_session`. Older v1/v2 files
-        // remain readable because the new fields use `#[serde(default)]`.
-        version: 3,
+        // v4 adds optional Docker fields (`docker_bridge`,
+        // `docker_container`, `docker_chain`) used by `--contained` mode.
+        // v3 added `pid_starttime` / `child_pid_starttime` / `tmux_session`.
+        // Older files remain readable because new fields use
+        // `#[serde(default)]`.
+        version: 4,
         pid: parent_pid,
         pid_starttime: read_proc_starttime(parent_pid),
         child_pid_starttime: read_proc_starttime(config.child_pid),
@@ -874,6 +891,9 @@ pub fn record_sandbox_state(
         cgroup_path: cgroup_path.map(|s| s.to_string()),
         dns_target: dns_target.map(|s| s.to_string()),
         child_pid: Some(config.child_pid),
+        docker_bridge: None,
+        docker_container: None,
+        docker_chain: None,
     };
 
     let path = state_file_path(state.pid);
@@ -1083,6 +1103,28 @@ fn cleanup_state_resources(state: &SandboxState) -> StateCleanupCounts {
         // Per-sandbox iptables chain GVM-{veth_host} + DNAT/MASQUERADE rules.
         counts.iptables_chains += 1;
         tracing::debug!(iface = %state.veth_host, "Cleaned orphan: TC filter + iptables + veth");
+    }
+
+    // 4. Docker bridge + container + iptables (set only by `--contained`).
+    //    Fields are `None` for sandbox state files, so this block is a no-op
+    //    for sandbox runs. For Docker runs, we reverse the launch sequence:
+    //    `docker stop/rm` → cleanup_docker_bridge_iptables → `docker network rm`.
+    if let Some(ref container) = state.docker_container {
+        let _ = Command::new("docker")
+            .args(["stop", container])
+            .output();
+        let _ = Command::new("docker")
+            .args(["rm", "-f", container])
+            .output();
+        tracing::debug!(container = %container, "Stopped orphan Docker container");
+    }
+    if let Some(ref bridge) = state.docker_bridge {
+        let _ = cleanup_docker_bridge_iptables(bridge);
+        let _ = Command::new("docker")
+            .args(["network", "rm", bridge])
+            .output();
+        counts.iptables_chains += 1;
+        tracing::debug!(bridge = %bridge, "Cleaned orphan Docker bridge + iptables");
     }
 
     counts
@@ -1360,6 +1402,68 @@ pub fn cleanup_all_orphans_report() -> Result<CleanupReport> {
     report.iptables_chains += stale_nat;
     cleaned += stale_nat;
 
+    // 5b. Defense-in-depth: GVM Docker iptables chains whose matching bridge
+    // is gone (bridge removed by `docker network rm` or Docker daemon reset
+    // without going through our cleanup path).
+    let stale_docker_chains = cleanup_stale_docker_chains() as u32;
+    report.iptables_chains += stale_docker_chains;
+    cleaned += stale_docker_chains;
+
+    // 5c. Defense-in-depth: GVM Docker bridges with no matching iptables
+    // chain (bridge survived but our enforcement chain was flushed — a
+    // degraded state where the bridge would pass traffic without the
+    // egress DROP rule). List via `docker network ls`, check `iptables -L`
+    // for `GVM-{bridge}` chain existence, remove bridges that lack it.
+    if let Ok(out) = Command::new("docker")
+        .args([
+            "network",
+            "ls",
+            "--filter",
+            &format!("name={}", DOCKER_BRIDGE_PREFIX),
+            "--format",
+            "{{.Name}}",
+        ])
+        .output()
+    {
+        let names = String::from_utf8_lossy(&out.stdout);
+        for bridge in names.lines().map(str::trim).filter(|s| !s.is_empty()) {
+            if !bridge.starts_with(DOCKER_BRIDGE_PREFIX) {
+                continue;
+            }
+            // If the state file for this bridge still exists on an alive PID,
+            // leave it alone. Fast check: search state dir for the bridge name.
+            let in_use = std::fs::read_dir(STATE_DIR)
+                .ok()
+                .map(|it| {
+                    it.filter_map(|e| e.ok()).any(|entry| {
+                        std::fs::read_to_string(entry.path())
+                            .ok()
+                            .map(|c| c.contains(bridge))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+            if in_use {
+                continue;
+            }
+            let chain_exists = Command::new("iptables")
+                .args(["-L", &format!("GVM-{}", bridge), "-n"])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !chain_exists {
+                tracing::warn!(
+                    bridge = bridge,
+                    "Stale GVM Docker bridge (no iptables chain, no state file) — removing"
+                );
+                let _ = Command::new("docker")
+                    .args(["network", "rm", bridge])
+                    .output();
+                cleaned += 1;
+            }
+        }
+    }
+
     // 6. Defense-in-depth: remove /run/gvm/{sandbox-staging-ws,sandbox-root,
     //    home-merged,home-overlay,ws-merged,ws-overlay}-<pid> directories
     // whose owning PID is dead AND which have no live mount underneath.
@@ -1614,6 +1718,323 @@ fn run_ip6tables(args: &[&str]) -> Result<()> {
         anyhow::bail!("ip6tables {} failed: {}", args.join(" "), stderr.trim());
     }
     Ok(())
+}
+
+// ─── Docker Bridge iptables Helpers (--contained mode) ───
+//
+// `--contained` mode uses host-side iptables on a user-defined Docker bridge
+// to force-route all container egress through the GVM proxy. Unlike sandbox
+// mode (which creates a veth pair), this mode lets Docker manage the bridge
+// and only installs iptables rules scoped to that specific bridge.
+//
+// Isolation guarantee:
+// - Bridge names follow the `gvm-docker-{slot}` prefix, parallel to
+//   sandbox's `veth-gvm-*`. Other Docker workloads use `docker0` or
+//   `br-xxxxxxxx` and are unaffected.
+// - Rules are installed in a dedicated chain `GVM-{bridge_name}`, referenced
+//   only via a single JUMP from `DOCKER-USER` with `-i {bridge_name}` as the
+//   first match condition. Traffic not originating on our bridge never enters
+//   our chain.
+// - Cleanup flushes and deletes the chain, removes the JUMP, and removes
+//   the bridge. Nothing else is touched.
+//
+// Why DOCKER-USER (not FORWARD): Docker rebuilds the FORWARD chain on
+// daemon restart and would strip any GVM rules installed there. DOCKER-USER
+// is the designated, persistence-safe hook for user rules.
+
+/// Bridge name prefix for GVM `--contained` mode. Must not collide with
+/// Docker's default `docker0` or user-defined `br-*` bridges.
+pub const DOCKER_BRIDGE_PREFIX: &str = "gvm-docker-";
+
+/// Subnet octet for GVM Docker bridges. Each slot gets
+/// `172.30.{slot}.0/24`, gateway `.1`, container range `.2-.254`.
+/// Sandbox mode uses `10.200.0.0/16` so the two modes never collide.
+const DOCKER_SUBNET_OCTET_1: u8 = 172;
+const DOCKER_SUBNET_OCTET_2: u8 = 30;
+/// Maximum number of concurrent Docker bridges (slots 0-255).
+const DOCKER_MAX_SLOTS: u32 = 256;
+
+/// Configuration for a Docker bridge iptables setup.
+#[derive(Debug, Clone)]
+pub struct DockerBridgeConfig {
+    /// Counter slot (used by orphan cleanup to correlate bridge and chain).
+    pub slot: u32,
+    /// Bridge name, e.g., `gvm-docker-0`. Must start with `DOCKER_BRIDGE_PREFIX`.
+    pub bridge: String,
+    /// Bridge subnet in CIDR notation (e.g., `172.30.0.0/24`). Used for
+    /// source matching on egress DROP rules and `docker network create --subnet`.
+    pub subnet: String,
+    /// Host IP reachable from the bridge (typically the bridge gateway,
+    /// e.g., `172.30.0.1`). Proxy ACCEPT rules target this address + port.
+    pub host_ip: String,
+    /// Proxy listen port on the host (e.g., 8080).
+    pub proxy_port: u16,
+}
+
+impl DockerBridgeConfig {
+    /// Build a config from a pre-allocated slot and the proxy port.
+    /// Caller is responsible for ensuring the slot is free (use
+    /// [`allocate_docker_slot`]).
+    pub fn from_slot(slot: u32, proxy_port: u16) -> Self {
+        let third = (slot % DOCKER_MAX_SLOTS) as u8;
+        let subnet = format!(
+            "{}.{}.{}.0/24",
+            DOCKER_SUBNET_OCTET_1, DOCKER_SUBNET_OCTET_2, third
+        );
+        let host_ip = format!(
+            "{}.{}.{}.1",
+            DOCKER_SUBNET_OCTET_1, DOCKER_SUBNET_OCTET_2, third
+        );
+        Self {
+            slot,
+            bridge: format!("{}{}", DOCKER_BRIDGE_PREFIX, slot),
+            subnet,
+            host_ip,
+            proxy_port,
+        }
+    }
+}
+
+/// Allocate the lowest free Docker bridge slot by scanning existing
+/// `gvm-docker-*` networks via `docker network ls`. Parallel to sandbox's
+/// `SANDBOX_COUNTER`, but slot-checked against live Docker state because
+/// Docker bridges persist across `gvm run` invocations (e.g., `--detach`).
+pub fn allocate_docker_slot() -> Result<u32> {
+    let output = Command::new("docker")
+        .args([
+            "network",
+            "ls",
+            "--filter",
+            &format!("name={}", DOCKER_BRIDGE_PREFIX),
+            "--format",
+            "{{.Name}}",
+        ])
+        .output()
+        .context("Failed to run `docker network ls` — is Docker running?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("docker network ls failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let used: std::collections::HashSet<u32> = stdout
+        .lines()
+        .filter_map(|name| {
+            name.trim()
+                .strip_prefix(DOCKER_BRIDGE_PREFIX)
+                .and_then(|s| s.parse::<u32>().ok())
+        })
+        .collect();
+
+    for slot in 0..DOCKER_MAX_SLOTS {
+        if !used.contains(&slot) {
+            return Ok(slot);
+        }
+    }
+    anyhow::bail!(
+        "All {} Docker bridge slots in use — run `gvm cleanup` or remove \
+         stale `{}*` networks",
+        DOCKER_MAX_SLOTS,
+        DOCKER_BRIDGE_PREFIX
+    );
+}
+
+/// Per-bridge iptables chain name.
+fn docker_chain_name(bridge: &str) -> String {
+    format!("GVM-{}", bridge)
+}
+
+/// Install host-side iptables rules that force all traffic from a GVM Docker
+/// bridge through the GVM proxy.
+///
+/// Rules installed (scoped entirely to the bridge interface):
+/// 1. Dedicated chain `GVM-{bridge}` is created.
+/// 2. Inside the chain: ACCEPT to `host_ip:proxy_port`, ACCEPT
+///    `ESTABLISHED,RELATED`, DROP everything else.
+/// 3. Single JUMP from `DOCKER-USER` with `-i {bridge}` as first match.
+///
+/// Idempotent: if the chain or JUMP already exists, the duplicate is
+/// skipped rather than erroring.
+pub fn setup_docker_bridge_iptables(cfg: &DockerBridgeConfig) -> Result<()> {
+    if !cfg.bridge.starts_with(DOCKER_BRIDGE_PREFIX) {
+        anyhow::bail!(
+            "Docker bridge name '{}' does not start with required prefix '{}' \
+             — refusing to install iptables rules to protect user workloads",
+            cfg.bridge,
+            DOCKER_BRIDGE_PREFIX
+        );
+    }
+
+    let chain = docker_chain_name(&cfg.bridge);
+    let proxy_port_str = cfg.proxy_port.to_string();
+
+    // 1. Create per-bridge chain (ignore "chain already exists" error).
+    if run_iptables(&["-N", &chain]).is_err() {
+        tracing::debug!(chain = %chain, "Chain already exists (idempotent create)");
+    }
+
+    // 2. Flush the chain before re-populating (idempotent setup).
+    run_iptables(&["-F", &chain])?;
+
+    // 3. Chain rules: ACCEPT proxy, ACCEPT established, DROP rest.
+    run_iptables(&[
+        "-A", &chain,
+        "-p", "tcp",
+        "-d", &cfg.host_ip,
+        "--dport", &proxy_port_str,
+        "-j", "ACCEPT",
+    ])?;
+    run_iptables(&[
+        "-A", &chain,
+        "-m", "state",
+        "--state", "ESTABLISHED,RELATED",
+        "-j", "ACCEPT",
+    ])?;
+    run_iptables(&[
+        "-A", &chain,
+        "-j", "DROP",
+    ])?;
+
+    // 4. JUMP from DOCKER-USER (persistence-safe across daemon restarts).
+    //    `-i {bridge}` is the first match condition: any traffic not from
+    //    our bridge skips this rule entirely and continues down DOCKER-USER.
+    let jump_args = ["-I", "DOCKER-USER", "-i", &cfg.bridge, "-j", &chain];
+    // Check first to avoid duplicate JUMP on re-setup.
+    let check_args = ["-C", "DOCKER-USER", "-i", &cfg.bridge, "-j", &chain];
+    if run_iptables(&check_args).is_err() {
+        run_iptables(&jump_args)?;
+    }
+
+    tracing::info!(
+        bridge = %cfg.bridge,
+        subnet = %cfg.subnet,
+        chain = %chain,
+        host_ip = %cfg.host_ip,
+        proxy_port = cfg.proxy_port,
+        "Docker bridge iptables installed"
+    );
+    Ok(())
+}
+
+/// Remove the iptables rules installed by `setup_docker_bridge_iptables`.
+/// Best-effort: every step uses `.ok()` so cleanup continues even if some
+/// rules are already gone. Returns `Ok(())` always.
+pub fn cleanup_docker_bridge_iptables(bridge: &str) -> Result<()> {
+    let chain = docker_chain_name(bridge);
+
+    // 1. Remove JUMP from DOCKER-USER. Retry loop because multiple JUMPs
+    //    could exist if setup was called repeatedly without cleanup.
+    for _ in 0..8 {
+        if run_iptables(&["-D", "DOCKER-USER", "-i", bridge, "-j", &chain]).is_err() {
+            break;
+        }
+    }
+
+    // 2. Flush + delete the chain.
+    run_iptables(&["-F", &chain]).ok();
+    run_iptables(&["-X", &chain]).ok();
+
+    tracing::debug!(bridge = %bridge, chain = %chain, "Docker bridge iptables cleaned");
+    Ok(())
+}
+
+/// Record a Docker-mode resource manifest to a per-PID state file so
+/// orphan cleanup can tear down bridge + container + iptables if the
+/// parent process dies unexpectedly. Uses the same file path / format
+/// as `record_sandbox_state` — sandbox-specific fields (veth, host_ip,
+/// etc.) are empty strings for Docker mode, and `cleanup_state_resources`
+/// branches on whether `docker_bridge` is present.
+pub fn record_docker_state(
+    cfg: &DockerBridgeConfig,
+    container_name: &str,
+) -> Result<()> {
+    let parent_pid = std::process::id();
+    let state = SandboxState {
+        version: 4,
+        pid: parent_pid,
+        pid_starttime: read_proc_starttime(parent_pid),
+        child_pid_starttime: None,
+        tmux_session: std::env::var("TMUX").ok().filter(|s| !s.is_empty()),
+        created_at: time::OffsetDateTime::now_utc().to_string(),
+        // Veth fields are empty for Docker mode. `cleanup_state_resources`
+        // probes `ip link show ""` → not found → skips veth cleanup.
+        veth_host: String::new(),
+        veth_sandbox: String::new(),
+        host_ip: cfg.host_ip.clone(),
+        sandbox_ip: String::new(),
+        proxy_port: cfg.proxy_port,
+        forward_chain: String::new(),
+        mount_paths: Vec::new(),
+        cgroup_path: None,
+        dns_target: None,
+        child_pid: None,
+        docker_bridge: Some(cfg.bridge.clone()),
+        docker_container: Some(container_name.to_string()),
+        docker_chain: Some(docker_chain_name(&cfg.bridge)),
+    };
+
+    let path = state_file_path(state.pid);
+    std::fs::create_dir_all(STATE_DIR).ok();
+    std::fs::write(&path, serde_json::to_string_pretty(&state)?)
+        .with_context(|| format!("Failed to write Docker state to {}", path.display()))?;
+
+    tracing::debug!(
+        path = %path.display(),
+        pid = state.pid,
+        bridge = %cfg.bridge,
+        container = %container_name,
+        "Docker-mode state recorded for orphan cleanup"
+    );
+    Ok(())
+}
+
+/// Scan for orphan GVM Docker bridge iptables chains whose matching bridge
+/// interface no longer exists. Returns the number of chains cleaned.
+///
+/// Called by the startup orphan sweeper alongside the veth cleanup to
+/// defend against SIGKILL / crash scenarios where the state file was
+/// removed but iptables rules survived.
+pub fn cleanup_stale_docker_chains() -> usize {
+    let mut cleaned = 0usize;
+    let output = match Command::new("iptables").args(["-L", "-n"]).output() {
+        Ok(o) => o,
+        Err(_) => return 0,
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let prefix_chain = format!("GVM-{}", DOCKER_BRIDGE_PREFIX);
+    for line in stdout.lines() {
+        let Some(chain) = line.strip_prefix("Chain ") else {
+            continue;
+        };
+        let Some(chain_name) = chain.split_whitespace().next() else {
+            continue;
+        };
+        if !chain_name.starts_with(&prefix_chain) {
+            continue;
+        }
+        // Derive bridge name: "GVM-gvm-docker-0" → "gvm-docker-0"
+        let bridge = &chain_name[4..];
+
+        // Check if bridge interface still exists
+        let bridge_exists = Command::new("ip")
+            .args(["link", "show", bridge])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if !bridge_exists {
+            tracing::warn!(
+                chain = chain_name,
+                bridge = bridge,
+                "Stale GVM Docker iptables chain (bridge gone) — removing"
+            );
+            let _ = cleanup_docker_bridge_iptables(bridge);
+            cleaned += 1;
+        }
+    }
+    cleaned
 }
 
 #[cfg(test)]

@@ -48,10 +48,10 @@ That's it. `gvm run` auto-configures the proxy, routes all HTTP traffic through 
 ```bash
 gvm run my_agent.py              # Lite:  HTTP proxy only (dev/testing)
 gvm run --sandbox my_agent.py    # Hard:  + Linux namespaces + seccomp (production)
-gvm run --contained my_agent.py  # Docker isolation (experimental — see note)
+gvm run --contained my_agent.py  # Docker isolation (Linux + WSL2)
 ```
 
-> **Non-Linux?** `--sandbox` is Linux-only (production). `--contained` (Docker) is implemented but experimental — unstable on WSL2 and slim images. On Windows/macOS, run without isolation — SRR still enforces governance on all HTTP traffic.
+> **Non-Linux?** `--sandbox` is Linux-only (production). `--contained` (Docker) is stable on **Linux + WSL2**: host-side iptables on a dedicated bridge force all container egress through the proxy, catching non-cooperative clients (Node.js raw `https`, raw sockets). On native Windows / macOS the Docker host VM's iptables is inaccessible, so contained mode falls back to cooperative HTTP_PROXY only (Node.js can bypass). For guaranteed enforcement on Windows, run `gvm` from WSL2.
 
 ---
 

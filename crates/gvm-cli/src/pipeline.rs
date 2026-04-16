@@ -78,8 +78,13 @@ pub async fn pre_launch(config: &AgentConfig) -> Result<PreLaunchState> {
         }
     }
 
-    // 3. Download MITM CA (sandbox/contained, skip if --no-mitm)
-    let mitm_ca = if config.no_mitm || config.mode == LaunchMode::Cooperative {
+    // 3. Download MITM CA (sandbox only, skip if --no-mitm).
+    // Docker mode and cooperative mode never use MITM — CA download is
+    // skipped to avoid the admin-API fetch when it isn't needed.
+    let mitm_ca = if config.no_mitm
+        || config.mode == LaunchMode::Cooperative
+        || matches!(config.mode, LaunchMode::Contained { .. })
+    {
         None
     } else {
         run::download_mitm_ca_cert(&config.proxy).await

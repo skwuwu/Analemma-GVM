@@ -14,9 +14,11 @@ All agent execution uses `gvm run` with flags:
 | **Enforce** | `gvm run agent.py` | Agent respects `HTTP_PROXY` | Production |
 | **Discover** | `gvm run -i agent.py` | Enforce + suggest rules after exit | Production |
 | **Sandbox** | `gvm run --sandbox agent.py` | Kernel-level (namespace + seccomp + MITM) | Production, Linux |
-| **Contained** | `gvm run --contained agent.py` | Docker network isolation + MITM | **Unsupported** — experimental only |
+| **Contained** | `gvm run --contained agent.py` | Docker bridge + host-side iptables egress lock (no MITM) | Linux + WSL2 production-ready |
 
-> **Contained mode (`--contained`)** is implemented as a proof-of-concept but is **not supported for production use**. Known issues: WSL2 network instability, iptables missing in slim images, `NET_ADMIN` capability abuse, Windows path failures. Use `--sandbox` on Linux. Contained mode may be stabilized in a future release.
+> **Contained mode (`--contained`)** is stable on Linux hosts and WSL2. Each run gets a dedicated `gvm-docker-{slot}` bridge with host-side iptables rules (DOCKER-USER chain) that force all egress through the proxy port. Non-cooperative clients (Node.js raw `https`, raw sockets) hit the DROP rule instead of silently bypassing. **Docker mode does not do MITM** — HTTPS decisions are SNI-level only. Use `--sandbox` for full HTTPS L7 inspection.
+>
+> **Platform scope**: iptables lives in the Docker host kernel. On native Linux and WSL2 (Windows), this works; on native Windows and macOS (Docker Desktop's hidden VM is inaccessible to `iptables`), contained mode falls back to cooperative `HTTP_PROXY` routing with a visible warning, meaning non-cooperative clients can bypass. Run `gvm` from WSL2 on Windows for guaranteed enforcement.
 
 > **Wasm policy engine** (`--features wasm`) is disabled by default. The native Rust policy engine is used for all enforcement. Wasm support is an **unsupported experimental feature** for future third-party policy plugin scenarios. Enabling it adds ~10MB to the binary and includes 5 known wasmtime CVEs.
 
@@ -55,7 +57,7 @@ The agent runs on the host with `HTTP_PROXY`/`HTTPS_PROXY` environment variables
 ```
 ⚠ Node.js agent detected in cooperative mode.
   Node.js does not respect HTTPS_PROXY by default — HTTPS traffic may bypass the proxy.
-  Use --contained or --sandbox for full HTTPS coverage via DNAT.
+  Use --contained (Linux/WSL2) or --sandbox (Linux) for guaranteed routing.
 ```
 
 ### Who this is for
@@ -70,43 +72,33 @@ Cooperative mode depends on the agent's HTTP library respecting proxy environmen
 
 ## Mode 2: Contained (`gvm run --contained`)
 
-> **Status: Experimental — not production-ready.** Contained mode is implemented but unstable due to Docker environment limitations: WSL2 network bridge issues with large responses, iptables unavailability in slim base images, `NET_ADMIN` capability constraints, and Windows path translation failures. Use `--sandbox` on Linux for production isolation. Contained mode stabilization is planned for a future release.
+**Status: Stable on Linux + WSL2.** Docker containment combines Docker's process isolation (read-only root, no-new-privileges, resource limits) with **host-side iptables egress lock** on a dedicated `gvm-docker-{slot}` bridge. Non-cooperative HTTP clients (Node.js raw `https`, `socket.connect`) that would silently bypass HTTP_PROXY are caught by the host's DROP rule and fail instead of leaking.
 
-The agent runs inside a Docker container with network-level isolation and transparent HTTPS MITM inspection.
+**Deliberately no MITM**: the previous contained implementation used in-container iptables DNAT + injected CA certificates, which broke on WSL2 / slim images / Windows paths. The current design drops MITM entirely in Docker mode — HTTPS decisions come from SNI inspection only. Use `--sandbox` on Linux for full HTTPS L7 inspection.
 
-### What's governed
+### What's governed (Linux / WSL2)
 
 | Channel | Governed? | Mechanism |
 |---------|-----------|-----------|
-| HTTP API calls | **Yes** | Routed through proxy via `HTTP_PROXY` |
-| HTTPS API calls | **Full L7** | Ephemeral CA injected, DNAT 443 → MITM listener |
-| API key injection (HTTPS) | **Yes** | MITM strips agent auth headers, injects from `gvm.toml` |
-| Proxy bypass (direct HTTPS) | **Hardened** | Docker `--internal` network + DNAT redirect |
+| HTTP API calls | **Yes** | `HTTP_PROXY` env var + host iptables ACCEPT to proxy port |
+| HTTPS API calls (HTTP_PROXY-respecting) | **Yes** (SNI-level) | CONNECT tunnel via proxy; SRR matches host from TLS ClientHello |
+| HTTPS API calls (HTTP_PROXY-ignoring, e.g. Node.js) | **Blocked** | Host iptables DROP rule in `GVM-gvm-docker-{slot}` chain |
+| HTTPS L7 payload inspection | **No** | By design — use `--sandbox` for MITM |
+| API key injection | **Yes** (HTTP only) | Proxy injects headers on non-TLS requests |
+| Raw socket / direct IP egress | **Blocked** | Host iptables DROP (only proxy port allowed) |
 | File system reads | Read-only root | `--read-only` Docker flag |
 | File system writes | `/tmp` only | tmpfs, destroyed on exit |
 | Resource limits | **Yes** | `--memory`, `--cpus` Docker resource limits |
 | Process execution | Allowed | Docker default seccomp profile |
-| UDP/ICMP | Blocked | Docker `--internal` network has no external route |
+| UDP/ICMP | **Blocked** | Host iptables DROP on bridge |
 
-### HTTPS MITM — CA trust coverage
+### Isolation from other Docker workloads
 
-| Runtime | Mechanism | Supported |
-|---------|-----------|-----------|
-| Python (requests, urllib3) | `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` env var | Yes |
-| Node.js | `NODE_EXTRA_CA_CERTS` env var | Yes |
-| Go (net/http) | System trust store (`/etc/ssl/certs/`) | Yes |
-| curl / libcurl | `CURL_CA_BUNDLE` env var | Yes |
-| Ruby (net/http) | `SSL_CERT_FILE` env var | Yes |
-| Java (HttpsURLConnection) | Requires JKS keystore import (`keytool`) | Manual only |
-| Certificate pinning apps | Reject any MITM CA | Cannot intercept |
+All iptables rules live in a dedicated chain named `GVM-gvm-docker-{slot}`, referenced by a single JUMP in `DOCKER-USER` filtered by `-i gvm-docker-{slot}`. Traffic from other Docker bridges (`docker0`, user-defined `br-*`) never matches the `-i` interface filter, so GVM rules do not affect any other container. Clean shutdown removes the JUMP + chain + bridge. SIGKILL is handled by `gvm cleanup` (or auto-cleanup on next `gvm run`) which sweeps stale `gvm-docker-*` bridges and `GVM-gvm-docker-*` chains.
 
-### Trade-off: `NET_ADMIN` capability
+### Platform fallback
 
-`--contained` grants `NET_ADMIN` to the container for iptables DNAT setup (HTTPS redirect to MITM listener). This means the agent could theoretically modify iptables rules inside the container. Mitigated by:
-- `--no-new-privileges` Docker flag
-- `--internal` Docker network (no external route even if rules are modified)
-
-For stronger isolation, use `--sandbox`.
+On native macOS or native Windows (outside WSL2), the Docker host is a hidden Linux VM whose iptables is not accessible from `gvm`. Contained mode detects this and falls back to cooperative `HTTP_PROXY` routing with a visible warning. In this fallback, non-cooperative clients (Node.js, raw sockets) can bypass the proxy — the same caveat as cooperative mode. For guaranteed enforcement, run `gvm` from WSL2 on Windows, or use `--sandbox` on native Linux.
 
 ---
 
@@ -250,7 +242,7 @@ These are architectural boundaries, not missing features:
 
 ## Mode comparison summary
 
-| Capability | Cooperative | Contained (experimental) | Sandbox |
+| Capability | Cooperative | Contained (Linux + WSL2) | Sandbox |
 |-----------|-------------|-----------|---------|
 | DNS governance (Layer 0) | None | None | **Tiered delay** (known=0ms, unknown=200ms, burst=3s, flood=10s) |
 | HTTP governance (Layer 1) | Cooperative | Structural | Structural |

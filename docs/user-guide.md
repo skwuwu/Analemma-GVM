@@ -277,7 +277,7 @@ The full matrix:
 |---|---|---|---|
 | **Cooperative** (default) | `gvm run --watch a.py` | `gvm run a.py` | `gvm run -i a.py` |
 | **Sandbox** (`--sandbox`) | `sudo gvm run --watch --sandbox a.py` | `sudo gvm run --sandbox a.py` | `sudo gvm run -i --sandbox a.py` |
-| **Contained** (`--contained`, experimental) | `gvm run --watch --contained a.py` | `gvm run --contained a.py` | `gvm run -i --contained a.py` |
+| **Contained** (`--contained`, Linux/WSL2) | `gvm run --watch --contained a.py` | `gvm run --contained a.py` | `gvm run -i --contained a.py` |
 
 All twelve cells work. `--watch` and `-i` are mutually exclusive (watch means
 "no rules," interactive means "suggest rules for caution hits" — one

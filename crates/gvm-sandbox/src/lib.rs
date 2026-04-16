@@ -358,6 +358,13 @@ pub fn cleanup_all_orphans() -> Result<u32> {
 #[cfg(target_os = "linux")]
 pub use network::CleanupReport;
 
+/// Docker bridge iptables integration for `--contained` mode.
+#[cfg(target_os = "linux")]
+pub use network::{
+    allocate_docker_slot, cleanup_docker_bridge_iptables, cleanup_stale_docker_chains,
+    record_docker_state, setup_docker_bridge_iptables, DockerBridgeConfig, DOCKER_BRIDGE_PREFIX,
+};
+
 #[cfg(not(target_os = "linux"))]
 #[derive(Debug, Clone, Default)]
 pub struct CleanupReport {

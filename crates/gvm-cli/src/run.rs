@@ -39,12 +39,6 @@ pub async fn run_agent(
     let mode = if sandbox {
         crate::pipeline::LaunchMode::Sandbox
     } else if contained {
-        eprintln!();
-        eprintln!("  {YELLOW}\u{26a0} WARNING: --contained (Docker) is an unsupported experimental feature.{RESET}");
-        eprintln!("  {DIM}Known issues: WSL2 network instability, missing iptables in slim images,{RESET}");
-        eprintln!("  {DIM}NET_ADMIN capability abuse, Windows path failures.{RESET}");
-        eprintln!("  {DIM}Use --sandbox on Linux for production isolation.{RESET}");
-        eprintln!();
         crate::pipeline::LaunchMode::Contained {
             image: image.to_string(),
             memory: memory.to_string(),
@@ -55,8 +49,19 @@ pub async fn run_agent(
         crate::pipeline::LaunchMode::Cooperative
     };
 
-    if no_mitm && mode != crate::pipeline::LaunchMode::Cooperative {
+    // MITM is only available in --sandbox mode (Linux kernel namespace +
+    // veth-level DNAT). Docker mode does not support MITM — the DNAT +
+    // CA injection approach was unstable across WSL2 / slim images and
+    // has been removed. Silently ignore --no-mitm in Docker mode, warn
+    // only when it would change sandbox behavior.
+    if no_mitm && mode == crate::pipeline::LaunchMode::Sandbox {
         eprintln!("  {YELLOW}\u{26a0}{RESET} MITM disabled (--no-mitm). HTTPS uses CONNECT relay (domain-level only).");
+    }
+    if matches!(mode, crate::pipeline::LaunchMode::Contained { .. }) {
+        eprintln!(
+            "  {DIM}Note: Docker mode uses SNI-level SRR (no MITM payload inspection). \
+             Use --sandbox on Linux for full HTTPS L7 inspection.{RESET}"
+        );
     }
 
     // Warn if Node.js in cooperative mode (HTTPS_PROXY not respected)
@@ -701,8 +706,20 @@ fn is_governance_event(event: &serde_json::Value) -> bool {
     event.get("decision").is_some()
 }
 
-/// Docker containment mode: run inside isolated container.
-/// Legacy function — pipeline.rs wraps this until full pipeline integration.
+/// Docker containment mode: run inside isolated container with host-side
+/// iptables enforcement on a dedicated `gvm-docker-{slot}` bridge.
+///
+/// Design (see docs/user-guide.md, "Docker mode"):
+///   - Host-side iptables on a GVM-prefixed bridge forces ALL egress
+///     through the proxy port (incl. Node.js HTTPS that ignores HTTP_PROXY).
+///   - No MITM: Docker mode gives up HTTPS payload inspection in exchange
+///     for stability. SNI-level host decisions still work via SRR. Use
+///     `--sandbox` on Linux for full MITM L7 inspection.
+///   - No in-container iptables, no NET_ADMIN capability: agents run
+///     non-privileged; all enforcement is on the host.
+///   - Linux + WSL2 only (iptables lives in the Docker host kernel).
+///     macOS / native Windows fall back to cooperative HTTP_PROXY only,
+///     with a clear warning.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_contained_legacy(
     script: &str,
@@ -712,10 +729,10 @@ pub(crate) async fn run_contained_legacy(
     memory: &str,
     cpus: &str,
     detach: bool,
-    no_mitm: bool,
+    _no_mitm: bool, // reserved; Docker mode never enables MITM.
 ) -> Result<()> {
     println!();
-    println!("{BOLD}Analemma-GVM \u{2014} Agent Containment (Layer 3){RESET}");
+    println!("{BOLD}Analemma-GVM \u{2014} Docker Containment{RESET}");
     println!();
 
     // Verify Docker is available
@@ -812,12 +829,47 @@ pub(crate) async fn run_contained_legacy(
         .parse()
         .with_context(|| format!("Invalid proxy URL: {}", proxy))?;
 
-    let local_proxy_host = matches!(proxy_url.host_str(), Some("127.0.0.1" | "localhost"));
-    let use_host_network = local_proxy_host && cfg!(target_os = "linux");
+    // ── Allocate a dedicated Docker bridge for this run ──
+    //
+    // Each `gvm run --contained` gets its own `gvm-docker-{slot}` bridge with
+    // a unique 172.30.{slot}.0/24 subnet. The bridge + host-side iptables are
+    // the enforcement primitive: non-HTTP_PROXY-respecting clients (Node.js,
+    // raw sockets) hit the DROP rule and fail, instead of silently bypassing.
+    //
+    // Host iptables setup is Linux-only. On non-Linux (macOS, native Windows),
+    // we fall back to the plain `gvm-bridge` + HTTP_PROXY cooperative mode
+    // with a visible warning.
+    let enforcement_enabled = cfg!(target_os = "linux");
+    #[cfg(target_os = "linux")]
+    let bridge_cfg: Option<gvm_sandbox::DockerBridgeConfig> = {
+        let proxy_port = proxy_url.port().unwrap_or(8080);
+        match gvm_sandbox::allocate_docker_slot() {
+            Ok(slot) => Some(gvm_sandbox::DockerBridgeConfig::from_slot(slot, proxy_port)),
+            Err(e) => {
+                println!("  {RED}Failed to allocate Docker bridge slot: {}{RESET}", e);
+                return Ok(());
+            }
+        }
+    };
 
-    let container_proxy = if use_host_network {
-        proxy.to_string()
-    } else if local_proxy_host {
+    // Build container-visible proxy URL. On Linux with an enforced bridge,
+    // the bridge gateway IP is the host's reachable proxy address. On other
+    // platforms we fall back to the existing `host.docker.internal` trick.
+    let local_proxy_host = matches!(proxy_url.host_str(), Some("127.0.0.1" | "localhost"));
+    #[cfg(target_os = "linux")]
+    let container_proxy = {
+        let cfg = bridge_cfg.as_ref().expect("bridge_cfg set on linux");
+        let mut rewritten = proxy_url.clone();
+        // Proxy must listen on 0.0.0.0 or on the bridge gateway IP so the
+        // container can reach it. The gateway IP (e.g. 172.30.0.1) is the
+        // host-side endpoint of the bridge and is reachable from the container.
+        rewritten
+            .set_host(Some(&cfg.host_ip))
+            .context("Failed to rewrite proxy host for bridge gateway")?;
+        rewritten.to_string()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let container_proxy = if local_proxy_host {
         let mut rewritten = proxy_url.clone();
         rewritten
             .set_host(Some("host.docker.internal"))
@@ -831,124 +883,129 @@ pub(crate) async fn run_contained_legacy(
     println!("  {DIM}Script:{RESET}       {}", abs_script.display());
     println!("  {DIM}Image:{RESET}        {}", image);
     println!("  {DIM}Proxy:{RESET}        {}", proxy);
-    if use_host_network {
-        println!(
-            "  {DIM}Network mode:{RESET} host {DIM}(Linux localhost proxy compatibility){RESET}"
-        );
-    }
-    if local_proxy_host && !use_host_network {
-        println!("  {DIM}Proxy in container:{RESET} {}", container_proxy);
-    }
+    println!("  {DIM}Proxy in container:{RESET} {}", container_proxy);
     println!("  {DIM}Memory:{RESET}       {}", memory);
     println!("  {DIM}CPUs:{RESET}         {}", cpus);
-    if use_host_network {
-        println!("  {DIM}Network:{RESET}      host {DIM}(local proxy compatibility){RESET}");
-    } else {
-        println!("  {DIM}Network:{RESET}      gvm-bridge {DIM}(isolated){RESET}");
+    #[cfg(target_os = "linux")]
+    if let Some(cfg) = bridge_cfg.as_ref() {
+        println!(
+            "  {DIM}Network:{RESET}      {} {DIM}({}){RESET}",
+            cfg.bridge, cfg.subnet
+        );
     }
+    #[cfg(not(target_os = "linux"))]
+    println!("  {DIM}Network:{RESET}      gvm-bridge {DIM}(cooperative HTTP_PROXY only){RESET}");
     println!();
 
-    if !use_host_network {
-        // Ensure gvm-bridge network exists.
-        // Uses a regular bridge (not --internal) because --internal blocks all
-        // external routing including host.docker.internal, making the proxy
-        // unreachable from the container. Network isolation is enforced by:
-        //   - DNAT redirecting HTTPS to MITM proxy (iptables in entrypoint)
-        //   - HTTPS_PROXY env var routing HTTP through proxy
-        //   - No direct internet access for non-proxied traffic
+    if !enforcement_enabled {
+        println!(
+            "  {YELLOW}\u{26A0}{RESET} Non-Linux host: Docker mode falls back to cooperative \
+             HTTP_PROXY routing."
+        );
+        println!(
+            "    {DIM}Agents that ignore HTTP_PROXY (e.g. Node.js raw `https`) may bypass \
+             the proxy.{RESET}"
+        );
+        println!(
+            "    {DIM}For guaranteed enforcement, run `gvm run` from a Linux host or WSL2.{RESET}"
+        );
+        println!();
+    }
+
+    // ── Create the dedicated bridge + install host iptables rules ──
+    #[cfg(target_os = "linux")]
+    if let Some(cfg) = bridge_cfg.as_ref() {
+        // 1. docker network create --driver bridge --subnet <subnet> --gateway <host_ip>
+        let net_create = tokio::process::Command::new("docker")
+            .args([
+                "network",
+                "create",
+                "--driver",
+                "bridge",
+                "--subnet",
+                &cfg.subnet,
+                "--gateway",
+                &cfg.host_ip,
+                &cfg.bridge,
+            ])
+            .output()
+            .await?;
+        if !net_create.status.success() {
+            let err = String::from_utf8_lossy(&net_create.stderr);
+            println!("  {RED}Failed to create bridge {}: {}{RESET}", cfg.bridge, err.trim());
+            return Ok(());
+        }
+        // 2. Install host-side iptables rules (DOCKER-USER JUMP to GVM chain).
+        if let Err(e) = gvm_sandbox::setup_docker_bridge_iptables(cfg) {
+            // Clean up partially-created resources before returning.
+            let _ = tokio::process::Command::new("docker")
+                .args(["network", "rm", &cfg.bridge])
+                .output()
+                .await;
+            println!("  {RED}Failed to install host iptables: {}{RESET}", e);
+            println!(
+                "    {DIM}Hint: host-side iptables requires Linux + iptables tool. On \
+                 Docker Desktop (Windows/macOS outside WSL2), the Docker host VM is not \
+                 accessible; use cooperative mode or run gvm from WSL2.{RESET}"
+            );
+            return Ok(());
+        }
+        println!(
+            "  {GREEN}\u{2713}{RESET} Bridge {} + host iptables installed",
+            cfg.bridge
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Ensure legacy gvm-bridge exists (non-enforcing, HTTP_PROXY only).
         let net_check = tokio::process::Command::new("docker")
             .args(["network", "inspect", "gvm-bridge"])
             .output()
             .await?;
-
         if !net_check.status.success() {
-            println!("  {YELLOW}Creating gvm-bridge network...{RESET}");
-            let net_create = tokio::process::Command::new("docker")
+            let _ = tokio::process::Command::new("docker")
                 .args(["network", "create", "gvm-bridge"])
                 .output()
                 .await?;
-
-            if !net_create.status.success() {
-                let err = String::from_utf8_lossy(&net_create.stderr);
-                println!("  {RED}Failed to create network: {}{RESET}", err.trim());
-                return Ok(());
-            }
-            println!("  {GREEN}Network created{RESET}");
         }
     }
 
-    // ── Download ephemeral CA from proxy for MITM TLS inspection ──
-    // The proxy generates a session-scoped CA and exposes it via GET /gvm/ca.pem.
-    // We inject it into the container's trust store so that:
-    //   - DNAT 443→8443 routes HTTPS to the MITM listener
-    //   - The MITM listener presents certs signed by this CA
-    //   - The agent's TLS client trusts them (CA in trust store)
-    let ca_temp_dir = tempfile::tempdir().context("Failed to create temp dir for CA")?;
-    let ca_pem_path = ca_temp_dir.path().join("gvm-ca.crt");
-
-    let ca_url = format!("{}/gvm/ca.pem", proxy.trim_end_matches('/'));
-    let mitm_available = if no_mitm {
-        false
-    } else {
-        match reqwest::get(&ca_url).await {
-            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-                Ok(bytes) if !bytes.is_empty() => {
-                    std::fs::write(&ca_pem_path, &bytes).context("Failed to write CA PEM")?;
-                    println!(
-                        "  {GREEN}\u{2713}{RESET} MITM CA downloaded ({} bytes)",
-                        bytes.len()
-                    );
-                    true
-                }
-                _ => {
-                    println!("  {YELLOW}MITM CA empty — HTTPS inspection unavailable{RESET}");
-                    false
-                }
-            },
-            _ => {
-                println!("  {YELLOW}MITM CA not available — HTTPS will use CONNECT relay (domain-level only){RESET}");
-                false
-            }
+    // Ensure cleanup of the bridge + iptables runs even on early return or
+    // agent error. Uses a scope guard pattern via defer semantics.
+    // Also removes the per-PID state file so the orphan sweeper on the next
+    // launch does not try to clean resources we already released.
+    #[cfg(target_os = "linux")]
+    struct BridgeCleanup {
+        bridge: String,
+    }
+    #[cfg(target_os = "linux")]
+    impl Drop for BridgeCleanup {
+        fn drop(&mut self) {
+            let _ = gvm_sandbox::cleanup_docker_bridge_iptables(&self.bridge);
+            let _ = std::process::Command::new("docker")
+                .args(["network", "rm", &self.bridge])
+                .output();
+            let pid = std::process::id();
+            let _ = std::fs::remove_file(format!("/run/gvm/gvm-sandbox-{}.state", pid));
         }
-    };
+    }
+    #[cfg(target_os = "linux")]
+    let _bridge_cleanup = bridge_cfg.as_ref().map(|cfg| BridgeCleanup {
+        bridge: cfg.bridge.clone(),
+    });
 
-    // Compute MITM listener address for DNAT (proxy port + 363 = TLS port)
-    let proxy_port = proxy_url.port().unwrap_or(8080);
-    let tls_port = proxy_port + 363; // matches main.rs convention: 8080→8443
-    let proxy_host_for_container = if use_host_network {
-        proxy_url.host_str().unwrap_or("127.0.0.1").to_string()
-    } else {
-        "host.docker.internal".to_string()
-    };
-
-    // Build DNAT entrypoint script — runs inside container before the agent.
-    // Phase 1 (root + NET_ADMIN): set up iptables DNAT rules
-    // Phase 2 (cap drop): drop NET_ADMIN so agent cannot modify iptables
-    // This closes the "agent can iptables -F" vulnerability while keeping
-    // DNAT setup working. Uses setpriv (util-linux, available in Debian/Ubuntu).
-    let entrypoint_script = if mitm_available {
-        format!(
-            "if ! command -v iptables >/dev/null 2>&1; then \
-               echo '[GVM] ERROR: iptables not found. MITM TLS inspection requires iptables.' >&2; \
-               echo '[GVM] Use the gvm-agent base image: gvm run --contained --image gvm-agent:latest' >&2; \
-               echo '[GVM] Or add iptables to your image: RUN apt-get install -y iptables' >&2; \
-               exit 1; \
-             fi && \
-             GVM_HOST=$(getent hosts {host} | awk '{{print $1}}' | head -1) && \
-             iptables -t nat -A OUTPUT -p tcp --dport 443 -j DNAT --to-destination $GVM_HOST:{tls} && \
-             iptables -t nat -A OUTPUT -p tcp --dport 80 -j DNAT --to-destination $GVM_HOST:{http} && \
-             unset HTTPS_PROXY https_proxy && \
-             exec setpriv --inh-caps=-net_admin --bounding-set=-net_admin -- \"$@\"",
-            host = proxy_host_for_container,
-            tls = tls_port,
-            http = proxy_port,
-        )
-    } else {
-        "exec \"$@\"".to_string()
-    };
-
-    // Build docker run command
+    // ── Build docker run command ──
     let container_name = format!("gvm-agent-{}", agent_id);
+
+    // Record state file AFTER bridge is up and BEFORE container launch,
+    // so SIGKILL between here and container exit still has a path to
+    // orphan cleanup.
+    #[cfg(target_os = "linux")]
+    if let Some(cfg) = bridge_cfg.as_ref() {
+        if let Err(e) = gvm_sandbox::record_docker_state(cfg, &container_name) {
+            tracing::warn!(error = %e, "Failed to record Docker state file — orphan cleanup may miss this run");
+        }
+    }
     let mount_dir = script_dir.to_str().unwrap_or(".");
     let container_script = format!("/home/agent/workspace/{}", script_name);
 
@@ -983,25 +1040,18 @@ pub(crate) async fn run_contained_legacy(
         .arg("-e")
         .arg(format!("GVM_AGENT_ID={}", agent_id));
 
-    if mitm_available {
-        // MITM mode: NO proxy env vars. All traffic goes through DNAT:
-        //   TCP 443 → MITM TLS listener (full L7 inspection)
-        //   TCP 80  → proxy HTTP port (HTTP inspection)
-        // Proxy env vars would cause CONNECT tunneling which bypasses MITM.
-        cmd.arg("-e")
-            .arg(format!("GVM_PROXY_URL={}", container_proxy));
-    } else {
-        // No MITM: CONNECT relay for HTTPS (domain-level only)
-        cmd.arg("-e")
-            .arg(format!("HTTP_PROXY={}", container_proxy))
-            .arg("-e")
-            .arg(format!("HTTPS_PROXY={}", container_proxy))
-            .arg("-e")
-            .arg(format!("http_proxy={}", container_proxy))
-            .arg("-e")
-            .arg(format!("https_proxy={}", container_proxy));
-    }
+    // Proxy env vars — always set. Non-cooperative clients are caught by the
+    // host iptables DROP rule on Linux; on other platforms they silently
+    // bypass (the warning above makes this explicit).
     cmd.arg("-e")
+        .arg(format!("HTTP_PROXY={}", container_proxy))
+        .arg("-e")
+        .arg(format!("HTTPS_PROXY={}", container_proxy))
+        .arg("-e")
+        .arg(format!("http_proxy={}", container_proxy))
+        .arg("-e")
+        .arg(format!("https_proxy={}", container_proxy))
+        .arg("-e")
         .arg(format!("GVM_PROXY_URL={}", container_proxy))
         .arg("-e")
         .arg("NO_PROXY=127.0.0.1,localhost,::1")
@@ -1009,9 +1059,10 @@ pub(crate) async fn run_contained_legacy(
         .arg("no_proxy=127.0.0.1,localhost,::1");
 
     // Pass through LLM provider API keys if set in host environment.
-    // Most agent frameworks (OpenClaw, LangChain, CrewAI) need these to call LLM APIs.
-    // The keys are still governed: all HTTPS traffic goes through DNAT → MITM,
-    // so the proxy inspects every request regardless of whether the agent has the key.
+    // Most agent frameworks (OpenClaw, LangChain, CrewAI) need these to call
+    // LLM APIs. The keys are still governed: on Linux all egress is either
+    // through the proxy (allowed) or dropped (iptables). On other platforms,
+    // only HTTP_PROXY-respecting clients are governed.
     for key in &[
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
@@ -1026,61 +1077,16 @@ pub(crate) async fn run_contained_legacy(
     cmd.arg("-v")
         .arg(format!("{}:/home/agent/workspace:ro", mount_dir));
 
-    // CA injection: mount CA PEM + /etc/ssl/certs as tmpfs for Go/system trust store
-    if mitm_available {
-        // Mount CA PEM into multiple trust store paths
-        let ca_host_path_raw = ca_pem_path.to_str().unwrap_or("");
-        // On Windows, convert path to Docker-compatible format
-        #[cfg(windows)]
-        let ca_host_path = {
-            let s = ca_host_path_raw.replace('\\', "/");
-            let s = s.trim_start_matches(r"\\?\").to_string();
-            if s.chars().nth(1) == Some(':') {
-                format!("/{}/{}", s.chars().next().unwrap().to_lowercase(), &s[3..])
-            } else {
-                s
-            }
-        };
-        #[cfg(not(windows))]
-        let ca_host_path = ca_host_path_raw.to_string();
-        cmd.arg("-v")
-            .arg(format!(
-                "{}:/usr/local/share/ca-certificates/gvm-ca.crt:ro",
-                ca_host_path
-            ))
-            .arg("-v")
-            .arg(format!("{}:/etc/ssl/certs/gvm-ca.crt:ro", ca_host_path))
-            .arg("-v")
-            .arg(format!(
-                "{}:/etc/ssl/certs/ca-certificates.crt:ro",
-                ca_host_path
-            ))
-            .arg("-v")
-            .arg(format!("{}:/etc/pki/tls/certs/gvm-ca.crt:ro", ca_host_path));
-
-        // CA trust environment variables (covers Python requests, Node.js, curl)
-        cmd.arg("-e")
-            .arg("SSL_CERT_FILE=/etc/ssl/certs/gvm-ca.crt")
-            .arg("-e")
-            .arg("REQUESTS_CA_BUNDLE=/etc/ssl/certs/gvm-ca.crt")
-            .arg("-e")
-            .arg("NODE_EXTRA_CA_CERTS=/etc/ssl/certs/gvm-ca.crt")
-            .arg("-e")
-            .arg("CURL_CA_BUNDLE=/etc/ssl/certs/gvm-ca.crt");
-
-        // NET_ADMIN capability for DNAT iptables rule inside container.
-        // Trade-off: widens attack surface, but:
-        //   - no-new-privileges prevents escalation from NET_ADMIN
-        //   - container network is already isolated (gvm-bridge --internal)
-        //   - DNAT is set in the entrypoint, then iptables is not needed further
-        // NET_ADMIN + root required for iptables DNAT setup in entrypoint.
-        // no-new-privileges prevents escalation from root.
-        cmd.arg("--cap-add=NET_ADMIN").arg("--user").arg("root");
-    }
-
-    if use_host_network {
-        cmd.arg("--network").arg("host");
+    // ── Network attach ──
+    #[cfg(target_os = "linux")]
+    if let Some(cfg) = bridge_cfg.as_ref() {
+        cmd.arg("--network").arg(&cfg.bridge);
     } else {
+        cmd.arg("--network").arg("bridge");
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = local_proxy_host; // silence unused warning on non-linux
         cmd.arg("--network")
             .arg("gvm-bridge")
             .arg("--add-host")
@@ -1091,13 +1097,7 @@ pub(crate) async fn run_contained_legacy(
         cmd.arg("-d");
     }
 
-    // Entrypoint: shell wrapper that sets DNAT then execs the agent command.
-    // Uses `sh -c 'script' _ arg1 arg2` pattern where _ is $0 and args become $@.
-    cmd.arg("--entrypoint").arg("sh");
     cmd.arg(image);
-    cmd.arg("-c");
-    cmd.arg(&entrypoint_script);
-    cmd.arg("_"); // $0 placeholder for sh -c
     for arg in &container_cmd {
         cmd.arg(arg);
     }
@@ -1108,24 +1108,16 @@ pub(crate) async fn run_contained_legacy(
 
     // Security summary
     println!("  {BOLD}Security layers active:{RESET}");
-    println!("    {GREEN}\u{2713}{RESET} Layer 1: Governance Engine (policy evaluation)");
-    println!("    {GREEN}\u{2713}{RESET} Layer 2: Enforcement Proxy (request interception)");
-    println!("    {GREEN}\u{2713}{RESET} Layer 3: Docker Containment");
-    if mitm_available {
-        println!(
-            "      {DIM}\u{2022} Transparent MITM: ephemeral CA injected, DNAT 443→{}{RESET}",
-            tls_port
-        );
+    println!("    {GREEN}\u{2713}{RESET} SRR enforcement (on proxy)");
+    println!("    {GREEN}\u{2713}{RESET} Docker isolation (read-only FS, no-new-privileges, resource limits)");
+    if enforcement_enabled {
+        println!("    {GREEN}\u{2713}{RESET} Host iptables egress lock (force-route through proxy)");
     } else {
-        println!("      {DIM}\u{2022} HTTPS: CONNECT relay (domain-level only){RESET}");
+        println!("    {YELLOW}\u{26A0}{RESET} HTTP_PROXY only (no egress lock — non-Linux)");
     }
-    if use_host_network {
-        println!("      {DIM}\u{2022} Network: host (shared host network namespace){RESET}");
-    } else {
-        println!("      {DIM}\u{2022} Network: gvm-bridge (no external access){RESET}");
-    }
+    println!("      {DIM}\u{2022} HTTPS: SNI-level SRR (no MITM payload inspection; use --sandbox for MITM){RESET}");
     println!("      {DIM}\u{2022} Filesystem: read-only root{RESET}");
-    println!("      {DIM}\u{2022} Privileges: no-new-privileges{RESET}");
+    println!("      {DIM}\u{2022} Privileges: no-new-privileges (non-root), no NET_ADMIN{RESET}");
     println!(
         "      {DIM}\u{2022} Resources: {} memory, {} CPUs{RESET}",
         memory, cpus

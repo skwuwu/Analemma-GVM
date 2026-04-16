@@ -52,6 +52,25 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
+### 2026-04-16: Docker contained mode refactor — host-side iptables, no MITM
+
+**What changed:**
+1. Removed in-container iptables DNAT + CA injection from `crates/gvm-cli/src/run.rs::run_contained_legacy`. Docker mode no longer does MITM at all.
+2. Added `setup_docker_bridge_iptables`, `cleanup_docker_bridge_iptables`, `cleanup_stale_docker_chains`, `allocate_docker_slot`, `record_docker_state`, `DockerBridgeConfig` to `crates/gvm-sandbox/src/network.rs`. All rules live in a dedicated `GVM-gvm-docker-{slot}` chain referenced by a single JUMP in `DOCKER-USER` filtered by `-i gvm-docker-{slot}` — zero impact on non-GVM Docker workloads.
+3. Each `gvm run --contained` run gets its own `gvm-docker-{slot}` bridge (`172.30.{slot}.0/24`) allocated by scanning existing GVM bridges via `docker network ls`.
+4. Extended `SandboxState` (v4) with `docker_bridge`, `docker_container`, `docker_chain` fields (backward-compat via `#[serde(default)]`). `cleanup_state_resources` branches on these for Docker cleanup (`docker stop` + `docker network rm` + iptables chain removal).
+5. `cleanup_all_orphans_report` now sweeps stale `GVM-gvm-docker-*` chains (bridge gone) and stale bridges (no chain, no state file) as defense-in-depth against SIGKILL leakage.
+6. Dropped NET_ADMIN capability from the container; agent runs non-root with `--no-new-privileges`.
+7. Docker mode silently ignores `--no-mitm` (MITM is never available); sandbox mode still honors it. Removed "experimental" warning banner — contained is now stable on Linux + WSL2.
+8. Non-Linux hosts (macOS, native Windows outside WSL2) fall back to cooperative `HTTP_PROXY` routing with a visible warning.
+9. New manual-test script `scripts/docker-bridge-smoke.sh` and E2E suite `scripts/docker-contained-e2e.sh`.
+
+**Why:** Previous contained mode (in-container iptables DNAT + injected MITM CA) broke on WSL2 / slim images / Windows paths and required NET_ADMIN which could be abused. The new design moves all enforcement to the host kernel's iptables on a GVM-namespaced bridge, drops MITM in exchange for stability, and forces non-cooperative HTTP clients (Node.js raw `https`) through the DROP rule instead of letting them silently bypass.
+
+**Affected files:** `crates/gvm-sandbox/src/network.rs`, `crates/gvm-sandbox/src/lib.rs`, `crates/gvm-cli/src/run.rs`, `crates/gvm-cli/src/pipeline.rs`, `docs/governance-coverage.md`, `docs/quickstart.md`, `docs/reference.md`, `docs/user-guide.md`, `scripts/docker-bridge-smoke.sh`, `scripts/docker-contained-e2e.sh`.
+
+**Risk:** Low/Medium. Host iptables rules scoped by bridge-name prefix cannot leak to other workloads. Cleanup is multi-layered (scope-guarded Drop + state file + orphan sweep + stale-chain/bridge defense-in-depth). Docker mode loses HTTPS payload inspection — use `--sandbox` on Linux for that. Non-Linux/WSL2 fallback preserves HTTP_PROXY behavior; no regression for platforms that never had enforcement.
+
 ### 2026-04-13: Unified gvm.toml configuration system
 
 **What changed:**
