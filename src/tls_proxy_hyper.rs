@@ -210,12 +210,15 @@ async fn handle_request(
                 .header("Content-Type", "application/json")
                 .header("X-GVM-Block-Reason", "Token budget exceeded")
                 .header("Retry-After", "60")
-                .body(full_body(serde_json::json!({
-                    "blocked": true,
-                    "decision": "BudgetExceeded",
-                    "reason": reason,
-                    "next_action": "wait for budget window to slide"
-                }).to_string()))
+                .body(full_body(
+                    serde_json::json!({
+                        "blocked": true,
+                        "decision": "BudgetExceeded",
+                        "reason": reason,
+                        "next_action": "wait for budget window to slide"
+                    })
+                    .to_string(),
+                ))
                 .expect("static response builder"));
         }
     }
@@ -252,7 +255,8 @@ async fn handle_request(
         nats_sequence: None,
         event_hash: None,
         llm_trace: None,
-        default_caution: is_default_caution, config_integrity_ref: None,
+        default_caution: is_default_caution,
+        config_integrity_ref: None,
     };
     match state.ledger.append_durable(&wal_event).await {
         Ok(()) => tracing::info!(host = %host, path = %path, "MITM WAL event recorded (Pending)"),
@@ -558,11 +562,9 @@ async fn handle_request(
                     );
 
                     // Wrap tapped stream back into BoxBody for hyper response
-                    let tapped_body = BodyExt::boxed(
-                        http_body_util::StreamBody::new(
-                            tapped.map(|r| r.map(hyper::body::Frame::data))
-                        )
-                    );
+                    let tapped_body = BodyExt::boxed(http_body_util::StreamBody::new(
+                        tapped.map(|r| r.map(hyper::body::Frame::data)),
+                    ));
                     return Ok(Response::from_parts(parts, tapped_body));
                 }
             }

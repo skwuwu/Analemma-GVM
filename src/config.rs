@@ -90,10 +90,8 @@ pub fn load_gvm_toml() -> Option<GvmConfig> {
                             mode = format!("{:04o}", mode & 0o777),
                             "gvm.toml has insecure permissions — group/other can read API keys"
                         );
-                        match std::fs::set_permissions(
-                            path,
-                            std::fs::Permissions::from_mode(0o600),
-                        ) {
+                        match std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                        {
                             Ok(()) => tracing::info!(
                                 path = %path.display(),
                                 "Fixed gvm.toml permissions to 0600"

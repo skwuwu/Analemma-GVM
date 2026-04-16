@@ -362,7 +362,10 @@ impl NetworkSRR {
             }
         }
 
-        tracing::info!(rules = rules.len(), "Network SRR rules compiled from gvm.toml");
+        tracing::info!(
+            rules = rules.len(),
+            "Network SRR rules compiled from gvm.toml"
+        );
 
         Ok(Self {
             rules,
@@ -403,9 +406,7 @@ impl NetworkSRR {
                             .push(format!("{} {}{}", rule.method, host, rule.path_pattern));
                     }
                 }
-                EnforcementDecision::Delay { .. } => {
-                    delay += 1
-                }
+                EnforcementDecision::Delay { .. } => delay += 1,
                 EnforcementDecision::Allow => allow += 1,
                 _ => {}
             }

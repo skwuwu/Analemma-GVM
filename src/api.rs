@@ -898,21 +898,19 @@ pub async fn reload_srr(State(state): State<AppState>) -> Response<Body> {
     let new_srr = if let Some(ref gvm_path) = state.gvm_toml_path {
         // Reload from gvm.toml
         match crate::config::load_gvm_toml() {
-            Some(gvm) if !gvm.rules.is_empty() => {
-                match NetworkSRR::from_rule_configs(gvm.rules) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!(error = %e, "SRR reload from gvm.toml failed — config preserved");
-                        return json_response(
-                            StatusCode::BAD_REQUEST,
-                            &serde_json::json!({
-                                "reloaded": false,
-                                "error": format!("gvm.toml SRR parse failed: {}. Config preserved.", e),
-                            }),
-                        );
-                    }
+            Some(gvm) if !gvm.rules.is_empty() => match NetworkSRR::from_rule_configs(gvm.rules) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, "SRR reload from gvm.toml failed — config preserved");
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        &serde_json::json!({
+                            "reloaded": false,
+                            "error": format!("gvm.toml SRR parse failed: {}. Config preserved.", e),
+                        }),
+                    );
                 }
-            }
+            },
             Some(_) => {
                 // gvm.toml exists but no rules — try legacy file
                 match NetworkSRR::load(Path::new(&state.srr_config_path)) {
@@ -1011,7 +1009,11 @@ pub async fn reload_srr(State(state): State<AppState>) -> Response<Body> {
         .iter()
         .map(|(label, path)| (label.as_str(), path.as_path()))
         .collect();
-    match state.ledger.record_config_load(&config_refs, prev_ref).await {
+    match state
+        .ledger
+        .record_config_load(&config_refs, prev_ref)
+        .await
+    {
         Ok(new_hash) => {
             if let Ok(mut guard) = state.active_integrity_ref.write() {
                 *guard = Some(new_hash.clone());
@@ -1035,10 +1037,7 @@ pub async fn reload_srr(State(state): State<AppState>) -> Response<Body> {
         }
     }
 
-    tracing::info!(
-        srr_rules = srr_count,
-        "Governance hot-reloaded (SRR)"
-    );
+    tracing::info!(srr_rules = srr_count, "Governance hot-reloaded (SRR)");
     json_response(
         StatusCode::OK,
         &serde_json::json!({
@@ -1260,7 +1259,10 @@ fn is_internal_system_event(event: &serde_json::Value) -> bool {
     if enforcement_point == "startup" {
         return true;
     }
-    let operation = event.get("operation").and_then(|v| v.as_str()).unwrap_or("");
+    let operation = event
+        .get("operation")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     if operation.starts_with("gvm.system.") || operation.starts_with("gvm.vault.") {
         return true;
     }
@@ -1381,9 +1383,7 @@ pub async fn dashboard_events(
 }
 
 /// Return aggregated WAL statistics as JSON.
-pub async fn dashboard_stats(
-    State(state): State<AppState>,
-) -> Json<serde_json::Value> {
+pub async fn dashboard_stats(State(state): State<AppState>) -> Json<serde_json::Value> {
     let wal_path = &state.wal_path;
     let file = match std::fs::File::open(wal_path) {
         Ok(f) => f,
@@ -1486,7 +1486,10 @@ pub async fn dashboard_stats(
             }
         }
 
-        if let Some(code) = parsed.pointer("/transport/status_code").and_then(|v| v.as_u64()) {
+        if let Some(code) = parsed
+            .pointer("/transport/status_code")
+            .and_then(|v| v.as_u64())
+        {
             *status_codes.entry(code.to_string()).or_default() += 1;
         }
 
@@ -1507,8 +1510,10 @@ pub async fn dashboard_stats(
                         .unwrap_or(0);
                     llm_tokens += prompt + completion;
 
-                    let provider =
-                        trace.get("provider").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let provider = trace
+                        .get("provider")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
                     let model_name = trace.get("model").and_then(|v| v.as_str());
                     llm_cost += estimate_llm_cost(provider, model_name, prompt, completion);
                 }

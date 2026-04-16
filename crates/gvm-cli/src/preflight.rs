@@ -59,7 +59,11 @@ pub fn run_preflight(config_dir: &str) {
     let gvm_toml_creds = count_gvm_toml_credentials();
     let secrets_path = config_path.join("secrets.toml");
     let legacy_cred_count = count_credentials(&secrets_path);
-    let cred_count = if gvm_toml_creds > 0 { gvm_toml_creds } else { legacy_cred_count };
+    let cred_count = if gvm_toml_creds > 0 {
+        gvm_toml_creds
+    } else {
+        legacy_cred_count
+    };
     checks.push(Check {
         ok: cred_count > 0,
         label: "Credentials",

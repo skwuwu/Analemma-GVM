@@ -32,7 +32,8 @@ fn make_test_event(id: &str) -> GVMEvent {
         nats_sequence: None,
         event_hash: None,
         llm_trace: None,
-        default_caution: false, config_integrity_ref: None,
+        default_caution: false,
+        config_integrity_ref: None,
     }
 }
 

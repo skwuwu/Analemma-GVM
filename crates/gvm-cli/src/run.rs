@@ -329,7 +329,8 @@ fn load_placeholder_env_vars() -> Vec<(String, String)> {
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(path) {
                 if let Ok(parsed) = toml::from_str::<toml::Value>(&content) {
-                    if let Some(credentials) = parsed.get("credentials").and_then(|c| c.as_table()) {
+                    if let Some(credentials) = parsed.get("credentials").and_then(|c| c.as_table())
+                    {
                         if !credentials.is_empty() {
                             return generate_placeholder_vars(credentials);
                         }
@@ -362,8 +363,9 @@ fn load_placeholder_env_vars() -> Vec<(String, String)> {
 }
 
 /// Generate placeholder env vars from a credential table.
-fn generate_placeholder_vars(credentials: &toml::map::Map<String, toml::Value>) -> Vec<(String, String)> {
-
+fn generate_placeholder_vars(
+    credentials: &toml::map::Map<String, toml::Value>,
+) -> Vec<(String, String)> {
     let mut env_vars = Vec::new();
     for (host, cred) in credentials {
         let cred_type = cred
@@ -441,9 +443,8 @@ pub(crate) fn workspace_root_for_proxy() -> std::path::PathBuf {
         "config/proxy.toml",
     ];
 
-    let has_marker = |dir: &std::path::Path| -> bool {
-        markers.iter().any(|m| dir.join(m).exists())
-    };
+    let has_marker =
+        |dir: &std::path::Path| -> bool { markers.iter().any(|m| dir.join(m).exists()) };
 
     if let Ok(p) = std::env::var("GVM_WORKSPACE") {
         let path = std::path::PathBuf::from(p);
@@ -942,7 +943,11 @@ pub(crate) async fn run_contained_legacy(
             .await?;
         if !net_create.status.success() {
             let err = String::from_utf8_lossy(&net_create.stderr);
-            println!("  {RED}Failed to create bridge {}: {}{RESET}", cfg.bridge, err.trim());
+            println!(
+                "  {RED}Failed to create bridge {}: {}{RESET}",
+                cfg.bridge,
+                err.trim()
+            );
             return Ok(());
         }
         // 2. Install host-side iptables rules (DOCKER-USER JUMP to GVM chain).
@@ -1130,7 +1135,9 @@ pub(crate) async fn run_contained_legacy(
     println!("    {GREEN}\u{2713}{RESET} SRR enforcement (on proxy)");
     println!("    {GREEN}\u{2713}{RESET} Docker isolation (read-only FS, no-new-privileges, resource limits)");
     if enforcement_enabled {
-        println!("    {GREEN}\u{2713}{RESET} Host iptables egress lock (force-route through proxy)");
+        println!(
+            "    {GREEN}\u{2713}{RESET} Host iptables egress lock (force-route through proxy)"
+        );
     } else {
         println!("    {YELLOW}\u{26A0}{RESET} HTTP_PROXY only (no egress lock — non-Linux)");
     }

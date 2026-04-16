@@ -817,7 +817,11 @@ async fn main() -> anyhow::Result<()> {
 
             eprintln!(
                 "  {}Dashboard:{} {}{}{}",
-                ui::GREEN, ui::RESET, ui::CYAN, dashboard_url, ui::RESET
+                ui::GREEN,
+                ui::RESET,
+                ui::CYAN,
+                dashboard_url,
+                ui::RESET
             );
 
             // Open browser

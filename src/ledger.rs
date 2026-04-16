@@ -779,7 +779,8 @@ pub fn build_dns_event(
         nats_sequence: None,
         event_hash: None,
         llm_trace: None,
-        default_caution: true, config_integrity_ref: None,
+        default_caution: true,
+        config_integrity_ref: None,
     }
 }
 

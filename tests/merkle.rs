@@ -40,7 +40,8 @@ fn make_test_event(agent_id: &str) -> GVMEvent {
         nats_sequence: None,
         event_hash: None,
         llm_trace: None,
-        default_caution: false, config_integrity_ref: None,
+        default_caution: false,
+        config_integrity_ref: None,
     }
 }
 
@@ -639,16 +640,15 @@ async fn integrity_context_recorded_on_config_load() {
 
     let expected_hash = {
         use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(format!("{:x}", Sha256::digest(config_content)).as_bytes()))
+        format!(
+            "{:x}",
+            Sha256::digest(format!("{:x}", Sha256::digest(config_content)).as_bytes())
+        )
     };
 
-    let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "").await.expect("ledger init"),
-    );
+    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger init"));
 
-    let config_files: Vec<(&str, &std::path::Path)> = vec![
-        ("gvm_toml", config_path.as_path()),
-    ];
+    let config_files: Vec<(&str, &std::path::Path)> = vec![("gvm_toml", config_path.as_path())];
     let context_hash = ledger
         .record_config_load(&config_files, None)
         .await
@@ -659,7 +659,9 @@ async fn integrity_context_recorded_on_config_load() {
 
     // Read WAL and find the config_load event
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let wal = tokio::fs::read_to_string(&wal_path).await.expect("read WAL");
+    let wal = tokio::fs::read_to_string(&wal_path)
+        .await
+        .expect("read WAL");
     let events: Vec<serde_json::Value> = wal
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
@@ -711,17 +713,22 @@ async fn integrity_context_recorded_on_config_load() {
         .and_then(|v| v.as_str())
         .expect("config_hash must be present");
     assert!(!config_hash.is_empty());
-    assert_eq!(config_hash, expected_hash, "config_hash must match SHA-256 of file content hash");
+    assert_eq!(
+        config_hash, expected_hash,
+        "config_hash must match SHA-256 of file content hash"
+    );
 
     // previous_state should be null (first load)
     assert!(
-        ic.get("previous_state").is_none()
-            || ic.get("previous_state").unwrap().is_null(),
+        ic.get("previous_state").is_none() || ic.get("previous_state").unwrap().is_null(),
         "previous_state must be None for first config load"
     );
 
     // timestamp must be recent (within 60 seconds)
-    let ts = ic.get("timestamp").and_then(|v| v.as_u64()).expect("timestamp must be present");
+    let ts = ic
+        .get("timestamp")
+        .and_then(|v| v.as_u64())
+        .expect("timestamp must be present");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -738,14 +745,13 @@ async fn chain_integrity_valid_on_single_load() {
     let config_path = dir.path().join("test.toml");
     std::fs::write(&config_path, b"test = true").expect("write");
 
-    let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "").await.expect("ledger init"),
-    );
+    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger init"));
 
-    let config_files: Vec<(&str, &std::path::Path)> = vec![
-        ("test", config_path.as_path()),
-    ];
-    ledger.record_config_load(&config_files, None).await.expect("record");
+    let config_files: Vec<(&str, &std::path::Path)> = vec![("test", config_path.as_path())];
+    ledger
+        .record_config_load(&config_files, None)
+        .await
+        .expect("record");
 
     // Flush
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -785,22 +791,32 @@ fn integrity_context_hash_is_deterministic() {
         opaque_extensions: std::collections::BTreeMap::new(),
     };
 
-    assert_eq!(ctx1.context_hash(), ctx2.context_hash(), "same inputs must produce same hash");
+    assert_eq!(
+        ctx1.context_hash(),
+        ctx2.context_hash(),
+        "same inputs must produce same hash"
+    );
 
     // Different config_hash → different context_hash
     let ctx3 = gvm_types::GvmIntegrityContext {
         config_hash: "def456".to_string(),
         ..ctx1.clone()
     };
-    assert_ne!(ctx1.context_hash(), ctx3.context_hash(), "different config must produce different hash");
+    assert_ne!(
+        ctx1.context_hash(),
+        ctx3.context_hash(),
+        "different config must produce different hash"
+    );
 }
 
 /// Verify that opaque_extensions serializes and deserializes correctly.
 #[test]
 fn opaque_extensions_round_trip() {
     let mut ctx = gvm_types::GvmIntegrityContext::local("hash123".to_string(), None);
-    ctx.opaque_extensions.insert("tpm_quote".to_string(), vec![0xDE, 0xAD, 0xBE, 0xEF]);
-    ctx.opaque_extensions.insert("sgx_report".to_string(), vec![1, 2, 3, 4, 5]);
+    ctx.opaque_extensions
+        .insert("tpm_quote".to_string(), vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    ctx.opaque_extensions
+        .insert("sgx_report".to_string(), vec![1, 2, 3, 4, 5]);
 
     let json = serde_json::to_string(&ctx).expect("serialize");
     let restored: gvm_types::GvmIntegrityContext =
@@ -826,15 +842,14 @@ async fn chain_integrity_detects_tampered_wal() {
     let config_path = dir.path().join("test.toml");
     std::fs::write(&config_path, b"version = 1").expect("write");
 
-    let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "").await.expect("ledger init"),
-    );
+    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger init"));
 
     // First load
-    let config_files: Vec<(&str, &std::path::Path)> = vec![
-        ("test", config_path.as_path()),
-    ];
-    let _first_hash = ledger.record_config_load(&config_files, None).await.expect("first load");
+    let config_files: Vec<(&str, &std::path::Path)> = vec![("test", config_path.as_path())];
+    let _first_hash = ledger
+        .record_config_load(&config_files, None)
+        .await
+        .expect("first load");
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Second load with correct chain
@@ -940,7 +955,10 @@ async fn allow_included_in_merkle_chain_with_deny() {
     let events = read_wal_events(&wal_path).await;
     let decisions: Vec<&str> = events.iter().map(|e| e.decision.as_str()).collect();
     assert!(decisions.iter().any(|d| *d == "Allow"), "Allow present");
-    assert!(decisions.iter().any(|d| d.starts_with("Deny")), "Deny present");
+    assert!(
+        decisions.iter().any(|d| d.starts_with("Deny")),
+        "Deny present"
+    );
     for e in &events {
         assert!(e.event_hash.is_some(), "all events must carry event_hash");
     }
@@ -989,5 +1007,8 @@ async fn connect_deny_persists_to_wal() {
         .find(|e| e.operation.starts_with("connect:"))
         .expect("CONNECT Deny must appear in WAL");
     assert!(deny.decision.starts_with("Deny"));
-    assert!(deny.event_hash.is_some(), "event_hash required for Merkle chain");
+    assert!(
+        deny.event_hash.is_some(),
+        "event_hash required for Merkle chain"
+    );
 }

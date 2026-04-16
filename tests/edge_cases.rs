@@ -21,7 +21,6 @@ fn srr_from_toml(toml_str: &str) -> NetworkSRR {
     NetworkSRR::load(&path).expect("valid SRR toml must parse")
 }
 
-
 // ═══════════════════════════════════════════════════════════════════
 // 1. INPUT BOUNDARIES — SRR
 // ═══════════════════════════════════════════════════════════════════
@@ -321,7 +320,8 @@ async fn edge_concurrent_status_update_no_crash() {
                 nats_sequence: None,
                 event_hash: None,
                 llm_trace: None,
-                default_caution: false, config_integrity_ref: None,
+                default_caution: false,
+                config_integrity_ref: None,
             };
             ledger
                 .append_durable(&event)

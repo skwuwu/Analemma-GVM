@@ -8,8 +8,8 @@ use gvm_proxy::config::{self, ProxyConfig};
 use gvm_proxy::dns_governance;
 use gvm_proxy::ledger::Ledger;
 use gvm_proxy::proxy::{proxy_handler, AppState};
-use gvm_proxy::token_budget::TokenBudget;
 use gvm_proxy::srr::NetworkSRR;
+use gvm_proxy::token_budget::TokenBudget;
 use gvm_proxy::vault::Vault;
 #[cfg(feature = "wasm")]
 use gvm_proxy::wasm_engine::WasmEngine;
@@ -47,7 +47,10 @@ async fn main() {
             Some("gvm.toml".to_string()),
             Some("config/gvm.toml".to_string()),
         ];
-        candidates.into_iter().flatten().find(|c| Path::new(c).exists())
+        candidates
+            .into_iter()
+            .flatten()
+            .find(|c| Path::new(c).exists())
     } else {
         None
     };
@@ -55,10 +58,7 @@ async fn main() {
     // 2. First-run detection: if config files are missing, offer interactive setup.
     //    After setup, reload config so template proxy.toml settings take effect.
     let srr_path_str = config.srr.network_file.clone();
-    if gvm_config.is_none()
-        && !Path::new(&srr_path_str).exists()
-        && offer_first_run_setup()
-    {
+    if gvm_config.is_none() && !Path::new(&srr_path_str).exists() && offer_first_run_setup() {
         // Template applied — reload config to pick up template's proxy.toml
         config = ProxyConfig::load_or_default();
     }
@@ -69,7 +69,10 @@ async fn main() {
         if !gvm.rules.is_empty() {
             match NetworkSRR::from_rule_configs(gvm.rules.clone()) {
                 Ok(s) => {
-                    tracing::info!(rules = gvm.rules.len(), "Network SRR rules loaded from gvm.toml");
+                    tracing::info!(
+                        rules = gvm.rules.len(),
+                        "Network SRR rules loaded from gvm.toml"
+                    );
                     s
                 }
                 Err(e) => {
@@ -248,7 +251,8 @@ async fn main() {
 
     // 7.5a. Verify integrity chain from previous sessions
     {
-        let wal_path_str = std::env::var("GVM_WAL_PATH").unwrap_or_else(|_| config.wal.path.clone());
+        let wal_path_str =
+            std::env::var("GVM_WAL_PATH").unwrap_or_else(|_| config.wal.path.clone());
         let wal_file = std::path::Path::new(&wal_path_str);
         let (valid, first_break) = Ledger::check_chain_integrity(wal_file);
         if let Some(ref broken_at) = first_break {
@@ -1254,11 +1258,7 @@ fn offer_first_run_setup() -> bool {
     }
 
     // Copy template files
-    let files_to_copy = [
-        "proxy.toml",
-        "srr_network.toml",
-        "policies/global.toml",
-    ];
+    let files_to_copy = ["proxy.toml", "srr_network.toml", "policies/global.toml"];
 
     let mut copied = 0;
     for file in &files_to_copy {

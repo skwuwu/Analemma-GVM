@@ -11,8 +11,8 @@
 use gvm_proxy::api_keys::APIKeyStore;
 use gvm_proxy::ledger::Ledger;
 use gvm_proxy::proxy::{proxy_handler, AppState};
-use gvm_proxy::token_budget::TokenBudget;
 use gvm_proxy::srr::NetworkSRR;
+use gvm_proxy::token_budget::TokenBudget;
 use gvm_proxy::types::*;
 use gvm_proxy::vault::Vault;
 use std::sync::Arc;
@@ -462,7 +462,8 @@ decision = { type = "Delay", milliseconds = 300 }
         request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ca_expires_days: None,
         dns_governance: None,
-        wal_path: "data/wal.log".to_string(), active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        wal_path: "data/wal.log".to_string(),
+        active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
     };
 
     let app = Router::new().fallback(proxy_handler).with_state(state);
@@ -612,9 +613,7 @@ async fn config_file_hashes_recorded_in_merkle_chain() {
     );
 
     // Record config load (SRR only — registry removed)
-    let config_files: Vec<(&str, &std::path::Path)> = vec![
-        ("srr:srr.toml", srr_path.as_path()),
-    ];
+    let config_files: Vec<(&str, &std::path::Path)> = vec![("srr:srr.toml", srr_path.as_path())];
     ledger
         .record_config_load(&config_files, None)
         .await
@@ -772,7 +771,6 @@ decision = { type = "Delay", milliseconds = 10 }
     )
     .expect("writing SRR config must succeed");
 
-
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(
         &secrets_path,
@@ -840,7 +838,8 @@ token = "sk_test_proxy_injected_key"
         request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ca_expires_days: None,
         dns_governance: None,
-        wal_path: "data/wal.log".to_string(), active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        wal_path: "data/wal.log".to_string(),
+        active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
     };
 
     let app = Router::new()
@@ -1030,7 +1029,6 @@ decision = { type = "Allow" }
     )
     .expect("writing SRR config must succeed");
 
-
     // Two hosts: one with ApiKey type (custom header), one with Bearer.
     // Both will be remapped to the same local upstream via host_overrides.
     let secrets_path = dir.path().join("secrets.toml");
@@ -1108,7 +1106,8 @@ token = "sk_test_proxy_injected_bearer"
         request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ca_expires_days: None,
         dns_governance: None,
-        wal_path: "data/wal.log".to_string(), active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        wal_path: "data/wal.log".to_string(),
+        active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
     };
 
     let app = Router::new()
@@ -1246,7 +1245,6 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
     )
     .expect("writing SRR config must succeed");
 
-
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(&secrets_path, "[credentials]\n").expect("writing empty secrets must succeed");
 
@@ -1299,7 +1297,8 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
         request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ca_expires_days: None,
         dns_governance: None,
-        wal_path: "data/wal.log".to_string(), active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        wal_path: "data/wal.log".to_string(),
+        active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
     };
 
     let app = Router::new()
@@ -1415,7 +1414,6 @@ decision = { type = "Allow" }
     )
     .expect("writing SRR config must succeed");
 
-
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(&secrets_path, "[credentials]\n").expect("writing empty secrets must succeed");
 
@@ -1468,7 +1466,8 @@ decision = { type = "Allow" }
         request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ca_expires_days: None,
         dns_governance: None,
-        wal_path: "data/wal.log".to_string(), active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        wal_path: "data/wal.log".to_string(),
+        active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
     };
 
     let app = Router::new()
@@ -1722,10 +1721,10 @@ fn make_test_event(event_id: &str, operation: &str) -> GVMEvent {
         nats_sequence: None,
         event_hash: None,
         llm_trace: None,
-        default_caution: false, config_integrity_ref: None,
+        default_caution: false,
+        config_integrity_ref: None,
     }
 }
-
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Test 6: Checkpoint Save → Read → Merkle Verification Round-Trip
@@ -1803,7 +1802,8 @@ async fn checkpoint_save_restore_merkle_verified() {
         request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ca_expires_days: None,
         dns_governance: None,
-        wal_path: "data/wal.log".to_string(), active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        wal_path: "data/wal.log".to_string(),
+        active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
     };
 
     let app = Router::new()
@@ -2204,7 +2204,6 @@ decision = { type = "Allow" }
     )
     .unwrap();
 
-
     let secrets_path = dir.path().join("secrets.toml");
     std::fs::write(&secrets_path, "[credentials]\n").unwrap();
 
@@ -2257,7 +2256,8 @@ decision = { type = "Allow" }
         request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ca_expires_days: None,
         dns_governance: None,
-        wal_path: "data/wal.log".to_string(), active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        wal_path: "data/wal.log".to_string(),
+        active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
     };
 
     let app = Router::new()
@@ -2409,7 +2409,8 @@ decision = { type = "Allow" }
         request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ca_expires_days: None,
         dns_governance: None,
-        wal_path: "data/wal.log".to_string(), active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        wal_path: "data/wal.log".to_string(),
+        active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
     };
 
     let app = Router::new().fallback(proxy_handler).with_state(state);
@@ -2526,7 +2527,8 @@ decision = { type = "Allow" }
         request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ca_expires_days: None,
         dns_governance: None,
-        wal_path: "data/wal.log".to_string(), active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        wal_path: "data/wal.log".to_string(),
+        active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
     };
 
     let app = Router::new().fallback(proxy_handler).with_state(state);
@@ -2647,7 +2649,8 @@ decision = { type = "Allow" }
         request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ca_expires_days: None,
         dns_governance: None,
-        wal_path: "data/wal.log".to_string(), active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        wal_path: "data/wal.log".to_string(),
+        active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
     };
 
     let app = Router::new().fallback(proxy_handler).with_state(state);
@@ -2736,7 +2739,8 @@ async fn ic3_self_approval_blocked_on_proxy_port() {
         request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ca_expires_days: None,
         dns_governance: None,
-        wal_path: "data/wal.log".to_string(), active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
+        wal_path: "data/wal.log".to_string(),
+        active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
     };
 
     // Build AGENT-FACING router only (no admin endpoints)

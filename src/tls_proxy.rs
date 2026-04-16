@@ -542,7 +542,8 @@ pub async fn append_enforcement_event(
         nats_sequence: None,
         event_hash: None,
         llm_trace: None,
-        default_caution, config_integrity_ref: None,
+        default_caution,
+        config_integrity_ref: None,
     };
     if let Err(e) = ledger.append_durable(&event).await {
         tracing::error!(error = %e, decision = %decision_str, "MITM: enforcement WAL append FAILED");
@@ -715,7 +716,8 @@ async fn handle_mitm_stream_legacy<S: tokio::io::AsyncRead + tokio::io::AsyncWri
                     nats_sequence: None,
                     event_hash: None,
                     llm_trace: None,
-                    default_caution: false, config_integrity_ref: None,
+                    default_caution: false,
+                    config_integrity_ref: None,
                 };
                 let _ = state.ledger.append_durable(&fail_event).await;
                 break;
@@ -858,7 +860,8 @@ async fn handle_mitm_stream_legacy<S: tokio::io::AsyncRead + tokio::io::AsyncWri
                     nats_sequence: None,
                     event_hash: None,
                     llm_trace: None,
-                    default_caution: is_default_caution, config_integrity_ref: None,
+                    default_caution: is_default_caution,
+                    config_integrity_ref: None,
                 };
                 state.ledger.append_durable(&event).await.ok();
             }
@@ -958,7 +961,8 @@ async fn handle_mitm_stream_legacy<S: tokio::io::AsyncRead + tokio::io::AsyncWri
                 nats_sequence: None,
                 event_hash: None,
                 llm_trace: None,
-                default_caution: is_default_caution, config_integrity_ref: None,
+                default_caution: is_default_caution,
+                config_integrity_ref: None,
             };
             match state.ledger.append_durable(&event).await {
                 Ok(()) => tracing::info!(host = %host, path = %req.path, "MITM WAL event recorded"),
@@ -1032,7 +1036,8 @@ async fn handle_mitm_stream_legacy<S: tokio::io::AsyncRead + tokio::io::AsyncWri
                 nats_sequence: None,
                 event_hash: None,
                 llm_trace: None,
-                default_caution: is_default_caution, config_integrity_ref: None,
+                default_caution: is_default_caution,
+                config_integrity_ref: None,
             };
             state.ledger.append_durable(&fail_event).await.ok();
             break;

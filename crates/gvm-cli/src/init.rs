@@ -72,7 +72,9 @@ pub fn run_init(industry: &str, config_dir: &str) -> Result<()> {
     if !gvm_toml_dst.exists() {
         let gvm_template = generate_gvm_toml_template(industry);
         std::fs::write(gvm_toml_dst, gvm_template)?;
-        println!("  {GREEN}\u{2713}{RESET}  gvm.toml {DIM}(unified config — add API keys here){RESET}");
+        println!(
+            "  {GREEN}\u{2713}{RESET}  gvm.toml {DIM}(unified config — add API keys here){RESET}"
+        );
         copied += 1;
     } else {
         println!("  {DIM}skip{RESET}  gvm.toml {DIM}(already exists — not overwriting){RESET}");
@@ -85,9 +87,7 @@ pub fn run_init(industry: &str, config_dir: &str) -> Result<()> {
             &secrets_dst,
             "# Legacy credentials file. Prefer gvm.toml [credentials] section instead.\n",
         )?;
-        println!(
-            "  {GREEN}\u{2713}{RESET}  secrets.toml {DIM}(legacy — prefer gvm.toml){RESET}"
-        );
+        println!("  {GREEN}\u{2713}{RESET}  secrets.toml {DIM}(legacy — prefer gvm.toml){RESET}");
         copied += 1;
     } else {
         println!("  {DIM}skip{RESET}  secrets.toml {DIM}(already exists — not overwriting credentials){RESET}");

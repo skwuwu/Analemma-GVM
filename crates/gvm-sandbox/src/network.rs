@@ -1110,9 +1110,7 @@ fn cleanup_state_resources(state: &SandboxState) -> StateCleanupCounts {
     //    for sandbox runs. For Docker runs, we reverse the launch sequence:
     //    `docker stop/rm` → cleanup_docker_bridge_iptables → `docker network rm`.
     if let Some(ref container) = state.docker_container {
-        let _ = Command::new("docker")
-            .args(["stop", container])
-            .output();
+        let _ = Command::new("docker").args(["stop", container]).output();
         let _ = Command::new("docker")
             .args(["rm", "-f", container])
             .output();
@@ -1879,22 +1877,28 @@ pub fn setup_docker_bridge_iptables(cfg: &DockerBridgeConfig) -> Result<()> {
 
     // 3. Chain rules: ACCEPT proxy, ACCEPT established, DROP rest.
     run_iptables(&[
-        "-A", &chain,
-        "-p", "tcp",
-        "-d", &cfg.host_ip,
-        "--dport", &proxy_port_str,
-        "-j", "ACCEPT",
+        "-A",
+        &chain,
+        "-p",
+        "tcp",
+        "-d",
+        &cfg.host_ip,
+        "--dport",
+        &proxy_port_str,
+        "-j",
+        "ACCEPT",
     ])?;
     run_iptables(&[
-        "-A", &chain,
-        "-m", "state",
-        "--state", "ESTABLISHED,RELATED",
-        "-j", "ACCEPT",
+        "-A",
+        &chain,
+        "-m",
+        "state",
+        "--state",
+        "ESTABLISHED,RELATED",
+        "-j",
+        "ACCEPT",
     ])?;
-    run_iptables(&[
-        "-A", &chain,
-        "-j", "DROP",
-    ])?;
+    run_iptables(&["-A", &chain, "-j", "DROP"])?;
 
     // 4. JUMP from DOCKER-USER (persistence-safe across daemon restarts).
     //    `-i {bridge}` is the first match condition: any traffic not from
@@ -1945,10 +1949,7 @@ pub fn cleanup_docker_bridge_iptables(bridge: &str) -> Result<()> {
 /// as `record_sandbox_state` — sandbox-specific fields (veth, host_ip,
 /// etc.) are empty strings for Docker mode, and `cleanup_state_resources`
 /// branches on whether `docker_bridge` is present.
-pub fn record_docker_state(
-    cfg: &DockerBridgeConfig,
-    container_name: &str,
-) -> Result<()> {
+pub fn record_docker_state(cfg: &DockerBridgeConfig, container_name: &str) -> Result<()> {
     let parent_pid = std::process::id();
     let state = SandboxState {
         version: 4,

@@ -47,14 +47,13 @@ use gvm_proxy::vault::Vault;
 /// lifetime of the test so the tempfile isn't garbage-collected; once
 /// the test ends the temp dir is cleaned up automatically.
 pub async fn test_state() -> (AppState, std::path::PathBuf) {
-    let wal_path =
-        std::env::temp_dir().join(format!("gvm-test-{}.wal", uuid::Uuid::new_v4()));
+    let wal_path = std::env::temp_dir().join(format!("gvm-test-{}.wal", uuid::Uuid::new_v4()));
 
     // Write an empty TOML file and parse it — this matches what all
     // existing integration tests did inline, and keeps NetworkSRR's
     // only constructor (`load`) as the single entry point.
-    let empty_srr_path = std::env::temp_dir()
-        .join(format!("gvm-test-srr-{}.toml", uuid::Uuid::new_v4()));
+    let empty_srr_path =
+        std::env::temp_dir().join(format!("gvm-test-srr-{}.toml", uuid::Uuid::new_v4()));
     std::fs::write(&empty_srr_path, "").expect("write empty srr file");
     let srr = Arc::new(std::sync::RwLock::new(
         NetworkSRR::load(&empty_srr_path).expect("empty SRR must parse"),
