@@ -784,8 +784,14 @@ pub fn build_dns_event(
 }
 
 impl Ledger {
-    /// IC-1 / Allow: async append with no durability guarantee.
-    /// WAL is skipped (IC-1 is reversible, loss tolerated at < 0.1%).
+    /// Low-audit-value, high-frequency events (DNS Tier 1 `Known`,
+    /// Vault read / list_keys). Publishes to NATS only; WAL is
+    /// **deliberately excluded from the audit chain** to bound log growth.
+    ///
+    /// **Do not use for governance decisions** (Allow / AuditOnly / Delay /
+    /// RequireApproval / Deny). Those must go through [`append_durable`] so
+    /// they reach the Merkle chain and are available for compliance
+    /// verification, notarization, and `gvm suggest` rule generation.
     pub async fn append_async(&self, event: GVMEvent) {
         let event_json = match serde_json::to_vec(&event) {
             Ok(j) => j,

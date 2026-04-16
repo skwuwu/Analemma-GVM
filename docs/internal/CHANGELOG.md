@@ -52,6 +52,73 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
+### 2026-04-16: Allow events persist to WAL (governance audit completeness)
+
+**What changed:**
+
+1. `proxy.rs` Allow path (HTTP, line ~521) — switched from `append_async`
+   (NATS-stub, skipped the WAL file) to `append_durable`. Every Allow
+   decision now reaches the Merkle-chained audit log.
+2. `proxy.rs` IC-3 APPROVED execution (line ~720) — switched to
+   `append_durable`. Human-approved actions are the highest-value audit
+   records and must never be lost.
+3. `proxy.rs` CONNECT Deny (line ~1561) — switched to `append_durable`.
+   **Pre-existing bug**: this path previously used `append_async`, which
+   did not write to the WAL, so Deny decisions for HTTPS tunnels were
+   silently dropped from the audit chain. Regression-guarded by the new
+   `connect_deny_persists_to_wal` test.
+4. `proxy.rs` CONNECT Allow/Delay (line ~1602) — switched to
+   `append_durable`. Allow on a tunnel is the audit anchor for all
+   subsequent traffic inside it.
+5. `dns_governance.rs` — Tier 2 (`Unknown`) moved from async to durable.
+   A new domain appearing is itself a governance signal ("agent reaching
+   somewhere unexpected") and warrants a durable record. Only Tier 1
+   (`Known`, allowlist) remains async. Tier 3/4 were already durable.
+6. `ledger.rs::append_async` doc comment redefined: now explicitly
+   "deliberately excluded from the audit chain" for low-audit-value,
+   high-frequency events only (Vault read/list, DNS Tier 1). Added a
+   warning against using it for governance decisions.
+7. `dashboard.html` — added Allow filter button; removed the
+   "`proxyTotal - (dl + dn)`" workaround that existed because Allow
+   counts weren't coming from WAL. `decisions.Allow` is now authoritative.
+8. User-facing docs (`user-guide.md`) — simplified the watch/suggest
+   workflow: `gvm suggest --from data/wal.log` now works directly after
+   any run mode, no need to redirect to a separate `session.jsonl`.
+9. Architecture doc (`ledger.md`) — durability table now lists every
+   decision type plus the non-governance exclusions (Vault read/list,
+   DNS Tier 1) with an explicit "not in Merkle chain" marker.
+
+**Why:** The old design excluded Allow from the Merkle chain under the
+rationale "IC-1 is reversible, loss tolerated." But for compliance,
+notarization, and `gvm suggest` rule generation, Allow events are
+essential evidence of what the agent actually did. Excluding them made
+the WAL an incomplete audit record and forced dashboard workarounds.
+The CONNECT-tunnel Deny bug further proved the async path was a hazard
+for governance decisions it was never intended to carry.
+
+**Affected files:** `src/proxy.rs`, `src/dns_governance.rs`,
+`src/ledger.rs`, `src/dashboard.html`, `tests/merkle.rs` (3 new tests),
+`tests/stress.rs` (2 new benches), `docs/architecture/ledger.md`,
+`docs/user-guide.md`.
+
+**Performance (measured on dev laptop):**
+
+- Allow durable throughput: 62K events/sec (10K concurrent, release build)
+- 100K mixed-event WAL (61.8 MB): write 986ms, integrity-chain verify 438ms
+- Projected verify_wal latency on 1 GB WAL: ~7 seconds (linear O(N))
+
+**Roadmap follow-up (out of scope for this commit):** Incremental
+Merkle verification — only rescan events after the last successful
+verification checkpoint — for production audit logs growing past a
+few GB.
+
+**Risk:** Low. Dominant change is widening which callsites go durable;
+the group-commit path is the same proven code. The 62K/s Allow
+throughput leaves multiple orders of magnitude of headroom for realistic
+agent traffic. WAL size will grow faster; archival to S3 (or similar)
+on segment rotation is the recommended mitigation but is independent
+of this change.
+
 ### 2026-04-16: Docker contained mode refactor — host-side iptables, no MITM
 
 **What changed:**

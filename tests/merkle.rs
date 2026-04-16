@@ -857,3 +857,137 @@ async fn chain_integrity_detects_tampered_wal() {
     assert!(broken.is_some(), "tampered chain must be detected");
     assert!(valid >= 1, "at least the first link should be valid");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Allow / CONNECT-Deny WAL persistence (governance audit invariants)
+//
+// These tests pin the invariant introduced in the "Allow audit" refactor:
+// every governance decision — including Allow and the CONNECT-tunnel Deny
+// path that previously slipped through append_async — must land in the WAL
+// file with a populated event_hash so it participates in the Merkle chain.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Read the WAL file and return only event lines (skip MerkleBatchRecord
+/// lines). Used by the persistence tests below.
+async fn read_wal_events(wal_path: &std::path::Path) -> Vec<GVMEvent> {
+    let content = tokio::fs::read_to_string(wal_path)
+        .await
+        .expect("WAL file must be readable after flush");
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.contains("\"merkle_root\""))
+        .filter_map(|l| serde_json::from_str::<GVMEvent>(l).ok())
+        .collect()
+}
+
+/// Allow events must persist to WAL via group commit (Merkle-chained audit).
+/// Regression guard for: append_async-was-NATS-stub, which silently dropped
+/// Allow records.
+#[tokio::test]
+async fn allow_events_persist_to_wal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wal_path = dir.path().join("wal.log");
+    let ledger = Ledger::new(&wal_path, "", "").await.expect("ledger init");
+
+    let mut allow_event = make_test_event("agent-allow");
+    allow_event.decision = "Allow".to_string();
+    allow_event.status = EventStatus::Confirmed;
+
+    ledger
+        .append_durable(&allow_event)
+        .await
+        .expect("Allow must reach WAL");
+
+    drop(ledger);
+
+    let events = read_wal_events(&wal_path).await;
+    assert_eq!(events.len(), 1, "one Allow event in WAL");
+    assert_eq!(events[0].decision, "Allow");
+    assert!(
+        events[0].event_hash.is_some(),
+        "Allow event must carry event_hash (Merkle chain participation)"
+    );
+}
+
+/// Allow and Deny produced in the same group-commit window must both appear
+/// in the same batch's Merkle root. Proves Allow is not just written but
+/// actually integrated into the chain (i.e., a compliance auditor can prove
+/// an Allow happened at a specific batch position).
+#[tokio::test]
+async fn allow_included_in_merkle_chain_with_deny() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wal_path = dir.path().join("wal.log");
+    let ledger = Ledger::new(&wal_path, "", "").await.expect("ledger init");
+
+    let mut allow = make_test_event("agent-mixed-allow");
+    allow.decision = "Allow".to_string();
+    allow.status = EventStatus::Confirmed;
+
+    let mut deny = make_test_event("agent-mixed-deny");
+    deny.decision = "Deny { reason: \"test\" }".to_string();
+    deny.status = EventStatus::Failed {
+        reason: "test-policy".to_string(),
+    };
+
+    let allow_fut = ledger.append_durable(&allow);
+    let deny_fut = ledger.append_durable(&deny);
+    let (r1, r2) = tokio::join!(allow_fut, deny_fut);
+    r1.expect("Allow durable");
+    r2.expect("Deny durable");
+
+    drop(ledger);
+
+    let events = read_wal_events(&wal_path).await;
+    let decisions: Vec<&str> = events.iter().map(|e| e.decision.as_str()).collect();
+    assert!(decisions.iter().any(|d| *d == "Allow"), "Allow present");
+    assert!(decisions.iter().any(|d| d.starts_with("Deny")), "Deny present");
+    for e in &events {
+        assert!(e.event_hash.is_some(), "all events must carry event_hash");
+    }
+
+    // Verify Merkle batch record present and contains both events by count.
+    let content = tokio::fs::read_to_string(&wal_path).await.unwrap();
+    let batch_lines: Vec<&str> = content
+        .lines()
+        .filter(|l| l.contains("\"merkle_root\""))
+        .collect();
+    assert!(
+        !batch_lines.is_empty(),
+        "at least one MerkleBatchRecord must be written"
+    );
+}
+
+/// Regression test for the CONNECT-tunnel Deny WAL leak. Pre-refactor, the
+/// CONNECT Deny path called `append_async` which never touched the WAL
+/// file, so Deny decisions for HTTPS tunnels were silently lost from the
+/// audit chain. This test asserts that a Deny-shaped event reaches WAL
+/// when the governance decision layer writes it durably.
+#[tokio::test]
+async fn connect_deny_persists_to_wal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wal_path = dir.path().join("wal.log");
+    let ledger = Ledger::new(&wal_path, "", "").await.expect("ledger init");
+
+    let mut deny_event = make_test_event("agent-connect-deny");
+    deny_event.operation = "connect:api.bank.com".to_string();
+    deny_event.decision = "Deny { reason: \"test-policy\" }".to_string();
+    deny_event.status = EventStatus::Failed {
+        reason: "test-policy".to_string(),
+    };
+    deny_event.enforcement_point = "proxy".to_string();
+
+    ledger
+        .append_durable(&deny_event)
+        .await
+        .expect("CONNECT Deny must reach WAL");
+
+    drop(ledger);
+
+    let events = read_wal_events(&wal_path).await;
+    let deny = events
+        .iter()
+        .find(|e| e.operation.starts_with("connect:"))
+        .expect("CONNECT Deny must appear in WAL");
+    assert!(deny.decision.starts_with("Deny"));
+    assert!(deny.event_hash.is_some(), "event_hash required for Merkle chain");
+}

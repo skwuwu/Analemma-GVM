@@ -77,15 +77,18 @@ Rules are appended directly to `gvm.toml`. No manual editing needed.
 ### `gvm suggest`
 
 ```bash
-# After running gvm watch or gvm run, the audit log has all observed traffic:
+# After running `gvm run` or `gvm watch`, the WAL has every observed
+# request (Allow/Delay/Deny all persist). Point suggest at it:
 gvm suggest --from data/wal.log > new-rules.toml
 
-# Or from a JSON session log (for explicit capture):
+# Equivalent alternative — capture the watch stream to a JSON file:
 gvm watch --output json my_agent.py > session.jsonl
 gvm suggest --from session.jsonl --decision allow > new-rules.toml
 ```
 
-Reads the audit log (or a watch JSON log) and generates TOML rules for every URL that hit Default-to-Caution. Review the file, then merge into `gvm.toml`.
+Reads the audit log (WAL or watch session JSON) and emits an SRR rule for every URL seen. Merge into `gvm.toml` after review.
+
+> Earlier versions of GVM skipped `Allow` decisions from the WAL, so `gvm suggest --from wal.log` only produced rules for `Default-to-Caution` hits. All governance decisions now persist durably; the WAL is the single source of truth for suggest.
 
 ---
 

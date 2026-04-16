@@ -526,12 +526,19 @@ pub async fn run_dns_proxy(
                     classification.window_age_secs,
                     &classification.base_domain,
                 );
-                if matches!(classification.tier, DnsTier::Flood | DnsTier::Anomalous) {
-                    // Durable WAL for high-tier events (IC-2)
-                    let _ = ledger.append_durable(&event).await;
-                } else {
-                    // Async WAL for Tier 2 (IC-1, loss tolerated)
+                // Tier 1 (Known) is high-frequency and low-audit-value —
+                // stays async (NATS-only, deliberately excluded from the
+                // Merkle chain so the bulk of normal DNS traffic does not
+                // bloat the audit log).
+                //
+                // Tier 2+ (Unknown / Anomalous / Flood) IS audited: a new
+                // domain appearing is itself a governance signal ("agent
+                // reaching somewhere unexpected"), and suspicious/flood
+                // patterns need forensic recovery.
+                if matches!(classification.tier, DnsTier::Known) {
                     ledger.append_async(event).await;
+                } else {
+                    let _ = ledger.append_durable(&event).await;
                 }
             }
 

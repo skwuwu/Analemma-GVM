@@ -123,6 +123,7 @@ tailwind.config = { theme: { extend: { fontFamily: { mono: ['JetBrains Mono', 'm
       <div class="text-[10px] text-slate-600 uppercase tracking-wider">Live Events</div>
       <div class="flex items-center gap-1.5" id="filter-bar">
         <button class="filter-btn active text-[10px] px-2 py-0.5 rounded border border-slate-800 text-slate-500" data-filter="all" onclick="setFilter('all')">All</button>
+        <button class="filter-btn active text-[10px] px-2 py-0.5 rounded border border-emerald-900/50 text-emerald-600" data-filter="Allow" onclick="setFilter('Allow')">Allow</button>
         <button class="filter-btn active text-[10px] px-2 py-0.5 rounded border border-yellow-900/50 text-yellow-700" data-filter="Delay" onclick="setFilter('Delay')">Delay</button>
         <button class="filter-btn active text-[10px] px-2 py-0.5 rounded border border-red-900/50 text-red-400" data-filter="Deny" onclick="setFilter('Deny')">Deny</button>
       </div>
@@ -245,14 +246,13 @@ function renderStats(s){
   const up=s.uptime_secs||0,rps=up>0?(s.total_requests/up).toFixed(1):'0.0';
   const dec=s.decisions||{},al=dec.Allow||0,dl=dec.Delay||0,dn=dec.Deny||0,tot=al+dl+dn;
 
-  // proxy_total includes all requests (including Allow/IC-1 not in WAL)
+  // All governance decisions now persist to WAL, so the decisions map
+  // is authoritative. Use the proxy total only as a floor for in-flight
+  // requests that haven't finished their WAL append yet.
   const proxyTotal = s.proxy_total || tot;
-  // Allowed = proxy total minus delayed/denied (which are in WAL)
-  const walDelayDeny = (dl + dn);
-  const allowed = proxyTotal > walDelayDeny ? proxyTotal - walDelayDeny : al;
 
   document.getElementById('m-total').textContent=proxyTotal;
-  document.getElementById('m-allowed').textContent=allowed;
+  document.getElementById('m-allowed').textContent=al;
   document.getElementById('m-cost').textContent=`$${(s.llm?.estimated_cost_usd||0).toFixed(4)}`;
   document.getElementById('subtitle').textContent=`Uptime ${fmtDur(up)}`;
 

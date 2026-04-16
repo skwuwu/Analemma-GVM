@@ -501,5 +501,154 @@ decision = { type = "Delay", milliseconds = 300 }
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// 6. RATE LIMITER — removed (replaced by token_budget in src/token_budget.rs)
+// 6. WAL throughput / audit verification (Allow-path regression guards)
+// ═══════════════════════════════════════════════════════════════════
+
+/// Allow-only throughput: 10K Allow events must clear group commit
+/// quickly. Guards against a regression where switching Allow from
+/// `append_async` (NATS stub) to `append_durable` (WAL+fsync) could
+/// introduce an unacceptable slowdown in the hot path.
+///
+/// Ignored by default because a 10K WAL run writes a real file and is
+/// slower than a unit test. Run with `cargo test --test stress
+/// wal_throughput_all_allow -- --ignored --nocapture` when tuning.
+#[tokio::test]
+#[ignore]
+async fn wal_throughput_all_allow() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wal_path = dir.path().join("wal.log");
+
+    let config = GroupCommitConfig {
+        batch_window: Duration::from_millis(2),
+        max_batch_size: 256,
+        channel_capacity: 16_384,
+        ..Default::default()
+    };
+
+    let ledger = Arc::new(
+        Ledger::with_config(&wal_path, "", "", config)
+            .await
+            .expect("ledger init"),
+    );
+
+    let total = 10_000usize;
+    let start = Instant::now();
+
+    let mut handles = Vec::with_capacity(total);
+    for i in 0..total {
+        let ledger = ledger.clone();
+        handles.push(tokio::spawn(async move {
+            let mut event = make_test_event(&format!("allow-{}", i));
+            event.decision = "Allow".to_string();
+            event.status = EventStatus::Confirmed;
+            ledger
+                .append_durable(&event)
+                .await
+                .expect("Allow durable append must succeed");
+        }));
+    }
+    for h in handles {
+        h.await.expect("task panic");
+    }
+    let elapsed = start.elapsed();
+    let throughput = total as f64 / elapsed.as_secs_f64();
+
+    eprintln!(
+        "wal_throughput_all_allow: {} events in {:?} ({:.0}/s)",
+        total, elapsed, throughput
+    );
+
+    // Hard ceiling: 60s for 10K events (< 170/s would indicate a severe
+    // regression). Baseline on a modern laptop is typically 1000-5000/s.
+    assert!(
+        elapsed.as_secs() < 60,
+        "10K Allow durable appends took {:?} (> 60s ceiling)",
+        elapsed
+    );
+}
+
+/// Measure `verify_wal` latency on a mid-size audit log (100K events) so
+/// we can project compliance-check performance for production-scale WALs.
+/// Not a pass/fail gate — prints timing for roadmap decisions. Use
+/// `--nocapture` to see the measurement.
+///
+/// Note: 100K events is chosen to keep the test under a minute. A 1GB
+/// WAL (target audit-size class) is ~5M events at ~200 bytes each; we
+/// linearly extrapolate from the 100K number.
+#[tokio::test]
+#[ignore]
+async fn verify_wal_latency_100k_events() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let wal_path = dir.path().join("wal.log");
+
+    let config = GroupCommitConfig {
+        batch_window: Duration::from_millis(5),
+        max_batch_size: 512,
+        channel_capacity: 32_768,
+        ..Default::default()
+    };
+
+    let ledger = Arc::new(
+        Ledger::with_config(&wal_path, "", "", config)
+            .await
+            .expect("ledger init"),
+    );
+
+    let total = 100_000usize;
+    let write_start = Instant::now();
+    let mut handles = Vec::with_capacity(total);
+    for i in 0..total {
+        let ledger = ledger.clone();
+        handles.push(tokio::spawn(async move {
+            let mut event = make_test_event(&format!("audit-{}", i));
+            event.decision = if i % 5 == 0 {
+                "Delay { milliseconds: 300 }".to_string()
+            } else {
+                "Allow".to_string()
+            };
+            event.status = EventStatus::Confirmed;
+            ledger.append_durable(&event).await.ok();
+        }));
+    }
+    for h in handles {
+        h.await.ok();
+    }
+    let write_elapsed = write_start.elapsed();
+    drop(ledger);
+
+    let wal_size = tokio::fs::metadata(&wal_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    // Measure verification
+    let verify_start = Instant::now();
+    let (valid_links, _broken) = Ledger::check_chain_integrity(&wal_path);
+    let verify_elapsed = verify_start.elapsed();
+
+    eprintln!(
+        "verify_wal_latency_100k_events:\n  write: {:?} ({:.0}/s)\n  WAL size: {} bytes ({:.1} MB)\n  verify (chain integrity scan): {:?} ({} config_load links)\n  projected 1GB verify: {:?}",
+        write_elapsed,
+        total as f64 / write_elapsed.as_secs_f64(),
+        wal_size,
+        wal_size as f64 / 1_048_576.0,
+        verify_elapsed,
+        valid_links,
+        Duration::from_secs_f64(
+            verify_elapsed.as_secs_f64() * (1_073_741_824.0 / wal_size.max(1) as f64)
+        )
+    );
+
+    // Not a hard gate — this test exists to report numbers.
+    // Ceiling only to catch catastrophic regression.
+    assert!(
+        verify_elapsed.as_secs() < 300,
+        "verify_wal on {} MB took {:?}",
+        wal_size / 1_048_576,
+        verify_elapsed
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 7. RATE LIMITER — removed (replaced by token_budget in src/token_budget.rs)
 // Token budget unit tests are in src/token_budget.rs

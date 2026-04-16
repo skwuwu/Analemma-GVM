@@ -358,14 +358,22 @@ pub struct GVMEvent {
 
 ### Durability by Decision Type
 
-| Decision | Strictness | WAL Write | Status Lifecycle |
-|----------|------------|-----------|------------------|
-| Allow | 0 | `append_async` (loss tolerated) | → Confirmed |
-| AuditOnly | 1 | `append_durable` (fsync) | Pending → Confirmed/Failed |
-| Delay { ms } | 2 | `append_durable` (fsync) | Pending → delay → Confirmed/Failed |
-| RequireApproval | 3 | `append_durable` (fsync) | Pending → approval/timeout → Confirmed/Failed |
-| Deny | 4 | `append_durable` (fsync) | → Failed { reason } |
-| TokenBudget exceeded | — | `append_durable` (fsync) | → Failed (403, budget_exceeded) |
+Every governance decision is Merkle-chained. Non-governance internal
+events (DNS Tier 1 `Known`, Vault read/list) are deliberately excluded
+from the audit chain via `append_async` to bound log growth.
+
+| Decision / Event | Strictness | WAL Write | Status Lifecycle |
+|-----------------|------------|-----------|------------------|
+| Allow | 0 | `append_durable` (group commit, ~2ms batched fsync) | → Confirmed |
+| AuditOnly | 1 | `append_durable` | Pending → Confirmed/Failed |
+| Delay { ms } | 2 | `append_durable` | Pending → delay → Confirmed/Failed |
+| RequireApproval | 3 | `append_durable` | Pending → approval/timeout → Confirmed/Failed |
+| Deny | 4 | `append_durable` | → Failed { reason } |
+| TokenBudget exceeded | — | `append_durable` | → Failed (403, budget_exceeded) |
+| DNS Tier 1 (Known) | — | `append_async` (NATS only, **not in Merkle chain**) | — |
+| DNS Tier 2+ (Unknown/Anomalous/Flood) | — | `append_durable` | Pending → Confirmed |
+| Vault read / list_keys | — | `append_async` (NATS only, **not in Merkle chain**) | — |
+| Vault write / delete | — | `append_durable` | Pending → Confirmed |
 
 ### DNS Governance Context Fields
 

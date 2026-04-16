@@ -513,13 +513,24 @@ pub async fn proxy_handler(
 
     match &classification.decision {
         EnforcementDecision::Allow => {
-            // Fast path: forward immediately, async ledger (IC-1, loss tolerated)
+            // Forward first, then WAL via group commit. Allow is a governance
+            // decision and MUST be in the Merkle audit chain for compliance
+            // and notarization. Group commit (~2ms batch window) keeps the
+            // overhead negligible against a 50-500ms upstream round-trip.
             let engine_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
             let mut response = forward_request(&state, request, &target).await;
 
             event.status = event_status_from_response(&response);
-            state.ledger.append_async(event.clone()).await;
-            // Allow uses async WAL (loss tolerated) — confirm intent immediately
+            if let Err(e) = state.ledger.append_durable(&event).await {
+                // Response has already been returned upstream; we cannot
+                // retroactively reject. Log the WAL miss so operators can
+                // investigate audit gaps.
+                tracing::warn!(
+                    event_id = %event.event_id,
+                    error = %e,
+                    "Allow: WAL durable write failed (primary + emergency both down)"
+                );
+            }
             if let Some(ref claim) = shadow_claim {
                 state.intent_store.confirm(claim.claim_id);
             }
@@ -716,8 +727,15 @@ pub async fn proxy_handler(
                 let engine_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
                 let mut response = forward_request(&state, request, &target).await;
                 event.status = event_status_from_response(&response);
-                // Update WAL with execution result
-                state.ledger.append_async(event.clone()).await;
+                // IC-3 human-approved execution is a high-value audit record;
+                // must reach the Merkle chain.
+                if let Err(e) = state.ledger.append_durable(&event).await {
+                    tracing::warn!(
+                        event_id = %event.event_id,
+                        error = %e,
+                        "IC-3 APPROVED: WAL durable write failed"
+                    );
+                }
                 inject_gvm_response_headers(
                     response.headers_mut(),
                     &event,
@@ -1303,9 +1321,10 @@ fn append_proxy_wal_event(
         llm_trace: None,
         default_caution: false, config_integrity_ref: None,
     };
-    // Spawn background task for durable WAL write. Cannot .await in sync fn context,
-    // and append_async only writes to NATS (not WAL file). tokio::spawn ensures the
-    // event reaches the WAL file even without NATS configured.
+    // Spawn background task for durable WAL write. Called from a sync
+    // context (middleware/panic handler) where we cannot .await directly.
+    // The spawned task calls append_durable to ensure the event reaches
+    // the WAL file and Merkle chain.
     let ledger = state.ledger.clone();
     let decision_owned = decision.to_string();
     tokio::spawn(async move {
@@ -1558,7 +1577,17 @@ async fn handle_connect_inner(
                 parent_event_id: None,
                 session_id: String::new(),
             };
-            state.ledger.append_async(event).await;
+            // CONNECT Deny is a governance decision and must be durably
+            // audited. (Pre-existing bug: this path previously used
+            // append_async which did not write to WAL at all, so Deny
+            // decisions for HTTPS tunnels were silently lost.)
+            if let Err(e) = state.ledger.append_durable(&event).await {
+                tracing::warn!(
+                    event_id = %event.event_id,
+                    error = %e,
+                    "CONNECT Deny: WAL durable write failed"
+                );
+            }
 
             return error_response(
                 StatusCode::FORBIDDEN,
@@ -1570,7 +1599,8 @@ async fn handle_connect_inner(
         }
     }
 
-    // WAL record for allowed CONNECT (async, loss tolerated)
+    // WAL record for allowed CONNECT. Durable: Allow on a tunnel is the
+    // audit anchor for everything that flows inside — must reach Merkle chain.
     let event = GVMEvent {
         event_id: uuid::Uuid::new_v4().to_string(),
         trace_id: uuid::Uuid::new_v4().to_string(),
@@ -1599,7 +1629,13 @@ async fn handle_connect_inner(
         parent_event_id: None,
         session_id: String::new(),
     };
-    state.ledger.append_async(event).await;
+    if let Err(e) = state.ledger.append_durable(&event).await {
+        tracing::warn!(
+            event_id = %event.event_id,
+            error = %e,
+            "CONNECT Allow: WAL durable write failed"
+        );
+    }
 
     // MITM TLS inspection on CONNECT tunnel.
     // Apply MITM for connections from isolated environments (sandbox or Docker)
