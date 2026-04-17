@@ -1252,4 +1252,145 @@ mod tests {
     fn test_is_local_proxy_url_no_port() {
         assert!(is_local_proxy_url("http://localhost"));
     }
+
+    // ── looks_like_script() ──
+
+    #[test]
+    fn looks_like_script_python() {
+        assert!(looks_like_script("agent.py"));
+        assert!(looks_like_script("/home/user/agent.py"));
+    }
+
+    #[test]
+    fn looks_like_script_javascript() {
+        assert!(looks_like_script("main.js"));
+        assert!(looks_like_script("main.ts"));
+    }
+
+    #[test]
+    fn looks_like_script_shell() {
+        assert!(looks_like_script("run.sh"));
+        assert!(looks_like_script("run.bash"));
+    }
+
+    #[test]
+    fn looks_like_script_binary() {
+        assert!(!looks_like_script("gvm-proxy"));
+        assert!(!looks_like_script("./target/release/agent"));
+        assert!(!looks_like_script("agent.exe"));
+    }
+
+    #[test]
+    fn looks_like_script_no_extension() {
+        assert!(!looks_like_script("python3"));
+        assert!(!looks_like_script("node"));
+    }
+
+    // ── parse_memory_limit() ──
+
+    #[test]
+    fn parse_memory_limit_megabytes() {
+        assert_eq!(parse_memory_limit("512m"), Some(512 * 1024 * 1024));
+        assert_eq!(parse_memory_limit("512M"), Some(512 * 1024 * 1024));
+    }
+
+    #[test]
+    fn parse_memory_limit_gigabytes() {
+        assert_eq!(parse_memory_limit("2g"), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_memory_limit("1G"), Some(1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn parse_memory_limit_kilobytes() {
+        assert_eq!(parse_memory_limit("1024k"), Some(1024 * 1024));
+    }
+
+    #[test]
+    fn parse_memory_limit_raw_bytes() {
+        assert_eq!(parse_memory_limit("1048576"), Some(1048576));
+    }
+
+    #[test]
+    fn parse_memory_limit_empty() {
+        assert_eq!(parse_memory_limit(""), None);
+        assert_eq!(parse_memory_limit("  "), None);
+    }
+
+    #[test]
+    fn parse_memory_limit_invalid() {
+        assert_eq!(parse_memory_limit("not-a-number"), None);
+        assert_eq!(parse_memory_limit("abcm"), None);
+    }
+
+    #[test]
+    fn parse_memory_limit_whitespace_trimmed() {
+        assert_eq!(parse_memory_limit("  256m  "), Some(256 * 1024 * 1024));
+    }
+
+    // ── derive_admin_url() ──
+
+    #[test]
+    fn derive_admin_url_standard() {
+        assert_eq!(
+            derive_admin_url("http://127.0.0.1:8080"),
+            "http://127.0.0.1:9090"
+        );
+    }
+
+    #[test]
+    fn derive_admin_url_custom_port() {
+        assert_eq!(
+            derive_admin_url("http://localhost:3000"),
+            "http://localhost:4010"
+        );
+    }
+
+    #[test]
+    fn derive_admin_url_invalid_url_fallback() {
+        assert_eq!(derive_admin_url("not-a-url"), "http://127.0.0.1:9090");
+    }
+
+    // ── detect_interpreter() ──
+
+    #[test]
+    fn detect_interpreter_python() {
+        let (interp, args) = detect_interpreter("py", "agent.py");
+        assert!(
+            interp == "python3" || interp == "python",
+            "interpreter should be python3 or python, got: {}",
+            interp
+        );
+        assert_eq!(args, vec!["agent.py"]);
+    }
+
+    #[test]
+    fn detect_interpreter_javascript() {
+        let (interp, args) = detect_interpreter("js", "main.js");
+        assert_eq!(interp, "node");
+        assert_eq!(args, vec!["main.js"]);
+    }
+
+    #[test]
+    fn detect_interpreter_typescript() {
+        let (interp, args) = detect_interpreter("ts", "main.ts");
+        assert_eq!(interp, "npx");
+        assert_eq!(args, vec!["ts-node", "main.ts"]);
+    }
+
+    #[test]
+    fn detect_interpreter_shell() {
+        let (interp, args) = detect_interpreter("sh", "run.sh");
+        assert_eq!(interp, "bash");
+        assert_eq!(args, vec!["run.sh"]);
+    }
+
+    #[test]
+    fn detect_interpreter_unknown_defaults_to_python() {
+        let (interp, _args) = detect_interpreter("xyz", "script.xyz");
+        assert!(
+            interp == "python3" || interp == "python",
+            "unknown ext should default to python, got: {}",
+            interp
+        );
+    }
 }

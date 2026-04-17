@@ -1083,7 +1083,11 @@ fn cleanup_state_resources(state: &SandboxState) -> StateCleanupCounts {
         match std::fs::remove_dir(path) {
             Ok(()) => {
                 counts.mount_paths += 1;
-                tracing::debug!(path = mount_path, umount = umount_ok, "Removed orphan mount dir");
+                tracing::debug!(
+                    path = mount_path,
+                    umount = umount_ok,
+                    "Removed orphan mount dir"
+                );
             }
             Err(e) => {
                 tracing::debug!(

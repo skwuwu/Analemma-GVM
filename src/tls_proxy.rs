@@ -1743,6 +1743,220 @@ mod tests {
         assert_eq!(req.headers[0].0, "Authorization");
         assert_eq!(req.headers[0].1, b"Bearer sk-proj-abc123");
     }
+
+    // ── find_header_end() ──
+
+    #[test]
+    fn find_header_end_simple() {
+        let buf = b"GET / HTTP/1.1\r\nHost: x\r\n\r\nbody";
+        let end = find_header_end(buf).unwrap();
+        assert_eq!(&buf[end..], b"body");
+    }
+
+    #[test]
+    fn find_header_end_no_terminator() {
+        assert!(find_header_end(b"GET / HTTP/1.1\r\nHost: x\r\n").is_none());
+    }
+
+    #[test]
+    fn find_header_end_empty_input() {
+        assert!(find_header_end(b"").is_none());
+    }
+
+    #[test]
+    fn find_header_end_just_crlf_crlf() {
+        let buf = b"\r\n\r\n";
+        assert_eq!(find_header_end(buf), Some(4));
+    }
+
+    #[test]
+    fn find_header_end_multiple_headers() {
+        let buf = b"POST /api HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello";
+        let end = find_header_end(buf).unwrap();
+        assert_eq!(&buf[end..], b"hello");
+    }
+
+    // ── parse_content_length() ──
+
+    #[test]
+    fn parse_content_length_standard() {
+        let headers = b"Content-Length: 42\r\n";
+        assert_eq!(parse_content_length(headers), Some(42));
+    }
+
+    #[test]
+    fn parse_content_length_lowercase() {
+        let headers = b"content-length: 100\r\n";
+        assert_eq!(parse_content_length(headers), Some(100));
+    }
+
+    #[test]
+    fn parse_content_length_mixed_case() {
+        let headers = b"CONTENT-LENGTH: 999\r\n";
+        assert_eq!(parse_content_length(headers), Some(999));
+    }
+
+    #[test]
+    fn parse_content_length_with_whitespace() {
+        let headers = b"Content-Length:   77  \r\n";
+        assert_eq!(parse_content_length(headers), Some(77));
+    }
+
+    #[test]
+    fn parse_content_length_not_present() {
+        let headers = b"Host: example.com\r\nAccept: */*\r\n";
+        assert_eq!(parse_content_length(headers), None);
+    }
+
+    #[test]
+    fn parse_content_length_invalid_value() {
+        let headers = b"Content-Length: not-a-number\r\n";
+        assert_eq!(parse_content_length(headers), None);
+    }
+
+    #[test]
+    fn parse_content_length_empty() {
+        assert_eq!(parse_content_length(b""), None);
+    }
+
+    #[test]
+    fn parse_content_length_among_many_headers() {
+        let headers = b"Host: x\r\nAccept: */*\r\nContent-Length: 256\r\nConnection: close\r\n";
+        assert_eq!(parse_content_length(headers), Some(256));
+    }
+
+    // ── is_transfer_encoding_chunked() ──
+
+    #[test]
+    fn transfer_encoding_chunked_standard() {
+        assert!(is_transfer_encoding_chunked(
+            b"Transfer-Encoding: chunked\r\n"
+        ));
+    }
+
+    #[test]
+    fn transfer_encoding_chunked_mixed_case() {
+        assert!(is_transfer_encoding_chunked(
+            b"TRANSFER-ENCODING: CHUNKED\r\n"
+        ));
+    }
+
+    #[test]
+    fn transfer_encoding_not_chunked() {
+        assert!(!is_transfer_encoding_chunked(
+            b"Transfer-Encoding: gzip\r\n"
+        ));
+    }
+
+    #[test]
+    fn transfer_encoding_not_present() {
+        assert!(!is_transfer_encoding_chunked(b"Content-Length: 100\r\n"));
+    }
+
+    #[test]
+    fn transfer_encoding_chunked_empty() {
+        assert!(!is_transfer_encoding_chunked(b""));
+    }
+
+    #[test]
+    fn transfer_encoding_chunked_invalid_utf8() {
+        assert!(!is_transfer_encoding_chunked(&[0xff, 0xfe, 0xfd]));
+    }
+
+    // ── rebuild_raw_head() ──
+
+    #[test]
+    fn rebuild_raw_head_produces_valid_http() {
+        let mut req = HttpRequest {
+            method: "POST".to_string(),
+            path: "/v1/chat".to_string(),
+            host: "api.openai.com".to_string(),
+            headers: vec![
+                ("Host".to_string(), b"api.openai.com".to_vec()),
+                ("Content-Length".to_string(), b"13".to_vec()),
+            ],
+            body: b"{\"text\":\"hi\"}".to_vec(),
+            raw_head: vec![], // will be rebuilt
+        };
+
+        req.rebuild_raw_head();
+
+        let raw = String::from_utf8(req.raw_head.clone()).unwrap();
+        assert!(raw.starts_with("POST /v1/chat HTTP/1.1\r\n"));
+        assert!(raw.contains("Host: api.openai.com\r\n"));
+        assert!(raw.contains("Content-Length: 13\r\n"));
+        assert!(raw.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn rebuild_raw_head_empty_headers() {
+        let mut req = HttpRequest {
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            host: String::new(),
+            headers: vec![],
+            body: vec![],
+            raw_head: vec![],
+        };
+
+        req.rebuild_raw_head();
+
+        let raw = String::from_utf8(req.raw_head.clone()).unwrap();
+        assert_eq!(raw, "GET / HTTP/1.1\r\n\r\n");
+    }
+
+    // ── read_http_request smuggling defense ──
+
+    #[tokio::test]
+    async fn parse_rejects_cl_and_te_conflict() {
+        let raw = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello";
+        let mut cursor = std::io::Cursor::new(raw.to_vec());
+        let mut reader = tokio::io::BufReader::new(&mut cursor);
+        let result = read_http_request(&mut reader).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("smuggling"),
+            "error should mention smuggling: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_rejects_duplicate_cl_with_different_values() {
+        let raw =
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 10\r\n\r\nhello";
+        let mut cursor = std::io::Cursor::new(raw.to_vec());
+        let mut reader = tokio::io::BufReader::new(&mut cursor);
+        let result = read_http_request(&mut reader).await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Content-Length"),
+            "error should mention Content-Length: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_accepts_duplicate_cl_with_same_value() {
+        let raw =
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello";
+        let mut cursor = std::io::Cursor::new(raw.to_vec());
+        let mut reader = tokio::io::BufReader::new(&mut cursor);
+        let result = read_http_request(&mut reader).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().body, b"hello");
+    }
+
+    #[tokio::test]
+    async fn parse_empty_stream_returns_error() {
+        let raw: &[u8] = b"";
+        let mut cursor = std::io::Cursor::new(raw.to_vec());
+        let mut reader = tokio::io::BufReader::new(&mut cursor);
+        let result = read_http_request(&mut reader).await;
+        assert!(result.is_err());
+    }
 }
 
 /// Test helpers (not public API).

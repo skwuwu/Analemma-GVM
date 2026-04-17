@@ -616,3 +616,345 @@ fn dirs_home() -> Option<String> {
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── GvmConfig TOML deserialization ──
+
+    #[test]
+    fn gvm_config_empty_toml_uses_defaults() {
+        let config: GvmConfig = toml::from_str("").unwrap();
+        assert!(config.rules.is_empty());
+        assert!(config.credentials.is_empty());
+        assert_eq!(config.budget.max_tokens_per_hour, 0);
+        assert_eq!(config.budget.reserve_per_request, 500);
+        assert!(config.filesystem.is_none());
+        assert_eq!(config.seccomp.profile, "default");
+        assert!(config.seccomp.custom_path.is_none());
+    }
+
+    #[test]
+    fn gvm_config_parses_rules() {
+        let toml_str = r#"
+[[rules]]
+method = "POST"
+pattern = "api.stripe.com/v1/charges"
+description = "Payment charges"
+[rules.decision]
+type = "Deny"
+reason = "Blocked"
+"#;
+        let config: GvmConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.rules.len(), 1);
+        assert_eq!(config.rules[0].method, "POST");
+        assert_eq!(config.rules[0].pattern, "api.stripe.com/v1/charges");
+        assert_eq!(config.rules[0].decision.decision_type, "Deny");
+    }
+
+    #[test]
+    fn gvm_config_parses_budget() {
+        let toml_str = r#"
+[budget]
+max_tokens_per_hour = 100000
+max_cost_per_hour = 5.50
+reserve_per_request = 1000
+"#;
+        let config: GvmConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.budget.max_tokens_per_hour, 100000);
+        assert!((config.budget.max_cost_per_hour - 5.50).abs() < f64::EPSILON);
+        assert_eq!(config.budget.reserve_per_request, 1000);
+    }
+
+    #[test]
+    fn gvm_config_partial_budget_fills_defaults() {
+        let toml_str = r#"
+[budget]
+max_tokens_per_hour = 50000
+"#;
+        let config: GvmConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.budget.max_tokens_per_hour, 50000);
+        assert!((config.budget.max_cost_per_hour - 0.0).abs() < f64::EPSILON);
+        assert_eq!(config.budget.reserve_per_request, 500);
+    }
+
+    #[test]
+    fn gvm_config_parses_credentials() {
+        let toml_str = r#"
+[credentials."api.openai.com"]
+type = "Bearer"
+token = "sk-test-123"
+"#;
+        let config: GvmConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.credentials.len(), 1);
+        assert!(config.credentials.contains_key("api.openai.com"));
+    }
+
+    #[test]
+    fn gvm_config_malformed_toml_fails() {
+        let bad = "[[rules]\nmethod = broken";
+        let result = toml::from_str::<GvmConfig>(bad);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn gvm_config_unknown_fields_ignored() {
+        // serde(deny_unknown_fields) is NOT set, so extra keys should parse fine
+        let toml_str = r#"
+unknown_future_key = "value"
+[budget]
+max_tokens_per_hour = 1000
+"#;
+        let config: GvmConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.budget.max_tokens_per_hour, 1000);
+    }
+
+    // ── ProxyConfig defaults ──
+
+    #[test]
+    fn proxy_config_default_has_expected_values() {
+        let config = ProxyConfig::default();
+        assert_eq!(config.server.listen, "0.0.0.0:8080");
+        assert_eq!(config.server.admin_listen, "127.0.0.1:9090");
+        assert_eq!(config.server.drain_timeout_secs, 5);
+        assert_eq!(config.enforcement.default_decision.decision_type, "Delay");
+        assert_eq!(config.enforcement.default_decision.milliseconds, Some(300));
+        assert!(config.enforcement.ic1_async_ledger);
+        assert_eq!(config.enforcement.ic3_approval_timeout_secs, 300);
+        assert_eq!(config.enforcement.default_unknown, "delay");
+        assert_eq!(config.enforcement.default_delay_ms, 300);
+        assert_eq!(config.nats.url, "nats://127.0.0.1:4222");
+        assert_eq!(config.nats.stream, "gvm-audit");
+        assert_eq!(config.redis.url, "redis://127.0.0.1:6379");
+        assert!(config.srr.hot_reload);
+        assert!(!config.srr.payload_inspection);
+        assert_eq!(config.srr.max_body_bytes, 65536);
+        assert!(config.policies.is_none());
+        assert!(config.operations.is_none());
+        assert!(config.dev.is_none());
+        assert!(config.jwt.is_none());
+        assert!(config.filesystem.is_none());
+    }
+
+    #[test]
+    fn proxy_config_load_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proxy.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+listen = "127.0.0.1:9999"
+
+[enforcement]
+ic1_async_ledger = false
+ic1_loss_threshold = 0.01
+[enforcement.default_decision]
+type = "Allow"
+
+[nats]
+url = "nats://10.0.0.1:4222"
+stream = "test-stream"
+max_age_days = 30
+
+[redis]
+url = "redis://10.0.0.1:6379"
+
+[srr]
+network_file = "srr.toml"
+semantic_file = "sem.toml"
+hot_reload = false
+
+[secrets]
+file = "secrets.toml"
+key_env = "MY_KEY"
+"#,
+        )
+        .unwrap();
+
+        let config = ProxyConfig::load(&path).unwrap();
+        assert_eq!(config.server.listen, "127.0.0.1:9999");
+        assert_eq!(config.server.admin_listen, "127.0.0.1:9090"); // default
+        assert!(!config.enforcement.ic1_async_ledger);
+        assert_eq!(config.nats.url, "nats://10.0.0.1:4222");
+        assert!(!config.srr.hot_reload);
+    }
+
+    #[test]
+    fn proxy_config_load_missing_file_returns_error() {
+        let result = ProxyConfig::load(Path::new("/nonexistent/proxy.toml"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn proxy_config_load_malformed_toml_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.toml");
+        std::fs::write(&path, "this is not valid toml {{{").unwrap();
+        let result = ProxyConfig::load(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn proxy_config_load_missing_required_field_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.toml");
+        // Missing [server], [enforcement], etc.
+        std::fs::write(&path, "[redis]\nurl = \"redis://localhost\"").unwrap();
+        let result = ProxyConfig::load(&path);
+        assert!(result.is_err());
+    }
+
+    // ── WalConfig defaults ──
+
+    #[test]
+    fn wal_config_defaults() {
+        let config = WalConfig::default();
+        assert_eq!(config.path, "data/wal.log");
+        assert_eq!(config.batch_window_ms, 2);
+        assert_eq!(config.max_batch_size, 128);
+        assert_eq!(config.max_wal_bytes, 100 * 1024 * 1024);
+        assert_eq!(config.max_wal_segments, 10);
+    }
+
+    #[test]
+    fn wal_config_partial_override() {
+        let toml_str = r#"
+path = "/var/log/gvm/wal.log"
+max_batch_size = 256
+"#;
+        let config: WalConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.path, "/var/log/gvm/wal.log");
+        assert_eq!(config.max_batch_size, 256);
+        assert_eq!(config.batch_window_ms, 2); // default
+        assert_eq!(config.max_wal_bytes, 100 * 1024 * 1024); // default
+    }
+
+    // ── OnBlockConfig defaults ──
+
+    #[test]
+    fn on_block_config_defaults() {
+        let config = OnBlockConfig::default();
+        assert!(matches!(config.deny, BlockResponseMode::Halt));
+        assert!(matches!(
+            config.require_approval,
+            BlockResponseMode::SoftPivot
+        ));
+        assert!(matches!(
+            config.infrastructure_failure,
+            BlockResponseMode::Halt
+        ));
+    }
+
+    // ── DnsGovernanceConfig defaults ──
+
+    #[test]
+    fn dns_governance_config_defaults() {
+        let config = DnsGovernanceConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.listen_port, 5353);
+    }
+
+    #[test]
+    fn dns_governance_config_disabled() {
+        let toml_str = r#"
+enabled = false
+listen_port = 5454
+"#;
+        let config: DnsGovernanceConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.enabled);
+        assert_eq!(config.listen_port, 5454);
+    }
+
+    // ── BudgetConfig defaults ──
+
+    #[test]
+    fn budget_config_defaults() {
+        let config = BudgetConfig::default();
+        assert_eq!(config.max_tokens_per_hour, 0);
+        assert!((config.max_cost_per_hour - 0.0).abs() < f64::EPSILON);
+        assert_eq!(config.reserve_per_request, 500);
+    }
+
+    // ── SeccompConfig defaults ──
+
+    #[test]
+    fn seccomp_config_defaults() {
+        let config = SeccompConfig::default();
+        assert_eq!(config.profile, "default");
+        assert!(config.custom_path.is_none());
+    }
+
+    #[test]
+    fn seccomp_config_custom_profile() {
+        let toml_str = r#"
+profile = "strict"
+custom_path = "/etc/gvm/seccomp.json"
+"#;
+        let config: SeccompConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.profile, "strict");
+        assert_eq!(config.custom_path.as_deref(), Some("/etc/gvm/seccomp.json"));
+    }
+
+    // ── JwtAuthConfig ──
+
+    #[test]
+    fn jwt_config_defaults() {
+        let toml_str = ""; // empty — serde defaults apply
+        let config: JwtAuthConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.secret_env, "GVM_JWT_SECRET");
+        assert_eq!(config.token_ttl_secs, 3600);
+    }
+
+    // ── ProxyConfig TOML with legacy [policies] section still parses ──
+
+    #[test]
+    fn proxy_config_with_legacy_policies_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+listen = "0.0.0.0:8080"
+
+[enforcement]
+ic1_async_ledger = true
+ic1_loss_threshold = 0.001
+[enforcement.default_decision]
+type = "Delay"
+milliseconds = 300
+
+[nats]
+url = "nats://localhost:4222"
+stream = "gvm"
+max_age_days = 30
+
+[redis]
+url = "redis://localhost"
+
+[srr]
+network_file = "srr.toml"
+semantic_file = "sem.toml"
+hot_reload = true
+
+[secrets]
+file = "secrets.toml"
+key_env = "KEY"
+
+[policies]
+directory = "config/policies"
+hot_reload = true
+
+[operations]
+registry_file = "config/operations.toml"
+"#,
+        )
+        .unwrap();
+
+        let config = ProxyConfig::load(&path).unwrap();
+        assert!(config.policies.is_some());
+        assert!(config.operations.is_some());
+    }
+}
