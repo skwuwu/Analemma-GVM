@@ -357,5 +357,9 @@ async fn classify_poisoned_srr_returns_error() {
     let result = classify(&state, &input);
     assert!(result.is_err(), "poisoned SRR lock must return Err");
     let err = result.err().unwrap();
-    assert!(err.contains("poisoned"), "error should mention poisoned: {}", err);
+    assert!(
+        err.contains("poisoned"),
+        "error should mention poisoned: {}",
+        err
+    );
 }
