@@ -1,0 +1,202 @@
+# Nightly chaos stress test on the project's EC2 sandbox host.
+#
+# WHY THIS EXISTS
+# ───────────────────────────────────────────────────────────────────
+# The 60-minute chaos stress test (`scripts/stress-test.sh`) exercises
+# the full sandbox lifecycle: 3 OpenClaw agents in --sandbox mode,
+# proxy kill recovery (T+15m), network partition (T+25m), disk pressure
+# (T+35m), and final residual scan. Without this gate, regressions in
+# cleanup paths are invisible until release.
+#
+# Concrete example: the SIGINT NAT-leak bug (DNS DNAT format mismatch
+# in cleanup_host_network) sat in the codebase for weeks and was only
+# discovered when the user ran the stress + observability scripts by
+# hand. CI test counts went green every push while a NAT rule was
+# accumulating per session. This workflow closes that gap.
+#
+# WHAT IT REQUIRES
+# ───────────────────────────────────────────────────────────────────
+# Three repository secrets must be configured (Settings → Secrets →
+# Actions → New repository secret):
+#
+#   EC2_HOST        — hostname or IP, e.g. "43.201.62.93"
+#   EC2_USER        — SSH user, default "ubuntu" if unset
+#   EC2_SSH_KEY     — full PEM private key contents (BEGIN/END lines)
+#
+# The EC2 instance must already have:
+#   - ~/Analemma-GVM cloned and tracking origin/master
+#   - .env with ANTHROPIC_API_KEY
+#   - Rust toolchain (rustup default stable)
+#   - openclaw available in PATH (npm install -g openclaw)
+#   - tmux + iproute2 (for chaos network partition via tc)
+#
+# COST AWARENESS
+# ───────────────────────────────────────────────────────────────────
+# Each run pins the EC2 instance for ~70 minutes (build cache hit makes
+# build cheap, then 60 min stress, then ~5 min cleanup + result scan).
+# Default schedule is **weekly** (Sunday 18:00 UTC = early Monday KST)
+# to keep cost bounded. Switch to nightly by uncommenting the daily
+# cron line below if budget allows.
+
+name: Nightly Stress (EC2)
+
+on:
+  schedule:
+    # Sunday 18:00 UTC — Monday 03:00 KST. Off-hours, low SSH contention.
+    - cron: '0 18 * * 0'
+    # Uncomment for nightly runs:
+    # - cron: '0 18 * * *'
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Duration in minutes (default 60)'
+        required: false
+        default: '60'
+
+jobs:
+  stress:
+    name: 60-minute chaos stress on EC2
+    runs-on: ubuntu-latest
+    # Hard cap: 60-min test + 30-min build/cleanup safety margin.
+    timeout-minutes: 95
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sanity check secrets
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          if [ -z "$EC2_HOST" ]; then
+            echo "::error::EC2_HOST secret not configured. See workflow header."
+            exit 1
+          fi
+          if [ -z "$EC2_SSH_KEY" ]; then
+            echo "::error::EC2_SSH_KEY secret not configured. See workflow header."
+            exit 1
+          fi
+
+      - name: Configure SSH
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          umask 077
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/ec2.pem
+          chmod 600 ~/.ssh/ec2.pem
+
+      - name: Sync EC2 to current master
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          USER="${EC2_USER:-ubuntu}"
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/ec2.pem "$USER@$EC2_HOST" \
+            "cd ~/Analemma-GVM \
+              && git fetch origin master \
+              && git reset --hard $GITHUB_SHA \
+              && git rev-parse --short HEAD"
+
+      - name: Build release binaries on EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          USER="${EC2_USER:-ubuntu}"
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/ec2.pem "$USER@$EC2_HOST" \
+            "cd ~/Analemma-GVM && cargo build --release -p gvm-cli -p gvm-proxy 2>&1 | tail -3"
+
+      - name: Pre-test cleanup
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          USER="${EC2_USER:-ubuntu}"
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/ec2.pem "$USER@$EC2_HOST" \
+            "cd ~/Analemma-GVM \
+              && sudo ./target/release/gvm cleanup >/dev/null 2>&1 || true \
+              && sudo ./target/release/gvm stop >/dev/null 2>&1 || true \
+              && sudo iptables-save -t nat | grep -c veth-gvm || echo 0"
+
+      - name: Run stress test
+        id: stress
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          DURATION: ${{ github.event.inputs.duration || '60' }}
+        run: |
+          USER="${EC2_USER:-ubuntu}"
+          # The stress script already runs through a tmux-internal session
+          # when needed; we drive it foreground here so the workflow
+          # exit code matches the script verdict. ssh -tt keeps a TTY
+          # which the script's progress bar uses, but the captured log
+          # is what we evaluate.
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/ec2.pem "$USER@$EC2_HOST" \
+            "cd ~/Analemma-GVM && sudo -E bash scripts/stress-test.sh --duration $DURATION 2>&1" \
+            | tee stress-ci.log
+          # The stress script writes "VERDICT: PASS" or "VERDICT: FAIL"
+          # near the end of its output. Anything else means the script
+          # crashed before reporting — also a failure.
+          if grep -q "VERDICT: PASS" stress-ci.log; then
+            echo "verdict=PASS" >> $GITHUB_OUTPUT
+          else
+            echo "verdict=FAIL" >> $GITHUB_OUTPUT
+            echo "::error::Stress test verdict was not PASS"
+            grep -E "FAIL|verdict|orphan|residual" stress-ci.log | tail -30 || true
+            exit 1
+          fi
+
+      - name: Pull stress artifacts from EC2
+        if: always()
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          USER="${EC2_USER:-ubuntu}"
+          mkdir -p stress-artifacts
+          # The stress script writes results to results/stress-<timestamp>/.
+          # Pull the most recent one for the workflow artifact bundle.
+          ssh -o StrictHostKeyChecking=no -i ~/.ssh/ec2.pem "$USER@$EC2_HOST" \
+            "cd ~/Analemma-GVM && ls -1dt results/stress-* 2>/dev/null | head -1" \
+            > latest_dir.txt || true
+          LATEST=$(cat latest_dir.txt 2>/dev/null || echo '')
+          if [ -n "$LATEST" ]; then
+            scp -r -o StrictHostKeyChecking=no -i ~/.ssh/ec2.pem \
+              "$USER@$EC2_HOST:~/Analemma-GVM/$LATEST" stress-artifacts/ || true
+          fi
+          mv stress-ci.log stress-artifacts/ 2>/dev/null || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-test-${{ github.run_id }}
+          path: stress-artifacts/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Post-test residual scan
+        if: always()
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          USER="${EC2_USER:-ubuntu}"
+          # Even after VERDICT: PASS the test could leave residuals if
+          # cleanup_host_network silently failed for one rule. This is
+          # a paranoia check — any leftover veth/NAT/state file blocks
+          # the workflow.
+          NAT_COUNT=$(ssh -o StrictHostKeyChecking=no -i ~/.ssh/ec2.pem "$USER@$EC2_HOST" \
+            "sudo iptables-save -t nat 2>/dev/null | grep -c veth-gvm || echo 0")
+          VETH_COUNT=$(ssh -o StrictHostKeyChecking=no -i ~/.ssh/ec2.pem "$USER@$EC2_HOST" \
+            "ip -o link show 2>/dev/null | grep -c veth-gvm || echo 0")
+          STATE_COUNT=$(ssh -o StrictHostKeyChecking=no -i ~/.ssh/ec2.pem "$USER@$EC2_HOST" \
+            "sudo ls /run/gvm/gvm-sandbox-*.state 2>/dev/null | wc -l")
+          echo "Post-test residuals: NAT=$NAT_COUNT veth=$VETH_COUNT state=$STATE_COUNT"
+          if [ "$NAT_COUNT" -ne 0 ] || [ "$VETH_COUNT" -ne 0 ] || [ "$STATE_COUNT" -ne 0 ]; then
+            echo "::error::Residual sandbox resources after test: NAT=$NAT_COUNT veth=$VETH_COUNT state=$STATE_COUNT"
+            ssh -o StrictHostKeyChecking=no -i ~/.ssh/ec2.pem "$USER@$EC2_HOST" \
+              "cd ~/Analemma-GVM && sudo ./target/release/gvm cleanup" || true
+            exit 1
+          fi

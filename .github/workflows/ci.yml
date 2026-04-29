@@ -142,3 +142,45 @@ jobs:
 
           kill $PROXY_PID 2>/dev/null
           echo "E2E smoke passed"
+
+  # Sandbox observability — exercises the user-facing CLI surface that
+  # surfaces sandbox failures (OOM, timeout, seccomp violation, SIGINT
+  # cleanup, gvm status, gvm stop). Critical regression gate: this is the
+  # job that catches "CLI says everything is fine but a NAT/veth/cgroup
+  # residual was actually left behind" — exactly the SIGINT NAT-leak class
+  # of bug we just fixed.
+  #
+  # Linux-only by construction (sandbox needs network namespaces, seccomp,
+  # cgroups). Uses sudo because veth/iptables setup requires CAP_NET_ADMIN.
+  sandbox-observability:
+    name: Sandbox Observability (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install runtime deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-psutil iproute2
+
+      - name: Build CLI + proxy (release)
+        run: cargo build --release -p gvm-cli -p gvm-proxy
+
+      - name: Run sandbox-observability suite
+        # The script self-cleans (`gvm cleanup` + `gvm stop` in trap EXIT).
+        # Failures bubble up via the script's own exit code.
+        run: |
+          sudo -E env "PATH=$PATH" bash scripts/sandbox-observability-test.sh
+
+      - name: Upload structured report (always, for triage on failure)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-observability-report
+          path: |
+            /tmp/gvm-obs-report/sandbox-observability.junit.xml
+            /tmp/gvm-obs-report/sandbox-observability.json
+          if-no-files-found: ignore
+          retention-days: 14

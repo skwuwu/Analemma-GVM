@@ -52,6 +52,59 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
+### 2026-04-29: P0 release-gate CI additions — sandbox-observability + nightly-stress
+
+**What changed:**
+
+`.github/workflows/ci.yml` — added a `sandbox-observability` job that
+runs on every push and PR (Linux runner, ubuntu-latest). It builds the
+release CLI/proxy, installs `python3-psutil` + `iproute2`, then runs
+`scripts/sandbox-observability-test.sh` under `sudo`. The script
+exercises 9 user-facing diagnostic surfaces — OOM hint, timeout hint,
+seccomp negative-probe (8 syscalls), normal-exit silence, CPU throttle
+note, `gvm status` structure, in-process cleanup verification, **Ctrl+C
+graceful cleanup**, and `gvm stop` staged output. JUnit XML + JSON
+reports are uploaded as a workflow artifact for triage.
+
+`.github/workflows/nightly-stress.yml` — new scheduled workflow that
+SSHes into the project's EC2 sandbox host and runs the 60-minute chaos
+stress test. Triggers weekly (Sunday 18:00 UTC) by default; switch to
+nightly by uncommenting the daily cron line. `workflow_dispatch` also
+exposes a `duration` input. The workflow:
+  - syncs EC2 to the workflow's `github.sha`,
+  - rebuilds the release binaries,
+  - pre-cleans residuals so a previous failed run can't poison the
+    starting state,
+  - runs `scripts/stress-test.sh --duration 60`,
+  - parses `VERDICT: PASS` from the captured log,
+  - pulls the per-run results dir + the live log as artifacts,
+  - **runs an explicit post-test residual scan** (NAT rules, veth
+    interfaces, state files) — any non-zero count fails the workflow
+    even if the script's own verdict was PASS. This is what catches
+    the SIGINT NAT-leak class of bug end-to-end.
+
+Three repository secrets must be configured before the nightly runs:
+`EC2_HOST`, `EC2_USER` (defaults to `ubuntu`), and `EC2_SSH_KEY` (full
+PEM contents). The workflow header has the full list and EC2-side
+prerequisites (cloned repo, .env, openclaw, tmux/iproute2).
+
+**Why:** the SIGINT NAT-leak bug fixed in the previous entry was
+visible only when the user ran `scripts/sandbox-observability-test.sh`
++ `scripts/stress-test.sh` by hand. CI was green every push for weeks
+while a NAT rule was silently accumulating per session. Without these
+two gates, the same class of cleanup-path bug would re-emerge —
+`cargo test --workspace` does not exercise iptables / veth / cgroup
+state and never will. These workflows close that gap.
+
+**Affected files:** `.github/workflows/ci.yml`,
+`.github/workflows/nightly-stress.yml`, `docs/internal/CHANGELOG.md`.
+
+**Risk:** Low. Sandbox-observability extends CI runtime by ~2 minutes
+on Linux (build + script execution). Nightly-stress runs on EC2 and
+costs whatever the existing EC2 instance already costs — no new
+infra. If EC2 is offline the workflow fails fast in the secrets
+sanity-check step.
+
 ### 2026-04-29: Sandbox SIGINT NAT leak — DNS DNAT cleanup format mismatch
 
 **What changed:**
