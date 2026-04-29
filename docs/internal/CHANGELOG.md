@@ -52,6 +52,86 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
+### 2026-04-29: P2 — cert cache attack tests + sandbox cleanup matrix (incl. discovered bugs)
+
+**What changed:**
+
+1. `src/tls_proxy.rs` — added five GvmCertResolver tests covering the
+   actual security/perf invariants the cache exists to provide:
+   - `cert_cache_bounded_under_sni_attack`: 12,000 unique-domain
+     SNI flood stays ≤ MAX_CERT_CACHE_SIZE after pending eviction
+     tasks flush. Verifies the attacker cannot OOM the proxy.
+   - `cert_cache_hit_returns_same_underlying_cert`: cache hit
+     returns the SAME Arc<CertifiedKey> as the first issue —
+     pointer-equality assertion. Catches any regression that
+     regenerates certs per handshake.
+   - `cert_cache_chain_includes_ca_for_client_verification`:
+     leaf chain is `[leaf, ca]` (length 2), each entry non-empty
+     and distinct.
+   - `cert_cache_concurrent_distinct_domains_no_deadlock_no_panic`:
+     32 threads × 32 unique domains complete cleanly, cache size
+     stays bounded.
+   - `cert_cache_concurrent_same_domain_all_threads_succeed`: 32
+     threads barriered to hit the same new domain simultaneously;
+     all get a valid 2-entry chain, steady-state cache has 1-2
+     entries.
+
+2. `crates/gvm-sandbox/src/sandbox_impl.rs` — removed the
+   `if network_result.is_ok()` gate around cleanup_host_network +
+   clear_sandbox_state. Same root-cause class as the SIGINT NAT-leak
+   fix: when setup_host_network() fails partway through, the gate
+   skipped cleanup of partial-setup artifacts (veth pair, early
+   iptables rules). cleanup_host_network is idempotent (`-D` +
+   `.ok()` ignore missing rules) so always running it is safe and
+   closes the leak. Doc-comment in the file records the two
+   production failure modes this fixes.
+
+3. `scripts/sandbox-observability-test.sh` — added Tests 10-13
+   covering termination paths beyond Ctrl+C:
+   - Test 10: Agent SIGTERM
+   - Test 11: Agent SIGKILL (uncatchable)
+   - Test 12: Parent (gvm CLI) SIGTERM
+   - Test 13: Parent SIGKILL → `gvm cleanup` recovery
+   Each verifies real system state via `iptables-save`, `ip link`,
+   and `/run/gvm/*.state` — never the CLI's self-report.
+
+**Bug discovered (the ENTIRE point of writing the matrix):**
+
+Tests 10-13 all fail today. Root cause: when the gvm CLI parent dies
+(particularly via SIGKILL, but also SIGTERM in some races), the
+sandbox PID-namespace init does NOT die with it. The cloned child
+becomes the namespace's PID 1; on parent death the kernel reparents
+it to init(1) and it keeps running. `is_pid_alive_with_starttime`
+in `cleanup_all_orphans_report` then sees the namespace init as
+alive and skips cleanup of its veth/iptables/state — permanently.
+The user sees an orphan agent, leaked veth-gvm-h0, leaked NAT rules,
+and `gvm cleanup` claiming success while leaving everything in place.
+
+The fix is non-trivial — needs PR_SET_PDEATHSIG(SIGKILL) on the
+clone, OR a cgroup-based teardown, OR a watchdog in the sandbox
+init that exits when its parent (gvm CLI) is gone. All three are
+design changes that need careful review of the sandbox architecture
+docs and integration with existing tc-filter / overlayfs cleanup
+ordering. Scheduled for follow-up.
+
+Until the fix lands, Tests 10-13 are gated behind
+`SANDBOX_CLEANUP_MATRIX=1` so they don't block CI on a known
+architectural bug. The default run reports them as SKIP. The day
+the fix lands, flip the env var on in
+`.github/workflows/ci.yml::sandbox-observability` and the matrix
+becomes a green-or-bust regression gate.
+
+**Affected files:** `src/tls_proxy.rs`,
+`crates/gvm-sandbox/src/sandbox_impl.rs`,
+`scripts/sandbox-observability-test.sh`,
+`docs/internal/CHANGELOG.md`.
+
+**Risk:** Low for the test additions and the cleanup gate fix.
+Cert tests are pure unit tests. The sandbox_impl gate fix only
+affects the failure-path; the success path was already calling
+cleanup. The matrix is opt-in until the architectural bug it found
+is fixed.
+
 ### 2026-04-29: P0 release-gate CI additions — sandbox-observability + nightly-stress
 
 **What changed:**

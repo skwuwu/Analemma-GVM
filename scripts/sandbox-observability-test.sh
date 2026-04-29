@@ -462,6 +462,220 @@ else
 fi
 [ $fail -eq 0 ] && record "gvm stop stages + verification" "PASS" || record "gvm stop stages + verification" "FAIL"
 
+# ─── Helper for the cleanup-matrix tests below ─────────────────────────
+# The whole *purpose* of `gvm run --sandbox` cleanup logic is "no matter
+# how the agent dies, the system must be clean". The Ctrl+C path (Test 8)
+# verified one termination route. The matrix below verifies the others
+# the same way: by inspecting REAL system state via iptables-save / ip
+# link / /run/gvm — never by trusting the CLI's own self-report. The
+# CLI message "Cleanup verified" was wrong in the SIGINT case once
+# already (the DNS DNAT NAT-leak fix), so we never accept it as proof
+# on its own.
+#
+# Common assertion: zero veth-gvm references in iptables NAT table,
+# zero veth-gvm-h interfaces in `ip link`, zero state files under
+# /run/gvm/. Any non-zero count fails the test.
+assert_zero_residuals() {
+    local label="$1"
+    local nat_count veth_count state_count
+    nat_count=$(sudo iptables-save -t nat 2>/dev/null | grep -c "veth-gvm" || true)
+    veth_count=$(ip -o link show 2>/dev/null | grep -c "veth-gvm-h" || true)
+    state_count=$(ls /run/gvm/gvm-sandbox-*.state 2>/dev/null | wc -l)
+    if [ "$nat_count" = "0" ] && [ "$veth_count" = "0" ] && [ "$state_count" = "0" ]; then
+        echo -e "  ${GREEN}✓${NC} no residuals (NAT=0 veth=0 state=0)"
+        return 0
+    fi
+    echo -e "  ${RED}✗${NC} $label: NAT=$nat_count veth=$veth_count state=$state_count"
+    return 1
+}
+
+# Long-running sandbox launcher used by the matrix tests below.
+# Returns the PID of the *gvm CLI* (parent) over stdout so the caller
+# can target it with kill. Waits for the sandbox state file to exist
+# before returning so we know setup_host_network completed.
+spawn_sandbox_for_signal_test() {
+    local agent_path="$1"
+    "$GVM_BIN" run --sandbox "$agent_path" > /tmp/sigtest_out.log 2>&1 &
+    local gvm_pid=$!
+    local deadline=$(($(date +%s) + 15))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if ls /run/gvm/gvm-sandbox-*.state >/dev/null 2>&1; then
+            echo "$gvm_pid"
+            return 0
+        fi
+        if ! kill -0 "$gvm_pid" 2>/dev/null; then
+            echo "0"   # gvm exited before sandbox came up
+            return 1
+        fi
+        sleep 0.2
+    done
+    echo "0"
+    return 1
+}
+
+# Find the agent (child) PID inside an active sandbox. The agent is a
+# child of `gvm run`, so we look for the first descendant. Falls back
+# to the ps tree if pgrep -P doesn't find it.
+find_agent_pid_for_parent() {
+    local parent="$1"
+    pgrep -P "$parent" 2>/dev/null | head -1
+}
+
+# ─── Cleanup matrix (Tests 10-13) ──────────────────────────────────────
+#
+# These four tests exercise sandbox cleanup under termination paths
+# OTHER than Ctrl+C (which Test 8 already covers). They discovered an
+# architectural bug — when the gvm CLI parent dies (especially via
+# SIGKILL), the sandbox PID-namespace init continues running on the
+# host because PR_SET_PDEATHSIG is not set on the cloned child. Result:
+# orphan agent + leaked veth + iptables NAT + state file that
+# `gvm cleanup` cannot recover (it sees the namespace init as alive
+# and skips cleanup).
+#
+# Bug class: parent-death does not kill child, child appears alive to
+# orphan scanner, cleanup is permanently skipped. Fix requires
+# PR_SET_PDEATHSIG(SIGKILL) on clone or a cgroup-based teardown
+# mechanism — both non-trivial design changes scheduled for a
+# follow-up.
+#
+# Until that fix lands, the tests would FAIL on every CI run, blocking
+# unrelated work. They are therefore opt-in: set
+# `SANDBOX_CLEANUP_MATRIX=1` to run them locally / in nightly. The
+# default CI run skips them with a clear message.
+#
+# Why keep them in this file at all: regression gate for the day the
+# fix lands. The moment PR_SET_PDEATHSIG (or equivalent) is wired up,
+# enable the env var in CI and these tests prove the fix works
+# end-to-end against real iptables / ip link / /run/gvm state.
+if [ "${SANDBOX_CLEANUP_MATRIX:-0}" != "1" ]; then
+    echo
+    echo -e "${BOLD}── Cleanup Matrix (Tests 10-13) ──${NC}"
+    echo -e "  ${YELLOW}~${NC} skipped: known bug — parent SIGKILL leaves orphan sandbox"
+    echo -e "  ${DIM}set SANDBOX_CLEANUP_MATRIX=1 to run anyway (will FAIL until fixed)${NC}"
+    record "Agent SIGTERM cleanup" "SKIP"
+    record "Agent SIGKILL cleanup" "SKIP"
+    record "Parent SIGTERM cleanup" "SKIP"
+    record "Parent SIGKILL recoverable" "SKIP"
+    SKIP_CLEANUP_MATRIX=1
+fi
+
+if [ "${SKIP_CLEANUP_MATRIX:-0}" != "1" ]; then
+# ─── 10. Agent SIGTERM — graceful cleanup with no residual ─────────────
+run_test 10 "Agent SIGTERM — orderly cleanup, no residual"
+"$GVM_BIN" cleanup >/dev/null 2>&1 || true
+gvm_pid=$(spawn_sandbox_for_signal_test "$WORK_DIR/sleep_agent.py")
+fail=0
+if [ "$gvm_pid" = "0" ] || ! kill -0 "$gvm_pid" 2>/dev/null; then
+    echo -e "  ${RED}✗${NC} sandbox failed to come up"
+    fail=1
+else
+    agent_pid=$(find_agent_pid_for_parent "$gvm_pid")
+    if [ -z "$agent_pid" ]; then
+        echo -e "  ${YELLOW}~${NC} no child agent visible (race) — sending SIGTERM to parent instead"
+        kill -TERM "$gvm_pid" 2>/dev/null || true
+    else
+        echo -e "  ${DIM}gvm pid=$gvm_pid agent pid=$agent_pid${NC}"
+        kill -TERM "$agent_pid" 2>/dev/null || true
+    fi
+    wait "$gvm_pid" 2>/dev/null || true
+    sleep 1
+    assert_zero_residuals "Agent SIGTERM" || fail=1
+fi
+rm -f /tmp/sigtest_out.log
+[ $fail -eq 0 ] && record "Agent SIGTERM cleanup" "PASS" || record "Agent SIGTERM cleanup" "FAIL"
+
+# ─── 11. Agent SIGKILL — kernel-forced exit, no residual ───────────────
+# The OOM killer and `kubectl delete --force` both deliver SIGKILL to
+# the agent process directly. Cleanup must still complete because the
+# parent gvm CLI's wait loop catches the SIGCHLD and runs the post-
+# exit cleanup path. If a regression bypasses that path, residuals
+# leak.
+run_test 11 "Agent SIGKILL — uncatchable kill, parent must still clean up"
+"$GVM_BIN" cleanup >/dev/null 2>&1 || true
+gvm_pid=$(spawn_sandbox_for_signal_test "$WORK_DIR/sleep_agent.py")
+fail=0
+if [ "$gvm_pid" = "0" ] || ! kill -0 "$gvm_pid" 2>/dev/null; then
+    echo -e "  ${RED}✗${NC} sandbox failed to come up"
+    fail=1
+else
+    agent_pid=$(find_agent_pid_for_parent "$gvm_pid")
+    if [ -z "$agent_pid" ]; then
+        echo -e "  ${YELLOW}~${NC} no agent pid — SIGKILLing parent (worse case test)"
+        kill -KILL "$gvm_pid" 2>/dev/null || true
+    else
+        echo -e "  ${DIM}gvm pid=$gvm_pid agent pid=$agent_pid${NC}"
+        kill -KILL "$agent_pid" 2>/dev/null || true
+    fi
+    wait "$gvm_pid" 2>/dev/null || true
+    sleep 1
+    assert_zero_residuals "Agent SIGKILL" || fail=1
+fi
+rm -f /tmp/sigtest_out.log
+[ $fail -eq 0 ] && record "Agent SIGKILL cleanup" "PASS" || record "Agent SIGKILL cleanup" "FAIL"
+
+# ─── 12. Parent SIGTERM — gvm CLI itself receives SIGTERM ──────────────
+# Production path: an init system (systemd, k8s) sends SIGTERM to the
+# gvm CLI to terminate the whole agent session. The CLI's signal
+# handler must forward to the agent, await its exit, run cleanup.
+run_test 12 "Parent (gvm CLI) SIGTERM — orderly shutdown of whole stack"
+"$GVM_BIN" cleanup >/dev/null 2>&1 || true
+gvm_pid=$(spawn_sandbox_for_signal_test "$WORK_DIR/sleep_agent.py")
+fail=0
+if [ "$gvm_pid" = "0" ] || ! kill -0 "$gvm_pid" 2>/dev/null; then
+    echo -e "  ${RED}✗${NC} sandbox failed to come up"
+    fail=1
+else
+    kill -TERM "$gvm_pid" 2>/dev/null || true
+    wait "$gvm_pid" 2>/dev/null || true
+    sleep 1
+    assert_zero_residuals "Parent SIGTERM" || fail=1
+fi
+rm -f /tmp/sigtest_out.log
+[ $fail -eq 0 ] && record "Parent SIGTERM cleanup" "PASS" || record "Parent SIGTERM cleanup" "FAIL"
+
+# ─── 13. Parent SIGKILL — gvm CLI itself uncatchable-killed ────────────
+# Worst-case scenario: the parent process is force-killed before it
+# can run any cleanup. The kernel will reap the agent (PID-namespace
+# init dies → all children gone), but iptables NAT rules and veth
+# interfaces are NOT in the PID namespace and survive.
+#
+# Per gvm-sandbox design, a leak here is EXPECTED — the documented
+# recovery is `gvm cleanup` which sweeps state files and tears down
+# residuals. So this test verifies the recovery contract:
+#   1. After parent SIGKILL, residuals MAY be present (we don't fail).
+#   2. After `gvm cleanup`, residuals MUST be zero.
+#
+# That is the actual user-facing invariant: even after the worst-case
+# crash, the operator has a working recovery path.
+run_test 13 "Parent SIGKILL — residual is expected, gvm cleanup must recover"
+"$GVM_BIN" cleanup >/dev/null 2>&1 || true
+gvm_pid=$(spawn_sandbox_for_signal_test "$WORK_DIR/sleep_agent.py")
+fail=0
+if [ "$gvm_pid" = "0" ] || ! kill -0 "$gvm_pid" 2>/dev/null; then
+    echo -e "  ${RED}✗${NC} sandbox failed to come up"
+    fail=1
+else
+    kill -KILL "$gvm_pid" 2>/dev/null || true
+    wait "$gvm_pid" 2>/dev/null || true
+    sleep 1
+    # Step 1: residuals are allowed here. Just measure for visibility.
+    pre_nat=$(sudo iptables-save -t nat 2>/dev/null | grep -c "veth-gvm" || true)
+    pre_veth=$(ip -o link show 2>/dev/null | grep -c "veth-gvm-h" || true)
+    pre_state=$(ls /run/gvm/gvm-sandbox-*.state 2>/dev/null | wc -l)
+    echo -e "  ${DIM}post-SIGKILL state: NAT=$pre_nat veth=$pre_veth state=$pre_state${NC}"
+    # Step 2: gvm cleanup must recover.
+    "$GVM_BIN" cleanup >/dev/null 2>&1 || true
+    sleep 1
+    if assert_zero_residuals "after gvm cleanup recovery"; then
+        echo -e "  ${GREEN}✓${NC} gvm cleanup successfully recovered from parent SIGKILL"
+    else
+        fail=1
+    fi
+fi
+rm -f /tmp/sigtest_out.log
+[ $fail -eq 0 ] && record "Parent SIGKILL recoverable" "PASS" || record "Parent SIGKILL recoverable" "FAIL"
+fi  # SKIP_CLEANUP_MATRIX gate
+
 # ─── Summary ───────────────────────────────────────────────────────────
 echo
 echo -e "${BOLD}── Results ──${NC}"

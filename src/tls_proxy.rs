@@ -1744,6 +1744,223 @@ mod tests {
         assert_eq!(req.headers[0].1, b"Bearer sk-proj-abc123");
     }
 
+    // ── Cert cache attack resistance + concurrency ─────────────────
+    //
+    // These tests cover the actual purpose of GvmCertResolver — not
+    // "issue_and_cache returns Some" (already covered by
+    // cert_resolver_generates_and_caches above) but the security and
+    // correctness invariants the cache exists to provide:
+    //
+    //   1. SNI cache poisoning: an attacker who can request unlimited
+    //      unique SNI values must NOT be able to grow the cert cache
+    //      unbounded. Moka's TinyLFU eviction caps live entries at
+    //      MAX_CERT_CACHE_SIZE.
+    //
+    //   2. Cache hit semantics: a second issue for the same domain
+    //      must return the SAME Arc<CertifiedKey> as the first call —
+    //      not a freshly generated cert with a different key. If this
+    //      ever regresses, every TLS handshake re-pays the rcgen cost
+    //      (~0.1ms × handshake_rate) and clients may see cert rotation
+    //      they shouldn't.
+    //
+    //   3. Concurrent generation: simultaneous requests for the same
+    //      new domain must all succeed without deadlock and must
+    //      converge on equivalent cert chains (same chain length,
+    //      same CA in second slot).
+    //
+    //   4. Concurrent issuance for many distinct domains must not
+    //      deadlock or panic — moka's lock-free reads + striped write
+    //      locks have to handle the worst case proxies see in
+    //      production (50+ concurrent unseen SNI values).
+
+    #[test]
+    fn cert_cache_bounded_under_sni_attack() {
+        let ca = test_helpers::create_test_ca();
+        let resolver = GvmCertResolver::new(&ca.0, &ca.1).unwrap();
+
+        // 12,000 unique domains — well above the 10,000 cap. Each
+        // generates a real ECDSA P-256 leaf cert (~0.1ms each), so
+        // this test takes ~1.5s on a typical CI runner. The point
+        // is to verify the bound holds, not raw throughput.
+        let n_attack: u64 = 12_000;
+        for i in 0..n_attack {
+            let domain = format!("evil-{}.attacker.example", i);
+            assert!(
+                resolver.issue_and_cache(&domain).is_some(),
+                "issue_and_cache must not fail under SNI flood"
+            );
+        }
+
+        // Flush moka's pending eviction tasks so entry_count() reflects
+        // the steady-state size (TinyLFU eviction is async).
+        let live = resolver.sync_and_count();
+        assert!(
+            live <= MAX_CERT_CACHE_SIZE,
+            "SNI attack grew cache beyond cap: live={} max={}",
+            live,
+            MAX_CERT_CACHE_SIZE
+        );
+        // And ALSO non-trivially populated — if `live` were 0 the
+        // test would pass vacuously but the attacker won.
+        assert!(
+            live > MAX_CERT_CACHE_SIZE / 2,
+            "cache mysteriously empty after {} inserts (live={})",
+            n_attack,
+            live
+        );
+    }
+
+    #[test]
+    fn cert_cache_hit_returns_same_underlying_cert() {
+        let ca = test_helpers::create_test_ca();
+        let resolver = GvmCertResolver::new(&ca.0, &ca.1).unwrap();
+
+        let first = resolver.issue_and_cache("api.openai.com").unwrap();
+        let second = resolver.issue_and_cache("api.openai.com").unwrap();
+
+        // The point: cache HIT must return a clone of the SAME
+        // CertifiedKey, not a regenerated one. Compare by Arc
+        // pointer-equality first (cheapest) and fall back to
+        // cert-chain bytes if Arc pointers differ (which can
+        // happen if a future refactor introduces a wrapping layer).
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "cache hit produced a different Arc — leaf cert was \
+             unexpectedly regenerated"
+        );
+
+        // Belt-and-suspenders: chain bytes must match too.
+        assert_eq!(
+            first.cert.len(),
+            second.cert.len(),
+            "chain length differs across cache hit"
+        );
+        for (a, b) in first.cert.iter().zip(second.cert.iter()) {
+            assert_eq!(
+                a.as_ref(),
+                b.as_ref(),
+                "chain DER bytes differ across cache hit"
+            );
+        }
+    }
+
+    #[test]
+    fn cert_cache_chain_includes_ca_for_client_verification() {
+        // The leaf cert chain MUST include the CA cert as the second
+        // entry so clients verifying the chain can walk leaf → CA
+        // → trust-store. If the chain only had the leaf, verifiers
+        // that do not preload the original CA in their trust store
+        // would reject the connection.
+        let ca = test_helpers::create_test_ca();
+        let resolver = GvmCertResolver::new(&ca.0, &ca.1).unwrap();
+        let key = resolver.issue_and_cache("api.openai.com").unwrap();
+
+        assert_eq!(
+            key.cert.len(),
+            2,
+            "leaf cert chain must contain [leaf, ca], got {} entries",
+            key.cert.len()
+        );
+
+        // Second entry must be the original CA cert DER (we extracted
+        // it in GvmCertResolver::new from the input pem).
+        assert!(!key.cert[0].as_ref().is_empty(), "leaf DER is empty");
+        assert!(
+            !key.cert[1].as_ref().is_empty(),
+            "CA DER (chain slot 1) is empty"
+        );
+        assert_ne!(
+            key.cert[0].as_ref(),
+            key.cert[1].as_ref(),
+            "leaf and CA DER are identical — chain is degenerate"
+        );
+    }
+
+    #[test]
+    fn cert_cache_concurrent_distinct_domains_no_deadlock_no_panic() {
+        use std::thread;
+
+        let ca = test_helpers::create_test_ca();
+        let resolver = Arc::new(GvmCertResolver::new(&ca.0, &ca.1).unwrap());
+
+        // 32 threads × 32 distinct domains each = 1024 generations.
+        // Far above the realistic concurrent-handshake count, but
+        // small enough to keep the test under a few seconds.
+        let mut handles = Vec::new();
+        for thread_id in 0..32u32 {
+            let r = Arc::clone(&resolver);
+            handles.push(thread::spawn(move || {
+                for i in 0..32u32 {
+                    let d = format!("t{}-d{}.example", thread_id, i);
+                    let key = r.issue_and_cache(&d).expect("must succeed");
+                    assert_eq!(
+                        key.cert.len(),
+                        2,
+                        "concurrent generation produced wrong chain length"
+                    );
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+
+        // After all threads finish, the cache must have at least one
+        // entry and at most MAX_CERT_CACHE_SIZE. Anything outside that
+        // band means eviction is broken.
+        let live = resolver.sync_and_count();
+        assert!(live > 0, "cache empty after 1024 concurrent generations");
+        assert!(
+            live <= MAX_CERT_CACHE_SIZE,
+            "cache grew beyond cap during concurrent issuance: {}",
+            live
+        );
+    }
+
+    #[test]
+    fn cert_cache_concurrent_same_domain_all_threads_succeed() {
+        // 32 threads request the SAME domain at roughly the same
+        // time. Each must get a valid cert; the cache itself must
+        // converge on a single cached entry (or close to it — moka
+        // doesn't guarantee single-flight on writes, only on reads,
+        // so multiple threads MAY each generate independently in the
+        // worst case; the contract is "no deadlock + every thread
+        // gets a working cert").
+        use std::sync::Barrier;
+        use std::thread;
+
+        let ca = test_helpers::create_test_ca();
+        let resolver = Arc::new(GvmCertResolver::new(&ca.0, &ca.1).unwrap());
+        let barrier = Arc::new(Barrier::new(32));
+
+        let mut handles = Vec::new();
+        for _ in 0..32u32 {
+            let r = Arc::clone(&resolver);
+            let b = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                b.wait();
+                let key = r.issue_and_cache("api.contended.com").unwrap();
+                assert_eq!(key.cert.len(), 2);
+                key
+            }));
+        }
+        let keys: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Every thread must have gotten a valid 2-entry chain.
+        for k in &keys {
+            assert_eq!(k.cert.len(), 2);
+        }
+
+        // Steady-state: cache contains the entry exactly once.
+        let live = resolver.sync_and_count();
+        assert!(
+            live >= 1 && live <= 2,
+            "expected 1 (single-flight) or 2 (race winner overwrote loser) \
+             entries for one domain, got {}",
+            live
+        );
+    }
+
     // ── find_header_end() ──
 
     #[test]

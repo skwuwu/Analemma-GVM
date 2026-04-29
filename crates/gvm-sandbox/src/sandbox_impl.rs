@@ -548,10 +548,35 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     // Must happen before cleanup_host_network which deletes the veth interface.
     drop(_tc_guard);
 
-    if network_result.is_ok() {
-        cleanup_host_network(&veth_config, dns_target.as_deref());
-        clear_sandbox_state();
-    }
+    // Always run cleanup, even on partial setup failure.
+    //
+    // Earlier this gate was `if network_result.is_ok()` — if
+    // setup_host_network() returned Err, cleanup was skipped entirely.
+    // Two production failure modes that produced silent leaks:
+    //
+    //   1. Slot-collision retries: setup adds veth pair + first NAT
+    //      rule, then a later iptables rule fails (slot already taken,
+    //      ip_forward sysctl, etc.). network_result is Err. The gate
+    //      skipped cleanup → veth pair AND any added rules leaked.
+    //
+    //   2. Repeated launches after a crash: previous run left veth-
+    //      gvm-h0; new run's setup fails on `ip addr add` because
+    //      slot 0 is occupied; gate skips cleanup; the new run's
+    //      output says "Cleanup verification: 2 residual(s)" but
+    //      doesn't actually remove them — the user has to run
+    //      `gvm cleanup` manually. (Discovered by the
+    //      Test 10 / Agent SIGTERM matrix scenario.)
+    //
+    // cleanup_host_network is idempotent: it uses `iptables -D` (with
+    // .ok() to swallow "no such rule" errors) and `ip link del` (with
+    // .ok() for "no such device"). Calling it always — even when
+    // setup didn't reach the point of installing rules — is safe and
+    // closes both leak modes.
+    //
+    // clear_sandbox_state is also idempotent: a no-op if the state
+    // file was never written.
+    cleanup_host_network(&veth_config, dns_target.as_deref());
+    clear_sandbox_state();
 
     // 7. Verify cleanup actually released everything we claim to have released.
     // Cheap (~tens of ms): one `ip link show`, two iptables calls, one
