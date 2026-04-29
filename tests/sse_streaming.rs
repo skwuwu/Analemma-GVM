@@ -412,6 +412,522 @@ async fn sse_empty_stream_completes_promptly() {
 }
 
 // ════════════════════════════════════════════════════════════════
+// 7. Multi-event chunk boundary count (catches partial coalescing)
+// ════════════════════════════════════════════════════════════════
+//
+// Test 1 only checks total bytes match. A regression that coalesces
+// two adjacent chunks into one (a real risk if proxy.rs ever switches
+// to a buffered relay or BufRead-style abstraction) would still pass
+// test 1 because the concatenated bytes are identical. Test 4
+// catches a *full* buffering regression via timing, but a
+// "coalesce-pairs" regression with small inter-chunk gaps wouldn't
+// be visible to the timing assertion either.
+//
+// This test gives upstream enough inter-chunk delay (40ms) that the
+// proxy must hand each chunk to the body stream as it arrives —
+// otherwise the response-body Stream will report fewer chunks than
+// the upstream sent. The exact count is the contract.
+
+#[tokio::test]
+async fn sse_chunk_count_matches_upstream() {
+    let chunks: Vec<&'static [u8]> = vec![
+        b"data: {\"i\":1}\n\n",
+        b"data: {\"i\":2}\n\n",
+        b"data: {\"i\":3}\n\n",
+        b"data: {\"i\":4}\n\n",
+        b"data: {\"i\":5}\n\n",
+    ];
+    // 40ms inter-chunk gap — large enough that hyper's tower service
+    // will deliver each upstream Frame as a separate Body item,
+    // small enough to keep total runtime under 250ms.
+    let upstream = spawn_sse_upstream(chunks.clone(), 40).await;
+    let (state, _wal) = proxy_state_with_upstream("api.beat.com", upstream).await;
+    let app = Router::new()
+        .fallback(gvm_proxy::proxy::proxy_handler)
+        .with_state(state);
+
+    let response = app
+        .oneshot(build_proxy_request("api.beat.com"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (parts, body) = response.into_parts();
+    let received = drain_stream(&parts.headers, body).await;
+
+    assert_eq!(
+        received.len(),
+        chunks.len(),
+        "expected {} chunks (one per upstream emit), got {} — proxy is coalescing",
+        chunks.len(),
+        received.len()
+    );
+
+    // And every received chunk must be a complete event boundary (ends
+    // with \n\n), proving no upstream chunk was split mid-event either.
+    for (i, c) in received.iter().enumerate() {
+        assert!(
+            c.ends_with(b"\n\n"),
+            "chunk {} does not end at SSE event boundary: {:?}",
+            i,
+            std::str::from_utf8(c).unwrap_or("<binary>")
+        );
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+// 8. Multi-byte UTF-8 split across chunk boundary
+// ════════════════════════════════════════════════════════════════
+//
+// The original "large body" test sent 1MB of `b'x'` (ASCII). That
+// proves byte count matches but cannot detect a regression where the
+// proxy decodes-then-re-encodes the body, because every byte is
+// independently valid UTF-8. The dangerous bug class is when the
+// proxy converts to String mid-stream (e.g. via `String::from_utf8`)
+// and a multi-byte character lands across a chunk boundary —
+// `from_utf8` errors out, the proxy panics or replaces with U+FFFD,
+// and the agent sees corrupted content.
+//
+// This test sends a string where each chunk ends in the FIRST byte
+// of a 4-byte emoji (🦀 = F0 9F A6 80) and the next chunk starts
+// with the remaining 3 bytes. The relayed stream must be byte-
+// identical when concatenated.
+
+#[tokio::test]
+async fn sse_multibyte_utf8_split_across_chunk_boundary() {
+    // 🦀 = 0xF0 0x9F 0xA6 0x80 (4-byte UTF-8). Place the first byte at
+    // the end of one chunk, the remaining 3 bytes at the start of the
+    // next — any "decode-then-re-encode" regression in the relay
+    // path will break here because the first chunk's last byte is
+    // alone an invalid UTF-8 sequence.
+    static C0: &[u8] = b"data: \"prefix\xF0";
+    static C1: &[u8] = b"\x9F\xA6\x80suffix\"\n\n";
+    // 한 = 0xED 0x95 0x9C (3-byte UTF-8). Split as 1 byte | 2 bytes
+    // across the chunk boundary.
+    static C2: &[u8] = b"data: \"\xED";
+    static C3: &[u8] = b"\x95\x9C\xEA\xB8\x80\xEC\x96\xB4\"\n\n"; // 한 + 글 + 어
+    let chunks: Vec<&'static [u8]> = vec![C0, C1, C2, C3];
+
+    let upstream = spawn_sse_upstream(chunks.clone(), 20).await;
+    let (state, _wal) = proxy_state_with_upstream("api.utf8.com", upstream).await;
+    let app = Router::new()
+        .fallback(gvm_proxy::proxy::proxy_handler)
+        .with_state(state);
+
+    let response = app
+        .oneshot(build_proxy_request("api.utf8.com"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (parts, body) = response.into_parts();
+    let received = drain_stream(&parts.headers, body).await;
+    let total: Vec<u8> = received.iter().flatten().copied().collect();
+    let expected: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+
+    assert_eq!(
+        total, expected,
+        "concatenated stream differs from upstream — UTF-8 boundary corrupted"
+    );
+
+    // Sanity: the assembled stream IS valid UTF-8 with the expected chars.
+    let s = std::str::from_utf8(&total).expect("relayed stream must be valid UTF-8");
+    assert!(
+        s.contains("\"prefix🦀suffix\""),
+        "4-byte emoji split across chunks must reassemble"
+    );
+    assert!(
+        s.contains("\"한글어\""),
+        "3-byte hangul split across chunks must reassemble"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════
+// 9. Upstream early close: proxy propagates EOF, doesn't hang
+// ════════════════════════════════════════════════════════════════
+//
+// Real Anthropic / OpenAI streams sometimes close the connection
+// mid-event when the model hits a stop sequence. The proxy must
+// treat the upstream EOF as the end of the body and surface it
+// promptly — not retry, not hang waiting for more, not synthesise
+// a fake closing event.
+
+#[tokio::test]
+async fn sse_upstream_early_close_propagates_promptly() {
+    // Two chunks emitted, then upstream's tcp stream is dropped by
+    // axum's serve loop after the response future resolves.
+    let chunks: Vec<&'static [u8]> = vec![
+        b"data: {\"i\":1}\n\n",
+        b"data: {\"i\":2,\"partial",
+        // Note the deliberately incomplete last chunk — the upstream
+        // closes BEFORE finishing the JSON. The proxy must surface
+        // these bytes to the client as-is and then EOF.
+    ];
+    let upstream = spawn_sse_upstream(chunks.clone(), 30).await;
+    let (state, _wal) = proxy_state_with_upstream("api.eof.com", upstream).await;
+    let app = Router::new()
+        .fallback(gvm_proxy::proxy::proxy_handler)
+        .with_state(state);
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        app.oneshot(build_proxy_request("api.eof.com")),
+    )
+    .await
+    .expect("must not hang on early close")
+    .expect("proxy must respond");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (parts, body) = response.into_parts();
+    let received = drain_stream(&parts.headers, body).await;
+    let total: Vec<u8> = received.iter().flatten().copied().collect();
+
+    // The two emitted chunks (including the partial one) must be in
+    // the relayed stream. We do NOT require any specific chunking here
+    // because the relevant contract is "every byte upstream sent is
+    // delivered before EOF surfaces".
+    let needle1: &[u8] = b"data: {\"i\":1}\n\n";
+    let needle2: &[u8] = b"data: {\"i\":2,\"partial";
+    assert!(
+        total.windows(needle1.len()).any(|w| w == needle1),
+        "first complete chunk missing from relayed body ({} bytes total)",
+        total.len()
+    );
+    assert!(
+        total.windows(needle2.len()).any(|w| w == needle2),
+        "second partial chunk missing from relayed body ({} bytes total)",
+        total.len()
+    );
+}
+
+// ════════════════════════════════════════════════════════════════
+// 10-13. Policy mapping on streaming — the actual reason MITM exists
+// ════════════════════════════════════════════════════════════════
+//
+// All the tests above verify "bytes pass through". The whole point of
+// putting a proxy in front of LLM traffic is to apply governance.
+// These four tests prove that streaming requests:
+//   10. are blocked when SRR says Deny (no upstream call, no body)
+//   11. are recorded in the WAL with correct host/decision metadata
+//   12. carry proxy-injected response headers (X-GVM-Decision etc.)
+//   13. carry proxy-injected upstream credentials (Authorization)
+
+async fn srr_with(rules_toml: &str) -> gvm_proxy::srr::NetworkSRR {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("srr.toml");
+    std::fs::write(&p, rules_toml).unwrap();
+    gvm_proxy::srr::NetworkSRR::load(&p).unwrap()
+}
+
+#[tokio::test]
+async fn streaming_srr_deny_blocks_before_upstream_call() {
+    // Upstream tracks whether anything reached it.
+    let upstream_hit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hit_clone = upstream_hit.clone();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app_up = Router::new().fallback(move |_req: Request<Body>| {
+        let hit = hit_clone.clone();
+        async move {
+            hit.store(true, std::sync::atomic::Ordering::Relaxed);
+            Response::builder()
+                .status(200)
+                .header("Content-Type", "text/event-stream")
+                .body(Body::from("data: leaked\n\n"))
+                .unwrap()
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, app_up).await.ok();
+    });
+
+    let srr = srr_with(
+        r#"
+[[rules]]
+method = "POST"
+pattern = "api.deny-stream.com/v1/messages"
+[rules.decision]
+type = "Deny"
+reason = "stream blocked by policy"
+"#,
+    )
+    .await;
+    let (mut state, _wal) = common::test_state_with_srr(srr).await;
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        "api.deny-stream.com".to_string(),
+        format!("127.0.0.1:{}", addr.port()),
+    );
+    state.host_overrides = overrides;
+
+    let app = Router::new()
+        .fallback(gvm_proxy::proxy::proxy_handler)
+        .with_state(state);
+
+    let resp = app
+        .oneshot(build_proxy_request("api.deny-stream.com"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "Deny rule must produce 403, not stream a body"
+    );
+    let body = http_body_util::BodyExt::collect(resp.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    assert!(
+        !body.windows(b"leaked".len()).any(|w| w == b"leaked"),
+        "denied stream must not relay any upstream bytes"
+    );
+    assert!(
+        !upstream_hit.load(std::sync::atomic::Ordering::Relaxed),
+        "denied request must not have reached the upstream socket"
+    );
+}
+
+#[tokio::test]
+async fn streaming_request_recorded_in_wal_with_correct_metadata() {
+    let chunks: Vec<&'static [u8]> = vec![b"data: {\"i\":1}\n\n", b"data: {\"i\":2}\n\n"];
+    let upstream = spawn_sse_upstream(chunks, 0).await;
+
+    let srr = srr_with(
+        r#"
+[[rules]]
+method = "*"
+pattern = "{any}"
+[rules.decision]
+type = "Allow"
+"#,
+    )
+    .await;
+    let (mut state, wal_path) = common::test_state_with_srr(srr).await;
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        "api.audited.com".to_string(),
+        format!("127.0.0.1:{}", upstream.port()),
+    );
+    state.host_overrides = overrides;
+
+    let app = Router::new()
+        .fallback(gvm_proxy::proxy::proxy_handler)
+        .with_state(state);
+    let resp = app
+        .oneshot(build_proxy_request("api.audited.com"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Drain the body so the proxy's tap finishes and the event flushes
+    // through the group-commit WAL writer before we read the file.
+    let _ = http_body_util::BodyExt::collect(resp.into_body()).await;
+
+    // Group-commit batch_window_ms is 2ms; 200ms is plenty.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let wal = std::fs::read_to_string(&wal_path).unwrap_or_default();
+    let mut found_event_for_host = false;
+    for line in wal.lines() {
+        if line.contains("\"host\":\"api.audited.com\"") {
+            found_event_for_host = true;
+            assert!(
+                line.contains("\"decision\":\"Allow\""),
+                "WAL event must record the Allow decision: {}",
+                line
+            );
+            assert!(
+                line.contains("\"path\":\"/v1/messages\""),
+                "WAL event must record the request path: {}",
+                line
+            );
+        }
+    }
+    assert!(
+        found_event_for_host,
+        "no governance event for streaming request found in WAL"
+    );
+}
+
+#[tokio::test]
+async fn streaming_response_carries_proxy_injected_headers() {
+    let chunks: Vec<&'static [u8]> = vec![b"data: {\"i\":1}\n\n"];
+    let upstream = spawn_sse_upstream(chunks, 0).await;
+    let (state, _wal) = proxy_state_with_upstream("api.headers.com", upstream).await;
+    let app = Router::new()
+        .fallback(gvm_proxy::proxy::proxy_handler)
+        .with_state(state);
+
+    let resp = app
+        .oneshot(build_proxy_request("api.headers.com"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // X-GVM-Decision (and friends) on streaming responses are the
+    // observability anchor — agent SDKs key off them. If the proxy
+    // ever drops these on the streaming path, all governance UX
+    // disappears even though enforcement still works.
+    assert!(
+        resp.headers().get("X-GVM-Decision").is_some(),
+        "streaming response must carry X-GVM-Decision header"
+    );
+    assert!(
+        resp.headers().get("X-GVM-Event-Id").is_some(),
+        "streaming response must carry X-GVM-Event-Id header"
+    );
+}
+
+#[tokio::test]
+async fn streaming_upstream_request_receives_injected_credentials() {
+    use std::sync::Mutex;
+
+    // Capture the Authorization header that arrives at the upstream.
+    let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let cap = captured.clone();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app_up = Router::new().fallback(move |req: Request<Body>| {
+        let cap = cap.clone();
+        async move {
+            if let Some(auth) = req.headers().get("authorization") {
+                if let Ok(s) = auth.to_str() {
+                    *cap.lock().unwrap() = Some(s.to_string());
+                }
+            }
+            Response::builder()
+                .status(200)
+                .header("Content-Type", "text/event-stream")
+                .body(Body::from("data: ok\n\n"))
+                .unwrap()
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, app_up).await.ok();
+    });
+
+    // Build state with credentials configured for the virtual host.
+    let dir = tempfile::tempdir().unwrap();
+    let secrets_path = dir.path().join("secrets.toml");
+    std::fs::write(
+        &secrets_path,
+        r#"
+[credentials."api.creds.com"]
+type = "Bearer"
+token = "sk-streaming-injected"
+"#,
+    )
+    .unwrap();
+    let (mut state, _wal) = common::test_state().await;
+    state.api_keys = Arc::new(
+        gvm_proxy::api_keys::APIKeyStore::load(&secrets_path).expect("secrets must parse"),
+    );
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        "api.creds.com".to_string(),
+        format!("127.0.0.1:{}", addr.port()),
+    );
+    state.host_overrides = overrides;
+
+    let app = Router::new()
+        .fallback(gvm_proxy::proxy::proxy_handler)
+        .with_state(state);
+    let resp = app
+        .oneshot(build_proxy_request("api.creds.com"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let _ = http_body_util::BodyExt::collect(resp.into_body()).await;
+
+    let observed = captured.lock().unwrap().clone();
+    assert_eq!(
+        observed.as_deref(),
+        Some("Bearer sk-streaming-injected"),
+        "upstream must receive the proxy-injected credential, not the agent's"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════
+// 14. Real TCP socket end-to-end (covers hyper/TCP that oneshot skips)
+// ════════════════════════════════════════════════════════════════
+//
+// All previous tests use `tower::ServiceExt::oneshot`, which short-
+// circuits the tower Service stack and never opens a socket. Most
+// streaming bugs in production live below that layer: hyper's
+// HTTP/1.1 framer, TCP_NODELAY, send-buffer coalescing, content-length
+// vs chunked encoding decisions. This test runs the proxy on a real
+// `tokio::net::TcpListener` and connects with a real reqwest client
+// over a real TCP socket so any of those layers regressing is
+// observable.
+
+#[tokio::test]
+async fn streaming_works_over_real_tcp_socket() {
+    let chunks: Vec<&'static [u8]> = vec![
+        b"data: {\"i\":1}\n\n",
+        b"data: {\"i\":2}\n\n",
+        b"data: {\"i\":3}\n\n",
+    ];
+    let upstream = spawn_sse_upstream(chunks, 30).await;
+    let (state, _wal) = proxy_state_with_upstream("api.tcp.com", upstream).await;
+    let app = Router::new()
+        .fallback(gvm_proxy::proxy::proxy_handler)
+        .with_state(state);
+
+    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(proxy_listener, app).await.ok();
+    });
+
+    // Real hyper client over a real TCP socket — bypasses oneshot
+    // and exercises the full hyper HTTP/1 framer + tokio TCP stack.
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build_http::<Body>();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("http://{}/v1/messages", proxy_addr))
+        .header("X-GVM-Agent-Id", "tcp-test")
+        .header("X-GVM-Operation", "gvm.llm.stream")
+        .header("X-GVM-Target-Host", "api.tcp.com")
+        .header("X-GVM-Trace-Id", "tcp-trace")
+        .header("X-GVM-Event-Id", "tcp-evt")
+        .header("Accept", "text/event-stream")
+        .body(Body::empty())
+        .unwrap();
+    let resp = client
+        .request(req)
+        .await
+        .expect("real-TCP request must complete");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = resp.into_body();
+    let mut stream = BodyDataStream::new(body);
+    let mut bytes_total = 0usize;
+    let mut chunks_received = 0usize;
+    while let Some(chunk) = stream.next().await {
+        let bs = chunk.expect("body chunk over TCP must read");
+        if !bs.is_empty() {
+            bytes_total += bs.len();
+            chunks_received += 1;
+        }
+    }
+    let expected = b"data: {\"i\":1}\n\ndata: {\"i\":2}\n\ndata: {\"i\":3}\n\n".len();
+    assert!(
+        bytes_total >= expected,
+        "real-TCP body bytes too small ({} bytes, expected ≥{})",
+        bytes_total,
+        expected
+    );
+    assert!(
+        chunks_received >= 1,
+        "real-TCP body produced zero non-empty chunks"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════
 // Use Arc to silence unused-import warning when feature combinations
 // trim compilation paths.
 // ════════════════════════════════════════════════════════════════
