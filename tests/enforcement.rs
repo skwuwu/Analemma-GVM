@@ -197,6 +197,9 @@ type = "Allow"
     );
     let (state, _wal) = common::test_state_with_srr(srr).await;
 
+    let mut context = HashMap::new();
+    context.insert("risk".to_string(), serde_json::json!("low"));
+
     let headers = GVMHeaders {
         operation: "gvm.llm.chat".to_string(),
         agent_id: "finance-bot".to_string(),
@@ -212,7 +215,7 @@ type = "Allow"
             tier: ResourceTier::External,
             sensitivity: Sensitivity::Medium,
         }),
-        context: HashMap::new(),
+        context,
     };
 
     let input = ClassifyInput {
@@ -235,6 +238,86 @@ type = "Allow"
     assert_eq!(op.subject.tenant_id.as_deref(), Some("acme-corp"));
     assert_eq!(op.subject.session_id, "sess-123");
     assert_eq!(op.resource.service, "openai");
+    assert!(matches!(op.resource.sensitivity, Sensitivity::Medium));
+    assert_eq!(
+        op.context.attributes.get("risk").and_then(|v| v.as_str()),
+        Some("low")
+    );
+}
+
+#[tokio::test]
+async fn classify_sdk_metadata_cannot_downgrade_srr_deny() {
+    let srr = srr_from_toml(
+        r#"
+[[rules]]
+method = "POST"
+pattern = "api.bank.com/transfer/*"
+[rules.decision]
+type = "Deny"
+reason = "wire transfers require out-of-band approval"
+
+[[rules]]
+method = "*"
+pattern = "{any}"
+[rules.decision]
+type = "Delay"
+milliseconds = 300
+"#,
+    );
+    let (state, _wal) = common::test_state_with_srr(srr).await;
+
+    let mut context = HashMap::new();
+    context.insert("approved".to_string(), serde_json::json!(true));
+    context.insert("risk".to_string(), serde_json::json!("low"));
+
+    let headers = GVMHeaders {
+        operation: "gvm.storage.read".to_string(),
+        agent_id: "self-declared-safe-agent".to_string(),
+        tenant_id: Some("tenant-a".to_string()),
+        session_id: Some("session-a".to_string()),
+        trace_id: "trace-a".to_string(),
+        event_id: "event-a".to_string(),
+        parent_event_id: None,
+        rate_limit: None,
+        resource: Some(ResourceDescriptor {
+            service: "readonly-reporting".to_string(),
+            identifier: Some("claimed-safe-resource".to_string()),
+            tier: ResourceTier::Internal,
+            sensitivity: Sensitivity::Low,
+        }),
+        context,
+    };
+
+    let input = ClassifyInput {
+        method: "POST",
+        host: "api.bank.com",
+        path: "/transfer/123",
+        body: None,
+        gvm_headers: Some(&headers),
+    };
+
+    let output = classify(&state, &input).expect("classify must succeed");
+    match &output.classification.decision {
+        EnforcementDecision::Deny { reason } => assert!(
+            reason.contains("wire transfers"),
+            "SRR deny reason must be preserved"
+        ),
+        other => panic!("SDK metadata must not downgrade SRR Deny, got {:?}", other),
+    }
+
+    let op = output
+        .classification
+        .operation
+        .expect("SDK metadata remains available for audit");
+    assert_eq!(op.operation, "gvm.storage.read");
+    assert_eq!(op.resource.service, "readonly-reporting");
+    assert_eq!(
+        op.context
+            .attributes
+            .get("approved")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
 }
 
 #[tokio::test]

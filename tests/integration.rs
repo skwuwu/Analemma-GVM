@@ -1389,189 +1389,67 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
 //          what the proxy expects to parse
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Test: SDK resource/context header contract — removed (ABAC system deleted,
-// SRR does not use X-GVM-Resource or X-GVM-Context headers).
+// Test: SDK resource/context headers are audit metadata only. SRR remains the
+// enforcement source, so self-declared low-risk metadata must not downgrade a
+// network-level deny.
 #[tokio::test]
-#[ignore] // ABAC removed — this test validated ABAC attribute matching
 async fn sdk_proxy_header_contract_resource_and_context_json() {
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use axum::Router;
-    use tower::ServiceExt;
-
-    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
-
-    // Policy: check resource tier attribute via SRR
-    let srr_path = dir.path().join("srr.toml");
+    let srr_path = tempfile::NamedTempFile::new()
+        .expect("temp srr file")
+        .into_temp_path();
     std::fs::write(
         &srr_path,
         r#"
 [[rules]]
+method = "POST"
+pattern = "api.bank.com/transfer/*"
+decision = { type = "Deny", reason = "wire transfer blocked by SRR" }
+
+[[rules]]
 method = "*"
 pattern = "{any}"
-decision = { type = "Allow" }
+decision = { type = "Delay", milliseconds = 300 }
 "#,
     )
-    .expect("writing SRR config must succeed");
+    .expect("write srr");
+    let srr = NetworkSRR::load(&srr_path).expect("srr must parse");
 
-    let secrets_path = dir.path().join("secrets.toml");
-    std::fs::write(&secrets_path, "[credentials]\n").expect("writing empty secrets must succeed");
+    let mut context = std::collections::HashMap::new();
+    context.insert("approved".to_string(), serde_json::json!(true));
+    context.insert("risk".to_string(), serde_json::json!("low"));
 
-    let wal_path = dir.path().join("wal.log");
-
-    let srr = Arc::new(std::sync::RwLock::new(
-        NetworkSRR::load(&srr_path).expect("valid SRR config must parse"),
-    ));
-    let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("valid secrets must parse"));
-    let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
-            .await
-            .expect("ledger must init"),
-    );
-    let vault = Arc::new(Vault::new(ledger.clone()).expect("vault must init"));
-    let token_budget = Arc::new(TokenBudget::new(0, 0.0, 500));
-    let http_client =
-        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build_http();
-
-    let state = gvm_proxy::proxy::AppState {
-        srr,
-
-        api_keys,
-        ledger,
-        vault,
-        token_budget,
-        #[cfg(feature = "wasm")]
-        wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
-        checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
-        on_block: gvm_proxy::config::OnBlockConfig::default(),
-        http_client,
-        host_overrides: std::collections::HashMap::new(),
-        jwt_config: None,
-        intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
-        srr_config_path: String::new(),
-
-        gvm_toml_path: None,
-        mitm_ca_pem: None,
-        payload_inspection: false,
-        max_body_bytes: 65536,
-        pending_approvals: std::sync::Arc::new(dashmap::DashMap::new()),
-        ic3_approval_timeout_secs: 300,
-        shadow_config: gvm_proxy::intent_store::ShadowConfig::default(),
-        mitm_resolver: None,
-        mitm_server_config: None,
-        mitm_client_config: None,
-        tls_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        start_time: std::time::Instant::now(),
-        request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        ca_expires_days: None,
-        dns_governance: None,
-        wal_path: "data/wal.log".to_string(),
-        active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
+    let headers = GVMHeaders {
+        operation: "gvm.storage.read".to_string(),
+        agent_id: "sdk-contract-agent".to_string(),
+        tenant_id: Some("tenant-a".to_string()),
+        session_id: Some("session-sdk-001".to_string()),
+        trace_id: "trace-contract-001".to_string(),
+        event_id: "evt-contract-001".to_string(),
+        parent_event_id: None,
+        rate_limit: None,
+        resource: Some(ResourceDescriptor {
+            service: "claimed-safe-resource".to_string(),
+            identifier: None,
+            tier: ResourceTier::Internal,
+            sensitivity: Sensitivity::Low,
+        }),
+        context,
     };
 
-    let app = Router::new()
-        .fallback(gvm_proxy::proxy::proxy_handler)
-        .with_state(state);
-
-    // ── Scenario A: SDK sends resource JSON with Critical sensitivity ──
-    // This mimics exactly what the Python SDK's @ic decorator produces:
-    // headers["X-GVM-Resource"] = json.dumps(resource.to_dict())
-    let resource_json = serde_json::json!({
-        "service": "payment-db",
-        "tier": "External",
-        "sensitivity": "Critical"
-    });
-
-    let context_json = serde_json::json!({
-        "amount": "50000",
-        "currency": "USD"
-    });
-
-    let request = Request::builder()
-        .method("POST")
-        .uri("/v1/transfer")
-        .header("X-GVM-Agent-Id", "sdk-contract-agent")
-        .header("X-GVM-Operation", "gvm.payment.transfer")
-        .header("X-GVM-Target-Host", "api.bank.com")
-        .header("X-GVM-Trace-Id", "trace-contract-001")
-        .header("X-GVM-Event-Id", "evt-contract-001")
-        .header("X-GVM-Resource", resource_json.to_string())
-        .header("X-GVM-Context", context_json.to_string())
-        .header("X-GVM-Session-Id", "session-sdk-001")
-        .body(Body::empty())
-        .expect("request must build");
-
-    let response = app
-        .clone()
-        .oneshot(request)
-        .await
-        .expect("proxy must handle SDK-formatted request");
-
-    // Policy should deny based on resource.sensitivity == "Critical"
+    let decision = srr.check("POST", "api.bank.com", "/transfer/123", None);
+    assert!(
+        matches!(decision.decision, EnforcementDecision::Deny { .. }),
+        "SRR deny must hold even when SDK metadata claims a safe operation/resource"
+    );
     assert_eq!(
-        response.status(),
-        StatusCode::FORBIDDEN,
-        "Critical sensitivity resource must be denied by governance policy"
+        headers.context.get("risk").and_then(|v| v.as_str()),
+        Some("low"),
+        "SDK context remains available for audit"
     );
-
-    // ── Scenario B: Same operation but Medium sensitivity → allowed ──
-    let resource_medium = serde_json::json!({
-        "service": "analytics-db",
-        "tier": "Internal",
-        "sensitivity": "Medium"
-    });
-
-    let request = Request::builder()
-        .method("GET")
-        .uri("/v1/report")
-        .header("X-GVM-Agent-Id", "sdk-contract-agent")
-        .header("X-GVM-Operation", "gvm.storage.read")
-        .header("X-GVM-Target-Host", "api.example.com")
-        .header("X-GVM-Trace-Id", "trace-contract-002")
-        .header("X-GVM-Event-Id", "evt-contract-002")
-        .header("X-GVM-Resource", resource_medium.to_string())
-        .header("X-GVM-Context", "{}")
-        .body(Body::empty())
-        .expect("request must build");
-
-    let response = app
-        .clone()
-        .oneshot(request)
-        .await
-        .expect("proxy must handle medium-sensitivity request");
-
-    // Should NOT be denied — Medium sensitivity is allowed
-    assert_ne!(
-        response.status(),
-        StatusCode::FORBIDDEN,
-        "Medium sensitivity resource must not be denied"
-    );
-
-    // ── Scenario C: Malformed resource JSON → should not crash, degrade gracefully ──
-    let request = Request::builder()
-        .method("GET")
-        .uri("/v1/data")
-        .header("X-GVM-Agent-Id", "sdk-contract-agent")
-        .header("X-GVM-Operation", "gvm.storage.read")
-        .header("X-GVM-Target-Host", "api.example.com")
-        .header("X-GVM-Trace-Id", "trace-contract-003")
-        .header("X-GVM-Event-Id", "evt-contract-003")
-        .header("X-GVM-Resource", "not-valid-json{{{")
-        .header("X-GVM-Context", "also-broken")
-        .body(Body::empty())
-        .expect("request must build");
-
-    let response = app
-        .oneshot(request)
-        .await
-        .expect("proxy must not crash on malformed SDK headers");
-    // Should not be 500 (internal error) — graceful degradation
-    assert_ne!(
-        response.status(),
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Malformed resource JSON must not crash the proxy"
-    );
+    assert!(matches!(
+        headers.resource.as_ref().map(|r| &r.sensitivity),
+        Some(Sensitivity::Low)
+    ));
 }
 
 // Test 11 (Policy Conflict Detection) removed — ABAC system deleted.
