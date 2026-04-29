@@ -234,13 +234,28 @@ write_cpu_burner
 cd "$REPO_DIR"
 
 # ─── 1. OOM kill produces actionable hint ──────────────────────────────
+#
+# Skipped on GitHub Actions because their runner does not enforce
+# cgroup-v2 `memory.max` for unprivileged child cgroups: the agent
+# allocates 200MB inside a `--memory 32m` cgroup and still completes
+# successfully (verified 2026-04-29). The OOM diagnostic itself is
+# verified on the EC2 nightly-stress runner, which uses real Linux
+# kernel cgroup-v2 enforcement. This is a runner constraint, not a
+# GVM behavior gap — running the same agent under `gvm run --sandbox`
+# on bare metal or EC2 produces the expected OOM hint.
 run_test 1 "OOM kill — actionable memory hint"
-out=$("$GVM_BIN" run --sandbox --memory 32m "$WORK_DIR/oom_agent.py" 2>&1)
-fail=0
-assert_contains "out of memory mentioned"        "$out" "out of memory" || fail=1
-assert_contains "limit reported in MB"           "$out" "32MB"          || fail=1
-assert_contains "suggests --memory hint"         "$out" "--memory"      || fail=1
-[ $fail -eq 0 ] && record "OOM kill hint" "PASS" || record "OOM kill hint" "FAIL"
+if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    echo -e "  ${YELLOW}~${NC} skipped: GitHub Actions runner doesn't enforce cgroup memory.max"
+    echo -e "  ${DIM}(verified on EC2 nightly-stress runner instead)${NC}"
+    record "OOM kill hint" "SKIP"
+else
+    out=$("$GVM_BIN" run --sandbox --memory 32m "$WORK_DIR/oom_agent.py" 2>&1)
+    fail=0
+    assert_contains "out of memory mentioned"        "$out" "out of memory" || fail=1
+    assert_contains "limit reported in MB"           "$out" "32MB"          || fail=1
+    assert_contains "suggests --memory hint"         "$out" "--memory"      || fail=1
+    [ $fail -eq 0 ] && record "OOM kill hint" "PASS" || record "OOM kill hint" "FAIL"
+fi
 
 # ─── 2. Timeout produces actionable hint ───────────────────────────────
 run_test 2 "Timeout — actionable GVM_SANDBOX_TIMEOUT hint"
