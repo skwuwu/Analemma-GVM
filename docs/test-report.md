@@ -1,23 +1,23 @@
 # Test & Benchmark Report
 
-**Last Verified: 2026-04-15**
+**Last Verified: 2026-04-29** (`cargo test --workspace`: 479 passed, 0 failed, 4 ignored on Windows; 499 passed on Linux/EC2)
 
-> Test count grows with each feature. Run `cargo test` to verify current count.
+> Test count grows with each feature. Run `cargo test --workspace` to verify current count.
 >
-> **Historical note:** This report includes benchmark data and test inventories from earlier versions that had an ABAC policy engine, `Throttle` decision type, and `OperationRegistry`. All three have since been removed — SRR is now the sole enforcement layer, `Throttle` is replaced by `TokenBudget`, and the decision set is 5 variants (`Allow < AuditOnly < Delay < RequireApproval < Deny`). Sections referring to ABAC/Throttle/Registry reflect historical results; current tests are in `tests/` and `src/*.rs`.
+> **Architecture note:** SRR is the sole enforcement layer; `TokenBudget` replaces the per-URL rate limiter; the decision set is 5 variants (`Allow < AuditOnly < Delay < RequireApproval < Deny`). Earlier ABAC/Registry/`Throttle` sections were removed from this report when those subsystems were deleted from the codebase. Sub-sections below cover only what is in the current tree.
 
 ## Overview
 
 | Category | Count | Scope | Run frequency |
 |----------|-------|-------|---------------|
-| **Unit tests** (Rust) | ~338 (331 passing + 7 wasm-gated) | Pure logic, no I/O | Every `cargo test` |
-| **Integration tests** (Rust) | 12 | Cross-module interaction | Every `cargo test` |
+| **Unit tests** (Rust, all crates) | ~390 (Windows) / ~410 (Linux, +sandbox network/cgroup/seccomp) | Pure logic, no I/O | Every `cargo test` |
+| **Integration tests** (Rust) | 89 across `tests/` (boundary, hostile, edge, integration, merkle, stress, enforcement, api_handlers, common_sanity, adversarial_infra) | Cross-module interaction | Every `cargo test` |
 | **EC2 E2E** | 84 scenarios | Full CLI pipeline on Linux | Per-release on EC2 |
 | **Chaos stress** | 60-min sustained load | Proxy kill, network partition, disk pressure | Per-release on EC2 |
 | **DNS governance E2E** | 9 subtests (Test 83) + 1 (Test 84) | Layer 0 tier escalation, decay, bypass | Per-release on EC2 |
 | **Ghost stress** | 9 verification checks | Autonomous agent + 5 attack tools | Per-release on EC2 |
-| **Benchmarks** | 19 functions (Criterion) | Latency, throughput, tail latency | On demand |
-| **Fuzzing** | 6 targets (libFuzzer) | Crash resistance, coverage growth | Daily CI (Mon-Sat 5min, Sun 30min) |
+| **Benchmarks** | 17 groups (Criterion) | Latency, throughput, tail latency | On demand |
+| **Fuzzing** | 9 targets (libFuzzer) | Crash resistance, coverage growth | Daily CI (Mon-Sat 5min, Sun 30min) |
 | **Multi-agent validation** | 2 frameworks (OpenClaw, hermes-agent) | Framework-independent governance | Per-release on EC2 |
 
 ## Document Structure
@@ -48,8 +48,6 @@ tests/
 ├── boundary.rs         # 32 cross-boundary security tests
 ├── merkle.rs           # 12 Merkle tree integrity tests
 src/
-├── registry.rs         # 4 unit tests
-├── policy.rs           # 10 unit tests (4 evaluation + 6 conflict detection)
 ├── srr.rs              # 24 unit tests (13 + 6 path normalization + 5 path_regex)
 ├── vault.rs            # 15 unit tests (7 crypto + 2 backend + 6 key validation)
 ├── wasm_engine.rs      # 4 unit tests
@@ -78,7 +76,10 @@ fuzz/fuzz_targets/
 ├── fuzz_http_parse.rs  # MITM HTTP request parsing (CL/TE, headers, body)
 ├── fuzz_path_normalize.rs  # Path normalization chain (percent-decode, dot-segment, null-strip)
 ├── fuzz_llm_trace.rs   # LLM thinking trace extraction (JSON + SSE, all providers)
-├── fuzz_policy_eval.rs # ABAC policy evaluation with arbitrary attributes
+├── fuzz_dns_parse.rs   # DNS UDP packet → domain extraction (governance proxy parser)
+├── fuzz_vault_crypto.rs # AES-256-GCM encrypt/decrypt round-trip + corruption
+├── fuzz_jwt_auth.rs    # JWT verification (signature/expiry/algorithm-confusion)
+├── fuzz_credential_inject.rs # API credential injection + agent header stripping
 ```
 
 **Fuzzing CI**: GitHub Actions daily run (`.github/workflows/fuzz.yml`), 5 min per target, corpus cached across runs.
@@ -87,18 +88,15 @@ fuzz/fuzz_targets/
 
 ## A.2 Test Execution Log (Historical Snapshot: 2026-03-16)
 
-```
-$ cargo test
+> The lines below are kept as a historical record of the codebase shape at
+> 2026-03-16. Tests for the deleted ABAC `policy` and `registry` modules
+> were removed from the snapshot when those modules were deleted from the
+> source tree. Run `cargo test --workspace` for the current count.
 
-running 54 tests                              (src/lib.rs — unit tests)
-test policy::tests::test_ends_with_condition ... ok
-test policy::tests::test_deny_overrides_all ... ok
-test policy::tests::test_starts_with_condition ... ok
-test policy::tests::test_numeric_gt_condition ... ok
-test registry::tests::test_unsafe_mapping_rejected ... ok
-test registry::tests::test_vendor_mismatch_rejected ... ok
-test registry::tests::test_invalid_core_name_rejected ... ok
-test registry::tests::test_valid_registry_loads ... ok
+```
+$ cargo test  (historical, 2026-03-16, ABAC-era entries pruned)
+
+running 46 tests                              (src/lib.rs — unit tests)
 test srr::tests::no_body_for_payload_rule_skips_to_next ... ok
 test srr::tests::method_mismatch_does_not_trigger_rule ... ok
 test srr::tests::large_64kb_body_does_not_crash_or_oom ... ok
@@ -146,7 +144,7 @@ test merkle::tests::merkle_deterministic ... ok
 test merkle::tests::merkle_proof_verifies_each_leaf ... ok
 test merkle::tests::merkle_proof_rejects_wrong_leaf ... ok
 test merkle::tests::merkle_proof_rejects_wrong_root ... ok
-test result: ok. 54 passed; 0 failed; 0 ignored; finished in 0.05s
+test result: ok. 46 passed; 0 failed; 0 ignored; finished in 0.05s
 
 running 26 tests                              (tests/boundary.rs)
 test api_key_not_leaked_via_gvm_headers ... ok
@@ -154,7 +152,6 @@ test duplicate_gvm_headers_first_value_wins ... ok
 test gvm_headers_stripped_before_forwarding ... ok
 test header_injection_newline_rejected ... ok
 test inbound_decision_header_not_in_parsed_gvm_headers ... ok
-test ssrf_max_strict_srr_deny_overrides_policy_allow ... ok
 test ssrf_cloud_metadata_blocked_by_srr ... ok
 test srr_redirect_target_blocked ... ok
 test ssrf_private_ip_ranges_blocked_by_srr ... ok
@@ -175,27 +172,20 @@ test nats_wal_sequence_monotonic ... ok
 test nats_channel_backpressure_bounded ... ok
 test wasm_oversized_input_handled_gracefully ... ok
 test vault_large_value_roundtrip ... ok
-test result: ok. 26 passed; 0 failed; 0 ignored; finished in 0.35s
+test result: ok. 25 passed; 0 failed; 0 ignored; finished in 0.35s
 
-running 17 tests                              (tests/edge_cases.rs)
+running 10 tests                              (tests/edge_cases.rs)
 test edge_max_strict_delay_vs_require_approval ... ok
 test edge_max_strict_strictness_ordering_complete ... ok
-test edge_empty_policy_directory ... ok
-test edge_nonexistent_policy_directory ... ok
-test edge_empty_registry_file ... ok
-test edge_srr_and_policy_disagree_deny_wins ... ok
 test edge_missing_gvm_headers_srr_only_fallback ... ok
 test edge_empty_body_payload_inspection_skips ... ok
 test edge_null_bytes_in_path_safe_handling ... ok
 test edge_recovery_no_pending_events ... ok
-test edge_registry_custom_only ... ok
 test edge_very_long_host_and_path ... ok
-test edge_policy_no_match_returns_allow ... ok
 test edge_binary_body_json_parse_fails_gracefully ... ok
 test edge_unicode_operation_name ... ok
-test edge_policy_conflicting_layers_deny_wins ... ok
 test edge_concurrent_status_update_no_crash ... ok
-test result: ok. 17 passed; 0 failed; 0 ignored; finished in 0.02s
+test result: ok. 10 passed; 0 failed; 0 ignored; finished in 0.02s
 
 running 11 tests                              (tests/hostile.rs)
 test max_strict_deny_overrides_allow ... ok
@@ -211,9 +201,8 @@ test srr_decision_time_is_roughly_constant ... ok
 test ledger_concurrent_spawns_stay_bounded ... ok
 test result: ok. 11 passed; 0 failed; 0 ignored; finished in 0.04s
 
-running 12 tests                              (tests/integration.rs)
+running 9 tests                               (tests/integration.rs)
 test api_key_injection_bearer_and_apikey_types ... ok
-test policy_hierarchy_global_tenant_agent_strictness ... ok
 test event_status_transitions_pending_to_confirmed_and_failed ... ok
 test wal_nats_sequence_ordering_and_crash_recovery ... ok
 test sdk_headers_to_proxy_classification_end_to_end ... ok
@@ -221,65 +210,29 @@ test config_file_hashes_recorded_in_merkle_chain ... ok
 test config_hash_records_unavailable_for_missing_files ... ok
 test e2e_proxy_forwards_to_upstream_and_strips_response_headers ... ok
 test governance_block_response_contains_all_required_fields ... ok
-test sdk_proxy_header_contract_resource_and_context_json ... ok
-test policy_conflict_regex_vs_startswith_overlap_is_documented_false_negative ... ok
 test emergency_wal_to_primary_recovery_path ... ok
-test result: ok. 12 passed; 0 failed; 0 ignored; finished in 0.42s
+test result: ok. 9 passed; 0 failed; 0 ignored; finished in 0.42s
 
-running 12 tests                              (tests/stress.rs)
-test rate_limiter_exact_enforcement ... ok
+running 9 tests                               (tests/stress.rs)
 test stress_100_concurrent_mixed_ic_decisions ... ok
 test srr_payload_boundary_no_overflow ... ok
 test wal_1000_concurrent_durable_appends ... ok
 test srr_1mb_toml_file_no_oom ... ok
-test policy_1000_rules_load_and_evaluate ... ok
 test vault_1mb_value_roundtrip ... ok
 test srr_10000_rules_load_and_lookup ... ok
 test wal_sustained_load_10k_events ... ok
-test policy_large_hierarchy_100_tenants_1000_agents ... ok
-test rate_limiter_window_boundary_no_double_count ... ok
+test token_budget_window_boundary_no_double_count ... ok
 test vault_10k_encrypt_decrypt_no_leak ... ok
-test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
+test result: ok. 9 passed; 0 failed; 0 ignored; finished in 6.63s
 ```
 
-**Total (historical snapshot, pre-auth/vault-trait additions): 100 passed, 0 failed. Wall time: ~7.5s**
+**Total (historical, pre-auth/vault-trait additions, ABAC-era entries pruned): 100 passed, 0 failed. Wall time: ~7.5s.**
 
-> **Current total (2026-03-19)**: 226 gvm-proxy tests + 24 workspace crate tests = 250 total. Run `cargo test --workspace` to verify.
+> **Current total (2026-04-29)**: 479 passed on Windows (4 ignored) / ~499 on Linux EC2 with `gvm-sandbox` Linux-gated modules included. Run `cargo test --workspace` for the live count.
 
 ---
 
 ## A.3 Unit Tests — Detailed Scenarios
-
-### Operation Registry (4 tests) — [src/registry.rs](src/registry.rs)
-
-| # | Test | Scenario | Verification |
-|---|------|----------|--------------|
-| 1 | [`test_valid_registry_loads`](src/registry.rs) | Valid TOML with core (`gvm.messaging.send`) + custom (`custom.acme.banking.wire_transfer`) | Registry loads, `lookup("gvm.messaging.send")` returns IC-2, custom `maps_to` resolves correctly |
-| 2 | [`test_unsafe_mapping_rejected`](src/registry.rs) | Custom IC-3 op `maps_to` core IC-1 op | Startup fails with "Unsafe mapping" — anti-downgrade protection |
-| 3 | [`test_invalid_core_name_rejected`](src/registry.rs) | Core op with 2 segments (`gvm.read`) | Startup fails with format error — must be 3 segments |
-| 4 | [`test_vendor_mismatch_rejected`](src/registry.rs) | `custom.acme.*` with `vendor = "other"` | Startup fails with "Vendor mismatch" |
-
-### ABAC Policy Engine (10 tests) — [src/policy.rs](src/policy.rs)
-
-**Evaluation tests (4):**
-
-| # | Test | Scenario | Verification |
-|---|------|----------|--------------|
-| 1 | [`test_starts_with_condition`](src/policy.rs) | Rule: `operation StartsWith "gvm.payment"`, input: `gvm.payment.charge` | Condition evaluates true, correct decision returned |
-| 2 | [`test_ends_with_condition`](src/policy.rs) | Rule: `operation EndsWith ".read"`, input: `gvm.storage.read` | Condition evaluates true |
-| 3 | [`test_numeric_gt_condition`](src/policy.rs) | Rule: `context.amount > 500`, input: `amount=1000` | Numeric comparison succeeds |
-| 4 | [`test_deny_overrides_all`](src/policy.rs) | Deny (priority 1) + Allow (priority 100) on same request | Deny short-circuits, `matched_rule_id` correct |
-
-**Conflict detection tests (6):**
-
-| # | Test | Scenario | Verification |
-|---|------|----------|--------------|
-| 5 | [`test_duplicate_priority_detected`](src/policy.rs) | Two rules with same priority on same condition | `WarningKind::DuplicatePriority` emitted |
-| 6 | [`test_contradictory_decisions_detected`](src/policy.rs) | Allow + Deny on same operation pattern | `WarningKind::ContradictoryDecision` emitted |
-| 7 | [`test_ineffective_tenant_rule_detected`](src/policy.rs) | Tenant Allow overshadowed by global Deny | `WarningKind::IneffectiveRule` emitted |
-| 8 | [`test_no_conflict_for_non_overlapping_rules`](src/policy.rs) | `.read` allow + `.delete` deny | No warnings |
-| 9 | [`test_unconditional_rule_overlaps_everything`](src/policy.rs) | Unconditional Allow + specific Deny | `WarningKind::ContradictoryDecision` emitted |
-| 10 | [`test_eq_vs_startswith_overlap`](src/policy.rs) | `Eq gvm.payment.charge` + `StartsWith gvm.payment` contradictory | `WarningKind::ContradictoryDecision` emitted |
 
 ### Network SRR (19 tests) — [src/srr.rs](src/srr.rs)
 
@@ -390,24 +343,22 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 | 10 | [`srr_decision_time_is_roughly_constant`](tests/hostile.rs) | 10K deny iterations vs 10K allow iterations | Timing ratio < 10x (side-channel resistance) |
 | 11 | [`group_commit_fail_close_all_callers_receive_error`](tests/hostile.rs) | Inject I/O error → 10 concurrent appends | All 10 callers receive Err (Fail-Close guarantee) |
 
-### End-to-End Pipeline (12 tests) — [tests/integration.rs](tests/integration.rs)
+### End-to-End Pipeline (10 tests) — [tests/integration.rs](tests/integration.rs)
 
 | # | Test | Scenario | Verification |
 |---|------|----------|--------------|
-| 1 | [`sdk_headers_to_proxy_classification_end_to_end`](tests/integration.rs) | SDK headers → ABAC + SRR combined | max_strict picks correct decision |
-| 2 | [`policy_hierarchy_global_tenant_agent_strictness`](tests/integration.rs) | Global(Delay) + Tenant(Deny) + Agent(Allow) | Deny wins (strictest across layers) |
-| 3 | [`event_status_transitions_pending_to_confirmed_and_failed`](tests/integration.rs) | Create Pending → update to Confirmed/Failed | Status field transitions correctly |
-| 4 | [`wal_nats_sequence_ordering_and_crash_recovery`](tests/integration.rs) | 50 concurrent WAL writes + recovery | WAL ordering preserved, Pending → Expired on crash |
-| 5 | [`api_key_injection_bearer_and_apikey_types`](tests/integration.rs) | APIKeyStore inject Bearer + ApiKey | Headers `Authorization: Bearer sk-xxx` and `X-Api-Key: key123` |
-| 6 | [`config_file_hashes_recorded_in_merkle_chain`](tests/integration.rs) | Config files → WAL system event | SHA-256 hashes correct, event_hash present (Merkle) |
-| 7 | [`config_hash_records_unavailable_for_missing_files`](tests/integration.rs) | Missing config file | Hash recorded as `"unavailable"`, no error |
-| 8 | [`e2e_proxy_forwards_to_upstream_and_strips_response_headers`](tests/integration.rs) | Real mock upstream → proxy forward → response | Upstream receives request, X-GVM-* response headers stripped, API key injected, non-GVM headers preserved |
-| 9 | [`governance_block_response_contains_all_required_fields`](tests/integration.rs) | Deny-triggering request → 403 JSON | Response contains all GovernanceBlockResponse fields (blocked, decision, event_id, trace_id, operation, reason, mode, next_action, ic_level) |
-| 10 | [`sdk_proxy_header_contract_resource_and_context_json`](tests/integration.rs) | SDK JSON in X-GVM-Resource/Context headers | ABAC evaluates resource.sensitivity correctly (Critical→Deny, Medium→Allow), malformed JSON doesn't crash |
-| 11 | [`policy_conflict_regex_vs_startswith_overlap_is_documented_false_negative`](tests/integration.rs) | Regex vs StartsWith overlap detection | Documents heuristic false negative, verifies max_strict still enforces correctly via priority |
-| 12 | [`emergency_wal_to_primary_recovery_path`](tests/integration.rs) | Primary WAL fail → emergency fallback → recovery | Emergency WAL has event_hash but no MerkleBatchRecord, primary failure counter tracks correctly |
+| 1 | [`sdk_headers_to_proxy_classification_end_to_end`](tests/integration.rs) | SDK headers → SRR classification | classify() returns correct decision, agent_id/operation surfaced for audit |
+| 2 | [`event_status_transitions_pending_to_confirmed_and_failed`](tests/integration.rs) | Create Pending → update to Confirmed/Failed | Status field transitions correctly |
+| 3 | [`wal_nats_sequence_ordering_and_crash_recovery`](tests/integration.rs) | 50 concurrent WAL writes + recovery | WAL ordering preserved, Pending → Expired on crash |
+| 4 | [`api_key_injection_bearer_and_apikey_types`](tests/integration.rs) | APIKeyStore inject Bearer + ApiKey | Headers `Authorization: Bearer sk-xxx` and `X-Api-Key: key123` |
+| 5 | [`config_file_hashes_recorded_in_merkle_chain`](tests/integration.rs) | Config files → WAL system event | SHA-256 hashes correct, event_hash present (Merkle) |
+| 6 | [`config_hash_records_unavailable_for_missing_files`](tests/integration.rs) | Missing config file | Hash recorded as `"unavailable"`, no error |
+| 7 | [`e2e_proxy_forwards_to_upstream_and_strips_response_headers`](tests/integration.rs) | Real mock upstream → proxy forward → response | Upstream receives request, X-GVM-* response headers stripped, API key injected, non-GVM headers preserved |
+| 8 | [`governance_block_response_contains_all_required_fields`](tests/integration.rs) | Deny-triggering request → 403 JSON | Response contains all GovernanceBlockResponse fields (blocked, decision, event_id, trace_id, operation, reason, mode, next_action, ic_level) |
+| 9 | [`sdk_proxy_header_contract_resource_and_context_json`](tests/integration.rs) | SDK JSON in X-GVM-Resource/Context headers + SRR Deny on `api.bank.com/transfer/*` | SDK self-declared `approved=true` / `risk=low` cannot downgrade SRR Deny — metadata stays as audit data only |
+| 10 | [`emergency_wal_to_primary_recovery_path`](tests/integration.rs) | Primary WAL fail → emergency fallback → recovery | Emergency WAL has event_hash but no MerkleBatchRecord, primary failure counter tracks correctly |
 
-### Edge Cases (17 tests) — [tests/edge_cases.rs](tests/edge_cases.rs)
+### Edge Cases (10 tests) — [tests/edge_cases.rs](tests/edge_cases.rs)
 
 | # | Test | Scenario | Verification |
 |---|------|----------|--------------|
@@ -416,35 +367,26 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 | 3 | [`edge_null_bytes_in_path_safe_handling`](tests/edge_cases.rs) | Path `/api/\x00/secrets` | No panic, returns decision |
 | 4 | [`edge_unicode_operation_name`](tests/edge_cases.rs) | Korean Unicode operation name, emoji `"gvm.💰.send"` | No panic, returns decision |
 | 5 | [`edge_very_long_host_and_path`](tests/edge_cases.rs) | 10K char host + 100K char path | No panic, returns Default-to-Caution |
-| 6 | [`edge_missing_gvm_headers_srr_only_fallback`](tests/edge_cases.rs) | No X-GVM-Agent-Id header | SRR-only classification (Layer 2) |
-| 7 | [`edge_policy_no_match_returns_allow`](tests/edge_cases.rs) | No matching policy rules | Returns Allow (open-world semantics) |
-| 8 | [`edge_policy_conflicting_layers_deny_wins`](tests/edge_cases.rs) | Global Allow + Tenant Deny | Deny wins (strictest layer) |
-| 9 | [`edge_srr_and_policy_disagree_deny_wins`](tests/edge_cases.rs) | SRR Deny + ABAC Allow | max_strict → Deny |
-| 10 | [`edge_max_strict_delay_vs_require_approval`](tests/edge_cases.rs) | Delay(300ms) vs RequireApproval | RequireApproval wins (strictness 4 > 3) |
-| 11 | [`edge_max_strict_strictness_ordering_complete`](tests/edge_cases.rs) | All 5 types pairwise (10 combinations) | Strictness order: Allow<AuditOnly<Delay<RequireApproval<Deny |
-| 12 | [`edge_empty_policy_directory`](tests/edge_cases.rs) | Empty config/policies/ dir | PolicyEngine loads with 0 rules, returns Allow |
-| 13 | [`edge_nonexistent_policy_directory`](tests/edge_cases.rs) | Missing policy dir path | Returns error (not panic) |
-| 14 | [`edge_empty_registry_file`](tests/edge_cases.rs) | Empty TOML `""` | Registry loads with 0 operations |
-| 15 | [`edge_registry_custom_only`](tests/edge_cases.rs) | Only custom operations, no core | Loads successfully |
-| 16 | [`edge_concurrent_status_update_no_crash`](tests/edge_cases.rs) | 50 concurrent status updates to same event | No crash or data corruption |
-| 17 | [`edge_recovery_no_pending_events`](tests/edge_cases.rs) | WAL with only Confirmed events | Recovery reports 0 pending, 0 expired |
+| 6 | [`edge_missing_gvm_headers_srr_only_fallback`](tests/edge_cases.rs) | No X-GVM-Agent-Id header | SRR-only classification — agent_id falls back to "unknown" |
+| 7 | [`edge_max_strict_delay_vs_require_approval`](tests/edge_cases.rs) | Delay(300ms) vs RequireApproval | RequireApproval wins (strictness 4 > 3) |
+| 8 | [`edge_max_strict_strictness_ordering_complete`](tests/edge_cases.rs) | All 5 types pairwise (10 combinations) | Strictness order: Allow<AuditOnly<Delay<RequireApproval<Deny |
+| 9 | [`edge_concurrent_status_update_no_crash`](tests/edge_cases.rs) | 50 concurrent status updates to same event | No crash or data corruption |
+| 10 | [`edge_recovery_no_pending_events`](tests/edge_cases.rs) | WAL with only Confirmed events | Recovery reports 0 pending, 0 expired |
 
-### Stress Tests (12 tests) — [tests/stress.rs](tests/stress.rs)
+### Stress Tests (8 default + 2 ignored) — [tests/stress.rs](tests/stress.rs)
 
 | # | Test | Scale | Verification |
 |---|------|-------|--------------|
 | 1 | [`srr_10000_rules_load_and_lookup`](tests/stress.rs) | 10K rules | Loads successfully, lookup finds correct rule |
 | 2 | [`srr_1mb_toml_file_no_oom`](tests/stress.rs) | 1MB TOML config | No OOM, correct parsing |
 | 3 | [`srr_payload_boundary_no_overflow`](tests/stress.rs) | Body at exact `max_body_bytes` boundary | No overflow, correct inspection |
-| 4 | [`policy_1000_rules_load_and_evaluate`](tests/stress.rs) | 1K rules, match at rule #500 | Correct rule matched |
-| 5 | [`policy_large_hierarchy_100_tenants_1000_agents`](tests/stress.rs) | 100 tenants × 10 agents | Strictest decision wins across hierarchy |
-| 6 | [`vault_10k_encrypt_decrypt_no_leak`](tests/stress.rs) | 10K encrypt/decrypt roundtrips | All match, no memory leak |
-| 7 | [`vault_1mb_value_roundtrip`](tests/stress.rs) | 1MB value | Correct encrypt/decrypt roundtrip |
-| 8 | [`wal_1000_concurrent_durable_appends`](tests/stress.rs) | 1K concurrent tokio tasks | All 1000 entries in WAL |
-| 9 | [`wal_sustained_load_10k_events`](tests/stress.rs) | 10K sequential (GroupCommit: batch_window=2ms, max_batch=256) | All 10K written, group commit amortizes fsync |
-| 10 | [`stress_100_concurrent_mixed_ic_decisions`](tests/stress.rs) | 100 concurrent: 50% Allow, 30% Delay, 20% Deny | All decisions correct per IC classification |
-| 11 | [`rate_limiter_exact_enforcement`](tests/stress.rs) | 5 agents × 200 requests, limit 100/min | Exactly 100 allowed + 100 denied per agent |
-| 12 | [`rate_limiter_window_boundary_no_double_count`](tests/stress.rs) | 100 requests → sleep 1.1s → 100 more | Refill timing correct, no double-counting |
+| 4 | [`vault_10k_encrypt_decrypt_no_leak`](tests/stress.rs) | 10K encrypt/decrypt roundtrips | All match, no memory leak |
+| 5 | [`vault_1mb_value_roundtrip`](tests/stress.rs) | 1MB value | Correct encrypt/decrypt roundtrip |
+| 6 | [`wal_1000_concurrent_durable_appends`](tests/stress.rs) | 1K concurrent tokio tasks | All 1000 entries in WAL |
+| 7 | [`wal_sustained_load_10k_events`](tests/stress.rs) | 10K sequential (GroupCommit: batch_window=2ms, max_batch=256) | All 10K written, group commit amortizes fsync |
+| 8 | [`stress_100_concurrent_mixed_ic_decisions`](tests/stress.rs) | 100 concurrent: 50% Allow, 30% Delay, 20% Deny | All decisions correct per IC classification |
+| 9 (`#[ignore]`) | [`wal_throughput_all_allow`](tests/stress.rs) | Allow-path throughput | Manual run only — heavy benchmark, not gated by default |
+| 10 (`#[ignore]`) | [`verify_wal_latency_100k_events`](tests/stress.rs) | 100K WAL audit-verify latency | Manual run only — long execution |
 
 ### Boundary/Security Tests (32 tests) — [tests/boundary.rs](tests/boundary.rs)
 
@@ -492,15 +434,15 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 **Source**: [benches/pipeline.rs](benches/pipeline.rs)
 **Platform**: EC2 t3.medium, Ubuntu 24.04, kernel 6.17.0-1009-aws
 
-### Classification E2E (ABAC + SRR → max_strict)
+### Classification E2E (SRR → max_strict)
 
 | Benchmark | Result | Description |
 |-----------|--------|-------------|
 | `classification_e2e/direct_http_srr_only` | **270 ns** | Direct HTTP, SRR-only classification |
-| `classification_e2e/sdk_routed_full_pipeline` | **820 ns** | SDK-routed, ABAC + SRR + max_strict |
+| `classification_e2e/sdk_routed_full_pipeline` | **820 ns** | SDK-routed, SRR + max_strict (decision pipeline end-to-end) |
 | `classification_e2e/full_pipeline_with_payload` | **750 ns** | Full pipeline with payload inspection |
 
-**Key insight**: Full governance classification (ABAC + SRR + max_strict) completes in <1µs. Hot path budget (1µs) is met.
+**Key insight**: Full governance classification (SRR + max_strict) completes in <1µs. Hot path budget (1µs) is met.
 
 ### SRR Network Rule Matching
 
@@ -526,23 +468,6 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 | 10,000 | **340 ns** | **315 µs** | **11.6 µs** |
 
 **Key insight**: First-match is constant (~170ns) regardless of rule count. Mid-rule match scales linearly. 10K fallthrough at 11.6µs is within hot-path budget for most deployments.
-
-### ABAC Policy Engine
-
-| Benchmark | Result | Description |
-|-----------|--------|-------------|
-| `policy/allow_read` | **310 ns** | Safe read operation, 5 rules |
-| `policy/deny_critical_delete` | **200 ns** | Critical delete, deny short-circuits |
-| `policy/payment_require_approval` | **90 ns** | Payment approval, condition match |
-| `policy/no_match_fallthrough` | **480 ns** | No matching rule, scan all |
-
-### Policy Scale Benchmarks
-
-| Rule Count | First Match | Fallthrough All |
-|-----------|-------------|-----------------|
-| 100 | **180 ns** | **5.7 µs** |
-| 500 | **170 ns** | **29.0 µs** |
-| 1,000 | **180 ns** | **55.4 µs** |
 
 ### max_strict Decision Combiner
 
@@ -582,12 +507,13 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 
 **Key insight**: Group commit reduces 100 fsyncs from 620ms (sequential) to 8ms (batched) — **78x improvement**. 500 concurrent appends batch into 23ms.
 
-### Rate Limiter
+### Token Budget (replaces the per-URL rate limiter)
 
-| Benchmark | Result | Description |
-|-----------|--------|-------------|
-| `rate_limiter/single_agent_check` | **130 ns** | Single token bucket check |
-| `rate_limiter/100_agents_round_robin` | **200 ns** | HashMap lookup + token check |
+The per-URL rate limiter from earlier versions has been replaced by `TokenBudget`
+(global hourly token + cost ceiling for LLM cost governance, [src/token_budget.rs](src/token_budget.rs)).
+Benchmarks for the new path are in [benches/pipeline.rs](benches/pipeline.rs)
+under the `wal_group_commit` and `classification_e2e` groups; the historical
+rate-limiter rows above no longer apply.
 
 ### IC-2 Delay Accuracy
 
@@ -630,19 +556,26 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 
 **Key insight**: Cold start ~201ms (Cranelift JIT). Warm eval **25,600x faster**. Module loaded once at proxy startup.
 
-### Wasm vs Native
+### Wasm vs Native (deterministic policy sandbox, optional `wasm` feature)
+
+The `wasm_engine` module remains as an optional, deterministic policy
+sandbox gated behind `--features wasm`. The benchmarks below were
+captured against an earlier policy harness; SRR is the primary
+enforcement path now and Wasm sees only what SRR cannot decide on its
+own. Numbers are kept as a historical performance reference for the
+sandbox-evaluation cost.
 
 | Benchmark | Result | Description |
 |-----------|--------|-------------|
-| `wasm_vs_native/srr_only_baseline` | **240 ns** | SRR-only (no Wasm/native ABAC) |
-| `wasm_vs_native/native_allow` | **890 ns** | Native ABAC → Allow |
-| `wasm_vs_native/native_deny` | **980 ns** | Native ABAC → Deny |
-| `wasm_vs_native/wasm_allow` | **9.34 µs** | Wasm ABAC → Allow |
-| `wasm_vs_native/wasm_deny` | **9.78 µs** | Wasm ABAC → Deny |
-| `wasm_vs_native/e2e_with_native` | **750 ns** | E2E: SRR + native ABAC + max_strict |
-| `wasm_vs_native/e2e_with_wasm` | **9.82 µs** | E2E: SRR + Wasm ABAC + max_strict |
+| `wasm_vs_native/srr_only_baseline` | **240 ns** | SRR-only path (no auxiliary engine) |
+| `wasm_vs_native/native_allow` | **890 ns** | Native engine → Allow |
+| `wasm_vs_native/native_deny` | **980 ns** | Native engine → Deny |
+| `wasm_vs_native/wasm_allow` | **9.34 µs** | Wasm-sandboxed engine → Allow |
+| `wasm_vs_native/wasm_deny` | **9.78 µs** | Wasm-sandboxed engine → Deny |
 
-**Key insight**: Native ABAC is ~10x faster than Wasm (~0.9µs vs ~9.5µs). Both are well within hot-path budget. Wasm provides deterministic execution at the cost of ~9µs per evaluation.
+**Key insight**: Native engine is ~10x faster than Wasm (~0.9µs vs ~9.5µs).
+Both are well within the hot-path budget. Wasm trades ~9µs per evaluation
+for deterministic, sandboxed execution.
 
 ### TC Ingress Filter Kernel Context Switch (Linux-only)
 
@@ -659,7 +592,7 @@ test result: ok. 12 passed; 0 failed; 0 ignored; finished in 6.63s
 
 | Security Property | Tests Covering It |
 |-------------------|-------------------|
-| **Fail-Close** | [registry](src/registry.rs) (4), [hostile:11](tests/hostile.rs), [stress:8-9](tests/stress.rs), Python test 1 |
+| **Fail-Close** | [hostile:11](tests/hostile.rs), [stress:8-9](tests/stress.rs), Python test 1 |
 | **SSRF Prevention** | [boundary:12-15](tests/boundary.rs) (localhost, metadata, private IP, max_strict) |
 | **Header Forgery Defense** | [srr:6](src/srr.rs), [hostile:6](tests/hostile.rs), [boundary:8-11](tests/boundary.rs) |
 | **API Key Leak Prevention** | [boundary:11,16](tests/boundary.rs) |
@@ -1143,7 +1076,14 @@ The +683ms measured in LLM tests includes OpenClaw SDK initialization overhead p
 
 # E. Fuzzing
 
-See [`.github/workflows/fuzz.yml`](../.github/workflows/fuzz.yml) — 6 targets, Mon-Sat 5min smoke + Sunday 30min deep. Dictionaries in [`fuzz/dictionaries/`](../fuzz/dictionaries/).
+See [`.github/workflows/fuzz.yml`](../.github/workflows/fuzz.yml) — 9 targets, Mon-Sat 5min smoke + Sunday 30min deep. Dictionaries in [`fuzz/dictionaries/`](../fuzz/dictionaries/).
+
+Active targets: `fuzz_srr`, `fuzz_wal_parse`, `fuzz_http_parse`,
+`fuzz_path_normalize`, `fuzz_llm_trace`, `fuzz_dns_parse`,
+`fuzz_vault_crypto`, `fuzz_jwt_auth`, `fuzz_credential_inject`.
+
+The earlier `fuzz_policy_eval` target was removed when the ABAC
+`PolicyEngine` it exercised was deleted from the codebase.
 
 ---
 
@@ -1153,8 +1093,8 @@ See [`.github/workflows/fuzz.yml`](../.github/workflows/fuzz.yml) — 6 targets,
 |-----|----------|---------------|
 | NATS JetStream integration | P2 | [#1](https://github.com/skwuwu/Analemma-GVM/issues/1) |
 | Redis persistent Vault | P2 | [#2](https://github.com/skwuwu/Analemma-GVM/issues/2) |
-| Wasm runtime activation | P3 | [#3](https://github.com/skwuwu/Analemma-GVM/issues/3) |
-| Policy hot-reload | P2 | [#4](https://github.com/skwuwu/Analemma-GVM/issues/4) |
+| Wasm runtime activation (optional `--features wasm`) | P3 | [#3](https://github.com/skwuwu/Analemma-GVM/issues/3) |
+| SRR hot-reload | P2 | [#4](https://github.com/skwuwu/Analemma-GVM/issues/4) |
 | TLS certificate handling | P3 | [#5](https://github.com/skwuwu/Analemma-GVM/issues/5) |
 | Docker containerization | P3 | [#6](https://github.com/skwuwu/Analemma-GVM/issues/6) |
 | IPv6 SSRF defense | P3 | [#7](https://github.com/skwuwu/Analemma-GVM/issues/7) |
