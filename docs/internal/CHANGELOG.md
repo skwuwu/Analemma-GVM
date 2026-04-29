@@ -52,6 +52,71 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
+### 2026-04-29: Sandbox parent-death watchdog — PR_SET_PDEATHSIG + matrix wait fix
+
+**What changed:**
+
+1. `crates/gvm-sandbox/src/sandbox_impl.rs::child_entry` — armed
+   `prctl(PR_SET_PDEATHSIG, SIGKILL)` as the very first action in
+   the cloned sandbox child, BEFORE any coordination/setup. The
+   kernel now delivers SIGKILL to the namespace init the moment
+   its parent thread terminates. Once the namespace init dies,
+   the kernel cascades SIGKILL to every process inside that PID
+   namespace — closing the "orphan agent after parent SIGKILL"
+   class of leak at the kernel level. A `getppid() == 1` race
+   guard immediately after the prctl call handles the (tiny)
+   window between clone(2) and prctl(2): if the parent died in
+   that window we have already been reparented to host init, so
+   the child suicides instead of running orphaned.
+
+   The "parent" for PDEATHSIG purposes is the cloning thread.
+   gvm-cli runs sandbox launch via `tokio::task::spawn_blocking`,
+   which dedicates a blocking-pool thread to the call for its
+   full duration — that thread persists until launch returns or
+   the parent process dies. The semantics are exactly what we
+   want: PDEATHSIG fires on parent process death OR on graceful
+   completion (in which case cleanup has already run).
+
+2. `scripts/sandbox-observability-test.sh` — fixed a subshell
+   bug in the cleanup matrix (Tests 10-13). The previous
+   `spawn_sandbox_for_signal_test()` helper backgrounded gvm-cli
+   inside a `$(...)` subshell, which broke the parent script's
+   `wait $gvm_pid` — the PID was not a direct child of the main
+   shell, so wait returned immediately and the script measured
+   residuals while cleanup was still in progress. Now each test
+   inlines `gvm run --sandbox ... &` in the script body (matching
+   Test 8's pattern that already worked) and `wait` actually
+   blocks until cleanup completes.
+
+3. `.github/workflows/ci.yml::sandbox-observability` — flipped
+   `SANDBOX_CLEANUP_MATRIX=1` on. Tests 10-13 now run on every
+   push and PR, gating regressions to the parent-death-cleanup
+   path. They are no longer opt-in.
+
+**Result on EC2 (kernel 6.17.0-1009-aws):**
+
+  13 passed, 0 failed, 0 skipped
+
+  - Test 10 Agent SIGTERM:     no residuals
+  - Test 11 Agent SIGKILL:     no residuals
+  - Test 12 Parent SIGTERM:    no residuals
+  - Test 13 Parent SIGKILL:    post-kill state had NAT=2/state=1
+    as expected (parent died before cleanup), `gvm cleanup`
+    recovered to all zeros. veth was already cleared by the
+    PID-namespace teardown that PDEATHSIG triggered.
+
+**Affected files:** `crates/gvm-sandbox/src/sandbox_impl.rs`,
+`scripts/sandbox-observability-test.sh`,
+`.github/workflows/ci.yml`,
+`docs/internal/CHANGELOG.md`.
+
+**Risk:** Low. PDEATHSIG is a no-op on platforms that don't
+support it; the call falls back to a warning + race-guard exit.
+The matrix wait fix is purely script-side. Activating the matrix
+in CI is safe because the matrix passes on the runner — if a
+future regression breaks parent-death cleanup, CI catches it
+the next push.
+
 ### 2026-04-29: P2 — cert cache attack tests + sandbox cleanup matrix (incl. discovered bugs)
 
 **What changed:**

@@ -624,6 +624,55 @@ fn child_entry(
     home_overlay_merged: Option<&std::path::Path>,
     ws_overlay_merged: Option<&std::path::Path>,
 ) -> isize {
+    // ── parent-death watchdog ──────────────────────────────────────
+    //
+    // Purpose: when the gvm CLI parent dies (especially via SIGKILL,
+    // kernel OOM-killer, or any path the CLI cannot intercept), the
+    // sandbox PID-namespace init MUST die with it. Otherwise the
+    // namespace init gets reparented to host PID 1 and keeps running,
+    // leaking veth + iptables NAT + state file forever. cleanup
+    // logic then sees the namespace init as alive and skips
+    // recovery permanently.
+    //
+    // PR_SET_PDEATHSIG arms the kernel to deliver SIGKILL to THIS
+    // process the moment its parent thread terminates. Once we are
+    // PID 1 of our own PID namespace, our death triggers a kernel
+    // cascade that kills every process inside the namespace — exactly
+    // what we need.
+    //
+    // The "parent" for PDEATHSIG is the thread that called clone(2).
+    // gvm-cli runs sandbox launch via tokio::task::spawn_blocking,
+    // which dedicates a blocking-pool thread to the launch_sandboxed
+    // call for its full duration. That thread persists until the
+    // launch returns, so PDEATHSIG firing on its death is correct
+    // semantics — it dies precisely when the parent process dies
+    // (or completes the sandbox lifecycle gracefully, in which case
+    // the cleanup path has already run).
+    //
+    // Best-effort: if prctl fails (very old kernel / restricted env)
+    // we still launch the sandbox. Operators on those kernels lose
+    // orphan-prevention but the agent itself works. The lockfile
+    // heartbeat (separate fix) provides a second layer of defense.
+    unsafe {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+            let err = std::io::Error::last_os_error();
+            eprintln!(
+                "gvm-sandbox: PR_SET_PDEATHSIG failed: {} \
+                 — orphan-prevention disabled for this sandbox",
+                err
+            );
+        }
+        // Race guard: if the parent died BETWEEN clone() and the
+        // prctl call above, PDEATHSIG never armed and we'd leak.
+        // Re-check with getppid() — if we have already been
+        // reparented to init(1), suicide instead of running an
+        // orphan agent.
+        if libc::getppid() == 1 {
+            eprintln!("gvm-sandbox: parent died before PDEATHSIG armed — exiting");
+            return 1;
+        }
+    }
+
     // Wait for parent to complete UID mapping and network setup
     let network_seed = match wait_for_parent(coord_fd) {
         Ok(seed) => seed,

@@ -170,9 +170,17 @@ jobs:
 
       - name: Run sandbox-observability suite
         # The script self-cleans (`gvm cleanup` + `gvm stop` in trap EXIT).
-        # Failures bubble up via the script's own exit code.
+        # SANDBOX_CLEANUP_MATRIX=1 enables the 4-test cleanup matrix
+        # (Tests 10-13: agent SIGTERM, agent SIGKILL, parent SIGTERM,
+        # parent SIGKILL). The matrix is gated behind that env so
+        # follow-up architectural fixes can disable it cleanly if a
+        # regression appears, but with PR_SET_PDEATHSIG armed and the
+        # subshell-wait bug fixed (commits in the same batch as this
+        # workflow change) all 13 tests pass on Linux. Failures bubble
+        # up via the script's own exit code.
         run: |
-          sudo -E env "PATH=$PATH" bash scripts/sandbox-observability-test.sh
+          sudo -E env "PATH=$PATH" SANDBOX_CLEANUP_MATRIX=1 \
+            bash scripts/sandbox-observability-test.sh
 
       - name: Upload structured report (always, for triage on failure)
         if: always()
