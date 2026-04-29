@@ -537,6 +537,24 @@ fn run_sysctl(key: &str, value: &str) -> Result<()> {
 /// Clean up host-side network resources.
 /// `dns_target_override`: if Some, use this DNS target for DNAT rule deletion
 /// instead of re-resolving (which may return a different value after DHCP renewal).
+/// Resolve the `--to-destination` value for the DNS UDP DNAT rule.
+///
+/// The setup path always passes a fully-formed `host:port` string to
+/// `iptables -A` (see [`setup_host_network`]). For cleanup to match the
+/// exact rule iptables installed, we MUST pass the SAME string to
+/// `iptables -D`. The state file records this string in
+/// `dns_target_override`; the only fallback path is when no state was
+/// recorded, in which case we synthesise the legacy `<upstream>:53` form.
+///
+/// Pulled out as a free function so the format invariant ("contains a
+/// colon, exactly one port suffix") is unit-testable without spinning up
+/// a sandbox.
+pub(crate) fn resolve_dns_dnat_target(dns_target_override: Option<&str>) -> String {
+    dns_target_override
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("{}:53", resolve_host_dns()))
+}
+
 pub fn cleanup_host_network(config: &VethConfig, dns_target_override: Option<&str>) {
     let proxy_port = config.proxy_addr.port();
 
@@ -584,10 +602,22 @@ pub fn cleanup_host_network(config: &VethConfig, dns_target_override: Option<&st
     .ok();
 
     // DNAT (DNS UDP) — use recorded dns_target to ensure exact rule match.
-    // Falling back to resolve_host_dns() only if state file didn't record it.
-    let dns_target = dns_target_override
-        .map(|s| s.to_string())
-        .unwrap_or_else(resolve_host_dns);
+    //
+    // `dns_target_override` is the EXACT string passed to iptables `-A` in
+    // setup_host_network: already in `host:port` form (e.g. "10.200.0.1:5353"
+    // when GVM_DNS_LISTEN points at the governance proxy, or "8.8.8.8:53"
+    // when the DNS proxy is disabled). Re-formatting it here as
+    // `format!("{}:53", dns_target)` produced "10.200.0.1:5353:53", which
+    // never matches the rule iptables installed, so `-D` silently failed
+    // (the trailing `.ok()` swallows the error). The DNS DNAT entry then
+    // leaked across every sandbox session, surfacing as
+    // "NAT rule referencing veth-gvm-h0" in `verify_cleanup`.
+    //
+    // Fix: build the SAME `host:port` string in BOTH paths and pass it
+    // through unchanged. The only fallback that needs port-appending is
+    // when no override is recorded — i.e., the state file is corrupt or
+    // missing — so we attach `:53` only in that branch.
+    let dns_target = resolve_dns_dnat_target(dns_target_override);
     run_iptables(&[
         "-t",
         "nat",
@@ -602,7 +632,7 @@ pub fn cleanup_host_network(config: &VethConfig, dns_target_override: Option<&st
         "-j",
         "DNAT",
         "--to-destination",
-        &format!("{}:53", dns_target),
+        &dns_target,
     ])
     .ok();
 
@@ -2094,7 +2124,52 @@ pub fn cleanup_stale_docker_chains() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_proc_stat_starttime;
+    use super::{parse_proc_stat_starttime, resolve_dns_dnat_target};
+
+    // ── DNS DNAT cleanup format symmetry (regression for SIGINT NAT leak) ──
+
+    #[test]
+    fn dns_dnat_target_uses_override_verbatim_governance_proxy() {
+        // GVM_DNS_LISTEN path stores e.g. "10.200.0.1:5353" in the state
+        // file. cleanup_host_network must pass that EXACT string to
+        // iptables -D — re-formatting as "10.200.0.1:5353:53" was the
+        // bug that leaked DNS DNAT rules across every sandbox run.
+        let resolved = resolve_dns_dnat_target(Some("10.200.0.1:5353"));
+        assert_eq!(resolved, "10.200.0.1:5353");
+        assert!(
+            !resolved.ends_with(":53:53"),
+            "must not double-append :53 — that was the SIGINT leak"
+        );
+    }
+
+    #[test]
+    fn dns_dnat_target_uses_override_verbatim_legacy_upstream() {
+        // Disabled-DNS-governance path stores "8.8.8.8:53" in the state
+        // file. Same contract — cleanup uses the override verbatim, no
+        // re-formatting.
+        let resolved = resolve_dns_dnat_target(Some("8.8.8.8:53"));
+        assert_eq!(resolved, "8.8.8.8:53");
+    }
+
+    #[test]
+    fn dns_dnat_target_falls_back_to_upstream_with_port_53() {
+        // Only when state file is missing/corrupted (override = None)
+        // does cleanup synthesise a :53 suffix. The resolved upstream
+        // is host-dependent, but the contract is "ends with :53 and
+        // contains exactly one colon".
+        let resolved = resolve_dns_dnat_target(None);
+        assert!(
+            resolved.ends_with(":53"),
+            "fallback must terminate at :53, got {}",
+            resolved
+        );
+        assert_eq!(
+            resolved.matches(':').count(),
+            1,
+            "fallback must have exactly one port suffix, got {}",
+            resolved
+        );
+    }
 
     // Field 22 (starttime) is the canonical PID-reuse defeater. The parser
     // has to survive comm fields containing spaces, parens, and surprising

@@ -52,6 +52,49 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
+### 2026-04-29: Sandbox SIGINT NAT leak — DNS DNAT cleanup format mismatch
+
+**What changed:**
+
+`crates/gvm-sandbox/src/network.rs` — fixed an asymmetry between
+`setup_host_network()` and `cleanup_host_network()` for the DNS UDP
+DNAT rule. Setup builds the `--to-destination` argument as a complete
+`host:port` string (e.g. `"10.200.0.1:5353"` when the DNS governance
+proxy is enabled, or `"8.8.8.8:53"` when it is not). Cleanup was
+reading the recorded value from the state file, then re-formatting it
+as `format!("{}:53", recorded)`, producing `"10.200.0.1:5353:53"` —
+which never matches the rule iptables installed. `iptables -D` then
+silently fails because the trailing `.ok()` swallows the error, and
+the DNAT rule leaks across every sandbox session.
+
+Pulled the DNS-target resolution into a `resolve_dns_dnat_target()`
+helper so the format invariant ("setup and cleanup pass the SAME
+string to iptables") is explicit and unit-testable. Three regression
+tests in `network::tests::dns_dnat_target_*` lock in:
+- governance-proxy override (`host_ip:5353`) is used verbatim,
+- legacy override (`upstream:53`) is used verbatim,
+- no override → fallback synthesises exactly one `:53` suffix.
+
+**Why:** the `scripts/sandbox-observability-test.sh` "Ctrl+C graceful
+cleanup" test (Test 8) failed on EC2 with
+`Cleanup verification: 1 residual(s) detected — Network: NAT rule
+referencing veth-gvm-h0`. Reproduced by hand, captured `iptables-save
+-t nat` before/during/after a sandbox SIGINT: TCP DNAT was removed
+correctly, DNS DNAT remained. The same root cause also explains the
+"orphan veth: 1" output of `scripts/stress-test.sh` whenever DNS
+governance is enabled (default).
+
+**Affected files:** `crates/gvm-sandbox/src/network.rs`,
+`docs/internal/CHANGELOG.md`.
+
+**Risk:** Low. The fallback path (state file missing) still produces
+`<upstream>:53`, identical to setup's fallback path, so no behaviour
+change there. The override path now passes the EXACT recorded string,
+which is the rule iptables actually has — so `-D` matches and the
+rule is removed. Verified on EC2: post-fix `iptables-save -t nat`
+shows zero `veth-gvm` residuals after SIGINT, and Test 8 went from
+FAIL to PASS (9/9 sandbox-observability checks green).
+
 ### 2026-04-16: CI gate repairs — clippy, dependency check, fuzz
 
 **What changed:**
