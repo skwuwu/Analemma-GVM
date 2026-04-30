@@ -50,7 +50,12 @@ fn distinct_intents_claim_concurrently_without_cross_binding() {
     let mut intent_ids = Vec::with_capacity(N);
     for i in 0..N {
         let id = store
-            .register(&intent("POST", &format!("host-{}.example", i), "/", "agent"))
+            .register(&intent(
+                "POST",
+                &format!("host-{}.example", i),
+                "/",
+                "agent",
+            ))
             .expect("register");
         intent_ids.push(id);
     }
