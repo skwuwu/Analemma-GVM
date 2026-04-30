@@ -128,8 +128,14 @@ struct GroupCommitRequest {
 #[allow(clippy::upper_case_acronyms)]
 struct WAL {
     /// Sender for submitting write requests to the batch task.
-    /// Wrapped in Option so we can take() it during shutdown to close the channel.
-    tx: tokio::sync::mpsc::Sender<GroupCommitRequest>,
+    /// Wrapped in `Option` so `shutdown()` can `take()` it, dropping
+    /// the only sender held by the Ledger and closing the channel.
+    /// `batch_loop` exits when `rx.recv()` returns `None`, completing
+    /// the JoinHandle the shutdown path awaits. Without the take,
+    /// the channel stayed open indefinitely and shutdown always hit
+    /// the documented 5s timeout — turning every rolling restart
+    /// into a 5s-per-pod stall.
+    tx: Option<tokio::sync::mpsc::Sender<GroupCommitRequest>>,
     /// Handle to the background batch task — awaited during graceful shutdown.
     batch_task: Option<tokio::task::JoinHandle<()>>,
     /// Path retained for crash recovery (read path).
@@ -165,7 +171,7 @@ impl WAL {
         tracing::info!(path = %path.display(), "WAL opened (group commit + merkle)");
 
         Ok(Self {
-            tx,
+            tx: Some(tx),
             batch_task: Some(batch_task),
             path: path.to_path_buf(),
             inject_error,
@@ -185,14 +191,17 @@ impl WAL {
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 
-        self.tx
-            .send(GroupCommitRequest {
-                data,
-                event_hash: hash,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| anyhow!("WAL batch task shut down"))?;
+        let tx = self
+            .tx
+            .as_ref()
+            .ok_or_else(|| anyhow!("WAL batch task shut down"))?;
+        tx.send(GroupCommitRequest {
+            data,
+            event_hash: hash,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| anyhow!("WAL batch task shut down"))?;
 
         reply_rx
             .await
@@ -992,22 +1001,20 @@ impl Ledger {
     /// - The Merkle batch record for the final batch has been written
     /// - No more writes are possible (append_durable will return Err)
     pub async fn shutdown(&mut self) {
-        // Drop the sender clone in Ledger — but the WAL struct also holds one.
-        // We need to signal the batch task to stop by closing the channel.
-        // The batch_loop exits when rx.recv() returns None (all senders dropped).
-        //
-        // Since WAL.tx is not Option-wrapped, we can't take it. Instead, we
-        // just await the batch task — it will exit when this Ledger is dropped
-        // (or when all clones of the tx sender are dropped).
-        //
-        // For immediate shutdown: we take the batch_task handle and await it.
-        // The channel will close when the last Ledger/WAL is dropped.
+        // Two-step shutdown:
+        //  1. Drop our sender by taking it out of the Option. This closes
+        //     the mpsc channel because we hold the only sender (the
+        //     batch task itself does NOT clone the sender — it just
+        //     receives). Without this, the channel stays open forever
+        //     and the batch task waits indefinitely on rx.recv(),
+        //     making the timeout below fire on every shutdown.
+        //  2. Await the batch task handle. batch_loop sees rx.recv()
+        //     return None, flushes any remaining batch with Merkle
+        //     record, and exits.
+        let _ = self.wal.tx.take();
+
         if let Some(handle) = self.wal.batch_task.take() {
-            // Drop our sender to close the channel (triggers batch_loop exit)
-            // We can't drop self.wal.tx directly, but dropping the handle's
-            // reference will let the batch task drain and exit.
             tracing::info!("WAL shutdown: waiting for batch task to flush remaining events...");
-            // Give batch task a moment to process remaining items
             match tokio::time::timeout(Duration::from_secs(5), handle).await {
                 Ok(Ok(())) => {
                     tracing::info!("WAL shutdown: batch task completed cleanly");
