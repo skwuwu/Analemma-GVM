@@ -35,11 +35,12 @@ fn full_body(data: impl Into<Bytes>) -> MitmBody {
 
 /// Stamp the proxy's governance observability headers onto a response
 /// header map. Same contract as the cooperative HTTP path: every
-/// response carrying agent-visible bytes also carries `X-GVM-Decision`
-/// + `X-GVM-Event-Id` so SDKs can correlate audit log entries to the
-/// HTTP transactions they instrumented. Best-effort: header value
-/// parsing failures are logged at debug and skipped — never panic
-/// out of the response path.
+/// response carrying agent-visible bytes also carries
+/// `X-GVM-Decision` and `X-GVM-Event-Id` so SDKs can correlate audit
+/// log entries to the HTTP transactions they instrumented.
+///
+/// Best-effort: header value parsing failures are logged at debug and
+/// skipped — never panic out of the response path.
 fn stamp_governance_headers(headers: &mut hyper::HeaderMap, event_id: &str, decision: &str) {
     if let Ok(v) = hyper::header::HeaderValue::from_str(decision) {
         headers.insert("x-gvm-decision", v);
