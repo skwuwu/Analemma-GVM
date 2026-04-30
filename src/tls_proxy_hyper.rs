@@ -33,6 +33,26 @@ fn full_body(data: impl Into<Bytes>) -> MitmBody {
         .boxed()
 }
 
+/// Stamp the proxy's governance observability headers onto a response
+/// header map. Same contract as the cooperative HTTP path: every
+/// response carrying agent-visible bytes also carries `X-GVM-Decision`
+/// + `X-GVM-Event-Id` so SDKs can correlate audit log entries to the
+/// HTTP transactions they instrumented. Best-effort: header value
+/// parsing failures are logged at debug and skipped — never panic
+/// out of the response path.
+fn stamp_governance_headers(headers: &mut hyper::HeaderMap, event_id: &str, decision: &str) {
+    if let Ok(v) = hyper::header::HeaderValue::from_str(decision) {
+        headers.insert("x-gvm-decision", v);
+    } else {
+        tracing::debug!(decision, "MITM: decision string not header-safe");
+    }
+    if let Ok(v) = hyper::header::HeaderValue::from_str(event_id) {
+        headers.insert("x-gvm-event-id", v);
+    } else {
+        tracing::debug!(event_id, "MITM: event_id not header-safe");
+    }
+}
+
 /// Entry point: serve MITM HTTP/1.1 on a TLS stream using hyper.
 /// Replaces the old manual keep-alive loop + custom relay.
 pub async fn serve_mitm<S>(
@@ -274,7 +294,29 @@ async fn handle_request(
         } else {
             format!("{}:80", local_addr)
         };
-        return forward_http(&addr, &method, &path, &original_headers, &body_bytes, &host).await;
+        // Apply credential injection on the dev path too — agents that
+        // talk to host_override targets must not be able to smuggle
+        // their own Authorization to bypass Layer 3. The TLS-upstream
+        // branch below does the same; without this call here, the dev
+        // branch was a credential-bypass.
+        let mut dev_headers = original_headers.clone();
+        let credential_policy = crate::api_keys::MissingCredentialPolicy::default();
+        if let Err(e) = state
+            .api_keys
+            .inject(&mut dev_headers, &host, &credential_policy)
+        {
+            tracing::warn!(error = %e, host = %host,
+                "MITM dev: credential injection failed (passthrough)");
+        }
+        // Synthesise an event_id + decision string for the dev path so
+        // governance headers can be stamped on the response — same
+        // observability anchor the production TLS path provides.
+        let dev_event_id = uuid::Uuid::new_v4().to_string();
+        let dev_decision = format!("{:?}", classify_output.classification.decision);
+        let mut resp =
+            forward_http(&addr, &method, &path, &dev_headers, &body_bytes, &host).await?;
+        stamp_governance_headers(resp.headers_mut(), &dev_event_id, &dev_decision);
+        return Ok(resp);
     }
 
     // Production: TLS upstream
@@ -522,7 +564,12 @@ async fn handle_request(
             let llm_provider = crate::llm_trace::identify_llm_provider(&host);
             if let Some(provider) = llm_provider {
                 if resp.status().is_success() {
-                    let (parts, body) = resp.into_parts();
+                    let (mut parts, body) = resp.into_parts();
+                    stamp_governance_headers(
+                        &mut parts.headers,
+                        &wal_event.event_id,
+                        &wal_event.decision,
+                    );
                     let is_sse = parts
                         .headers
                         .get(hyper::header::CONTENT_TYPE)
@@ -570,7 +617,8 @@ async fn handle_request(
             }
 
             // Non-LLM or non-2xx: forward as-is
-            let (parts, body) = resp.into_parts();
+            let (mut parts, body) = resp.into_parts();
+            stamp_governance_headers(&mut parts.headers, &wal_event.event_id, &wal_event.decision);
             let boxed = body.map_err(|e| e.to_string()).boxed();
             Ok(Response::from_parts(parts, boxed))
         }

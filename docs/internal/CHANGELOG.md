@@ -52,6 +52,60 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
+### 2026-04-30: MITM streaming integration tests + two production bugs they found
+
+**Test additions (tests/mitm_streaming.rs, 6 tests):**
+
+The cooperative-mode SSE tests verified the `proxy_handler` path; real
+LLM agent traffic uses MITM TLS via `tls_proxy_hyper::serve_mitm` —
+structurally different code that previously had no streaming-aware
+integration test. The new file spins up a real TLS-terminating MITM
+listener (using `GvmCertResolver`) and a TLS client that trusts the
+test CA, then drives the same six policy-mapping invariants through
+the production MITM path:
+
+  - mitm_sse_multi_event_preserves_boundaries
+  - mitm_anthropic_thinking_trace_passes_through
+  - mitm_mid_stream_pause_does_not_coalesce_chunks
+  - mitm_srr_deny_blocks_before_upstream_call (atomic flag verifies
+    no upstream socket is opened on Deny)
+  - mitm_streaming_response_carries_proxy_injected_headers
+  - mitm_streaming_upstream_request_receives_injected_credentials
+
+The DN-mismatch trap that breaks `test_helpers::create_test_ca` for
+real TLS verification is documented + worked around with
+`create_compatible_test_ca` that uses the same DN
+(`CN=GVM MITM CA, O=Analemma GVM`) that `GvmCertResolver::new`
+reconstructs internally.
+
+**Production bugs the new tests discovered + fixed:**
+
+1) **Credential bypass on dev-mode host_overrides path** (security).
+   `forward_http` (the `host_overrides` redirect branch in
+   tls_proxy_hyper.rs) forwarded the agent's headers verbatim to the
+   local mock without invoking `api_keys.inject()`. An agent could
+   smuggle its own `Authorization: Bearer …` header and bypass
+   Layer-3 credential isolation when host_overrides was active.
+   The TLS-upstream branch did call `inject()`; the dev branch did
+   not. Fixed by mirroring the inject call before forward_http.
+
+2) **MITM streaming responses lacked X-GVM-* observability headers**
+   (observability). Cooperative path stamps `X-GVM-Decision` and
+   `X-GVM-Event-Id` on every response so SDKs can correlate audit
+   entries to HTTP transactions. The MITM path (3 response branches:
+   LLM-tapped, non-LLM forward-as-is, dev forward_http) stamped no
+   such headers. Added a `stamp_governance_headers` helper and
+   wired it into all three MITM response branches.
+
+**Affected files:** `tests/mitm_streaming.rs` (new),
+`src/tls_proxy_hyper.rs`, `docs/internal/CHANGELOG.md`.
+
+**Risk:** Low. New test file is self-contained. The two bug fixes
+add response headers (additive) and a credential-injection call
+(additive — it strips auth headers only when a configured credential
+exists for the host). All existing tests continue to pass; total
+workspace test count: 498 → 504.
+
 ### 2026-04-29: Sandbox parent-death watchdog — PR_SET_PDEATHSIG + matrix wait fix
 
 **What changed:**
