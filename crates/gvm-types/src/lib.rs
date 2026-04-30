@@ -336,22 +336,62 @@ pub struct IntegrityChainReport {
 pub fn verify_integrity_chain(wal_path: &std::path::Path) -> IntegrityChainReport {
     use std::io::BufRead;
 
-    let file = match std::fs::File::open(wal_path) {
-        Ok(f) => f,
-        Err(_) => {
-            return IntegrityChainReport {
-                valid_links: 0,
-                total_config_loads: 0,
-                first_break: None,
+    // Production WAL is rotated at `max_wal_bytes` — the bulk of the
+    // audit history lives in `wal.log.1`, `wal.log.2`, ..., not in
+    // the active `wal.log`. The verifier MUST traverse rotated
+    // segments in chronological order (oldest .1 → newest active)
+    // so the integrity-context chain that crosses rotation boundaries
+    // can be validated end-to-end. Without this, a `gvm audit verify`
+    // run would only see the events in the active segment and report
+    // an artificially-low total_config_loads.
+    //
+    // Rotation naming, per ledger::rotate_wal: when wal.log fills,
+    // it is renamed to wal.log.<N> where N is one greater than the
+    // current max numeric suffix. So wal.log.1 is the OLDEST segment,
+    // wal.log.<max> is the most-recently-rotated, and wal.log
+    // is always the active head.
+    let mut segments: Vec<std::path::PathBuf> = Vec::new();
+    let parent = wal_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let stem = wal_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("wal.log")
+        .to_string();
+    if let Ok(entries) = std::fs::read_dir(&parent) {
+        let mut numbered: Vec<(u64, std::path::PathBuf)> = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy().to_string();
+            if let Some(suffix) = name_str.strip_prefix(&format!("{}.", stem)) {
+                if let Ok(n) = suffix.parse::<u64>() {
+                    numbered.push((n, parent.join(&name_str)));
+                }
             }
         }
-    };
+        numbered.sort_by_key(|(n, _)| *n);
+        segments.extend(numbered.into_iter().map(|(_, p)| p));
+    }
+    // Active segment last — that is the head of the chain.
+    segments.push(wal_path.to_path_buf());
 
-    let reader = std::io::BufReader::new(file);
     let mut prev_config_hash: Option<String> = None;
     let mut valid_links = 0usize;
     let mut total_config_loads = 0usize;
     let mut first_break: Option<String> = None;
+
+    for seg_path in &segments {
+        let file = match std::fs::File::open(seg_path) {
+            Ok(f) => f,
+            // Active segment may not exist on a fresh WAL; rotated
+            // segments may have been pruned per max_wal_segments —
+            // both are non-fatal, just skip and continue the chain.
+            Err(_) => continue,
+        };
+        let reader = std::io::BufReader::new(file);
 
     for line in reader.lines() {
         let line = match line {
@@ -377,7 +417,22 @@ pub fn verify_integrity_chain(wal_path: &std::path::Path) -> IntegrityChainRepor
         };
 
         total_config_loads += 1;
-        let current_hash = ctx.get("config_hash").and_then(|v| v.as_str());
+        // Chain link semantics: production callers (api.rs::reload_srr,
+        // main.rs startup) pass the previous event's CONTEXT_HASH —
+        // the canonical SHA-256 of the full integrity-context fields,
+        // not just config_hash — as `prev_config_hash` to
+        // record_config_load, and that is what gets stored in
+        // `previous_state`. So `claimed_prev` we read off the wire
+        // must be compared to the PREVIOUS event's context_hash, not
+        // its config_hash. Reconstruct the IntegrityContext to call
+        // its `context_hash()` method — that is the canonical hash
+        // GvmIntegrityContext promises.
+        let current_hash: Option<String> =
+            match serde_json::from_value::<GvmIntegrityContext>(ctx.clone()) {
+                Ok(parsed_ctx) => Some(parsed_ctx.context_hash()),
+                Err(_) => None,
+            };
+        let current_hash = current_hash.as_deref();
         let claimed_prev = ctx.get("previous_state").and_then(|v| v.as_str());
 
         match (&prev_config_hash, claimed_prev) {
@@ -404,6 +459,7 @@ pub fn verify_integrity_chain(wal_path: &std::path::Path) -> IntegrityChainRepor
             prev_config_hash = Some(hash.to_string());
         }
     }
+    }  // end per-segment loop
 
     IntegrityChainReport {
         valid_links,
