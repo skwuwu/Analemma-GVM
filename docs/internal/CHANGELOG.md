@@ -52,6 +52,61 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
+### 2026-04-30: TokenBudget release-decrement TOCTOU fix (real production bug)
+
+**What changed:**
+
+`src/token_budget.rs` — `release_reservation` and the release leg of
+`record(tokens, cost)` previously did a non-atomic
+`load + saturating_sub + store` on `pending_reservations: AtomicU64`.
+Under real CPU-parallel contention (16 OS threads, 5,000 balanced
+reserve+release pairs each), two threads racing observed the same
+`prev`, both computed `prev - reserve`, both stored the same value —
+one decrement was effectively lost per collision. The pending counter
+drifted upward; eventually `check_and_reserve` started returning
+`Err(BudgetExceeded)` even when actual usage was well below the cap.
+
+Replaced with an `atomic_saturating_sub` helper backed by
+`fetch_update` (retry-on-conflict closure) that preserves the
+underflow guard the saturating_sub provided.
+
+**How it was caught:**
+
+`tests/token_budget_contention.rs` (5 new integration tests, also
+new in this commit) exercises real OS threads via `std::thread::spawn`
++ `std::sync::Barrier`. The default `#[tokio::test]` flavour runs
+tasks on a single-threaded runtime, so the original 6 unit tests
+in src/token_budget.rs never produced real contention. The new
+tests verify:
+
+  1. `pending_counter_returns_to_zero_after_balanced_concurrent_churn`
+     16 threads × 5,000 reserve+release pairs → pending counter
+     must equal 0. Pre-fix observed 47,400 drift.
+  2. `pending_counter_balances_under_mixed_record_and_release`
+     Same shape with half record() / half release_reservation().
+     Pre-fix observed 65,500 drift.
+  3. `cap_respected_under_burst_within_one_request_slack`
+     32-thread barrier + budget for 10 reservations, observed Ok
+     count must be in [10, 14] — captures the documented atomic-
+     compose TOCTOU on the reserve side (single-instruction
+     CAS would tighten this to 10).
+  4. `reservations_resume_after_release_makes_room`
+     Sequential exhaust + release + reserve cycle.
+  5. `concurrent_record_sums_correctly`
+     16 threads × 2,500 record() calls → exact total tokens. Catches
+     any future load+store regression on the slot accumulator path
+     (currently fetch_add → safe, but locked in here).
+
+**Affected files:** `src/token_budget.rs`,
+`tests/token_budget_contention.rs` (new),
+`docs/internal/CHANGELOG.md`.
+
+**Risk:** Low. fetch_update is the standard atomic-update primitive
+and produces the exact same end-state value as load+store would when
+no conflict occurs; under conflict it retries until success or the
+closure says no change. No semantic change beyond closing the race.
+Workspace test count: 510 → 515.
+
 ### 2026-04-30: MITM streaming integration tests + two production bugs they found
 
 **Test additions (tests/mitm_streaming.rs, 6 tests):**

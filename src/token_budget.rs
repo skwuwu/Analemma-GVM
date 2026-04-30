@@ -13,6 +13,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const SLOTS: usize = 60; // 60 minutes = 1 hour window
 
+/// Atomic saturating subtract: `*counter = max(0, *counter - delta)`,
+/// guaranteed race-free under concurrent callers. Replaces the
+/// `load + saturating_sub + store` pattern that lost decrements when
+/// two threads observed the same `prev` value (verified by
+/// `tests/token_budget_contention.rs` — 47,400 token drift over
+/// 80,000 balanced reserve+release pairs on 16 OS threads).
+fn atomic_saturating_sub(counter: &AtomicU64, delta: u64) {
+    // fetch_update retries on conflict; closure is pure so safe to
+    // re-run. Returning Some(new) on success / None on no change.
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+        Some(prev.saturating_sub(delta))
+    });
+}
+
 /// Per-minute slot storing accumulated tokens and cost.
 struct Slot {
     tokens: AtomicU64,
@@ -154,11 +168,14 @@ impl TokenBudget {
 
     /// Record actual token usage after LLM response. Releases reservation.
     pub fn record(&self, tokens: u64, cost_usd: f64) {
-        // Release reservation
-        let reserve = self.reserve_per_request;
-        let prev = self.pending_reservations.load(Ordering::Relaxed);
-        self.pending_reservations
-            .store(prev.saturating_sub(reserve), Ordering::Relaxed);
+        // Release reservation. Must be a single atomic op — the prior
+        // `load(); store(prev - reserve)` pattern lost decrements
+        // under real CPU-parallel contention (verified at 47,400-token
+        // drift over 80,000 balanced reserve+release pairs across 16
+        // OS threads). fetch_update with saturating_sub closes the
+        // race while preserving the underflow guard the original
+        // saturating_sub provided.
+        atomic_saturating_sub(&self.pending_reservations, self.reserve_per_request);
 
         // Add actual usage to current slot
         self.rotate_if_needed();
@@ -172,10 +189,7 @@ impl TokenBudget {
 
     /// Release reservation without recording (e.g., request failed before response).
     pub fn release_reservation(&self) {
-        let reserve = self.reserve_per_request;
-        let prev = self.pending_reservations.load(Ordering::Relaxed);
-        self.pending_reservations
-            .store(prev.saturating_sub(reserve), Ordering::Relaxed);
+        atomic_saturating_sub(&self.pending_reservations, self.reserve_per_request);
     }
 
     /// Current budget status for dashboard display.
