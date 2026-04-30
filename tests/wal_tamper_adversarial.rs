@@ -80,9 +80,7 @@ fn evt(seq: u64) -> GVMEvent {
 }
 
 async fn write_clean_wal(path: &std::path::Path, n: u64) {
-    let mut ledger = Ledger::new(path, "", "")
-        .await
-        .expect("ledger init");
+    let mut ledger = Ledger::new(path, "", "").await.expect("ledger init");
     for i in 0..n {
         ledger.append_durable(&evt(i)).await.expect("append");
     }
@@ -124,24 +122,41 @@ async fn mid_wal_byte_mutation_flags_some_tamper_signal() {
         pre_report.chain_intact
     );
 
-    // Tamper: flip one byte in the middle of the file. We choose a
-    // byte that lands inside an event JSON line (not whitespace) by
-    // picking the file midpoint and finding a surrounding ASCII byte.
-    let file_len = std::fs::metadata(&path).unwrap().len();
-    assert!(file_len > 200, "WAL must be at least 200 bytes for the test");
-    let mid = (file_len / 2) as u64;
+    // Tamper: flip a SEMANTICALLY MEANINGFUL byte — specifically, a
+    // character inside an event JSON line that's part of an audited
+    // field. A pure file-midpoint XOR is fragile across platforms: on
+    // Windows the midpoint can land on a syntactic byte (e.g. inside
+    // a Merkle root hex string that happens to recompute to the
+    // legacy form, or on whitespace) and verify_wal returns clean.
+    //
+    // Find the first event line containing `agent_id`, pick the byte
+    // immediately after `"agent_id":"`, and flip its low bit. That
+    // byte is guaranteed to be inside the agent_id value — part of
+    // the event's canonical hash — so event_hash recomputes to a
+    // different value than the stored hash, and tampered_events
+    // becomes non-empty.
+    let needle = b"\"agent_id\":\"";
+    let pos_in_file = pre
+        .as_bytes()
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|i| i + needle.len())
+        .expect("scaffolding: at least one event must contain agent_id");
+    assert!(
+        pos_in_file < pre.len(),
+        "agent_id needle landed at the very end of file"
+    );
 
     let mut f = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(&path)
         .unwrap();
-    f.seek(SeekFrom::Start(mid)).unwrap();
+    f.seek(SeekFrom::Start(pos_in_file as u64)).unwrap();
     let mut byte = [0u8; 1];
     f.read_exact(&mut byte).unwrap();
-    // XOR with 0x01 produces a different printable / ASCII byte.
     let tampered = byte[0] ^ 0x01;
-    f.seek(SeekFrom::Start(mid)).unwrap();
+    f.seek(SeekFrom::Start(pos_in_file as u64)).unwrap();
     f.write_all(&[tampered]).unwrap();
     f.sync_all().unwrap();
     drop(f);
@@ -154,7 +169,7 @@ async fn mid_wal_byte_mutation_flags_some_tamper_signal() {
         || !report.chain_intact;
     assert!(
         signal_fired,
-        "mid-WAL byte mutation produced ZERO tamper signals: \
+        "agent_id byte mutation produced ZERO tamper signals: \
          tampered_events={:?} invalid_batches={:?} chain_intact={}. \
          The audit chain claims integrity it does not have.",
         report.tampered_events, report.invalid_batches, report.chain_intact

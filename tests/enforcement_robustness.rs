@@ -90,7 +90,10 @@ type = "Allow"
     };
     let out = classify(&state, &input).expect("classify");
     assert!(
-        matches!(out.classification.decision, EnforcementDecision::Deny { .. }),
+        matches!(
+            out.classification.decision,
+            EnforcementDecision::Deny { .. }
+        ),
         "matching payload must produce Deny, got {:?}",
         out.classification.decision
     );
