@@ -393,73 +393,73 @@ pub fn verify_integrity_chain(wal_path: &std::path::Path) -> IntegrityChainRepor
         };
         let reader = std::io::BufReader::new(file);
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        if parsed.get("operation").and_then(|v| v.as_str()) != Some("gvm.system.config_load") {
-            continue;
-        }
-
-        let Some(ctx) = parsed.pointer("/context/_integrity_context").cloned() else {
-            continue;
-        };
-
-        total_config_loads += 1;
-        // Chain link semantics: production callers (api.rs::reload_srr,
-        // main.rs startup) pass the previous event's CONTEXT_HASH —
-        // the canonical SHA-256 of the full integrity-context fields,
-        // not just config_hash — as `prev_config_hash` to
-        // record_config_load, and that is what gets stored in
-        // `previous_state`. So `claimed_prev` we read off the wire
-        // must be compared to the PREVIOUS event's context_hash, not
-        // its config_hash. Reconstruct the IntegrityContext to call
-        // its `context_hash()` method — that is the canonical hash
-        // GvmIntegrityContext promises.
-        let current_hash: Option<String> =
-            match serde_json::from_value::<GvmIntegrityContext>(ctx.clone()) {
-                Ok(parsed_ctx) => Some(parsed_ctx.context_hash()),
-                Err(_) => None,
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
             };
-        let current_hash = current_hash.as_deref();
-        let claimed_prev = ctx.get("previous_state").and_then(|v| v.as_str());
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
 
-        match (&prev_config_hash, claimed_prev) {
-            (None, _) => {
-                // First config_load we see — cannot verify; accept.
-                valid_links += 1;
+            let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if parsed.get("operation").and_then(|v| v.as_str()) != Some("gvm.system.config_load") {
+                continue;
             }
-            (Some(expected), Some(claimed)) if expected == claimed => {
-                valid_links += 1;
-            }
-            (Some(_), _) => {
-                if first_break.is_none() {
-                    let event_id = parsed
-                        .get("event_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    first_break = Some(event_id);
+
+            let Some(ctx) = parsed.pointer("/context/_integrity_context").cloned() else {
+                continue;
+            };
+
+            total_config_loads += 1;
+            // Chain link semantics: production callers (api.rs::reload_srr,
+            // main.rs startup) pass the previous event's CONTEXT_HASH —
+            // the canonical SHA-256 of the full integrity-context fields,
+            // not just config_hash — as `prev_config_hash` to
+            // record_config_load, and that is what gets stored in
+            // `previous_state`. So `claimed_prev` we read off the wire
+            // must be compared to the PREVIOUS event's context_hash, not
+            // its config_hash. Reconstruct the IntegrityContext to call
+            // its `context_hash()` method — that is the canonical hash
+            // GvmIntegrityContext promises.
+            let current_hash: Option<String> =
+                match serde_json::from_value::<GvmIntegrityContext>(ctx.clone()) {
+                    Ok(parsed_ctx) => Some(parsed_ctx.context_hash()),
+                    Err(_) => None,
+                };
+            let current_hash = current_hash.as_deref();
+            let claimed_prev = ctx.get("previous_state").and_then(|v| v.as_str());
+
+            match (&prev_config_hash, claimed_prev) {
+                (None, _) => {
+                    // First config_load we see — cannot verify; accept.
+                    valid_links += 1;
+                }
+                (Some(expected), Some(claimed)) if expected == claimed => {
+                    valid_links += 1;
+                }
+                (Some(_), _) => {
+                    if first_break.is_none() {
+                        let event_id = parsed
+                            .get("event_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        first_break = Some(event_id);
+                    }
                 }
             }
-        }
 
-        if let Some(hash) = current_hash {
-            prev_config_hash = Some(hash.to_string());
+            if let Some(hash) = current_hash {
+                prev_config_hash = Some(hash.to_string());
+            }
         }
-    }
-    }  // end per-segment loop
+    } // end per-segment loop
 
     IntegrityChainReport {
         valid_links,

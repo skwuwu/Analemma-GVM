@@ -114,7 +114,8 @@ async fn integrity_chain_spans_rotated_segments() {
         report.total_config_loads, TOTAL
     );
     assert_eq!(
-        report.valid_links, TOTAL,
+        report.valid_links,
+        TOTAL,
         "every link must validate across the rotation boundary (1 first + \
          {} chained); got {} valid links. previous_state ↔ context_hash \
          comparison may have drifted.",
