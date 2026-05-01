@@ -780,8 +780,8 @@ async fn integrity_context_recorded_on_config_load() {
 
     assert_eq!(
         ic.get("spec_version").and_then(|v| v.as_u64()),
-        Some(1),
-        "spec_version must be 1"
+        Some(3),
+        "spec_version must be 3 (Phase 5: prev_anchor_hash binding)"
     );
     assert_eq!(
         ic.get("trust_model").and_then(|v| v.as_str()),
@@ -867,6 +867,7 @@ fn integrity_context_hash_is_deterministic() {
         timestamp: 1000000,
         previous_state: None,
         checkpoint_id: None,
+        prev_anchor_hash: None,
         opaque_extensions: std::collections::BTreeMap::new(),
     };
 
@@ -880,6 +881,7 @@ fn integrity_context_hash_is_deterministic() {
         timestamp: 1000000,
         previous_state: None,
         checkpoint_id: None,
+        prev_anchor_hash: None,
         opaque_extensions: std::collections::BTreeMap::new(),
     };
 
@@ -904,7 +906,7 @@ fn integrity_context_hash_is_deterministic() {
 /// Verify that opaque_extensions serializes and deserializes correctly.
 #[test]
 fn opaque_extensions_round_trip() {
-    let mut ctx = gvm_types::GvmIntegrityContext::local("hash123".to_string(), None);
+    let mut ctx = gvm_types::GvmIntegrityContext::local("hash123".to_string(), None, None);
     ctx.opaque_extensions
         .insert("tpm_quote".to_string(), vec![0xDE, 0xAD, 0xBE, 0xEF]);
     ctx.opaque_extensions

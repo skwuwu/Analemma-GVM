@@ -74,7 +74,7 @@ fn wal_without_any_config_load_returns_zero_counts() {
 
 #[test]
 fn single_config_load_counts_as_one_valid_link() {
-    let ctx = GvmIntegrityContext::local("hash-1".to_string(), None);
+    let ctx = GvmIntegrityContext::local("hash-1".to_string(), None, None);
     let (_dir, path) = write_wal(&[&config_load_event(&ctx)]);
     let report = verify_integrity_chain(&path);
     assert_eq!(report.total_config_loads, 1);
@@ -87,8 +87,8 @@ fn single_config_load_counts_as_one_valid_link() {
 
 #[test]
 fn properly_chained_two_event_run_validates_both_links() {
-    let ctx1 = GvmIntegrityContext::local("config-A".to_string(), None);
-    let ctx2 = GvmIntegrityContext::local("config-B".to_string(), Some(ctx1.context_hash()));
+    let ctx1 = GvmIntegrityContext::local("config-A".to_string(), None, None);
+    let ctx2 = GvmIntegrityContext::local("config-B".to_string(), Some(ctx1.context_hash()), None);
     let (_dir, path) = write_wal(&[&config_load_event(&ctx1), &config_load_event(&ctx2)]);
     let report = verify_integrity_chain(&path);
     assert_eq!(report.total_config_loads, 2);
@@ -98,13 +98,14 @@ fn properly_chained_two_event_run_validates_both_links() {
 
 #[test]
 fn tampered_previous_state_records_first_break() {
-    let ctx1 = GvmIntegrityContext::local("config-A".to_string(), None);
+    let ctx1 = GvmIntegrityContext::local("config-A".to_string(), None, None);
     // Second event claims a previous_state that doesn't match ctx1's
     // context_hash — simulates an attacker editing the WAL to splice
     // in unrelated history.
     let ctx2 = GvmIntegrityContext::local(
         "config-B".to_string(),
         Some("totally-fake-prior-hash".to_string()),
+        None,
     );
     let (_dir, path) = write_wal(&[&config_load_event(&ctx1), &config_load_event(&ctx2)]);
     let report = verify_integrity_chain(&path);
@@ -122,8 +123,8 @@ fn tampered_previous_state_records_first_break() {
 
 #[test]
 fn malformed_json_line_is_skipped_without_poisoning_subsequent_events() {
-    let ctx1 = GvmIntegrityContext::local("config-A".to_string(), None);
-    let ctx2 = GvmIntegrityContext::local("config-B".to_string(), Some(ctx1.context_hash()));
+    let ctx1 = GvmIntegrityContext::local("config-A".to_string(), None, None);
+    let ctx2 = GvmIntegrityContext::local("config-B".to_string(), Some(ctx1.context_hash()), None);
     let event1 = config_load_event(&ctx1);
     let event2 = config_load_event(&ctx2);
     let (_dir, path) = write_wal(&[
@@ -165,7 +166,7 @@ fn integrity_context_missing_should_break_chain() {
         "decision": "Allow",
     })
     .to_string();
-    let ctx_good = GvmIntegrityContext::local("config-A".to_string(), None);
+    let ctx_good = GvmIntegrityContext::local("config-A".to_string(), None, None);
     let (_dir, path) = write_wal(&[&no_ctx_event, &config_load_event(&ctx_good)]);
     let report = verify_integrity_chain(&path);
     assert_eq!(
@@ -192,10 +193,12 @@ fn truncated_history_first_with_some_prev_is_flagged() {
     let truncated_first = GvmIntegrityContext::local(
         "config-mid-chain".to_string(),
         Some("phantom-prior-hash".to_string()),
+        None,
     );
     let next = GvmIntegrityContext::local(
         "config-after".to_string(),
         Some(truncated_first.context_hash()),
+        None,
     );
 
     let (_dir, path) = write_wal(&[
@@ -229,7 +232,7 @@ fn truncated_history_first_with_some_prev_is_flagged() {
 fn genuine_genesis_with_none_prev_is_accepted() {
     // Sanity: the (None, None) form — a genuinely fresh-install
     // first config_load — must still be accepted by the new guard.
-    let genesis_ctx = GvmIntegrityContext::local("genesis-config".to_string(), None);
+    let genesis_ctx = GvmIntegrityContext::local("genesis-config".to_string(), None, None);
     let (_dir, path) = write_wal(&[&config_load_event(&genesis_ctx)]);
     let report = verify_integrity_chain(&path);
 
@@ -254,7 +257,7 @@ fn integrity_context_missing_silently_skipped_documents_gap() {
         "decision": "Allow",
     })
     .to_string();
-    let ctx_good = GvmIntegrityContext::local("config-A".to_string(), None);
+    let ctx_good = GvmIntegrityContext::local("config-A".to_string(), None, None);
     let (_dir, path) = write_wal(&[&no_ctx_event, &config_load_event(&ctx_good)]);
     let report = verify_integrity_chain(&path);
     // Documents the gap: the broken event is invisible to the verifier.

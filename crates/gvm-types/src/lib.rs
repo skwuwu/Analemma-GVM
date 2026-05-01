@@ -397,6 +397,21 @@ pub struct GvmIntegrityContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_id: Option<u64>,
 
+    /// Phase 5 (v3): hash of the live anchor at the moment this context
+    /// was recorded. `None` only at genesis (no anchor yet). Bound into
+    /// `context_hash()` (v3 canonical input) so an attacker who replays
+    /// an old config_load JSON line into a newer position must have a
+    /// matching anchor in scope — replaying the event without the
+    /// matching anchor changes the recomputed `context_hash` and breaks
+    /// the chain link, defeating splice/replay.
+    ///
+    /// Always serialized when `Some(_)`. Old v1 records on disk have
+    /// no field; serde defaults it to `None` for backward compatibility,
+    /// and the verifier dispatches by `spec_version` (1 = legacy hash,
+    /// 3 = v3 hash including this field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_anchor_hash: Option<String>,
+
     /// Vendor-neutral extension space for hardware security modules (Intel SGX,
     /// ARM TrustZone), external attestation services, or organization-specific
     /// metadata. Keys are string identifiers; values are opaque byte payloads.
@@ -425,15 +440,26 @@ pub enum Algorithm {
 }
 
 impl GvmIntegrityContext {
-    /// Create a local integrity context (default for standalone users).
+    /// Create a v3 local integrity context (default for standalone users).
     /// config_hash is always computed; no signature.
-    pub fn local(config_hash: String, previous_state: Option<String>) -> Self {
+    ///
+    /// `prev_anchor_hash` binds this context to the live anchor at the
+    /// moment of `record_config_load`, defeating splice/replay attacks
+    /// (a stolen config_load JSON line cannot be re-injected after a
+    /// newer anchor without breaking the recomputed `context_hash`).
+    /// `None` is reserved for the very first config_load on a fresh
+    /// install, before any batch has sealed an anchor.
+    pub fn local(
+        config_hash: String,
+        previous_state: Option<String>,
+        prev_anchor_hash: Option<String>,
+    ) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         Self {
-            spec_version: 1,
+            spec_version: 3,
             trust_model: TrustModel::Local,
             origin_id: "local-default".to_string(),
             algorithm: Algorithm::None,
@@ -442,23 +468,56 @@ impl GvmIntegrityContext {
             timestamp: now,
             previous_state,
             checkpoint_id: None,
+            prev_anchor_hash,
             opaque_extensions: BTreeMap::new(),
         }
     }
 
-    /// SHA-256 hash of this context (used as config_integrity_ref in behavioral events).
+    /// SHA-256 hash of this context (used as `config_integrity_ref` in
+    /// behavioral events).
+    ///
+    /// Dispatches by `spec_version`:
+    ///   - v1 (legacy) — original 6-component canonical input. Kept so
+    ///     existing WAL records continue to verify after upgrade.
+    ///   - v3 (Phase 5) — adds `prev_anchor_hash` as the 7th component.
+    ///     Genesis substitution per §4.8: `None → GENESIS_HASH_HEX`.
+    ///
+    /// v1 and v3 are intentionally distinct: the canonical version tag
+    /// (`v1:` / `v3:`) prefixes the input so the same config produces
+    /// a different hash under the two schemas. An auditor that sees a
+    /// v1 hash where v3 was expected (or vice versa) immediately knows
+    /// the schema does not match the writer's claimed version.
     pub fn context_hash(&self) -> String {
         use sha2::{Digest, Sha256};
-        let canonical = format!(
-            "v{}:{}:{}:{}:{}:{}",
-            self.spec_version,
-            self.trust_model_str(),
-            self.origin_id,
-            self.config_hash,
-            self.timestamp,
-            self.previous_state.as_deref().unwrap_or("none"),
-        );
-        format!("{:x}", Sha256::digest(canonical.as_bytes()))
+        match self.spec_version {
+            3 => {
+                let canonical = format!(
+                    "v3:{}:{}:{}:{}:{}:{}",
+                    self.trust_model_str(),
+                    self.origin_id,
+                    self.config_hash,
+                    self.timestamp,
+                    self.previous_state.as_deref().unwrap_or("none"),
+                    self.prev_anchor_hash.as_deref().unwrap_or(GENESIS_HASH_HEX),
+                );
+                format!("{:x}", Sha256::digest(canonical.as_bytes()))
+            }
+            // v1 + any other spec_version we don't yet recognize falls
+            // back to the legacy canonical input. This keeps mixed-vintage
+            // WALs verifiable after an in-place upgrade.
+            _ => {
+                let canonical = format!(
+                    "v{}:{}:{}:{}:{}:{}",
+                    self.spec_version,
+                    self.trust_model_str(),
+                    self.origin_id,
+                    self.config_hash,
+                    self.timestamp,
+                    self.previous_state.as_deref().unwrap_or("none"),
+                );
+                format!("{:x}", Sha256::digest(canonical.as_bytes()))
+            }
+        }
     }
 
     fn trust_model_str(&self) -> &str {
@@ -478,6 +537,17 @@ pub struct IntegrityChainReport {
     pub total_config_loads: usize,
     /// First event_id where the chain broke, or `None` if intact.
     pub first_break: Option<String>,
+    /// Phase 5: number of v3 config_loads whose `prev_anchor_hash`
+    /// resolves to an anchor seen earlier in the WAL. Equals the count
+    /// of v3 records with `Some(anchor_hash)` minus replay/splice
+    /// failures. v1 records and v3 genesis (`None`) records are not
+    /// counted here.
+    pub v3_anchor_bindings_valid: usize,
+    /// Phase 5: number of v3 config_loads whose `prev_anchor_hash` is
+    /// `Some(_)` but not found in any anchor seen earlier. A non-zero
+    /// value is a replay/splice signal — and `first_break` is also set
+    /// to the first such event_id.
+    pub v3_anchor_bindings_missing: usize,
 }
 
 /// Scan a WAL file for `gvm.system.config_load` events and verify the integrity-context
@@ -535,6 +605,14 @@ pub fn verify_integrity_chain(wal_path: &std::path::Path) -> IntegrityChainRepor
     let mut valid_links = 0usize;
     let mut total_config_loads = 0usize;
     let mut first_break: Option<String> = None;
+    // Phase 5: track every anchor_hash we've seen in the WAL up to the
+    // current line. A v3 config_load that references an anchor not in
+    // this set is a replay/splice signal — the binding cannot be
+    // satisfied with any earlier WAL state.
+    let mut seen_anchor_hashes: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut v3_anchor_bindings_valid = 0usize;
+    let mut v3_anchor_bindings_missing = 0usize;
 
     for seg_path in &segments {
         let file = match std::fs::File::open(seg_path) {
@@ -560,6 +638,19 @@ pub fn verify_integrity_chain(wal_path: &std::path::Path) -> IntegrityChainRepor
                 Ok(v) => v,
                 Err(_) => continue,
             };
+
+            // Phase 5: harvest anchor_hash from any GvmStateAnchor line
+            // we walk past. The set is the universe of anchors visible
+            // BEFORE any subsequent config_load — replay/splice attempts
+            // will reference an anchor outside this set.
+            if let Some(ah) = parsed.get("anchor_hash").and_then(|v| v.as_str()) {
+                if parsed.get("batch_root").is_some() {
+                    // Reasonable confirmation this is actually an anchor
+                    // line and not some other JSON that happens to carry
+                    // an anchor_hash field.
+                    seen_anchor_hashes.insert(ah.to_string());
+                }
+            }
 
             if parsed.get("operation").and_then(|v| v.as_str()) != Some("gvm.system.config_load") {
                 continue;
@@ -641,6 +732,37 @@ pub fn verify_integrity_chain(wal_path: &std::path::Path) -> IntegrityChainRepor
                 }
             }
 
+            // Phase 5: v3 prev_anchor_hash binding check. A v3 record
+            // that names an anchor must have actually seen that anchor
+            // earlier in the same WAL we walked. Failing to find it is
+            // a splice/replay signal: the config_load JSON line was
+            // injected from a different (earlier or alien) WAL.
+            //
+            // Genesis case (prev_anchor_hash is None) is silently
+            // accepted; v1 records do not carry this field and are not
+            // counted in the v3 metrics either way.
+            let spec_version = ctx.get("spec_version").and_then(|v| v.as_u64());
+            let claimed_prev_anchor = ctx.get("prev_anchor_hash").and_then(|v| v.as_str());
+            if spec_version == Some(3) {
+                if let Some(anchor) = claimed_prev_anchor {
+                    if seen_anchor_hashes.contains(anchor) {
+                        v3_anchor_bindings_valid += 1;
+                    } else {
+                        v3_anchor_bindings_missing += 1;
+                        if first_break.is_none() {
+                            let event_id = parsed
+                                .get("event_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            first_break = Some(event_id);
+                        }
+                    }
+                }
+                // None at v3 = legitimate genesis (or first config_load
+                // before any batch sealed). Not counted.
+            }
+
             if let Some(hash) = current_hash {
                 prev_config_hash = Some(hash.to_string());
             }
@@ -651,6 +773,8 @@ pub fn verify_integrity_chain(wal_path: &std::path::Path) -> IntegrityChainRepor
         valid_links,
         total_config_loads,
         first_break,
+        v3_anchor_bindings_valid,
+        v3_anchor_bindings_missing,
     }
 }
 

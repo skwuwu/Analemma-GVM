@@ -1001,8 +1001,23 @@ impl Ledger {
         // Combined config hash (all files concatenated then hashed)
         let config_hash = format!("{:x}", Sha256::digest(combined_hash_input.as_bytes()));
 
-        // Create integrity context (Local hash-only for standalone users)
-        let integrity = gvm_types::GvmIntegrityContext::local(config_hash, prev_context_hash);
+        // Phase 5 (v3): bind this context to the live anchor at the moment
+        // of recording. Reading the triple snapshot is wait-free; the value
+        // we read here is the anchor of the most recently sealed batch
+        // (None at genesis). The next batch — which carries this very
+        // config_load event — will seal under a new anchor whose
+        // prev_anchor links back to whatever we observed here, so the
+        // chain on disk is: prev_anchor_hash points BACKWARD to the
+        // anchor that existed when the config was loaded.
+        let prev_anchor_hash = self.wal.triple.load_full().last_anchor.clone();
+
+        // Create integrity context (Local hash-only for standalone users).
+        // Now v3: includes prev_anchor_hash binding for replay defense.
+        let integrity = gvm_types::GvmIntegrityContext::local(
+            config_hash,
+            prev_context_hash,
+            prev_anchor_hash,
+        );
         let context_hash = integrity.context_hash();
 
         // Embed full context in config_load event (behavioral events only carry the hash)
