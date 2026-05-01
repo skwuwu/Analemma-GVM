@@ -34,6 +34,25 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         tracing::debug!(error = %e, "Orphan cleanup failed (non-fatal)");
     }
 
+    // Parent-process liveness heartbeat. Defense-in-depth complement to
+    // PR_SET_PDEATHSIG: gives the cleanup path a positive liveness
+    // signal that survives PID reuse (flock auto-releases on parent
+    // death) and detects hung parents (mtime stops advancing).
+    // Held via RAII for the duration of `launch` — drops before the
+    // function returns, releasing the lockfile cleanly. Acquisition
+    // failure is non-fatal: we still launch the sandbox, just without
+    // the extra liveness signal (PDEATHSIG remains in place).
+    let _heartbeat = match crate::heartbeat::ParentHeartbeat::acquire(std::process::id()) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Parent heartbeat acquisition failed — continuing without lockfile signal"
+            );
+            None
+        }
+    };
+
     // Pre-flight: resolve interpreter path
     let interpreter_path = which_interpreter(&config.interpreter)
         .with_context(|| format!("Interpreter '{}' not found in PATH", config.interpreter))?;

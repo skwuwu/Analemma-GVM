@@ -52,6 +52,98 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
+### 2026-05-01: Sandbox parent-liveness heartbeat (defense-in-depth for PDEATHSIG)
+
+**What changed:**
+
+New module `crates/gvm-sandbox/src/heartbeat.rs` (Linux-only). The
+parent gvm process opens `/run/gvm/gvm-{pid}.heartbeat`, holds an
+exclusive `flock(LOCK_EX)` for its lifetime, and a background
+thread updates the file's mtime every 5 s. The cleanup path
+(`network::cleanup_all_orphans_report`) now consults a probe
+function `heartbeat::parent_state(pid, threshold)` before falling
+back to the existing PID/starttime check:
+
+  * `Dead` — non-blocking `LOCK_EX` succeeds. The kernel atomically
+    released the parent's lock on process death (any path: clean
+    exit, SIGKILL, OOM-kill, panic, segfault). Cleanup proceeds.
+  * `Hung` — lock still held but mtime older than 30 s. Parent is
+    alive in `/proc` but its heartbeat thread is wedged
+    (D-state, deadlocked tokio runtime, etc.). Cleanup proceeds.
+  * `Alive` — lock held + mtime fresh. Skip.
+  * `NoHeartbeat` — file missing (older version or already swept).
+    Falls back to PID/starttime.
+
+When cleanup removes a sandbox state file because its owner died,
+it also removes that owner's heartbeat file in the same pass so
+files don't accumulate.
+
+**Why:**
+
+`PR_SET_PDEATHSIG(SIGKILL)` (added 2026-04) covers most parent-
+death paths, but two failure modes slipped through:
+
+  1. **PID reuse with matching starttime**: theoretically possible
+     after long uptime if the kernel re-issues the same PID and
+     the new process happens to land on the same clock tick.
+     `is_pid_alive_with_starttime` would report alive → orphan
+     resources persist.
+  2. **Hung parent**: tokio runtime deadlocked, kernel D-state,
+     hardware fault. PID is alive in `/proc` but the parent is
+     making no progress and will never run cleanup. PDEATHSIG
+     fires only on process *death*, not hang.
+
+flock alone covers (1) — kernel guarantees release on any death
+path. mtime alone covers (2). Together they close the gap.
+
+**Affected files:**
+
+  * `crates/gvm-sandbox/src/heartbeat.rs` — new module (~280 LoC
+    incl. tests). 8 unit tests covering acquire/drop, Alive/Dead/
+    Hung/NoHeartbeat states, mtime advance, and second-acquire
+    failure.
+  * `crates/gvm-sandbox/src/lib.rs` — declares `pub mod heartbeat`
+    under `#[cfg(target_os = "linux")]`.
+  * `crates/gvm-sandbox/src/sandbox_impl.rs::launch` — acquires
+    `ParentHeartbeat` at start of every sandbox launch. Held via
+    RAII for the function lifetime; drop releases lock + unlinks.
+    Acquisition failure is non-fatal (log + continue without the
+    extra signal).
+  * `crates/gvm-sandbox/src/network.rs::cleanup_all_orphans_report`
+    — heartbeat probe added before the `is_pid_alive_with_starttime`
+    block. Also removes the heartbeat file alongside the state file
+    when its owner is gone.
+
+**Risk:**
+
+LOW. Heartbeat is purely additive — failure mode is "extra orphan
+detection skipped", never "false orphan cleanup of a live
+sandbox". The probe is read-only (it tries `LOCK_EX | LOCK_NB`
+then immediately `LOCK_UN` if it acquired), so concurrent probes
+do not affect parent state. The 30 s stale threshold is large
+enough to absorb any reasonable scheduler/IO delay; raising it
+costs nothing because the lock signal still catches process death.
+
+**Test coverage:**
+
+In-process unit tests (Linux-only, gated `#[cfg(target_os = "linux")]`):
+
+  * `acquire_creates_file_and_drop_removes_it`
+  * `parent_state_reports_alive_while_held`
+  * `parent_state_reports_dead_after_drop` — directly exercises
+    "FD close releases flock" with raw libc primitives.
+  * `parent_state_reports_hung_when_mtime_stale`
+  * `parent_state_no_heartbeat_for_missing_file`
+  * `second_acquire_with_same_pid_fails`
+  * `touch_thread_advances_mtime` — uses `acquire_with_interval(100ms)`
+    to verify mtime advances within the test window.
+  * `drop_releases_lock_so_re_acquire_succeeds`
+
+Cross-process flock release on SIGKILL relies on documented kernel
+semantics that are exercised in EC2 stress (fork + kill agent).
+
+---
+
 ### 2026-04-30: TokenBudget release-decrement TOCTOU fix (real production bug)
 
 **What changed:**

@@ -303,6 +303,12 @@ pub mod tc_filter;
 #[cfg(target_os = "linux")]
 mod sandbox_impl;
 
+// Parent-process liveness heartbeat. Linux-only because flock + per-PID
+// lockfile under /run/gvm/ are the implementation primitives. On other
+// platforms the sandbox is unavailable anyway.
+#[cfg(target_os = "linux")]
+pub mod heartbeat;
+
 /// Launch an agent inside a Linux-native sandbox.
 ///
 /// Orchestrates the full isolation sequence:

@@ -1293,7 +1293,26 @@ pub fn cleanup_all_orphans_report() -> Result<CleanupReport> {
         // current /proc/PID/stat starttime will not match the recorded
         // value and the PID is treated as dead — so the leaked resources
         // get cleaned up instead of being skipped indefinitely.
-        if is_pid_alive_with_starttime(state.pid, state.pid_starttime) {
+        //
+        // Heartbeat lockfile (defense-in-depth): the kernel atomically
+        // releases the parent's flock on any death path (including
+        // SIGKILL/OOM that the parent cannot intercept), and the mtime
+        // signal flags a hung-but-alive parent that the PID/starttime
+        // check would happily skip. If either signal says "not alive",
+        // force cleanup regardless of /proc state.
+        let hb_state =
+            crate::heartbeat::parent_state(state.pid, crate::heartbeat::HEARTBEAT_STALE_THRESHOLD);
+        let force_cleanup_by_heartbeat = matches!(
+            hb_state,
+            crate::heartbeat::ParentState::Dead | crate::heartbeat::ParentState::Hung
+        );
+        if force_cleanup_by_heartbeat {
+            tracing::info!(
+                parent_pid = state.pid,
+                heartbeat = ?hb_state,
+                "Heartbeat signals parent not making progress — cleaning orphan resources"
+            );
+        } else if is_pid_alive_with_starttime(state.pid, state.pid_starttime) {
             // Also check child_pid if recorded (v2+ state files)
             let child_alive = state
                 .child_pid
@@ -1327,6 +1346,10 @@ pub fn cleanup_all_orphans_report() -> Result<CleanupReport> {
         }
         report.sandboxes += 1;
         let _ = std::fs::remove_file(&path);
+        // The parent for this state file is gone — its heartbeat
+        // lockfile is orphaned too. Best-effort remove so the file
+        // doesn't accumulate across hundreds of crashes.
+        let _ = std::fs::remove_file(crate::heartbeat::heartbeat_path(state.pid));
         cleaned += 1;
     }
 
