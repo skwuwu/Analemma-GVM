@@ -131,6 +131,141 @@ pub enum AlertLevel {
     Critical,
 }
 
+// ─── Operation descriptor (Phase 1 — privacy-preserving event_hash) ───
+//
+// Splits the previously-monolithic `operation: String` field into a
+// non-sensitive `category` (e.g. "http.POST", "gvm.dns.query") and an
+// optional `detail` (e.g. "/api/v1/user/12345/delete") plus a salted
+// digest of the detail. The event_hash v2 input uses category + digest
+// instead of the raw operation string, so an external auditor receiving
+// a redacted proof can verify the event_hash without learning the
+// detail (the salt stays with the unredacted form).
+//
+// Threat model:
+// - Attacker holds an event_hash but not the salt → cannot brute-force
+//   the detail string from a known operation alphabet.
+// - Verifier with redacted proof (no salt, no detail, only digest) →
+//   can still recompute event_hash via category + digest.
+// - Verifier with full proof (salt + detail + digest) → can reconstruct
+//   detail_digest and verify it matches the stored value.
+
+/// Domain-separation prefix for `compute_detail_digest()`.
+/// Versioned so a future digest-format migration (different salt size,
+/// different hash algorithm) can coexist with v1 records.
+pub const PREFIX_OPDETAIL_V1: &[u8] = b"gvm-opdetail-v1:";
+
+/// Domain-separation prefix for the LEGACY event_hash function
+/// (`compute_event_hash_v1` — uses raw operation string).
+/// Kept for backward compatibility with WAL records written before
+/// the v2 dispatcher landed.
+pub const PREFIX_EVENT_V1: &[u8] = b"gvm-event-v1:";
+
+/// Domain-separation prefix for `compute_event_hash_v2`.
+/// Used when the event has `operation_descriptor: Some(...)`.
+pub const PREFIX_EVENT_V2: &[u8] = b"gvm-event-v2:";
+
+/// Operation descriptor — split-form replacement for the legacy
+/// `operation: String` field. Production callers populate this when
+/// the operation has a sensitive detail component (URL path, DNS
+/// subdomain, vault key id, etc.).
+///
+/// JSON shape:
+/// ```json
+/// {
+///   "category": "http.POST",
+///   "detail": "/api/v1/user/1234/delete",
+///   "detail_salt": "<base64 16 random bytes>",
+///   "detail_digest": "<64 hex>"
+/// }
+/// ```
+///
+/// In a redacted form, `detail` and `detail_salt` are stripped and
+/// only `detail_digest` survives — yet `event_hash` remains
+/// recomputable.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct OperationDescriptor {
+    /// Non-sensitive category. Always exposed in proofs.
+    /// Examples: "http.POST", "http.GET", "gvm.dns.query",
+    /// "gvm.vault.write", "gvm.system.config_load".
+    pub category: String,
+
+    /// Sensitive detail. May be redacted in external proofs.
+    /// `None` for category-only operations (e.g. config_load) where
+    /// no detail exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+
+    /// Per-event 16-byte random salt. Defeats dictionary attacks:
+    /// without the salt, an external party with only `detail_digest`
+    /// cannot enumerate plausible detail strings to find a match.
+    /// Stripped together with `detail` during redaction.
+    /// Empty (`Vec::new()`) when `detail` is None.
+    #[serde(default, with = "base64_bytes", skip_serializing_if = "Vec::is_empty")]
+    pub detail_salt: Vec<u8>,
+
+    /// `compute_detail_digest(detail_salt, detail.as_deref())`.
+    /// Always present in v2 events (computed when descriptor is
+    /// constructed). Survives redaction so the verifier can still
+    /// recompute event_hash.
+    pub detail_digest: String,
+}
+
+impl OperationDescriptor {
+    /// Build a descriptor with caller-supplied salt. Production code
+    /// generates the salt with `rand::thread_rng().fill(&mut salt)`;
+    /// tests can pass a deterministic salt for reproducibility.
+    ///
+    /// `detail = None` produces a "category-only" descriptor — the
+    /// salt is ignored (forced empty), and `detail_digest` is the
+    /// canonical "no detail" marker.
+    pub fn new(category: impl Into<String>, detail: Option<String>, salt: Vec<u8>) -> Self {
+        let (detail_salt, digest) = match detail.as_deref() {
+            Some(d) => {
+                let dg = compute_detail_digest(&salt, Some(d));
+                (salt, dg)
+            }
+            None => (Vec::new(), compute_detail_digest(&[], None)),
+        };
+        Self {
+            category: category.into(),
+            detail,
+            detail_salt,
+            detail_digest: digest,
+        }
+    }
+
+    /// Convenience for category-only operations (no sensitive detail).
+    pub fn category_only(category: impl Into<String>) -> Self {
+        Self::new(category, None, Vec::new())
+    }
+
+    /// Re-compute `detail_digest` from the current `detail_salt` and
+    /// `detail`. Returns true if the stored digest matches — used by
+    /// verifiers that hold the un-redacted form to confirm the digest
+    /// was computed correctly.
+    pub fn verify_digest(&self) -> bool {
+        let recomputed = compute_detail_digest(&self.detail_salt, self.detail.as_deref());
+        recomputed == self.detail_digest
+    }
+}
+
+/// Domain-separated SHA-256 over (salt, detail). Always returns 64-hex.
+///
+/// Canonical input: `PREFIX_OPDETAIL_V1 || u32_le(salt.len) || salt
+/// || u32_le(detail.len) || detail`. `detail = None` is encoded as
+/// length-0, producing a deterministic "no detail" digest.
+pub fn compute_detail_digest(salt: &[u8], detail: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(PREFIX_OPDETAIL_V1);
+    h.update((salt.len() as u32).to_le_bytes());
+    h.update(salt);
+    let d = detail.unwrap_or("");
+    h.update((d.len() as u32).to_le_bytes());
+    h.update(d.as_bytes());
+    hex::encode(h.finalize())
+}
+
 // ─── Event Schema (PART 6) ───
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -193,6 +328,24 @@ pub struct GVMEvent {
     /// Only config_load events carry the full GvmIntegrityContext.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_integrity_ref: Option<String>,
+
+    /// Phase 1 split form of the operation field — separates
+    /// non-sensitive `category` from sensitive `detail` so external
+    /// proofs can be redacted without invalidating `event_hash`.
+    ///
+    /// Behavior:
+    /// - `None` (legacy events) → `compute_event_hash` uses the
+    ///   v1 algorithm over `operation: String`.
+    /// - `Some(desc)` (v2 events) → `compute_event_hash` uses the
+    ///   v2 algorithm: `category` and `detail_digest` are hashed
+    ///   instead of the raw operation string.
+    ///
+    /// New event-creation paths populate this when the operation
+    /// carries PII-bearing detail (URL path, DNS subdomain, vault
+    /// key). Category-only paths (config_load, etc.) may still
+    /// supply an `OperationDescriptor::category_only(...)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_descriptor: Option<OperationDescriptor>,
 }
 
 // ─── Integrity Context (execution environment reproducibility) ───

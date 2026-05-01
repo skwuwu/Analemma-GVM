@@ -322,6 +322,7 @@ async fn edge_concurrent_status_update_no_crash() {
                 llm_trace: None,
                 default_caution: false,
                 config_integrity_ref: None,
+                operation_descriptor: None,
             };
             ledger
                 .append_durable(&event)

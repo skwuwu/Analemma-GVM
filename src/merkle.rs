@@ -30,23 +30,68 @@ use sha2::{Digest, Sha256};
 
 /// Compute the SHA-256 hash of an event's audit-critical fields.
 ///
-/// Fields included: event_id, trace_id, agent_id, operation, decision,
-/// decision_source, status, enforcement_point, timestamp, payload.content_hash.
+/// Dispatcher (Phase 1):
+/// - `event.operation_descriptor.is_some()` → v2 hash
+///   (uses `category` and `detail_digest` instead of raw operation)
+/// - `event.operation_descriptor.is_none()` → v1 hash (legacy)
+///   (uses `operation: String` directly)
 ///
-/// These fields cover all audit-significant properties. In particular,
-/// `status` prevents undetected Pending→Confirmed tampering, and
+/// Both versions share the same set of audit-critical fields:
+/// event_id, trace_id, agent_id, operation*, decision, decision_source,
+/// status, enforcement_point, timestamp, payload.content_hash.
+/// The only difference is whether the "operation" axis is taken
+/// monolithically (v1) or split into category + salted detail digest
+/// (v2 — privacy-preserving for redacted proofs).
+///
+/// `status` field prevents undetected Pending→Confirmed tampering;
 /// `decision_source` / `enforcement_point` prevent attribution falsification.
 pub fn compute_event_hash(event: &GVMEvent) -> String {
+    match &event.operation_descriptor {
+        Some(desc) => compute_event_hash_v2(event, desc),
+        None => compute_event_hash_v1(event),
+    }
+}
+
+/// Legacy v1 event hash. Uses `event.operation: String` directly.
+/// Kept for backward compatibility with WAL entries written before
+/// the v2 dispatcher landed.
+fn compute_event_hash_v1(event: &GVMEvent) -> String {
     let mut hasher = Sha256::new();
-    // Domain separation prefix prevents cross-context hash collisions
-    hasher.update(b"gvm-event-v1:");
-    // Length-prefixed fields prevent delimiter-based collision attacks
-    // (e.g. event_id="a|b" + trace_id="c" vs event_id="a" + trace_id="b|c")
+    hasher.update(gvm_types::PREFIX_EVENT_V1);
     for field in &[
         event.event_id.as_str(),
         event.trace_id.as_str(),
         event.agent_id.as_str(),
         event.operation.as_str(),
+        event.decision.as_str(),
+        event.decision_source.as_str(),
+        &format!("{:?}", event.status),
+        event.enforcement_point.as_str(),
+        &event.timestamp.to_rfc3339(),
+        event.payload.content_hash.as_str(),
+    ] {
+        hasher.update((field.len() as u32).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// Phase 1 v2 event hash. Uses `category` and `detail_digest` from
+/// the OperationDescriptor instead of `event.operation: String`.
+///
+/// Privacy property: when the verifier holds a redacted proof
+/// (no `detail`, no `detail_salt`, but `detail_digest` preserved),
+/// `compute_event_hash_v2` recomputes the same hash as the producer
+/// — so audit verification works without leaking the operation detail.
+pub fn compute_event_hash_v2(event: &GVMEvent, desc: &gvm_types::OperationDescriptor) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(gvm_types::PREFIX_EVENT_V2);
+    for field in &[
+        event.event_id.as_str(),
+        event.trace_id.as_str(),
+        event.agent_id.as_str(),
+        desc.category.as_str(),
+        desc.detail_digest.as_str(),
         event.decision.as_str(),
         event.decision_source.as_str(),
         &format!("{:?}", event.status),
@@ -545,6 +590,7 @@ mod tests {
             llm_trace: None,
             default_caution: false,
             config_integrity_ref: None,
+            operation_descriptor: None,
         };
         let prod_hash = compute_event_hash(&event);
 
@@ -582,5 +628,153 @@ mod tests {
         let root_ab = compute_merkle_root(&[a.clone(), b.clone()]).unwrap();
         let root_ba = compute_merkle_root(&[b, a]).unwrap();
         assert_ne!(root_ab, root_ba, "order must matter");
+    }
+
+    // ─── Phase 1 — event_hash dispatcher (v1/v2) ────────────────
+
+    fn make_test_event(operation: &str) -> GVMEvent {
+        GVMEvent {
+            event_id: "evt-001".to_string(),
+            trace_id: "trace-001".to_string(),
+            parent_event_id: None,
+            agent_id: "agent-1".to_string(),
+            tenant_id: None,
+            session_id: "sess".to_string(),
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-05-02T12:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            operation: operation.to_string(),
+            resource: ResourceDescriptor::default(),
+            context: HashMap::new(),
+            transport: None,
+            decision: "Allow".to_string(),
+            decision_source: "SRR".to_string(),
+            matched_rule_id: None,
+            enforcement_point: "proxy".to_string(),
+            status: EventStatus::Confirmed,
+            payload: PayloadDescriptor::default(),
+            nats_sequence: None,
+            event_hash: None,
+            llm_trace: None,
+            default_caution: false,
+            config_integrity_ref: None,
+            operation_descriptor: None,
+        }
+    }
+
+    #[test]
+    fn dispatcher_uses_v1_when_descriptor_is_none() {
+        // Legacy event (no descriptor) MUST hash through v1 path.
+        // Pin that the dispatcher returns the same value as the old
+        // monolithic compute_event_hash would have, so existing WAL
+        // entries continue to verify after this commit lands.
+        let event = make_test_event("POST /api/v1/x");
+        assert!(event.operation_descriptor.is_none());
+        let dispatched = compute_event_hash(&event);
+        let v1_direct = super::compute_event_hash_v1(&event);
+        assert_eq!(dispatched, v1_direct, "None descriptor must dispatch to v1");
+    }
+
+    #[test]
+    fn dispatcher_uses_v2_when_descriptor_present() {
+        let mut event = make_test_event("POST /api/v1/x");
+        let desc = gvm_types::OperationDescriptor::new(
+            "http.POST",
+            Some("/api/v1/x".to_string()),
+            vec![1u8; 16],
+        );
+        event.operation_descriptor = Some(desc.clone());
+
+        let dispatched = compute_event_hash(&event);
+        let v2_direct = compute_event_hash_v2(&event, &desc);
+        assert_eq!(dispatched, v2_direct, "Some descriptor must dispatch to v2");
+    }
+
+    #[test]
+    fn v1_and_v2_produce_distinct_hashes_for_same_event() {
+        // Domain-separation prefix differs, so even with the same
+        // logical event content the two algorithms produce different
+        // hashes. This is intentional — verifiers MUST know which
+        // version they're using and not silently accept either.
+        let mut event = make_test_event("POST /api/v1/x");
+        let desc = gvm_types::OperationDescriptor::new(
+            "http.POST",
+            Some("/api/v1/x".to_string()),
+            vec![1u8; 16],
+        );
+        let v1 = compute_event_hash_v1(&event);
+        event.operation_descriptor = Some(desc.clone());
+        let v2 = compute_event_hash_v2(&event, &desc);
+        assert_ne!(v1, v2, "v1 and v2 hashes must be distinct");
+    }
+
+    #[test]
+    fn v2_hash_redaction_preserving_property() {
+        // The privacy goal: redacting (detail, salt) from the
+        // descriptor MUST NOT change the v2 hash output, because
+        // the hash uses detail_digest (which survives redaction).
+        let event = make_test_event("POST /api/v1/secret");
+        let salt = vec![42u8; 16];
+        let full = gvm_types::OperationDescriptor::new(
+            "http.POST",
+            Some("/api/v1/secret".to_string()),
+            salt,
+        );
+        let redacted = gvm_types::OperationDescriptor {
+            category: full.category.clone(),
+            detail: None,
+            detail_salt: Vec::new(),
+            detail_digest: full.detail_digest.clone(),
+        };
+
+        let h_full = compute_event_hash_v2(&event, &full);
+        let h_redacted = compute_event_hash_v2(&event, &redacted);
+        assert_eq!(
+            h_full, h_redacted,
+            "v2 hash must be invariant under detail/salt redaction \
+             when detail_digest is preserved"
+        );
+    }
+
+    #[test]
+    fn v2_hash_changes_with_different_detail_digest() {
+        let event = make_test_event("POST /api/v1/x");
+        let d1 = gvm_types::OperationDescriptor::new(
+            "http.POST",
+            Some("/api/v1/x".to_string()),
+            vec![1u8; 16],
+        );
+        let d2 = gvm_types::OperationDescriptor::new(
+            "http.POST",
+            Some("/api/v1/x".to_string()),
+            vec![2u8; 16], // different salt → different digest
+        );
+        assert_ne!(d1.detail_digest, d2.detail_digest);
+
+        let h1 = compute_event_hash_v2(&event, &d1);
+        let h2 = compute_event_hash_v2(&event, &d2);
+        assert_ne!(h1, h2, "different detail_digest must affect v2 hash");
+    }
+
+    #[test]
+    fn v2_hash_uses_category_not_legacy_operation() {
+        // Two events: same category, different legacy operation.
+        // v2 hash must NOT depend on the legacy operation field.
+        let mut e1 = make_test_event("POST /api/v1/x");
+        let mut e2 = make_test_event("DIFFERENT_LEGACY_STRING");
+        let desc = gvm_types::OperationDescriptor::new(
+            "http.POST",
+            Some("/api/v1/x".to_string()),
+            vec![5u8; 16],
+        );
+        e1.operation_descriptor = Some(desc.clone());
+        e2.operation_descriptor = Some(desc.clone());
+        let h1 = compute_event_hash(&e1);
+        let h2 = compute_event_hash(&e2);
+        assert_eq!(
+            h1, h2,
+            "v2 hash must be independent of legacy operation field — \
+             event.operation should NOT be in canonical input"
+        );
     }
 }

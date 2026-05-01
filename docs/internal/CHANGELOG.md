@@ -52,6 +52,157 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
+### 2026-05-02: Phase 1.A — OperationDescriptor + event_hash v1/v2 dispatcher
+
+**What changed:**
+
+Privacy-preserving event_hash. Splits the previously-monolithic
+`operation: String` field into a non-sensitive `category` (e.g.
+`http.POST`, `gvm.dns.query`) and an optional sensitive `detail`
+(URL path, DNS subdomain) plus a **salted SHA-256 digest** of
+the detail. The new `compute_event_hash_v2` uses `category +
+detail_digest` instead of the raw operation string, so an external
+auditor receiving a redacted proof can verify event_hash without
+learning the detail.
+
+This is Phase 1.A — type foundation + hash dispatcher only. Phase 1.B
+will migrate production event-creation sites to populate
+`operation_descriptor` (currently all sites set it to `None`, so
+v1 hash continues for every shipped event; v2 path is exercised
+by tests only).
+
+**New types** (`crates/gvm-types/src/lib.rs`):
+
+```rust
+pub struct OperationDescriptor {
+    pub category: String,            // "http.POST" — public-safe
+    pub detail: Option<String>,      // "/api/v1/user/1234/delete"
+    pub detail_salt: Vec<u8>,        // 16 random bytes (caller-supplied)
+    pub detail_digest: String,       // SHA256("gvm-opdetail-v1:" || ...)
+}
+
+pub fn compute_detail_digest(salt: &[u8], detail: Option<&str>) -> String;
+
+pub const PREFIX_EVENT_V1: &[u8] = b"gvm-event-v1:";
+pub const PREFIX_EVENT_V2: &[u8] = b"gvm-event-v2:";
+pub const PREFIX_OPDETAIL_V1: &[u8] = b"gvm-opdetail-v1:";
+```
+
+`OperationDescriptor::new(category, detail, salt)` builds with
+caller-supplied salt (production uses `rand::thread_rng()`; tests
+pass deterministic bytes for reproducibility). `category_only(...)`
+forces empty salt + canonical "no detail" digest.
+
+**Threat model addressed**:
+- Attacker holds `event_hash` but not the salt → cannot brute-force
+  the detail string from a known operation alphabet.
+- Verifier with redacted proof (no salt, no detail, only digest) →
+  recomputes `event_hash` via `category + digest`. Privacy preserved.
+- Verifier with full proof (salt + detail + digest) → can
+  re-compute `detail_digest` to confirm the stored value.
+
+**`GVMEvent` schema additions** (backward-compatible):
+
+```rust
+pub struct GVMEvent {
+    // ... existing fields unchanged ...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_descriptor: Option<OperationDescriptor>,
+}
+```
+
+`#[serde(default, skip_serializing_if = ...)]` keeps legacy WAL
+records round-trippable. Old WAL events deserialize with `None`
+descriptor → dispatch through v1 hash.
+
+**`compute_event_hash` dispatcher** (`src/merkle.rs`):
+
+```rust
+pub fn compute_event_hash(event: &GVMEvent) -> String {
+    match &event.operation_descriptor {
+        Some(desc) => compute_event_hash_v2(event, desc),
+        None      => compute_event_hash_v1(event),
+    }
+}
+```
+
+Phase 1.B migration cost is bounded: when a callsite is updated to
+set `operation_descriptor: Some(...)`, the dispatcher silently
+switches that event's hash to v2. No verifier-side change needed —
+the existing `event_hash` field stores whichever version was used
+at write time, and verifiers re-dispatch to compare.
+
+**Standards (§1.6 expanded)**: domain-separation prefix catalog
+table added with all 7 active prefixes (`gvm-event-v1:`,
+`gvm-event-v2:`, `gvm-opdetail-v1:`, `gvm-node-v1:`, `gvm-seal-v1:`,
+`gvm-anchor-v1:`, `gvm-thinking-v1|`). Adding a new hash function
+requires adding a new prefix entry.
+
+**Tests added (24 new, all passing)**:
+
+`crates/gvm-types/tests/operation_descriptor.rs` (16 tests):
+- detail_digest format (64 hex lowercase)
+- determinism for identical inputs
+- different salt → different digest
+- different detail → different digest
+- None detail canonical value
+- domain prefix is load-bearing
+- descriptor with detail populates salt + digest correctly
+- category_only forces empty salt
+- new() with None detail ignores supplied salt
+- verify_digest round-trips
+- verify_digest detects detail tamper
+- verify_digest detects salt tamper
+- serde roundtrip preserves digest
+- redacted form's digest stays usable for outer hash
+- redacted form's empty fields skip serialization
+- prefix catalog distinct + versioned
+
+`src/merkle.rs::tests` (6 new tests in the existing module):
+- dispatcher uses v1 when descriptor is None
+- dispatcher uses v2 when descriptor is Some
+- v1 and v2 produce distinct hashes for same event (prefix discipline)
+- v2 hash redaction-preserving (h(full) == h(redacted_with_digest))
+- v2 hash changes with different detail_digest
+- v2 hash uses category, not legacy operation string
+
+**Migration cost** (Phase 1.A this commit):
+- Added `operation_descriptor: None` to 24 GVMEvent construction
+  sites across `src/` and `tests/`. Mechanical change via Python
+  regex insertion after each `config_integrity_ref:` field, with
+  indentation preservation. No semantic change to existing events.
+
+**Affected files**:
+- `crates/gvm-types/src/lib.rs` — new type, prefix constants,
+  GVMEvent.operation_descriptor
+- `src/merkle.rs` — dispatcher + v1/v2 split + 6 new tests
+- 6 production source files — `operation_descriptor: None` added
+  at 15 sites
+- 9 test files — `operation_descriptor: None` added at 9 sites
+- `crates/gvm-types/tests/operation_descriptor.rs` — NEW, 16 tests
+- `docs/internal/GVM_CODE_STANDARDS.md` — §1.6 prefix catalog
+
+**Verification**:
+- `cargo test --workspace --tests`: 613 passed / 0 failed / 4 ignored
+  (was 589; +24 new tests)
+- `cargo fmt --all -- --check`: clean
+- `cargo check --workspace --tests`: clean
+
+**Backward compatibility**: zero. Existing WAL files round-trip
+identically (descriptor is optional, serde-skipped when None).
+v1 hash continues to be computed for every existing event.
+
+**Open follow-ups (next commits in v3 series)**:
+- Phase 1.B: migrate production event-creation sites to populate
+  `operation_descriptor` for sensitive operations (HTTP, MITM,
+  DNS, vault). Until then, v2 path is exercised by tests only.
+- Phase 2 wiring: `TripleState` ArcSwap RCU + group commit rewrite
+  to emit `BatchSealRecord` + `GvmStateAnchor` per batch.
+- Phase 2.5: `verify_anchor_chain` (timing audit).
+- Phase 3: leaves-only checkpoint tree (rightmost-path cache).
+- Phase 5: `prev_anchor_hash` in `GvmIntegrityContext` (replay
+  defense).
+
 ### 2026-05-02: Phase 0 + Phase 2 type foundation — anchor / seal / leaves_blob
 
 **What changed (v3 design Phase 0 + Phase 2 type-only foundation):**

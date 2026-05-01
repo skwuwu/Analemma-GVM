@@ -476,6 +476,7 @@ async fn ledger_concurrent_spawns_stay_bounded() {
                 llm_trace: None,
                 default_caution: false,
                 config_integrity_ref: None,
+                operation_descriptor: None,
             };
             ledger
                 .append_durable(&event)
@@ -606,6 +607,7 @@ async fn group_commit_primary_fail_emergency_wal_catches() {
             llm_trace: None,
             default_caution: false,
             config_integrity_ref: None,
+            operation_descriptor: None,
         };
         ledger
             .append_durable(&event)
@@ -644,6 +646,7 @@ async fn group_commit_primary_fail_emergency_wal_catches() {
                 llm_trace: None,
                 default_caution: false,
                 config_integrity_ref: None,
+                operation_descriptor: None,
             };
             ledger.append_durable(&event).await
         }));
@@ -705,6 +708,7 @@ async fn group_commit_primary_fail_emergency_wal_catches() {
         llm_trace: None,
         default_caution: false,
         config_integrity_ref: None,
+        operation_descriptor: None,
     };
     // After disabling error injection, writes should succeed via primary WAL again
     ledger
@@ -1180,6 +1184,7 @@ async fn emergency_wal_catches_events_when_primary_fails() {
             llm_trace: None,
             default_caution: false,
             config_integrity_ref: None,
+            operation_descriptor: None,
         };
         // With emergency WAL, this should succeed even though primary is broken
         ledger
@@ -1257,6 +1262,7 @@ async fn emergency_wal_catches_events_when_primary_fails() {
         llm_trace: None,
         default_caution: false,
         config_integrity_ref: None,
+        operation_descriptor: None,
     };
     ledger
         .append_durable(&event)

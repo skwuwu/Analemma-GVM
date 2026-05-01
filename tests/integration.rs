@@ -1601,6 +1601,7 @@ fn make_test_event(event_id: &str, operation: &str) -> GVMEvent {
         llm_trace: None,
         default_caution: false,
         config_integrity_ref: None,
+        operation_descriptor: None,
     }
 }
 

@@ -141,6 +141,25 @@ hasher.update(event.event_id.as_bytes());
 
 - No custom cryptographic constructions. Use audited crates only (aes-gcm, sha2, hex).
 
+**Domain separation prefix catalog** (every SHA-256 invocation in
+the codebase MUST use one of these prefixes; adding a new hash
+function REQUIRES adding a new prefix):
+
+| Prefix | Function | Source |
+|--------|----------|--------|
+| `gvm-event-v1:` | `compute_event_hash_v1` (legacy operation: String) | `crates/gvm-types::PREFIX_EVENT_V1` |
+| `gvm-event-v2:` | `compute_event_hash_v2` (OperationDescriptor) | `crates/gvm-types::PREFIX_EVENT_V2` |
+| `gvm-opdetail-v1:` | `compute_detail_digest` (salted detail digest) | `crates/gvm-types::PREFIX_OPDETAIL_V1` |
+| `gvm-node-v1:` | Merkle internal node hash | `src/merkle.rs` (literal) |
+| `gvm-seal-v1:` | `BatchSealRecord::seal_hash` | `crates/gvm-types::PREFIX_SEAL_V1` |
+| `gvm-anchor-v1:` | `GvmStateAnchor::compute_hash` | `crates/gvm-types::PREFIX_ANCHOR_V1` |
+| `gvm-thinking-v1\|` | LLM thinking content privacy hash | `src/llm_trace.rs` (literal) |
+
+Tests under `crates/gvm-types/tests/operation_descriptor.rs` and
+`crates/gvm-types/tests/anchor.rs` pin that each prefix is
+load-bearing — removing it produces a different hash, so a
+silent migration to a non-prefixed hash would break verification.
+
 ### 1.7 Unsafe & FFI Discipline
 
 GVM uses `unsafe` for Linux syscalls (clone, fork, waitpid, getsockopt, prctl, seccomp) and Wasm FFI. "Rust means safe" is false when `unsafe` is present.

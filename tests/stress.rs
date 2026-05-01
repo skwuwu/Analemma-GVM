@@ -46,6 +46,7 @@ fn make_test_event(id: &str) -> GVMEvent {
         llm_trace: None,
         default_caution: false,
         config_integrity_ref: None,
+        operation_descriptor: None,
     }
 }
 

@@ -76,6 +76,7 @@ fn evt(seq: u64) -> GVMEvent {
         llm_trace: None,
         default_caution: false,
         config_integrity_ref: None,
+        operation_descriptor: None,
     }
 }
 

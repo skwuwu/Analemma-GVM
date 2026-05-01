@@ -697,6 +697,7 @@ impl Ledger {
             llm_trace: None,
             default_caution: false,
             config_integrity_ref: Some(context_hash.clone()),
+            operation_descriptor: None,
         };
 
         self.append_durable(&event).await?;
@@ -805,6 +806,7 @@ pub fn build_dns_event(
         llm_trace: None,
         default_caution: true,
         config_integrity_ref: None,
+        operation_descriptor: None,
     }
 }
 
