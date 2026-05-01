@@ -52,6 +52,153 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
+### 2026-05-02: Phase 0 + Phase 2 type foundation — anchor / seal / leaves_blob
+
+**What changed (v3 design Phase 0 + Phase 2 type-only foundation):**
+
+This is the first concrete code shipping the v3 logging architecture.
+Type definitions and verifier strip-evasion guard only — group commit
+task wiring is deferred to a follow-up commit. New types are defined,
+documented with §1.6 domain-separation prefixes, and exercised by
+unit tests; existing WAL behavior is unchanged.
+
+**Phase 0 — naming + strip-evasion guard:**
+
+1. `Ledger::record_config_load` parameter renamed
+   `prev_config_hash` → `prev_context_hash`. The value passed by
+   production callers (`state.current_integrity_ref()`) was always
+   a `context_hash`, never a `config_hash`. Doc updated to match.
+
+2. `verify_integrity_chain` (in `crates/gvm-types/src/lib.rs`)
+   now treats `(prev_seen=None, claimed_prev=Some(_))` as a chain
+   break. The OLD rule "(None, _) → accept" let an attacker truncate
+   older WAL segments and the surviving "first" config_load passed
+   verification even when it claimed `Some(prior)`. The NEW rule
+   accepts only `(None, None)` as genuine genesis. Test:
+   `truncated_history_first_with_some_prev_is_flagged` in
+   `crates/gvm-types/tests/verify_chain.rs`.
+
+**Phase 2 — type foundation (no wiring yet):**
+
+New constants in `crates/gvm-types/src/lib.rs`:
+
+- `GENESIS_HASH_HEX` = 64 hex zeros — canonical "no-prior" sentinel.
+  Used as canonical-input substitute for `None` in
+  `BatchSealRecord::seal_hash` and `GvmStateAnchor::compute_hash`.
+  Keeps the hash deterministic across the genesis transition.
+- `PREFIX_SEAL_V1` = `b"gvm-seal-v1:"` (domain separation §1.6)
+- `PREFIX_ANCHOR_V1` = `b"gvm-anchor-v1:"`
+
+New types:
+
+- `BatchSealRecord` — captures (context_hash, checkpoint_root,
+  prev_anchor) at batch close time. Its `seal_hash()` will become
+  the LAST leaf of the batch's Merkle tree (via the next wiring
+  commit), making seal-record tampering propagate to merkle_root
+  and to anchor_hash. Domain-separated SHA-256 with length-prefixed
+  fields.
+
+- `GvmStateAnchor` — finality binding for a sealed batch. Combines
+  batch_root + context_hash + checkpoint_root + prev_anchor under
+  one anchor_hash. Methods: `seal()` constructs from a seal record,
+  `verify_self_hash()` recomputes and compares.
+
+- `AnchorSignature` enum: `SelfSigned` (Ed25519, cheap, no time
+  proof), `Hsm` (hardware attestation report), `Tsa` (RFC 3161
+  TimeStampToken — only variant that defeats clock rewind).
+
+- `LeavesFormat::Sha256Concat` — encoding marker for
+  `MerkleBatchRecord::leaves_blob`, future-proofs against algorithm
+  changes (SHA3, BLAKE3) without ambiguity.
+
+`MerkleBatchRecord` extended with three optional fields, all
+`#[serde(default, skip_serializing_if = ...)]` so legacy WAL
+records continue to round-trip without unknown-key errors:
+
+- `leaves_blob: Vec<u8>` — 32-byte SHA-256 hashes concatenated
+  (base64 in JSON). Length invariant is exactly
+  `(event_count + 1) * 32` for Phase 2+ batches (events + 1 seal).
+- `seal_position: Option<usize>` — index in leaves_blob where the
+  seal_hash sits. Always `event_count` for Phase 2+ batches.
+- `leaves_format: Option<LeavesFormat>` — encoding marker.
+
+New methods on `MerkleBatchRecord`:
+- `leaves_iter()` — zero-copy `chunks_exact(32)` iteration over the
+  blob (per implementation guide ②). No allocation; iterator
+  yields `&[u8]` slices pointing into the original buffer.
+- `leaf(index)`, `seal_leaf()` — bounds-checked access.
+- `validate_leaves_invariant()` — runtime check of length /
+  seal_position consistency. Both legacy (empty blob) and Phase 2
+  (full blob) forms pass.
+
+**Standards doc updates** (`docs/internal/GVM_CODE_STANDARDS.md`):
+
+- §4.6 Anchor Finality — every batch produces exactly one anchor;
+  anchor_hash is self-consistent; chain link is mandatory.
+- §4.7 Per-event vs Anchor Context Semantics — `event.config_integrity_ref`
+  is point-of-event truth; `anchor.context_hash` is point-of-witness
+  truth; verifiers MUST NOT assume equality.
+- §4.8 Genesis & Strip-Evasion Guard — formal definition of
+  `GENESIS_HASH_HEX` substitution, formal definition of the new
+  (None, None) genesis rule, anchor chain audit recipe.
+
+**Tests added (25 new, all passing):**
+
+- `crates/gvm-types/tests/anchor.rs` — 18 tests covering:
+  - GENESIS sentinel format
+  - Domain prefixes versioned and distinct
+  - `BatchSealRecord::seal_hash` determinism + every-field-affects-hash
+  - Genesis substitution (None ↔ Some(GENESIS_HASH_HEX) → equal hash)
+  - Domain prefix is load-bearing (no-prefix variant differs)
+  - hex output format (64 chars lowercase)
+  - `GvmStateAnchor::seal` produces self-consistent hash
+  - `verify_self_hash` detects field tamper
+  - Anchor chain link affects anchor_hash
+  - Serde roundtrip preserves verifiability
+  - `MerkleBatchRecord` legacy/Phase-2 invariant checks (5 cases)
+  - `chunks_exact(32)` zero-copy verified by pointer arithmetic
+  - Backward-compat: legacy serialization omits new fields
+
+- `crates/gvm-types/tests/verify_chain.rs` — 2 new tests:
+  - `truncated_history_first_with_some_prev_is_flagged` (strip-evasion)
+  - `genuine_genesis_with_none_prev_is_accepted` (regression guard)
+
+**Why now:** the v3 design discussion in this session converged on
+three foundational primitives (anchor + seal + leaves_blob) that
+together form the new logging structure. Landing them as types-only
+first lets the next commit (group commit task rewrite) target stable
+APIs rather than design-and-implement-in-one-go.
+
+**Backward compatibility:** zero — existing WAL files round-trip
+identically. Phase 2 fields all serde-skip when empty/None. Existing
+verifiers that don't know about anchors continue to work on
+pre-anchor WALs.
+
+**Affected files:**
+- `crates/gvm-types/Cargo.toml` — add `hex = "0.4"` dep
+- `crates/gvm-types/src/lib.rs` — new constants, types, methods,
+  strip-evasion guard
+- `crates/gvm-types/tests/anchor.rs` — NEW, 18 tests
+- `crates/gvm-types/tests/verify_chain.rs` — 2 new tests
+- `src/ledger.rs` — param rename, MerkleBatchRecord constructor
+  populated with legacy defaults for new fields
+- `docs/internal/GVM_CODE_STANDARDS.md` — §4.6/§4.7/§4.8
+
+**Verification:**
+- `cargo test --workspace --tests` : 589 passed / 0 failed / 4 ignored
+  (was 564 before — +25 new tests)
+- `cargo fmt --all -- --check` : clean
+- `cargo check --workspace --tests` : clean
+
+**Open follow-ups (next commits in v3 series):**
+- Phase 1: `OperationDescriptor` split + event_hash v2 (privacy)
+- Phase 2 wiring: `TripleState` ArcSwap RCU + group commit rewrite
+  to emit BatchSealRecord + GvmStateAnchor per batch
+- Phase 2.5: `verify_anchor_chain` (timing audit)
+- Phase 3: leaves-only checkpoint tree (rightmost-path cache per
+  feedback ①, replacing current Vec<String> recompute)
+- Phase 5: `prev_anchor_hash` binding in `GvmIntegrityContext` v3
+
 ### 2026-05-01: GVM_TEST_DNS_WINDOW_SEC → config (post-§6.5 sweep)
 
 **What changed:**

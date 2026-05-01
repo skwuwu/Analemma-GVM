@@ -338,13 +338,20 @@ async fn flush_batch_with_merkle(
     // Compute Merkle root
     let merkle_root = crate::merkle::compute_merkle_root(&leaf_hashes)?;
 
-    // Build batch record
+    // Build batch record. Phase 2 anchor/seal/leaves_blob fields
+    // remain at their legacy-empty defaults until the group_commit
+    // task is rewritten to thread them through (Phase 2 wiring,
+    // separate commit). Reading existing WAL is unaffected because
+    // serde defaults skip these on deserialize.
     let batch_record = MerkleBatchRecord {
         batch_id,
         merkle_root: merkle_root.clone(),
         prev_batch_root: prev_batch_root.clone(),
         event_count: batch.len(),
         timestamp: chrono::Utc::now(),
+        leaves_blob: Vec::new(),
+        seal_position: None,
+        leaves_format: None,
     };
 
     let mut batch_record_data = serde_json::to_vec(&batch_record)?;
@@ -616,11 +623,19 @@ impl Ledger {
     /// reproducibility and tamper detection.
     /// Behavioral events reference this context via `config_integrity_ref`.
     ///
+    /// `prev_context_hash` — the previous integrity context's
+    /// `context_hash()` (NOT its `config_hash`). Production callers
+    /// pass `state.current_integrity_ref()` (which is a context_hash),
+    /// and this value is stored as `previous_state` in the new
+    /// `GvmIntegrityContext`. Naming: the parameter was previously
+    /// `prev_config_hash` which was misleading — both producer and
+    /// consumer always used context_hash, not config_hash.
+    ///
     /// Returns the context hash (for attaching to subsequent behavioral events).
     pub async fn record_config_load(
         &self,
         config_files: &[(&str, &std::path::Path)],
-        prev_config_hash: Option<String>,
+        prev_context_hash: Option<String>,
     ) -> Result<String> {
         use sha2::{Digest, Sha256};
 
@@ -650,7 +665,7 @@ impl Ledger {
         let config_hash = format!("{:x}", Sha256::digest(combined_hash_input.as_bytes()));
 
         // Create integrity context (Local hash-only for standalone users)
-        let integrity = gvm_types::GvmIntegrityContext::local(config_hash, prev_config_hash);
+        let integrity = gvm_types::GvmIntegrityContext::local(config_hash, prev_context_hash);
         let context_hash = integrity.context_hash();
 
         // Embed full context in config_load event (behavioral events only carry the hash)

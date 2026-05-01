@@ -406,6 +406,110 @@ payload.content_hash  // integrity of associated data
 
 No decision may depend on state that is not recorded in the WAL.
 
+### 4.6 Anchor Finality (Phase 2+)
+
+Every batch flush produces a `GvmStateAnchor` that combines:
+
+1. The batch's Merkle root (events + seal record as last leaf)
+2. The active `GvmIntegrityContext::context_hash()` at seal time
+3. The global checkpoint aggregator root at seal time
+4. The hash of the immediately previous anchor
+
+The anchor's `anchor_hash = SHA-256("gvm-anchor-v1:" || canonical fields)`.
+This hash is what an HSM signs / what an RFC 3161 TSA timestamps /
+what an external auditor receives as the trust root inside a `GvmProof`.
+
+**Required**:
+- Every batch with at least one event MUST produce exactly one anchor.
+- An anchor's `anchor_hash` MUST be a self-consistent recomputation
+  from its other fields. `verify_self_hash()` MUST return true.
+- The chain `anchor_N.prev_anchor == anchor_{N-1}.anchor_hash` MUST hold.
+- An audit detecting `anchor_N.prev_anchor != anchor_{N-1}.anchor_hash`
+  MUST flag the chain break.
+
+**Genesis**: the very first anchor in a fresh installation has
+`prev_anchor = None`. All subsequent anchors must have `prev_anchor =
+Some(...)`. See §4.8 for the full bootstrap convention.
+
+### 4.7 Per-Event vs Anchor Context Semantics
+
+Behavioral events carry the `config_integrity_ref` they observed at
+request handling time:
+
+```rust
+// In a request handler:
+let ref_at_handler = state.current_integrity_ref();   // CTX_OLD
+// ... build event with config_integrity_ref = CTX_OLD ...
+// (somewhere else, reload swaps active ref to CTX_NEW)
+ledger.append(event).await;
+```
+
+Batch anchors carry the `context_hash` observed at seal time:
+
+```rust
+// In the group commit task at seal:
+let triple = self.triple_state.snapshot();
+// triple.context_hash may be CTX_NEW even though the queue contains
+// events with config_integrity_ref = CTX_OLD.
+```
+
+These two values MAY legitimately differ within a single batch when
+reload happens during the batch window. This is documented behavior,
+NOT a bug.
+
+**Verifier MUST NOT** assume `event.config_integrity_ref ==
+anchor.context_hash`. Instead:
+
+- Verify `event.config_integrity_ref` against the proof's included
+  `GvmIntegrityContext` (point-of-event truth — answers "which config
+  governed this specific event")
+- Verify `anchor.context_hash` against the chain (point-of-witness
+  truth — answers "what was the active config when the system sealed
+  this batch")
+
+Both are valid attestations of different facts. A `GvmProof` carries
+both so the verifier can cross-check whichever question the audit asks.
+
+### 4.8 Genesis & Strip-Evasion Guard
+
+**Bootstrap convention**:
+
+- `GENESIS_HASH_HEX = "00...00"` (64 hex zeros) is the canonical
+  "no prior" sentinel.
+- For hash inputs that need to bind to prior state but observe `None`,
+  substitute `GENESIS_HASH_HEX` into the canonical input. This keeps
+  the hash deterministic across the genesis transition (None ↔
+  Some("0000...")). Implementations MUST canonicalize via this
+  substitution, NOT skip the field.
+- The very first `GvmIntegrityContext` after a fresh install has
+  `previous_state = None`. The very first `GvmStateAnchor` has
+  `prev_anchor = None`.
+
+**Strip-evasion guard for `verify_integrity_chain`**:
+
+The audit walks WAL segments in chronological order. The OLD rule
+(pre-2026-05-02) was "accept the first config_load with whatever
+`previous_state` it claims" — that let an attacker truncate older
+segments and the surviving "first" passed. The NEW rule:
+
+```
+(prev_seen, claimed_prev_state):
+  (None, None)                  → genesis — accept once
+  (None, Some(_))               → BREAK (truncation evidence: the
+                                   surviving first claims a prior we
+                                   cannot find)
+  (Some(exp), Some(c)) if exp == c  → valid link
+  anything else                  → BREAK
+```
+
+Test: `truncated_history_first_with_some_prev_is_flagged` in
+`crates/gvm-types/tests/verify_chain.rs` pins this contract.
+
+**Anchor chain audit (Phase 2.5)**: the same logic applies to
+`verify_anchor_chain` walking `GvmStateAnchor` records. First
+anchor with `prev_anchor = None` is genesis-accepted; first anchor
+with `prev_anchor = Some(_)` is a truncation flag.
+
 ---
 
 ## 5. Concurrency Principles

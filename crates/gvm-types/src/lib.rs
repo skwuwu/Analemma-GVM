@@ -435,10 +435,43 @@ pub fn verify_integrity_chain(wal_path: &std::path::Path) -> IntegrityChainRepor
             let current_hash = current_hash.as_deref();
             let claimed_prev = ctx.get("previous_state").and_then(|v| v.as_str());
 
+            // §4.8 strip-evasion guard:
+            //
+            // The OLD rule was "(None, _) => accept" — accepting any
+            // first observation regardless of what it claimed for
+            // previous_state. That let an attacker truncate prior
+            // segments and the surviving "first" config_load passed
+            // even when it claimed Some(prior_hash).
+            //
+            // NEW rule:
+            //   (None, None)        → genuine genesis (only valid first form)
+            //   (None, Some(_))     → first observation claims prior history
+            //                         that we cannot find in the WAL we
+            //                         walked: truncation evidence → break
+            //   (Some(exp), Some(c)) if exp == c → normal chain link
+            //   anything else        → break
+            //
+            // The genesis case (None, None) is the ONE accepted "starts
+            // here" form. In the proxy this is the first config_load
+            // after a fresh install (record_config_load called with
+            // prev_context_hash = None on startup).
             match (&prev_config_hash, claimed_prev) {
-                (None, _) => {
-                    // First config_load we see — cannot verify; accept.
+                (None, None) => {
+                    // Genuine genesis — accept once.
                     valid_links += 1;
+                }
+                (None, Some(_)) => {
+                    // First config_load we see references a prior we
+                    // cannot validate against — that prior is missing
+                    // from the WAL we just walked. Truncation evidence.
+                    if first_break.is_none() {
+                        let event_id = parsed
+                            .get("event_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        first_break = Some(event_id);
+                    }
                 }
                 (Some(expected), Some(claimed)) if expected == claimed => {
                     valid_links += 1;
@@ -465,6 +498,275 @@ pub fn verify_integrity_chain(wal_path: &std::path::Path) -> IntegrityChainRepor
         valid_links,
         total_config_loads,
         first_break,
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Phase 2 — State Anchor Foundation
+// ════════════════════════════════════════════════════════════════════
+//
+// Three forest/chain structures (WAL batch trees, Config integrity
+// chain, Checkpoint forest) are tied together at every batch flush
+// via a `GvmStateAnchor`. The anchor is the unit of finality:
+// what is timestamped externally, what an HSM signs, what auditors
+// receive as the trust root for a `GvmProof`.
+//
+// Genesis convention: the very first anchor in a system has
+// `prev_anchor = None`. All subsequent anchors must reference the
+// prior anchor's `anchor_hash` via `prev_anchor`. Audit detects
+// truncation by walking the chain from genesis.
+//
+// Domain separation: every hash function in this module uses an
+// explicit `gvm-<scope>-v<n>:` prefix (see §1.6 of GVM_CODE_STANDARDS.md).
+// This prevents cross-context hash collisions and lets a future
+// algorithm change be detected without ambiguity.
+
+/// All-zeros 32-byte hash, hex-encoded. Acts as the canonical
+/// "no-prior" sentinel for the very first context/anchor in a
+/// fresh installation. Hashing functions that need to bind to
+/// prior state but observe `None` substitute this value into the
+/// canonical input — keeping the hash deterministic regardless
+/// of whether the absence is genuine genesis or stripped history.
+///
+/// Verifier policy (§4.8 in GVM_CODE_STANDARDS.md):
+///   - First context_load on disk MAY have previous_state = None.
+///     Audit accepts (None, None) only. Any (None, Some(_)) is a
+///     truncation signal — the prior is gone, history was lost.
+///   - First anchor MAY have prev_anchor = None. Same rule applies.
+pub const GENESIS_HASH_HEX: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Domain-separation prefix for `BatchSealRecord::seal_hash()`.
+/// Versioned so future seal-record schema changes (added fields,
+/// algorithm migration) do not silently produce colliding hashes.
+pub const PREFIX_SEAL_V1: &[u8] = b"gvm-seal-v1:";
+
+/// Domain-separation prefix for `GvmStateAnchor::compute_hash()`.
+pub const PREFIX_ANCHOR_V1: &[u8] = b"gvm-anchor-v1:";
+
+/// Per-batch seal record. Captured atomically at batch close from a
+/// `TripleState` snapshot (Phase 2 ledger integration). The seal's
+/// `seal_hash()` becomes the LAST leaf of the batch's Merkle tree —
+/// any tamper of the seal fields invalidates the batch root and,
+/// transitively, the anchor. This is the cryptographic enforcement
+/// of "the values witnessed at seal time are the values bound to
+/// this batch."
+///
+/// WAL line ordering for a Phase 2 batch:
+///
+///   1..N. event_1 .. event_N        (GVMEvent JSON)
+///   N+1.  seal                      (BatchSealRecord JSON)
+///   N+2.  batch_record              (MerkleBatchRecord JSON, leaves_blob
+///                                    contains all event_hashes plus
+///                                    the seal's seal_hash() at the end)
+///   N+3.  anchor                    (GvmStateAnchor JSON, anchor_hash
+///                                    binds batch_root + context + ckpt
+///                                    + prev_anchor)
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct BatchSealRecord {
+    /// Equals the batch_id of the immediately following MerkleBatchRecord.
+    pub seal_id: u64,
+    /// Wall-clock instant at which the seal was captured. The anchor's
+    /// timestamp inherits this value — they MUST match.
+    pub sealed_at: chrono::DateTime<chrono::Utc>,
+    /// Active integrity-context hash at seal time. Pin: this is the
+    /// system-level observation, NOT every event in the batch
+    /// necessarily uses this ref (see §4.7 — per-event ref vs
+    /// anchor context).
+    pub context_hash: String,
+    /// Global checkpoint aggregator root at seal time, or None if no
+    /// checkpoints have been registered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_root: Option<String>,
+    /// Hash of the immediately previous anchor, or None at genesis.
+    /// Bound into seal_hash so anchor-chain tampering breaks the
+    /// batch_root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_anchor: Option<String>,
+}
+
+impl BatchSealRecord {
+    /// Domain-separated SHA-256 over seal fields. This hash is the
+    /// LAST LEAF of the batch Merkle tree, so any tamper propagates
+    /// to merkle_root and to anchor_hash.
+    pub fn seal_hash(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(PREFIX_SEAL_V1);
+        for f in [
+            &self.seal_id.to_le_bytes()[..],
+            &self.sealed_at.timestamp().to_le_bytes(),
+            self.context_hash.as_bytes(),
+            self.checkpoint_root
+                .as_deref()
+                .unwrap_or(GENESIS_HASH_HEX)
+                .as_bytes(),
+            self.prev_anchor
+                .as_deref()
+                .unwrap_or(GENESIS_HASH_HEX)
+                .as_bytes(),
+        ] {
+            h.update((f.len() as u32).to_le_bytes());
+            h.update(f);
+        }
+        h.finalize().into()
+    }
+
+    /// Hex-encoded form of `seal_hash()`. Convenience for logging
+    /// and for embedding as a hex string in MerkleBatchRecord
+    /// representations that prefer hex over binary.
+    pub fn seal_hash_hex(&self) -> String {
+        hex::encode(self.seal_hash())
+    }
+}
+
+/// Per-batch state anchor — the finality binding for `(WAL batch,
+/// active config, checkpoint state)` at the moment a batch was sealed.
+///
+/// External attestation (HSM signature, RFC 3161 timestamp) attaches
+/// to `anchor_hash`. A `GvmProof` ships ONE anchor and lets a
+/// verifier reconstruct everything else.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct GvmStateAnchor {
+    /// Schema version for forward compatibility. Currently 1.
+    pub spec_version: u8,
+    /// Identity of the batch this anchor seals. Equals
+    /// `BatchSealRecord::seal_id` and `MerkleBatchRecord::batch_id`
+    /// for the same group commit.
+    pub batch_id: u64,
+    /// Wall-clock at seal time. Inherited from the seal record;
+    /// MUST equal `seal.sealed_at`.
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Merkle root of this batch (events + seal_hash as last leaf).
+    pub batch_root: String,
+    /// Active integrity-context hash at seal time.
+    pub context_hash: String,
+    /// Global checkpoint aggregator root, or None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_root: Option<String>,
+    /// Hash of the immediately previous anchor, or None at genesis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_anchor: Option<String>,
+    /// Domain-separated SHA-256 over the canonical fields above.
+    /// What an HSM signs; what an external auditor verifies.
+    pub anchor_hash: String,
+    /// Optional finality attestation. SelfSigned alone proves
+    /// "GVM produced this anchor"; only TSA proves "this anchor
+    /// existed by this wall-clock time according to a third party"
+    /// (defeats clock rewind).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<AnchorSignature>,
+}
+
+/// Anchor attestation variants.
+///
+/// Storage cost grows with attestation strength: SelfSigned ~64B,
+/// Hsm ~1-2KB (attestation report), Tsa ~3-5KB (RFC 3161 token).
+/// Operators may mix-and-match: every anchor SelfSigned, every
+/// Nth anchor additionally Tsa-attested for cost amortization.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum AnchorSignature {
+    /// Local Ed25519 keypair owned by the gvm-proxy process.
+    /// Cheap (~50µs/sign) but does NOT defeat clock rewind on its own.
+    SelfSigned {
+        key_id: String,
+        #[serde(with = "base64_bytes")]
+        signature: Vec<u8>,
+    },
+    /// Hardware attestation (HSM, TPM, Intel SGX, AMD SEV).
+    /// `attestation_report` carries the hardware-vendor blob.
+    Hsm {
+        key_id: String,
+        #[serde(with = "base64_bytes")]
+        signature: Vec<u8>,
+        #[serde(with = "base64_bytes")]
+        attestation_report: Vec<u8>,
+    },
+    /// RFC 3161 TimeStampToken from an external Time-Stamping
+    /// Authority. The ONLY variant that provides "the anchor
+    /// existed by this time" guarantee.
+    Tsa {
+        tsa_url: String,
+        #[serde(with = "base64_bytes")]
+        token: Vec<u8>,
+    },
+}
+
+impl GvmStateAnchor {
+    /// Compute the canonical anchor hash from the field values.
+    /// Stored back into `anchor_hash` after construction.
+    ///
+    /// Genesis substitution: `prev_anchor == None` and
+    /// `checkpoint_root == None` are both replaced with `GENESIS_HASH_HEX`
+    /// in the canonical input. This keeps the hash deterministic
+    /// across the genesis transition (None ↔ Some("0000...")).
+    pub fn compute_hash(
+        spec_version: u8,
+        batch_id: u64,
+        timestamp_secs: i64,
+        batch_root: &str,
+        context_hash: &str,
+        checkpoint_root: Option<&str>,
+        prev_anchor: Option<&str>,
+    ) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(PREFIX_ANCHOR_V1);
+        for f in [
+            &[spec_version][..],
+            &batch_id.to_le_bytes(),
+            &timestamp_secs.to_le_bytes(),
+            batch_root.as_bytes(),
+            context_hash.as_bytes(),
+            checkpoint_root.unwrap_or(GENESIS_HASH_HEX).as_bytes(),
+            prev_anchor.unwrap_or(GENESIS_HASH_HEX).as_bytes(),
+        ] {
+            h.update((f.len() as u32).to_le_bytes());
+            h.update(f);
+        }
+        h.finalize().into()
+    }
+
+    /// Build an anchor from a sealed batch. Caller is responsible
+    /// for attaching `signature` (None for first cut, populated by
+    /// signing layer). The returned anchor has `anchor_hash` filled.
+    pub fn seal(spec_version: u8, seal: &BatchSealRecord, batch_root: String) -> Self {
+        let anchor_hash_bytes = Self::compute_hash(
+            spec_version,
+            seal.seal_id,
+            seal.sealed_at.timestamp(),
+            &batch_root,
+            &seal.context_hash,
+            seal.checkpoint_root.as_deref(),
+            seal.prev_anchor.as_deref(),
+        );
+        Self {
+            spec_version,
+            batch_id: seal.seal_id,
+            timestamp: seal.sealed_at,
+            batch_root,
+            context_hash: seal.context_hash.clone(),
+            checkpoint_root: seal.checkpoint_root.clone(),
+            prev_anchor: seal.prev_anchor.clone(),
+            anchor_hash: hex::encode(anchor_hash_bytes),
+            signature: None,
+        }
+    }
+
+    /// Verify that the stored `anchor_hash` matches a re-computation
+    /// from the other fields. Catches in-place tampering of any
+    /// canonical-input field.
+    pub fn verify_self_hash(&self) -> bool {
+        let recomputed = Self::compute_hash(
+            self.spec_version,
+            self.batch_id,
+            self.timestamp.timestamp(),
+            &self.batch_root,
+            &self.context_hash,
+            self.checkpoint_root.as_deref(),
+            self.prev_anchor.as_deref(),
+        );
+        hex::encode(recomputed) == self.anchor_hash
     }
 }
 
@@ -605,10 +907,121 @@ pub struct MerkleBatchRecord {
     pub merkle_root: String,
     /// Merkle root of the previous batch (None for the first batch)
     pub prev_batch_root: Option<String>,
-    /// Number of events in this batch
+    /// Number of events in this batch (excludes the seal record at
+    /// the end). For batches written by Phase 2+ ledger, the actual
+    /// leaf count is `event_count + 1` (events + 1 seal at
+    /// `seal_position`).
     pub event_count: usize,
     /// Timestamp of batch flush
     pub timestamp: chrono::DateTime<chrono::Utc>,
+
+    // ─── Phase 2: leaves blob + seal position (backward compatible) ───
+    //
+    // Behavior:
+    // - Phase 1 (legacy) batches have these absent / empty / None.
+    //   Verifiers fall back to leaf-recomputation from event lines.
+    // - Phase 2+ batches have leaves_blob == 32 × (event_count + 1) bytes,
+    //   contiguous concatenation of leaf hashes in WAL order.
+    //   leaves[seal_position] is the seal record's seal_hash.
+    // - leaves_format documents the encoding so a future format change
+    //   (e.g. SHA3-256) can be detected without ambiguity.
+    /// Concatenated 32-byte leaf hashes in WAL order. Length is exactly
+    /// `(event_count + 1) * 32` for Phase 2+ batches: events first,
+    /// then the BatchSealRecord's seal_hash. Empty for legacy batches.
+    /// Stored as base64 in JSON to keep the record line-oriented.
+    #[serde(default, with = "base64_bytes", skip_serializing_if = "Vec::is_empty")]
+    pub leaves_blob: Vec<u8>,
+
+    /// Index into the leaves_blob where the seal_hash sits. Always
+    /// `event_count` (the seal is appended after every event leaf).
+    /// Explicit field guards against future leaf-ordering changes.
+    /// `None` for legacy batches (no seal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal_position: Option<usize>,
+
+    /// Encoding of `leaves_blob`. `None` for legacy batches.
+    /// Phase 2 sets this to `Sha256Concat`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leaves_format: Option<LeavesFormat>,
+}
+
+/// Encoding format of `MerkleBatchRecord::leaves_blob`.
+///
+/// Versioned so that future hash algorithm changes (e.g. SHA3, BLAKE3)
+/// can coexist in the same WAL with explicit format detection rather
+/// than implicit guesswork.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum LeavesFormat {
+    /// Contiguous concatenation of 32-byte SHA-256 hashes, in WAL order.
+    /// Length invariant: `leaves_blob.len() == (event_count + 1) * 32`.
+    /// The trailing 32 bytes are the BatchSealRecord's `seal_hash()`.
+    Sha256Concat,
+}
+
+impl MerkleBatchRecord {
+    /// Iterate over the 32-byte leaf hashes without allocation.
+    /// Returns an empty iterator for legacy batches (no leaves_blob).
+    /// Use `chunks_exact(32)` so any malformed (non-multiple-of-32)
+    /// blob produces an empty iterator rather than a panic.
+    pub fn leaves_iter(&self) -> std::slice::ChunksExact<'_, u8> {
+        self.leaves_blob.chunks_exact(32)
+    }
+
+    /// Return the leaf at `index` as a 32-byte slice, or None if the
+    /// index is out of range or the blob is malformed.
+    pub fn leaf(&self, index: usize) -> Option<&[u8]> {
+        let start = index.checked_mul(32)?;
+        let end = start.checked_add(32)?;
+        if end > self.leaves_blob.len() {
+            return None;
+        }
+        Some(&self.leaves_blob[start..end])
+    }
+
+    /// Return the seal record's hash (last leaf) if this batch carries
+    /// a Phase 2+ seal; otherwise None.
+    pub fn seal_leaf(&self) -> Option<&[u8]> {
+        self.seal_position.and_then(|pos| self.leaf(pos))
+    }
+
+    /// Validate the leaves_blob length against event_count + seal.
+    /// Returns Ok if either the blob is absent (legacy) or its length
+    /// matches the Phase 2 invariant exactly.
+    pub fn validate_leaves_invariant(&self) -> Result<(), String> {
+        if self.leaves_blob.is_empty() {
+            // Legacy batch — no seal expected.
+            if self.seal_position.is_some() {
+                return Err(format!(
+                    "seal_position={:?} present but leaves_blob is empty",
+                    self.seal_position
+                ));
+            }
+            return Ok(());
+        }
+        if self.leaves_blob.len() % 32 != 0 {
+            return Err(format!(
+                "leaves_blob length {} is not a multiple of 32",
+                self.leaves_blob.len()
+            ));
+        }
+        let expected = (self.event_count + 1) * 32;
+        if self.leaves_blob.len() != expected {
+            return Err(format!(
+                "leaves_blob length {} != expected {} (event_count {} + seal)",
+                self.leaves_blob.len(),
+                expected,
+                self.event_count
+            ));
+        }
+        match self.seal_position {
+            Some(pos) if pos == self.event_count => Ok(()),
+            Some(pos) => Err(format!(
+                "seal_position {} != event_count {}",
+                pos, self.event_count
+            )),
+            None => Err("Phase 2 batch missing seal_position".to_string()),
+        }
+    }
 }
 
 /// LLM reasoning/thinking trace extracted from API responses.

@@ -176,6 +176,72 @@ fn integrity_context_missing_should_break_chain() {
 }
 
 #[test]
+fn truncated_history_first_with_some_prev_is_flagged() {
+    // §4.8 strip-evasion guard.
+    //
+    // Attack: attacker keeps wal.log.5 (which contains a config_load
+    // claiming previous_state = Some(some_hash)) but deletes wal.log.1-4.
+    // The audit walk starts from wal.log.5; the first config_load it
+    // sees claims Some(prior) but no prior is in the WAL we walked.
+    //
+    // OLD behavior: (None, _) was accepted unconditionally — attack
+    // succeeded silently.
+    //
+    // NEW behavior: only (None, None) is accepted as genesis. The
+    // (None, Some(_)) form is a truncation signal — break.
+    let truncated_first = GvmIntegrityContext::local(
+        "config-mid-chain".to_string(),
+        Some("phantom-prior-hash".to_string()),
+    );
+    let next = GvmIntegrityContext::local(
+        "config-after".to_string(),
+        Some(truncated_first.context_hash()),
+    );
+
+    let (_dir, path) = write_wal(&[
+        &config_load_event(&truncated_first),
+        &config_load_event(&next),
+    ]);
+    let report = verify_integrity_chain(&path);
+
+    assert_eq!(report.total_config_loads, 2);
+    assert!(
+        report.first_break.is_some(),
+        "WAL whose first config_load claims a Some(prior) must be flagged \
+         as broken (truncation evidence) — got {:?}",
+        report.first_break
+    );
+    assert_eq!(
+        report.first_break.as_deref(),
+        Some(
+            serde_json::from_str::<serde_json::Value>(&config_load_event(&truncated_first))
+                .unwrap()
+                .get("event_id")
+                .and_then(|v| v.as_str())
+                .unwrap()
+        ),
+        "first_break must point at the surviving 'first' config_load \
+         (not the chain-internal next event)"
+    );
+}
+
+#[test]
+fn genuine_genesis_with_none_prev_is_accepted() {
+    // Sanity: the (None, None) form — a genuinely fresh-install
+    // first config_load — must still be accepted by the new guard.
+    let genesis_ctx = GvmIntegrityContext::local("genesis-config".to_string(), None);
+    let (_dir, path) = write_wal(&[&config_load_event(&genesis_ctx)]);
+    let report = verify_integrity_chain(&path);
+
+    assert_eq!(report.total_config_loads, 1);
+    assert_eq!(report.valid_links, 1);
+    assert!(
+        report.first_break.is_none(),
+        "(None, None) form must be accepted as genuine genesis"
+    );
+}
+
+#[test]
 fn integrity_context_missing_silently_skipped_documents_gap() {
     // Pins CURRENT behavior: missing _integrity_context is skipped.
     // Paired with the #[ignore]d test above, which pins the TARGET
