@@ -10,8 +10,42 @@
 //!   3. record() releases reservation + adds actual tokens/cost to current slot
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 const SLOTS: usize = 60; // 60 minutes = 1 hour window
+
+// ─── Clock abstraction (no production attack surface) ───
+//
+// Replaces the previous `_rotate_for_test` test-only hook (which was
+// `pub` and could be reached from any code holding a TokenBudget
+// reference, bypassing budget enforcement entirely). With Clock,
+// production uses SystemClock — tests pass a MockClock that advances
+// virtual time. The trait exposes ONLY a read of the current Unix
+// second; it cannot mutate budget state, so the abstraction itself
+// is not a privilege boundary that can be broken.
+
+/// Source of "now" for `TokenBudget` slot rotation.
+///
+/// Production callers pass `SystemClock`. Tests can substitute a
+/// fake clock to deterministically advance the sliding window without
+/// `std::thread::sleep`. Read-only — no method on this trait can
+/// alter budget enforcement state.
+pub trait BudgetClock: Send + Sync {
+    /// Current Unix epoch second.
+    fn now_unix_secs(&self) -> u64;
+}
+
+/// Default real-time clock.
+pub struct SystemClock;
+
+impl BudgetClock for SystemClock {
+    fn now_unix_secs(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+}
 
 /// Atomic saturating subtract: `*counter = max(0, *counter - delta)`,
 /// guaranteed race-free under concurrent callers. Replaces the
@@ -104,6 +138,9 @@ pub struct TokenBudget {
     last_rotation_epoch: AtomicU64,
     /// Sum of reserved tokens for in-flight requests (not yet completed).
     pending_reservations: AtomicU64,
+    /// Source of "now" — production: SystemClock; tests: MockClock.
+    /// Read-only: cannot bypass enforcement by tampering through this.
+    clock: Arc<dyn BudgetClock>,
     /// Config
     max_tokens_per_hour: u64,
     max_cost_per_hour_millionths: u64,
@@ -111,11 +148,26 @@ pub struct TokenBudget {
 }
 
 impl TokenBudget {
+    /// Construct with the production system clock.
     pub fn new(max_tokens_per_hour: u64, max_cost_per_hour: f64, reserve_per_request: u64) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        Self::with_clock(
+            max_tokens_per_hour,
+            max_cost_per_hour,
+            reserve_per_request,
+            Arc::new(SystemClock),
+        )
+    }
+
+    /// Construct with a caller-supplied clock. The clock is read-only;
+    /// it cannot mutate budget state. Tests pass a MockClock to advance
+    /// virtual time deterministically.
+    pub fn with_clock(
+        max_tokens_per_hour: u64,
+        max_cost_per_hour: f64,
+        reserve_per_request: u64,
+        clock: Arc<dyn BudgetClock>,
+    ) -> Self {
+        let now = clock.now_unix_secs();
         let minute = (now / 60) % SLOTS as u64;
 
         Self {
@@ -123,6 +175,7 @@ impl TokenBudget {
             current_minute: AtomicU64::new(minute),
             last_rotation_epoch: AtomicU64::new(now),
             pending_reservations: AtomicU64::new(0),
+            clock,
             max_tokens_per_hour,
             max_cost_per_hour_millionths: (max_cost_per_hour * 1_000_000.0) as u64,
             reserve_per_request,
@@ -224,11 +277,9 @@ impl TokenBudget {
     }
 
     /// Rotate current slot if a new minute has started. Zero expired slots.
+    /// Reads "now" from the injected clock (SystemClock in production).
     fn rotate_if_needed(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = self.clock.now_unix_secs();
         let new_minute = (now / 60) % SLOTS as u64;
         let old_minute = self.current_minute.load(Ordering::Relaxed);
 

@@ -416,15 +416,26 @@ enabled = false
 
 Use this when you already have dedicated DNS security tools (Route 53 DNS Firewall, Cloudflare Gateway, Cisco Umbrella) handling DNS-level threats.
 
-**Tuning for tests:**
+**Tuning the sliding window:**
 
-The sliding window duration (default 60s) can be overridden with `GVM_TEST_DNS_WINDOW_SEC` for E2E tests:
+The sliding-window duration (default 60s) is set in proxy config:
 
-```bash
-GVM_TEST_DNS_WINDOW_SEC=5 gvm run --sandbox agent.py  # 5-second window
+```toml
+[dns]
+window_secs = 60   # production default; minimum allowed is 5
 ```
 
-This is a test-only knob — do not use in production.
+Operators may shorten this for E2E tests (e.g. `window_secs = 5`)
+to avoid 60-second waits when verifying decay. Values below 5 seconds
+are clamped UP to 5, because Tier 3 detection requires ≥5 unique
+subdomains in the window — anything shorter would render the
+detection useless. A clamp triggers a `tracing::warn!` at startup.
+
+The previous `GVM_TEST_DNS_WINDOW_SEC` env-var override was removed
+in favor of config-file injection: env vars are ambient and
+auditors can't see them in the WAL `gvm.system.config_load` event.
+Configuration always lands in the audit chain. See
+`GVM_CODE_STANDARDS.md` §6.5 for the rationale.
 
 ---
 

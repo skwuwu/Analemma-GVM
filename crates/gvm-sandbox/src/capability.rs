@@ -156,6 +156,10 @@ fn check_user_namespaces() -> bool {
 fn check_seccomp() -> bool {
     // prctl(PR_GET_SECCOMP) returns 0 if seccomp is disabled but supported,
     // or the current mode if active. Returns -1/EINVAL if not supported.
+    // SAFETY: prctl(PR_GET_SECCOMP) takes no pointer arguments and only
+    // queries the current process's seccomp mode. It cannot fail in a way
+    // that violates memory safety; a -1 return simply means the option is
+    // not supported on this kernel.
     unsafe {
         let ret = libc::prctl(libc::PR_GET_SECCOMP);
         ret >= 0

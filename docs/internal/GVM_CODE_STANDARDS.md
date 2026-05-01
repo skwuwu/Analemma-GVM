@@ -1,7 +1,8 @@
 # GVM Code Standards
 
 > Authoritative engineering principles for all GVM contributions.
-> Every pull request must comply with these rules. No exceptions.
+> Every pull request must comply with these rules. Exceptions are allowed only
+> where this document explicitly names them and requires traceability.
 
 ---
 
@@ -140,7 +141,7 @@ hasher.update(event.event_id.as_bytes());
 
 - No custom cryptographic constructions. Use audited crates only (aes-gcm, sha2, hex).
 
-### 1.8 Unsafe & FFI Discipline
+### 1.7 Unsafe & FFI Discipline
 
 GVM uses `unsafe` for Linux syscalls (clone, fork, waitpid, getsockopt, prctl, seccomp) and Wasm FFI. "Rust means safe" is false when `unsafe` is present.
 
@@ -156,7 +157,7 @@ GVM uses `unsafe` for Linux syscalls (clone, fork, waitpid, getsockopt, prctl, s
 - `slice::from_raw_parts()` from Wasm linear memory — document the assumption that Wasmtime validates bounds.
 - `copy_nonoverlapping()` — verify total copy size ≤ allocated size. Assert no overlap.
 
-### 1.9 Namespace & Sandbox Isolation
+### 1.8 Namespace & Sandbox Isolation
 
 Sandbox isolation is only as strong as its weakest mount/seccomp configuration.
 
@@ -168,9 +169,9 @@ Sandbox isolation is only as strong as its weakest mount/seccomp configuration.
 - After `pivot_root`, old root must be unmounted (`MNT_DETACH`) and directory removed
 
 **seccomp-BPF:**
-- Default ENOSYS for unknown syscalls (graceful fallback). Whitelist for known-safe. No KILL for unknowns (prevents kernel/glibc upgrade regressions).
-- `socket()` must filter on `arg0` (domain): only AF_INET, AF_INET6, AF_UNIX allowed. AF_NETLINK allowed only if required for DNS. AF_PACKET blocked.
-- Dangerous syscalls (ptrace, mount, bpf, unshare, setns, open_by_handle_at) get ENOSYS — the operation never executes.
+- Default action is ENOSYS for unknown syscalls (graceful fallback). Whitelist known-safe syscalls. Do not use KILL for merely unknown syscalls; this prevents kernel/glibc upgrade regressions.
+- `socket()` must filter on `arg0` (domain): only AF_INET, AF_INET6, and AF_UNIX are normally allowed. AF_NETLINK is allowed only when required for resolver/DNS behavior and after capabilities are dropped. AF_PACKET is always blocked.
+- Dangerous syscalls (ptrace, mount, bpf, unshare, setns, open_by_handle_at) must not execute. Prefer ENOSYS when graceful process continuation is safe; use KILL only for active escape primitives where continuing the process after the attempted syscall is unsafe. The selected action must be tested and documented.
 - `openat()` argument filtering: seccomp cannot enforce path boundaries (kernel limitation). Rely on mount namespace for path isolation. Do not add false-confidence seccomp path filters.
 - **seccomp must NEVER be disableable.** No `--seccomp off` flag, no `GVM_DEBUG_SECCOMP_DISABLE` env var, no runtime toggle. A sandbox without seccomp is not a sandbox — agents can call mount/ptrace/unshare to break all other isolation layers. If seccomp causes issues, debug with `dmesg | grep SECCOMP` and add the syscall to the whitelist, not disable the filter.
 
@@ -185,7 +186,7 @@ Sandbox isolation is only as strong as its weakest mount/seccomp configuration.
 - All certificates backdated by 24 hours (`not_before = now - 24h`) for clock drift tolerance
 - ECDSA P-256 for all ephemeral certificates (fast generation, strong security)
 
-### 1.10 Async I/O Discipline
+### 1.9 Async I/O Discipline
 
 GVM proxy runs on tokio. Blocking the executor starves all concurrent requests.
 
@@ -262,10 +263,12 @@ Never silently use empty strings or zero values as defaults for security-critica
 The governance decision hot path must stay under these budgets:
 
 ```
-IC-1 (Allow):  < 1µs  policy evaluation + < 0ms  added latency
-IC-2 (Delay):  < 1µs  policy evaluation + 300ms  intentional delay
-IC-3 (Deny):   < 1µs  policy evaluation + < 0ms  added latency
-WAL append:    < 5ms  including fsync (group commit amortized)
+Allow:           < 1µs  SRR classification + < 0ms added latency
+AuditOnly:       < 1µs  SRR classification + < 0ms added latency
+Delay:           < 1µs  SRR classification + configured intentional delay
+RequireApproval: < 1µs  SRR classification + human approval wait
+Deny:            < 1µs  SRR classification + < 0ms added latency
+WAL append:      < 5ms  including fsync (group commit amortized)
 ```
 
 Rules:
@@ -357,21 +360,24 @@ This ordering must be:
 - Deterministic: same inputs always produce same output
 - Documented: the strictness value of each decision type is part of the public API
 
-### 4.3 Evaluation Independence
+### 4.3 Classification Independence
 
-Layer 1 (ABAC) and Layer 2 (SRR) must evaluate independently:
+SRR is the authoritative network enforcement layer. SDK/semantic metadata may
+add audit context and may raise strictness through `max_strict()`, but it must
+never be able to lower a transport-derived SRR decision.
 
 ```rust
-let policy_decision = state.policy.evaluate(&operation);  // Layer 1
-let srr_decision = state.srr.check(method, host, path, body); // Layer 2
-let final_decision = max_strict(policy_decision, srr_decision); // combine
+let srr_decision = state.srr.check(method, host, path, body);
+let semantic_decision = classify_sdk_metadata(headers);
+let final_decision = max_strict(srr_decision, semantic_decision);
 ```
 
 Rules:
-- Layer 1 must not read Layer 2 results
-- Layer 2 must not read Layer 1 results
-- Combination happens only via `max_strict()` after both complete
-- This independence enables semantic forgery detection
+- SRR must evaluate actual transport data: method, host, path, and inspected body.
+- SRR must ignore agent-declared operation/resource headers for enforcement.
+- SDK/semantic metadata must not downgrade SRR `Delay`, `RequireApproval`, or `Deny`.
+- Combination happens only via `max_strict()`.
+- This independence enables semantic forgery detection.
 
 ### 4.4 WAL Ordering Guarantees
 
@@ -467,7 +473,7 @@ let result = some_async_op(&snapshot).await;
 
 ### 6.1 Interface-Driven Testing
 
-**Principle**: System lifecycle control (Start, Stop, Status) and governance workflows (Approve, Reload) must be performed exclusively through CLI commands.
+**Principle**: E2E system lifecycle control (Start, Stop, Status) and user-facing governance workflows (Approve, Reload) must be performed through CLI commands. Rust unit/integration tests may call handlers, routers, and internal APIs directly when they are testing internal contracts rather than the CLI lifecycle.
 
 ```
 gvm run --sandbox -- <agent command>   # Agent execution
@@ -482,14 +488,14 @@ gvm audit verify                        # Merkle chain verification
 gvm preflight                           # Environment check
 ```
 
-**Exception (Internal API)**: The following cases permit direct HTTP protocol verification via `curl`:
+**Exception (Internal API)**: The following E2E/script cases permit direct HTTP protocol verification via `curl`:
 
 - **Communication integrity tests**: Verifying the proxy engine's HTTP/gRPC response specification itself (e.g., `GET /gvm/ca.pem` returns valid PEM, `POST /gvm/intent` accepts the correct JSON schema).
 - **Internal logic probing**: Validating experimental features not exposed to users (e.g., `/gvm/intent` for Shadow Mode 2-phase verification).
 - **Payload precision tests**: Testing scenarios where CLI arguments are inadequate for the data involved (e.g., `/gvm/check` with a large base64-encoded body field for payload inspection rules).
 - **Throughput measurement**: Burst/stress tests where CLI process spawn overhead would measure startup latency rather than proxy throughput (e.g., 100 sequential `curl /gvm/check` in a tight loop).
 
-Mark all such exceptions with `# 6.1-exception: <reason>` inline comments for traceability.
+Mark all E2E/script exceptions with `# 6.1-exception: <reason>` inline comments for traceability. Rust tests should name the direct contract in the test name or module comment; they do not need shell-style `# 6.1-exception` comments.
 
 **Prohibited** (no exceptions):
 - `cat data/proxy.pid` or any direct PID file access → use `gvm status --json | jq .pid`
@@ -517,7 +523,7 @@ Edge:        Missing input, null bytes, unicode, empty collections
 Hostile:     Concurrent stress, garbage input, timing, resource exhaustion
 ```
 
-### 6.2 Security Test Requirements
+### 6.3 Security Test Requirements
 
 Every security claim must have a corresponding test:
 
@@ -526,12 +532,15 @@ Claim: "Deny short-circuits"         → test_deny_overrides_all
 Claim: "Nonce is never reused"       → test_nonce_reuse_not_possible
 Claim: "Tampered data is detected"   → test_tampered_ciphertext_fails
 Claim: "SSRF is blocked"             → ssrf_localhost_blocked_by_srr
-Claim: "Fail-close on WAL failure"   → group_commit_fail_close_all_callers_receive_error
+Claim: "WAL primary fails → emergency-WAL fallback succeeds"
+                                      → group_commit_primary_fail_emergency_wal_catches
+Claim: "WAL primary AND emergency both fail → caller sees Err"
+                                      → MISSING — see test-report.md known gaps
 ```
 
 No security claim in documentation without a test that verifies it.
 
-### 6.3 Benchmark Requirements
+### 6.4 Benchmark Requirements
 
 Performance claims must be backed by Criterion benchmarks:
 
@@ -542,6 +551,136 @@ Claim: "28-88ns SRR"             → bench srr/allow_safe_host, srr/deny_bank_tr
 ```
 
 No performance claim in documentation without a benchmark that measures it.
+
+### 6.5 Tests Run Production Code Paths — No Production Test Hooks
+
+**Goal of testing**: verify production behavior. A test that runs a
+DIFFERENT code path than production is testing a different program.
+Therefore: never expose test-only entry points or env-var overrides in
+production binaries to make tests easier to write.
+
+**Forbidden** in production code (every clause has a real-world bypass
+the audit on 2026-05-01 caught):
+
+```rust
+// FORBIDDEN — gives test code a way to bypass enforcement, AND ships
+// the same surface to production attackers who hold a struct reference.
+pub fn classify_at(&self, domain: &str, now: Instant) -> ... { ... }
+
+#[doc(hidden)]
+pub fn _rotate_for_test(&self, minutes: u64) { ... } // pub! reachable!
+
+fn read_dir() -> String {
+    std::env::var("GVM_HEARTBEAT_DIR").unwrap_or(DEFAULT) // unconditional env read
+}
+```
+
+`#[doc(hidden)]` is a doc-tool hint, NOT a compiler boundary — the
+symbol is still callable from any code that depends on the crate. An
+env var read that is unconditional in production is reachable by any
+attacker who can influence the process environment (supply-chain
+compromise, container env injection, sandbox escape that lands in
+a sibling process with `prctl(PR_SET_PDEATHSIG)` etc.).
+
+**Required pattern (one of)**:
+
+1. **Clock / dependency injection at construction.** The test
+   substitutes a mock implementation; the trait method is read-only
+   so the abstraction itself cannot break enforcement. Tests run
+   the EXACT same `rotate_if_needed` / `classify` code as production —
+   only the source of "now" differs.
+
+   ```rust
+   pub trait BudgetClock: Send + Sync {
+       fn now_unix_secs(&self) -> u64;
+   }
+   pub struct SystemClock;          // production
+   impl BudgetClock for SystemClock { ... }
+
+   pub struct TokenBudget {
+       clock: Arc<dyn BudgetClock>, // wired at construction
+       ...
+   }
+   impl TokenBudget {
+       pub fn new(...) -> Self { Self::with_clock(..., Arc::new(SystemClock)) }
+       pub fn with_clock(..., clock: Arc<dyn BudgetClock>) -> Self { ... }
+   }
+   ```
+
+2. **`#[cfg(test)]` gating** when the test lives in the same crate.
+   The hook is COMPILED OUT of production binaries — the symbol does
+   not exist in the release binary, so it cannot be reached even
+   with a debugger or symbol-search:
+
+   ```rust
+   pub fn classify(&self, domain: &str) -> Decision {
+       self.classify_inner(domain, Instant::now())
+   }
+
+   #[cfg(test)]
+   pub(super) fn classify_at(&self, domain: &str, now: Instant) -> Decision {
+       self.classify_inner(domain, now)
+   }
+
+   fn classify_inner(&self, domain: &str, now: Instant) -> Decision { ... }
+   ```
+
+   For env-var overrides used only by unit tests in `mod tests`:
+
+   ```rust
+   fn heartbeat_dir() -> String {
+       #[cfg(test)]
+       if let Ok(d) = std::env::var("GVM_HEARTBEAT_DIR_TEST_ONLY") {
+           return d;
+       }
+       HEARTBEAT_DIR.to_string()  // production: hardcoded const
+   }
+   ```
+
+   The env var name carries `_TEST_ONLY` so anyone grepping the source
+   sees the intent without reading docs.
+
+3. **Constructor parameter** for paths/ports/IDs that production
+   reads from a config file. Production reads the config; tests pass
+   a tempdir/random port. No env-var override needed.
+
+**Forbidden alternatives** (each named because the audit found them):
+
+- `#[doc(hidden)] pub fn _foo_for_test(...)` — `pub` means callable.
+- Methods named `_foo`, `__foo`, `internal_foo` that are still `pub`.
+- Production code paths gated by env vars where setting the env var
+  weakens enforcement (e.g. "`GVM_DEBUG=1` disables seccomp").
+- Feature flags that default-on in production (`default = ["test-hooks"]`).
+- Visibility downgrade tricks (`pub(crate)` reachable from any
+  integration test in the same crate).
+
+**Decision flowchart** when adding a new test that needs to control
+something production doesn't expose:
+
+```
+Test in `mod tests {}` inside src/foo.rs?
+  → Use #[cfg(test)] gated method on the same impl block.
+
+Test in tests/ (separate integration crate)?
+  → Add a trait + constructor parameter (Clock, Path, etc.).
+  → Production passes the real impl; test passes a mock.
+
+Test needs to scan filesystem / proc?
+  → Construct with a `&Path` parameter; production passes /run/gvm,
+    test passes `tempfile::tempdir()`.
+```
+
+**Test that the hook is gone**: every PR that touches `src/` should
+search the diff for `_test`, `for_test`, `test_only`, `pub fn _`,
+`#[doc(hidden)] pub`, and `std::env::var(...)` in non-startup paths.
+The cfg(test) escape hatch may appear in src/ — but only in the form
+above, where the production constant survives.
+
+The audit on 2026-05-01 found three violations of this rule that the
+remediation pass converted: a `pub fn classify_at` (DNS) → cfg(test);
+a `#[doc(hidden)] pub fn _rotate_for_test` (token budget) → BudgetClock
+trait + `with_clock` constructor; an unconditional `GVM_HEARTBEAT_DIR`
+env read → cfg(test) gate with `_TEST_ONLY` suffix.
 
 ---
 
@@ -559,9 +698,9 @@ Agent Process
   │   └─ Tier 1 (known) free pass / Tier 2-4 graduated delay
   │   └─ No Deny — worst case is 10s delay, never agent termination
   │
-  ├─ Layer 1: HTTP Governance (proxy.rs + srr.rs + policy.rs)
-  │   └─ HTTP/HTTPS → proxy → SRR check + ABAC eval → max_strict() → forward
-  │   └─ Allow / Delay / RequireApproval / Deny
+  ├─ Layer 1: HTTP Governance (proxy.rs + srr.rs)
+  │   └─ HTTP/HTTPS → proxy → SRR check → max_strict() with any stricter metadata → forward
+  │   └─ Allow / AuditOnly / Delay / RequireApproval / Deny
   │
   └─ Layer 2: Filesystem Governance (overlayfs + fs_approve)
       └─ All writes → overlay → human review → approve/reject
@@ -651,7 +790,7 @@ INCORRECT: Deny → 403 + Connection: close + break → new CONNECT → handshak
 
 This principle applies to all proxy-generated responses on the MITM path:
 - **Deny (403)**: continue — agent may retry with different URL
-- **Throttle (429)**: continue — agent retries after rate limit window
+- **Token budget exceeded (403)**: continue when connection state is healthy; the agent may retry after budget recovery
 - **Classification error (500)**: break — internal error, connection state uncertain
 - **RequireApproval (403)**: break — approval flow requires out-of-band communication
 - **Circuit breaker (503)**: break — WAL is failing, reject all traffic

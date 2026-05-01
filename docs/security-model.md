@@ -84,7 +84,7 @@ If an attacker has root access to the host, GVM — like any userspace process �
 **Current (v1)**:
 - Cooperative default: SDK sets `HTTP_PROXY` via `GVMAgent.create_session()`.
 - **Enforced mode**: `gvm run --sandbox` (Linux namespace + veth + TC filter + iptables + seccomp). Three-layer defense-in-depth: (1) TC ingress filter on host-side veth (kernel-enforced, no userspace bypass), (2) iptables OUTPUT chain inside sandbox, (3) seccomp AF_NETLINK blocking prevents iptables modification.
-- Docker fallback: `gvm run --contained` (experimental — not production-ready, see Known Limitations).
+- Docker containment: `gvm run --contained` is production-ready on Linux and WSL2. It uses a dedicated Docker bridge plus host-side iptables egress lock to prevent direct network bypass, but it deliberately does not perform MITM; HTTPS enforcement is SNI/domain-level only. On native macOS or native Windows outside WSL2, Docker Desktop's hidden VM prevents host iptables control, so contained mode falls back to cooperative proxy routing with a visible warning.
 - Limitation: containment is opt-in and process-scoped. Processes not launched via `gvm run` still rely on cooperative proxy routing.
 
 `gvm run --sandbox` interception path (implemented):
@@ -150,7 +150,7 @@ After sandbox network setup, the agent can only reach: (1) GVM proxy via TCP on 
 |--------|-----------|----------|--------------------|-------------|
 | >= 4.15 | Active | Active | Active | Triple-layer (kernel-enforced) |
 | 3.17 - 4.14 | Fallback | Active | Active | Dual-layer (seccomp prevents iptables escape) |
-| < 3.17 | N/A | Active | N/A | iptables only (`--contained` Docker mode is experimental) |
+| < 3.17 | N/A | Active | N/A | iptables only; prefer `--contained` on Linux/WSL2 or upgrade kernel for sandbox |
 
 **Roadmap (v2)**: Move from opt-in containment to deployment-level mandatory interception profiles (policy-enforced launch path + identity attestation).
 

@@ -14,7 +14,7 @@ All agent execution uses `gvm run` with flags:
 | **Enforce** | `gvm run agent.py` | Agent respects `HTTP_PROXY` | Production |
 | **Discover** | `gvm run -i agent.py` | Enforce + suggest rules after exit | Production |
 | **Sandbox** | `gvm run --sandbox agent.py` | Kernel-level (namespace + seccomp + MITM) | Production, Linux |
-| **Contained** | `gvm run --contained agent.py` | Docker bridge + host-side iptables egress lock (no MITM) | Linux + WSL2 production-ready |
+| **Contained** | `gvm run --contained agent.py` | Docker bridge + host-side iptables egress lock (no MITM) | Production on Linux + WSL2 |
 
 > **Contained mode (`--contained`)** is stable on Linux hosts and WSL2. Each run gets a dedicated `gvm-docker-{slot}` bridge with host-side iptables rules (DOCKER-USER chain) that force all egress through the proxy port. Non-cooperative clients (Node.js raw `https`, raw sockets) hit the DROP rule instead of silently bypassing. **Docker mode does not do MITM** — HTTPS decisions are SNI-level only. Use `--sandbox` for full HTTPS L7 inspection.
 >
@@ -232,11 +232,15 @@ These are architectural boundaries, not missing features:
 | Channel | Why not governed | Mitigation |
 |---------|-----------------|------------|
 | **Agent stdin/stdout** | Not network traffic | Agent spawned with `stdin(Stdio::null())` |
-| **DNS content** | DNS queries via host resolver, not through HTTP proxy | Use DNS security tools (Route 53 DNS Firewall, Cloudflare Gateway). GVM logs DNS queries to WAL for audit. |
-| **DNS tunneling** | DLP concern, not HTTP governance | DNS exfiltration prevention belongs to network-layer DNS security. GVM provides forensic visibility. |
 | **Prompt injection detection** | Requires semantic analysis (ML/LLM) | Use an LLM WAF upstream. GVM + LLM WAF are complementary. |
 | **Agent internal state** | SDK-only (agent must use `@ic()` decorator) | Tier 1 (proxy-only) governs actions; Tier 2 (SDK) adds intent verification |
 | **LLM response content** | Privacy — response bodies not stored by default | Thinking hash stored for forensics (SHA-256, opt-in raw) |
+
+DNS is governed only in `--sandbox` mode. The design is deliberately
+Delay-Alert, not Deny: known hosts pass, unknown domains are delayed and
+logged, subdomain bursts/floods escalate delay, and the window decays when
+the behavior stops. Cooperative and contained modes do not provide DNS
+governance.
 
 ---
 
@@ -246,15 +250,15 @@ These are architectural boundaries, not missing features:
 |-----------|-------------|-----------|---------|
 | DNS governance (Layer 0) | None | None | **Tiered delay** (known=0ms, unknown=200ms, burst=3s, flood=10s) |
 | HTTP governance (Layer 1) | Cooperative | Structural | Structural |
-| HTTPS L7 inspection | Domain only | Full (MITM) | Full (MITM) |
-| API key isolation | HTTP only | HTTP + HTTPS | HTTP + HTTPS |
+| HTTPS L7 inspection | Domain only | SNI/domain only (no MITM) | Full (MITM) |
+| API key isolation | HTTP only | HTTP only; HTTPS is SNI-level | HTTP + HTTPS |
 | Network bypass prevention | None | Docker network | Kernel (TC + iptables + seccomp) |
 | Filesystem governance (Layer 2) | None | Read-only root | overlayfs Trust-on-Pattern |
 | Resource limits | None | Docker limits | cgroup v2 |
 | Syscall filtering | None | Docker default | Custom seccomp (~130 allowed) |
 | IC-3 self-approval prevention | None | None | Admin port unreachable |
-| Stability | **Production** | **Experimental** | **Production** |
-| Platform | Any OS | Any OS + Docker | Linux (kernel ≥ 4.15, recommended ≥ 6.1) |
+| Stability | **Production** | **Production on Linux + WSL2; cooperative fallback elsewhere** | **Production** |
+| Platform | Any OS | Linux + WSL2 for enforced egress lock; native macOS/Windows fallback is cooperative | Linux (kernel ≥ 4.15, recommended ≥ 6.1) |
 
 ---
 

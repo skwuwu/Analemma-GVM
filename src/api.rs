@@ -906,7 +906,7 @@ pub async fn reload_srr(State(state): State<AppState>) -> Response<Body> {
                         StatusCode::BAD_REQUEST,
                         &serde_json::json!({
                             "reloaded": false,
-                            "error": format!("gvm.toml SRR parse failed: {}. Config preserved.", e),
+                            "error": "SRR parse failed — see proxy logs. Config preserved.",
                         }),
                     );
                 }
@@ -921,7 +921,7 @@ pub async fn reload_srr(State(state): State<AppState>) -> Response<Body> {
                             StatusCode::BAD_REQUEST,
                             &serde_json::json!({
                                 "reloaded": false,
-                                "error": format!("SRR parse failed: {}. Config preserved.", e),
+                                "error": "SRR parse failed — see proxy logs. Config preserved.",
                             }),
                         );
                     }
@@ -937,7 +937,7 @@ pub async fn reload_srr(State(state): State<AppState>) -> Response<Body> {
                             StatusCode::BAD_REQUEST,
                             &serde_json::json!({
                                 "reloaded": false,
-                                "error": format!("SRR parse failed: {}. Config preserved.", e),
+                                "error": "SRR parse failed — see proxy logs. Config preserved.",
                             }),
                         );
                     }
@@ -953,7 +953,7 @@ pub async fn reload_srr(State(state): State<AppState>) -> Response<Body> {
                     StatusCode::BAD_REQUEST,
                     &serde_json::json!({
                         "reloaded": false,
-                        "error": format!("SRR parse failed: {}. Config preserved.", e),
+                        "error": "SRR parse failed — see proxy logs. Config preserved.",
                     }),
                 );
             }
@@ -1298,8 +1298,8 @@ pub async fn dashboard_events(
     let limit = query.limit.unwrap_or(100).min(500);
 
     let wal_path = &state.wal_path;
-    let file = match std::fs::File::open(wal_path) {
-        Ok(f) => f,
+    let content = match tokio::fs::read_to_string(wal_path).await {
+        Ok(content) => content,
         Err(_) => {
             return Json(serde_json::json!({
                 "events": [],
@@ -1309,7 +1309,7 @@ pub async fn dashboard_events(
         }
     };
 
-    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let file_len = content.len() as u64;
     if file_len <= offset {
         return Json(serde_json::json!({
             "events": [],
@@ -1318,23 +1318,20 @@ pub async fn dashboard_events(
         }));
     }
 
-    use std::io::{BufRead, Seek, SeekFrom};
-    let mut reader = std::io::BufReader::new(file);
-    if offset > 0 {
-        let _ = reader.seek(SeekFrom::Start(offset));
+    let mut start = offset as usize;
+    if !content.is_char_boundary(start) {
+        start = (start..content.len())
+            .find(|i| content.is_char_boundary(*i))
+            .unwrap_or(content.len());
     }
 
     let mut events = Vec::new();
-    let mut current_offset = offset;
+    let mut current_offset = start as u64;
     let mut current_batch_id: Option<u64> = None;
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        current_offset += line.len() as u64 + 1;
-        let trimmed = line.trim();
+    for line in content[start..].split_inclusive('\n') {
+        current_offset += line.len() as u64;
+        let trimmed = line.trim_end_matches(['\r', '\n']).trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -1385,8 +1382,8 @@ pub async fn dashboard_events(
 /// Return aggregated WAL statistics as JSON.
 pub async fn dashboard_stats(State(state): State<AppState>) -> Json<serde_json::Value> {
     let wal_path = &state.wal_path;
-    let file = match std::fs::File::open(wal_path) {
-        Ok(f) => f,
+    let content = match tokio::fs::read_to_string(wal_path).await {
+        Ok(content) => content,
         Err(_) => {
             return Json(serde_json::json!({
                 "total_requests": 0,
@@ -1401,10 +1398,7 @@ pub async fn dashboard_stats(State(state): State<AppState>) -> Json<serde_json::
         }
     };
 
-    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-
-    use std::io::BufRead;
-    let reader = std::io::BufReader::new(file);
+    let file_len = content.len() as u64;
 
     // Two-phase: collect latest state per event_id (upsert), then aggregate.
     // WAL may contain multiple entries per event_id (Pending → Confirmed + llm_trace).
@@ -1412,11 +1406,7 @@ pub async fn dashboard_stats(State(state): State<AppState>) -> Json<serde_json::
     let mut latest: std::collections::HashMap<String, serde_json::Value> =
         std::collections::HashMap::new();
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
+    for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;

@@ -1737,6 +1737,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn normalize_path_decodes_percent_encoded_dot_segments() {
+        // §4.1 traversal-bypass guard: %2E%2E (".." encoded) MUST be
+        // decoded BEFORE dot-segment collapsing, otherwise an attacker
+        // can sneak `/api/%2E%2E/admin` past a rule that matches
+        // `/admin`. The normalizer must produce the same output as
+        // `/api/../admin` → `/admin`.
+        assert_eq!(
+            normalize_path("/api/%2E%2E/admin").expect("encoded traversal must normalize"),
+            "/admin",
+            "regression: %2E%2E was not decoded → traversal bypass"
+        );
+        assert_eq!(
+            normalize_path("/api/%2e%2e/admin")
+                .expect("lowercase-encoded traversal must normalize"),
+            "/admin",
+            "regression: lowercase %2e%2e was not decoded"
+        );
+    }
+
+    #[test]
+    fn normalize_path_handles_invalid_percent_encoding() {
+        // Lone `%` and `%X` (1 hex digit) must not panic. Either
+        // pass through or reject — but no crash, no infinite loop.
+        // We just call them and ensure the call returns within reason.
+        let _ = normalize_path("/a%/b");
+        let _ = normalize_path("/a%2/b");
+        let _ = normalize_path("/a%ZZ/b");
+    }
+
+    #[test]
+    fn normalize_path_oversized_does_not_explode() {
+        // 4 KiB path. Some clients send long query-like paths; the
+        // normalizer must not be O(N²) or panic.
+        let long = format!("/{}", "a".repeat(4096));
+        let t0 = std::time::Instant::now();
+        let _ = normalize_path(&long);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(200),
+            "normalize_path on 4KiB input took {:?} — likely O(N²)",
+            t0.elapsed()
+        );
+    }
+
     // ── Test: SrrCheckResult metadata ──
 
     // ── Path regex tests ──

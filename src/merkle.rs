@@ -342,6 +342,8 @@ pub fn verify_wal(wal_content: &str) -> VerificationReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{EventStatus, PayloadDescriptor, ResourceDescriptor};
+    use std::collections::HashMap;
 
     fn hash_str(s: &str) -> String {
         let mut hasher = Sha256::new();
@@ -458,6 +460,119 @@ mod tests {
         let root1 = compute_merkle_root(&leaves).unwrap();
         let root2 = compute_merkle_root(&leaves).unwrap();
         assert_eq!(root1, root2, "same input must produce same root");
+    }
+
+    #[test]
+    fn merkle_node_hash_uses_domain_separation_prefix() {
+        // §1.6: domain-separation prefix `gvm-node-v1:` MUST be present
+        // in every internal-node hash. Removing the prefix would silently
+        // break hash universality across contexts but produce mathemati-
+        // cally valid output. This test pins the contract by hashing
+        // two leaves with AND without the prefix and asserting the
+        // production result matches the prefixed variant only.
+        let a = hash_str("event_a");
+        let b = hash_str("event_b");
+        let root =
+            compute_merkle_root(&[a.clone(), b.clone()]).expect("two-leaf root must compute");
+
+        // Same hash, NO domain prefix.
+        let no_prefix = {
+            let mut h = Sha256::new();
+            h.update(decode_hash(&a));
+            h.update(decode_hash(&b));
+            hex::encode(h.finalize())
+        };
+
+        // Same hash, WRONG (different) domain prefix.
+        let wrong_prefix = {
+            let mut h = Sha256::new();
+            h.update(b"gvm-node-v2:");
+            h.update(decode_hash(&a));
+            h.update(decode_hash(&b));
+            hex::encode(h.finalize())
+        };
+
+        // Same hash, CORRECT prefix.
+        let with_prefix = {
+            let mut h = Sha256::new();
+            h.update(b"gvm-node-v1:");
+            h.update(decode_hash(&a));
+            h.update(decode_hash(&b));
+            hex::encode(h.finalize())
+        };
+
+        assert_eq!(
+            root, with_prefix,
+            "production node hash MUST include the `gvm-node-v1:` prefix"
+        );
+        assert_ne!(
+            root, no_prefix,
+            "regression: production node hash matches the no-prefix variant — \
+             prefix is no longer load-bearing"
+        );
+        assert_ne!(
+            root, wrong_prefix,
+            "regression: production node hash matches a different prefix — \
+             version pinning is broken"
+        );
+    }
+
+    #[test]
+    fn merkle_event_hash_uses_domain_separation_prefix() {
+        // §1.6 sibling test for compute_event_hash.
+        let event = GVMEvent {
+            event_id: "deadbeef".to_string(),
+            trace_id: "cafebabe".to_string(),
+            parent_event_id: None,
+            agent_id: "agent-x".to_string(),
+            tenant_id: None,
+            session_id: "sess".to_string(),
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            operation: "gvm.test.op".to_string(),
+            resource: ResourceDescriptor::default(),
+            context: HashMap::new(),
+            transport: None,
+            decision: "Allow".to_string(),
+            decision_source: "test".to_string(),
+            matched_rule_id: None,
+            enforcement_point: "test".to_string(),
+            status: EventStatus::Confirmed,
+            payload: PayloadDescriptor::default(),
+            nats_sequence: None,
+            event_hash: None,
+            llm_trace: None,
+            default_caution: false,
+            config_integrity_ref: None,
+        };
+        let prod_hash = compute_event_hash(&event);
+
+        // Build same hash WITHOUT the domain prefix.
+        let no_prefix = {
+            let mut h = Sha256::new();
+            for field in &[
+                event.event_id.as_str(),
+                event.trace_id.as_str(),
+                event.agent_id.as_str(),
+                event.operation.as_str(),
+                event.decision.as_str(),
+                event.decision_source.as_str(),
+                &format!("{:?}", event.status),
+                event.enforcement_point.as_str(),
+                &event.timestamp.to_rfc3339(),
+                event.payload.content_hash.as_str(),
+            ] {
+                h.update((field.len() as u32).to_le_bytes());
+                h.update(field.as_bytes());
+            }
+            hex::encode(h.finalize())
+        };
+        assert_ne!(
+            prod_hash, no_prefix,
+            "regression: compute_event_hash output equals the no-prefix variant — \
+             `gvm-event-v1:` prefix is no longer applied"
+        );
     }
 
     #[test]

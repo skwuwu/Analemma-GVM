@@ -155,9 +155,13 @@ impl WasmEngine {
         let input_json = serde_json::to_string(req).context("Failed to serialize EvalRequest")?;
         let input_bytes = input_json.as_bytes();
 
-        let mut rt = runtime
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let mut rt = runtime.lock().map_err(|e| {
+            // §1.3: don't surface internal lock-poison details to callers.
+            // The PoisonError::to_string output is not sensitive but we
+            // keep the API uniform and log the raw error instead.
+            tracing::error!(error = %e, "Wasm runtime mutex poisoned — failing closed");
+            anyhow::anyhow!("Wasm runtime unavailable")
+        })?;
 
         // Copy instance handle (it's a lightweight Copy type)
         let instance = rt.instance;
@@ -349,6 +353,12 @@ mod tests {
 
     #[test]
     fn test_native_fallback() {
+        // ABAC layer "no rule matches → Allow" is the documented default.
+        // This is NOT the §1.1 fail-close surface — that applies at the
+        // request boundary (SRR + max_strict composition). The Wasm/native
+        // engine is the ABAC stage; empty rules legitimately mean
+        // "no policy applies, defer to upstream SRR/default-to-caution".
+        // See enforcement::classify for the actual fail-close composition.
         let engine = WasmEngine::native();
         assert!(!engine.is_wasm());
         assert!(engine.module_hash.is_none());
@@ -371,7 +381,44 @@ mod tests {
         let resp = engine
             .evaluate(&req)
             .expect("native engine evaluation must succeed");
-        assert_eq!(resp.decision, "Allow");
+        assert_eq!(
+            resp.decision, "Allow",
+            "ABAC empty-rules default is Allow — fail-close happens at the \
+             enforcement::classify boundary, not at this layer"
+        );
+    }
+
+    #[test]
+    fn test_native_fallback_deterministic_on_empty_rules() {
+        // Strengthening: same input → same decision (§4.1 determinism)
+        // regardless of repeat calls. Also asserts the response carries
+        // the no-rule-matched signal so callers can trace it.
+        let engine = WasmEngine::native();
+        let req = gvm_engine::EvalRequest {
+            operation: "gvm.messaging.read".to_string(),
+            resource: gvm_engine::ResourceAttrs {
+                service: "gmail".to_string(),
+                tier: "external".to_string(),
+                sensitivity: "low".to_string(),
+            },
+            subject: gvm_engine::SubjectAttrs {
+                agent_id: "test-agent".to_string(),
+                tenant_id: None,
+            },
+            context: gvm_engine::ContextAttrs::default(),
+            rules: vec![],
+        };
+
+        let r1 = engine.evaluate(&req).expect("first eval");
+        let r2 = engine.evaluate(&req).expect("second eval");
+        let r3 = engine.evaluate(&req).expect("third eval");
+        assert_eq!(r1.decision, r2.decision);
+        assert_eq!(r2.decision, r3.decision);
+        assert!(
+            r1.matched_rule.is_none(),
+            "empty rule set must not produce a matched_rule; got {:?}",
+            r1.matched_rule
+        );
     }
 
     #[test]

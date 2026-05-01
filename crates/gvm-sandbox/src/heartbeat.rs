@@ -34,6 +34,26 @@ const HEARTBEAT_DIR: &str = "/run/gvm";
 const HEARTBEAT_PREFIX: &str = "gvm-";
 const HEARTBEAT_SUFFIX: &str = ".heartbeat";
 
+/// Returns the heartbeat directory.
+///
+/// In production this is the hardcoded `/run/gvm`. Tests in this
+/// module may override the path via a `#[cfg(test)]`-gated env var
+/// so they can run as a non-root user (CI default) without silently
+/// skipping. The override is COMPILED OUT of production binaries
+/// (the `#[cfg(test)]` block is only present when the gvm-sandbox
+/// crate is built with `--cfg test`), so an attacker who can set
+/// env vars on the production gvm-proxy process cannot redirect
+/// heartbeat files and bypass orphan detection.
+fn heartbeat_dir() -> String {
+    #[cfg(test)]
+    {
+        if let Ok(test_dir) = std::env::var("GVM_HEARTBEAT_DIR_TEST_ONLY") {
+            return test_dir;
+        }
+    }
+    HEARTBEAT_DIR.to_string()
+}
+
 /// How often the parent touches the heartbeat file's mtime.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -63,7 +83,10 @@ pub enum ParentState {
 pub fn heartbeat_path(pid: u32) -> PathBuf {
     PathBuf::from(format!(
         "{}/{}{}{}",
-        HEARTBEAT_DIR, HEARTBEAT_PREFIX, pid, HEARTBEAT_SUFFIX
+        heartbeat_dir(),
+        HEARTBEAT_PREFIX,
+        pid,
+        HEARTBEAT_SUFFIX
     ))
 }
 
@@ -97,7 +120,7 @@ impl ParentHeartbeat {
     /// [`acquire`].
     #[doc(hidden)]
     pub fn acquire_with_interval(pid: u32, interval: Duration) -> Result<Self> {
-        let _ = std::fs::create_dir_all(HEARTBEAT_DIR);
+        let _ = std::fs::create_dir_all(heartbeat_dir());
         let path = heartbeat_path(pid);
 
         let file = std::fs::OpenOptions::new()
@@ -109,6 +132,9 @@ impl ParentHeartbeat {
             .with_context(|| format!("Failed to open heartbeat file {}", path.display()))?;
         let lock_fd: OwnedFd = file.into();
 
+        // SAFETY: flock() takes an integer fd and bitflags; no pointers are
+        // dereferenced. lock_fd is a live OwnedFd we just opened, so the
+        // raw fd is valid for the duration of this call.
         let ret = unsafe { libc::flock(lock_fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
@@ -201,6 +227,9 @@ fn touch_fd(fd: std::os::unix::io::RawFd) {
     // just opened), the next probe will see a stale mtime and the
     // parent will be incorrectly flagged Hung — but only after the
     // 30s threshold, so a transient failure is benign.
+    // SAFETY: `times` is a stack-allocated [timespec; 2]; futimens()
+    // reads exactly two elements via the pointer, matching the array
+    // size. `fd` is owned by the caller and live for this call.
     unsafe {
         libc::futimens(fd, times.as_ptr());
     }
@@ -231,11 +260,15 @@ pub fn parent_state(pid: u32, stale_threshold: Duration) -> ParentState {
     };
 
     let fd = file.as_raw_fd();
+    // SAFETY: flock() reads only the integer fd and flag bits; no pointer
+    // arguments. `fd` is owned by `file` and stays live until this scope
+    // ends, well after both flock() calls.
     let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
     if ret == 0 {
         // We acquired the exclusive lock — parent's open file
         // description is gone. Release before our FD drops to
         // avoid muddling state for subsequent probes.
+        // SAFETY: same fd as the LOCK_EX call above; still owned by `file`.
         unsafe {
             libc::flock(fd, libc::LOCK_UN);
         }
@@ -267,22 +300,36 @@ pub fn parent_state(pid: u32, stale_threshold: Duration) -> ParentState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
 
     // These tests run only on Linux (the module itself is gated).
-    // They use the real /run/gvm/ if available; if not (e.g., a
-    // build host without root tmpfs), they skip with a TODO trace.
+    // They no longer skip when /run/gvm is not writable: every test
+    // forces GVM_HEARTBEAT_DIR_TEST_ONLY to a process-shared tempdir
+    // so CI runs (non-root) actually exercise the flock/futimens paths
+    // instead of silently passing.
+    //
+    // The env var read in `heartbeat_dir()` is gated by `#[cfg(test)]`
+    // — production binaries never even compile the env-var lookup,
+    // so an attacker who can set env vars cannot redirect heartbeat
+    // files at runtime. The variable name carries `_TEST_ONLY` to
+    // make the test-fixture intent unmistakable to anyone grepping.
 
-    fn can_write_run_gvm() -> bool {
-        std::fs::create_dir_all(HEARTBEAT_DIR).is_ok()
-            && std::fs::write(format!("{}/.probe", HEARTBEAT_DIR), b"").is_ok()
+    static TEST_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+
+    fn ensure_test_dir() {
+        let dir = TEST_DIR
+            .get_or_init(|| tempfile::tempdir().expect("create heartbeat tempdir for tests"));
+        // SAFETY: process-wide env mutation is racy in general; here we
+        // only ever set it to the same path (the OnceLock-protected
+        // tempdir), so concurrent tests observe the same value.
+        unsafe {
+            std::env::set_var("GVM_HEARTBEAT_DIR_TEST_ONLY", dir.path());
+        }
     }
 
     #[test]
     fn acquire_creates_file_and_drop_removes_it() {
-        if !can_write_run_gvm() {
-            eprintln!("skipping: /run/gvm/ not writable");
-            return;
-        }
+        ensure_test_dir();
         // Use a synthetic PID well above the live range so we don't
         // collide with a real running gvm.
         let synthetic_pid = u32::MAX - 1;
@@ -302,10 +349,7 @@ mod tests {
 
     #[test]
     fn parent_state_reports_alive_while_held() {
-        if !can_write_run_gvm() {
-            eprintln!("skipping: /run/gvm/ not writable");
-            return;
-        }
+        ensure_test_dir();
         let synthetic_pid = u32::MAX - 2;
         let _ = std::fs::remove_file(heartbeat_path(synthetic_pid));
 
@@ -319,10 +363,7 @@ mod tests {
 
     #[test]
     fn parent_state_reports_dead_after_drop() {
-        if !can_write_run_gvm() {
-            eprintln!("skipping: /run/gvm/ not writable");
-            return;
-        }
+        ensure_test_dir();
         let synthetic_pid = u32::MAX - 3;
         let path = heartbeat_path(synthetic_pid);
         let _ = std::fs::remove_file(&path);
@@ -360,10 +401,7 @@ mod tests {
 
     #[test]
     fn parent_state_reports_hung_when_mtime_stale() {
-        if !can_write_run_gvm() {
-            eprintln!("skipping: /run/gvm/ not writable");
-            return;
-        }
+        ensure_test_dir();
         let synthetic_pid = u32::MAX - 4;
         let path = heartbeat_path(synthetic_pid);
         let _ = std::fs::remove_file(&path);
@@ -411,10 +449,7 @@ mod tests {
 
     #[test]
     fn second_acquire_with_same_pid_fails() {
-        if !can_write_run_gvm() {
-            eprintln!("skipping: /run/gvm/ not writable");
-            return;
-        }
+        ensure_test_dir();
         let synthetic_pid = u32::MAX - 5;
         let _ = std::fs::remove_file(heartbeat_path(synthetic_pid));
 
@@ -428,10 +463,7 @@ mod tests {
 
     #[test]
     fn touch_thread_advances_mtime() {
-        if !can_write_run_gvm() {
-            eprintln!("skipping: /run/gvm/ not writable");
-            return;
-        }
+        ensure_test_dir();
         let synthetic_pid = u32::MAX - 7;
         let _ = std::fs::remove_file(heartbeat_path(synthetic_pid));
 
@@ -458,10 +490,7 @@ mod tests {
 
     #[test]
     fn drop_releases_lock_so_re_acquire_succeeds() {
-        if !can_write_run_gvm() {
-            eprintln!("skipping: /run/gvm/ not writable");
-            return;
-        }
+        ensure_test_dir();
         let synthetic_pid = u32::MAX - 8;
         let _ = std::fs::remove_file(heartbeat_path(synthetic_pid));
 

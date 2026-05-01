@@ -1,10 +1,34 @@
 # Test & Benchmark Report
 
-**Last Verified: 2026-04-29** (`cargo test --workspace`: 479 passed, 0 failed, 4 ignored on Windows; 499 passed on Linux/EC2)
+**Last Verified: 2026-05-01** (`cargo test --workspace`: full workspace passed, 0 failed on Windows; Linux/EC2-only sandbox scenarios remain release gates)
+
+> **Note on snapshots:** Per-suite test names listed in this document are
+> historical snapshots. Names rotate as the suite evolves. After a test-
+> quality audit pass on 2026-05-01, several entries below now refer to
+> previous test names that have been renamed or removed (e.g.
+> `group_commit_fail_close_all_callers_receive_error` → split into
+> `group_commit_primary_fail_emergency_wal_catches` plus a tracked-
+> missing companion). Always confirm the current state by running
+> `cargo test --workspace`. The "0 failed on Windows" line above does
+> NOT exercise the Linux-gated sandbox isolation tests; those are
+> covered only on the EC2 release gate.
 
 > Test count grows with each feature. Run `cargo test --workspace` to verify current count.
 >
-> **Architecture note:** SRR is the sole enforcement layer; `TokenBudget` replaces the per-URL rate limiter; the decision set is 5 variants (`Allow < AuditOnly < Delay < RequireApproval < Deny`). Earlier ABAC/Registry/`Throttle` sections were removed from this report when those subsystems were deleted from the codebase. Sub-sections below cover only what is in the current tree.
+> **Architecture note:** SRR is the authoritative network enforcement layer; SDK headers are convenience metadata and cannot downgrade transport-level SRR decisions. The decision set is 5 variants (`Allow < AuditOnly < Delay < RequireApproval < Deny`), and `max_strict` resolves cross-layer conflicts. Unknown or unclassified traffic must fall to Default-to-Caution (`Delay 300ms`), not `Allow`. Earlier ABAC/Registry/`Throttle` sections were removed from this report when those subsystems were deleted from the codebase.
+
+## Design Compliance Baseline
+
+These are the design principles every test in this report is interpreted against:
+
+| Principle | Test expectation |
+|-----------|------------------|
+| Proxy/SRR is authority | Agent-declared SDK headers cannot make a dangerous URL safer. Host, method, path, and inspected payload drive enforcement. |
+| Fail-close / Default-to-Caution | Unknown input, malformed payloads, oversized bodies, and unmatched URLs must return `Delay` or stricter, never `Allow`. |
+| `max_strict` monotonicity | Tenant/SDK/semantic context may raise strictness, but cannot lower SRR `Deny` or `Delay`. |
+| Auditability | Decisions on proxy and MITM paths must emit governance headers and WAL metadata where classification exists. |
+| DNS governance scope | DNS hostile tests must expect tiered delay/logging in sandbox mode, not DNS Deny. Cooperative and contained modes do not claim DNS control. |
+| Mode boundary honesty | Contained mode is Linux/WSL2 egress-lock without MITM; Sandbox is the full L7 MITM security boundary. |
 
 ## Overview
 
@@ -12,9 +36,9 @@
 |----------|-------|-------|---------------|
 | **Unit tests** (Rust, all crates) | ~390 (Windows) / ~410 (Linux, +sandbox network/cgroup/seccomp) | Pure logic, no I/O | Every `cargo test` |
 | **Integration tests** (Rust) | 89 across `tests/` (boundary, hostile, edge, integration, merkle, stress, enforcement, api_handlers, common_sanity, adversarial_infra) | Cross-module interaction | Every `cargo test` |
-| **EC2 E2E** | 84 scenarios | Full CLI pipeline on Linux | Per-release on EC2 |
+| **EC2 E2E** | 84+ scenarios | Full CLI pipeline on Linux | Per-release on EC2 |
 | **Chaos stress** | 60-min sustained load | Proxy kill, network partition, disk pressure | Per-release on EC2 |
-| **DNS governance E2E** | 9 subtests (Test 83) + 1 (Test 84) | Layer 0 tier escalation, decay, bypass | Per-release on EC2 |
+| **DNS governance E2E** | 9 subtests (Test 83) + 1 (Test 84) | Layer 0 tier escalation, decay, DoH mitigation | Per-release on EC2 |
 | **Ghost stress** | 9 verification checks | Autonomous agent + 5 attack tools | Per-release on EC2 |
 | **Benchmarks** | 17 groups (Criterion) | Latency, throughput, tail latency | On demand |
 | **Fuzzing** | 9 targets (libFuzzer) | Crash resistance, coverage growth | Daily CI (Mon-Sat 5min, Sun 30min) |
@@ -228,7 +252,7 @@ test result: ok. 9 passed; 0 failed; 0 ignored; finished in 6.63s
 
 **Total (historical, pre-auth/vault-trait additions, ABAC-era entries pruned): 100 passed, 0 failed. Wall time: ~7.5s.**
 
-> **Current total (2026-04-29)**: 479 passed on Windows (4 ignored) / ~499 on Linux EC2 with `gvm-sandbox` Linux-gated modules included. Run `cargo test --workspace` for the live count.
+> **Current total (2026-05-01)**: the full Windows workspace run passed with 0 failures. Run `cargo test --workspace` for the live count; Linux/EC2 adds sandbox-only gates that are not executed by the Windows host run.
 
 ---
 

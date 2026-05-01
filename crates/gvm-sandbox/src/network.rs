@@ -996,6 +996,10 @@ fn is_pid_alive(pid: u32) -> bool {
 /// original PID as dead so its leaked resources get cleaned up.
 fn is_pid_alive_with_starttime(pid: u32, expected_starttime: Option<u64>) -> bool {
     // Step 1: basic liveness check
+    // SAFETY: kill(pid, 0) is the standard liveness probe — signal 0 is
+    // never delivered, only validated. Takes integer args, no pointer
+    // dereference. ESRCH/EPERM are observable through errno but we only
+    // need the binary alive/dead answer here.
     if unsafe { libc::kill(pid as i32, 0) != 0 } {
         return false;
     }
@@ -1139,6 +1143,10 @@ fn cleanup_state_resources(state: &SandboxState) -> StateCleanupCounts {
             if let Ok(content) = std::fs::read_to_string(&procs_path) {
                 for line in content.lines() {
                     if let Ok(pid) = line.trim().parse::<i32>() {
+                        // SAFETY: kill() takes only integer args; PID was just
+                        // parsed from cgroup.procs and may already be exited or
+                        // recycled — ESRCH/EPERM are intentionally ignored as
+                        // this is best-effort orphan cleanup.
                         unsafe { libc::kill(pid, libc::SIGKILL) };
                     }
                 }

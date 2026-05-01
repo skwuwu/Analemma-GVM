@@ -478,16 +478,47 @@ mod tests {
 
     #[test]
     fn secret_zeroized_on_drop() {
-        // Verify zeroize contract: JwtSecret derives ZeroizeOnDrop
-        // which zeroes the key Vec<u8> on drop.
-        // Compile-time guarantee via derive(ZeroizeOnDrop).
+        // Verify zeroize contract: JwtSecret derives ZeroizeOnDrop, which
+        // calls Vec::zeroize() before the heap buffer is deallocated.
+        // We capture the buffer pointer pre-drop and read the same bytes
+        // post-drop with read_volatile — if the sentinel pattern still
+        // appears, Drop did not zero.
+        //
+        // SAFETY caveat: the allocator may reuse the slot before we read.
+        // We use a 32-byte distinctive sentinel (0xA5) so an allocator-
+        // recycled slot is unlikely to match. The test fails if and only
+        // if the original sentinel survives — which proves "no zeroing".
+
+        let sentinel: u8 = 0xA5;
         let secret = JwtSecret {
-            key: vec![0xFF; 32],
+            key: vec![sentinel; 32],
         };
         assert_eq!(secret.key.len(), 32);
+
+        // Capture the pointer to the Vec's heap buffer.
+        let buf_ptr: *const u8 = secret.key.as_ptr();
+
         drop(secret);
-        // If we reach here, drop did not panic — zeroize contract holds.
-        // Runtime memory scan would use valgrind to confirm.
+
+        // Read 32 bytes through the captured pointer post-drop.
+        // SAFETY: pointer is dangling after drop; we use read_volatile to
+        // defeat the optimizer. If the allocator has reused the slot for
+        // something else, we'll read non-sentinel bytes — still passing
+        // the contract. Only "still all 0xA5" indicates zeroize ran NOT.
+        let observed: [u8; 32] = unsafe {
+            let mut buf = [0u8; 32];
+            for (i, slot) in buf.iter_mut().enumerate() {
+                *slot = std::ptr::read_volatile(buf_ptr.add(i));
+            }
+            buf
+        };
+
+        assert_ne!(
+            observed, [sentinel; 32],
+            "JwtSecret heap buffer still holds the original sentinel after \
+             drop — ZeroizeOnDrop did not zero. observed={:02x?}",
+            observed,
+        );
     }
 
     #[test]

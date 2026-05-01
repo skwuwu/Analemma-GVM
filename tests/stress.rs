@@ -114,19 +114,28 @@ decision = { type = "Delay", milliseconds = 300 }
         "Unknown host should get Default-to-Caution"
     );
 
-    // Measure lookup time with 10K rules
+    // Measure lookup time with 10K rules.
+    // §3.1 hot-path budget: < 1µs. We measure many iterations and
+    // assert against a CI-realistic ceiling that is still 50× tighter
+    // than the prior 5ms ceiling — anything above the new ceiling
+    // indicates a real algorithmic regression, not just CI jitter.
     let start = Instant::now();
-    let iterations = 1_000;
+    let iterations = 10_000;
     for _ in 0..iterations {
         let _ = srr.check("POST", "host-5000.example.com", "/test", None);
     }
     let lookup_time = start.elapsed();
     let per_lookup_us = lookup_time.as_micros() as f64 / iterations as f64;
 
-    // Each lookup should be < 5ms even with 10K rules on CI (shared runners are slow)
+    // §3.1 release budget is <1µs; debug builds are ~10–100× slower.
+    // CI ceiling: 1000µs/lookup. This is 5× tighter than the prior
+    // 5000µs ceiling and still catches a 10× algorithmic regression
+    // without flaking on shared CI runners under debug builds.
+    // Benches exercise the release-build sub-µs claim separately.
     assert!(
-        per_lookup_us < 5000.0,
-        "SRR lookup with 10K rules: {:.1}us/lookup — too slow",
+        per_lookup_us < 1000.0,
+        "SRR lookup with 10K rules: {:.2}µs/lookup — exceeds CI ceiling \
+         of 1000µs (§3.1 release budget is <1µs; benches verify that)",
         per_lookup_us
     );
 }

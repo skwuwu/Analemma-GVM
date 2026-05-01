@@ -308,38 +308,81 @@ async fn concurrent_agent_disconnects_yield_410_gone() {
 
 #[tokio::test]
 async fn approve_after_handler_removed_entry_returns_404() {
-    let (state, _wal) = common::test_state().await;
-    let (pa, _rx) = pending("evt-race", "agent-1");
-    state.pending_approvals.insert("evt-race".to_string(), pa);
+    // Repeat the race many times to exercise multiple interleavings.
+    // On each iteration two approve_request tasks fire concurrently
+    // against the same event_id — exactly one must succeed (or GONE),
+    // the other must observe the entry already gone (404 / GONE).
+    const ITERATIONS: usize = 200;
 
-    // First approve drains the entry.
-    let resp1 = gvm_proxy::api::approve_request(
-        State(state.clone()),
-        Json(serde_json::json!({"event_id": "evt-race", "approved": true})),
-    )
-    .await;
-    // First call: either OK (channel delivered) or GONE (rx dropped).
-    // Both consume the entry.
-    let s1 = resp1.status();
-    assert!(
-        s1 == StatusCode::OK || s1 == StatusCode::GONE,
-        "first approve must consume the entry, got {}",
-        s1
-    );
+    for iter in 0..ITERATIONS {
+        let (state, _wal) = common::test_state().await;
+        let evt_id = format!("evt-race-{}", iter);
+        let (pa, _rx) = pending(&evt_id, "agent-1");
+        state.pending_approvals.insert(evt_id.clone(), pa);
 
-    // Second approve must see the entry gone → 404.
-    let resp2 = gvm_proxy::api::approve_request(
-        State(state.clone()),
-        Json(serde_json::json!({"event_id": "evt-race", "approved": true})),
-    )
-    .await;
-    assert_eq!(
-        resp2.status(),
-        StatusCode::NOT_FOUND,
-        "second approve must observe entry gone (404), no double-deliver"
-    );
+        // Use a barrier so both tasks contend on the DashMap at
+        // approximately the same moment.
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
 
-    assert_eq!(state.pending_approvals.len(), 0);
+        let s1 = state.clone();
+        let evt1 = evt_id.clone();
+        let b1 = barrier.clone();
+        let t1 = tokio::spawn(async move {
+            b1.wait().await;
+            gvm_proxy::api::approve_request(
+                State(s1),
+                Json(serde_json::json!({"event_id": evt1, "approved": true})),
+            )
+            .await
+        });
+
+        let s2 = state.clone();
+        let evt2 = evt_id.clone();
+        let b2 = barrier.clone();
+        let t2 = tokio::spawn(async move {
+            b2.wait().await;
+            gvm_proxy::api::approve_request(
+                State(s2),
+                Json(serde_json::json!({"event_id": evt2, "approved": true})),
+            )
+            .await
+        });
+
+        let r1 = t1.await.expect("approve task 1 must not panic");
+        let r2 = t2.await.expect("approve task 2 must not panic");
+
+        let s1_status = r1.status();
+        let s2_status = r2.status();
+
+        // Exactly one of: (OK, NOT_FOUND), (NOT_FOUND, OK), or both
+        // GONE/NOT_FOUND if the rx was dropped before either reached
+        // the channel send. The forbidden state is two OKs (double-
+        // deliver) or any 5xx.
+        let oks = [s1_status, s2_status]
+            .iter()
+            .filter(|s| **s == StatusCode::OK)
+            .count();
+        let gones = [s1_status, s2_status]
+            .iter()
+            .filter(|s| **s == StatusCode::GONE || **s == StatusCode::NOT_FOUND)
+            .count();
+        assert!(
+            oks <= 1,
+            "iter {iter}: at most one approve may succeed; \
+             got s1={s1_status} s2={s2_status}",
+        );
+        assert_eq!(
+            oks + gones,
+            2,
+            "iter {iter}: every response must be OK/GONE/NOT_FOUND; \
+             got s1={s1_status} s2={s2_status}",
+        );
+        assert_eq!(
+            state.pending_approvals.len(),
+            0,
+            "iter {iter}: pending_approvals must be empty after race",
+        );
+    }
 }
 
 // ════════════════════════════════════════════════════════════════

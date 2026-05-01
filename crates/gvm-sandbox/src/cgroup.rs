@@ -160,6 +160,12 @@ impl Drop for CgroupGuard {
                 for line in content.lines() {
                     if let Ok(pid) = line.trim().parse::<i32>() {
                         if pid > 0 {
+                            // SAFETY: libc::kill takes a PID and signal, both POD
+                            // values; no pointers are dereferenced. PID was just
+                            // parsed from /proc and may have already exited or been
+                            // recycled — kill() returning ESRCH/EPERM is harmless and
+                            // we ignore the return code intentionally (best-effort
+                            // cleanup of remaining cgroup procs).
                             unsafe {
                                 libc::kill(pid, libc::SIGKILL);
                             }

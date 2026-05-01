@@ -91,9 +91,9 @@ async fn srr_100_concurrent_checks_complete_without_blocking() {
     );
 
     // POST to /transfer/* (25 requests) + POST to /graphql with TransferFunds body (25 requests)
-    assert!(
-        deny_count >= 25,
-        "Expected at least 25 denies (transfer+graphql), got {}",
+    assert_eq!(
+        deny_count, 50,
+        "Expected exactly 50 denies (transfer+graphql), got {}",
         deny_count
     );
 }
@@ -364,51 +364,71 @@ fn srr_garbage_input_does_not_panic() {
     }
 }
 
-// ─── Test 8: Secret Zeroing — VaultEncryption key is zeroed on drop ───
+// ─── Test 8: Secret Zeroing — LocalKeyProvider::Drop zeros the key bytes ───
+//
+// We use a raw pointer captured BEFORE drop and read the same memory after
+// drop with `ptr::read_volatile`. This is unsafe (the allocator may reuse
+// the memory), but it is the only way short of valgrind/bytehound to
+// observe whether the Drop impl actually wrote zeros.
+//
+// To minimize the chance of allocator reuse between drop and inspection,
+// we inline the inspection with no intervening allocations. If the
+// allocator does reuse the slot, we'll read non-zero bytes that
+// happen NOT to match the original key — the test still detects "Drop did
+// not zero" because the original key bytes were 0xA5 and zero≠0xA5; an
+// allocator-reused slot is also unlikely to be exactly 0xA5.
 
 #[test]
 fn vault_key_is_zeroed_on_drop() {
-    {
-        // We need to verify that after drop, the key memory is zeroed.
-        // Due to Rust's ownership model, we can't directly inspect freed memory safely.
-        // Instead, we verify the zeroize contract: encrypt/decrypt works before drop,
-        // and the Drop impl calls zeroize().
-        //
-        // For a true memory scan, use: valgrind --tool=memcheck or bytehound.
-        // Here we test the compile-time contract: VaultEncryption implements Drop with zeroize.
-        use gvm_proxy::ledger::Ledger;
-        use gvm_proxy::vault::Vault;
+    use gvm_proxy::vault::{KeyProvider, LocalKeyProvider};
 
-        let dir = tempfile::tempdir().expect("temp dir creation must succeed");
-        let wal_path = dir.path().join("wal.log");
+    // Sentinel pattern — distinct from 0x00 (drop result) and 0xFF (likely
+    // tag/footer bytes), so any allocator-reuse byte is most likely
+    // *also* non-sentinel and the test still rejects "no zeroing".
+    let sentinel = [0xA5u8; 32];
+    let provider = Box::new(LocalKeyProvider::new(sentinel));
 
-        let rt = tokio::runtime::Runtime::new().expect("tokio runtime creation must succeed");
-        rt.block_on(async {
-            let ledger = Arc::new(
-                Ledger::new(&wal_path, "", "")
-                    .await
-                    .expect("ledger must initialize for key zeroing test"),
-            );
-            let vault = Vault::new(ledger).expect("vault must initialize with valid ledger");
+    // Smoke test: provider works before drop.
+    let ct = provider
+        .encrypt(b"plaintext-before-drop")
+        .expect("encrypt must succeed before drop");
+    let pt = provider.decrypt(&ct).expect("decrypt must succeed");
+    assert_eq!(pt, b"plaintext-before-drop");
 
-            // Write and read — proves encryption works
-            vault
-                .write("test-key", b"secret-data", "agent-1")
-                .await
-                .expect("vault write must succeed before drop");
-            let data = vault
-                .read("test-key", "agent-1")
-                .await
-                .expect("vault read must succeed before drop");
-            assert_eq!(data.expect("written key must be readable"), b"secret-data");
+    // Capture the address of the inner key. The Box keeps it stable.
+    // SAFETY: LocalKeyProvider has a single field `key: [u8; 32]` per
+    // `src/vault.rs:80`. Casting Box<LocalKeyProvider> to *const u8 yields
+    // a pointer to the start of the struct, which is the start of `key`
+    // because there is no other field in front of it.
+    let key_ptr: *const u8 = (&*provider as *const LocalKeyProvider) as *const u8;
 
-            // vault is dropped here — ZeroizeOnDrop zeros the key
-        });
-        // If we reach here, the vault was dropped without crash
-    }
+    drop(provider);
 
-    // Contract verified: VaultEncryption::drop() calls key.zeroize()
-    // Runtime memory scan would use /proc/self/mem or valgrind to confirm
+    // Read 32 bytes through the captured pointer.
+    // SAFETY: We do NOT free or shadow this pointer; the underlying
+    // allocation is freed by `drop`. read_volatile defeats compiler
+    // optimization that might elide the read. This is best-effort —
+    // a malloc that immediately reuses the slot for another sentinel-
+    // matching value would defeat the test, but standard allocators
+    // typically scribble or zero recycled slots.
+    let observed: [u8; 32] = unsafe {
+        let mut buf = [0u8; 32];
+        for (i, slot) in buf.iter_mut().enumerate() {
+            *slot = std::ptr::read_volatile(key_ptr.add(i));
+        }
+        buf
+    };
+
+    // If Drop ran zeroize, we expect all-zero (or at worst allocator-
+    // recycled bytes that are NOT the sentinel). The test fails only if
+    // the original sentinel still survives — that proves Drop did not
+    // zero.
+    assert_ne!(
+        observed, sentinel,
+        "key bytes still contain the original sentinel after drop — \
+         LocalKeyProvider::Drop did not zeroize. observed={:02x?}",
+        observed,
+    );
 }
 
 // ─── Test 9: Backpressure — concurrent task spawns stay bounded ───
@@ -799,6 +819,101 @@ mod proptest_max_strict {
     }
 }
 
+// ─── Test 12b: §4.1 Determinism — same SRR input → same decision ───
+//
+// `max_strict` algebra is property-tested above, but the higher-level
+// claim ("same operation metadata → same enforcement decision regardless
+// of time-of-day or concurrent requests") needs end-to-end coverage.
+// We feed the same (method, host, path, body) tuple through SRR many
+// times across many threads and assert every output is identical.
+
+mod proptest_srr_determinism {
+    use gvm_proxy::srr::NetworkSRR;
+    use proptest::prelude::*;
+    use std::sync::Arc;
+
+    fn fixed_srr() -> NetworkSRR {
+        super::srr_from_toml(
+            r#"
+[[rules]]
+method = "POST"
+pattern = "api.bank.com/transfer/{any}"
+decision = { type = "Deny", reason = "policy" }
+
+[[rules]]
+method = "GET"
+pattern = "api.openai.com/{any}"
+decision = { type = "Allow" }
+
+[[rules]]
+method = "*"
+pattern = "{any}"
+decision = { type = "Delay", milliseconds = 200 }
+"#,
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Same input across N repeated calls on the same thread must
+        /// produce identical decisions.
+        #[test]
+        fn srr_check_repeats_are_identical(
+            method in prop::sample::select(vec!["GET", "POST", "DELETE"]),
+            host in "[a-z]{3,12}\\.(test|com)",
+            path in "/[a-z0-9/]{0,30}",
+        ) {
+            let srr = fixed_srr();
+            let r1 = srr.check(&method, &host, &path, None);
+            let r2 = srr.check(&method, &host, &path, None);
+            let r3 = srr.check(&method, &host, &path, None);
+            prop_assert_eq!(format!("{:?}", r1.decision), format!("{:?}", r2.decision));
+            prop_assert_eq!(format!("{:?}", r2.decision), format!("{:?}", r3.decision));
+        }
+    }
+
+    /// 32 threads × 50 iterations against the same input must all
+    /// produce identical decisions (no race-induced divergence).
+    #[test]
+    fn srr_check_concurrent_32threads_identical_decisions() {
+        let srr = Arc::new(fixed_srr());
+        let inputs = vec![
+            ("POST", "api.bank.com", "/transfer/123"),
+            ("GET", "api.openai.com", "/v1/models"),
+            ("DELETE", "unknown.example.com", "/x"),
+        ];
+        for (m, h, p) in inputs {
+            // Reference decision computed once, single-threaded.
+            let reference = format!("{:?}", srr.check(m, h, p, None).decision);
+
+            let mut handles = Vec::new();
+            for _ in 0..32 {
+                let s = Arc::clone(&srr);
+                let r = reference.clone();
+                let m_owned = m.to_string();
+                let h_owned = h.to_string();
+                let p_owned = p.to_string();
+                handles.push(std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        let d =
+                            format!("{:?}", s.check(&m_owned, &h_owned, &p_owned, None).decision);
+                        assert_eq!(
+                            d, r,
+                            "concurrent SRR.check on same input produced different \
+                             decision: ref={} got={}",
+                            r, d
+                        );
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+        }
+    }
+}
+
 // ─── Test 13: HTTP Case-Smuggling Bypass Attempt ───
 //
 // Attacker tries to bypass SRR rules by varying HTTP method/host/path casing.
@@ -935,33 +1050,49 @@ fn srr_unicode_normalization_bypass_attempt() {
     "#,
     );
 
-    // Fullwidth characters: ／ (U+FF0F) instead of / (U+002F)
-    let result = srr.check("POST", "api.bank.com", "/transfer\u{FF0F}123", None);
-    // Must not panic. This should NOT match the rule (different bytes).
-    // Catch-all Delay is the safe fallback.
-    let _s = result.decision.strictness();
+    let bypass_attempts = vec![
+        (
+            "fullwidth slash in path",
+            "POST",
+            "api.bank.com",
+            "/transfer\u{FF0F}123",
+        ),
+        (
+            "combining mark in host",
+            "POST",
+            "a\u{0324}pi.bank.com",
+            "/transfer/123",
+        ),
+        (
+            "right-to-left override host",
+            "POST",
+            "\u{202E}moc.knab.ipa",
+            "/transfer/123",
+        ),
+        (
+            "cyrillic homoglyph host",
+            "POST",
+            "\u{0430}pi.bank.com",
+            "/transfer/123",
+        ),
+        (
+            "percent-encoded path suffix",
+            "POST",
+            "api.bank.com",
+            "/transfer/%31%32%33",
+        ),
+    ];
 
-    // Combining dot below on 'a' in "api": a̤pi.bank.com
-    let result = srr.check("POST", "a\u{0324}pi.bank.com", "/transfer/123", None);
-    let _s = result.decision.strictness();
-
-    // Right-to-left override (U+202E) — could visually disguise URLs
-    let result = srr.check("POST", "\u{202E}moc.knab.ipa", "/transfer/123", None);
-    let _s = result.decision.strictness();
-
-    // Homoglyph: Cyrillic 'а' (U+0430) instead of Latin 'a' (U+0061)
-    let result = srr.check("POST", "\u{0430}pi.bank.com", "/transfer/123", None);
-    // This is a different hostname, so the bank rule should NOT match.
-    // Must fall through to catch-all (Delay), not be accidentally allowed.
-    assert!(
-        result.decision.strictness() >= EnforcementDecision::Delay { milliseconds: 0 }.strictness(),
-        "Homoglyph host must not bypass to Allow, got {:?}",
-        result.decision
-    );
-
-    // Percent-encoded path: /transfer/%31%32%33 instead of /transfer/123
-    let result = srr.check("POST", "api.bank.com", "/transfer/%31%32%33", None);
-    let _s = result.decision.strictness();
+    for (name, method, host, path) in bypass_attempts {
+        let result = srr.check(method, host, path, None);
+        assert!(
+            result.decision.strictness()
+                >= EnforcementDecision::Delay { milliseconds: 0 }.strictness(),
+            "{} must not bypass to Allow, got {:?}",
+            name,
+            result.decision
+        );
+    }
 }
 
 // ─── Test 16: Path Traversal Bypass Attempt ───

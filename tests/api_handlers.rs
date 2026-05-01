@@ -46,12 +46,31 @@ type = "Allow"
     );
     state.srr_config_path = srr_path;
 
-    let resp = gvm_proxy::api::reload_srr(State(state)).await;
+    let resp = gvm_proxy::api::reload_srr(State(state.clone())).await;
     assert_eq!(resp.status(), StatusCode::OK);
 
     let json = body_json(resp).await;
     assert_eq!(json["reloaded"], true);
     assert_eq!(json["srr_rules"], 1);
+
+    // Side-effect assertion: the in-memory SRR has actually been
+    // swapped — classify against the new rule and assert Allow. A
+    // handler that returns 200 but never writes the lock would fail
+    // this. (Without this, the reported `srr_rules == 1` could come
+    // from any 1-rule set, including a stale one.)
+    let result = state
+        .srr
+        .read()
+        .unwrap()
+        .check("GET", "api.github.com", "/repos", None);
+    assert!(
+        matches!(
+            result.decision,
+            gvm_types::EnforcementDecision::Allow { .. }
+        ),
+        "after reload, the new Allow rule must apply; got {:?}",
+        result.decision
+    );
 }
 
 #[tokio::test]
@@ -97,13 +116,41 @@ type = "Allow"
     let (_dir2, bad_path) = srr_file("not valid {{ toml");
     state.srr_config_path = bad_path;
 
-    let _resp = gvm_proxy::api::reload_srr(State(state.clone())).await;
+    let resp = gvm_proxy::api::reload_srr(State(state.clone())).await;
 
-    // Original rules should be preserved
+    // Strong contract: failed reload must NOT return 200. A handler
+    // that swallowed the parse error and returned 200 with empty
+    // rules would silently regress.
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "failed reload must surface a 4xx, not silently succeed"
+    );
+    let json = body_json(resp).await;
+    assert_eq!(json["reloaded"], false);
+
+    // Original rules count must be preserved.
     let rule_count = state.srr.read().unwrap().rule_count();
     assert_eq!(
         rule_count, 1,
         "original rules must be preserved on failed reload"
+    );
+
+    // Original rule MUST still apply — pin the actual pattern, not
+    // just count. Empty-rules-set with count==1 (somehow) would fail
+    // here because the original Allow no longer applies.
+    let result = state
+        .srr
+        .read()
+        .unwrap()
+        .check("GET", "api.github.com", "/repos", None);
+    assert!(
+        matches!(
+            result.decision,
+            gvm_types::EnforcementDecision::Allow { .. }
+        ),
+        "post-failed-reload, original Allow rule for api.github.com/* must still apply; got {:?}",
+        result.decision
     );
 }
 

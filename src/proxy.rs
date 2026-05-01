@@ -1296,8 +1296,11 @@ fn extract_target(request: &Request<Body>) -> Option<Target> {
     })
 }
 
-/// Remove GVM-specific headers before forwarding to upstream
-fn remove_gvm_headers(headers: &mut axum::http::HeaderMap) {
+/// Remove GVM-specific headers before forwarding to upstream.
+///
+/// Public so integration tests can verify the actual prefix list
+/// (rather than re-implementing it and giving false coverage).
+pub fn remove_gvm_headers(headers: &mut axum::http::HeaderMap) {
     let gvm_prefixes = [
         "x-gvm-agent-id",
         "x-gvm-trace-id",

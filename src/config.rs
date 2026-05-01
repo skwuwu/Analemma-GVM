@@ -238,6 +238,19 @@ pub struct DnsGovernanceConfig {
     /// Local UDP port for the DNS governance proxy (default: 5353).
     #[serde(default = "default_dns_port")]
     pub listen_port: u16,
+    /// Sliding-window duration in seconds for Tier 3/4 burst detection
+    /// (default: 60). Operators can shorten this for E2E tests to
+    /// avoid 60-second waits, but values below 5 seconds are clamped
+    /// to 5 — anything shorter would make Tier 3 (≥5 unique
+    /// subdomains in the window) impossible to trigger. Reading from
+    /// config (not env var) ensures the override is auditable in the
+    /// WAL config-load record. See §6.5 of GVM_CODE_STANDARDS.md.
+    #[serde(default = "default_dns_window_secs")]
+    pub window_secs: u64,
+}
+
+fn default_dns_window_secs() -> u64 {
+    60
 }
 
 impl Default for DnsGovernanceConfig {
@@ -245,6 +258,7 @@ impl Default for DnsGovernanceConfig {
         Self {
             enabled: true,
             listen_port: 5353,
+            window_secs: 60,
         }
     }
 }

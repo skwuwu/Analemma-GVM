@@ -672,8 +672,73 @@ mod tests {
 
     #[test]
     fn mutex_poison_fail_closed() {
-        let store = IntentStore::new(30);
-        let r = store.claim("GET", "nonexistent.com", "/", None);
-        assert!(!r.verified);
+        // Drive the inner Mutex into Poison state by panicking inside a
+        // thread that holds the lock, then assert every public surface
+        // returns a fail-closed result instead of panicking the caller.
+        use std::sync::Arc;
+
+        let store = Arc::new(IntentStore::new(30));
+
+        // Pre-register a real intent so claim() has something to find.
+        let req = IntentRequest {
+            method: "GET".to_string(),
+            host: "example.com".to_string(),
+            path: "/x".to_string(),
+            operation: "test.poison".to_string(),
+            agent_id: "agent-1".to_string(),
+            ttl_secs: Some(30),
+        };
+        let _ = store
+            .register(&req)
+            .expect("pre-poison register must succeed");
+
+        // Poison the inner mutex.
+        let store_clone = Arc::clone(&store);
+        let _ = std::thread::spawn(move || {
+            let _guard = store_clone.inner.lock().expect("first lock must succeed");
+            panic!("intentional panic to poison IntentStore mutex");
+        })
+        .join();
+
+        // Confirm the lock IS poisoned (sanity check on test harness).
+        assert!(
+            store.inner.lock().is_err(),
+            "test harness failure: thread panic did not poison the mutex"
+        );
+
+        // claim() on a poisoned store must fail closed, not panic.
+        let r = store.claim("GET", "example.com", "/x", Some("agent-1"));
+        assert!(
+            !r.verified,
+            "poisoned IntentStore::claim must return verified=false (fail-closed)"
+        );
+
+        // confirm/release must not panic on a poisoned mutex (they are
+        // documented as safe to call regardless).
+        store.confirm(0);
+        store.release(0);
+
+        // register() should also surface an error rather than panic.
+        let req2 = IntentRequest {
+            method: "POST".to_string(),
+            host: "y.com".to_string(),
+            path: "/".to_string(),
+            operation: "test.after_poison".to_string(),
+            agent_id: "agent-2".to_string(),
+            ttl_secs: Some(30),
+        };
+        match store.register(&req2) {
+            Ok(_) => {
+                // Register may succeed if it bypasses inner — that's
+                // also an acceptable contract, but record the observation.
+                eprintln!("note: register() succeeded post-poison (may bypass inner)");
+            }
+            Err(e) => {
+                assert!(
+                    !e.is_empty(),
+                    "post-poison register error must carry a non-empty message"
+                );
+            }
+        }
     }
 }

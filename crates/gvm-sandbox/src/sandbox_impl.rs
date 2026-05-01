@@ -169,6 +169,13 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     let child_home_overlay = home_overlay_merged.clone();
     let child_ws_overlay = ws_overlay.as_ref().map(|(m, _)| m.clone());
 
+    // SAFETY: nix::sched::clone is unsafe because the child runs on the
+    // provided stack with the captured closure; we satisfy the contract by:
+    //   * passing a freshly-allocated, sufficiently-large `stack` (CHILD_STACK_SIZE)
+    //     that lives until clone() returns to the parent;
+    //   * boxing the closure so the child has a stable callable until exit;
+    //   * the child only calls async-signal-safe-acceptable functions until
+    //     its own exec/exit (see child_entry contract).
     let child_pid = unsafe {
         nix::sched::clone(
             Box::new(move || {
@@ -336,6 +343,10 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
     // Install single handler on SIGTERM + SIGINT + SIGHUP (sets TERMINATION_FLAG)
     TERMINATION_FLAG.store(false, Ordering::Relaxed); // Reset for this sandbox run
     TERMINATION_SIGNAL.store(0, Ordering::Relaxed);
+    // SAFETY: termination_flag_handler is an `extern "C"` function with the
+    // exact signal-handler signature; casting via *const () to sighandler_t
+    // is the libc-conventional way to install a handler. The function only
+    // touches AtomicBool/AtomicI32, both async-signal-safe.
     unsafe {
         let handler = termination_flag_handler as *const () as libc::sighandler_t;
         libc::signal(libc::SIGTERM, handler);
@@ -672,6 +683,9 @@ fn child_entry(
     // we still launch the sandbox. Operators on those kernels lose
     // orphan-prevention but the agent itself works. The lockfile
     // heartbeat (separate fix) provides a second layer of defense.
+    // SAFETY: PR_SET_PDEATHSIG only takes integer args; getppid() takes
+    // none. Neither dereferences user pointers, and both are safe to call
+    // from any context (async-signal-safe in fact).
     unsafe {
         if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
             let err = std::io::Error::last_os_error();
@@ -917,6 +931,10 @@ fn child_entry(
 
             loop {
                 let mut status: i32 = 0;
+                // SAFETY: `&mut status` points to a stack-allocated i32 that
+                // lives for this iteration; waitpid() writes through it only
+                // after a successful return. -1 is the documented "any child"
+                // sentinel.
                 let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
                 if pid < 0 {
                     // ECHILD: no more children — all reaped
@@ -950,6 +968,9 @@ fn child_entry(
             }
 
             // Use _exit to avoid running Rust destructors in the clone'd process.
+            // SAFETY: _exit() takes an integer status and never returns; no
+            // pointers, no allocator interaction. Skipping Rust drop glue is
+            // intentional for the cloned init process.
             unsafe { libc::_exit(agent_exit_code) };
         }
     }
@@ -1057,6 +1078,10 @@ fn drop_all_capabilities() -> anyhow::Result<()> {
         if keep.contains(&cap) {
             continue;
         }
+        // SAFETY: prctl(PR_CAPBSET_DROP, ...) takes only integer arguments
+        // and modifies the calling process's capability bounding set; no
+        // pointers are dereferenced. EINVAL on out-of-range capabilities is
+        // expected and ignored below.
         let ret = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) };
         if ret < 0 {
             let err = std::io::Error::last_os_error();

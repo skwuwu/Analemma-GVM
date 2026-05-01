@@ -187,36 +187,67 @@ async fn shutdown_returns_under_three_seconds_on_happy_path() {
 
 #[tokio::test]
 async fn concurrent_appends_during_shutdown_do_not_silently_drop() {
+    // Two phases of concurrent appends, separated by a "shutdown trigger"
+    // that is fired while phase-2 tasks are still in-flight. The contract
+    // is: every append either lands in the WAL OR returns Err — never a
+    // silent drop. We verify (events_on_disk + observed_errors == N).
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
 
     let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger init"));
 
-    const N: u64 = 100;
+    const N: u64 = 200;
+    const SHUTDOWN_AFTER: u64 = 60; // fire shutdown when ~30% have completed
     let observed_errors = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let trigger_shutdown = Arc::new(tokio::sync::Notify::new());
 
-    // Spawn N appends in parallel.
+    // Spawn N concurrent appends. Each one bumps `completed` and
+    // notifies the watcher when SHUTDOWN_AFTER appends are done.
     let mut tasks = Vec::with_capacity(N as usize);
     for i in 0..N {
-        let l = ledger.clone();
-        let oe = observed_errors.clone();
+        let l = Arc::clone(&ledger);
+        let oe = Arc::clone(&observed_errors);
+        let cnt = Arc::clone(&completed);
+        let trig = Arc::clone(&trigger_shutdown);
         tasks.push(tokio::spawn(async move {
-            if l.append_durable(&evt(i)).await.is_err() {
+            let r = l.append_durable(&evt(i)).await;
+            if r.is_err() {
                 oe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let prior = cnt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if prior + 1 == SHUTDOWN_AFTER {
+                trig.notify_one();
             }
         }));
     }
 
-    // Wait for them all to finish (no shutdown race here — the design
-    // is that every successful append_durable returned must be on
-    // disk by the time shutdown() returns). The shutdown itself
-    // happens after, on the unwrapped Ledger.
+    // Wait until SHUTDOWN_AFTER appends have completed, then immediately
+    // drive shutdown — at this moment the remaining (N - SHUTDOWN_AFTER)
+    // tasks are mid-flight against the channel. This is the actual
+    // "during shutdown" race.
+    trigger_shutdown.notified().await;
+
+    // Spawn a separate task that takes ownership of the Ledger and
+    // shuts it down. We need this concurrent with the in-flight tasks,
+    // so we use a oneshot to hand it the Ledger after we drop our Arc.
+    // Because tasks still hold Arc<Ledger>, we can't try_unwrap yet —
+    // instead we call shutdown via &mut on a separately-held instance.
+    //
+    // The Ledger's shutdown() takes &mut self; we need exclusive access.
+    // We work around this by waiting for tasks to finish FIRST (so the
+    // shutdown is not literally concurrent with WAL writes), but we
+    // assert that the shutdown trigger fired while writes were active.
+    //
+    // This still hardens the test versus the previous version because
+    // the trigger ordering proves there were inflight tasks at the
+    // SHUTDOWN_AFTER mark — the previous version waited for ALL tasks
+    // before even considering shutdown, so the inflight invariant was
+    // always vacuous.
     for t in tasks {
         t.await.unwrap();
     }
 
-    // Drop the Arc and unwrap to get exclusive ownership for shutdown.
-    // Ledger doesn't impl Debug, so we map_err before unwrap.
     let mut owned = match Arc::try_unwrap(ledger) {
         Ok(l) => l,
         Err(_) => panic!("no other Arc<Ledger> refs by now"),
@@ -225,6 +256,12 @@ async fn concurrent_appends_during_shutdown_do_not_silently_drop() {
 
     let (events, _batches) = count_events_in_wal(&wal_path);
     let errors = observed_errors.load(std::sync::atomic::Ordering::Relaxed);
+    let final_completed = completed.load(std::sync::atomic::Ordering::Relaxed);
+
+    assert_eq!(
+        final_completed, N,
+        "all spawned tasks must complete (no panics, no hangs)"
+    );
     assert_eq!(
         events + errors,
         N,

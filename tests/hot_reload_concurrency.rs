@@ -265,14 +265,39 @@ async fn concurrent_reloads_serialize_without_deadlock() {
         );
     }
 
-    // The map should have exactly one rule (the winner's). We don't
-    // care which i won — only that the lock didn't corrupt state.
+    // Stronger assertion: the loaded rule must be ONE of the 8 we wrote.
+    // If the lock had corrupted state into "empty" or "stale R1", every
+    // classify against `api.r{i}.test/*` would fail, and no winner would
+    // be identifiable. We probe each candidate; exactly one must Allow.
     let rule_count = state.srr.read().unwrap().rule_count();
     assert_eq!(
         rule_count, 1,
-        "post-concurrent-reload rule count should be 1 (winner's rule) — \
+        "post-concurrent-reload rule count must be 1 (winner's rule) — \
          got {}; lock state may be corrupt",
         rule_count
+    );
+
+    let mut allow_winners = Vec::new();
+    for i in 0..8u32 {
+        let host = format!("api.r{}.test", i);
+        let result = state
+            .srr
+            .read()
+            .unwrap()
+            .check("GET", &host, "/anything", None);
+        if matches!(
+            result.decision,
+            gvm_types::EnforcementDecision::Allow { .. }
+        ) {
+            allow_winners.push(i);
+        }
+    }
+    assert_eq!(
+        allow_winners.len(),
+        1,
+        "exactly one of the 8 concurrent reload payloads must be the winner; \
+         got allow_winners={:?} (0=stale state, 2+=double-application)",
+        allow_winners,
     );
 
     let _ = std::fs::remove_file(path);

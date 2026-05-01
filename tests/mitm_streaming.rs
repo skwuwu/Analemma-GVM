@@ -276,13 +276,16 @@ async fn tls_request(
 
     // Read until upstream closes the TLS stream.
     let mut buf = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(10), tls.read_to_end(&mut buf)).await;
+    tokio::time::timeout(Duration::from_secs(10), tls.read_to_end(&mut buf))
+        .await
+        .expect("MITM response must finish within timeout")
+        .expect("TLS response body must read");
 
     // Split header / body at first \r\n\r\n.
     let split = buf
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .unwrap_or(buf.len());
+        .expect("MITM response must contain HTTP header terminator");
     let head = String::from_utf8_lossy(&buf[..split]).to_string();
     let body = if split + 4 < buf.len() {
         buf[split + 4..].to_vec()
@@ -293,6 +296,142 @@ async fn tls_request(
     let status = lines.next().unwrap_or("").to_string();
     let headers = lines.next().unwrap_or("").to_string();
     (status, headers, body)
+}
+
+/// Send two sequential HTTP/1.1 requests on the SAME TLS session
+/// (Connection: keep-alive). Returns (status1, body1, status2, body2).
+/// Used to verify §7.6 — Deny on MITM keep-alive must not close the
+/// connection, so the agent's retry on the same session succeeds.
+async fn tls_request_pair_keepalive(
+    listener_addr: std::net::SocketAddr,
+    sni: &str,
+    ca_cert_pem: &[u8],
+    req1_path: &str,
+    req2_path: &str,
+) -> (String, Vec<u8>, String, Vec<u8>) {
+    let cfg = Arc::new(client_config_trusting(ca_cert_pem));
+    let connector = tokio_rustls::TlsConnector::from(cfg);
+    let server_name = ServerName::try_from(sni.to_string()).expect("SNI must parse");
+
+    let tcp = tokio::net::TcpStream::connect(listener_addr).await.unwrap();
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("TLS handshake");
+
+    async fn send_and_read(
+        tls: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+        sni: &str,
+        path: &str,
+        is_last: bool,
+    ) -> (String, Vec<u8>) {
+        let conn_hdr = if is_last {
+            "Connection: close\r\n"
+        } else {
+            "Connection: keep-alive\r\n"
+        };
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: {sni}\r\n\
+             Accept: application/json\r\n\
+             {conn_hdr}Content-Length: 0\r\n\r\n",
+            path = path,
+            sni = sni,
+            conn_hdr = conn_hdr,
+        );
+        tls.write_all(req.as_bytes()).await.unwrap();
+        tls.flush().await.unwrap();
+
+        // Read until we have a full HTTP/1.1 response (header + Content-
+        // Length bytes, OR final chunk 0\r\n\r\n).
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let header_end;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "timeout waiting for response headers on path {path}; got {} bytes",
+                    buf.len()
+                );
+            }
+            let n = tokio::time::timeout(Duration::from_millis(500), tls.read(&mut tmp))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or(0);
+            if n == 0 {
+                if is_last {
+                    break;
+                }
+                continue;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = p + 4;
+                // Read body per Content-Length OR chunked.
+                let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                let cl: Option<usize> = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Content-Length:"))
+                    .and_then(|v| v.trim().parse().ok());
+                let chunked = head
+                    .to_ascii_lowercase()
+                    .contains("transfer-encoding: chunked");
+
+                if let Some(cl) = cl {
+                    while buf.len() < header_end + cl {
+                        if tokio::time::Instant::now() >= deadline {
+                            panic!(
+                                "timeout reading {} body bytes on path {path}; have {}",
+                                cl,
+                                buf.len() - header_end
+                            );
+                        }
+                        let n =
+                            tokio::time::timeout(Duration::from_millis(500), tls.read(&mut tmp))
+                                .await
+                                .ok()
+                                .and_then(|r| r.ok())
+                                .unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                } else if chunked {
+                    while !buf.windows(5).any(|w| w == b"0\r\n\r\n") {
+                        if tokio::time::Instant::now() >= deadline {
+                            panic!("timeout reading chunked body on path {path}");
+                        }
+                        let n =
+                            tokio::time::timeout(Duration::from_millis(500), tls.read(&mut tmp))
+                                .await
+                                .ok()
+                                .and_then(|r| r.ok())
+                                .unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                }
+                break;
+            }
+        }
+
+        let split = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("response must have header terminator");
+        let head = String::from_utf8_lossy(&buf[..split]).to_string();
+        let status = head.lines().next().unwrap_or("").to_string();
+        let body = buf[split + 4..].to_vec();
+        (status, body)
+    }
+
+    let (s1, b1) = send_and_read(&mut tls, sni, req1_path, false).await;
+    let (s2, b2) = send_and_read(&mut tls, sni, req2_path, true).await;
+    (s1, b1, s2, b2)
 }
 
 /// Decode HTTP/1.1 chunked transfer-encoding into the underlying body.
@@ -376,7 +515,11 @@ type = "Allow"
         &[],
     )
     .await;
-    assert!(status.contains("200"), "expected 200, got: {}", status);
+    assert!(
+        status.starts_with("HTTP/1.1 200") || status.starts_with("HTTP/1.0 200"),
+        "expected HTTP 200, got: {}",
+        status
+    );
 
     // hyper emits the response body as chunked. Decode and compare to
     // what upstream sent — every byte must reach the client.
@@ -417,13 +560,18 @@ type = "Allow"
     state.host_overrides = overrides;
     let fixture = spawn_mitm_listener(state, wal).await;
 
-    let (_status, _headers, body) = tls_request(
+    let (status, _headers, body) = tls_request(
         fixture.listener_addr,
         "api.anthropic.com",
         &fixture.ca_cert_pem,
         &[],
     )
     .await;
+    assert!(
+        status.starts_with("HTTP/1.1 200") || status.starts_with("HTTP/1.0 200"),
+        "expected HTTP 200, got: {}",
+        status
+    );
 
     let decoded = decode_chunked(&body);
     let s = std::str::from_utf8(&decoded).expect("body must be UTF-8");
@@ -489,7 +637,7 @@ reason = "policy"
     .await;
 
     assert!(
-        status.contains("403"),
+        status.starts_with("HTTP/1.1 403") || status.starts_with("HTTP/1.0 403"),
         "Deny rule on MITM streaming path must produce 403, got: {}",
         status
     );
@@ -500,6 +648,200 @@ reason = "policy"
     assert!(
         !upstream_hit.load(Ordering::Relaxed),
         "MITM Deny must short-circuit before any TCP connection to upstream"
+    );
+}
+
+/// §7.6 regression: a Deny on a MITM keep-alive connection must NOT
+/// close the TLS session. The agent's retry on the same session
+/// (different URL or different rule outcome) must succeed. Closing
+/// would force a new CONNECT tunnel and breaks node-undici fallback.
+#[tokio::test]
+async fn mitm_keepalive_survives_deny_then_allow_retry() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let upstream_hit = Arc::new(AtomicUsize::new(0));
+    let hit = upstream_hit.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new().fallback(move |_req: AxumRequest<Body>| {
+        let h = hit.clone();
+        async move {
+            h.fetch_add(1, Ordering::Relaxed);
+            AxumResponse::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ok":true}"#))
+                .unwrap()
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    // First path is denied, second path is allowed. A correct MITM
+    // implementation answers BOTH on the same TLS session.
+    let srr = srr_with(
+        r#"
+[[rules]]
+method = "POST"
+pattern = "api.keepalive.test/v1/blocked"
+[rules.decision]
+type = "Deny"
+reason = "policy"
+
+[[rules]]
+method = "*"
+pattern = "{any}"
+[rules.decision]
+type = "Allow"
+"#,
+    )
+    .await;
+    let (mut state, wal) = common::test_state_with_srr(srr).await;
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        "api.keepalive.test".to_string(),
+        format!("127.0.0.1:{}", addr.port()),
+    );
+    state.host_overrides = overrides;
+    let fixture = spawn_mitm_listener(state, wal).await;
+
+    let (s1, _b1, s2, b2) = tls_request_pair_keepalive(
+        fixture.listener_addr,
+        "api.keepalive.test",
+        &fixture.ca_cert_pem,
+        "/v1/blocked",
+        "/v1/allowed",
+    )
+    .await;
+
+    assert!(
+        s1.starts_with("HTTP/1.1 403"),
+        "first request must be Denied with 403, got: {s1}"
+    );
+    assert!(
+        s2.starts_with("HTTP/1.1 200"),
+        "second request on same TLS session must succeed (keep-alive \
+         after Deny preserved); got: {s2}"
+    );
+    assert!(
+        b2.windows(b"\"ok\":true".len())
+            .any(|w| w == b"\"ok\":true"),
+        "second response must carry upstream allow body; got body={:?}",
+        String::from_utf8_lossy(&b2),
+    );
+    assert_eq!(
+        upstream_hit.load(Ordering::Relaxed),
+        1,
+        "exactly ONE upstream hit (allowed retry); Deny must short-circuit"
+    );
+}
+
+/// §7.7 regression: when upstream emits `Content-Type: text/event-stream`
+/// AND `Transfer-Encoding: chunked` simultaneously, the relay MUST
+/// dispatch on chunked framing (the chunk terminator `0\r\n\r\n`),
+/// NOT on Content-Type. Dispatching on `text/event-stream` historically
+/// caused the relay to wait for TCP EOF that never came on a keep-alive
+/// upstream connection.
+#[tokio::test]
+async fn mitm_sse_with_chunked_and_event_stream_content_type_terminates() {
+    // Upstream that explicitly sets BOTH headers (the bug-class combo).
+    // Body::from_stream generates chunked encoding; we annotate the
+    // header explicitly so the relay sees both signals.
+    let chunks: Vec<&'static [u8]> = vec![
+        b"data: {\"i\":1}\n\n",
+        b"data: {\"i\":2}\n\n",
+        b"data: [DONE]\n\n",
+    ];
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new().fallback(move |_req: AxumRequest<Body>| {
+        let chunks = chunks.clone();
+        async move {
+            let stream = async_stream::stream! {
+                for chunk in chunks {
+                    yield Ok::<_, std::io::Error>(axum::body::Bytes::from_static(chunk));
+                }
+            };
+            AxumResponse::builder()
+                .status(200)
+                // Both signals present — this is the regression combo.
+                .header("Content-Type", "text/event-stream")
+                .header("Cache-Control", "no-cache")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    let srr = srr_with(
+        r#"
+[[rules]]
+method = "*"
+pattern = "{any}"
+[rules.decision]
+type = "Allow"
+"#,
+    )
+    .await;
+    let (mut state, wal) = common::test_state_with_srr(srr).await;
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        "api.sse-chunked.test".to_string(),
+        format!("127.0.0.1:{}", addr.port()),
+    );
+    state.host_overrides = overrides;
+    let fixture = spawn_mitm_listener(state, wal).await;
+
+    // The pre-existing tls_request uses `Connection: close`, but on
+    // upstream keep-alive (which axum::serve uses), the relay MUST
+    // honour chunk terminators OR the read_to_end below would hang
+    // forever. We add a hard timeout to detect a regression promptly.
+    let result = tokio::time::timeout(
+        Duration::from_secs(8),
+        tls_request(
+            fixture.listener_addr,
+            "api.sse-chunked.test",
+            &fixture.ca_cert_pem,
+            &[],
+        ),
+    )
+    .await;
+
+    let (status, headers, body) = result.expect(
+        "MITM relay hung on SSE+chunked+text/event-stream — §7.7 \
+         regression: relay dispatched on Content-Type instead of chunked framing",
+    );
+
+    assert!(
+        status.starts_with("HTTP/1.1 200"),
+        "expected 200, got: {status}"
+    );
+    let head_lower = headers.to_ascii_lowercase();
+    assert!(
+        head_lower.contains("transfer-encoding: chunked"),
+        "MITM-relayed response head must declare chunked framing; got: {headers}"
+    );
+    assert!(
+        head_lower.contains("content-type: text/event-stream"),
+        "Content-Type must pass through unchanged; got: {headers}"
+    );
+
+    let decoded = decode_chunked(&body);
+    let expected: Vec<u8> = vec![
+        b"data: {\"i\":1}\n\n".to_vec(),
+        b"data: {\"i\":2}\n\n".to_vec(),
+        b"data: [DONE]\n\n".to_vec(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    assert_eq!(
+        decoded, expected,
+        "every SSE chunk must reach the client exactly once, in order"
     );
 }
 
@@ -534,22 +876,44 @@ type = "Allow"
         &[],
     )
     .await;
-    assert!(status.contains("200"));
-
-    let lower = headers.to_lowercase();
-    // The MITM path may stamp these on the streaming response. If
-    // the proxy ever stops doing so, agent SDKs lose their
-    // observability anchor — so we assert at least one of the GVM
-    // headers is present. Per-header existence is checked above the
-    // empty-list case.
-    let has_decision = lower.contains("\nx-gvm-decision:") || lower.starts_with("x-gvm-decision:");
-    let has_event = lower.contains("\nx-gvm-event-id:") || lower.starts_with("x-gvm-event-id:");
     assert!(
-        has_decision || has_event,
-        "MITM streaming response must carry at least one X-GVM-* governance \
-         header; received headers:\n{}",
-        headers
+        status.starts_with("HTTP/1.1 200") || status.starts_with("HTTP/1.0 200"),
+        "expected HTTP 200, got: {}",
+        status
     );
+
+    // Strong assertion: header VALUES must be correct, not just present.
+    // An empty `x-gvm-decision:` header would satisfy the previous
+    // substring check but indicates a regression.
+    fn header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+        for line in headers.split("\r\n").chain(headers.split('\n')) {
+            let mut parts = line.splitn(2, ':');
+            if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+                if k.trim().eq_ignore_ascii_case(name) {
+                    return Some(v.trim());
+                }
+            }
+        }
+        None
+    }
+
+    let decision = header_value(&headers, "x-gvm-decision")
+        .expect("MITM streaming response must carry X-GVM-Decision");
+    assert_eq!(
+        decision, "Allow",
+        "X-GVM-Decision value must be `Allow` for an Allow rule; got {:?}",
+        decision
+    );
+
+    let event_id = header_value(&headers, "x-gvm-event-id")
+        .expect("MITM streaming response must carry X-GVM-Event-Id");
+    // Event id format: UUID v4 (36 chars with dashes) or hex.
+    assert!(
+        event_id.len() >= 8,
+        "X-GVM-Event-Id must look like an id (>=8 chars), got {:?}",
+        event_id
+    );
+    assert!(!event_id.is_empty(), "X-GVM-Event-Id must not be empty");
 }
 
 #[tokio::test]
@@ -611,7 +975,11 @@ token = "sk-mitm-stream"
         &[("Authorization", "Bearer agent-smuggled-token")],
     )
     .await;
-    assert!(status.contains("200"));
+    assert!(
+        status.starts_with("HTTP/1.1 200") || status.starts_with("HTTP/1.0 200"),
+        "expected HTTP 200, got: {}",
+        status
+    );
 
     let observed = captured.lock().unwrap().clone();
     assert_eq!(

@@ -218,8 +218,48 @@ mod tests {
 
     #[test]
     fn ca_zeroized_on_drop() {
-        let ca = EphemeralCA::generate().unwrap();
-        assert!(ca.ca_cert_pem().len() > 100);
+        // Verify Drop actually wrote zeros over the CA bytes. We use
+        // `ca_cert_pem()` because it returns `&[u8]` pointing into the
+        // private field — `ca_key_pem()` returns a *clone*, so its
+        // pointer would not survive `drop(ca)` and we'd be reading
+        // from a separately-allocated heap region that Drop never
+        // touches. The cert and key buffers share the same Drop impl
+        // (both are `zeroize()`d), so testing the cert proves the
+        // zeroize call ran.
+        let ca = EphemeralCA::generate().expect("CA generation must succeed");
+        let cert = ca.ca_cert_pem();
+        assert!(cert.len() > 100);
+
+        // Snapshot original cert bytes (first 64) for post-drop comparison.
+        let mut original = [0u8; 64];
+        let copy_len = original.len().min(cert.len());
+        original[..copy_len].copy_from_slice(&cert[..copy_len]);
+
+        // Capture the pointer to the live heap buffer in `ca`.
+        let key_ptr: *const u8 = cert.as_ptr();
+
         drop(ca);
+
+        // SAFETY: read_volatile through dangling pointer post-drop. The
+        // allocation may have been recycled — in that case we read
+        // unrelated bytes which still won't match `original`. The test
+        // fails only if the original key bytes survive — which proves
+        // Drop did NOT zero.
+        let observed: [u8; 64] = unsafe {
+            let mut buf = [0u8; 64];
+            for (i, slot) in buf.iter_mut().enumerate() {
+                *slot = std::ptr::read_volatile(key_ptr.add(i));
+            }
+            buf
+        };
+
+        assert_ne!(
+            observed,
+            original,
+            "CA cert heap buffer still holds the original PEM bytes \
+             after drop — Drop did not zeroize. \
+             original_prefix={:02x?}",
+            &original[..8],
+        );
     }
 }

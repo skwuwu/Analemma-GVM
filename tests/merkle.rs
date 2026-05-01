@@ -329,7 +329,10 @@ async fn merkle_wal_verification_valid() {
     assert!(report.chain_intact);
 }
 
-/// Verify that verify_wal detects a tampered event hash.
+/// Verify that `verify_wal` reports a tampered event in `tampered_events`
+/// while still validating the batch Merkle root (because the stored
+/// event_hash is used as the batch leaf — by design, this lets us
+/// distinguish content-tamper from batch-root-tamper).
 #[tokio::test]
 async fn merkle_wal_verification_detects_tampered_event() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
@@ -338,59 +341,124 @@ async fn merkle_wal_verification_detects_tampered_event() {
         .await
         .expect("ledger with valid path must initialize");
 
+    let mut event_ids = Vec::new();
     for i in 0..3 {
         let event = make_test_event(&format!("agent-tamper-{}", i));
+        event_ids.push(event.event_id.clone());
         ledger
             .append_durable(&event)
             .await
             .expect("tamper test event append must succeed");
     }
-
-    // No sleep needed: append_durable().await guarantees fsync completed.
     drop(ledger);
 
-    // Read and tamper with the WAL
     let content = tokio::fs::read_to_string(&wal_path)
         .await
         .expect("WAL file must be readable after flush");
     let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
 
-    // Find the first event line and tamper with the decision field
+    // Tamper exactly one event (the first non-batch line).
+    let mut tampered_event_id: Option<String> = None;
     for line in lines.iter_mut() {
         if !line.contains("\"merkle_root\"") {
             if let Ok(mut event) = serde_json::from_str::<GVMEvent>(line) {
-                event.decision = "Deny".to_string(); // Tamper!
+                tampered_event_id = Some(event.event_id.clone());
+                event.decision = "Deny".to_string();
                 *line =
                     serde_json::to_string(&event).expect("tampered event must serialize to JSON");
                 break;
             }
         }
     }
+    let tampered_id =
+        tampered_event_id.expect("test setup must produce at least one tamperable event");
 
-    let tampered = lines.join("\n");
-    let _report = merkle::verify_wal(&tampered);
+    let tampered_wal = lines.join("\n");
+    let report = merkle::verify_wal(&tampered_wal);
 
-    // The batch is still "valid" because the stored event_hash didn't change —
-    // but recomputing the event hash reveals tampering. The verify_wal function
-    // uses the stored hash as the leaf (preserving batch structure), so the
-    // Merkle root matches. Event-level tampering is detected by comparing
-    // compute_event_hash() against stored event_hash.
+    // The actual contract: tampered_events is populated.
+    assert!(
+        report.tampered_events.contains(&tampered_id),
+        "verify_wal must report the tampered event_id in tampered_events; \
+         got tampered_events={:?}, tampered_id={}",
+        report.tampered_events,
+        tampered_id,
+    );
+    assert_eq!(
+        report.tampered_events.len(),
+        1,
+        "exactly one event was tampered; report must list exactly one"
+    );
 
-    // Verify event-level tampering detection
-    let first_event_line = tampered
-        .lines()
-        .find(|l| !l.contains("\"merkle_root\""))
-        .expect("WAL must contain at least one event line");
-    let tampered_event: GVMEvent =
-        serde_json::from_str(first_event_line).expect("event line must be valid JSON");
-    let recomputed = merkle::compute_event_hash(&tampered_event);
-    assert_ne!(
-        tampered_event
-            .event_hash
-            .as_ref()
-            .expect("tampered event must still have original event_hash field"),
-        &recomputed,
-        "tampered event hash must not match recomputed hash"
+    // Untampered events must NOT appear in the tampered list (false-positive guard).
+    for id in &event_ids {
+        if id != &tampered_id {
+            assert!(
+                !report.tampered_events.contains(id),
+                "untampered event {} must not be reported as tampered",
+                id
+            );
+        }
+    }
+
+    // Batch root remains valid — content tamper does not break the Merkle
+    // structure because leaves are stored hashes, not recomputed live.
+    assert!(
+        report.invalid_batches.is_empty(),
+        "stored-leaf design means content tamper preserves batch root; \
+         got invalid_batches={:?}",
+        report.invalid_batches,
+    );
+    assert!(
+        report.chain_intact,
+        "inter-batch chain must remain intact under content tamper"
+    );
+}
+
+/// Companion test: tampering the stored event_hash itself (not the body)
+/// MUST be reported, because then the recomputed hash differs from the
+/// stored one. Guards against a regression where verify_wal trusts the
+/// stored hash blindly.
+#[tokio::test]
+async fn merkle_wal_verification_detects_tampered_event_hash() {
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
+    let wal_path = dir.path().join("wal.log");
+    let ledger = Ledger::new(&wal_path, "", "")
+        .await
+        .expect("ledger with valid path must initialize");
+
+    for i in 0..2 {
+        let event = make_test_event(&format!("agent-hash-tamper-{}", i));
+        ledger
+            .append_durable(&event)
+            .await
+            .expect("event append must succeed");
+    }
+    drop(ledger);
+
+    let content = tokio::fs::read_to_string(&wal_path)
+        .await
+        .expect("WAL must be readable");
+    let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+
+    let mut tampered_id: Option<String> = None;
+    for line in lines.iter_mut() {
+        if !line.contains("\"merkle_root\"") {
+            if let Ok(mut event) = serde_json::from_str::<GVMEvent>(line) {
+                tampered_id = Some(event.event_id.clone());
+                // Replace the event_hash with a syntactically valid but wrong hash.
+                event.event_hash = Some("0".repeat(64));
+                *line = serde_json::to_string(&event).expect("re-serialize must succeed");
+                break;
+            }
+        }
+    }
+    let tampered_id = tampered_id.expect("at least one event line required");
+
+    let report = merkle::verify_wal(&lines.join("\n"));
+    assert!(
+        report.tampered_events.contains(&tampered_id),
+        "event with rewritten event_hash must be reported as tampered"
     );
 }
 

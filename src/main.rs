@@ -481,7 +481,13 @@ async fn main() {
             .map(|srr| srr.known_hosts().into_iter().collect())
             .unwrap_or_default();
         let known_hosts = Arc::new(std::sync::RwLock::new(known_set));
-        let dns_gov = Arc::new(dns_governance::DnsGovernance::new(known_hosts));
+        // Read sliding-window from config (clamped at 5s minimum inside
+        // DnsGovernance::with_window_secs to keep Tier 3 detection
+        // meaningful — see DnsGovernanceConfig::window_secs doc).
+        let dns_gov = Arc::new(dns_governance::DnsGovernance::with_window_secs(
+            known_hosts,
+            config.dns.window_secs,
+        ));
         state.dns_governance = Some(dns_gov.clone());
 
         // Bind to 0.0.0.0 (all interfaces) instead of 127.0.0.1.
@@ -594,11 +600,18 @@ async fn main() {
     // 12. Start server with CONNECT tunnel support
     // Use TcpSocket with SO_REUSEADDR so the proxy can restart immediately
     // after a crash without waiting for TIME_WAIT to expire.
-    let listen_addr: std::net::SocketAddr = config
-        .server
-        .listen
-        .parse()
-        .unwrap_or_else(|_| "0.0.0.0:8080".parse().unwrap());
+    //
+    // GVM Code Standard §2.3: required configuration must cause startup
+    // failure. Silently falling back to a hard-coded address would open a
+    // different port than the operator configured, which is a fail-open
+    // behavior. Refuse to start instead.
+    let listen_addr: std::net::SocketAddr = config.server.listen.parse().unwrap_or_else(|e| {
+        eprintln!(
+            "Fatal: invalid server.listen `{}`: {} — fix proxy config and restart",
+            config.server.listen, e
+        );
+        std::process::exit(1);
+    });
     let socket = tokio::net::TcpSocket::new_v4().expect("Failed to create TCP socket");
     socket
         .set_reuseaddr(true)
@@ -904,7 +917,16 @@ async fn reload_srr_localhost_only(
             .body(Body::from(
                 r#"{"error":"Reload only allowed from localhost. Use admin port for remote access."}"#,
             ))
-            .unwrap();
+            .unwrap_or_else(|_| {
+                // SAFETY (logical): builder above uses static literals only,
+                // so this fallback is unreachable in practice. Standard §1.2
+                // forbids unwrap()/expect() on runtime paths regardless, so
+                // we return an empty 403 rather than panic.
+                Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .body(Body::empty())
+                    .unwrap_or_else(|_| Response::new(Body::empty()))
+            });
     }
 
     api::reload_srr(axum::extract::State(state)).await

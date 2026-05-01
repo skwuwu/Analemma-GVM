@@ -52,6 +52,424 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
+### 2026-05-01: GVM_TEST_DNS_WINDOW_SEC → config (post-§6.5 sweep)
+
+**What changed:**
+
+A second pass under §6.5 ("Tests Run Production Code Paths — No
+Production Test Hooks") found a fourth violation that the first
+remediation missed: `src/dns_governance.rs` read
+`GVM_TEST_DNS_WINDOW_SEC` unconditionally in production. Setting the
+env var at startup shrunk the Tier 3/4 sliding window from 60 seconds
+to as low as 1 second, which makes Tier 3 detection (≥5 unique
+subdomains within the window) effectively impossible to trigger —
+an attacker who could influence the gvm-proxy startup environment
+(supply-chain compromise, container env injection) could blind
+the burst detector while leaving the rest of the sandbox apparently
+healthy.
+
+The migration:
+
+- `DnsGovernanceConfig` gains a `window_secs: u64` field
+  (default 60) — operators set it in `proxy.toml [dns]` so the
+  override lands in the WAL `gvm.system.config_load` event and is
+  audit-visible.
+- `DnsGovernance::new()` and `DnsGovernance::with_window_secs()`
+  store the duration on the struct. The window is fixed at
+  construction.
+- `clamp_window_secs(requested)` enforces a 5-second floor —
+  anything below is clamped UP and a `tracing::warn!` fires with
+  both the requested and clamped values.
+- The free function `window_duration()` is gone. `DomainWindow::record`,
+  `DomainWindow::is_idle`, and `GlobalWindow::record` now take a
+  `window: Duration` parameter; `DnsGovernance` passes
+  `self.window` on every call. No global state, no env-var read.
+- `scripts/ec2-e2e-test.sh` Test 83d patched to inject
+  `[dns] window_secs = 5` into `proxy.toml` (and restore the
+  backup at the end), instead of exporting an env var.
+- `docs/user-guide.md` updated to show the config syntax and
+  explain the 5-second floor.
+
+**Why:** The previous comment said "test-only knob — do not use in
+production," but the binary had no way to enforce that. §6.5
+explicitly forbids env-var overrides that weaken enforcement.
+Moving to config achieves three things at once: (1) production
+attackers can't shrink the window via env, (2) the override lands
+in the audit chain, (3) the floor protects Tier 3 from operator
+misconfiguration.
+
+**Affected files:**
+- `src/config.rs` — `DnsGovernanceConfig::window_secs` + default fn
+- `src/dns_governance.rs` — env-var read removed; window injected
+  via constructor; `clamp_window_secs(...)` enforces 5s floor;
+  `DomainWindow`/`GlobalWindow` take `window: Duration` param.
+- `src/main.rs` — passes `config.dns.window_secs` to
+  `DnsGovernance::with_window_secs(...)`.
+- `scripts/ec2-e2e-test.sh` — config-file injection for test 83d.
+- `docs/user-guide.md` — operator-facing doc updated.
+
+**Risk:** Low.
+- All 564 tests pass; cargo fmt clean.
+- Existing config files without the new field default to
+  `window_secs = 60` (matches prior production behavior).
+- The 5-second floor is not breaking — the previous E2E test used
+  exactly 5 seconds, so the floor is set to the smallest value
+  that's actually been used in practice.
+
+**Open follow-up:** `GVM_DEBUG_SKIP_DYNLOAD` (in
+`crates/gvm-sandbox/src/sandbox_impl.rs:70`) is also an
+unconditional env-var read in production, but it does not weaken
+a security boundary — it disables ldd-based dynload pre-resolution
+to work around a kernel-6.17 panic. Migration to config is desirable
+for §6.5 consistency but is not security-urgent. Tracked.
+
+### 2026-05-01: Remove insecure test hooks; codify §6.5 "no production test hooks"
+
+**What changed:**
+
+The 2026-05-01 test-quality audit pass added three test-only entry
+points to production code. A follow-up review identified each as a
+real attack-surface increase, not just a code-smell. This commit
+removes all three and codifies the principle as `§6.5` of the GVM
+Code Standards.
+
+The three offending hooks and their replacements:
+
+1. **`DnsGovernance::classify_at(domain, now: Instant)` was `pub`** —
+   any code holding a `DnsGovernance` reference could inject a fake
+   `Instant` and bypass Tier 3/4 burst detection. Replaced with:
+   - `pub fn classify(...)` — production entry, calls inner.
+   - `fn classify_inner(domain, now)` — private.
+   - `#[cfg(test)] pub(super) fn classify_at(...)` — only compiled
+     when the `gvm-proxy` crate is built with `--cfg test`. The
+     symbol does NOT exist in production binaries.
+
+2. **`TokenBudget::_rotate_for_test(minutes)` was `pub` (with only
+   `#[doc(hidden)]`, which is a doc-tool hint and NOT a compiler
+   boundary)** — any code holding a `TokenBudget` reference could
+   force-rotate the slot counter and clear all per-slot usage
+   counters, bypassing budget enforcement entirely. Replaced with
+   a `BudgetClock` trait:
+   ```rust
+   pub trait BudgetClock: Send + Sync {
+       fn now_unix_secs(&self) -> u64;
+   }
+   pub struct SystemClock;          // production
+   pub struct TokenBudget { clock: Arc<dyn BudgetClock>, ... }
+   impl TokenBudget {
+       pub fn new(...) -> Self { Self::with_clock(..., Arc::new(SystemClock)) }
+       pub fn with_clock(..., clock: Arc<dyn BudgetClock>) -> Self { ... }
+   }
+   ```
+   The trait exposes only a read of "now" — it cannot mutate budget
+   state, so an attacker who substitutes a mock clock cannot bypass
+   enforcement (they can only delay or accelerate the next
+   rotation, which doesn't add capacity). Tests construct with a
+   `MockClock` that exposes `advance_minutes(n)`. Production
+   passes `Arc::new(SystemClock)` from `TokenBudget::new`. Same
+   `rotate_if_needed` code path runs in both cases.
+
+3. **`heartbeat_dir()` did unconditional `std::env::var("GVM_HEARTBEAT_DIR")`**
+   in production — anyone who can set env vars on the gvm-proxy
+   process at startup (supply-chain compromise, container env
+   injection) could redirect heartbeat lockfiles to a writable but
+   wrong directory, breaking the orphan-detection invariant. Now
+   the env-var read is wrapped in `#[cfg(test)]`:
+   ```rust
+   fn heartbeat_dir() -> String {
+       #[cfg(test)]
+       if let Ok(d) = std::env::var("GVM_HEARTBEAT_DIR_TEST_ONLY") {
+           return d;
+       }
+       HEARTBEAT_DIR.to_string()  // production: hardcoded /run/gvm
+   }
+   ```
+   The variable name carries `_TEST_ONLY` so grep-readers see the
+   intent without reading the doc comment.
+
+**Standards doc — §6.5 added** (`docs/internal/GVM_CODE_STANDARDS.md`):
+
+> Tests Run Production Code Paths — No Production Test Hooks.
+> Forbidden: `pub fn _foo_for_test`, `#[doc(hidden)] pub fn ...` (still
+> reachable), unconditional env-var reads that weaken enforcement.
+> Required: trait/dependency injection, `#[cfg(test)]` gating, or
+> constructor parameters. The doc carries a decision flowchart for
+> "test in mod tests vs tests/ vs touches FS" so future PRs know
+> the right pattern.
+
+**Why:** A test that runs a different code path than production is
+testing a different program. The three hooks above were each
+attempts to make tests easier to write, but each created reachable
+attack surface. The principle is now an explicit standard the
+audit can cite, not just an implicit norm.
+
+**Affected files:**
+- `src/dns_governance.rs` — `classify_at` → `#[cfg(test)] pub(super)`
+- `src/token_budget.rs` — `_rotate_for_test` removed; `BudgetClock`
+  trait + `SystemClock` + `with_clock(...)` constructor added.
+- `crates/gvm-sandbox/src/heartbeat.rs` — env-var read wrapped in
+  `#[cfg(test)]`; var renamed `GVM_HEARTBEAT_DIR_TEST_ONLY`.
+- `tests/token_budget_contention.rs` — uses `MockClock` via
+  `TokenBudget::with_clock`. Recovery test steps the clock minute-
+  by-minute (mirrors production's once-per-minute rotation; a
+  single 60-min jump is not modelable because production
+  `rotate_if_needed` wraps mod 60).
+- `docs/internal/GVM_CODE_STANDARDS.md` — §6.5 added.
+
+**Risk:** Low.
+- `cargo test --workspace --tests`: 564 passed / 0 failed / 4 ignored.
+- `cargo fmt` clean. `cargo check --workspace --tests` clean.
+- No production behavior change. Production passes `SystemClock`
+  (same `SystemTime::now()` source as before). The `BudgetClock`
+  trait introduces one Arc<dyn> indirection per `rotate_if_needed`
+  call — measured on a release build, this is one cache-resident
+  vtable load, well under the §3.1 hot-path budget.
+
+### 2026-05-01: Test-suite quality audit + fixes (anti-tests, spec gaps, loose assertions)
+
+**What changed:**
+
+A multi-agent audit of the ~700-test suite identified ~70 quality
+defects. This commit fixes the actionable subset (cross-platform,
+non-Linux-only, code-not-infrastructure). The defects fall into five
+groups:
+
+**Group A — Anti-tests (13 fixes).** Tests whose names advertise
+verifying X but whose bodies pass even when X is broken. Each was
+either rewritten or paired with a #[ignore]'d target-contract test
+documenting the gap:
+
+- `tests/boundary.rs::vault_tampered_ciphertext_detected` — never
+  tampered. Now exercises 6 byte positions (nonce/body/tag) plus
+  truncation and append.
+- `tests/merkle.rs::merkle_wal_verification_detects_tampered_event`
+  — admitted in its own comments that `verify_wal` doesn't detect
+  the tamper. Now actually asserts `report.tampered_events` is
+  populated. Companion test added for stored-hash tamper.
+- `tests/hostile.rs::vault_key_is_zeroed_on_drop`,
+  `src/auth.rs::secret_zeroized_on_drop`,
+  `crates/gvm-sandbox/src/ca.rs::ca_zeroized_on_drop` — each
+  asserted nothing. Now use `read_volatile` through a captured
+  pre-drop pointer with a 0xA5 sentinel pattern; fail iff Drop
+  did not zero.
+- `src/intent_store.rs::mutex_poison_fail_closed` — never poisoned
+  the mutex. Now panics in a thread holding the lock to actually
+  poison it, then asserts `claim`/`confirm`/`release`/`register`
+  fail-close instead of panicking the caller.
+- `tests/ledger_shutdown.rs::concurrent_appends_during_shutdown_…` —
+  waited for ALL tasks to finish before shutdown. Now uses a
+  `Notify` trigger that fires when ~30% complete, so shutdown
+  starts while writes are inflight.
+- `tests/ic3_concurrency.rs::approve_after_handler_removed_entry_…`
+  — sequential calls. Now spawns 200 iterations × 2 concurrent
+  approves with a `tokio::sync::Barrier`, asserts at most 1 OK
+  and exactly (OK+GONE+NOT_FOUND)==2.
+- `tests/hot_reload_concurrency.rs::concurrent_reloads_…` — only
+  asserted rule_count==1 (held for any winner). Now classifies
+  each of the 8 candidate hosts and asserts exactly ONE wins.
+- `tests/enforcement_robustness.rs::classify_does_not_panic_on_…`
+  (oversize agent_id, control-char trace_id) — pinned verbatim
+  passthrough as the contract, blocking §1.5 boundary hardening.
+  Now assert `len() <= input_len` (permissive — verbatim OR
+  hardened both pass) plus a 5s soft latency guard. The control-
+  char test now serializes through JSON and asserts no raw
+  CR/LF/NUL reach the WAL stream.
+- `src/dns_governance.rs::test_tier3_decay_to_tier2` — manually
+  cleared internal state instead of advancing time. Added
+  `classify_at(domain, now: Instant)` test hook; the test now
+  advances the virtual clock past the window and verifies decay
+  through the actual production code path.
+- `crates/gvm-types/tests/verify_chain.rs::integrity_context_…` —
+  encoded "skip silently" as the contract, which is an evasion
+  vector. Renamed: a #[ignore]'d test pins the TARGET contract
+  ("missing context MUST be reported as first_break"); a paired
+  test pins the CURRENT behavior with a "this is the gap"
+  comment. Re-enable the ignored one when the verifier is
+  hardened.
+- `src/wasm_engine.rs::test_native_fallback` — clarified that
+  ABAC empty-rules-default-Allow is correct here (§4.1 fail-close
+  applies at the `enforcement::classify` boundary, not this
+  layer). Companion determinism test added.
+
+**Group B — CI silent (heartbeat injection).** All 8 heartbeat tests
+in `crates/gvm-sandbox/src/heartbeat.rs` silently `return` when
+`/run/gvm/` was not writable — which is always true under non-root
+CI. Added `GVM_HEARTBEAT_DIR` env override + `OnceLock<TempDir>`
+test fixture that points the tests at a tempdir. CI now actually
+exercises flock/futimens.
+
+**Group C — Spec-coverage gaps (5 new tests).** §6.3 mandates
+"every security claim has a test". The audit found these missing:
+
+- `tests/mitm_streaming.rs::mitm_keepalive_survives_deny_then_allow_retry`
+  — §7.6 keep-alive contract: a Deny on a MITM keep-alive
+  connection must NOT close the TLS session. Issues two requests
+  on the same TLS socket; first is denied, second succeeds.
+- `tests/mitm_streaming.rs::mitm_sse_with_chunked_and_event_stream_…`
+  — §7.7 framing-discipline regression: SSE upstream that emits
+  `Content-Type: text/event-stream` AND `Transfer-Encoding:
+  chunked` must terminate via chunked framing (the historical bug
+  was the relay waiting for TCP EOF). Wraps the request in an
+  8-second hard timeout to detect a regression promptly.
+- `tests/hostile.rs::proptest_srr_determinism::*` — §4.1
+  determinism: 64-case proptest plus a 32-thread × 50-iteration
+  concurrent test asserting same SRR input always produces the
+  same decision regardless of thread or repetition.
+- `src/merkle.rs::merkle_node_hash_uses_domain_separation_prefix`
+  + `merkle_event_hash_uses_domain_separation_prefix` — §1.6:
+  removing the `gvm-node-v1:` / `gvm-event-v1:` prefix would
+  silently pass all prior Merkle tests. Now compute the same hash
+  with no-prefix and a wrong-prefix variant and assert the
+  production output matches ONLY the correct-prefix one.
+- `tests/token_budget_contention.rs::budget_recovers_after_full_window_…`
+  + `…_partial_window_…` + `separate_budgets_do_not_share_state_…`
+  — token-bucket recovery (window-slide) and per-agent isolation
+  contracts had zero coverage. Added `_rotate_for_test(minutes)`
+  hidden helper to advance the slot counter without `thread::sleep`.
+
+**Group D — Side-effect coverage in handler tests.** Reload tests
+returned 200 without ever verifying the SRR was actually swapped.
+Now `reload_srr_from_file_succeeds` calls `srr.check()` against the
+new Allow rule and asserts Allow. `reload_srr_preserves_old_rules_on_failure`
+captures the response status (was thrown away) and additionally
+verifies the original Allow rule still fires.
+
+**Group E — Loose assertions tightened.**
+
+- `tests/stress.rs::srr_10000_rules_load_and_lookup` — ceiling was
+  5000µs (5× the §3.1 budget). Now 1000µs, with comment that
+  benches verify the release-build sub-µs claim.
+- `tests/mitm_streaming.rs::mitm_streaming_response_carries_proxy_…`
+  — `is_some()` / `contains("name:")` accepted empty values. Now
+  parses the header value and asserts `X-GVM-Decision == "Allow"`
+  and `X-GVM-Event-Id` is non-empty + ≥8 chars.
+- `tests/boundary.rs::gvm_headers_stripped_…` — re-implemented the
+  prefix list inline (false coverage). Made `proxy::remove_gvm_headers`
+  `pub` and the test now calls the production function directly.
+- `src/dns_governance.rs` — added 4 malformed-packet tests:
+  pointer-compression in question section, label overrun,
+  QDCOUNT=0 with trailing bytes, oversized label.
+- `src/srr.rs::normalize_path_decodes_percent_encoded_dot_segments`
+  — §4.1 traversal-bypass guard: `%2E%2E` must be decoded BEFORE
+  dot-segment collapsing. Plus `…_handles_invalid_percent_encoding`
+  and `…_oversized_does_not_explode` (4KiB latency guard).
+- `tests/common_sanity.rs` — replaced the `assert!(...|| true)`
+  tautology with the actual contract (`tls_ready=true` is the
+  test-helper default).
+
+**Group F — Stale docs.** `GVM_CODE_STANDARDS.md` §6.3 cited
+`group_commit_fail_close_all_callers_receive_error` as canonical;
+that test no longer exists. Updated to point at the current
+emergency-WAL fallback test and explicitly mark the both-paths-fail
+test as MISSING. `test-report.md` snapshot updated with a note that
+per-test names rotate and that the "Windows green" line does NOT
+exercise the Linux-gated sandbox isolation tests.
+
+**Why:** A test suite that gives confidence requires every test
+to actually verify what its name advertises. The 13 anti-tests in
+particular were the highest-impact fixes — they are the bug-class
+"CI green therefore feature is safe" that the audit was designed
+to catch. The spec-coverage tests (Group C) close §6.3 gaps that
+the standard explicitly named.
+
+**Production code touched:**
+- `src/dns_governance.rs` — added `classify_at(now)` + 4 parser tests
+- `src/token_budget.rs` — added `_rotate_for_test(minutes)`
+- `src/proxy.rs` — `remove_gvm_headers` now `pub`
+- `src/merkle.rs` — added 2 domain-separation tests
+- `src/auth.rs` — secret_zeroized_on_drop rewritten
+- `src/srr.rs` — normalize_path negative tests + oversize guard
+- `src/wasm_engine.rs` — clarified contract + determinism test
+- `src/intent_store.rs` — mutex_poison_fail_closed rewritten
+- `crates/gvm-sandbox/src/heartbeat.rs` — `GVM_HEARTBEAT_DIR` injection
+- `crates/gvm-sandbox/src/ca.rs` — ca_zeroized_on_drop rewritten
+
+**Test files touched:**
+- `tests/boundary.rs` — vault tamper rewritten + header-strip
+- `tests/merkle.rs` — verify_wal tamper test split
+- `tests/hostile.rs` — vault zeroize + SRR determinism proptest
+- `tests/ledger_shutdown.rs` — concurrent appends rewritten
+- `tests/ic3_concurrency.rs` — approve race actually concurrent
+- `tests/hot_reload_concurrency.rs` — distinct-payload winner check
+- `tests/enforcement_robustness.rs` — anti-tests rewritten
+- `tests/mitm_streaming.rs` — keep-alive + SSE+chunked + header values
+- `tests/api_handlers.rs` — reload side-effect assertions
+- `tests/token_budget_contention.rs` — recovery + multi-agent
+- `tests/stress.rs` — SRR ceiling tightened (5000µs → 1000µs)
+- `tests/common_sanity.rs` — tautology replaced
+- `crates/gvm-types/tests/verify_chain.rs` — context-missing renamed
+
+**Risk:** Low.
+- All ~564 tests pass on Windows (`cargo test --workspace`).
+- 4 ignored: 1 SSE flush, 2 stress perf benches, 1 cli auto-start E2E,
+  1 NEW intentionally-ignored test documenting the integrity-context
+  evasion target contract.
+- `cargo fmt` clean.
+- No production behavior changes — only test-only helpers
+  (`classify_at`, `_rotate_for_test`, `GVM_HEARTBEAT_DIR`,
+  `remove_gvm_headers` visibility bump).
+
+### 2026-05-01: Code-standards compliance pass (§1.2 / §1.3 / §1.7 / §2.3 / §7.1)
+
+**What changed:**
+
+Audited `src/` and `crates/` against `docs/internal/GVM_CODE_STANDARDS.md`
+and closed nine drift points found in the scan. Categories:
+
+- **§1.3 Error sanitization** — `POST /gvm/reload` no longer reflects
+  raw toml/regex parser strings (file paths, line numbers) in the
+  response. The HTTP body now reads `"SRR parse failed — see proxy
+  logs. Config preserved."` while the full error still goes to
+  `tracing::error!`. (`src/api.rs`)
+- **§1.7 Unsafe documentation** — Added `// SAFETY:` comments to every
+  remaining runtime `unsafe { ... }` block that lacked one (12 sites
+  across `crates/gvm-sandbox`: capability/cgroup/heartbeat/sandbox_impl/
+  network).
+- **§2.3 Required config fail-close** — Removed the silent
+  `unwrap_or_else(|_| "0.0.0.0:8080")` fallback for `server.listen`.
+  An invalid listen address now exits with a fatal log instead of
+  binding to a different port than the operator configured.
+  (`src/main.rs`)
+- **§1.2 Runtime panic-equivalents** — The non-loopback reload-handler
+  branch in `main.rs` no longer ends in `.unwrap()`; it falls back to
+  an empty 403. `launch_contained_wrapper` in `crates/gvm-cli/src/
+  pipeline.rs` replaces `unreachable!()` with `anyhow::bail!`, marked
+  with a `7.1-exception` note tracking the legacy bridge.
+- **§1.9 Async file I/O** — `Ledger::record_config_load` now uses
+  `tokio::fs::read` so the policy hot-reload path no longer issues
+  blocking `std::fs::read` from inside the live runtime.
+  (`src/ledger.rs`)
+- **DNS log clarity** — `dns_governance.rs` mutex-poison branches
+  previously logged "fail-open"; that wording was misleading because
+  the fallback returns `DnsTier::Unknown` (Tier 2 — moderate delay),
+  not a free pass. Logs now say "fall back to Tier 2 (Unknown)" and
+  the rationale is captured in a comment.
+- **§1.3 Wasm lock poison** — `WasmEngine::evaluate_wasm` no longer
+  surfaces the `PoisonError` text to the caller; logs the error and
+  returns the generic `Wasm runtime unavailable`.
+
+**Why:** All findings came from a code-standards scan; they were
+single-spot drift rather than systemic gaps. Fixing them in one pass
+keeps the standard credible — every rule the document asserts now
+holds in the tree.
+
+**Affected files:**
+- `src/api.rs` — sanitized reload errors
+- `src/main.rs` — listen-addr fail-close, reload-handler unwrap
+- `src/ledger.rs` — `tokio::fs::read` for record_config_load
+- `src/dns_governance.rs` — fail-open → fail-graceful wording
+- `src/wasm_engine.rs` — generic lock-poison error
+- `crates/gvm-cli/src/pipeline.rs` — `bail!` instead of `unreachable!`
+- `crates/gvm-sandbox/src/{capability,cgroup,heartbeat,sandbox_impl,
+  network}.rs` — added 12 SAFETY comments
+
+**Risk:** Low. No behavioral change on the happy path. Listen-address
+fail-close is a stricter error path: operators who relied on the
+silent fallback will now see a fatal log with the offending value.
+Reload handler now returns 403 with empty body instead of panicking
+on the (already unreachable) builder failure. All 275 lib tests + 422
+integration tests pass; cargo fmt clean.
+
 ### 2026-05-01: Sandbox parent-liveness heartbeat (defense-in-depth for PDEATHSIG)
 
 **What changed:**

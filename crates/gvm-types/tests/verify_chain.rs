@@ -141,11 +141,23 @@ fn malformed_json_line_is_skipped_without_poisoning_subsequent_events() {
 }
 
 #[test]
-fn integrity_context_missing_from_event_is_silently_skipped() {
-    // An event with operation "gvm.system.config_load" but NO
-    // _integrity_context in its context map (legacy data, or a
-    // crash that wrote a partial event). The verifier should not
-    // count it as a config_load and should not panic.
+#[ignore = "documents known evasion vector — see security-model.md \
+            'integrity-context strip evasion'. Re-enable once verifier \
+            treats missing _integrity_context as a chain break."]
+fn integrity_context_missing_should_break_chain() {
+    // SECURITY GAP: an event with operation "gvm.system.config_load"
+    // but NO _integrity_context in its context map is currently
+    // SKIPPED by the verifier (treated as legacy data). This means an
+    // attacker who strips _integrity_context from a forged event
+    // evades the integrity-chain check entirely.
+    //
+    // Correct behavior (target contract): missing _integrity_context
+    // on a config_load event MUST be reported as first_break.
+    //
+    // This test pins the *target* contract; it is #[ignore]d until
+    // the production verifier is hardened. The current "silently
+    // skipped" behavior is preserved by `integrity_context_missing_…
+    // _silently_skipped_documents_gap` below.
     let no_ctx_event = serde_json::json!({
         "event_id": "sys-broken",
         "operation": "gvm.system.config_load",
@@ -157,8 +169,36 @@ fn integrity_context_missing_from_event_is_silently_skipped() {
     let (_dir, path) = write_wal(&[&no_ctx_event, &config_load_event(&ctx_good)]);
     let report = verify_integrity_chain(&path);
     assert_eq!(
+        report.first_break.as_deref(),
+        Some("sys-broken"),
+        "config_load missing _integrity_context MUST be reported as a chain break"
+    );
+}
+
+#[test]
+fn integrity_context_missing_silently_skipped_documents_gap() {
+    // Pins CURRENT behavior: missing _integrity_context is skipped.
+    // Paired with the #[ignore]d test above, which pins the TARGET
+    // behavior. When the verifier is hardened, this test should be
+    // deleted and the ignored one re-enabled.
+    let no_ctx_event = serde_json::json!({
+        "event_id": "sys-broken",
+        "operation": "gvm.system.config_load",
+        "context": {},
+        "decision": "Allow",
+    })
+    .to_string();
+    let ctx_good = GvmIntegrityContext::local("config-A".to_string(), None);
+    let (_dir, path) = write_wal(&[&no_ctx_event, &config_load_event(&ctx_good)]);
+    let report = verify_integrity_chain(&path);
+    // Documents the gap: the broken event is invisible to the verifier.
+    assert_eq!(
         report.total_config_loads, 1,
-        "config_load missing _integrity_context is not counted"
+        "current behavior: config_load missing _integrity_context is invisible"
     );
     assert_eq!(report.valid_links, 1);
+    assert!(
+        report.first_break.is_none(),
+        "current behavior: no break reported — this is the security gap"
+    );
 }

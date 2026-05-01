@@ -203,10 +203,9 @@ fn hostile_headers(agent_id: String, trace_id: String) -> GVMHeaders {
 async fn classify_does_not_panic_on_oversize_agent_id() {
     // 1 MB of 'A's. Production agents could supply this either by
     // bug, malicious intent, or an SDK that auto-encodes long
-    // metadata. Classify MUST handle without panic. We document the
-    // resulting OperationMetadata length so any future caller that
-    // fans the metadata into log files / dashboards knows the
-    // worst-case allocation.
+    // metadata. Classify MUST handle without panic AND must not
+    // unbound-allocate the entire payload N times across the
+    // request lifetime.
     let huge = "A".repeat(1024 * 1024);
     let headers = hostile_headers(huge.clone(), "trace".to_string());
 
@@ -228,30 +227,42 @@ type = "Allow"
         body: None,
         gvm_headers: Some(&headers),
     };
+    let t0 = std::time::Instant::now();
     let out = classify(&state, &input).expect("must not panic on 1MB agent_id");
+    let elapsed = t0.elapsed();
 
-    // CURRENT BEHAVIOR (locked in by this test): the agent_id passes
-    // through verbatim. If a future fix introduces truncation /
-    // rejection at the classify layer, update the assertion to match
-    // the new contract — but DO NOT silently regress. Audit-pipeline
-    // operators rely on knowing whether to truncate at log emit.
-    assert_eq!(
+    // Contract (intentionally permissive): agent_id may pass through
+    // verbatim today (no boundary cap is enforced at classify), or a
+    // future hardening pass may truncate / reject. Either is acceptable
+    // — what we CANNOT tolerate is a panic, hang, or quadratic blowup.
+    //
+    // Upper bound on accepted length: the input itself. A future fix
+    // that truncates to N bytes (N < 1MB) STILL satisfies the assertion
+    // — we deliberately do NOT lock in verbatim passthrough as the
+    // contract (that would block §1.5 boundary-validation hardening).
+    assert!(
+        out.agent_id.len() <= huge.len(),
+        "agent_id must never grow past input length; got {} > {}",
         out.agent_id.len(),
         huge.len(),
-        "current contract is verbatim passthrough (size = {} bytes); \
-         change of policy must update the test deliberately",
-        out.agent_id.len()
+    );
+    // Soft latency guard against quadratic regression. 1MB classify on
+    // a debug build is ~50ms typical; 5s catches unbounded copy loops.
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "classify on 1MB input took {:?} — likely O(N²) regression",
+        elapsed,
     );
 }
 
 #[tokio::test]
 async fn classify_passes_control_char_trace_id_without_panic() {
-    // Trace IDs with embedded \n / \r / \0. These would inject log
+    // Trace IDs with embedded \n / \r / \0 / BEL would inject log
     // lines if any downstream sink does plain printf. Classify must
-    // not panic; it's the WAL serializer (JSON) and tracing
-    // structured-log emitter that hold the line. We assert: classify
-    // returns successfully with the original trace_id. If a future
-    // sanitiser layer is added, this test pins the contract.
+    // not panic. The actual line of defense is JSON serialization —
+    // we verify here that ANY sanitization layer (current: none on
+    // classify; future: a possible boundary truncator) plus the JSON
+    // emitter combine to keep raw control bytes out of the WAL stream.
     let bad = "trace\r\nFAKE: injected log line\0\u{0007}".to_string();
     let headers = hostile_headers("agent".to_string(), bad.clone());
 
@@ -278,10 +289,31 @@ type = "Allow"
         .classification
         .operation
         .expect("operation metadata present");
+
+    // The actual contract per §1.5: the audit-stream emitter must
+    // never spill raw control bytes onto a line-oriented sink.
+    // Whether classify sanitizes upstream or relies on JSON escaping
+    // downstream, the *combined* output must escape \r, \n, \0.
+    let serialized = serde_json::to_string(&op).expect("operation metadata must JSON-serialize");
+    assert!(
+        !serialized.contains('\r') && !serialized.contains('\n') && !serialized.contains('\0'),
+        "WAL JSON line must not contain raw CR/LF/NUL — log-injection \
+         defense breached. serialized={:?}",
+        serialized
+    );
+
+    // Round-trip integrity: a JSON consumer that parses this line
+    // must get back the original bytes (escape != lossy mutation).
+    let reparsed: serde_json::Value =
+        serde_json::from_str(&serialized).expect("re-parse must succeed");
+    let session = reparsed
+        .get("subject")
+        .and_then(|s| s.get("session_id"))
+        .and_then(|s| s.as_str())
+        .expect("session_id must round-trip through JSON");
     assert_eq!(
-        op.subject.session_id, bad,
-        "session_id falls back to trace_id verbatim — JSON serializer \
-         downstream is the line of defense for log injection"
+        session, bad,
+        "JSON round-trip must preserve original bytes; escape ≠ mutate"
     );
 }
 

@@ -36,7 +36,7 @@ pub struct AgentConfig {
     pub suppress_output: bool,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchMode {
     Cooperative,
     Sandbox,
@@ -499,6 +499,9 @@ async fn launch_contained_wrapper(config: &AgentConfig, _pre: &PreLaunchState) -
     // Contained mode delegates to run.rs's existing run_contained which has
     // complex Docker-specific logic (image building, volume mounts, DNAT entrypoint).
     // For now, we call the legacy function. Full pipeline integration is Phase 2.
+    //
+    // 7.1-exception: legacy bridge — see project tracker for migration to
+    // pipeline-native contained launch.
     if let LaunchMode::Contained {
         ref image,
         ref memory,
@@ -519,7 +522,13 @@ async fn launch_contained_wrapper(config: &AgentConfig, _pre: &PreLaunchState) -
         .await
         .map(|_| 0)
     } else {
-        unreachable!()
+        // GVM Code Standard §1.2: prefer Result<E> over unreachable!() in
+        // runtime paths. The dispatcher should only invoke this for
+        // Contained mode, but a future caller mistake should fail soft.
+        anyhow::bail!(
+            "internal: launch_contained_wrapper invoked with non-Contained mode {:?}",
+            config.mode
+        )
     }
 }
 

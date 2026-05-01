@@ -609,8 +609,8 @@ impl Ledger {
     /// proxy restarts, the hash mismatch is visible in the audit trail.
     ///
     /// Called at proxy startup (after config load) and on policy hot-reload.
-    // COLD PATH: blocking std::fs::read() acceptable — called at startup/reload, not per-request.
-    /// Record config file hashes + GvmIntegrityContext in the Merkle chain.
+    /// Hot-reload runs on the live tokio runtime, so file reads use
+    /// `tokio::fs::read` (§1.9: never block the executor in async fn).
     ///
     /// Creates an integrity context that records the config state for
     /// reproducibility and tamper detection.
@@ -628,7 +628,7 @@ impl Ledger {
         let mut combined_hash_input = String::new();
 
         for (label, path) in config_files {
-            let hash = match std::fs::read(path) {
+            let hash = match tokio::fs::read(path).await {
                 Ok(bytes) => {
                     let digest = Sha256::digest(&bytes);
                     format!("{:x}", digest)

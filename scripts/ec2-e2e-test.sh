@@ -6689,15 +6689,26 @@ print('DNS_83C_DONE')
         fi
         rm -f "$DNS83C_OUT"
 
-        # 83d: decay — after window expires, tier drops back to Tier 2
-        # Uses GVM_TEST_DNS_WINDOW_SEC=5 so we only wait 6 seconds.
-        # sudo -E preserves env vars (some distros strip them by default).
+        # 83d: decay — after window expires, tier drops back to Tier 2.
+        # Override the sliding window to 5 seconds via the proxy config
+        # file (NOT via env var — production binaries no longer accept
+        # GVM_TEST_DNS_WINDOW_SEC, see GVM_CODE_STANDARDS.md §6.5).
         sudo pkill -f gvm-proxy 2>/dev/null
         sleep 1
         sudo "$GVM_BIN" cleanup > /dev/null 2>&1 || true
         DNS83D_OUT=$(mktemp /tmp/gvm-dns83d-XXXX.txt)
-        export GVM_TEST_DNS_WINDOW_SEC=5
-        timeout 60 sudo -E "$GVM_BIN" run --sandbox \
+        # Inject the 5-second window into proxy.toml. The clamp floor in
+        # DnsGovernance::with_window_secs is 5s — exactly our value.
+        DNS83D_CFG_BACKUP="$(mktemp /tmp/gvm-dns83d-cfg-XXXX.toml)"
+        cp config/proxy.toml "$DNS83D_CFG_BACKUP"
+        # Append/replace [dns] window_secs = 5
+        if grep -q "^\[dns\]" config/proxy.toml; then
+            sed -i.bak '/^\[dns\]/,/^\[/ { /^window_secs/d }' config/proxy.toml
+            sed -i.bak '/^\[dns\]/a window_secs = 5' config/proxy.toml
+        else
+            printf '\n[dns]\nwindow_secs = 5\n' >> config/proxy.toml
+        fi
+        timeout 60 sudo "$GVM_BIN" run --sandbox \
             --agent-id dns-decay -- python3 -c "
 import socket, time
 
@@ -6740,8 +6751,13 @@ print('DNS_83D_DONE')
         fi
         rm -f "$DNS83D_OUT"
 
-        # Restart proxy without test window override for remaining tests
-        unset GVM_TEST_DNS_WINDOW_SEC
+        # Restart proxy without test window override for remaining tests.
+        # Restore the original proxy.toml (the 5-second window was config-
+        # injected, not env-injected, so we have to revert the file).
+        if [ -f "$DNS83D_CFG_BACKUP" ]; then
+            cp "$DNS83D_CFG_BACKUP" config/proxy.toml
+            rm -f "$DNS83D_CFG_BACKUP" config/proxy.toml.bak
+        fi
         sudo pkill -f gvm-proxy 2>/dev/null
         sleep 1
         ensure_proxy || true
