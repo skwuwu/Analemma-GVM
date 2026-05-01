@@ -74,7 +74,11 @@ async fn merkle_event_hash_embedded_in_wal() {
         .expect("WAL file must be readable after flush");
     let event_lines: Vec<&str> = content
         .lines()
-        .filter(|l| !l.contains("\"merkle_root\""))
+        .filter(|l| {
+            l.contains("\"event_id\":")
+                && !l.contains("\"merkle_root\"")
+                && !l.contains("\"anchor_hash\"")
+        })
         .collect();
 
     assert_eq!(event_lines.len(), 1);
@@ -194,20 +198,31 @@ async fn merkle_batch_root_recomputable() {
         .await
         .expect("WAL file must be readable after flush");
 
-    // Collect event hashes and batch records in WAL order
+    // Collect event hashes + seal hash in WAL order. Phase 2 batches
+    // include the BatchSealRecord's seal_hash() as the LAST leaf.
     let mut current_batch_hashes: Vec<String> = Vec::new();
     for line in content.lines() {
+        // Anchor record — skip (verify_anchor_chain handles those).
+        if line.contains("\"anchor_hash\":") {
+            continue;
+        }
+
         if line.contains("\"merkle_root\"") {
-            // Batch record — verify Merkle root
             let record: MerkleBatchRecord = serde_json::from_str(line)
                 .expect("batch record line must be valid MerkleBatchRecord JSON");
             let recomputed = merkle::compute_merkle_root(&current_batch_hashes).unwrap();
             assert_eq!(
                 record.merkle_root, recomputed,
-                "batch {}: stored root must match recomputed root",
+                "batch {}: stored root must match recomputed root \
+                 (events + seal as last leaf)",
                 record.batch_id
             );
             current_batch_hashes.clear();
+        } else if line.contains("\"seal_id\":") && line.contains("\"sealed_at\":") {
+            // Seal record — append seal_hash as the last leaf for this batch.
+            let seal: gvm_types::BatchSealRecord =
+                serde_json::from_str(line).expect("seal line must be valid BatchSealRecord JSON");
+            current_batch_hashes.push(hex::encode(seal.seal_hash()));
         } else if let Ok(event) = serde_json::from_str::<GVMEvent>(line) {
             current_batch_hashes.push(
                 event
@@ -554,16 +569,24 @@ async fn merkle_proof_proves_event_in_batch() {
         .await
         .expect("WAL file must be readable after flush");
 
-    // Collect event hashes from one batch
+    // Collect event hashes + seal hash from one batch.
+    // Phase 2: leaf list is events + seal_hash (last leaf).
     let mut batch_event_hashes: Vec<String> = Vec::new();
     let mut batch_root: Option<String> = None;
 
     for line in content.lines() {
+        if line.contains("\"anchor_hash\":") {
+            continue; // anchor record — skip
+        }
         if line.contains("\"merkle_root\"") {
             let record: MerkleBatchRecord = serde_json::from_str(line)
                 .expect("batch record line must be valid MerkleBatchRecord JSON");
             batch_root = Some(record.merkle_root);
-            break; // Only check the first batch
+            break;
+        } else if line.contains("\"seal_id\":") && line.contains("\"sealed_at\":") {
+            let seal: gvm_types::BatchSealRecord =
+                serde_json::from_str(line).expect("seal line must be valid BatchSealRecord JSON");
+            batch_event_hashes.push(hex::encode(seal.seal_hash()));
         } else if let Ok(event) = serde_json::from_str::<GVMEvent>(line) {
             batch_event_hashes.push(
                 event

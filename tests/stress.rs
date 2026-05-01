@@ -356,7 +356,11 @@ async fn wal_1000_concurrent_durable_appends() {
         .expect("WAL file must be readable after concurrent writes");
     let event_count = content
         .lines()
-        .filter(|line| !line.contains("\"merkle_root\""))
+        .filter(|line| {
+            line.contains("\"event_id\":")
+                && !line.contains("\"merkle_root\"")
+                && !line.contains("\"anchor_hash\"")
+        })
         .count();
     assert_eq!(
         event_count, 1_000,
@@ -420,7 +424,11 @@ async fn wal_sustained_load_10k_events() {
         .expect("WAL file must be readable after sustained load");
     let event_count = content
         .lines()
-        .filter(|line| !line.contains("\"merkle_root\""))
+        .filter(|line| {
+            line.contains("\"event_id\":")
+                && !line.contains("\"merkle_root\"")
+                && !line.contains("\"anchor_hash\"")
+        })
         .count();
     assert_eq!(
         event_count, total_events,

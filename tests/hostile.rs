@@ -503,7 +503,11 @@ async fn ledger_concurrent_spawns_stay_bounded() {
         .expect("WAL file must be readable after all appends");
     let event_count = wal_content
         .lines()
-        .filter(|line| !line.contains("\"merkle_root\""))
+        .filter(|line| {
+            line.contains("\"event_id\":")
+                && !line.contains("\"merkle_root\"")
+                && !line.contains("\"anchor_hash\"")
+        })
         .count();
     assert_eq!(
         event_count, 500,

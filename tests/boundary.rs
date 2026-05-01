@@ -1043,17 +1043,23 @@ async fn nats_wal_sequence_monotonic() {
         handle.await.expect("spawned task must not panic");
     }
 
-    // Read WAL and verify all 50 events present (filter out MerkleBatchRecord lines)
+    // Read WAL and verify all 50 events present. Phase 2 adds seal +
+    // anchor lines per batch; positively identify events by `event_id`
+    // presence rather than negatively excluding merkle_root.
     let content = tokio::fs::read_to_string(&wal_path)
         .await
         .expect("WAL file must be readable after writes");
     let event_count = content
         .lines()
-        .filter(|line| !line.contains("\"merkle_root\""))
+        .filter(|line| {
+            // Event lines have event_id, NOT merkle_root, NOT anchor_hash, NOT seal_id-with-sealed_at.
+            line.contains("\"event_id\":")
+                && !line.contains("\"merkle_root\"")
+                && !line.contains("\"anchor_hash\"")
+        })
         .count();
     assert_eq!(event_count, 50, "WAL must contain exactly 50 events");
 
-    // Verify batch records exist (at least 1 batch was flushed)
     let batch_count = content
         .lines()
         .filter(|line| line.contains("\"merkle_root\""))
@@ -1061,6 +1067,25 @@ async fn nats_wal_sequence_monotonic() {
     assert!(
         batch_count > 0,
         "WAL must contain at least one Merkle batch record"
+    );
+
+    // Phase 2 invariant: every batch record has a seal record before
+    // and an anchor record after. Counts should match.
+    let seal_count = content
+        .lines()
+        .filter(|line| line.contains("\"seal_id\":") && line.contains("\"sealed_at\":"))
+        .count();
+    let anchor_count = content
+        .lines()
+        .filter(|line| line.contains("\"anchor_hash\":"))
+        .count();
+    assert_eq!(
+        seal_count, batch_count,
+        "every batch must have one seal record"
+    );
+    assert_eq!(
+        anchor_count, batch_count,
+        "every batch must have one anchor record"
     );
 }
 

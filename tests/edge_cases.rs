@@ -341,7 +341,11 @@ async fn edge_concurrent_status_update_no_crash() {
         .expect("WAL file must be readable after writes");
     let event_count = content
         .lines()
-        .filter(|line| !line.contains("\"merkle_root\""))
+        .filter(|line| {
+            line.contains("\"event_id\":")
+                && !line.contains("\"merkle_root\"")
+                && !line.contains("\"anchor_hash\"")
+        })
         .count();
     assert_eq!(
         event_count, 10,

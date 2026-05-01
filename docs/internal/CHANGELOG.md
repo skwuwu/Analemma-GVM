@@ -52,6 +52,154 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
+### 2026-05-02: Phase 2 wiring — group commit emits BatchSealRecord + GvmStateAnchor
+
+**What changed:**
+
+The new logging structure goes live. Every batch flush now writes
+THREE additional WAL lines beyond the events themselves: a
+`BatchSealRecord` capturing the active state at seal time, a
+`MerkleBatchRecord` whose `leaves_blob` includes the seal_hash as
+the last leaf, and a `GvmStateAnchor` binding all three roots into
+a single 32-byte finality marker.
+
+**WAL line layout (Phase 2+)**:
+
+```
+... events from earlier batch ...
+event_1                ← GVMEvent JSON
+event_2
+...
+event_N
+seal                   ← BatchSealRecord JSON  (NEW)
+batch_record           ← MerkleBatchRecord JSON (now with leaves_blob,
+                                                 seal_position, leaves_format)
+anchor                 ← GvmStateAnchor JSON   (NEW)
+... events from next batch ...
+```
+
+The `merkle_root` in batch_record is computed over event_hashes
+plus the seal's `seal_hash()` as the last leaf — so any tamper of
+the seal record propagates to merkle_root and to anchor_hash.
+
+**TripleState — atomic snapshot at batch close** (`src/ledger.rs`):
+
+```rust
+pub struct TripleState {
+    pub context_hash: Option<String>,
+    pub checkpoint_root: Option<String>,
+    pub last_anchor: Option<String>,
+}
+
+// Inside Ledger:
+pub fn update_context_hash(&self, new_hash: String);
+pub fn update_checkpoint_root(&self, new_root: Option<String>);
+pub fn triple_snapshot(&self) -> Arc<TripleState>;
+```
+
+Backed by `arc_swap::ArcSwap`. Writers use RCU so concurrent
+`update_context_hash` and `update_checkpoint_root` calls do not lose
+each other (per §4.7 Snapshot Atomicity Invariant). Reads (batch
+task at seal time) are wait-free via `load_full()`.
+
+**`record_config_load` now publishes**: after the config_load event
+reaches the WAL via `append_durable`, the new `context_hash` is
+published into the triple via `update_context_hash`. The CURRENT
+batch (containing the config_load event) was already sealed with
+the OLD context — that's correct semantics (§4.7: seal records
+"active context AT seal time", not "context the batch's events
+will use going forward").
+
+**Group commit task rewritten** (`flush_batch_with_anchor`):
+
+1. Snapshot triple_state via `load_full()` — single atomic read.
+2. Build `BatchSealRecord` from snapshot (seal_id, sealed_at,
+   context_hash, checkpoint_root, prev_anchor).
+3. `leaves = event_hashes (decoded to 32B) || seal_hash()`.
+4. `batch_root = compute_merkle_root(leaves_hex)`.
+5. Build `MerkleBatchRecord` with full `leaves_blob` (binary,
+   base64-encoded in JSON), `seal_position = event_count`,
+   `leaves_format = Sha256Concat`.
+6. `anchor = GvmStateAnchor::seal(1, &seal, batch_root)` — computes
+   anchor_hash with domain separation.
+7. Single `write_all` + `sync_data` for events + seal + batch_record
+   + anchor. Same fsync amortization as before.
+8. After fsync, publish anchor_hash into `triple_state.last_anchor`
+   so the NEXT batch's seal captures it as `prev_anchor`.
+
+**Genesis convention**: the very first batch's seal has
+`prev_anchor = None` (triple_state starts with `last_anchor: None`).
+First batch's seal also has `context_hash = GENESIS_HASH_HEX` if no
+`update_context_hash` call preceded the first event.
+
+**`verify_wal` updated**: recognizes the three new line types.
+Anchor records are skipped (audited separately by Phase 2.5
+`verify_anchor_chain`). Seal records contribute their `seal_hash()`
+as the last leaf of the current batch's leaf list, so recomputed
+batch_root matches the stored merkle_root. Pre-Phase-2 (legacy)
+WAL files continue to verify exactly as before — the leaf list is
+just events with no seal injection.
+
+**Existing test updates**:
+
+- `tests/boundary.rs::nats_wal_sequence_monotonic` — event filter
+  changed from naive `!line.contains("merkle_root")` to positive
+  `line.contains("\"event_id\":")` plus exclusion of
+  `merkle_root` and `anchor_hash` (avoid counting seal/anchor as
+  events). Also added invariants: `seal_count == batch_count ==
+  anchor_count`.
+- `tests/edge_cases.rs`, `tests/hostile.rs`, `tests/merkle.rs`,
+  `tests/stress.rs` — same naive filter pattern fixed via Python
+  regex sweep.
+- `tests/merkle.rs::merkle_batch_root_recomputable` /
+  `merkle_proof_proves_event_in_batch` — leaf-list reconstruction
+  now appends the seal record's `seal_hash()` after collecting
+  event_hashes, matching the writer's algorithm.
+
+**Tests added (8 new in `tests/anchor_wiring.rs`)**:
+
+- single batch writes event/seal/batch_record/anchor in correct order
+- anchor.verify_self_hash returns true for fresh batches
+- leaves_blob length == (event_count + 1) × 32 invariant
+- seal_hash matches the last 32 bytes of leaves_blob
+- prev_anchor chain links across consecutive batches (genesis None
+  → batch 1 anchor_hash → batch 2 prev_anchor)
+- context_hash published before batch flush appears in seal
+- anchor inherits all per-seal fields (context_hash, checkpoint_root,
+  prev_anchor, batch_id, timestamp)
+- triple_snapshot reflects updates immediately, RCU preserves
+  unrelated fields
+
+**Verification**:
+- `cargo test --workspace --tests`: 619 passed / 0 failed / 4 ignored
+  (was 611 — +8 new anchor wiring tests; existing tests adapted)
+- `cargo fmt --all -- --check`: clean
+- `cargo check --workspace --tests`: clean
+
+**Performance**: per-batch overhead ~ +500 bytes (seal + anchor
+records, ~250 bytes each as JSON), one extra `arc_swap::load_full()`
+(~50ns), three extra serialize calls. fsync count unchanged (still 1
+per batch). Hot path (event creation, append_durable) is not
+affected — anchor work happens in the background batch task.
+
+**Backward compatibility**: NEW WAL files produced by this commit
+are NOT readable by pre-Phase-2 verifiers (they would skip the seal
+record as "unknown line" and miscompute merkle_root). Old WAL files
+remain readable: the new verify_wal handles missing seal/anchor
+lines as legacy form. Mixed WALs (old segments + new active) work
+correctly because verification is per-line.
+
+**Known follow-ups**:
+- Phase 2.5: `verify_anchor_chain` separate audit (timing,
+  monotonic batch_id, prev_anchor chain validation, signature check)
+- Phase 1.B: migrate production event-creation sites to populate
+  `operation_descriptor` for sensitive operations
+- Phase 3: replace per-agent `Vec<String>` checkpoint storage with
+  leaves-only `BTreeMap` + rightmost-path cache
+- Phase 5: `prev_anchor_hash` binding in `GvmIntegrityContext` v3
+  (replay defense)
+- Phase 6: TSA / HSM signature integration
+
 ### 2026-05-02: Phase 1.A — OperationDescriptor + event_hash v1/v2 dispatcher
 
 **What changed:**

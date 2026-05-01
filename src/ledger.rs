@@ -1,5 +1,7 @@
 use crate::merkle::compute_event_hash;
-use crate::types::{EventStatus, GVMEvent, MerkleBatchRecord};
+use crate::types::{
+    BatchSealRecord, EventStatus, GVMEvent, GvmStateAnchor, LeavesFormat, MerkleBatchRecord,
+};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -7,6 +9,29 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+
+// ─── Phase 2: Triple-state snapshot for atomic batch close ───
+//
+// One Arc holding (context_hash, checkpoint_root, last_anchor) so the
+// batch task can capture all three in a single ArcSwap::load_full()
+// call. Writers (reload, register, post-anchor publish) update via
+// rcu so concurrent updates do not lose each other's writes.
+//
+// See §4.6/§4.7/§4.8 of GVM_CODE_STANDARDS.md.
+
+/// State observed at batch close time and anchored into `GvmStateAnchor`.
+#[derive(Clone, Debug, Default)]
+pub struct TripleState {
+    /// Active integrity-context hash (from `record_config_load`).
+    /// `None` only before the first config_load completes.
+    pub context_hash: Option<String>,
+    /// Global checkpoint aggregator root (Phase 3+). `None` until
+    /// the checkpoint subsystem ships.
+    pub checkpoint_root: Option<String>,
+    /// Hash of the last anchor written to WAL. `None` at genesis,
+    /// becomes `Some` after the first batch flushes.
+    pub last_anchor: Option<String>,
+}
 
 // ─── Emergency WAL (Fallback Storage) ───
 
@@ -142,6 +167,11 @@ struct WAL {
     path: PathBuf,
     /// Test-only: when set to true, the batch task will reject all writes.
     inject_error: Arc<AtomicBool>,
+    /// Phase 2: triple-state snapshot bundle. Shared with the batch
+    /// task; readers (batch close) and writers (reload, register,
+    /// post-anchor) all go through `arc_swap::ArcSwap` so reads are
+    /// wait-free and writers don't lose each other's updates.
+    triple: Arc<arc_swap::ArcSwap<TripleState>>,
 }
 
 impl WAL {
@@ -159,6 +189,8 @@ impl WAL {
 
         let (tx, rx) = tokio::sync::mpsc::channel(config.channel_capacity);
         let inject_error = Arc::new(AtomicBool::new(false));
+        let triple: Arc<arc_swap::ArcSwap<TripleState>> =
+            Arc::new(arc_swap::ArcSwap::from_pointee(TripleState::default()));
 
         let batch_task = tokio::spawn(batch_loop(
             rx,
@@ -166,15 +198,17 @@ impl WAL {
             config,
             inject_error.clone(),
             path.to_path_buf(),
+            Arc::clone(&triple),
         ));
 
-        tracing::info!(path = %path.display(), "WAL opened (group commit + merkle)");
+        tracing::info!(path = %path.display(), "WAL opened (group commit + merkle + anchor)");
 
         Ok(Self {
             tx: Some(tx),
             batch_task: Some(batch_task),
             path: path.to_path_buf(),
             inject_error,
+            triple,
         })
     }
 
@@ -210,7 +244,20 @@ impl WAL {
 }
 
 /// Background batch task: collects writes, flushes in batches, single fsync per batch.
-/// After flushing events, computes the Merkle root and appends a batch record.
+///
+/// Phase 2 wiring: every batch flush now produces THREE additional WAL
+/// lines beyond the events themselves:
+///   N+1. BatchSealRecord — captures the TripleState snapshot at seal time
+///   N+2. MerkleBatchRecord — leaves_blob includes events + seal_hash
+///        as last leaf (so seal tampering invalidates batch_root)
+///   N+3. GvmStateAnchor — anchor_hash binds (batch_root, context_hash,
+///        checkpoint_root, prev_anchor)
+///
+/// Snapshot atomicity (§4.7): the triple_state is read once per batch,
+/// AFTER the batch is drained and BEFORE seal_hash is computed. This
+/// captures system state at the close moment; per-event refs may
+/// differ (handler-time vs seal-time race is documented behavior).
+///
 /// Handles size-based rotation when the WAL file exceeds `max_wal_bytes`.
 async fn batch_loop(
     mut rx: tokio::sync::mpsc::Receiver<GroupCommitRequest>,
@@ -218,6 +265,7 @@ async fn batch_loop(
     config: GroupCommitConfig,
     inject_error: Arc<AtomicBool>,
     wal_path: PathBuf,
+    triple: Arc<arc_swap::ArcSwap<TripleState>>,
 ) {
     let mut batch: Vec<GroupCommitRequest> = Vec::with_capacity(config.max_batch_size);
     let mut batch_id: u64 = 0;
@@ -232,9 +280,20 @@ async fn batch_loop(
                 // Channel closed — all senders dropped, shutdown.
                 // Flush any remaining events that arrived before channel close.
                 if !batch.is_empty() {
-                    let result =
-                        flush_batch_with_merkle(&mut file, &batch, batch_id, &prev_batch_root)
-                            .await;
+                    let result = flush_batch_with_anchor(
+                        &mut file,
+                        &batch,
+                        batch_id,
+                        &prev_batch_root,
+                        &triple,
+                    )
+                    .await;
+                    if let Ok(ref outcome) = result {
+                        // Publish anchor on shutdown path too — observers
+                        // reading the WAL after a clean shutdown see the
+                        // last_anchor as the final tail of the chain.
+                        publish_anchor(&triple, outcome.anchor_hash.clone());
+                    }
                     for req in batch.drain(..) {
                         let notify = match &result {
                             Ok(_) => Ok(()),
@@ -248,22 +307,18 @@ async fn batch_loop(
         }
 
         // Phase 2a: Non-blocking drain of all immediately available requests.
-        // This avoids paying the OS timer resolution penalty (15.6ms on Windows)
-        // when items are already queued.
         while batch.len() < config.max_batch_size {
             match rx.try_recv() {
                 Ok(req) => batch.push(req),
-                Err(_) => break, // Channel empty or closed
+                Err(_) => break,
             }
         }
 
         // Phase 2b: If batch is small and window is configured, briefly wait for more.
-        // Skip if we already have a decent batch from the non-blocking drain.
         if batch.len() < config.max_batch_size / 4 && !config.batch_window.is_zero() {
             match tokio::time::timeout(config.batch_window, rx.recv()).await {
                 Ok(Some(req)) => {
                     batch.push(req);
-                    // Drain any additional items that arrived during the wait
                     while batch.len() < config.max_batch_size {
                         match rx.try_recv() {
                             Ok(req) => batch.push(req),
@@ -271,26 +326,32 @@ async fn batch_loop(
                         }
                     }
                 }
-                Ok(None) => {} // Channel closed — flush what we have
-                Err(_) => {}   // Timeout — flush now
+                Ok(None) => {}
+                Err(_) => {}
             }
         }
 
-        // Phase 3: Flush entire batch with single write_all + single fsync
+        // Phase 3: Flush entire batch — events + seal + batch_record + anchor
         let result = if inject_error.load(Ordering::Relaxed) {
             Err(anyhow!("WAL I/O error (injected for testing)"))
         } else {
-            flush_batch_with_merkle(&mut file, &batch, batch_id, &prev_batch_root).await
+            flush_batch_with_anchor(&mut file, &batch, batch_id, &prev_batch_root, &triple).await
         };
 
         // Update batch chain state on success
-        if let Ok(ref root) = result {
-            prev_batch_root = Some(root.clone());
+        if let Ok(ref outcome) = result {
+            prev_batch_root = Some(outcome.batch_root.clone());
+            // Publish the new anchor into the triple BEFORE incrementing
+            // batch_id so the next batch's seal capture sees this anchor
+            // as its prev_anchor.
+            publish_anchor(&triple, outcome.anchor_hash.clone());
             batch_id += 1;
 
-            // Track bytes written for rotation check
+            // Track bytes written for rotation check.
+            // Now includes seal record + anchor record — approximate
+            // overhead bumped from 256 to 768 bytes.
             let batch_bytes: u64 = batch.iter().map(|r| r.data.len() as u64).sum();
-            bytes_written += batch_bytes + 256; // approximate batch record overhead
+            bytes_written += batch_bytes + 768;
 
             // Phase 3.5: Size-based rotation check
             if config.max_wal_bytes > 0 && bytes_written >= config.max_wal_bytes {
@@ -301,10 +362,8 @@ async fn batch_loop(
                     tracing::info!(
                         batch_id,
                         prev_root = ?prev_batch_root,
-                        "WAL rotated — new segment started, Merkle chain linked via prev_batch_root"
+                        "WAL rotated — new segment started, chain linked via prev_batch_root + prev_anchor"
                     );
-                    // prev_batch_root carries over — the first batch in the new
-                    // segment references the last root of the old segment.
                 }
             }
         }
@@ -320,56 +379,133 @@ async fn batch_loop(
     }
 }
 
+/// RCU update of the triple_state's `last_anchor` field. Used by
+/// the batch task post-flush so the next batch's seal captures
+/// this anchor as its `prev_anchor`.
+fn publish_anchor(triple: &Arc<arc_swap::ArcSwap<TripleState>>, new_anchor: String) {
+    triple.rcu(|prev| TripleState {
+        context_hash: prev.context_hash.clone(),
+        checkpoint_root: prev.checkpoint_root.clone(),
+        last_anchor: Some(new_anchor.clone()),
+    });
+}
+
+/// Outcome of a successful batch flush.
+struct BatchFlushOutcome {
+    batch_root: String,
+    anchor_hash: String,
+}
+
 /// Flush event data + Merkle batch record in a single fsync.
 ///
 /// 1. Concatenate all pre-serialized event JSON lines
 /// 2. Compute Merkle root from event hashes
 /// 3. Serialize and append MerkleBatchRecord
 /// 4. Single write_all + fsync for the entire buffer (events + batch record)
-async fn flush_batch_with_merkle(
+/// Flush the batch with seal record, Merkle root over (events + seal),
+/// and anchor in a single fsync.
+///
+/// WAL line ordering (Phase 2+):
+///   1..N. event_1..event_N      (GVMEvent JSON, pre-serialized by callers)
+///   N+1.  BatchSealRecord       (captures TripleState at close moment)
+///   N+2.  MerkleBatchRecord     (root over event_hashes + seal_hash;
+///                                leaves_blob carries all N+1 leaves)
+///   N+3.  GvmStateAnchor        (anchor_hash binds batch_root +
+///                                context_hash + ckpt_root + prev_anchor)
+///
+/// Returns (batch_root, anchor_hash) on success. Caller publishes the
+/// anchor_hash into the triple_state so the NEXT batch's seal references
+/// it as `prev_anchor`.
+async fn flush_batch_with_anchor(
     file: &mut tokio::fs::File,
     batch: &[GroupCommitRequest],
     batch_id: u64,
     prev_batch_root: &Option<String>,
-) -> Result<String> {
-    // Collect event hashes for Merkle tree
-    let leaf_hashes: Vec<String> = batch.iter().map(|r| r.event_hash.clone()).collect();
+    triple: &Arc<arc_swap::ArcSwap<TripleState>>,
+) -> Result<BatchFlushOutcome> {
+    // ─── Step 1: snapshot the triple state — single ArcSwap load ───
+    // §4.7: this is the "point-of-witness" observation. Per-event
+    // refs in the batch may differ from this snapshot.
+    let snap = triple.load_full();
+    let sealed_at = chrono::Utc::now();
 
-    // Compute Merkle root
-    let merkle_root = crate::merkle::compute_merkle_root(&leaf_hashes)?;
+    // ─── Step 2: build the seal record from snapshot ────────────────
+    let seal = BatchSealRecord {
+        seal_id: batch_id,
+        sealed_at,
+        context_hash: snap
+            .context_hash
+            .clone()
+            .unwrap_or_else(|| gvm_types::GENESIS_HASH_HEX.to_string()),
+        checkpoint_root: snap.checkpoint_root.clone(),
+        prev_anchor: snap.last_anchor.clone(),
+    };
+    let seal_hash_bytes: [u8; 32] = seal.seal_hash();
 
-    // Build batch record. Phase 2 anchor/seal/leaves_blob fields
-    // remain at their legacy-empty defaults until the group_commit
-    // task is rewritten to thread them through (Phase 2 wiring,
-    // separate commit). Reading existing WAL is unaffected because
-    // serde defaults skip these on deserialize.
+    // ─── Step 3: leaves = event_hashes (decoded) + seal_hash ────────
+    // event_hash is hex; decode to 32-byte binary for the leaves_blob
+    // and for Merkle root computation.
+    let mut leaves_blob: Vec<u8> = Vec::with_capacity((batch.len() + 1) * 32);
+    let mut leaves_hex: Vec<String> = Vec::with_capacity(batch.len() + 1);
+    for req in batch {
+        // event_hash is the precomputed hex from append() — decode for blob.
+        let bytes = hex::decode(&req.event_hash)
+            .map_err(|e| anyhow!("event_hash hex decode failed: {}", e))?;
+        if bytes.len() != 32 {
+            return Err(anyhow!(
+                "event_hash must decode to 32 bytes, got {}",
+                bytes.len()
+            ));
+        }
+        leaves_blob.extend_from_slice(&bytes);
+        leaves_hex.push(req.event_hash.clone());
+    }
+    leaves_blob.extend_from_slice(&seal_hash_bytes);
+    leaves_hex.push(hex::encode(seal_hash_bytes));
+
+    // ─── Step 4: compute batch_root over (events + seal) ────────────
+    let batch_root = crate::merkle::compute_merkle_root(&leaves_hex)?;
+
+    // ─── Step 5: build MerkleBatchRecord with leaves_blob ───────────
     let batch_record = MerkleBatchRecord {
         batch_id,
-        merkle_root: merkle_root.clone(),
+        merkle_root: batch_root.clone(),
         prev_batch_root: prev_batch_root.clone(),
         event_count: batch.len(),
-        timestamp: chrono::Utc::now(),
-        leaves_blob: Vec::new(),
-        seal_position: None,
-        leaves_format: None,
+        timestamp: sealed_at,
+        leaves_blob,
+        seal_position: Some(batch.len()), // seal is at index event_count
+        leaves_format: Some(LeavesFormat::Sha256Concat),
     };
 
-    let mut batch_record_data = serde_json::to_vec(&batch_record)?;
-    batch_record_data.push(b'\n');
+    // ─── Step 6: build anchor binding all three roots ───────────────
+    let anchor = GvmStateAnchor::seal(1, &seal, batch_root.clone());
 
-    // Single buffer: all events + batch record
+    // ─── Step 7: serialize all three records, single fsync ──────────
+    let mut seal_data = serde_json::to_vec(&seal)?;
+    seal_data.push(b'\n');
+    let mut batch_data = serde_json::to_vec(&batch_record)?;
+    batch_data.push(b'\n');
+    let mut anchor_data = serde_json::to_vec(&anchor)?;
+    anchor_data.push(b'\n');
+
     let event_len: usize = batch.iter().map(|r| r.data.len()).sum();
-    let mut buf = Vec::with_capacity(event_len + batch_record_data.len());
+    let mut buf =
+        Vec::with_capacity(event_len + seal_data.len() + batch_data.len() + anchor_data.len());
     for req in batch {
         buf.extend_from_slice(&req.data);
     }
-    buf.extend_from_slice(&batch_record_data);
+    buf.extend_from_slice(&seal_data);
+    buf.extend_from_slice(&batch_data);
+    buf.extend_from_slice(&anchor_data);
 
-    // Single write + single fsync for the entire batch (events + merkle record)
     file.write_all(&buf).await?;
     file.sync_data().await?;
 
-    Ok(merkle_root)
+    Ok(BatchFlushOutcome {
+        batch_root,
+        anchor_hash: anchor.anchor_hash,
+    })
 }
 
 /// Rotate the WAL file: rename current to `wal.log.<N>`, open a fresh file,
@@ -486,6 +622,41 @@ pub struct Ledger {
 }
 
 impl Ledger {
+    /// Phase 2: publish a new active integrity-context hash into the
+    /// triple-state. Called from `record_config_load` (after the
+    /// config_load event reaches the WAL) and from `api::reload_srr`
+    /// (after the in-memory SRR is swapped). The next batch's seal
+    /// captures this value as `context_hash`.
+    ///
+    /// Atomic: ArcSwap RCU loop. Concurrent `update_context_hash`
+    /// and `update_checkpoint_root` calls do not lose each other.
+    pub fn update_context_hash(&self, new_hash: String) {
+        self.wal.triple.rcu(|prev| TripleState {
+            context_hash: Some(new_hash.clone()),
+            checkpoint_root: prev.checkpoint_root.clone(),
+            last_anchor: prev.last_anchor.clone(),
+        });
+    }
+
+    /// Phase 2: publish a new global checkpoint aggregator root.
+    /// Called from `CheckpointAggregator::register` (Phase 3) once
+    /// the per-agent SMT update commits. Until Phase 3 ships,
+    /// callers leave this at `None` (the seal records `None`).
+    pub fn update_checkpoint_root(&self, new_root: Option<String>) {
+        self.wal.triple.rcu(|prev| TripleState {
+            context_hash: prev.context_hash.clone(),
+            checkpoint_root: new_root.clone(),
+            last_anchor: prev.last_anchor.clone(),
+        });
+    }
+
+    /// Phase 2: read the current triple-state snapshot. Wait-free
+    /// (single ArcSwap load). Useful for diagnostics; production
+    /// hot paths do not need to call this.
+    pub fn triple_snapshot(&self) -> Arc<TripleState> {
+        self.wal.triple.load_full()
+    }
+
     /// Initialize the ledger with WAL and NATS configuration.
     pub async fn new(wal_path: &Path, nats_url: &str, stream_name: &str) -> Result<Self> {
         Self::with_config(
@@ -701,11 +872,21 @@ impl Ledger {
         };
 
         self.append_durable(&event).await?;
+
+        // Phase 2 wiring: publish the new context_hash into the triple
+        // state so the NEXT batch's seal/anchor captures it. The current
+        // batch (which this config_load event is in) has ALREADY been
+        // sealed with the OLD context_hash — that is correct semantics
+        // per §4.7: the seal records "active context AT seal time".
+        // The new context becomes "active" only after this method
+        // returns successfully.
+        self.update_context_hash(context_hash.clone());
+
         tracing::info!(
             files = config_files.len(),
             context_hash = %context_hash,
             auth_type = "local",
-            "Integrity context recorded in Merkle chain"
+            "Integrity context recorded in Merkle chain (triple-state updated)"
         );
         Ok(context_hash)
     }

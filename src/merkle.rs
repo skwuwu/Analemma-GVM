@@ -293,8 +293,23 @@ pub struct VerificationReport {
 ///
 /// WAL format: each line is either a GVMEvent JSON or a MerkleBatchRecord JSON.
 /// Batch records are identified by the presence of a `merkle_root` field.
+///
+/// Phase 2 changes:
+///   - Seal records (BatchSealRecord) appear immediately before their
+///     batch record. Their seal_hash() is appended to the batch leaf
+///     list, so the recomputed root matches the stored merkle_root
+///     (which was computed over events + seal at write time).
+///   - Anchor records (GvmStateAnchor) appear immediately after their
+///     batch record. They are recognized but currently consumed only
+///     to advance past the line; full anchor-chain audit lives in
+///     `verify_anchor_chain` (Phase 2.5).
+///   - Legacy WAL entries (pre-Phase-2, no seal/anchor) continue to
+///     verify exactly as before — the leaf list is just events.
 pub fn verify_wal(wal_content: &str) -> VerificationReport {
+    use gvm_types::BatchSealRecord;
+
     let mut events_in_current_batch: Vec<String> = Vec::new();
+    let mut pending_seal_hash: Option<String> = None;
     let mut total_events = 0usize;
     let mut total_batches = 0usize;
     let mut valid_batches = 0usize;
@@ -310,9 +325,34 @@ pub fn verify_wal(wal_content: &str) -> VerificationReport {
             continue;
         }
 
-        // Try to parse as a batch record first (has merkle_root field)
+        // Phase 2: Anchor record — has anchor_hash. Skip; anchor-chain
+        // audit is verify_anchor_chain (Phase 2.5).
+        if trimmed.contains("\"anchor_hash\":")
+            && serde_json::from_str::<gvm_types::GvmStateAnchor>(trimmed).is_ok()
+        {
+            continue;
+        }
+
+        // Phase 2: Seal record — has seal_id + sealed_at + context_hash.
+        // Record its seal_hash so the next batch record's leaf list
+        // can include it as the last leaf (matching the writer).
+        if trimmed.contains("\"seal_id\":") && trimmed.contains("\"sealed_at\":") {
+            if let Ok(seal) = serde_json::from_str::<BatchSealRecord>(trimmed) {
+                pending_seal_hash = Some(hex::encode(seal.seal_hash()));
+                continue;
+            }
+        }
+
+        // Try to parse as a batch record (has merkle_root field)
         if let Ok(batch_record) = serde_json::from_str::<MerkleBatchRecord>(trimmed) {
             total_batches += 1;
+
+            // Phase 2: append seal_hash as the last leaf if a seal
+            // appeared before this batch record. Phase 1 (legacy)
+            // batches have no seal — leaf list is events only.
+            if let Some(seal_hash) = pending_seal_hash.take() {
+                events_in_current_batch.push(seal_hash);
+            }
 
             // Verify Merkle root
             if events_in_current_batch.is_empty() {
@@ -354,17 +394,12 @@ pub fn verify_wal(wal_content: &str) -> VerificationReport {
                     let computed = compute_event_hash(&event);
                     if computed != *hash {
                         // Event content was tampered — hash doesn't match.
-                        // Track the tampered event for the report.
                         tampered_events.push(event.event_id.clone());
                     }
-                    // Always use the stored hash for batch root verification.
-                    // This lets us distinguish "event content tampered but batch
-                    // root intact" from "batch root itself tampered".
                     events_in_current_batch.push(hash.clone());
                 }
                 None => {
                     // No stored hash (legacy event or IC-1 async record).
-                    // Compute hash on-the-fly so batch Merkle root stays correct.
                     unhashed_events.push(event.event_id.clone());
                     let computed = compute_event_hash(&event);
                     events_in_current_batch.push(computed);
