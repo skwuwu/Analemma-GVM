@@ -21,6 +21,8 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 - WebSocket proxy support
 - Overlayfs periodic scan (long-running agents): tokio timer → scan_upper_layer() at interval
 - Overlayfs inotify-based real-time scan (event-driven alternative to periodic)
+- **Audit Phase 5b — cross-rotation anchor recovery**: extend `scan_wal_for_recovery` to fall back to the highest-numbered `wal.log.<N>` segment when the active `wal.log` carries no anchor (rotation-then-shutdown corner case). Today recovery falls back to genesis in that window — true positive on the rule, false positive on the operator's situation.
+- **Audit Phase 4 — leaves-only checkpoint persistence**: snapshot the `CheckpointAggregator` `BTreeMap` to disk at shutdown (and periodically on a tokio timer), reload at `Ledger::with_config_and_signer` so `checkpoint_root` survives restart. Today the in-memory aggregator resets to empty on startup, leaving anchors with `checkpoint_root: None` until checkpoints re-register. Snapshot must itself hash into the next anchor (so a tampered snapshot file is detected at first batch).
 
 **v1.1 — Hardening**
 - SRR hot-path execution via Wasm engine
@@ -31,6 +33,9 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 - File permission check on `secrets.toml`
 - HMAC-signed checkpoint step
 - Configurable `MAX_CHECKPOINT_SIZE` / `MAX_HISTORY_TURNS` per agent
+- **Audit Phase 6b — HSM-backed anchor signing**: implement `verify_anchor_signature` for the `AnchorSignature::Hsm` variant. Backends to evaluate: PKCS#11 (YubiHSM, CloudHSM), Vault Transit, AWS KMS asymmetric. Trait already in place (`AnchorSigner`); only the Hsm verify path returns "not implemented" today.
+- **Audit Phase 6c — RFC 3161 TSA attestation**: implement `AnchorSignature::Tsa` end-to-end (signing layer fetches a TimeStampToken from a configured TSA, verifier validates the token chain). This is the only attestation variant that defeats clock rewind; SelfSigned alone proves "GVM produced this anchor" but not "by this wall-clock time." Cost amortization pattern: every Nth anchor TSA-attested, every anchor SelfSigned.
+- **Audit follow-up — `BatchSealRecord.checkpoint_root` integrity**: today the seal records the live aggregator root but NOT the per-leaf set, so a tampered checkpoint snapshot would change the root without leaving a witness in the WAL. Bind the leaf set hash (or a Merkle proof of the leaves) into the seal so the seal alone is sufficient to verify the aggregator state at seal time.
 
 **v2.0 — Runtime & Infrastructure**
 - Mandatory-by-default interception profile
