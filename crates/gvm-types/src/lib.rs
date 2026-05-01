@@ -1154,6 +1154,108 @@ impl GvmStateAnchor {
     }
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Phase 3: Checkpoint Aggregator (leaves-only Merkle root)
+// ────────────────────────────────────────────────────────────────────
+//
+// `compute_checkpoint_root` is the canonical aggregator: given a map of
+// (agent_id -> 32-byte checkpoint hash), produce a single 32-byte root
+// that is bound into `BatchSealRecord::checkpoint_root` and therefore
+// into the anchor.
+//
+// Design:
+//   - Last-write-wins per agent_id (the checkpoint hash IS the leaf).
+//   - Leaves are sorted by agent_id for canonical order; root is
+//     deterministic across insertion order.
+//   - Leaves-only: the aggregator stores ONLY the (agent_id, hash) pairs.
+//     The Merkle tree is recomputed on demand. This is intentional — a
+//     persistent SMT would dominate memory for long-running operators
+//     with many agents, and a one-shot recompute is fast (1k agents ≈
+//     well under 1ms on a modern CPU).
+//   - Domain-separation prefix `gvm-ckpt-v1:` so a future schema change
+//     produces a different root over the same inputs.
+//   - An empty aggregator produces `None` for the root (semantically:
+//     "no checkpoints registered yet"), letting the anchor record
+//     `checkpoint_root: None` until the first checkpoint registers.
+
+/// Domain-separation prefix for `compute_checkpoint_root`.
+pub const PREFIX_CKPT_V1: &[u8] = b"gvm-ckpt-v1:";
+/// Domain-separation prefix for the per-leaf hash inside the aggregator
+/// tree. Distinct from the root prefix so a leaf hash and a root hash
+/// over the same inputs cannot collide.
+pub const PREFIX_CKPT_LEAF_V1: &[u8] = b"gvm-ckpt-leaf-v1:";
+
+/// Compute the canonical aggregator root over `(agent_id, checkpoint_hash)`
+/// pairs. Returns `None` when the input is empty.
+///
+/// Canonicalization:
+///   1. Sort by `agent_id` (lexicographic, byte-wise on the UTF-8 bytes).
+///   2. For each pair, the leaf is
+///      `SHA256(PREFIX_CKPT_LEAF_V1 || len(agent_id) || agent_id || hash)`.
+///   3. Build a binary Merkle tree by pairwise hashing, duplicating the
+///      last leaf if the level is odd. The root is
+///      `SHA256(PREFIX_CKPT_V1 || node_root)` so the prefix wraps the
+///      whole tree (a leaf cannot be confused with a root).
+///
+/// This is intentionally a single function (no struct) so callers in
+/// gvm-proxy can hold the leaves in whatever container suits them
+/// (BTreeMap, HashMap, snapshot of an ArcSwap) and re-derive the root
+/// on demand.
+pub fn compute_checkpoint_root(leaves: &[(String, [u8; 32])]) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    if leaves.is_empty() {
+        return None;
+    }
+
+    // 1. Sort by agent_id for canonical order.
+    let mut sorted: Vec<&(String, [u8; 32])> = leaves.iter().collect();
+    sorted.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+
+    // 2. Hash each leaf with the leaf prefix.
+    let mut level: Vec<[u8; 32]> = sorted
+        .iter()
+        .map(|(agent_id, ckpt)| {
+            let mut h = Sha256::new();
+            h.update(PREFIX_CKPT_LEAF_V1);
+            let agent_bytes = agent_id.as_bytes();
+            h.update((agent_bytes.len() as u32).to_le_bytes());
+            h.update(agent_bytes);
+            h.update(ckpt);
+            let out: [u8; 32] = h.finalize().into();
+            out
+        })
+        .collect();
+
+    // 3. Build binary tree, duplicating the last node when the level is odd.
+    while level.len() > 1 {
+        let mut next: Vec<[u8; 32]> = Vec::with_capacity(level.len().div_ceil(2));
+        for pair in level.chunks(2) {
+            let mut h = Sha256::new();
+            h.update(pair[0]);
+            // Odd-tail duplication: hashes the last node with itself.
+            h.update(if pair.len() == 2 { pair[1] } else { pair[0] });
+            let out: [u8; 32] = h.finalize().into();
+            next.push(out);
+        }
+        level = next;
+    }
+
+    // 4. Wrap the tree root with the aggregator prefix so the final
+    //    output cannot be confused with an internal node hash.
+    let node_root = level[0];
+    let mut h = Sha256::new();
+    h.update(PREFIX_CKPT_V1);
+    h.update(node_root);
+    let out: [u8; 32] = h.finalize().into();
+    Some(out)
+}
+
+/// Hex form of `compute_checkpoint_root`. Convenience for ledger
+/// callers that store the root as a `String` in `TripleState`.
+pub fn compute_checkpoint_root_hex(leaves: &[(String, [u8; 32])]) -> Option<String> {
+    compute_checkpoint_root(leaves).map(hex::encode)
+}
+
 /// Serde helper for Vec<u8> as base64 in JSON.
 mod base64_bytes {
     use serde::{Deserialize, Deserializer, Serializer};

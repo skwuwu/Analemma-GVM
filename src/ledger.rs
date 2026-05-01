@@ -1,4 +1,5 @@
 use crate::merkle::compute_event_hash;
+use crate::sign::{AnchorSigner, NoopSigner};
 use crate::types::{
     BatchSealRecord, EventStatus, GVMEvent, GvmStateAnchor, LeavesFormat, MerkleBatchRecord,
 };
@@ -172,14 +173,34 @@ struct WAL {
     /// post-anchor) all go through `arc_swap::ArcSwap` so reads are
     /// wait-free and writers don't lose each other's updates.
     triple: Arc<arc_swap::ArcSwap<TripleState>>,
+    /// Phase 6: anchor signer. `NoopSigner` by default (no signature
+    /// produced); `SelfSignedSigner` (Ed25519) attaches a signature to
+    /// every anchor. The signer is owned by the batch task too — this
+    /// reference is held only so callers can configure the WAL with a
+    /// non-default signer at construction.
+    #[allow(dead_code)]
+    signer: Arc<dyn AnchorSigner>,
 }
 
 impl WAL {
-    async fn open(path: &Path, config: GroupCommitConfig) -> Result<Self> {
+    async fn open_with_signer(
+        path: &Path,
+        config: GroupCommitConfig,
+        signer: Arc<dyn AnchorSigner>,
+    ) -> Result<Self> {
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
+
+        // ─── Phase 5: scan WAL tail for anchor-chain continuity ───
+        // We extract the most recent (batch_id, batch_root, anchor_hash,
+        // context_hash) from the WAL so the next batch after restart
+        // links into the prior anchor chain instead of starting a new
+        // genesis. Without this, every restart created a chain break
+        // that `verify_anchor_chain` would correctly flag as a
+        // truncation signal — true positive vs. mundane restart noise.
+        let recovered = scan_wal_for_recovery(path).await;
 
         let file = tokio::fs::OpenOptions::new()
             .create(true)
@@ -190,8 +211,22 @@ impl WAL {
         let (tx, rx) = tokio::sync::mpsc::channel(config.channel_capacity);
         let inject_error = Arc::new(AtomicBool::new(false));
         let triple: Arc<arc_swap::ArcSwap<TripleState>> =
-            Arc::new(arc_swap::ArcSwap::from_pointee(TripleState::default()));
+            Arc::new(arc_swap::ArcSwap::from_pointee(TripleState {
+                context_hash: recovered.last_context_hash.clone(),
+                checkpoint_root: None,
+                last_anchor: recovered.last_anchor_hash.clone(),
+            }));
 
+        if recovered.last_anchor_hash.is_some() || recovered.last_batch_id.is_some() {
+            tracing::info!(
+                last_batch_id = ?recovered.last_batch_id,
+                last_anchor_short = recovered.last_anchor_hash.as_ref().map(|h| &h[..h.len().min(12)]).unwrap_or(""),
+                last_context_short = recovered.last_context_hash.as_ref().map(|h| &h[..h.len().min(12)]).unwrap_or(""),
+                "Phase 5 startup recovery — anchor chain continuity restored"
+            );
+        }
+
+        let signer_for_task = Arc::clone(&signer);
         let batch_task = tokio::spawn(batch_loop(
             rx,
             file,
@@ -199,6 +234,8 @@ impl WAL {
             inject_error.clone(),
             path.to_path_buf(),
             Arc::clone(&triple),
+            recovered,
+            signer_for_task,
         ));
 
         tracing::info!(path = %path.display(), "WAL opened (group commit + merkle + anchor)");
@@ -209,6 +246,7 @@ impl WAL {
             path: path.to_path_buf(),
             inject_error,
             triple,
+            signer,
         })
     }
 
@@ -243,6 +281,89 @@ impl WAL {
     }
 }
 
+/// State recovered from the WAL tail at startup so the anchor chain
+/// continues across restarts (Phase 5). Genuine "fresh start" leaves
+/// every field `None` / `0` and the next batch begins at genesis.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct WalRecoveryState {
+    /// Highest `batch_id` observed in any MerkleBatchRecord. The next
+    /// batch starts at `last_batch_id + 1` so batch_id is monotonic
+    /// across restarts (verify_anchor_chain would otherwise flag a
+    /// duplicate or skip).
+    pub last_batch_id: Option<u64>,
+    /// Most recent `merkle_root` written. Becomes the new batch's
+    /// `prev_batch_root` so the inter-batch chain links across the
+    /// restart boundary.
+    pub last_batch_root: Option<String>,
+    /// Most recent `anchor_hash`. Seeds `triple.last_anchor` so the
+    /// next batch's seal binds to the prior anchor instead of `None`
+    /// (genesis-misuse signal).
+    pub last_anchor_hash: Option<String>,
+    /// Most recent `context_hash` from a config_load event's embedded
+    /// integrity context. Seeds `triple.context_hash` so behavioral
+    /// events between restart and the first new config_load are
+    /// sealed under the active config that was live before shutdown.
+    pub last_context_hash: Option<String>,
+}
+
+/// Walk the WAL forward, retaining the LAST occurrence of each
+/// recovery field. Forward iteration is intentional: the tail of an
+/// append-only WAL is exactly the latest value, and forward scanning
+/// avoids the line-boundary ambiguity that backward seeking on a
+/// large WAL would introduce.
+///
+/// On any I/O or parse error the function returns whatever it has
+/// gathered so far — a partially recovered chain is strictly better
+/// than a forced genesis after every restart.
+async fn scan_wal_for_recovery(path: &Path) -> WalRecoveryState {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(b) => b,
+        Err(_) => return WalRecoveryState::default(),
+    };
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(s) => s,
+        Err(_) => return WalRecoveryState::default(),
+    };
+
+    let mut state = WalRecoveryState::default();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // GvmStateAnchor — the canonical chain head record.
+        if trimmed.contains("\"anchor_hash\"") && trimmed.contains("\"batch_root\"") {
+            if let Ok(anchor) = serde_json::from_str::<gvm_types::GvmStateAnchor>(trimmed) {
+                state.last_anchor_hash = Some(anchor.anchor_hash);
+                continue;
+            }
+        }
+        // MerkleBatchRecord — independent confirmation of batch_id /
+        // batch_root, and the only line that carries them when an anchor
+        // line happens to be malformed.
+        if trimmed.contains("\"merkle_root\"") && trimmed.contains("\"batch_id\"") {
+            if let Ok(rec) = serde_json::from_str::<gvm_types::MerkleBatchRecord>(trimmed) {
+                state.last_batch_id = Some(rec.batch_id);
+                state.last_batch_root = Some(rec.merkle_root);
+                continue;
+            }
+        }
+        // config_load event — extract the active context_hash.
+        // Match conservatively to avoid accidentally parsing every line
+        // as a GVMEvent on hot startup paths.
+        if trimmed.contains("\"gvm.system.config_load\"") {
+            if let Ok(event) = serde_json::from_str::<GVMEvent>(trimmed) {
+                if let Some(ref ctx_ref) = event.config_integrity_ref {
+                    state.last_context_hash = Some(ctx_ref.clone());
+                }
+            }
+        }
+    }
+
+    state
+}
+
 /// Background batch task: collects writes, flushes in batches, single fsync per batch.
 ///
 /// Phase 2 wiring: every batch flush now produces THREE additional WAL
@@ -258,6 +379,10 @@ impl WAL {
 /// captures system state at the close moment; per-event refs may
 /// differ (handler-time vs seal-time race is documented behavior).
 ///
+/// Phase 5: when `recovered` carries values from a prior session, the
+/// task seeds `batch_id` and `prev_batch_root` so the first new batch
+/// links into the prior anchor chain.
+///
 /// Handles size-based rotation when the WAL file exceeds `max_wal_bytes`.
 async fn batch_loop(
     mut rx: tokio::sync::mpsc::Receiver<GroupCommitRequest>,
@@ -266,10 +391,12 @@ async fn batch_loop(
     inject_error: Arc<AtomicBool>,
     wal_path: PathBuf,
     triple: Arc<arc_swap::ArcSwap<TripleState>>,
+    recovered: WalRecoveryState,
+    signer: Arc<dyn AnchorSigner>,
 ) {
     let mut batch: Vec<GroupCommitRequest> = Vec::with_capacity(config.max_batch_size);
-    let mut batch_id: u64 = 0;
-    let mut prev_batch_root: Option<String> = None;
+    let mut batch_id: u64 = recovered.last_batch_id.map(|n| n + 1).unwrap_or(0);
+    let mut prev_batch_root: Option<String> = recovered.last_batch_root.clone();
     let mut bytes_written: u64 = file.metadata().await.map(|m| m.len()).unwrap_or(0);
 
     loop {
@@ -286,6 +413,7 @@ async fn batch_loop(
                         batch_id,
                         &prev_batch_root,
                         &triple,
+                        signer.as_ref(),
                     )
                     .await;
                     if let Ok(ref outcome) = result {
@@ -335,7 +463,15 @@ async fn batch_loop(
         let result = if inject_error.load(Ordering::Relaxed) {
             Err(anyhow!("WAL I/O error (injected for testing)"))
         } else {
-            flush_batch_with_anchor(&mut file, &batch, batch_id, &prev_batch_root, &triple).await
+            flush_batch_with_anchor(
+                &mut file,
+                &batch,
+                batch_id,
+                &prev_batch_root,
+                &triple,
+                signer.as_ref(),
+            )
+            .await
         };
 
         // Update batch chain state on success
@@ -422,6 +558,7 @@ async fn flush_batch_with_anchor(
     batch_id: u64,
     prev_batch_root: &Option<String>,
     triple: &Arc<arc_swap::ArcSwap<TripleState>>,
+    signer: &dyn AnchorSigner,
 ) -> Result<BatchFlushOutcome> {
     // ─── Step 1: snapshot the triple state — single ArcSwap load ───
     // §4.7: this is the "point-of-witness" observation. Per-event
@@ -479,7 +616,14 @@ async fn flush_batch_with_anchor(
     };
 
     // ─── Step 6: build anchor binding all three roots ───────────────
-    let anchor = GvmStateAnchor::seal(1, &seal, batch_root.clone());
+    let mut anchor = GvmStateAnchor::seal(1, &seal, batch_root.clone());
+
+    // ─── Step 6b: Phase 6 — sign anchor_hash if a signer is wired ──
+    let anchor_hash_bytes: [u8; 32] = hex::decode(&anchor.anchor_hash)
+        .map_err(|e| anyhow!("anchor_hash hex decode failed: {}", e))?
+        .try_into()
+        .map_err(|_| anyhow!("anchor_hash must decode to 32 bytes"))?;
+    anchor.signature = signer.sign(&anchor_hash_bytes);
 
     // ─── Step 7: serialize all three records, single fsync ──────────
     let mut seal_data = serde_json::to_vec(&seal)?;
@@ -675,7 +819,29 @@ impl Ledger {
         stream_name: &str,
         config: GroupCommitConfig,
     ) -> Result<Self> {
-        let wal = WAL::open(wal_path, config).await?;
+        Self::with_config_and_signer(
+            wal_path,
+            nats_url,
+            stream_name,
+            config,
+            Arc::new(NoopSigner),
+        )
+        .await
+    }
+
+    /// Phase 6: initialize the ledger with a custom anchor signer.
+    /// Operators who want every anchor signed (Ed25519 self-signed,
+    /// HSM-backed, or TSA-attested) wire their signer here. The signer
+    /// is invoked from inside the batch task; production paths must
+    /// not block (the trait method is sync-by-design).
+    pub async fn with_config_and_signer(
+        wal_path: &Path,
+        nats_url: &str,
+        stream_name: &str,
+        config: GroupCommitConfig,
+        signer: Arc<dyn AnchorSigner>,
+    ) -> Result<Self> {
+        let wal = WAL::open_with_signer(wal_path, config, signer).await?;
 
         // Emergency WAL path: same directory, separate file
         let emergency_path = wal_path.with_file_name("wal_emergency.log");

@@ -52,6 +52,104 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
+### 2026-05-02: Phase 3 + Phase 5 + Phase 6 — checkpoint aggregator, startup recovery, anchor signing
+
+**What changed:**
+
+Three pieces of finality infrastructure ship together because each one
+addresses a gap that would have shown up under the others' tests if
+delivered in isolation.
+
+- **Phase 3 — Checkpoint aggregator (leaves-only).** A new
+  `CheckpointAggregator` lets agents register `(agent_id, [u8; 32])`
+  checkpoint hashes; the aggregator computes the canonical Merkle root
+  via `gvm_types::compute_checkpoint_root` and publishes it into the
+  ledger's `TripleState::checkpoint_root` so the next batch's seal /
+  anchor binds the live aggregator state. Last-write-wins per agent.
+  No persistent SMT — the root is recomputed in-memory on every
+  `register` (well under 1 ms for thousands of agents). Domain prefix
+  `gvm-ckpt-v1:` for the root, `gvm-ckpt-leaf-v1:` for each leaf so a
+  leaf hash and a root hash over the same input cannot collide.
+
+- **Phase 5 — Startup recovery of the anchor chain.** `WAL::open` now
+  scans the existing WAL forward and seeds `(last_batch_id,
+  last_batch_root, last_anchor_hash, last_context_hash)` so the first
+  batch after restart links into the prior chain instead of being a
+  fresh genesis. Without this, every restart looked like a truncation
+  break to `verify_anchor_chain` (true positive on the rule, false
+  positive on the operator's actual situation). Malformed lines are
+  skipped — a bad WAL falls back safely to genesis rather than
+  bricking the proxy.
+
+- **Phase 6 — Anchor signing scaffolding.** New `AnchorSigner` trait
+  with three concrete impls: `NoopSigner` (default, leaves
+  `signature: None`), `SelfSignedSigner` (Ed25519 keypair owned by
+  the proxy), and the existing `AnchorSignature::Hsm` / `Tsa` enum
+  variants reserved for HSM and RFC 3161 TSA backends in a future
+  iteration. The batch task signs every anchor's `anchor_hash` after
+  `GvmStateAnchor::seal()` and before serialization. A separate
+  `verify_anchor_signature` function lets an external auditor verify
+  using only a `VerifyingKey` from a registry — they never see the
+  signing key.
+
+**Files affected:**
+
+- `crates/gvm-types/src/lib.rs`: `compute_checkpoint_root`,
+  `compute_checkpoint_root_hex`, `PREFIX_CKPT_V1`,
+  `PREFIX_CKPT_LEAF_V1`.
+- `src/checkpoint.rs` (NEW): `CheckpointAggregator` (live aggregator
+  with `register` / `current_root_hex` / `entry_count`).
+- `src/sign.rs` (NEW): `AnchorSigner` trait, `NoopSigner`,
+  `SelfSignedSigner`, `verify_anchor_signature`.
+- `src/ledger.rs`: `WalRecoveryState`, `scan_wal_for_recovery`,
+  `WAL::open_with_signer`, `Ledger::with_config_and_signer`. Batch
+  task now applies the signer after `GvmStateAnchor::seal()` and
+  seeds `batch_id` / `prev_batch_root` from recovery.
+- `Cargo.toml`: `ed25519-dalek = "2"`.
+- `tests/checkpoint_aggregator.rs` (NEW, 10 tests): pure aggregator
+  invariants (empty / single / determinism / order-independence /
+  collision resistance) + live aggregator wiring (publishes root
+  into triple state, last-write-wins per agent, end-to-end binding
+  into next anchor).
+- `tests/anchor_chain_recovery.rs` (NEW, 7 tests): fresh WAL
+  starts at genesis, restart recovers last anchor / batch_root /
+  context_hash, cross-session chain passes `verify_anchor_chain`,
+  malformed WAL falls back to genesis safely, recovered chain with
+  a real break is still caught.
+- `tests/anchor_signing.rs` (NEW, 7 tests): default ledger uses
+  NoopSigner, explicit NoopSigner matches default, self-signed
+  ledger writes verifiable signatures, signature does not verify
+  under unrelated key, tampered anchor_hash breaks signature
+  verification, audit reports `signed_anchor_count` correctly for
+  both signed and unsigned WALs.
+
+**Why:**
+
+- Phase 3 closes the gap where `checkpoint_root` was always `None` in
+  every anchor — the field was reserved but never populated. Operators
+  running multi-agent workloads now get a per-batch attestation of the
+  global checkpoint state.
+- Phase 5 closes the false-positive that would have made
+  `verify_anchor_chain` (Phase 2.5) noisy in production: every restart
+  looked like a chain truncation. Now the chain is genuinely
+  contiguous across restarts, so any flagged break is real.
+- Phase 6 is the attestation foundation. `SelfSignedSigner` proves
+  "GVM produced this anchor"; `Tsa` (future) defeats clock rewind by
+  binding the anchor to an external time source. The trait shape
+  lets HSM/TSA slot in without rewriting the batch task.
+
+**Risk:**
+
+- Low. NoopSigner is the default, so existing operators see no
+  behavior change. Recovery falls back to genesis on any parse
+  error, so a corrupted WAL cannot brick startup.
+- Phase 5 changes batch_id semantics from "starts at 0 every
+  restart" to "monotonic across restarts." Anything that relied on
+  batch_id resetting (no production callers do) would notice.
+
+**Tests:** 676 passed, 0 failed (+24 from this phase). Total split
+across 50+ test files; no regressions.
+
 ### 2026-05-01: Phase 1.B + Phase 2.5 — descriptor migration + anchor-chain audit
 
 **What changed:**

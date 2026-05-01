@@ -65,6 +65,7 @@ moka = { version = "0.12", features = ["sync"] }
 rustls-pemfile = "2"
 webpki-roots = "0.26"
 time = "0.3"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 [features]
 default = []

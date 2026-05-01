@@ -4,6 +4,7 @@
 pub mod api;
 pub mod api_keys;
 pub mod auth;
+pub mod checkpoint;
 pub mod config;
 pub mod dns_governance;
 pub mod enforcement;
@@ -13,6 +14,7 @@ pub mod llm_trace;
 pub mod merkle;
 pub mod operation;
 pub mod proxy;
+pub mod sign;
 pub mod srr;
 pub mod tls_proxy;
 pub mod tls_proxy_hyper;
