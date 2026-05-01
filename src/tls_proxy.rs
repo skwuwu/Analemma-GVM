@@ -544,7 +544,7 @@ pub async fn append_enforcement_event(
         llm_trace: None,
         default_caution,
         config_integrity_ref: None,
-        operation_descriptor: None,
+        operation_descriptor: Some(crate::operation::http(&req.method, &req.path)),
     };
     if let Err(e) = ledger.append_durable(&event).await {
         tracing::error!(error = %e, decision = %decision_str, "MITM: enforcement WAL append FAILED");
@@ -719,7 +719,7 @@ async fn handle_mitm_stream_legacy<S: tokio::io::AsyncRead + tokio::io::AsyncWri
                     llm_trace: None,
                     default_caution: false,
                     config_integrity_ref: None,
-                    operation_descriptor: None,
+                    operation_descriptor: Some(crate::operation::http(&req.method, &req.path)),
                 };
                 let _ = state.ledger.append_durable(&fail_event).await;
                 break;
@@ -864,7 +864,10 @@ async fn handle_mitm_stream_legacy<S: tokio::io::AsyncRead + tokio::io::AsyncWri
                     llm_trace: None,
                     default_caution: is_default_caution,
                     config_integrity_ref: None,
-                    operation_descriptor: None,
+                    operation_descriptor: Some(crate::operation::ws_upgrade(
+                        &req.method,
+                        &req.path,
+                    )),
                 };
                 state.ledger.append_durable(&event).await.ok();
             }
@@ -966,7 +969,7 @@ async fn handle_mitm_stream_legacy<S: tokio::io::AsyncRead + tokio::io::AsyncWri
                 llm_trace: None,
                 default_caution: is_default_caution,
                 config_integrity_ref: None,
-                operation_descriptor: None,
+                operation_descriptor: Some(crate::operation::http(&req.method, &req.path)),
             };
             match state.ledger.append_durable(&event).await {
                 Ok(()) => tracing::info!(host = %host, path = %req.path, "MITM WAL event recorded"),
@@ -1042,7 +1045,7 @@ async fn handle_mitm_stream_legacy<S: tokio::io::AsyncRead + tokio::io::AsyncWri
                 llm_trace: None,
                 default_caution: is_default_caution,
                 config_integrity_ref: None,
-                operation_descriptor: None,
+                operation_descriptor: Some(crate::operation::http(&req.method, &req.path)),
             };
             state.ledger.append_durable(&fail_event).await.ok();
             break;

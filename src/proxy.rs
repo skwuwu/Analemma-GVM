@@ -1370,7 +1370,7 @@ fn append_proxy_wal_event(
         llm_trace: None,
         default_caution: false,
         config_integrity_ref: state.current_integrity_ref(),
-        operation_descriptor: None,
+        operation_descriptor: Some(crate::operation::http(method, path)),
     };
     // Spawn background task for durable WAL write. Called from a sync
     // context (middleware/panic handler) where we cannot .await directly.
@@ -1625,7 +1625,7 @@ async fn handle_connect_inner(
                 llm_trace: None,
                 default_caution: false,
                 config_integrity_ref: state.current_integrity_ref(),
-                operation_descriptor: None,
+                operation_descriptor: Some(crate::operation::connect(host)),
                 tenant_id: None,
                 parent_event_id: None,
                 session_id: String::new(),
@@ -1679,7 +1679,7 @@ async fn handle_connect_inner(
         llm_trace: None,
         default_caution: srr_result_catch_all,
         config_integrity_ref: state.current_integrity_ref(),
-        operation_descriptor: None,
+        operation_descriptor: Some(crate::operation::connect(host)),
         tenant_id: None,
         parent_event_id: None,
         session_id: String::new(),

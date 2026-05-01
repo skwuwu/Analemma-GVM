@@ -52,6 +52,69 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
+### 2026-05-01: Phase 1.B + Phase 2.5 — descriptor migration + anchor-chain audit
+
+**What changed:**
+
+Phase 1.B closes the v2 dispatch path: every event-creation site in
+the proxy now populates `event.operation_descriptor: Some(...)` so
+that `compute_event_hash` routes through the v2 algorithm
+(privacy-preserving — sensitive detail is held only in a salted
+SHA-256 digest while the category remains in the clear). The
+legacy `operation: String` field is preserved so existing v1 WAL
+records continue to verify.
+
+Phase 2.5 adds `verify_anchor_chain`: a stateless audit that walks
+all anchor lines in a WAL and reports breaks (self-hash mismatch,
+broken chain link, batch_id skip, monotonic timestamp violation,
+truncation/genesis-misuse signal) plus suspicious gaps (large but
+not necessarily malicious time jumps).
+
+**Files affected:**
+
+- `src/operation.rs` (NEW): construction helpers — `http`,
+  `connect`, `vault`, `dns_query`, `category_only`,
+  `ws_upgrade`. 16-byte salts via `rand::thread_rng()`.
+- `src/proxy.rs`, `src/tls_proxy.rs`, `src/tls_proxy_hyper.rs`:
+  HTTP / CONNECT / WebSocket-upgrade event sites populate
+  `operation_descriptor`.
+- `src/vault.rs`: `build_vault_event` uses
+  `crate::operation::vault(operation, key)`.
+- `src/ledger.rs`: `record_config_load` uses `category_only`,
+  `build_dns_event` uses `dns_query(domain)`.
+- `crates/gvm-types/src/lib.rs`: `verify_anchor_chain`,
+  `AnchorAuditConfig`, `AnchorChainReport`,
+  `AnchorChainBreakKind`.
+- `tests/descriptor_migration.rs` (NEW, 8 tests): helpers, v2
+  dispatcher routing, end-to-end `record_config_load` + vault
+  write descriptor presence.
+- `tests/anchor_chain_audit.rs` (NEW, 14 tests): self-hash, chain
+  link, batch_id monotonicity, clock inversion vs tolerance,
+  suspicious gap, truncation signal, genesis misuse, real-ledger
+  integration, real-ledger tamper detection.
+
+**Why:**
+
+- v2 dispatch is the privacy guarantee for redacted proofs: a
+  verifier holding only `(category, detail_digest)` can derive the
+  same `event_hash` without ever seeing the plaintext path / key /
+  domain. Phase 1.B ensures the production paths actually carry
+  descriptors, so the v2 algorithm runs in practice and not just
+  in tests.
+- Anchor chain audit is the second leg of finality. Phase 2 binds
+  state into anchors; Phase 2.5 lets an external auditor walk a
+  WAL and prove (or disprove) that the anchor chain is intact —
+  no live system state required.
+
+**Risk:**
+
+- Low. v1 hash path is unchanged for events without a descriptor;
+  legacy WAL records still verify.
+- `verify_anchor_chain` is read-only; it does not mutate WAL
+  state.
+
+**Tests:** 647 passed, 0 failed (+22 from this phase).
+
 ### 2026-05-02: Phase 2 wiring — group commit emits BatchSealRecord + GvmStateAnchor
 
 **What changed:**

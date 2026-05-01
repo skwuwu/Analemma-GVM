@@ -278,7 +278,7 @@ async fn handle_request(
         llm_trace: None,
         default_caution: is_default_caution,
         config_integrity_ref: None,
-        operation_descriptor: None,
+        operation_descriptor: Some(crate::operation::http(&method, &path)),
     };
     match state.ledger.append_durable(&wal_event).await {
         Ok(()) => tracing::info!(host = %host, path = %path, "MITM WAL event recorded (Pending)"),

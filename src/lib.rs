@@ -11,6 +11,7 @@ pub mod intent_store;
 pub mod ledger;
 pub mod llm_trace;
 pub mod merkle;
+pub mod operation;
 pub mod proxy;
 pub mod srr;
 pub mod tls_proxy;

@@ -655,6 +655,237 @@ pub fn verify_integrity_chain(wal_path: &std::path::Path) -> IntegrityChainRepor
 }
 
 // ════════════════════════════════════════════════════════════════════
+// Phase 2.5 — Anchor chain audit
+// ════════════════════════════════════════════════════════════════════
+//
+// `verify_anchor_chain` walks every `GvmStateAnchor` record across
+// rotated WAL segments and audits four invariants:
+//
+//   1. Self-consistency: each anchor's `anchor_hash` recomputes from
+//      its other fields (catches in-place field tamper).
+//   2. Chain link: `anchor[N].prev_anchor == anchor[N-1].anchor_hash`
+//      (catches truncation, splice, or out-of-order reordering).
+//   3. Monotonic batch_id: anchor[N].batch_id == anchor[N-1].batch_id+1
+//      (catches batch deletion or insertion).
+//   4. Monotonic timestamp: anchor[N].timestamp >= anchor[N-1].timestamp
+//      (catches clock-rewind tampering, modulo a configurable skew
+//      tolerance).
+//
+// Genesis: the first anchor in a fresh installation has
+// `prev_anchor == None`. Per §4.8, the (None, None) form is accepted
+// as genuine genesis; (None, Some(_)) flags truncation evidence.
+//
+// Signature verification (Ed25519, HSM, TSA) is OUT OF SCOPE for v1
+// of `verify_anchor_chain` — it returns the count of signed anchors
+// for the caller to inspect, but does not invoke vendor-specific
+// verifiers. A signature-checking wrapper is a separate Phase 6
+// deliverable.
+
+/// Tunable thresholds for anchor-chain timing audits.
+#[derive(Clone, Debug)]
+pub struct AnchorAuditConfig {
+    /// Maximum acceptable wall-clock gap between consecutive anchors.
+    /// Anything larger is flagged as a `suspicious_gap` — operators
+    /// should investigate (proxy paused, clock skew, log tampering).
+    pub max_gap_secs: u64,
+    /// Allowed clock-skew tolerance for the monotonic-timestamp check.
+    /// `anchor[N].timestamp + skew_tolerance_secs >= anchor[N-1].timestamp`
+    /// is the gentleness applied to the "monotonic" rule.
+    pub skew_tolerance_secs: u64,
+}
+
+impl Default for AnchorAuditConfig {
+    fn default() -> Self {
+        Self {
+            // 1 hour: catches multi-hour service pauses but tolerates
+            // routine restarts. Operators with strict SLOs may shrink.
+            max_gap_secs: 3600,
+            // Allow 5 seconds of NTP skew. Anything larger is treated
+            // as monotonic violation.
+            skew_tolerance_secs: 5,
+        }
+    }
+}
+
+/// Report of `verify_anchor_chain`. Each violation list is empty when
+/// the corresponding invariant held across the entire WAL.
+#[derive(Debug, Default)]
+pub struct AnchorChainReport {
+    /// Total number of anchor records found across all segments.
+    pub total_anchors: usize,
+    /// Number of anchors whose `anchor_hash` self-recomputed correctly.
+    pub valid_self_hashes: usize,
+    /// Number of valid `prev_anchor` links (including genesis).
+    pub valid_chain_links: usize,
+    /// First batch_id where any audit invariant broke. `None` if all
+    /// audits passed across the full chain.
+    pub first_break: Option<u64>,
+    /// Pairs `(anchor.batch_id, prior.batch_id)` where anchor's
+    /// timestamp is more than `skew_tolerance_secs` BEFORE the prior's.
+    pub clock_inversions: Vec<(u64, u64)>,
+    /// Pairs `(anchor.batch_id, gap_secs)` where the wall-clock gap to
+    /// the prior anchor exceeds `max_gap_secs`.
+    pub suspicious_gaps: Vec<(u64, u64)>,
+    /// Pairs `(expected_batch_id, observed_batch_id)` where consecutive
+    /// anchors do not have batch_id differ by exactly 1.
+    pub batch_id_skips: Vec<(u64, u64)>,
+    /// Number of anchors carrying a `signature` (any variant).
+    /// `verify_anchor_chain` does NOT verify the cryptographic signature
+    /// — that is Phase 6. This count is informational.
+    pub signed_anchor_count: usize,
+}
+
+/// Walk the WAL and audit the anchor chain (Phase 2.5).
+///
+/// Reads every rotated segment in chronological order (oldest .1 →
+/// newest active), parses each line as `GvmStateAnchor`, and applies
+/// the four invariants documented above plus the genesis rule.
+///
+/// `cfg` controls timing tolerances. `AnchorAuditConfig::default()` is
+/// suitable for most operators (1-hour max gap, 5-second clock skew).
+///
+/// Returns an `AnchorChainReport` summarizing what was found. Callers
+/// inspecting `first_break.is_some()` know the chain is broken and
+/// must investigate the listed violation vectors.
+pub fn verify_anchor_chain(
+    wal_path: &std::path::Path,
+    cfg: &AnchorAuditConfig,
+) -> AnchorChainReport {
+    use std::io::BufRead;
+
+    // Same segment ordering as verify_integrity_chain.
+    let mut segments: Vec<std::path::PathBuf> = Vec::new();
+    let parent = wal_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let stem = wal_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("wal.log")
+        .to_string();
+    if let Ok(entries) = std::fs::read_dir(&parent) {
+        let mut numbered: Vec<(u64, std::path::PathBuf)> = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy().to_string();
+            if let Some(suffix) = name_str.strip_prefix(&format!("{}.", stem)) {
+                if let Ok(n) = suffix.parse::<u64>() {
+                    numbered.push((n, parent.join(&name_str)));
+                }
+            }
+        }
+        numbered.sort_by_key(|(n, _)| *n);
+        segments.extend(numbered.into_iter().map(|(_, p)| p));
+    }
+    segments.push(wal_path.to_path_buf());
+
+    let mut report = AnchorChainReport::default();
+    let mut prev: Option<GvmStateAnchor> = None;
+    let mut seen_first_anchor = false;
+
+    let record_break = |r: &mut AnchorChainReport, batch_id: u64| {
+        if r.first_break.is_none() {
+            r.first_break = Some(batch_id);
+        }
+    };
+
+    for seg_path in &segments {
+        let file = match std::fs::File::open(seg_path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let reader = std::io::BufReader::new(file);
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Cheap pre-filter: skip non-anchor lines fast. An anchor
+            // line MUST contain "anchor_hash" because every anchor
+            // serializes that field.
+            if !trimmed.contains("\"anchor_hash\"") {
+                continue;
+            }
+            let anchor: GvmStateAnchor = match serde_json::from_str(trimmed) {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+
+            report.total_anchors += 1;
+            if anchor.signature.is_some() {
+                report.signed_anchor_count += 1;
+            }
+
+            // (1) Self-hash check.
+            if anchor.verify_self_hash() {
+                report.valid_self_hashes += 1;
+            } else {
+                record_break(&mut report, anchor.batch_id);
+            }
+
+            // (2)/(3)/(4) Chain link, batch_id monotonic, timestamp.
+            match (&prev, &anchor.prev_anchor) {
+                (None, None) => {
+                    if !seen_first_anchor {
+                        // Genuine genesis. Accept once.
+                        report.valid_chain_links += 1;
+                    } else {
+                        // We already saw at least one anchor, but this
+                        // one claims genesis (prev_anchor=None). That
+                        // means a fresh chain spliced in — break.
+                        record_break(&mut report, anchor.batch_id);
+                    }
+                }
+                (None, Some(_)) => {
+                    // §4.8 strip-evasion guard: first observed anchor
+                    // claims a prior we cannot find — truncation.
+                    record_break(&mut report, anchor.batch_id);
+                }
+                (Some(p), Some(claimed)) if &p.anchor_hash == claimed => {
+                    report.valid_chain_links += 1;
+                    // Batch ID monotonic check.
+                    if anchor.batch_id != p.batch_id + 1 {
+                        report
+                            .batch_id_skips
+                            .push((p.batch_id + 1, anchor.batch_id));
+                        record_break(&mut report, anchor.batch_id);
+                    }
+                    // Timestamp monotonic check (with skew tolerance).
+                    let prev_ts = p.timestamp.timestamp();
+                    let curr_ts = anchor.timestamp.timestamp();
+                    if curr_ts + (cfg.skew_tolerance_secs as i64) < prev_ts {
+                        report.clock_inversions.push((anchor.batch_id, p.batch_id));
+                        record_break(&mut report, anchor.batch_id);
+                    }
+                    // Suspicious gap check.
+                    let gap = (curr_ts - prev_ts).max(0) as u64;
+                    if gap > cfg.max_gap_secs {
+                        report.suspicious_gaps.push((anchor.batch_id, gap));
+                    }
+                }
+                (Some(_), Some(_)) | (Some(_), None) => {
+                    // prev_anchor mismatch OR claimed None despite
+                    // a prior existing — chain broken.
+                    record_break(&mut report, anchor.batch_id);
+                }
+            }
+
+            seen_first_anchor = true;
+            prev = Some(anchor);
+        }
+    }
+
+    report
+}
+
+// ════════════════════════════════════════════════════════════════════
 // Phase 2 — State Anchor Foundation
 // ════════════════════════════════════════════════════════════════════
 //

@@ -868,7 +868,9 @@ impl Ledger {
             llm_trace: None,
             default_caution: false,
             config_integrity_ref: Some(context_hash.clone()),
-            operation_descriptor: None,
+            // config_load is category-only — the full operation name
+            // is itself the disclosure (no sensitive detail).
+            operation_descriptor: Some(crate::operation::category_only("gvm.system.config_load")),
         };
 
         self.append_durable(&event).await?;
@@ -987,7 +989,9 @@ pub fn build_dns_event(
         llm_trace: None,
         default_caution: true,
         config_integrity_ref: None,
-        operation_descriptor: None,
+        // The queried domain may include a sensitive subdomain (e.g.
+        // customer-12345.attacker.example) — treat as detail.
+        operation_descriptor: Some(crate::operation::dns_query(domain)),
     }
 }
 
