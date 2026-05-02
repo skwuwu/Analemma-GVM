@@ -122,7 +122,7 @@ async fn live_aggregator_publishes_root_into_triple_state() {
 
     // First register: triple state now has Some(root).
     let root1 = agg
-        .register("agent-1", [1u8; 32])
+        .register_agent_root("agent-1", [1u8; 32])
         .await
         .expect("register must succeed");
     let snap = ledger.triple_snapshot();
@@ -133,7 +133,7 @@ async fn live_aggregator_publishes_root_into_triple_state() {
     );
 
     // Adding a second agent updates the root (different content → different root).
-    let root2 = agg.register("agent-2", [2u8; 32]).await.unwrap();
+    let root2 = agg.register_agent_root("agent-2", [2u8; 32]).await.unwrap();
     assert_ne!(root1, root2, "adding a second agent must change root");
     let snap = ledger.triple_snapshot();
     assert_eq!(snap.checkpoint_root.as_deref(), Some(root2.as_str()));
@@ -155,11 +155,11 @@ async fn live_aggregator_last_write_wins_per_agent() {
 
     // Same agent, two checkpoints in succession. The second
     // overwrites the first; entry_count stays at 1.
-    agg.register("agent-1", [1u8; 32]).await.unwrap();
+    agg.register_agent_root("agent-1", [1u8; 32]).await.unwrap();
     let root_a = agg.current_root_hex().await.unwrap();
     assert_eq!(agg.entry_count().await, 1);
 
-    agg.register("agent-1", [99u8; 32]).await.unwrap();
+    agg.register_agent_root("agent-1", [99u8; 32]).await.unwrap();
     let root_b = agg.current_root_hex().await.unwrap();
     assert_eq!(
         agg.entry_count().await,
@@ -202,7 +202,10 @@ async fn checkpoint_root_appears_in_anchor_after_register() {
     let agg = CheckpointAggregator::new(Arc::clone(&ledger));
 
     // Register a checkpoint (publishes root into triple state).
-    let expected_root = agg.register("agent-1", [42u8; 32]).await.unwrap();
+    let expected_root = agg
+        .register_agent_root("agent-1", [42u8; 32])
+        .await
+        .unwrap();
 
     // Write an event so the next batch closes; the seal captures the
     // current triple state, including our checkpoint_root.

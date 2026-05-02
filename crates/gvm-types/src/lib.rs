@@ -1315,6 +1315,25 @@ pub const PREFIX_CKPT_V1: &[u8] = b"gvm-ckpt-v1:";
 /// over the same inputs cannot collide.
 pub const PREFIX_CKPT_LEAF_V1: &[u8] = b"gvm-ckpt-leaf-v1:";
 
+/// Domain-separation prefix for per-step leaf hash in the per-agent
+/// checkpoint tree (Phase 3 enhancement). The leaf is
+/// `SHA256(PREFIX_CKPT_AGENT_LEAF_V1 || u32_le(step) || hash)` —
+/// the step is part of the leaf input so re-using the same hash
+/// at a different step produces a different leaf.
+pub const PREFIX_CKPT_AGENT_LEAF_V1: &[u8] = b"gvm-ckpt-agent-leaf-v1:";
+
+/// Domain-separation prefix for internal nodes in the per-agent
+/// checkpoint tree. Distinct from the global aggregator's node prefix
+/// so leaf/internal/root hashes from the agent tree never collide
+/// with the global tree.
+pub const PREFIX_CKPT_AGENT_NODE_V1: &[u8] = b"gvm-ckpt-agent-node-v1:";
+
+/// Domain-separation prefix for the *root wrapper* of a per-agent
+/// checkpoint tree. The output of `compute_agent_checkpoint_root` is
+/// `SHA256(PREFIX_CKPT_AGENT_ROOT_V1 || node_root)` so the agent root
+/// cannot collide with an internal node hash.
+pub const PREFIX_CKPT_AGENT_ROOT_V1: &[u8] = b"gvm-ckpt-agent-root-v1:";
+
 /// Compute the canonical aggregator root over `(agent_id, checkpoint_hash)`
 /// pairs. Returns `None` when the input is empty.
 ///
@@ -1384,6 +1403,295 @@ pub fn compute_checkpoint_root(leaves: &[(String, [u8; 32])]) -> Option<[u8; 32]
 /// callers that store the root as a `String` in `TripleState`.
 pub fn compute_checkpoint_root_hex(leaves: &[(String, [u8; 32])]) -> Option<String> {
     compute_checkpoint_root(leaves).map(hex::encode)
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Phase 3 (full) — per-agent per-step checkpoint tree
+// ════════════════════════════════════════════════════════════════════
+//
+// Each agent owns its own tree keyed by `step: u32`. The leaf is a
+// SHA-256 commitment over `(step, checkpoint_hash)` so re-using the
+// same hash at a different step yields a different leaf. The agent
+// root is computed by sorting leaves by step (ascending) and folding
+// pairwise with `gvm-ckpt-agent-node-v1:` prefix, then wrapping with
+// `gvm-ckpt-agent-root-v1:`.
+//
+// The global aggregator builds its leaves over `(agent_id, agent_root)`
+// using the existing `compute_checkpoint_root` (which uses
+// `gvm-ckpt-v1:` and `gvm-ckpt-leaf-v1:` prefixes). The two trees are
+// hash-domain-disjoint by prefix discipline.
+//
+// Inclusion proofs:
+//   - `agent_checkpoint_proof(leaves, step)` returns the path that
+//     fold to a per-agent ROOT (after the `gvm-ckpt-agent-root-v1:`
+//     wrap is applied externally).
+//   - `verify_agent_checkpoint_proof(leaf_hash, path, expected_root)`
+//     applies the wrap and compares.
+
+/// Compute a per-agent leaf hash. The `step` is part of the leaf
+/// input so the same checkpoint hash at a different step is a
+/// different leaf — necessary for per-step inclusion proofs.
+pub fn compute_agent_checkpoint_leaf(step: u32, hash: &[u8; 32]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(PREFIX_CKPT_AGENT_LEAF_V1);
+    h.update(step.to_le_bytes());
+    h.update(hash);
+    h.finalize().into()
+}
+
+/// Compute the root of a per-agent checkpoint tree from a sorted-by-step
+/// `BTreeMap<u32, [u8;32]>`. Returns `None` for an empty map.
+///
+/// Algorithm:
+///   1. Hash each leaf with `compute_agent_checkpoint_leaf(step, hash)`.
+///   2. Pairwise fold with `gvm-ckpt-agent-node-v1:` prefix (odd-tail
+///      duplicates the last leaf — Bitcoin convention).
+///   3. Wrap the final node with `gvm-ckpt-agent-root-v1:`.
+///
+/// Order is determined by the BTreeMap iteration (ascending step), so
+/// the same content always produces the same root.
+pub fn compute_agent_checkpoint_root(
+    leaves: &std::collections::BTreeMap<u32, [u8; 32]>,
+) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    if leaves.is_empty() {
+        return None;
+    }
+    let mut level: Vec<[u8; 32]> = leaves
+        .iter()
+        .map(|(step, hash)| compute_agent_checkpoint_leaf(*step, hash))
+        .collect();
+    while level.len() > 1 {
+        let mut next: Vec<[u8; 32]> = Vec::with_capacity(level.len().div_ceil(2));
+        for pair in level.chunks(2) {
+            let mut h = Sha256::new();
+            h.update(PREFIX_CKPT_AGENT_NODE_V1);
+            h.update(pair[0]);
+            h.update(if pair.len() == 2 { pair[1] } else { pair[0] });
+            let out: [u8; 32] = h.finalize().into();
+            next.push(out);
+        }
+        level = next;
+    }
+    let node_root = level[0];
+    let mut h = Sha256::new();
+    h.update(PREFIX_CKPT_AGENT_ROOT_V1);
+    h.update(node_root);
+    Some(h.finalize().into())
+}
+
+/// Hex form of `compute_agent_checkpoint_root`.
+pub fn compute_agent_checkpoint_root_hex(
+    leaves: &std::collections::BTreeMap<u32, [u8; 32]>,
+) -> Option<String> {
+    compute_agent_checkpoint_root(leaves).map(hex::encode)
+}
+
+/// Generate an inclusion proof for `step` in the per-agent tree.
+/// Returns the leaf hash + a sequence of `(sibling_hex, is_right)`
+/// pairs from leaf up to the inner node root (the wrap step is
+/// applied separately by the verifier).
+///
+/// `None` if `step` is not present in `leaves`.
+pub fn agent_checkpoint_proof(
+    leaves: &std::collections::BTreeMap<u32, [u8; 32]>,
+    step: u32,
+) -> Option<(String, Vec<(String, bool)>)> {
+    use sha2::{Digest, Sha256};
+    let mut level: Vec<[u8; 32]> = leaves
+        .iter()
+        .map(|(s, h)| compute_agent_checkpoint_leaf(*s, h))
+        .collect();
+    if level.is_empty() {
+        return None;
+    }
+
+    // Find the index of the requested step in BTreeMap iteration order.
+    let mut idx = leaves.keys().position(|s| *s == step)?;
+    let leaf_hex = hex::encode(level[idx]);
+
+    let mut path: Vec<(String, bool)> = Vec::new();
+    while level.len() > 1 {
+        if level.len() % 2 == 1 {
+            let last = level[level.len() - 1];
+            level.push(last);
+        }
+        let sibling_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
+        let is_right = idx % 2 == 0;
+        path.push((hex::encode(level[sibling_idx]), is_right));
+
+        let mut next: Vec<[u8; 32]> = Vec::with_capacity(level.len() / 2);
+        for pair in level.chunks(2) {
+            let mut h = Sha256::new();
+            h.update(PREFIX_CKPT_AGENT_NODE_V1);
+            h.update(pair[0]);
+            h.update(pair[1]);
+            next.push(h.finalize().into());
+        }
+        level = next;
+        idx /= 2;
+    }
+    Some((leaf_hex, path))
+}
+
+/// Verify an inclusion proof for a per-agent checkpoint tree against
+/// the expected wrapped root. Mirrors the `compute_agent_checkpoint_root`
+/// wrap step at the end.
+pub fn verify_agent_checkpoint_proof(
+    leaf_hex: &str,
+    path: &[(String, bool)],
+    expected_root_hex: &str,
+) -> bool {
+    use sha2::{Digest, Sha256};
+    let mut current: [u8; 32] = match hex::decode(leaf_hex)
+        .ok()
+        .and_then(|v| v.try_into().ok())
+    {
+        Some(b) => b,
+        None => return false,
+    };
+    for (sibling_hex, is_right) in path {
+        let sibling: [u8; 32] = match hex::decode(sibling_hex)
+            .ok()
+            .and_then(|v| v.try_into().ok())
+        {
+            Some(b) => b,
+            None => return false,
+        };
+        let mut h = Sha256::new();
+        h.update(PREFIX_CKPT_AGENT_NODE_V1);
+        if *is_right {
+            h.update(current);
+            h.update(sibling);
+        } else {
+            h.update(sibling);
+            h.update(current);
+        }
+        current = h.finalize().into();
+    }
+    // Wrap step.
+    let mut h = Sha256::new();
+    h.update(PREFIX_CKPT_AGENT_ROOT_V1);
+    h.update(current);
+    let wrapped: [u8; 32] = h.finalize().into();
+    hex::encode(wrapped) == expected_root_hex
+}
+
+/// Generate an inclusion proof for `agent_id` in the global aggregator.
+/// Returns the leaf hex + sibling-path. The leaf encoding uses
+/// `compute_checkpoint_root`'s leaf prefix
+/// (`gvm-ckpt-leaf-v1:` over `(len, agent_id, agent_root_bytes)`).
+/// Path walks up through `gvm-node` style internal nodes, then the
+/// final `gvm-ckpt-v1:` wrap is applied by the verifier.
+pub fn aggregator_inclusion_proof(
+    leaves: &[(String, [u8; 32])],
+    agent_id: &str,
+) -> Option<(String, Vec<(String, bool)>)> {
+    use sha2::{Digest, Sha256};
+    if leaves.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<(String, [u8; 32])> = leaves.to_vec();
+    sorted.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+
+    // Leaf hashes and the index of agent_id.
+    let mut level: Vec<[u8; 32]> = sorted
+        .iter()
+        .map(|(id, root)| {
+            let mut h = Sha256::new();
+            h.update(PREFIX_CKPT_LEAF_V1);
+            let id_bytes = id.as_bytes();
+            h.update((id_bytes.len() as u32).to_le_bytes());
+            h.update(id_bytes);
+            h.update(root);
+            h.finalize().into()
+        })
+        .collect();
+    let mut idx = sorted.iter().position(|(id, _)| id == agent_id)?;
+    let leaf_hex = hex::encode(level[idx]);
+
+    let mut path: Vec<(String, bool)> = Vec::new();
+    while level.len() > 1 {
+        if level.len() % 2 == 1 {
+            let last = level[level.len() - 1];
+            level.push(last);
+        }
+        let sibling_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
+        let is_right = idx % 2 == 0;
+        path.push((hex::encode(level[sibling_idx]), is_right));
+
+        let mut next: Vec<[u8; 32]> = Vec::with_capacity(level.len() / 2);
+        for pair in level.chunks(2) {
+            let mut h = Sha256::new();
+            // Note: aggregator's internal nodes (per existing
+            // compute_checkpoint_root) are PLAIN SHA-256 over the two
+            // children — no domain prefix on internal nodes (the wrap
+            // prefix is applied at root). Mirror that exactly.
+            h.update(pair[0]);
+            h.update(pair[1]);
+            next.push(h.finalize().into());
+        }
+        level = next;
+        idx /= 2;
+    }
+    Some((leaf_hex, path))
+}
+
+/// Verify an inclusion proof for the global aggregator.
+pub fn verify_aggregator_inclusion(
+    leaf_hex: &str,
+    path: &[(String, bool)],
+    expected_root_hex: &str,
+) -> bool {
+    use sha2::{Digest, Sha256};
+    let mut current: [u8; 32] = match hex::decode(leaf_hex)
+        .ok()
+        .and_then(|v| v.try_into().ok())
+    {
+        Some(b) => b,
+        None => return false,
+    };
+    for (sibling_hex, is_right) in path {
+        let sibling: [u8; 32] = match hex::decode(sibling_hex)
+            .ok()
+            .and_then(|v| v.try_into().ok())
+        {
+            Some(b) => b,
+            None => return false,
+        };
+        let mut h = Sha256::new();
+        if *is_right {
+            h.update(current);
+            h.update(sibling);
+        } else {
+            h.update(sibling);
+            h.update(current);
+        }
+        current = h.finalize().into();
+    }
+    // Final wrap.
+    let mut h = Sha256::new();
+    h.update(PREFIX_CKPT_V1);
+    h.update(current);
+    let wrapped: [u8; 32] = h.finalize().into();
+    hex::encode(wrapped) == expected_root_hex
+}
+
+/// Compose a per-agent leaf for the global aggregator: the input the
+/// aggregator hashes when given `(agent_id, agent_root)`. Useful for
+/// callers that want to verify both layers of inclusion (per-agent
+/// path → agent_root, then `compose_aggregator_leaf(...)` → global
+/// aggregator leaf hash that the global path's first step starts from).
+pub fn compose_aggregator_leaf(agent_id: &str, agent_root: &[u8; 32]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(PREFIX_CKPT_LEAF_V1);
+    let id_bytes = agent_id.as_bytes();
+    h.update((id_bytes.len() as u32).to_le_bytes());
+    h.update(id_bytes);
+    h.update(agent_root);
+    h.finalize().into()
 }
 
 /// Serde helper for Vec<u8> as base64 in JSON.
