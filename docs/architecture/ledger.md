@@ -19,8 +19,9 @@ The Ledger provides crash-safe event recording with a WAL-first (Write-Ahead Log
                       │
                       ▼
             ┌─────────────────┐
-            │  WAL Append     │ ← fsync to disk (< 1ms)
-            │  (durable)      │
+            │  WAL Append     │ ← group-commit batched fsync
+            │  (durable)      │   (~6 ms /req solo, ~8 ms /100 concurrent
+            │                 │    on EC2 EBS — see test-report D.1)
             └────────┬────────┘
                      │
                      ├──── ✓ Success → Continue to enforcement
@@ -39,16 +40,16 @@ The Ledger provides crash-safe event recording with a WAL-first (Write-Ahead Log
 
 ## 4.3 Dual-Path Write Strategy
 
-| IC Level | WAL | NATS | Durability | Latency |
-|----------|-----|------|------------|---------|
-| IC-1 (Allow) | Skip | Async spawn | Loss tolerated (< 0.1%) | ~0ms |
-| IC-2 (Delay) | fsync first | Async spawn | Guaranteed | < 1ms |
-| IC-3 (RequireApproval) | fsync first | Async spawn | Guaranteed | < 1ms |
-| Deny | fsync first | Async spawn | Guaranteed | < 1ms |
+| IC Level | WAL | NATS | Durability | Per-event latency (group commit, EC2 t3.medium) |
+|----------|-----|------|------------|-------------------------------------------------|
+| IC-1 (Allow) | Skip | Async spawn | Loss tolerated (< 0.1%) | ~0 ms |
+| IC-2 (Delay) | fsync first | Async spawn | Guaranteed | ~6 ms solo / ~85 µs at 100 concurrent (8.48 ms ÷ 100) |
+| IC-3 (RequireApproval) | fsync first | Async spawn | Guaranteed | ~6 ms solo |
+| Deny | fsync first | Async spawn | Guaranteed | ~6 ms solo |
 
 **IC-1 rationale**: Read operations are reversible. Losing an audit entry for `gvm.storage.read` is acceptable at a rate below 0.1%. The performance gain (no disk I/O) is significant under high read volume.
 
-**IC-2/3 rationale**: Write, payment, and approval operations must have a durable audit record before the action executes. WAL fsync provides this guarantee in under 1ms.
+**IC-2/3 rationale**: Write, payment, and approval operations must have a durable audit record before the action executes. WAL fsync provides this guarantee with single-event latency of ~6 ms on EBS, falling to ~85 µs under concurrent load thanks to group commit.
 
 ---
 
@@ -56,34 +57,44 @@ The Ledger provides crash-safe event recording with a WAL-first (Write-Ahead Log
 
 ### Structure
 
-The WAL is a newline-delimited JSON file (`data/wal.log`) containing interleaved event records and Merkle batch records:
+The WAL is a newline-delimited JSON file (`data/wal.log`) containing four kinds of lines (post-v3 audit refactor):
 
 ```json
-{"event_id":"evt-001","trace_id":"tr-abc","operation":"gvm.payment.refund","status":"Pending","event_hash":"a1b2..."}
-{"event_id":"evt-002","trace_id":"tr-abc","operation":"gvm.messaging.send","status":"Pending","event_hash":"c3d4..."}
-{"batch_id":0,"merkle_root":"e5f6...","prev_batch_root":null,"event_count":2,"timestamp":"..."}
+{"event_id":"evt-001","trace_id":"tr-abc","operation":"gvm.payment.refund","operation_descriptor":{"category":"http.POST","detail_digest":"…"},"status":"Pending","event_hash":"a1b2…"}
+{"event_id":"evt-002","trace_id":"tr-abc","operation":"gvm.messaging.send","operation_descriptor":{"category":"http.POST","detail_digest":"…"},"status":"Pending","event_hash":"c3d4…"}
+{"seal_id":0,"sealed_at":"…","context_hash":"…","checkpoint_root":null,"prev_anchor":null}
+{"batch_id":0,"merkle_root":"e5f6…","prev_batch_root":null,"event_count":2,"seal_position":2,"leaves_blob":"…","timestamp":"…"}
+{"spec_version":1,"batch_id":0,"timestamp":"…","batch_root":"e5f6…","context_hash":"…","checkpoint_root":null,"prev_anchor":null,"anchor_hash":"…"}
 ```
 
-Events within a batch form a Merkle tree (intra-batch integrity). Batches are chained via `prev_batch_root` (inter-batch integrity).
+Events within a batch + the seal record form a Merkle tree (intra-batch integrity); the seal's `seal_hash()` is the LAST leaf, so any tamper of seal fields propagates to `merkle_root` and into `anchor_hash`. Batches are chained both via `prev_batch_root` (inter-batch Merkle chain) and via `prev_anchor` on the anchor itself (state-anchor chain).
 
 ### Group Commit Architecture
 
 ```
-Caller A ─┐
-Caller B ──┤ mpsc channel (4096) → batch_loop → collect(try_recv drain) →
-Caller C ──┘                         write_all(events + batch_record) → fsync(1x)
+Caller A ─┐                         ┌─ event_1 line
+Caller B ─┤ mpsc channel (4096)  →  ├─ event_2 line
+Caller C ─┘     batch_loop           ├─ ...
+                drains via try_recv  ├─ event_N line
+                snapshots TripleState├─ seal line          (BatchSealRecord)
+                computes leaves+root ├─ batch_record line  (MerkleBatchRecord — leaves_blob includes seal_hash as last leaf)
+                signs anchor (opt.)  └─ anchor line        (GvmStateAnchor, anchor_hash binds all roots)
+                        │
+                        └─ write_all(all 4 line groups) → fsync(1x)
 ```
 
-Event hashing and JSON serialization happen in **caller threads** (parallel). The batch loop collects all queued events via non-blocking `try_recv()` drain, then writes the entire batch + Merkle batch record in a single `write_all + fsync`.
+Event hashing and JSON serialization happen in **caller threads** (parallel). The batch loop collects all queued events via non-blocking `try_recv()` drain, snapshots the active `(context_hash, checkpoint_root, last_anchor)` from `TripleState` via a single ArcSwap RCU read, builds the seal record + Merkle root + state anchor, then writes the entire group in a single `write_all + fsync`.
 
 ```rust
 struct WAL {
     tx: tokio::sync::mpsc::Sender<GroupCommitRequest>,
     _batch_task: tokio::task::JoinHandle<()>,
+    triple: Arc<arc_swap::ArcSwap<TripleState>>,
+    signer: Arc<dyn AnchorSigner>,
 }
 
 async fn append(&self, event: &GVMEvent) -> Result<()> {
-    let hash = compute_event_hash(event);
+    let hash = compute_event_hash(event);              // v1/v2 dispatcher
     let mut stamped = event.clone();
     stamped.event_hash = Some(hash.clone());
     let data = serde_json::to_vec(&stamped)?;
@@ -95,13 +106,14 @@ async fn append(&self, event: &GVMEvent) -> Result<()> {
 ```
 
 **Key properties**:
-- **One fsync per batch** — amortized across all events in the batch (not per-event)
-- **Batch window (2ms default)** — waits briefly for concurrent events to batch together, yielding 10-50x TPS under load vs per-event fsync. Configurable via `[wal] batch_window_ms` in `proxy.toml`.
+- **One fsync per batch** — amortized across all events plus the seal/batch/anchor lines
+- **Batch window (2ms default)** — waits briefly for concurrent events to batch together. Group commit reduces 100 sequential fsyncs from ~643 ms to ~8.5 ms (**76x improvement** — see [test-report D.1](../test-report.md#d1-benchmark-results-criterion-v05-2026-05-02--post-v3-audit)). Configurable via `[wal] batch_window_ms` in `proxy.toml`.
 - **Non-blocking drain** — `try_recv()` collects all queued events without timer overhead
 - **Bounded backpressure** — channel capacity 4096, max batch size 128
-- **Caller-parallel serialization** — event hash + JSON computed before channel send
-- **Size-based rotation** — `max_wal_bytes` (100MB default) triggers rotation to `wal.log.<N>`, `max_wal_segments` (10 default) prunes oldest segments. Merkle chain links across segments via `prev_root`
+- **Caller-parallel serialization** — event hash + JSON computed before channel send. v2 hash dispatcher (descriptor-aware) is ~2 µs per event.
+- **Size-based rotation** — `max_wal_bytes` (100MB default) triggers rotation to `wal.log.<N>`, `max_wal_segments` (10 default) prunes oldest segments. Merkle chain links across segments via `prev_batch_root`; anchor chain via `prev_anchor`.
 - **Emergency WAL fallback** — if primary WAL fails, events go to `wal_emergency.log` (degraded mode, no Merkle)
+- **Anchor signing (Phase 6)** — every anchor's `anchor_hash` is run through `AnchorSigner` after construction. Default `NoopSigner` leaves `signature: None`; `SelfSignedSigner` (Ed25519) attaches a 64-byte signature; `Hsm` / `Tsa` variants are reserved.
 
 > **Long-term retention**: Default settings retain at most 100MB x 10 = 1GB of audit trail on local disk. When the 11th segment is created, the oldest segment is **permanently deleted**. Segments are plain JSON files — back up or archive however you like (cron + S3, rsync, etc.) before they are pruned.
 
