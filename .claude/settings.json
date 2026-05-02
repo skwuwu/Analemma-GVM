@@ -85,7 +85,8 @@
       "Bash(ssh -i \"C:\\\\Users\\\\gimgy\\\\Downloads\\\\Analemma-test.pem\" ubuntu@43.201.62.93 'sudo pkill -9 -f \"\"gvm-proxy\\\\|openclaw\\\\|debug-long\\\\|prod-stress\"\" 2>/dev/null; sleep 2; echo \"\"clean\"\"')",
       "Bash(ssh -i \"C:\\\\Users\\\\gimgy\\\\Downloads\\\\Analemma-test.pem\" ubuntu@43.201.62.93 'cd ~/Analemma-GVM && LATEST=$\\(ls -td results/prod-2* | head -1\\) && for i in 1 2 3; do count=$\\(sed \"\"s/\\\\x1b\\\\[[0-9;]*m//g\"\" \"\"$LATEST/agents/agent-$i.log\"\" | grep -c \"\"✓.*Allow\"\" || echo 0\\); echo \"\"agent-$i: $count allowed events\"\"; done')",
       "Bash(ssh -i \"C:\\\\Users\\\\gimgy\\\\Downloads\\\\Analemma-test.pem\" ubuntu@43.201.62.93 'source ~/Analemma-GVM/.env && cd ~/Analemma-GVM && sudo env PATH=$PATH ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY target/release/gvm run --sandbox --agent-id bind-test -- python3 -c \"\":*)",
-      "Bash(ssh -i \"C:\\\\Users\\\\gimgy\\\\Downloads\\\\Analemma-test.pem\" ubuntu@43.201.62.93 'source ~/Analemma-GVM/.env && cd ~/Analemma-GVM && sudo killall -9 gvm-proxy gvm 2>/dev/null; sleep 1; sudo rm -f data/proxy.pid; sudo -E env PATH=$PATH target/release/gvm run --sandbox --agent-id home-check -- python3 -c \"\":*)"
+      "Bash(ssh -i \"C:\\\\Users\\\\gimgy\\\\Downloads\\\\Analemma-test.pem\" ubuntu@43.201.62.93 'source ~/Analemma-GVM/.env && cd ~/Analemma-GVM && sudo killall -9 gvm-proxy gvm 2>/dev/null; sleep 1; sudo rm -f data/proxy.pid; sudo -E env PATH=$PATH target/release/gvm run --sandbox --agent-id home-check -- python3 -c \"\":*)",
+      "Bash(awk '{passed += $4; failed += $6; ignored += $8} END {printf \"TOTALS: passed=%d failed=%d ignored=%d\\\\n\", passed, failed, ignored}')"
     ]
   }
 }
