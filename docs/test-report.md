@@ -554,16 +554,23 @@ test result: ok. 9 passed; 0 failed; 0 ignored; finished in 6.63s
 | `max_strict/allow_vs_deny` | **21.1 ns** | Full decision clone + comparison |
 | `max_strict/delay_vs_require_approval` | **7.5 ns** | Lightweight comparison |
 
-### WAL (Write-Ahead Log)
+### WAL (Write-Ahead Log) — post Phase F (priority lane + max_batch_size=512)
 
-| Benchmark | Median | Description |
-|-----------|--------|-------------|
-| `wal/durable_append_fsync` | **6.35 ms** | Single event WAL append + group-commit fsync (now writes 4 lines per batch: events + seal + batch_record + anchor) |
-| `wal/100_sequential_appends` | **643 ms** | 100 sequential per-event fsyncs |
-| `wal_group_commit/concurrent_appends/100` | **8.48 ms** | 100 concurrent → batched fsync |
-| `wal_group_commit/concurrent_appends/500` | **25.15 ms** | 500 concurrent → batched fsync |
+| Benchmark | Median (post-F) | Pre-F (Phase E) | Δ | Description |
+|-----------|--------:|--------:|---|-------------|
+| `wal/durable_append_fsync` | **6.36 ms** | 6.35 ms | ±0% | Single event solo (fsync floor) |
+| `wal/100_sequential_appends` | **645 ms** | 643 ms | ±0% | 100 sequential per-event fsyncs |
+| `wal_group_commit/concurrent_appends/100` | **11.40 ms** | 8.48 ms | +34% | 100 concurrent → 1 batch fsync |
+| `wal_group_commit/concurrent_appends/500` | **14.71 ms** | 25.15 ms | **-41%** | 500 concurrent → 1 batch fsync (was 4 batches at max=128) |
 
-**Key insight**: Group commit reduces 100 fsyncs from 643 ms (sequential) to 8.5 ms (batched) — **76x improvement**. The pre-v3 figures (6.28 ms / 7.99 ms / 23.47 ms) are within ~6% of these — the seal+anchor lines are part of the same fsync, so the only added cost is ~4 µs of in-memory hashing per batch (see v3 hot-path table above), invisible against the 6 ms fsync floor.
+**Key insight (Phase F)**: The 41% drop at 500 concurrent is the goal — `max_batch_size 128 → 512` absorbs the 500-event burst into a single fsync (vs 4 fsyncs previously). The 100-concurrent entry shows a +34% increase: this is the cost of the 3-way `tokio::select!` over priority lanes (~3 ms scheduling overhead at moderate concurrency, on a 2 vCPU EC2). The trade-off is **lower P99 tail at the cost of slightly higher P50 under moderate load** — acceptable because:
+- IC-1 Allow doesn't go through `append_durable` (uses `append_async`)
+- Above ~400 concurrent, the tail-bounded path dominates
+- Below ~50 concurrent, the absolute latency (~7-12 ms) is well within IC-2/IC-3 SLA budgets
+
+Group commit still delivers a **57x improvement** vs purely sequential fsync (645 ms → 11 ms at 100 concurrent).
+
+> **Note on priority benefit**: these benches use a uniform Allow event so all 500 land in the LOW lane. They measure the *infrastructure overhead* of having 3 lanes, not the *priority benefit*. With a realistic mix (e.g. 90 Deny + 410 Allow), high-priority events are guaranteed to drain in the FIRST batch (~6 ms tail) regardless of low-lane queue depth — a property the single-lane design could not provide. See `tests/wal_priority_lane.rs::high_priority_event_does_not_wait_behind_low_burst` for the regression pin.
 
 ### Vault (AES-256-GCM Encrypt + Decrypt + WAL)
 

@@ -8,7 +8,15 @@
 
 The Ledger provides crash-safe event recording with a WAL-first (Write-Ahead Log) architecture. Every enforcement decision is recorded locally before any external action, ensuring that even during proxy crashes or network failures, the audit trail remains intact.
 
-**Design principle**: WAL is the source of truth. NATS JetStream is the distribution layer. If NATS is unavailable, WAL has the complete record.
+**Design principle**: **WAL is the source of truth. The distribution channel is operator-chosen.** GVM is built as a sidecar/pipe — it owns the local audit trail (WAL + Merkle + anchor chain) but does not couple to a specific message bus. Operators wire downstream consumers to the WAL via whatever channel suits their environment:
+
+- **NATS JetStream (recommended default for distributed deployments)** — the proxy's `[nats]` config + `wal_sequence` field are pre-wired hooks; bringing up a JetStream cluster and switching the publish path from stub to active is the cleanest distribution upgrade. Provides ordered streams, replication, and consumer offset tracking out of the box.
+- **Kafka / Redpanda** — Kafka-compatible API, single binary deployment for Redpanda. Use the same publish hook pattern as NATS.
+- **AWS Kinesis / GCP Pub/Sub** — managed alternative. Wire via the same outbound publish hook.
+- **Tail-and-ship sidecar** — `tail -F data/wal.log | downstream-tool`. The WAL is newline-JSON; any log shipper (Vector, Fluent Bit, Filebeat) consumes it directly.
+- **Periodic batch upload** — cron + `gvm proof batch <id> --wal data/wal.log` to ship per-batch proofs to S3 or an external auditor.
+
+**The WAL stays authoritative regardless of which channel is chosen.** If the distribution channel is unreachable (broker down, network partition, sidecar crashed), GVM continues to enforce — the local Merkle/anchor chain is the source of truth for `gvm audit verify` and `gvm proof verify`. This is intentional: coupling enforcement to a specific message bus creates a single point of failure that the WAL-first design refuses.
 
 ---
 
@@ -72,25 +80,47 @@ Events within a batch + the seal record form a Merkle tree (intra-batch integrit
 ### Group Commit Architecture
 
 ```
-Caller A ─┐                         ┌─ event_1 line
-Caller B ─┤ mpsc channel (4096)  →  ├─ event_2 line
-Caller C ─┘     batch_loop           ├─ ...
-                drains via try_recv  ├─ event_N line
-                snapshots TripleState├─ seal line          (BatchSealRecord)
-                computes leaves+root ├─ batch_record line  (MerkleBatchRecord — leaves_blob includes seal_hash as last leaf)
-                signs anchor (opt.)  └─ anchor line        (GvmStateAnchor, anchor_hash binds all roots)
-                        │
-                        └─ write_all(all 4 line groups) → fsync(1x)
+Caller A (Deny) ──→  high lane mpsc (4096)  ─┐
+Caller B (Delay)──→  normal lane mpsc (4096) ─┤  batch_loop          ┌─ event_1 line
+Caller C (Allow)──→  low lane mpsc (4096)    ─┘  biased select       ├─ event_2 line
+                                                 + drain_priority    ├─ ...
+                                                 (high → normal      ├─ event_N line
+                                                  → low until        ├─ seal line          (BatchSealRecord)
+                                                  max_batch_size      ├─ batch_record line  (MerkleBatchRecord — leaves_blob includes seal_hash as last leaf)
+                                                  = 512)              └─ anchor line        (GvmStateAnchor, anchor_hash binds all roots)
+                                                                            │
+                                                                            └─ write_all(all 4 line groups) → fsync(1x)
 ```
 
-Event hashing and JSON serialization happen in **caller threads** (parallel). The batch loop collects all queued events via non-blocking `try_recv()` drain, snapshots the active `(context_hash, checkpoint_root, last_anchor)` from `TripleState` via a single ArcSwap RCU read, builds the seal record + Merkle root + state anchor, then writes the entire group in a single `write_all + fsync`.
+Event hashing and JSON serialization happen in **caller threads** (parallel). At `append`, an event's `decision` string is classified into one of three priority lanes (Phase F):
+
+- **High** — `Deny` / `RequireApproval` (security-critical: must drain first)
+- **Normal** — `Delay` / `AuditOnly`
+- **Low** — `Allow` / unclassified
+
+The batch loop runs a `biased tokio::select!` over the 3 receivers and a `drain_priority()` helper that fully drains high before normal, normal before low, until `max_batch_size` (512) is reached. **All admitted events share one fsync, one seal, one anchor** — the v3 audit chain (C2/C3 contracts) is unchanged. Priority only affects which pending events are admitted to the next batch.
 
 ```rust
+pub enum WalPriority { High, Normal, Low }
+
+impl WalPriority {
+    pub fn from_event(event: &GVMEvent) -> Self {
+        let d = event.decision.as_str();
+        if d.starts_with("Deny") || d.starts_with("RequireApproval") { Self::High }
+        else if d.starts_with("Delay") || d.starts_with("AuditOnly")
+                || d == "Confirmed" || d == "Pending"               { Self::Normal }
+        else                                                         { Self::Low }
+    }
+}
+
 struct WAL {
-    tx: tokio::sync::mpsc::Sender<GroupCommitRequest>,
-    _batch_task: tokio::task::JoinHandle<()>,
+    tx_high:   Option<tokio::sync::mpsc::Sender<GroupCommitRequest>>,
+    tx_normal: Option<tokio::sync::mpsc::Sender<GroupCommitRequest>>,
+    tx_low:    Option<tokio::sync::mpsc::Sender<GroupCommitRequest>>,
+    batch_task: Option<tokio::task::JoinHandle<()>>,
     triple: Arc<arc_swap::ArcSwap<TripleState>>,
     signer: Arc<dyn AnchorSigner>,
+    // ...
 }
 
 async fn append(&self, event: &GVMEvent) -> Result<()> {
@@ -99,17 +129,25 @@ async fn append(&self, event: &GVMEvent) -> Result<()> {
     stamped.event_hash = Some(hash.clone());
     let data = serde_json::to_vec(&stamped)?;
 
+    let priority = WalPriority::from_event(event);
+    let tx = match priority {
+        WalPriority::High   => self.tx_high.as_ref(),
+        WalPriority::Normal => self.tx_normal.as_ref(),
+        WalPriority::Low    => self.tx_low.as_ref(),
+    }.ok_or_else(|| anyhow!("WAL batch task shut down"))?;
+
     let (reply_tx, reply_rx) = oneshot::channel();
-    self.tx.send(GroupCommitRequest { data, event_hash: hash, reply: reply_tx }).await?;
+    tx.send(GroupCommitRequest { data, event_hash: hash, reply: reply_tx }).await?;
     reply_rx.await?
 }
 ```
 
 **Key properties**:
 - **One fsync per batch** — amortized across all events plus the seal/batch/anchor lines
-- **Batch window (2ms default)** — waits briefly for concurrent events to batch together. Group commit reduces 100 sequential fsyncs from ~643 ms to ~8.5 ms (**76x improvement** — see [test-report D.1](../test-report.md#d1-benchmark-results-criterion-v05-2026-05-02--post-v3-audit)). Configurable via `[wal] batch_window_ms` in `proxy.toml`.
-- **Non-blocking drain** — `try_recv()` collects all queued events without timer overhead
-- **Bounded backpressure** — channel capacity 4096, max batch size 128
+- **Batch window (2ms default)** — waits briefly for concurrent events to batch together. Group commit reduces 100 sequential fsyncs from ~645 ms to ~11 ms at 100 concurrent (**57x improvement**); 500 concurrent absorbs into one batch at ~14.7 ms (post-Phase F: `max_batch_size 128 → 512`, was 25 ms at the old size). See [test-report D.1](../test-report.md#wal-write-ahead-log--post-phase-f-priority-lane--max_batch_size512). Configurable via `[wal] batch_window_ms` in `proxy.toml`.
+- **3-tier priority lane** — high (Deny/RequireApproval) drains before normal (Delay/AuditOnly) before low (Allow). Tail latency for high-priority events is bounded by *one* fsync regardless of low-lane queue depth — no head-of-line blocking under noisy-neighbor bursts. See [tests/wal_priority_lane.rs](../../tests/wal_priority_lane.rs) for invariants.
+- **Non-blocking drain** — `try_recv()` collects queued events across all 3 lanes
+- **Bounded backpressure** — channel capacity 4096 *per lane*, max batch size 512
 - **Caller-parallel serialization** — event hash + JSON computed before channel send. v2 hash dispatcher (descriptor-aware) is ~2 µs per event.
 - **Size-based rotation** — `max_wal_bytes` (100MB default) triggers rotation to `wal.log.<N>`, `max_wal_segments` (10 default) prunes oldest segments. Merkle chain links across segments via `prev_batch_root`; anchor chain via `prev_anchor`.
 - **Emergency WAL fallback** — if primary WAL fails, events go to `wal_emergency.log` (degraded mode, no Merkle)
@@ -129,9 +167,9 @@ async fn append(&self, event: &GVMEvent) -> Result<()> {
 | WAL file management | 1 file | N files (one per agent) |
 | Serialization point | Batch-level (group commit) | None (but N separate fsyncs) |
 
-**Why global doesn't bottleneck**: The serialization point is the batch, not the event. At 100 agents × 10 ops/sec = 1,000 events/sec, with batch drain collecting ~10 events per batch, that's ~100 fsyncs/sec — trivial for any modern disk. Sharding becomes relevant only at ~100K events/sec, at which point NATS JetStream provides cross-shard ordering.
+**Why global doesn't bottleneck**: The serialization point is the batch, not the event. At 100 agents × 10 ops/sec = 1,000 events/sec, with batch drain collecting ~10 events per batch, that's ~100 fsyncs/sec — trivial for any modern disk. Sharding becomes relevant only at ~100K events/sec, at which point an external broker (operator's choice — see §4.1) provides cross-shard ordering.
 
-**Scaling path**: v1.x global WAL → v2.x NATS JetStream handles ordering → v3.x proxy sharding by agent_id hash (if needed).
+**Scaling path**: v1.x global WAL + Phase F priority lane → v2.x operator-chosen distribution channel handles ordering → v3.x proxy sharding by agent_id hash (if needed).
 
 ---
 
@@ -149,9 +187,9 @@ pub struct Ledger {
 }
 ```
 
-**Note**: NATS publishing is currently a **stub** — the `[nats]` config is accepted but events are only written to local WAL. The WAL sequence counter and NATS integration design are implemented in the code structure but actual NATS network I/O is not active. When NATS is connected in a future release, the monotonic `wal_sequence` ensures consumers can reconstruct WAL order from out-of-order NATS messages.
+**Note on distribution channel**: The `[nats]` config + `tokio::spawn(nats_publish)` hook in `Ledger::append_durable` are currently a **stub** — events are written to the local WAL only. Operators choosing a distribution channel (see §4.1) wire it here. NATS JetStream is the recommended default; the `wal_sequence` counter exists precisely so consumers can reconstruct WAL order from out-of-order broker messages. Other choices (Kafka, sidecar tail-and-ship, etc.) follow the same pattern.
 
-**WAL sequence properties** (active regardless of NATS):
+**WAL sequence properties** (active regardless of distribution channel):
 - Lock-free (`AtomicU64`) — zero performance impact
 - Monotonic — strictly increasing, no gaps within a process lifetime
 - SeqCst ordering — visible to all threads immediately
