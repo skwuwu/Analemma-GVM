@@ -100,12 +100,18 @@ impl EmergencyWAL {
 /// - `Duration::ZERO`: minimum latency per single request (no batching wait)
 /// - `2ms` (default): amortizes fsync across concurrent requests, 10-50x TPS gain
 /// - Higher values: more batching, higher throughput, but added latency per request
+///
+/// `max_batch_size` was raised from 128 → 512 in 2026-05-02 after the
+/// post-v3 SLA review: 500 concurrent appends at the old size required
+/// 4 fsyncs (~25 ms tail). 512 absorbs the same burst into a single
+/// fsync (~6 ms tail), and the marginal in-memory hashing cost (~4 µs
+/// per batch leaf) is hidden under the fsync floor.
 pub struct GroupCommitConfig {
     /// Maximum time to wait for more events before flushing (default: 2ms).
     pub batch_window: Duration,
-    /// Maximum batch size before forcing an immediate flush (default: 128).
+    /// Maximum batch size before forcing an immediate flush (default: 512).
     pub max_batch_size: usize,
-    /// Bounded channel capacity for backpressure (default: 4096).
+    /// Bounded channel capacity for backpressure (default: 4096 per lane).
     pub channel_capacity: usize,
     /// Maximum WAL file size in bytes before rotation (default: 100MB).
     pub max_wal_bytes: u64,
@@ -117,10 +123,69 @@ impl Default for GroupCommitConfig {
     fn default() -> Self {
         Self {
             batch_window: Duration::from_millis(2),
-            max_batch_size: 128,
+            max_batch_size: 512,
             channel_capacity: 4096,
             max_wal_bytes: 100 * 1024 * 1024, // 100MB
             max_wal_segments: 10,
+        }
+    }
+}
+
+// ─── Priority lanes (Phase F SLA — tail latency containment) ───
+//
+// A single WAL channel under load drains FIFO regardless of governance
+// severity, which means a burst of 400 IC-1/IC-2 events in front of
+// 100 Deny/IC-3 events makes the security-critical events wait the
+// full burst (~25 ms at 500 concurrent on EBS).
+//
+// Three lanes instead. Producers classify events at append time:
+//
+//   High   — Deny / RequireApproval (security-critical, must drain first)
+//   Normal — Delay / AuditOnly      (governed paths, normal SLA)
+//   Low    — Allow IC-1 (only via append_durable; IC-1 typically uses
+//            append_async which doesn't reach this queue at all)
+//
+// The batch loop drains High first, then Normal, then Low, until the
+// batch fills (max_batch_size) or all queues are empty. A single
+// fsync still covers the whole batch, so the Merkle/anchor chain
+// stays single-threaded — but a burst of low-severity events cannot
+// push high-severity events to the next fsync window.
+//
+// Atomicity: the seal/anchor still wraps the entire mixed batch in
+// one fsync. Nothing about the v3 audit chain (C1-C4 contracts in
+// docs/architecture/ledger.md) changes — only the *order* in which
+// pending events are admitted to the next batch.
+
+/// Priority lane for WAL appends. Determined per-event from the
+/// event's decision string (Deny/RequireApproval → High, Delay/
+/// AuditOnly → Normal, anything else → Low). External callers do
+/// not pick this directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalPriority {
+    High,
+    Normal,
+    Low,
+}
+
+impl WalPriority {
+    /// Classify an event by reading its `decision` field. Mirrors the
+    /// `EnforcementDecision::strictness()` total order without coupling
+    /// to that enum (the WAL receives serialized events, so we read
+    /// the string form).
+    pub fn from_event(event: &GVMEvent) -> Self {
+        let d = event.decision.as_str();
+        // "Deny { reason: ... }" or "Deny" both start with "Deny".
+        // "RequireApproval { urgency: ... }" same.
+        if d.starts_with("Deny") || d.starts_with("RequireApproval") {
+            WalPriority::High
+        } else if d.starts_with("Delay")
+            || d.starts_with("AuditOnly")
+            || d == "Confirmed"
+            || d == "Pending"
+        {
+            WalPriority::Normal
+        } else {
+            WalPriority::Low
         }
     }
 }
@@ -153,15 +218,14 @@ struct GroupCommitRequest {
 /// - Inter-batch: each batch references the previous batch's root (chain)
 #[allow(clippy::upper_case_acronyms)]
 struct WAL {
-    /// Sender for submitting write requests to the batch task.
-    /// Wrapped in `Option` so `shutdown()` can `take()` it, dropping
-    /// the only sender held by the Ledger and closing the channel.
-    /// `batch_loop` exits when `rx.recv()` returns `None`, completing
-    /// the JoinHandle the shutdown path awaits. Without the take,
-    /// the channel stayed open indefinitely and shutdown always hit
-    /// the documented 5s timeout — turning every rolling restart
-    /// into a 5s-per-pod stall.
-    tx: Option<tokio::sync::mpsc::Sender<GroupCommitRequest>>,
+    /// High-priority sender (Deny / RequireApproval). Drained first.
+    /// Wrapped in `Option` so `shutdown()` can `take()` and drop all
+    /// senders, signalling the batch task to exit.
+    tx_high: Option<tokio::sync::mpsc::Sender<GroupCommitRequest>>,
+    /// Normal-priority sender (Delay / AuditOnly).
+    tx_normal: Option<tokio::sync::mpsc::Sender<GroupCommitRequest>>,
+    /// Low-priority sender (Allow / unclassified durable appends).
+    tx_low: Option<tokio::sync::mpsc::Sender<GroupCommitRequest>>,
     /// Handle to the background batch task — awaited during graceful shutdown.
     batch_task: Option<tokio::task::JoinHandle<()>>,
     /// Path retained for crash recovery (read path).
@@ -208,7 +272,9 @@ impl WAL {
             .open(path)
             .await?;
 
-        let (tx, rx) = tokio::sync::mpsc::channel(config.channel_capacity);
+        let (tx_high, rx_high) = tokio::sync::mpsc::channel(config.channel_capacity);
+        let (tx_normal, rx_normal) = tokio::sync::mpsc::channel(config.channel_capacity);
+        let (tx_low, rx_low) = tokio::sync::mpsc::channel(config.channel_capacity);
         let inject_error = Arc::new(AtomicBool::new(false));
         let triple: Arc<arc_swap::ArcSwap<TripleState>> =
             Arc::new(arc_swap::ArcSwap::from_pointee(TripleState {
@@ -228,7 +294,9 @@ impl WAL {
 
         let signer_for_task = Arc::clone(&signer);
         let batch_task = tokio::spawn(batch_loop(
-            rx,
+            rx_high,
+            rx_normal,
+            rx_low,
             file,
             config,
             inject_error.clone(),
@@ -238,10 +306,12 @@ impl WAL {
             signer_for_task,
         ));
 
-        tracing::info!(path = %path.display(), "WAL opened (group commit + merkle + anchor)");
+        tracing::info!(path = %path.display(), "WAL opened (group commit + merkle + anchor + 3-tier priority)");
 
         Ok(Self {
-            tx: Some(tx),
+            tx_high: Some(tx_high),
+            tx_normal: Some(tx_normal),
+            tx_low: Some(tx_low),
             batch_task: Some(batch_task),
             path: path.to_path_buf(),
             inject_error,
@@ -250,8 +320,9 @@ impl WAL {
         })
     }
 
-    /// Append an event to the WAL via group commit.
-    /// Computes event_hash, sets it on the event, serializes, and submits to batch task.
+    /// Append an event to the WAL via group commit. Routes to the
+    /// appropriate priority lane based on the event's decision string
+    /// (see `WalPriority::from_event`).
     async fn append(&self, event: &GVMEvent) -> Result<()> {
         // Compute event hash and embed it in the serialized output
         let hash = compute_event_hash(event);
@@ -263,10 +334,13 @@ impl WAL {
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 
-        let tx = self
-            .tx
-            .as_ref()
-            .ok_or_else(|| anyhow!("WAL batch task shut down"))?;
+        let priority = WalPriority::from_event(event);
+        let tx = match priority {
+            WalPriority::High => self.tx_high.as_ref(),
+            WalPriority::Normal => self.tx_normal.as_ref(),
+            WalPriority::Low => self.tx_low.as_ref(),
+        }
+        .ok_or_else(|| anyhow!("WAL batch task shut down"))?;
         tx.send(GroupCommitRequest {
             data,
             event_hash: hash,
@@ -364,9 +438,21 @@ async fn scan_wal_for_recovery(path: &Path) -> WalRecoveryState {
     state
 }
 
-/// Background batch task: collects writes, flushes in batches, single fsync per batch.
+/// Background batch task: collects writes from 3 priority lanes,
+/// flushes in batches with one fsync per batch.
 ///
-/// Phase 2 wiring: every batch flush now produces THREE additional WAL
+/// Drain order per cycle:
+///   1. Drain all of high-priority queue (Deny / RequireApproval).
+///   2. Drain normal-priority (Delay / AuditOnly) until batch fills.
+///   3. Drain low-priority until batch fills.
+///   4. fsync the entire mixed batch as one Merkle/anchor unit.
+///
+/// Atomicity is preserved: events from all 3 lanes share the same
+/// fsync, the same seal, the same anchor. Priority only affects which
+/// pending events are *admitted* to the next batch — once admitted,
+/// they all clear together.
+///
+/// Phase 2 wiring: every batch flush produces THREE additional WAL
 /// lines beyond the events themselves:
 ///   N+1. BatchSealRecord — captures the TripleState snapshot at seal time
 ///   N+2. MerkleBatchRecord — leaves_blob includes events + seal_hash
@@ -375,17 +461,17 @@ async fn scan_wal_for_recovery(path: &Path) -> WalRecoveryState {
 ///        checkpoint_root, prev_anchor)
 ///
 /// Snapshot atomicity (§4.7): the triple_state is read once per batch,
-/// AFTER the batch is drained and BEFORE seal_hash is computed. This
-/// captures system state at the close moment; per-event refs may
-/// differ (handler-time vs seal-time race is documented behavior).
+/// AFTER the batch is drained and BEFORE seal_hash is computed.
 ///
 /// Phase 5: when `recovered` carries values from a prior session, the
-/// task seeds `batch_id` and `prev_batch_root` so the first new batch
-/// links into the prior anchor chain.
+/// task seeds `batch_id` and `prev_batch_root`.
 ///
 /// Handles size-based rotation when the WAL file exceeds `max_wal_bytes`.
+#[allow(clippy::too_many_arguments)]
 async fn batch_loop(
-    mut rx: tokio::sync::mpsc::Receiver<GroupCommitRequest>,
+    mut rx_high: tokio::sync::mpsc::Receiver<GroupCommitRequest>,
+    mut rx_normal: tokio::sync::mpsc::Receiver<GroupCommitRequest>,
+    mut rx_low: tokio::sync::mpsc::Receiver<GroupCommitRequest>,
     mut file: tokio::fs::File,
     config: GroupCommitConfig,
     inject_error: Arc<AtomicBool>,
@@ -399,63 +485,136 @@ async fn batch_loop(
     let mut prev_batch_root: Option<String> = recovered.last_batch_root.clone();
     let mut bytes_written: u64 = file.metadata().await.map(|m| m.len()).unwrap_or(0);
 
-    loop {
-        // Phase 1: Wait for at least one request (blocks until work arrives)
-        match rx.recv().await {
-            Some(req) => batch.push(req),
-            None => {
-                // Channel closed — all senders dropped, shutdown.
-                // Flush any remaining events that arrived before channel close.
-                if !batch.is_empty() {
-                    let result = flush_batch_with_anchor(
-                        &mut file,
-                        &batch,
-                        batch_id,
-                        &prev_batch_root,
-                        &triple,
-                        signer.as_ref(),
-                    )
-                    .await;
-                    if let Ok(ref outcome) = result {
-                        // Publish anchor on shutdown path too — observers
-                        // reading the WAL after a clean shutdown see the
-                        // last_anchor as the final tail of the chain.
-                        publish_anchor(&triple, outcome.anchor_hash.clone());
-                    }
-                    for req in batch.drain(..) {
-                        let notify = match &result {
-                            Ok(_) => Ok(()),
-                            Err(e) => Err(anyhow!("WAL shutdown flush failed: {}", e)),
-                        };
-                        let _ = req.reply.send(notify);
-                    }
-                }
-                break;
-            }
-        }
-
-        // Phase 2a: Non-blocking drain of all immediately available requests.
-        while batch.len() < config.max_batch_size {
-            match rx.try_recv() {
+    /// Drain all 3 lanes in priority order until the batch fills or
+    /// every lane is empty. Returns `true` if at least one event was
+    /// drained.
+    fn drain_priority(
+        batch: &mut Vec<GroupCommitRequest>,
+        rx_high: &mut tokio::sync::mpsc::Receiver<GroupCommitRequest>,
+        rx_normal: &mut tokio::sync::mpsc::Receiver<GroupCommitRequest>,
+        rx_low: &mut tokio::sync::mpsc::Receiver<GroupCommitRequest>,
+        max_batch_size: usize,
+    ) -> bool {
+        let start_len = batch.len();
+        // High first — security-critical, never wait behind low/normal.
+        while batch.len() < max_batch_size {
+            match rx_high.try_recv() {
                 Ok(req) => batch.push(req),
                 Err(_) => break,
             }
         }
+        while batch.len() < max_batch_size {
+            match rx_normal.try_recv() {
+                Ok(req) => batch.push(req),
+                Err(_) => break,
+            }
+        }
+        while batch.len() < max_batch_size {
+            match rx_low.try_recv() {
+                Ok(req) => batch.push(req),
+                Err(_) => break,
+            }
+        }
+        batch.len() > start_len
+    }
 
-        // Phase 2b: If batch is small and window is configured, briefly wait for more.
-        if batch.len() < config.max_batch_size / 4 && !config.batch_window.is_zero() {
-            match tokio::time::timeout(config.batch_window, rx.recv()).await {
-                Ok(Some(req)) => {
-                    batch.push(req);
-                    while batch.len() < config.max_batch_size {
-                        match rx.try_recv() {
-                            Ok(req) => batch.push(req),
-                            Err(_) => break,
-                        }
-                    }
+    loop {
+        // Phase 1: Wait for at least one request from ANY lane.
+        // tokio::select! is `biased` so high-priority wakes up first
+        // when multiple lanes are simultaneously ready. A `None` from
+        // any one lane means *that* lane's senders have been dropped
+        // and its queue is empty — but the other lanes may still be
+        // open with data.
+        let got_event = tokio::select! {
+            biased;
+            maybe = rx_high.recv() => match maybe {
+                Some(req) => { batch.push(req); true },
+                None => false,
+            },
+            maybe = rx_normal.recv() => match maybe {
+                Some(req) => { batch.push(req); true },
+                None => false,
+            },
+            maybe = rx_low.recv() => match maybe {
+                Some(req) => { batch.push(req); true },
+                None => false,
+            },
+        };
+
+        if !got_event {
+            // Some lane closed. Aggressively drain the remaining lanes
+            // for any queued events (priority order), flush whatever we
+            // have, then check if ALL lanes are exhausted.
+            drain_priority(
+                &mut batch,
+                &mut rx_high,
+                &mut rx_normal,
+                &mut rx_low,
+                config.max_batch_size,
+            );
+            if !batch.is_empty() {
+                let result = flush_batch_with_anchor(
+                    &mut file,
+                    &batch,
+                    batch_id,
+                    &prev_batch_root,
+                    &triple,
+                    signer.as_ref(),
+                )
+                .await;
+                if let Ok(ref outcome) = result {
+                    publish_anchor(&triple, outcome.anchor_hash.clone());
                 }
-                Ok(None) => {}
-                Err(_) => {}
+                for req in batch.drain(..) {
+                    let notify = match &result {
+                        Ok(_) => Ok(()),
+                        Err(e) => Err(anyhow!("WAL shutdown flush failed: {}", e)),
+                    };
+                    let _ = req.reply.send(notify);
+                }
+            }
+            // If all 3 lanes are closed AND empty, we're done.
+            if rx_high.is_closed()
+                && rx_normal.is_closed()
+                && rx_low.is_closed()
+            {
+                break;
+            }
+            // Otherwise some lane is still open; continue waiting.
+            continue;
+        }
+
+        // Phase 2a: Non-blocking priority drain across all 3 lanes.
+        drain_priority(
+            &mut batch,
+            &mut rx_high,
+            &mut rx_normal,
+            &mut rx_low,
+            config.max_batch_size,
+        );
+
+        // Phase 2b: If batch is small and window is configured,
+        // briefly wait for more from any lane. After the window, do
+        // one more priority drain to catch latecomers.
+        if batch.len() < config.max_batch_size / 4 && !config.batch_window.is_zero() {
+            let timeout = tokio::time::timeout(config.batch_window, async {
+                tokio::select! {
+                    biased;
+                    maybe = rx_high.recv() => maybe,
+                    maybe = rx_normal.recv() => maybe,
+                    maybe = rx_low.recv() => maybe,
+                }
+            })
+            .await;
+            if let Ok(Some(req)) = timeout {
+                batch.push(req);
+                drain_priority(
+                    &mut batch,
+                    &mut rx_high,
+                    &mut rx_normal,
+                    &mut rx_low,
+                    config.max_batch_size,
+                );
             }
         }
 
@@ -1394,7 +1553,11 @@ impl Ledger {
         //  2. Await the batch task handle. batch_loop sees rx.recv()
         //     return None, flushes any remaining batch with Merkle
         //     record, and exits.
-        let _ = self.wal.tx.take();
+        // Drop all 3 priority senders so the batch task observes
+        // shutdown across every lane.
+        let _ = self.wal.tx_high.take();
+        let _ = self.wal.tx_normal.take();
+        let _ = self.wal.tx_low.take();
 
         if let Some(handle) = self.wal.batch_task.take() {
             tracing::info!("WAL shutdown: waiting for batch task to flush remaining events...");
