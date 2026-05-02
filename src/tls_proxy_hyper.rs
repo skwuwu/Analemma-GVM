@@ -277,7 +277,14 @@ async fn handle_request(
         event_hash: None,
         llm_trace: None,
         default_caution: is_default_caution,
-        config_integrity_ref: None,
+        // Phase 5 (v3) §4.7: every behavioral event must record the
+        // active integrity-context that governed the handler decision,
+        // so an external auditor can resolve this event back to the
+        // `gvm.system.config_load` record in the WAL chain. The MITM
+        // path was previously logging None here, breaking traceability
+        // for HTTPS traffic specifically (HTTP through proxy_handler
+        // already populated this — see src/proxy.rs:511).
+        config_integrity_ref: state.current_integrity_ref(),
         operation_descriptor: Some(crate::operation::http(&method, &path)),
     };
     match state.ledger.append_durable(&wal_event).await {
