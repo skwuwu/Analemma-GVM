@@ -513,6 +513,12 @@ pub async fn proxy_handler(
     if let Some(ref mut t) = event.transport {
         t.method = request_method.clone();
     }
+    // Phase 1.B: every event reaching the WAL must carry the v2
+    // descriptor so external proofs can be redacted without breaking
+    // event_hash recompute. build_event is shared between Allow /
+    // Delay / Deny paths through proxy_handler; populate here once
+    // request_method is known.
+    event.operation_descriptor = Some(crate::operation::http(&request_method, &target.path));
 
     // ── Step 4: Token budget check (LLM providers only) ──
     // Budget enforcement is independent of SRR — applies to all LLM requests.

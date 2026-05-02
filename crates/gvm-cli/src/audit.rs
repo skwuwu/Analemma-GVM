@@ -1,30 +1,21 @@
 use anyhow::{Context, Result};
 use gvm_types::GVMEvent;
-use sha2::{Digest, Sha256};
 use std::io::BufRead;
 
-/// Recompute the expected event_hash from event fields.
-/// Must match compute_event_hash in src/merkle.rs exactly.
-/// Uses domain separation prefix + length-prefixed fields (no pipe delimiters).
+/// Recompute the expected event_hash from event fields. Dispatches
+/// between v1 (legacy `operation: String`) and v2 (Phase 1
+/// `operation_descriptor` with salted detail digest) based on whether
+/// the event carries a descriptor. Mirrors `gvm_proxy::merkle::compute_event_hash`
+/// — kept thin here so the CLI binary doesn't pull in gvm-proxy's
+/// axum/hyper/rustls dependency tree, but the hash MUST stay
+/// bit-identical to the writer's hash or every legitimate v2 record
+/// would be flagged as tampered.
 fn recompute_event_hash(event: &GVMEvent) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"gvm-event-v1:");
-    for field in &[
-        event.event_id.as_str(),
-        event.trace_id.as_str(),
-        event.agent_id.as_str(),
-        event.operation.as_str(),
-        event.decision.as_str(),
-        event.decision_source.as_str(),
-        &format!("{:?}", event.status),
-        event.enforcement_point.as_str(),
-        &event.timestamp.to_rfc3339(),
-        event.payload.content_hash.as_str(),
-    ] {
-        hasher.update((field.len() as u32).to_le_bytes());
-        hasher.update(field.as_bytes());
-    }
-    hex::encode(hasher.finalize())
+    // Reuse the canonical implementation from gvm-types (same crate
+    // both the writer and the verifier already depend on). This
+    // automatically handles v1 vs v2 dispatch, so the CLI report stays
+    // in sync with whatever schema the writer emitted.
+    gvm_types::proof::recompute_event_hash(event)
 }
 
 /// Verify WAL integrity: check for parseable events, monotonic timestamps,
