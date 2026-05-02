@@ -1229,6 +1229,168 @@ fn bench_ebpf_setup(c: &mut Criterion) {
 }
 
 // ═══════════════════════════════════════════════
+// 18. v3 audit hot-path benchmarks
+//
+// After the v3 audit refactor (Phases A-E + dispatcher fixes), every
+// behavioral event flows through:
+//   1. compute_event_hash dispatcher (v1 vs v2 selection)
+//   2. seal_hash() canonical input over the TripleState snapshot
+//   3. compute_hash() for the per-batch GvmStateAnchor
+//   4. compute_checkpoint_root over (agent_id, agent_root) pairs
+//   5. compute_agent_checkpoint_root over BTreeMap<step, [u8;32]>
+//
+// These benches isolate each step so a future regression in any one
+// of them shows up in CI/bench history rather than only as an
+// end-to-end fsync slowdown.
+// ═══════════════════════════════════════════════
+
+fn bench_v3_event_hash_dispatcher(c: &mut Criterion) {
+    use gvm_proxy::merkle::compute_event_hash;
+    let mut group = c.benchmark_group("v3_event_hash");
+
+    // v1 path: legacy event with operation_descriptor: None
+    let v1_event = make_test_event("v1");
+    group.bench_function("v1_legacy_operation_string", |b| {
+        b.iter(|| {
+            black_box(compute_event_hash(black_box(&v1_event)));
+        });
+    });
+
+    // v2 path: descriptor present (production today)
+    let mut v2_event = make_test_event("v2");
+    v2_event.operation_descriptor = Some(gvm_types::OperationDescriptor::new(
+        "http.POST",
+        Some("/api/v1/user/12345/delete".to_string()),
+        vec![7u8; 16],
+    ));
+    group.bench_function("v2_descriptor_with_detail", |b| {
+        b.iter(|| {
+            black_box(compute_event_hash(black_box(&v2_event)));
+        });
+    });
+
+    // v2 category-only (config_load): no salt, deterministic digest
+    let mut v2_cat_event = make_test_event("v2cat");
+    v2_cat_event.operation_descriptor =
+        Some(gvm_types::OperationDescriptor::category_only("gvm.system.config_load"));
+    group.bench_function("v2_category_only_no_detail", |b| {
+        b.iter(|| {
+            black_box(compute_event_hash(black_box(&v2_cat_event)));
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_v3_seal_and_anchor(c: &mut Criterion) {
+    let mut group = c.benchmark_group("v3_seal_anchor");
+
+    let seal = gvm_types::BatchSealRecord {
+        seal_id: 42,
+        sealed_at: chrono::Utc::now(),
+        context_hash: "a".repeat(64),
+        checkpoint_root: Some("b".repeat(64)),
+        prev_anchor: Some("c".repeat(64)),
+    };
+
+    group.bench_function("seal_hash_canonical", |b| {
+        b.iter(|| {
+            black_box(black_box(&seal).seal_hash());
+        });
+    });
+
+    let batch_root = "d".repeat(64);
+    group.bench_function("anchor_compute_hash", |b| {
+        b.iter(|| {
+            black_box(gvm_types::GvmStateAnchor::compute_hash(
+                1,
+                42,
+                seal.sealed_at.timestamp(),
+                black_box(&batch_root),
+                &seal.context_hash,
+                seal.checkpoint_root.as_deref(),
+                seal.prev_anchor.as_deref(),
+            ));
+        });
+    });
+
+    group.bench_function("anchor_seal_full", |b| {
+        b.iter(|| {
+            let anchor = gvm_types::GvmStateAnchor::seal(1, &seal, batch_root.clone());
+            black_box(anchor);
+        });
+    });
+
+    // verify_self_hash is on every audit-time check; pin its cost.
+    let anchor = gvm_types::GvmStateAnchor::seal(1, &seal, batch_root.clone());
+    group.bench_function("anchor_verify_self_hash", |b| {
+        b.iter(|| {
+            black_box(black_box(&anchor).verify_self_hash());
+        });
+    });
+
+    group.finish();
+}
+
+fn bench_v3_checkpoint_root(c: &mut Criterion) {
+    let mut group = c.benchmark_group("v3_checkpoint_root");
+
+    // Global aggregator root over (agent_id, agent_root) pairs.
+    for n in [10usize, 100, 1_000] {
+        let leaves: Vec<(String, [u8; 32])> = (0..n)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[0] = (i % 256) as u8;
+                (format!("agent-{}", i), h)
+            })
+            .collect();
+        group.bench_with_input(
+            BenchmarkId::new("global_root_agents", n),
+            &leaves,
+            |b, leaves| {
+                b.iter(|| {
+                    black_box(gvm_types::compute_checkpoint_root(black_box(leaves)));
+                });
+            },
+        );
+    }
+
+    // Per-agent per-step tree root.
+    for steps in [10u32, 100, 1_000] {
+        let mut tree: std::collections::BTreeMap<u32, [u8; 32]> = std::collections::BTreeMap::new();
+        for i in 0..steps {
+            let mut h = [0u8; 32];
+            h[0] = (i % 256) as u8;
+            tree.insert(i, h);
+        }
+        group.bench_with_input(
+            BenchmarkId::new("agent_tree_root_steps", steps),
+            &tree,
+            |b, t| {
+                b.iter(|| {
+                    black_box(gvm_types::compute_agent_checkpoint_root(black_box(t)));
+                });
+            },
+        );
+    }
+
+    // Step inclusion proof generation.
+    let mut tree: std::collections::BTreeMap<u32, [u8; 32]> = std::collections::BTreeMap::new();
+    for i in 0..100u32 {
+        let mut h = [0u8; 32];
+        h[0] = (i % 256) as u8;
+        tree.insert(i, h);
+    }
+    group.bench_function("agent_proof_step_50_of_100", |b| {
+        b.iter(|| {
+            black_box(gvm_types::agent_checkpoint_proof(black_box(&tree), 50));
+        });
+    });
+
+    group.finish();
+}
+
+// ═══════════════════════════════════════════════
 
 // Native bench group — always built. Wasm benches are split out behind
 // `--features wasm` so the bench binary builds on default features without
@@ -1247,6 +1409,9 @@ criterion_group!(
     bench_vault_p99,
     bench_vault_contention_p99,
     bench_ebpf_setup,
+    bench_v3_event_hash_dispatcher,
+    bench_v3_seal_and_anchor,
+    bench_v3_checkpoint_root,
 );
 
 #[cfg(feature = "wasm")]
