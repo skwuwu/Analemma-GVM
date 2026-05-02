@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
+pub mod proof;
+pub use proof::{
+    redact_event, verify_proof, CheckpointInclusion, GVMEventOrRedacted, GvmBatchProof, GvmProof,
+    MerkleInclusion, ProofVerifyReport, RedactedEvent, RedactionLevel,
+};
+
 // ─── Operation Namespace (PART 1) ───
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

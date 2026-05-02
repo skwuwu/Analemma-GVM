@@ -13,6 +13,7 @@ pub mod ledger;
 pub mod llm_trace;
 pub mod merkle;
 pub mod operation;
+pub mod proof;
 pub mod proxy;
 pub mod sign;
 pub mod srr;

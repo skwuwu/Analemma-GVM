@@ -9,6 +9,7 @@ mod fs_approve;
 mod init;
 mod pipeline;
 mod preflight;
+mod proof;
 mod proxy_manager;
 mod reload;
 mod run;
@@ -44,6 +45,18 @@ enum Commands {
     Audit {
         #[command(subcommand)]
         action: AuditAction,
+    },
+
+    /// Compact, redactable, single-anchor audit proofs (Phase 4).
+    ///
+    /// Produces a self-contained JSON document that an external auditor
+    /// can verify offline. Three actions:
+    ///   gvm proof event <event_id> --wal <path>   # single event
+    ///   gvm proof batch <batch_id> --wal <path>   # whole batch
+    ///   gvm proof verify <proof.json>             # offline verify
+    Proof {
+        #[command(subcommand)]
+        action: ProofAction,
     },
 
     /// Run interactive demo: finance, assistant, devops, data
@@ -534,6 +547,51 @@ enum AuditAction {
     },
 }
 
+#[derive(Subcommand)]
+enum ProofAction {
+    /// Build a single-event proof.
+    Event {
+        /// Event ID to bundle into the proof.
+        event_id: String,
+
+        /// Path to WAL file.
+        #[arg(long)]
+        wal: String,
+
+        /// Redaction level: none, standard (default), strict.
+        #[arg(long, default_value = "standard")]
+        redaction: String,
+
+        /// Output file path. Default: stdout.
+        #[arg(long)]
+        out: Option<String>,
+    },
+
+    /// Build a whole-batch proof.
+    Batch {
+        /// Batch ID to bundle.
+        batch_id: u64,
+
+        /// Path to WAL file.
+        #[arg(long)]
+        wal: String,
+
+        /// Redaction level: none, standard (default), strict.
+        #[arg(long, default_value = "standard")]
+        redaction: String,
+
+        /// Output file path. Default: stdout.
+        #[arg(long)]
+        out: Option<String>,
+    },
+
+    /// Offline-verify a proof JSON. Prints per-layer pass/fail.
+    Verify {
+        /// Path to proof JSON file.
+        proof: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -580,6 +638,28 @@ async fn main() -> anyhow::Result<()> {
             }
             AuditAction::Export { since, wal, format } => {
                 audit::export_events(&since, &wal, &format).await?;
+            }
+        },
+
+        Commands::Proof { action } => match action {
+            ProofAction::Event {
+                event_id,
+                wal,
+                redaction,
+                out,
+            } => {
+                proof::build_event_proof(&wal, &event_id, &redaction, out.as_deref())?;
+            }
+            ProofAction::Batch {
+                batch_id,
+                wal,
+                redaction,
+                out,
+            } => {
+                proof::build_batch_proof(&wal, batch_id, &redaction, out.as_deref())?;
+            }
+            ProofAction::Verify { proof: proof_path } => {
+                proof::verify_event_proof(&proof_path)?;
             }
         },
 
