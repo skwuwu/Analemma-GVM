@@ -231,7 +231,7 @@ Patterns are pre-compiled at config load time (fail-fast on invalid patterns) an
 - Rate limiter uses verified `agent_id` (spoofing prevented)
 - Backward-compatible: without JWT configured, header-based identity continues
 
-**Remaining limitation**: Token issuance endpoint (`POST /gvm/auth/token`) is unauthenticated in v1. Acceptable for single-host deployment where `gvm run` and proxy are co-located. Multi-tenant deployments should add mTLS for issuance.
+**Remaining limitation**: Token issuance endpoint (`POST /gvm/auth/token`) is unauthenticated in v1. Acceptable for the single-host deployment where `gvm run` and the proxy are co-located on the same trust boundary. Network-exposed token issuance (e.g., when the issuance endpoint is reachable from outside the host) should add mTLS or front it with an upstream auth gateway.
 
 ### 9. IPv4-Mapped IPv6 Bypass (Fixed)
 
@@ -570,12 +570,12 @@ The default proxy configuration binds to `0.0.0.0:8080` (all interfaces) for dev
 listen = "127.0.0.1:8080"  # localhost only
 ```
 
-For Kubernetes or multi-tenant environments, additionally apply:
+For Kubernetes or shared-cluster environments where multiple agent pods reach the same proxy, additionally apply:
 - **NetworkPolicy**: restrict ingress to the proxy pod from agent pods only
 - **mTLS**: mutual TLS between agent and proxy for identity verification
 - **Service mesh**: Istio/Linkerd sidecar for transparent authentication
 
-Without network-level isolation, any process on the same network can send requests with arbitrary `X-GVM-Agent-Id` headers, bypassing agent identity checks.
+Without network-level isolation, any process on the same network can send requests with arbitrary `X-GVM-Agent-Id` headers, bypassing agent identity checks. (Cross-organization isolation is solved at the deployment layer — separate GVM runtime per organization — not by sharing one proxy across orgs.)
 
 ---
 
@@ -674,7 +674,7 @@ All integrity contexts are generated locally by default. Nothing is transmitted 
 This document will be updated as:
 - New attack vectors are discovered or reported
 - Mitigations are implemented (entries move to "Fixed" or are removed)
-- The threat model boundary expands (e.g., multi-tenant SaaS deployment)
+- The threat model boundary expands (e.g., network-exposed token issuance, agent code from many internal authors)
 
 Each mitigation decision is driven by the deployment context — a local development tool has different security requirements than a production financial services proxy.
 

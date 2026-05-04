@@ -321,7 +321,7 @@ gvm run --microvm agent.py          # MicroVM (Firecracker/KVM, ~100ms) [future]
 
 **When MicroVM becomes justified:**
 
-- **Multi-tenant SaaS**: External users submit arbitrary agent code for execution. Untrusted user code (not just untrusted prompts) warrants hardware-level isolation.
+- **Untrusted agent code from arbitrary users within the organization**: when an organization runs a single GVM runtime serving N agents whose code comes from many internal authors and may itself be untrusted (not just prompts), hardware-level isolation between agents is warranted. (Cross-organization isolation is solved at the deployment layer — see "Deployment model" in `docs/internal/CHANGELOG.md` — by running one GVM runtime per organization.)
 - **Regulatory compliance**: Industries (finance, healthcare) may mandate hardware-boundary isolation for workload separation, regardless of practical threat assessment.
 - **Defense-in-depth requirement**: Security-critical deployments where even theoretical kernel exploit vectors must be mitigated.
 
@@ -351,7 +351,7 @@ The proxy layer (`proxy.rs`) and all enforcement logic (SRR, WAL, Vault) remain 
 | Fuzzing CI pipeline | High | Continuous fuzzing with `cargo-fuzz` or AFL — SRR regex matching and JSON payload parsing process adversarial external input directly, making fuzzing high-value for discovering edge cases |
 | Constant-time SRR | Low | Pad all code paths to fixed execution time — low priority because rate limiter already prevents statistical timing attacks and end-to-end timing difference is inherent to proxy architecture |
 | Memory allocator hardening | Low | Use `jemalloc` with security features or custom allocator |
-| MicroVM isolation mode | Low | Firecracker/KVM `--microvm` flag for multi-tenant SaaS (see 8.7) |
+| MicroVM isolation mode | Low | Firecracker/KVM `--microvm` flag for hardware-boundary isolation between agents inside one organization (see 8.7) |
 
 ---
 

@@ -372,7 +372,7 @@ pub struct GVMEvent {
 
     // ── Subject ──
     agent_id: String,                    // Acting agent ID
-    tenant_id: Option<String>,           // Multi-tenant org identifier
+    tenant_id: Option<String>,           // Org tag for audit correlation (single-org per runtime)
     session_id: String,                  // Session identifier
     timestamp: DateTime<Utc>,            // UTC timestamp
 

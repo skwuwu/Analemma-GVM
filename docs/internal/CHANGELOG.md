@@ -8,6 +8,20 @@
 
 ## Roadmap
 
+### Deployment model
+
+**One GVM runtime per organization.** GVM governs the agents of a single
+organization within one runtime — JWT identity, per-agent budget, vault
+namespace, Merkle audit chain, sandbox isolation are all designed for
+the N-agent / single-org case. If multiple organizations need
+independent governance, each runs its own GVM runtime (separate
+process, separate WAL, separate ledger). This is intentional: a single
+WAL with one Merkle chain is what lets the auditor verify the entire
+system from one anchor — splitting it for cross-tenant data isolation
+would erase that property. Multi-tenancy is solved at the deployment
+layer (separate processes / containers / VMs), not inside the GVM
+runtime.
+
 ### Current (v0.5.0)
 
 HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key isolation, IC classification (Allow/Delay/RequireApproval/Deny), Merkle tree audit ledger with WAL group commit, AES-256-GCM encrypted state cache, Wasm runtime (optional, behind `--features wasm`), JWT agent identity, TC ingress filter (kernel-level proxy enforcement), seccomp BPF sandbox with dual filter stacking, DNS soft governance (4-tier delay + alert), filesystem governance (overlayfs Trust-on-Pattern), IC-3 human approval workflow (admin port separation), MITM TLS proxy (sole HTTPS inspection mechanism — uprobe removed).
@@ -51,7 +65,8 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 - Generic outbound capability governance (filesystem, shell, database)
 - Protocol expansion (WebSocket, gRPC method-level, SMTP)
 - Cross-agent collusion detection, trust delegation, inter-agent governance
-- Multi-tenant SaaS, Envoy filter mode, OPA compatibility layer, SOC 2 / ISO 27001
+  (within a single GVM runtime — see "Deployment model" above)
+- Envoy filter mode, OPA compatibility layer, SOC 2 / ISO 27001
 
 ---
 

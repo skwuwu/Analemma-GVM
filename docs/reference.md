@@ -160,7 +160,7 @@ SRR is the sole enforcement layer on Layer 1. Decisions are deterministic — sa
 ```python
 GVMAgent(
     agent_id="finance-001",           # Required
-    tenant_id="acme",                 # Optional: multi-tenant identity
+    tenant_id="acme",                 # Optional: org-scoped tag for audit correlation
     session_id="custom-session",      # Optional: auto-generated if omitted
     proxy_url="http://custom:8080",   # Optional: overrides GVM_PROXY_URL
     auto_checkpoint="ic2+",           # Optional: None | "ic2+" | "ic3" | "all"
