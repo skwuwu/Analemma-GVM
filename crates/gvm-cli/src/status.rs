@@ -357,6 +357,7 @@ fn dummy_sandbox_config() -> gvm_sandbox::SandboxConfig {
         cpu_limit: None,
         fs_policy: None,
         mitm_ca_cert: None,
+        sandbox_id: None,
         sandbox_profile: gvm_sandbox::SandboxProfile::Standard,
         extra_env: vec![],
     }
