@@ -183,6 +183,17 @@ pub struct AppState {
     /// MITM CA certificate PEM (for sandbox trust store download via GET /gvm/ca.pem).
     /// None when TLS MITM is not active.
     pub mitm_ca_pem: Option<Arc<Vec<u8>>>,
+    /// Per-sandbox MITM CA registry (CA-2). Holds one `SandboxCA` per
+    /// active sandbox keyed by `sandbox_id`. Provisioned by the
+    /// `POST /gvm/sandbox/launch` admin endpoint, looked up by the
+    /// MITM resolver during TLS handshake (CA-4 wiring), revoked on
+    /// sandbox exit (CA-5).
+    ///
+    /// Populated unconditionally at proxy startup — the registry is
+    /// just an empty `DashMap` until the first launch. The legacy
+    /// `mitm_ca_pem` (single shared CA) coexists during the migration
+    /// window and is removed at CA-5.
+    pub ca_registry: Arc<gvm_sandbox::ca::CARegistry>,
     /// SRR payload inspection: buffer request body for JSON field matching.
     pub payload_inspection: bool,
     /// Maximum body bytes to buffer for payload inspection.

@@ -445,6 +445,7 @@ async fn main() {
         srr_config_path: config.srr.network_file.clone(),
         gvm_toml_path: gvm_toml_path.clone(),
         mitm_ca_pem: Some(mitm_ca_cert_pem.clone()),
+        ca_registry: Arc::new(gvm_sandbox::ca::CARegistry::new()),
         payload_inspection: config.srr.payload_inspection,
         max_body_bytes: config.srr.max_body_bytes,
         pending_approvals: Arc::new(dashmap::DashMap::new()),
@@ -594,6 +595,21 @@ async fn main() {
         .route(
             "/gvm/dashboard/stats",
             axum::routing::get(api::dashboard_stats),
+        )
+        // Per-sandbox MITM CA (CA-3). Admin-only — sandbox launch is
+        // operator-initiated. The CLI calls these to provision a CA
+        // before a sandbox spawns and to revoke it on exit.
+        .route(
+            "/gvm/sandbox/launch",
+            axum::routing::post(api::sandbox_launch),
+        )
+        .route(
+            "/gvm/sandbox/:sandbox_id/ca.pem",
+            axum::routing::get(api::sandbox_ca_pem),
+        )
+        .route(
+            "/gvm/sandbox/:sandbox_id",
+            axum::routing::delete(api::sandbox_revoke),
         )
         .with_state(state)
         .layer(

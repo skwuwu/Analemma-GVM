@@ -450,6 +450,7 @@ decision = { type = "Delay", milliseconds = 300 }
 
         gvm_toml_path: None,
         mitm_ca_pem: None,
+        ca_registry: std::sync::Arc::new(gvm_sandbox::ca::CARegistry::new()),
         payload_inspection: false,
         max_body_bytes: 65536,
         pending_approvals: std::sync::Arc::new(dashmap::DashMap::new()),
@@ -827,6 +828,7 @@ token = "sk_test_proxy_injected_key"
 
         gvm_toml_path: None,
         mitm_ca_pem: None,
+        ca_registry: std::sync::Arc::new(gvm_sandbox::ca::CARegistry::new()),
         payload_inspection: false,
         max_body_bytes: 65536,
         pending_approvals: std::sync::Arc::new(dashmap::DashMap::new()),
@@ -1096,6 +1098,7 @@ token = "sk_test_proxy_injected_bearer"
 
         gvm_toml_path: None,
         mitm_ca_pem: None,
+        ca_registry: std::sync::Arc::new(gvm_sandbox::ca::CARegistry::new()),
         payload_inspection: false,
         max_body_bytes: 65536,
         pending_approvals: std::sync::Arc::new(dashmap::DashMap::new()),
@@ -1288,6 +1291,7 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
 
         gvm_toml_path: None,
         mitm_ca_pem: None,
+        ca_registry: std::sync::Arc::new(gvm_sandbox::ca::CARegistry::new()),
         payload_inspection: false,
         max_body_bytes: 65536,
         pending_approvals: std::sync::Arc::new(dashmap::DashMap::new()),
@@ -1673,6 +1677,7 @@ async fn checkpoint_save_restore_merkle_verified() {
 
         gvm_toml_path: None,
         mitm_ca_pem: None,
+        ca_registry: std::sync::Arc::new(gvm_sandbox::ca::CARegistry::new()),
         payload_inspection: false,
         max_body_bytes: 65536,
         pending_approvals: std::sync::Arc::new(dashmap::DashMap::new()),
@@ -2128,6 +2133,7 @@ decision = { type = "Allow" }
 
         gvm_toml_path: None,
         mitm_ca_pem: None,
+        ca_registry: std::sync::Arc::new(gvm_sandbox::ca::CARegistry::new()),
         payload_inspection: false,
         max_body_bytes: 65536,
         pending_approvals: pending_approvals.clone(),
@@ -2282,6 +2288,7 @@ decision = { type = "Allow" }
 
         gvm_toml_path: None,
         mitm_ca_pem: None,
+        ca_registry: std::sync::Arc::new(gvm_sandbox::ca::CARegistry::new()),
         payload_inspection: false,
         max_body_bytes: 65536,
         pending_approvals: std::sync::Arc::new(dashmap::DashMap::new()),
@@ -2401,6 +2408,7 @@ decision = { type = "Allow" }
 
         gvm_toml_path: None,
         mitm_ca_pem: None,
+        ca_registry: std::sync::Arc::new(gvm_sandbox::ca::CARegistry::new()),
         payload_inspection: true, // ENABLED for this test
         max_body_bytes: 65536,
         pending_approvals: std::sync::Arc::new(dashmap::DashMap::new()),
@@ -2524,6 +2532,7 @@ decision = { type = "Allow" }
 
         gvm_toml_path: None,
         mitm_ca_pem: None,
+        ca_registry: std::sync::Arc::new(gvm_sandbox::ca::CARegistry::new()),
         payload_inspection: false, // DISABLED — body should NOT be inspected
         max_body_bytes: 65536,
         pending_approvals: std::sync::Arc::new(dashmap::DashMap::new()),
@@ -2615,6 +2624,7 @@ async fn ic3_self_approval_blocked_on_proxy_port() {
 
         gvm_toml_path: None,
         mitm_ca_pem: None,
+        ca_registry: std::sync::Arc::new(gvm_sandbox::ca::CARegistry::new()),
         payload_inspection: false,
         max_body_bytes: 65536,
         pending_approvals: std::sync::Arc::new(dashmap::DashMap::new()),

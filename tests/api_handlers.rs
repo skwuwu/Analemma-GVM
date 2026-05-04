@@ -311,3 +311,185 @@ async fn approve_after_agent_disconnect_returns_gone() {
     let json = body_json(resp).await;
     assert_eq!(json["error"], "agent_disconnected");
 }
+
+// ═══════════════════════════════════════════════════════════════
+// POST /gvm/sandbox/launch  +  GET /gvm/sandbox/:id/ca.pem
+// +  DELETE /gvm/sandbox/:id   (CA-3 — per-sandbox MITM CA)
+// ═══════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn sandbox_launch_provisions_ca_and_returns_pem() {
+    let (state, _wal) = common::test_state().await;
+
+    let req = serde_json::json!({
+        "sandbox_id": "sb-launch-test-1",
+        "agent_id": "agent-x",
+    });
+    let resp = gvm_proxy::api::sandbox_launch(
+        State(state.clone()),
+        axum::Json(serde_json::from_value(req).unwrap()),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["sandbox_id"], "sb-launch-test-1");
+    let pem = json["ca_pem"].as_str().expect("ca_pem string");
+    assert!(
+        pem.starts_with("-----BEGIN CERTIFICATE-----"),
+        "ca_pem must be a real PEM cert, got: {}",
+        &pem[..pem.len().min(60)]
+    );
+    let pubkey_hash = json["ca_pubkey_hash"].as_str().expect("hash present");
+    assert_eq!(pubkey_hash.len(), 64, "SHA-256 hex");
+    assert!(json["launch_event_id"].is_string());
+    assert!(json["ca_not_after"].is_string());
+
+    // Registry now holds this sandbox's CA.
+    assert!(state.ca_registry.lookup("sb-launch-test-1").is_some());
+}
+
+#[tokio::test]
+async fn sandbox_launch_rejects_empty_ids() {
+    let (state, _wal) = common::test_state().await;
+
+    let req = serde_json::json!({
+        "sandbox_id": "",
+        "agent_id": "agent",
+    });
+    let resp = gvm_proxy::api::sandbox_launch(
+        State(state),
+        axum::Json(serde_json::from_value(req).unwrap()),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn sandbox_ca_pem_returns_same_cert_after_launch() {
+    let (state, _wal) = common::test_state().await;
+
+    // Launch.
+    let launch_req = serde_json::json!({
+        "sandbox_id": "sb-pem-test",
+        "agent_id": "agent",
+    });
+    let launch_resp = gvm_proxy::api::sandbox_launch(
+        State(state.clone()),
+        axum::Json(serde_json::from_value(launch_req).unwrap()),
+    )
+    .await;
+    assert_eq!(launch_resp.status(), StatusCode::OK);
+    let launch_json = body_json(launch_resp).await;
+    let launch_pem = launch_json["ca_pem"].as_str().unwrap().to_string();
+    let launch_hash = launch_json["ca_pubkey_hash"].as_str().unwrap().to_string();
+
+    // Re-fetch via GET. Same bytes, same hash header.
+    let resp = gvm_proxy::api::sandbox_ca_pem(
+        axum::extract::Path("sb-pem-test".to_string()),
+        State(state),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("X-GVM-CA-Pubkey-Hash").unwrap(),
+        launch_hash.as_str()
+    );
+
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(String::from_utf8_lossy(&bytes), launch_pem);
+}
+
+#[tokio::test]
+async fn sandbox_ca_pem_404_for_unknown_sandbox() {
+    let (state, _wal) = common::test_state().await;
+    let resp = gvm_proxy::api::sandbox_ca_pem(
+        axum::extract::Path("sb-does-not-exist".to_string()),
+        State(state),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn sandbox_revoke_removes_from_registry() {
+    let (state, _wal) = common::test_state().await;
+
+    let launch_req = serde_json::json!({
+        "sandbox_id": "sb-revoke-test",
+        "agent_id": "agent",
+    });
+    gvm_proxy::api::sandbox_launch(
+        State(state.clone()),
+        axum::Json(serde_json::from_value(launch_req).unwrap()),
+    )
+    .await;
+    assert!(state.ca_registry.lookup("sb-revoke-test").is_some());
+
+    let resp = gvm_proxy::api::sandbox_revoke(
+        axum::extract::Path("sb-revoke-test".to_string()),
+        State(state.clone()),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["revoked"], true);
+
+    // Subsequent lookup misses.
+    assert!(state.ca_registry.lookup("sb-revoke-test").is_none());
+}
+
+#[tokio::test]
+async fn sandbox_revoke_is_idempotent_for_unknown_sandbox() {
+    let (state, _wal) = common::test_state().await;
+    // No launch — revoke should still 200 OK.
+    let resp = gvm_proxy::api::sandbox_revoke(
+        axum::extract::Path("sb-never-existed".to_string()),
+        State(state),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn sandbox_launch_writes_durable_audit_event() {
+    let (state, wal_path) = common::test_state().await;
+
+    let req = serde_json::json!({
+        "sandbox_id": "sb-audit-test",
+        "agent_id": "agent-audit",
+    });
+    let resp = gvm_proxy::api::sandbox_launch(
+        State(state.clone()),
+        axum::Json(serde_json::from_value(req).unwrap()),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let event_id = json["launch_event_id"].as_str().unwrap().to_string();
+    let pubkey_hash = json["ca_pubkey_hash"].as_str().unwrap().to_string();
+
+    // Drop state so the ledger flushes its batch on shutdown.
+    drop(state);
+    // Small wait for the batch loop to drain. The default batch
+    // window is short; `drop(state)` triggers shutdown which fsyncs
+    // pending events. A 200ms wait is conservative.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Read WAL and find a record with our event_id.
+    let content = std::fs::read_to_string(&wal_path).unwrap();
+
+    let found = content
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["event_id"] == event_id.as_str());
+    let event = found.expect("sandbox launch event must be in WAL");
+
+    assert_eq!(event["operation"], "gvm.sandbox.launch");
+    assert_eq!(event["agent_id"], "agent-audit");
+    assert_eq!(event["session_id"], "sb-audit-test");
+    assert_eq!(event["context"]["sandbox_id"], "sb-audit-test");
+    assert_eq!(event["context"]["ca_pubkey_hash"], pubkey_hash);
+    assert_eq!(event["context"]["tls_inspection"], "active");
+    assert!(event["parent_event_id"].is_null(), "launch is chain root");
+}

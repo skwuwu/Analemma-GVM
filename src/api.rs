@@ -1546,6 +1546,211 @@ fn budget_status_json(state: &crate::proxy::AppState) -> serde_json::Value {
     })
 }
 
+// ─── Per-sandbox MITM CA endpoints (CA-3) ──────────────────────────────────
+//
+// These endpoints implement the per-sandbox CA model designed in CA-2.
+// They live on the **admin port only**: a sandbox launch is initiated by
+// the operator's CLI, never by an agent. Putting these on the agent port
+// would let an agent self-provision a CA.
+//
+// Wire-up note: at the time of CA-3 the legacy single-CA `GET /gvm/ca.pem`
+// (admin + agent) still exists and serves the proxy-wide
+// `mitm_ca_pem`. The new endpoints below coexist with it. Removal of the
+// legacy endpoint happens at CA-5 when the disk-persisted CA is dropped
+// entirely.
+
+/// `POST /gvm/sandbox/launch` request body.
+#[derive(Debug, Deserialize)]
+pub struct SandboxLaunchRequest {
+    /// Stable identity for this sandbox. The CLI generates this (typically
+    /// a UUID) so it can be used as a correlation key in audit logs and
+    /// `gvm sandbox inspect` output. The proxy does not invent it; that
+    /// way the CLI's pre-launch logging and the proxy's audit row share a
+    /// single ID without a back-and-forth.
+    pub sandbox_id: String,
+    /// Agent identity that will run inside this sandbox. Stamped on the
+    /// `gvm.sandbox.launch` audit event so a chain walker can attribute
+    /// every later enforcement decision in this sandbox to a known agent.
+    pub agent_id: String,
+}
+
+// Response is built inline via `serde_json::json!` rather than a typed
+// struct so we can keep the `json_response(&Value)` signature shared
+// with every other admin endpoint in this file. The schema is:
+// ```json
+// {
+//   "sandbox_id":      "<echoed>",
+//   "ca_pem":          "-----BEGIN CERTIFICATE-----\n...",
+//   "ca_pubkey_hash":  "<sha256(SPKI DER) hex>",
+//   "launch_event_id": "<uuid of gvm.sandbox.launch event>",
+//   "ca_not_after":    "<rfc3339>"
+// }
+// ```
+
+/// `POST /gvm/sandbox/launch` — admin endpoint.
+///
+/// Provisions a per-sandbox MITM CA, writes a durable
+/// `gvm.sandbox.launch` audit event (fail-close: the CA is **revoked
+/// from the registry** if the audit append fails — there must be no
+/// CA in service whose launch is missing from the chain), and returns
+/// the CA cert PEM for trust-store injection.
+///
+/// Subsequent enforcement events for this sandbox (CA-4 wiring) will
+/// set their `parent_event_id` to `launch_event_id`, anchoring every
+/// decision in the sandbox to a single Merkle-recorded cryptographic
+/// root.
+pub async fn sandbox_launch(
+    State(state): State<AppState>,
+    Json(req): Json<SandboxLaunchRequest>,
+) -> Response<Body> {
+    // Refuse empty IDs early — they would collide in the registry and
+    // produce useless audit rows.
+    if req.sandbox_id.trim().is_empty() || req.agent_id.trim().is_empty() {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({
+                "error": "sandbox_id and agent_id are required and must be non-empty",
+                "status": 400,
+            }),
+        );
+    }
+
+    // 1. Provision CA in the registry. This generates a fresh ECDSA
+    //    P-256 keypair entirely in memory.
+    let ca = match state.ca_registry.provision(&req.sandbox_id) {
+        Ok(ca) => ca,
+        Err(e) => {
+            tracing::error!(
+                sandbox = %req.sandbox_id,
+                error = %e,
+                "sandbox_launch: CA provisioning failed"
+            );
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({
+                    "error": "Failed to provision per-sandbox CA",
+                    "status": 500,
+                }),
+            );
+        }
+    };
+
+    // 2. Build the audit event binding sandbox_id ↔ ca_pubkey_hash.
+    let ca_not_after =
+        chrono::DateTime::<chrono::Utc>::from_timestamp(ca.not_after().unix_timestamp(), 0)
+            .unwrap_or_else(chrono::Utc::now);
+
+    let mut event = crate::operation::build_sandbox_launch_event(
+        ca.sandbox_id(),
+        &req.agent_id,
+        &ca.pubkey_hash_hex(),
+        ca_not_after,
+    );
+    // Stamp with the active integrity ref so the launch is bound to
+    // the policy version that approved it.
+    event.config_integrity_ref = state.current_integrity_ref();
+
+    let launch_event_id = event.event_id.clone();
+
+    // 3. Durable WAL append. **Fail-close**: if this fails, revoke the
+    //    CA we just minted — there must be no CA in service that is not
+    //    in the audit chain. Returning Err here means the sandbox launch
+    //    will not proceed (the CLI is expected to abort the sandbox
+    //    spawn if this endpoint fails).
+    if let Err(e) = state.ledger.append_durable(&event).await {
+        state.ca_registry.revoke(&req.sandbox_id);
+        tracing::error!(
+            sandbox = %req.sandbox_id,
+            error = %e,
+            "sandbox_launch: WAL append failed — CA revoked, refusing launch"
+        );
+        return json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &serde_json::json!({
+                "error": "Audit ledger unavailable — sandbox launch refused (fail-close)",
+                "status": 503,
+            }),
+        );
+    }
+
+    let resp_body = serde_json::json!({
+        "sandbox_id": req.sandbox_id,
+        "ca_pem": String::from_utf8_lossy(ca.ca_cert_pem()),
+        "ca_pubkey_hash": ca.pubkey_hash_hex(),
+        "launch_event_id": launch_event_id,
+        "ca_not_after": ca_not_after.to_rfc3339(),
+    });
+
+    tracing::info!(
+        sandbox = %req.sandbox_id,
+        agent = %req.agent_id,
+        pubkey_hash = %ca.pubkey_hash_hex(),
+        event_id = %launch_event_id,
+        "sandbox_launch: per-sandbox MITM CA provisioned + audit anchored"
+    );
+
+    json_response(StatusCode::OK, &resp_body)
+}
+
+/// `GET /gvm/sandbox/:sandbox_id/ca.pem` — return the CA cert PEM
+/// for a previously-provisioned sandbox.
+///
+/// Idempotent companion to `sandbox_launch` for clients that prefer a
+/// two-step flow (launch + later cert pull). The PEM bytes are the
+/// same as those returned in the launch response — there is no second
+/// keypair generated. The endpoint exists primarily so a CLI can
+/// re-fetch the cert if its local copy is lost between launch and
+/// trust-store injection (it does NOT serve a different CA per call).
+pub async fn sandbox_ca_pem(
+    Path(sandbox_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response<Body> {
+    let Some(ca) = state.ca_registry.lookup(&sandbox_id) else {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            &serde_json::json!({
+                "error": "No CA registered for this sandbox_id (was it launched? was it revoked?)",
+                "status": 404,
+            }),
+        );
+    };
+
+    let pem = ca.ca_cert_pem().to_vec();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/x-pem-file")
+        .header("X-GVM-CA-Pubkey-Hash", ca.pubkey_hash_hex())
+        .body(Body::from(pem))
+        .unwrap_or_else(|_| {
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::empty())
+                .expect("fallback 500 response with empty body cannot fail")
+        })
+}
+
+/// `DELETE /gvm/sandbox/:sandbox_id` — revoke a sandbox's CA.
+///
+/// Drops the `Arc<SandboxCA>` from the registry. In-flight TLS
+/// handshakes that already cloned the `Arc` complete with the old
+/// CA; new handshakes for this sandbox will miss `lookup()` and the
+/// MITM resolver (CA-4) will refuse them.
+///
+/// Called by the CLI on sandbox exit, and by the proxy's startup
+/// orphan sweep (CA-5) when stale state files are reaped. Idempotent
+/// — revoking an unknown sandbox_id is a no-op.
+pub async fn sandbox_revoke(
+    Path(sandbox_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response<Body> {
+    state.ca_registry.revoke(&sandbox_id);
+    let body = serde_json::json!({
+        "sandbox_id": sandbox_id,
+        "revoked": true,
+    });
+    json_response(StatusCode::OK, &body)
+}
+
 /// Approximate LLM cost estimation (same logic as gvm-cli watch).
 fn estimate_llm_cost(provider: &str, model: Option<&str>, prompt: u64, completion: u64) -> f64 {
     let (input_rate, output_rate) = match provider {
