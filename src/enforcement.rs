@@ -107,10 +107,7 @@ pub enum BudgetCheckOutcome {
 ///
 /// Idempotent for disabled budgets: if neither tier is enabled, returns
 /// Allowed without touching state.
-pub fn check_and_reserve_token_budget(
-    state: &AppState,
-    agent_id: &str,
-) -> BudgetCheckOutcome {
+pub fn check_and_reserve_token_budget(state: &AppState, agent_id: &str) -> BudgetCheckOutcome {
     if state.per_agent_budgets.is_enabled() {
         if let Err(exceeded) = state.per_agent_budgets.check_and_reserve(agent_id) {
             return BudgetCheckOutcome::PerAgentDenied(exceeded);

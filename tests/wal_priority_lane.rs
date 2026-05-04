@@ -182,10 +182,7 @@ async fn mixed_priority_batch_shares_single_anchor() {
     );
     assert_eq!(seals.len(), 1, "exactly ONE seal");
     assert_eq!(batches.len(), 1, "exactly ONE batch_record");
-    assert_eq!(
-        batches[0].event_count, 3,
-        "all 3 events in the same batch"
-    );
+    assert_eq!(batches[0].event_count, 3, "all 3 events in the same batch");
 }
 
 // ────────────────────────────────────────────────────────────────────

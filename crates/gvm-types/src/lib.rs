@@ -1544,10 +1544,7 @@ pub fn verify_agent_checkpoint_proof(
     expected_root_hex: &str,
 ) -> bool {
     use sha2::{Digest, Sha256};
-    let mut current: [u8; 32] = match hex::decode(leaf_hex)
-        .ok()
-        .and_then(|v| v.try_into().ok())
-    {
+    let mut current: [u8; 32] = match hex::decode(leaf_hex).ok().and_then(|v| v.try_into().ok()) {
         Some(b) => b,
         None => return false,
     };
@@ -1645,10 +1642,7 @@ pub fn verify_aggregator_inclusion(
     expected_root_hex: &str,
 ) -> bool {
     use sha2::{Digest, Sha256};
-    let mut current: [u8; 32] = match hex::decode(leaf_hex)
-        .ok()
-        .and_then(|v| v.try_into().ok())
-    {
+    let mut current: [u8; 32] = match hex::decode(leaf_hex).ok().and_then(|v| v.try_into().ok()) {
         Some(b) => b,
         None => return false,
     };

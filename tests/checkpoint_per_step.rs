@@ -21,9 +21,9 @@ use gvm_proxy::checkpoint::{AgentCheckpointTree, CheckpointAggregator};
 use gvm_proxy::ledger::{GroupCommitConfig, Ledger};
 use gvm_types::{
     agent_checkpoint_proof, compose_aggregator_leaf, compute_agent_checkpoint_leaf,
-    compute_agent_checkpoint_root, compute_agent_checkpoint_root_hex, verify_agent_checkpoint_proof,
-    verify_aggregator_inclusion, GvmStateAnchor, PREFIX_CKPT_AGENT_LEAF_V1,
-    PREFIX_CKPT_AGENT_NODE_V1, PREFIX_CKPT_AGENT_ROOT_V1,
+    compute_agent_checkpoint_root, compute_agent_checkpoint_root_hex,
+    verify_agent_checkpoint_proof, verify_aggregator_inclusion, GvmStateAnchor,
+    PREFIX_CKPT_AGENT_LEAF_V1, PREFIX_CKPT_AGENT_NODE_V1, PREFIX_CKPT_AGENT_ROOT_V1,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -82,7 +82,10 @@ fn step_is_part_of_leaf_input() {
     let h = [42u8; 32];
     let l0 = compute_agent_checkpoint_leaf(0, &h);
     let l1 = compute_agent_checkpoint_leaf(1, &h);
-    assert_ne!(l0, l1, "step is part of the leaf — same hash at different steps must differ");
+    assert_ne!(
+        l0, l1,
+        "step is part of the leaf — same hash at different steps must differ"
+    );
 }
 
 #[test]
@@ -169,7 +172,11 @@ async fn live_aggregator_last_write_wins_per_step() {
 
     // Same agent + different step: new pair. Step count grows.
     agg.register("agent-1", 6, [42u8; 32]).await.unwrap();
-    assert_eq!(agg.total_step_count().await, 2, "different step is a new leaf");
+    assert_eq!(
+        agg.total_step_count().await,
+        2,
+        "different step is a new leaf"
+    );
 
     drop(agg);
     let ledger_mut = Arc::get_mut(&mut ledger).expect("only ref");
@@ -329,11 +336,7 @@ async fn checkpoint_inclusion_path_verifies_against_anchor_checkpoint_root() {
         .unwrap();
     let agg_leaf = compose_aggregator_leaf(&inclusion.agent_id, &agent_root_bytes);
     assert!(
-        verify_aggregator_inclusion(
-            &hex::encode(agg_leaf),
-            &inclusion.global_path,
-            &final_root,
-        ),
+        verify_aggregator_inclusion(&hex::encode(agg_leaf), &inclusion.global_path, &final_root,),
         "global aggregator path must verify against the published global root"
     );
 

@@ -825,13 +825,21 @@ pub(crate) async fn run_contained_legacy(
         };
         std::path::PathBuf::from(s)
     };
-    let script_dir = abs_script
-        .parent()
-        .with_context(|| format!("Resolved script path has no parent: {}", abs_script.display()))?;
+    let script_dir = abs_script.parent().with_context(|| {
+        format!(
+            "Resolved script path has no parent: {}",
+            abs_script.display()
+        )
+    })?;
     let script_name = abs_script
         .file_name()
         .and_then(|n| n.to_str())
-        .with_context(|| format!("Resolved script path has no file name: {}", abs_script.display()))?;
+        .with_context(|| {
+            format!(
+                "Resolved script path has no file name: {}",
+                abs_script.display()
+            )
+        })?;
     let script_ext = abs_script
         .extension()
         .and_then(|e| e.to_str())

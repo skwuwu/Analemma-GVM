@@ -119,10 +119,7 @@ impl CheckpointAggregator {
     ) -> Result<String> {
         let mut inner = self.inner.lock().await;
 
-        let entry = inner
-            .agents
-            .entry(agent_id.to_string())
-            .or_default();
+        let entry = inner.agents.entry(agent_id.to_string()).or_default();
         entry.set(step, checkpoint);
 
         // Build the (agent_id, agent_root) leaf set for the global

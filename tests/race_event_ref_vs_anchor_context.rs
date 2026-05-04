@@ -176,9 +176,9 @@ fn verify_divergence(wal_path: &std::path::Path) -> bool {
                 Err(_) => continue,
             };
             if let Some(seal) = last_seal.take() {
-                let event_old = group_events.iter().any(|e| {
-                    e.config_integrity_ref.as_deref() == Some(OLD_CTX)
-                });
+                let event_old = group_events
+                    .iter()
+                    .any(|e| e.config_integrity_ref.as_deref() == Some(OLD_CTX));
                 let seal_new = seal.context_hash == NEW_CTX;
                 let anchor_new = anchor.context_hash == NEW_CTX;
                 if event_old && seal_new && anchor_new {

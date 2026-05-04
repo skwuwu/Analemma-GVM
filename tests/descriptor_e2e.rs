@@ -24,10 +24,10 @@
 //! `tests/mitm_streaming.rs` for real-traffic coverage).
 
 use gvm_proxy::ledger::Ledger;
+use gvm_types::proof::recompute_event_hash_either;
 use gvm_types::{
     proof, redact_event, GVMEvent, GVMEventOrRedacted, OperationDescriptor, RedactionLevel,
 };
-use gvm_types::proof::recompute_event_hash_either;
 
 fn read_events_with_op(wal_path: &std::path::Path, op: &str) -> Vec<GVMEvent> {
     let content = std::fs::read_to_string(wal_path).unwrap_or_default();
@@ -191,12 +191,30 @@ fn redaction_preserves_event_hash_recompute_for_every_descriptor_kind() {
     // proxy actually writes: HTTP, CONNECT, WS upgrade, DNS, Vault,
     // category-only (config_load).
     let cases: Vec<(&str, OperationDescriptor)> = vec![
-        ("http", gvm_proxy::operation::http("POST", "/api/v1/user/12345/delete")),
-        ("connect", gvm_proxy::operation::connect("api.openai.com:443")),
-        ("ws", gvm_proxy::operation::ws_upgrade("GET", "/v1/messages?stream=1")),
-        ("dns", gvm_proxy::operation::dns_query("customer.example.com")),
-        ("vault", gvm_proxy::operation::vault("vault_write", "agent-1:k:0")),
-        ("category_only", gvm_proxy::operation::category_only("gvm.system.config_load")),
+        (
+            "http",
+            gvm_proxy::operation::http("POST", "/api/v1/user/12345/delete"),
+        ),
+        (
+            "connect",
+            gvm_proxy::operation::connect("api.openai.com:443"),
+        ),
+        (
+            "ws",
+            gvm_proxy::operation::ws_upgrade("GET", "/v1/messages?stream=1"),
+        ),
+        (
+            "dns",
+            gvm_proxy::operation::dns_query("customer.example.com"),
+        ),
+        (
+            "vault",
+            gvm_proxy::operation::vault("vault_write", "agent-1:k:0"),
+        ),
+        (
+            "category_only",
+            gvm_proxy::operation::category_only("gvm.system.config_load"),
+        ),
     ];
 
     for (label, descriptor) in cases {
@@ -264,7 +282,9 @@ fn build_canonical_event(id: &str, descriptor: OperationDescriptor) -> GVMEvent 
     };
     // event_hash field is required for redacted-form recompute paths
     // that may consult it; populate explicitly.
-    event.event_hash = Some(recompute_event_hash_either(&GVMEventOrRedacted::Full(event.clone())));
+    event.event_hash = Some(recompute_event_hash_either(&GVMEventOrRedacted::Full(
+        event.clone(),
+    )));
     event
 }
 
@@ -330,7 +350,10 @@ async fn checkpoint_inclusion_round_trips_in_proof_json() {
     assert_eq!(inc.agent_id, "agent");
     assert_eq!(inc.step, 1);
     assert_eq!(inc.checkpoint_hash.len(), 64);
-    assert!(!inc.agent_path.is_empty(), "agent_path has at least one node");
+    assert!(
+        !inc.agent_path.is_empty(),
+        "agent_path has at least one node"
+    );
     assert!(
         proof::verify_proof(&parsed, None).all_pass,
         "round-tripped proof with checkpoint inclusion must still verify all-pass"

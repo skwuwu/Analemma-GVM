@@ -574,10 +574,7 @@ async fn batch_loop(
                 }
             }
             // If all 3 lanes are closed AND empty, we're done.
-            if rx_high.is_closed()
-                && rx_normal.is_closed()
-                && rx_low.is_closed()
-            {
+            if rx_high.is_closed() && rx_normal.is_closed() && rx_low.is_closed() {
                 break;
             }
             // Otherwise some lane is still open; continue waiting.
@@ -1172,11 +1169,8 @@ impl Ledger {
 
         // Create integrity context (Local hash-only for standalone users).
         // Now v3: includes prev_anchor_hash binding for replay defense.
-        let integrity = gvm_types::GvmIntegrityContext::local(
-            config_hash,
-            prev_context_hash,
-            prev_anchor_hash,
-        );
+        let integrity =
+            gvm_types::GvmIntegrityContext::local(config_hash, prev_context_hash, prev_anchor_hash);
         let context_hash = integrity.context_hash();
 
         // Embed full context in config_load event (behavioral events only carry the hash)

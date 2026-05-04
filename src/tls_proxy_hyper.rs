@@ -307,9 +307,7 @@ async fn handle_request(
         match crate::enforcement::check_and_reserve_token_budget(state, agent_id) {
             crate::enforcement::BudgetCheckOutcome::Allowed => {}
             crate::enforcement::BudgetCheckOutcome::PerAgentDenied(exceeded) => {
-                let reason = if exceeded.tokens_limit == 0
-                    && exceeded.cost_limit_millionths == 0
-                {
+                let reason = if exceeded.tokens_limit == 0 && exceeded.cost_limit_millionths == 0 {
                     "Per-agent budget admission rejected (quota table full)".to_string()
                 } else {
                     format!(

@@ -159,7 +159,9 @@ async fn live_aggregator_last_write_wins_per_agent() {
     let root_a = agg.current_root_hex().await.unwrap();
     assert_eq!(agg.entry_count().await, 1);
 
-    agg.register_agent_root("agent-1", [99u8; 32]).await.unwrap();
+    agg.register_agent_root("agent-1", [99u8; 32])
+        .await
+        .unwrap();
     let root_b = agg.current_root_hex().await.unwrap();
     assert_eq!(
         agg.entry_count().await,

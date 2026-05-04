@@ -29,7 +29,8 @@ fn parse_redaction(s: &str) -> Result<RedactionLevel> {
 fn write_or_print(json: &str, out: Option<&str>) -> Result<()> {
     match out {
         Some(path) => {
-            std::fs::write(path, json).with_context(|| format!("failed to write proof to {}", path))?;
+            std::fs::write(path, json)
+                .with_context(|| format!("failed to write proof to {}", path))?;
             eprintln!("Wrote proof to {}", path);
         }
         None => {
@@ -59,12 +60,9 @@ pub fn build_batch_proof(
     out: Option<&str>,
 ) -> Result<()> {
     let level = parse_redaction(redaction)?;
-    let proof = gvm_types::proof::build_batch_proof(
-        std::path::Path::new(wal_file),
-        batch_id,
-        level,
-    )
-    .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let proof =
+        gvm_types::proof::build_batch_proof(std::path::Path::new(wal_file), batch_id, level)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
     let json = serde_json::to_string_pretty(&proof)?;
     write_or_print(&json, out)
 }
@@ -82,13 +80,34 @@ pub fn verify_event_proof(proof_path: &str) -> Result<()> {
 
     println!("Proof verification report — {}", proof_path);
     println!("{}", "-".repeat(50));
-    println!("  Event hash recompute:        {}", layer(report.event_hash_valid));
-    println!("  WAL Merkle inclusion:        {}", layer(report.wal_inclusion_valid));
-    println!("  Batch root in anchor:        {}", layer(report.batch_root_in_anchor));
-    println!("  Anchor self-hash:            {}", layer(report.anchor_self_hash_valid));
-    println!("  Seal hash in batch root:     {}", layer(report.seal_in_batch_root));
-    println!("  Config short chain:          {}", layer(report.config_chain_valid));
-    println!("  Config chain anchored:       {}", layer(report.config_chain_anchored));
+    println!(
+        "  Event hash recompute:        {}",
+        layer(report.event_hash_valid)
+    );
+    println!(
+        "  WAL Merkle inclusion:        {}",
+        layer(report.wal_inclusion_valid)
+    );
+    println!(
+        "  Batch root in anchor:        {}",
+        layer(report.batch_root_in_anchor)
+    );
+    println!(
+        "  Anchor self-hash:            {}",
+        layer(report.anchor_self_hash_valid)
+    );
+    println!(
+        "  Seal hash in batch root:     {}",
+        layer(report.seal_in_batch_root)
+    );
+    println!(
+        "  Config short chain:          {}",
+        layer(report.config_chain_valid)
+    );
+    println!(
+        "  Config chain anchored:       {}",
+        layer(report.config_chain_anchored)
+    );
     print!("  Anchor signature:            ");
     match report.anchor_signature_valid {
         Some(true) => println!("PASS"),

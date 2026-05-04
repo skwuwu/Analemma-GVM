@@ -258,7 +258,11 @@ async fn multi_agent_burst_high_priority_lands_in_earlier_batch() {
     }
     for i in 0..2 {
         let l = ledger.clone();
-        let e = evt(&format!("b-deny-{}", i), "agent-B", "Deny { reason: \"x\" }");
+        let e = evt(
+            &format!("b-deny-{}", i),
+            "agent-B",
+            "Deny { reason: \"x\" }",
+        );
         handles.push(tokio::spawn(async move {
             l.append_durable(&e).await.unwrap();
         }));
@@ -292,12 +296,24 @@ async fn multi_agent_burst_high_priority_lands_in_earlier_batch() {
     let deny_positions: Vec<usize> = event_ids
         .iter()
         .enumerate()
-        .filter_map(|(i, id)| if id.starts_with("b-deny-") { Some(i) } else { None })
+        .filter_map(|(i, id)| {
+            if id.starts_with("b-deny-") {
+                Some(i)
+            } else {
+                None
+            }
+        })
         .collect();
     let allow_positions: Vec<usize> = event_ids
         .iter()
         .enumerate()
-        .filter_map(|(i, id)| if id.starts_with("a-low-") { Some(i) } else { None })
+        .filter_map(|(i, id)| {
+            if id.starts_with("a-low-") {
+                Some(i)
+            } else {
+                None
+            }
+        })
         .collect();
 
     let first_deny = *deny_positions.iter().min().unwrap();
@@ -349,7 +365,12 @@ async fn multi_agent_atomicity_preserved_under_burst() {
         for i in 0..5 {
             let l = ledger.clone();
             let e = evt(
-                &format!("{}-{}-{}", a, decision.split_whitespace().next().unwrap_or("x"), i),
+                &format!(
+                    "{}-{}-{}",
+                    a,
+                    decision.split_whitespace().next().unwrap_or("x"),
+                    i
+                ),
                 a,
                 decision,
             );
@@ -405,10 +426,8 @@ fn shared_jwt_config() -> JwtConfig {
 #[test]
 fn distinct_agents_get_independent_tokens() {
     let cfg = shared_jwt_config();
-    let token_a =
-        issue_token(&cfg, "agent-A", Some("tenant-org"), "proxy").expect("issue A");
-    let token_b =
-        issue_token(&cfg, "agent-B", Some("tenant-org"), "proxy").expect("issue B");
+    let token_a = issue_token(&cfg, "agent-A", Some("tenant-org"), "proxy").expect("issue A");
+    let token_b = issue_token(&cfg, "agent-B", Some("tenant-org"), "proxy").expect("issue B");
     assert_ne!(token_a, token_b, "tokens must differ between agents");
 
     let id_a = verify_token(&cfg, &token_a).expect("verify A");

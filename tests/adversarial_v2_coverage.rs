@@ -363,10 +363,7 @@ async fn aggregator_concurrent_register_converges_to_deterministic_root() {
             h[0] = a as u8;
             h[1] = s as u8;
             let aid = format!("agent-{}", a);
-            expected
-                .entry(aid.clone())
-                .or_default()
-                .insert(s, h);
+            expected.entry(aid.clone()).or_default().insert(s, h);
             let agg = agg.clone();
             handles.push(tokio::spawn(async move {
                 agg.register(&aid, s, h).await.unwrap();
@@ -382,7 +379,12 @@ async fn aggregator_concurrent_register_converges_to_deterministic_root() {
     // Compute expected root offline.
     let global_leaves: Vec<(String, [u8; 32])> = expected
         .into_iter()
-        .map(|(id, leaves)| (id, gvm_types::compute_agent_checkpoint_root(&leaves).unwrap()))
+        .map(|(id, leaves)| {
+            (
+                id,
+                gvm_types::compute_agent_checkpoint_root(&leaves).unwrap(),
+            )
+        })
         .collect();
     let expected_root = gvm_types::compute_checkpoint_root_hex(&global_leaves).unwrap();
 

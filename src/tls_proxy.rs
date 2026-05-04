@@ -573,7 +573,6 @@ pub async fn handle_mitm_stream<
     .await
 }
 
-
 /// Resolve the original destination when SNI is absent.
 ///
 /// Uses SO_ORIGINAL_DST on the accepted socket to recover the

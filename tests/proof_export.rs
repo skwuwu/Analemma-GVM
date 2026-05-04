@@ -95,11 +95,7 @@ async fn build_and_verify_round_trip() {
     assert!(report.batch_root_in_anchor, "anchor binds batch_root");
     assert!(report.anchor_self_hash_valid, "anchor self-hash must pass");
     assert!(report.seal_in_batch_root, "seal must be the last leaf");
-    assert!(
-        report.all_pass,
-        "all layers must pass — got {:?}",
-        report
-    );
+    assert!(report.all_pass, "all layers must pass — got {:?}", report);
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -172,7 +168,8 @@ async fn tampered_anchor_fails_self_hash() {
     let wal_path = dir.path().join("wal.log");
     write_one_event(&wal_path, "evt-tamper-anchor").await;
 
-    let mut proof = proof::build_proof(&wal_path, "evt-tamper-anchor", RedactionLevel::None).unwrap();
+    let mut proof =
+        proof::build_proof(&wal_path, "evt-tamper-anchor", RedactionLevel::None).unwrap();
     proof.anchor.context_hash = "ee".repeat(32);
     let report = verify_proof(&proof, None);
     assert!(

@@ -62,7 +62,6 @@ pub enum RedactionLevel {
     Strict,
 }
 
-
 /// An event in either full or redacted form. Both shapes preserve the
 /// canonical inputs to `event_hash` so the verifier can recompute the
 /// hash without holding the unredacted form.
@@ -134,13 +133,12 @@ pub fn redact_event(event: &GVMEvent, level: RedactionLevel) -> GVMEventOrRedact
             // For Strict, also strip the legacy operation string (no
             // privacy-bearing detail leaks from the descriptor side, but
             // the legacy field is the v1 path's full operation).
-            let operation = if matches!(level, RedactionLevel::Strict)
-                && stripped_descriptor.is_some()
-            {
-                String::new()
-            } else {
-                event.operation.clone()
-            };
+            let operation =
+                if matches!(level, RedactionLevel::Strict) && stripped_descriptor.is_some() {
+                    String::new()
+                } else {
+                    event.operation.clone()
+                };
 
             GVMEventOrRedacted::Redacted(RedactedEvent {
                 spec_version: 1,
@@ -316,10 +314,8 @@ pub fn verify_proof(
     report.anchor_self_hash_valid = proof.anchor.verify_self_hash();
 
     // ── Layer 5: config short chain ──
-    let (chain_ok, anchored_ok) = verify_config_short_chain(
-        &proof.config_short_chain,
-        &proof.anchor.context_hash,
-    );
+    let (chain_ok, anchored_ok) =
+        verify_config_short_chain(&proof.config_short_chain, &proof.anchor.context_hash);
     report.config_chain_valid = chain_ok;
     report.config_chain_anchored = anchored_ok;
 
@@ -530,7 +526,11 @@ pub fn generate_merkle_proof_path(
             let last = current_level[current_level.len() - 1];
             current_level.push(last);
         }
-        let sibling_idx = if idx.is_multiple_of(2) { idx + 1 } else { idx - 1 };
+        let sibling_idx = if idx.is_multiple_of(2) {
+            idx + 1
+        } else {
+            idx - 1
+        };
         let is_right = idx.is_multiple_of(2);
         proof.push((hex::encode(current_level[sibling_idx]), is_right));
 
@@ -552,10 +552,7 @@ pub fn generate_merkle_proof_path(
 /// scheme used by `gvm-proxy::merkle`. Local implementation so the
 /// verifier needs nothing from gvm-proxy.
 fn verify_merkle_path(leaf_hex: &str, path: &[(String, bool)], expected_root: &str) -> bool {
-    let mut current: [u8; 32] = match hex::decode(leaf_hex)
-        .ok()
-        .and_then(|v| v.try_into().ok())
-    {
+    let mut current: [u8; 32] = match hex::decode(leaf_hex).ok().and_then(|v| v.try_into().ok()) {
         Some(b) => b,
         None => return false,
     };
@@ -850,8 +847,7 @@ fn finalize_proof(
     }
 
     let leaf_hash = leaves_hex[event_index].clone();
-    let path = generate_merkle_proof_path(&leaves_hex, event_index)
-        .map_err(ProofBuildError)?;
+    let path = generate_merkle_proof_path(&leaves_hex, event_index).map_err(ProofBuildError)?;
 
     let wal_inclusion = MerkleInclusion {
         leaf_hash,

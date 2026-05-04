@@ -64,10 +64,7 @@ type = "Allow"
         .unwrap()
         .check("GET", "api.github.com", "/repos", None);
     assert!(
-        matches!(
-            result.decision,
-            gvm_types::EnforcementDecision::Allow
-        ),
+        matches!(result.decision, gvm_types::EnforcementDecision::Allow),
         "after reload, the new Allow rule must apply; got {:?}",
         result.decision
     );
@@ -145,10 +142,7 @@ type = "Allow"
         .unwrap()
         .check("GET", "api.github.com", "/repos", None);
     assert!(
-        matches!(
-            result.decision,
-            gvm_types::EnforcementDecision::Allow
-        ),
+        matches!(result.decision, gvm_types::EnforcementDecision::Allow),
         "post-failed-reload, original Allow rule for api.github.com/* must still apply; got {:?}",
         result.decision
     );

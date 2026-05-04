@@ -1271,8 +1271,9 @@ fn bench_v3_event_hash_dispatcher(c: &mut Criterion) {
 
     // v2 category-only (config_load): no salt, deterministic digest
     let mut v2_cat_event = make_test_event("v2cat");
-    v2_cat_event.operation_descriptor =
-        Some(gvm_types::OperationDescriptor::category_only("gvm.system.config_load"));
+    v2_cat_event.operation_descriptor = Some(gvm_types::OperationDescriptor::category_only(
+        "gvm.system.config_load",
+    ));
     group.bench_function("v2_category_only_no_detail", |b| {
         b.iter(|| {
             black_box(compute_event_hash(black_box(&v2_cat_event)));

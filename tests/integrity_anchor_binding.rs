@@ -23,9 +23,7 @@
 //!     v1 hash, v3 records dispatch to v3 hash, both round-trip.
 
 use gvm_proxy::ledger::{GroupCommitConfig, Ledger};
-use gvm_types::{
-    verify_integrity_chain, GvmIntegrityContext, GvmStateAnchor, GENESIS_HASH_HEX,
-};
+use gvm_types::{verify_integrity_chain, GvmIntegrityContext, GvmStateAnchor, GENESIS_HASH_HEX};
 
 // ────────────────────────────────────────────────────────────────────
 // 1. Type-level: prev_anchor_hash affects context_hash
@@ -64,11 +62,8 @@ fn v3_genesis_substitutes_genesis_hash_for_canonical_input() {
     // one with Some(GENESIS_HASH_HEX) — same other fields and
     // timestamp.
     let a = GvmIntegrityContext::local("cfg".to_string(), None, None);
-    let mut b = GvmIntegrityContext::local(
-        "cfg".to_string(),
-        None,
-        Some(GENESIS_HASH_HEX.to_string()),
-    );
+    let mut b =
+        GvmIntegrityContext::local("cfg".to_string(), None, Some(GENESIS_HASH_HEX.to_string()));
     b.timestamp = a.timestamp;
     assert_eq!(
         a.context_hash(),
@@ -216,10 +211,7 @@ async fn config_load_after_sealed_batch_carries_prior_anchor() {
         .await
         .unwrap();
     // Append a behavioral event so a batch closes with an anchor.
-    ledger
-        .append_durable(&make_event("between"))
-        .await
-        .unwrap();
+    ledger.append_durable(&make_event("between")).await.unwrap();
 
     // Second config_load: triple.last_anchor now has Some(anchor) from
     // the prior batch. The v3 context records that anchor.
@@ -271,18 +263,12 @@ async fn verify_chain_counts_v3_anchor_bindings() {
         .record_config_load(&[("policy", &policy_path)], None)
         .await
         .unwrap();
-    ledger
-        .append_durable(&make_event("e1"))
-        .await
-        .unwrap();
+    ledger.append_durable(&make_event("e1")).await.unwrap();
     let h2 = ledger
         .record_config_load(&[("policy", &policy_path)], Some(h1))
         .await
         .unwrap();
-    ledger
-        .append_durable(&make_event("e2"))
-        .await
-        .unwrap();
+    ledger.append_durable(&make_event("e2")).await.unwrap();
     ledger
         .record_config_load(&[("policy", &policy_path)], Some(h2))
         .await
@@ -326,10 +312,7 @@ async fn replay_with_phantom_anchor_hash_is_caught() {
         .record_config_load(&[("policy", &policy_path)], None)
         .await
         .unwrap();
-    ledger
-        .append_durable(&make_event("e1"))
-        .await
-        .unwrap();
+    ledger.append_durable(&make_event("e1")).await.unwrap();
     ledger.shutdown().await;
 
     // Forge a config_load line: valid previous_state pointing at h1's
