@@ -7,9 +7,9 @@ use serde::Deserialize;
 use std::path::Path;
 
 mod normalize;
-use normalize::{normalize_host, normalize_path};
 #[cfg(test)]
 use normalize::expand_ipv6;
+use normalize::{normalize_host, normalize_path};
 
 // ─── Network SRR (PART 4) ───
 

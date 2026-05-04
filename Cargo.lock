@@ -1622,7 +1622,9 @@ name = "gvm-sandbox"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "dashmap",
  "glob",
+ "hex",
  "libc",
  "nix",
  "procfs",
@@ -1630,6 +1632,7 @@ dependencies = [
  "seccompiler",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "time",
  "tracing",
