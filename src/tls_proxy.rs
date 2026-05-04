@@ -519,11 +519,12 @@ pub async fn append_enforcement_event(
     decision_str: &str,
     status_code: Option<u16>,
     default_caution: bool,
+    parent_event_id: Option<String>,
 ) {
     let event = gvm_types::GVMEvent {
         event_id: uuid::Uuid::new_v4().to_string(),
         trace_id: uuid::Uuid::new_v4().to_string(),
-        parent_event_id: None,
+        parent_event_id,
         agent_id: classify_output.agent_id.clone(),
         tenant_id: None,
         session_id: host.to_string(),
@@ -578,12 +579,14 @@ pub async fn handle_mitm_stream<
     host_hint: &str,
     client_config: std::sync::Arc<rustls::ClientConfig>,
     state: &crate::proxy::AppState,
+    sandbox_anchor: Option<(String, String)>,
 ) -> Result<()> {
     crate::tls_proxy_hyper::serve_mitm(
         tls_stream,
         host_hint.to_string(),
         client_config,
         state.clone(),
+        sandbox_anchor,
     )
     .await
 }

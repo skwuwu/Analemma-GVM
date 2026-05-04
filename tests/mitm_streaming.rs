@@ -181,7 +181,8 @@ async fn spawn_mitm_listener(
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "unknown.test".to_string());
                 let _ =
-                    gvm_proxy::tls_proxy::handle_mitm_stream(tls_stream, &sni, cc, &state).await;
+                    gvm_proxy::tls_proxy::handle_mitm_stream(tls_stream, &sni, cc, &state, None)
+                        .await;
             });
         }
     });

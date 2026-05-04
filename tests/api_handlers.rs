@@ -451,6 +451,55 @@ async fn sandbox_revoke_is_idempotent_for_unknown_sandbox() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+// ── CA-6 part 2: parent_event_id auto-wiring ──
+
+#[tokio::test]
+async fn resolve_sandbox_anchor_returns_none_for_loopback() {
+    let (state, _wal) = common::test_state().await;
+    // Loopback peer is the cooperative-mode signature — never a sandbox.
+    let anchor = state.resolve_sandbox_anchor(Some("127.0.0.1".parse().unwrap()));
+    assert!(anchor.is_none());
+}
+
+#[tokio::test]
+async fn resolve_sandbox_anchor_returns_none_when_peer_unknown() {
+    // Non-loopback IP that doesn't match any state file → None.
+    // Caller falls back to the legacy unverified-identity path.
+    let (state, _wal) = common::test_state().await;
+    let anchor = state.resolve_sandbox_anchor(Some("10.200.99.99".parse().unwrap()));
+    assert!(anchor.is_none());
+}
+
+#[tokio::test]
+async fn resolve_sandbox_anchor_uses_per_sandbox_metadata() {
+    // The Linux-only path goes through gvm_sandbox::lookup_sandbox_id_by_ip
+    // which scans /run/gvm/*.state files — those don't exist in test
+    // setup. So we can't exercise the *full* lookup path in a unit
+    // test. What we CAN verify here is that, given metadata is
+    // present in the registry, the AppState helper composes correctly:
+    // the metadata stored at sandbox_launch time is the same shape
+    // resolve_sandbox_anchor reads back.
+    let (state, _wal) = common::test_state().await;
+    let req = serde_json::json!({"sandbox_id": "sb-anchor", "agent_id": "agent-anchor"});
+    gvm_proxy::api::sandbox_launch(
+        State(state.clone()),
+        axum::Json(serde_json::from_value(req).unwrap()),
+    )
+    .await;
+
+    // Read metadata directly to verify the shape that resolve_sandbox_anchor
+    // would compose for a Linux peer hit. The agent_id and launch_event_id
+    // are what get stamped on subsequent enforcement events.
+    let metadata = state
+        .per_sandbox_metadata
+        .get("sb-anchor")
+        .expect("metadata recorded by sandbox_launch");
+    assert_eq!(metadata.agent_id, "agent-anchor");
+    assert!(metadata.launch_event_id.len() > 8); // UUID-ish
+                                                 // (launched_at is a chrono::DateTime — presence implied by struct
+                                                 // construction, no further assertion needed.)
+}
+
 // ── CA-7: gvm sandbox list ──
 
 #[tokio::test]

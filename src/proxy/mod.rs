@@ -381,6 +381,45 @@ impl AppState {
         Some((resolver, server_config))
     }
 
+    /// Resolve a connecting peer's IP back to its sandbox metadata
+    /// (CA-6 part 2). Returns `(agent_id, launch_event_id)` when the
+    /// peer's veth IP maps to a registered sandbox via the per-PID
+    /// state file (Linux) AND that sandbox has audit metadata recorded.
+    ///
+    /// **Used to anchor every enforcement event in a sandbox to its
+    /// launch event** — by stamping `parent_event_id =
+    /// launch_event_id` and `agent_id = <real identity>` on the
+    /// emitted GVMEvent, a chain walker traversing backward from any
+    /// decision can recover the launch context (CA pubkey hash,
+    /// agent_id, mode) without joining external state.
+    ///
+    /// Returns `None` for: loopback peers (cooperative mode — no
+    /// sandbox), peers with no matching state file (legacy launch
+    /// path), and on non-Linux builds where state files don't exist.
+    /// Callers MUST treat `None` as "fall through to legacy
+    /// agent_id='unknown' + parent_event_id=None" — this resolver is
+    /// strictly additive.
+    pub fn resolve_sandbox_anchor(
+        &self,
+        peer_ip: Option<std::net::IpAddr>,
+    ) -> Option<(String, String)> {
+        let ip = peer_ip?;
+        if ip.is_loopback() {
+            return None;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let sandbox_id = gvm_sandbox::lookup_sandbox_id_by_ip(&ip.to_string())?;
+            let metadata = self.per_sandbox_metadata.get(&sandbox_id)?;
+            return Some((metadata.agent_id.clone(), metadata.launch_event_id.clone()));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = ip; // avoid unused-var lint on Windows
+            None
+        }
+    }
+
     /// Revoke a sandbox: clear all derived state (TLS bundle cache,
     /// metadata), then drop its CA from the registry. Order matters
     /// — clear derived caches first so a concurrent

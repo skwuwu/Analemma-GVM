@@ -121,6 +121,19 @@ async fn handle_connect_inner(
         }
     }
 
+    // CA-6 part 2: resolve the connecting peer to its sandbox launch
+    // anchor BEFORE building either the Deny or Allow event, so both
+    // share the same identity attribution + parent_event_id chain
+    // link. Capturing peer_ip here (vs the original site below) is
+    // an additive change — the legacy site still uses `peer_ip` for
+    // MITM gating later.
+    let peer_ip_for_anchor = request.extensions().get::<std::net::IpAddr>().copied();
+    let (anchor_agent_id, anchor_parent_event_id) =
+        match state.resolve_sandbox_anchor(peer_ip_for_anchor) {
+            Some((agent, launch)) => (agent, Some(launch)),
+            None => ("unknown".to_string(), None),
+        };
+
     // Enforce decision
     match decision {
         EnforcementDecision::Deny { reason } => {
@@ -130,7 +143,7 @@ async fn handle_connect_inner(
             let event = GVMEvent {
                 event_id: uuid::Uuid::new_v4().to_string(),
                 trace_id: uuid::Uuid::new_v4().to_string(),
-                agent_id: "unknown".to_string(),
+                agent_id: anchor_agent_id.clone(),
                 operation: format!("connect:{}", host),
                 decision: "Deny".to_string(),
                 decision_source: "SRR".to_string(),
@@ -156,7 +169,7 @@ async fn handle_connect_inner(
                 config_integrity_ref: state.current_integrity_ref(),
                 operation_descriptor: Some(crate::operation::connect(host)),
                 tenant_id: None,
-                parent_event_id: None,
+                parent_event_id: anchor_parent_event_id.clone(),
                 session_id: String::new(),
             };
             // CONNECT Deny is a governance decision and must be durably
@@ -186,7 +199,7 @@ async fn handle_connect_inner(
     let event = GVMEvent {
         event_id: uuid::Uuid::new_v4().to_string(),
         trace_id: uuid::Uuid::new_v4().to_string(),
-        agent_id: "unknown".to_string(),
+        agent_id: anchor_agent_id.clone(),
         operation: format!("connect:{}", host),
         decision: format!("{:?}", decision),
         decision_source: "SRR".to_string(),
@@ -210,7 +223,7 @@ async fn handle_connect_inner(
         config_integrity_ref: state.current_integrity_ref(),
         operation_descriptor: Some(crate::operation::connect(host)),
         tenant_id: None,
-        parent_event_id: None,
+        parent_event_id: anchor_parent_event_id.clone(),
         session_id: String::new(),
     };
     if let Err(e) = state.ledger.append_durable(&event).await {
@@ -287,6 +300,13 @@ async fn handle_connect_inner(
         None
     };
     let connect_state = state.clone();
+    // Bundle the resolved anchor so every L7 event served inside this
+    // tunnel inherits the same (agent_id, launch_event_id) parent
+    // link. Resolved once per CONNECT instead of per-request, since
+    // the peer/sandbox binding is fixed for the tunnel's lifetime.
+    let anchor_for_stream: Option<(String, String)> = anchor_parent_event_id
+        .clone()
+        .map(|launch_id| (anchor_agent_id.clone(), launch_id));
 
     tokio::task::spawn(async move {
         let upgraded = match hyper::upgrade::on(request).await {
@@ -331,9 +351,14 @@ async fn handle_connect_inner(
                 }
             };
 
-            if let Err(e) =
-                crate::tls_proxy::handle_mitm_stream(tls_stream, &host_owned, cc, &connect_state)
-                    .await
+            if let Err(e) = crate::tls_proxy::handle_mitm_stream(
+                tls_stream,
+                &host_owned,
+                cc,
+                &connect_state,
+                anchor_for_stream,
+            )
+            .await
             {
                 tracing::debug!(host = %host_owned, error = %e, "CONNECT MITM: stream handling error");
             }

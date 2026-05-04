@@ -61,6 +61,7 @@ pub async fn serve_mitm<S>(
     host_hint: String,
     client_config: Arc<rustls::ClientConfig>,
     state: crate::proxy::AppState,
+    sandbox_anchor: Option<(String, String)>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -73,7 +74,8 @@ where
         let state = state.clone();
         let cc = client_config.clone();
         let hint = host_hint.clone();
-        async move { handle_request(req, &hint, cc, &state).await }
+        let anchor = sandbox_anchor.clone();
+        async move { handle_request(req, &hint, cc, &state, anchor).await }
     });
 
     let conn = http1::Builder::new()
@@ -96,6 +98,7 @@ async fn handle_request(
     host_hint: &str,
     client_config: Arc<rustls::ClientConfig>,
     state: &crate::proxy::AppState,
+    sandbox_anchor: Option<(String, String)>,
 ) -> Result<Response<MitmBody>, String> {
     // Extract metadata before consuming body.
     //
@@ -281,6 +284,7 @@ async fn handle_request(
                 &format!("Deny {{ reason: {:?} }}", reason),
                 Some(403),
                 false,
+                sandbox_anchor.as_ref().map(|(_, parent)| parent.clone()),
             )
             .await;
             // Keep-alive: no Connection: close — agent can retry on same connection
@@ -366,7 +370,11 @@ async fn handle_request(
     let wal_event = gvm_types::GVMEvent {
         event_id: uuid::Uuid::new_v4().to_string(),
         trace_id: uuid::Uuid::new_v4().to_string(),
-        parent_event_id: None,
+        // CA-6 part 2: anchor every L7 event in this sandbox to the
+        // sandbox's launch event, so a chain walker traversing back
+        // from any decision can recover the cryptographic root + agent
+        // identity without joining external state.
+        parent_event_id: sandbox_anchor.as_ref().map(|(_, parent)| parent.clone()),
         agent_id: classify_output.agent_id.clone(),
         tenant_id: None,
         session_id: host.clone(),

@@ -1157,6 +1157,15 @@ async fn handle_tls_connection(
     use gvm_proxy::tls_proxy::peek_sni;
     use tokio_rustls::TlsAcceptor;
 
+    // Capture the peer's IP BEFORE moving the stream into the
+    // acceptor — needed by Phase B (CA-6 part 2) to resolve which
+    // sandbox launch event should be the parent of every L7 event
+    // emitted on this connection. Falls back to None on the rare
+    // peer-address read failure (no anchor wired, agent_id stays
+    // unverified — same as the legacy path).
+    let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
+    let sandbox_anchor = state.resolve_sandbox_anchor(peer_ip);
+
     // 1. Pre-warm cert cache: peek SNI from raw TCP, generate cert on blocking
     //    thread pool. This prevents CPU-bound keygen from starving tokio workers.
     //    We also keep the SNI string itself to pass to the MITM handler — it's
@@ -1177,7 +1186,14 @@ async fn handle_tls_connection(
 
     // 3-8. Shared MITM handler (read request, SRR check, enforce, forward, relay)
     let host_hint = sni.as_deref().unwrap_or("");
-    gvm_proxy::tls_proxy::handle_mitm_stream(tls_stream, host_hint, client_config, &state).await
+    gvm_proxy::tls_proxy::handle_mitm_stream(
+        tls_stream,
+        host_hint,
+        client_config,
+        &state,
+        sandbox_anchor,
+    )
+    .await
 }
 
 /// Print a human-readable startup summary of loaded governance rules.
