@@ -1,24 +1,29 @@
 //! MITM CA management for transparent TLS inspection inside sandboxes.
 //!
-//! Two CA models coexist during the v0.5 → v0.6 migration:
+//! Two CA models coexist:
 //!
-//! 1. **`EphemeralCA` (legacy, this module's original type)** — persistent,
-//!    single CA shared by every sandbox. Stored at `data/mitm-ca.pem` +
-//!    `data/mitm-ca-key.pem` with 0600 permissions. Reused across proxy
-//!    restarts so running sandboxes keep TLS trust. **The name "Ephemeral"
-//!    is historical — the keypair is on host disk.** All sandboxes share
-//!    the same private key, so a key compromise affects every sandbox.
+//! 1. **`EphemeralCA` (legacy fallback, RAM-only since CA-5)** — single
+//!    CA generated fresh at proxy startup, held only in proxy memory,
+//!    zeroized on Drop. Shared across all sandboxes that have not been
+//!    migrated to the per-sandbox path. Sandboxes provisioned through
+//!    `POST /gvm/sandbox/launch` (CA-3) get their own `SandboxCA` and
+//!    do NOT use this legacy CA. Removal entirely once every launch
+//!    flow is migrated.
 //!
-//! 2. **`SandboxCA` + `CARegistry` (new, RAM-only, per-sandbox)** — each
-//!    sandbox launch generates its own CA, held in proxy memory only,
-//!    zeroized on sandbox exit. Bound to the audit chain via a
+//!    Trade-off: proxy restart now invalidates legacy sandboxes' TLS
+//!    trust (a fresh `EphemeralCA` has a different keypair). The
+//!    intended remedy is the sandbox heartbeat — sandbox detects
+//!    proxy down → self-terminates → relaunches via
+//!    `/gvm/sandbox/launch` and gets a fresh per-sandbox CA. Disk
+//!    persistence was the previous workaround; CA-5 drops it because
+//!    keeping a shared CA's private key on disk is the larger risk.
+//!
+//! 2. **`SandboxCA` + `CARegistry` (per-sandbox, RAM-only, since CA-2)** —
+//!    each sandbox launch generates its own CA, held in proxy memory
+//!    only, zeroized on sandbox exit. Bound to the audit chain via a
 //!    `gvm.sandbox.launch` event whose `parent_event_id` is the chain
 //!    root for every subsequent enforcement decision in that sandbox.
 //!    See [`SandboxCA`] / [`CARegistry`].
-//!
-//! Migration plan: CA-1 (this docfix) → CA-2 (introduce SandboxCA, dual
-//! emit sandbox_launch events) → CA-4 (MITM resolver routes by
-//! sandbox_id) → CA-5 (delete `data/mitm-ca-key.pem`, drop EphemeralCA).
 //!
 //! Leaf certificates are generated on-demand per domain (via SNI) and
 //! cached in a concurrent map. Both CA models cache leaves; the new
@@ -28,124 +33,51 @@
 use anyhow::{Context, Result};
 use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
 use sha2::{Digest, Sha256};
-use std::path::Path;
 use std::sync::Arc;
 use zeroize::Zeroize;
 
-/// **Legacy single-CA model — persistent on host disk, shared across sandboxes.**
+/// **Legacy single-CA model — RAM-only since CA-5, shared across sandboxes.**
 ///
-/// Persisted to disk so that proxy restarts don't invalidate running sandbox
-/// trust stores. Matches the pattern used by mitmproxy, Burp Suite, and
-/// Charles Proxy — one CA, reused across sessions. Will be removed at
-/// CA-5 in favor of [`SandboxCA`].
+/// Generated fresh at proxy startup, held only in proxy memory, zeroized
+/// on `Drop`. This is the fallback CA used by CONNECT MITM for any peer
+/// that did NOT provision via `POST /gvm/sandbox/launch` (CA-3) — i.e.
+/// sandboxes from older launch flows or the cooperative-loopback path.
 ///
-/// The CA cert + key are stored with restricted permissions (0600).
-/// The key is zeroized in memory on drop, but the disk copy survives
-/// process exit — that is the property the new model fixes.
+/// **Restart caveat (CA-5)**: a restarted proxy mints a new keypair, so
+/// any sandbox still trusting the previous CA fails TLS. The intended
+/// remedy is the per-sandbox flow (CA-2/CA-3/CA-4) plus a sandbox
+/// heartbeat (CA-6) that detects proxy down and self-terminates so the
+/// CLI can relaunch with a fresh CA. We accept the trade-off because
+/// keeping a shared CA's private key on host disk is the larger risk —
+/// any process that can read `data/mitm-ca-key.pem` can forge any TLS
+/// identity until the cert expires (365 days), and there is no
+/// rotation hook today.
 pub struct EphemeralCA {
     /// PEM-encoded CA certificate (for injection into sandbox trust store).
     ca_cert_pem: Vec<u8>,
     /// PEM-encoded CA private key (for GvmCertResolver to sign leaf certs).
     ca_key_pem: Vec<u8>,
-    /// Certificate `not_after` timestamp.
-    ///
-    /// Set exactly when the CA is freshly generated. When loaded from disk
-    /// (subsequent restarts), we approximate via the cert file's mtime + 365d
-    /// — this stays accurate as long as the file was written by `generate()`,
-    /// which is the only path that creates it. Surfaced as `ca_expires_days`
-    /// in `/gvm/health` so `gvm status` can warn before expiry.
+    /// Certificate `not_after` timestamp. Set when the CA is generated;
+    /// since CA-5 the keypair is RAM-only and never reloaded, so this
+    /// is always `now + 365 days` from process startup. Surfaced as
+    /// `ca_expires_days` in `/gvm/health` so `gvm status` can warn
+    /// before expiry — though in practice the proxy will be restarted
+    /// well before a 365-day-old key would expire.
     not_after: time::OffsetDateTime,
 }
 
-/// Default file paths for persistent CA storage.
-const CA_CERT_PATH: &str = "data/mitm-ca.pem";
-const CA_KEY_PATH: &str = "data/mitm-ca-key.pem";
-
 impl EphemeralCA {
-    /// Load existing CA from disk, or generate a new one and save it.
+    /// Generate a fresh RAM-only CA with an ECDSA P-256 key.
     ///
-    /// On first run: generates ECDSA P-256 CA, saves cert + key to data/.
-    /// On subsequent runs: loads from disk — same CA across proxy restarts.
-    /// Running sandboxes keep working because the CA doesn't change.
-    pub fn load_or_generate() -> Result<Self> {
-        let cert_path = Path::new(CA_CERT_PATH);
-        let key_path = Path::new(CA_KEY_PATH);
-
-        if cert_path.exists() && key_path.exists() {
-            match Self::load_from_disk(cert_path, key_path) {
-                Ok(ca) => return Ok(ca),
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to load saved CA — regenerating");
-                }
-            }
-        }
-
-        let ca = Self::generate()?;
-        ca.save_to_disk(cert_path, key_path)?;
-        Ok(ca)
-    }
-
-    /// Load CA cert + key from disk. No regeneration — exact same bytes.
-    fn load_from_disk(cert_path: &Path, key_path: &Path) -> Result<Self> {
-        let cert_pem = std::fs::read(cert_path).context("Failed to read CA cert")?;
-        let key_pem = std::fs::read(key_path).context("Failed to read CA key")?;
-
-        // Validate that the key is parseable
-        KeyPair::from_pem(&String::from_utf8_lossy(&key_pem))
-            .context("Saved CA key PEM is invalid")?;
-
-        // Approximate not_after from the cert file's mtime + 365d.
-        // This is exact because generate() always sets a 365-day validity
-        // and writes the file immediately. Falls back to "now + 365d" if the
-        // mtime is unreadable (extremely rare).
-        let mtime = std::fs::metadata(cert_path)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .and_then(|d| time::OffsetDateTime::from_unix_timestamp(d.as_secs() as i64).ok())
-            .unwrap_or_else(time::OffsetDateTime::now_utc);
-        let not_after = mtime + time::Duration::days(365);
-
-        tracing::info!(
-            cert = %cert_path.display(),
-            "MITM CA loaded from disk (persistent across restarts)"
-        );
-
-        Ok(Self {
-            ca_cert_pem: cert_pem,
-            ca_key_pem: key_pem,
-            not_after,
-        })
-    }
-
-    /// Save CA cert + key to disk with restricted permissions.
-    fn save_to_disk(&self, cert_path: &Path, key_path: &Path) -> Result<()> {
-        if let Some(parent) = cert_path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-
-        std::fs::write(cert_path, &self.ca_cert_pem).context("Failed to write CA cert")?;
-        std::fs::write(key_path, &self.ca_key_pem).context("Failed to write CA key")?;
-
-        // Restrict permissions (key file especially)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600)).ok();
-            std::fs::set_permissions(cert_path, std::fs::Permissions::from_mode(0o644)).ok();
-        }
-
-        tracing::info!(
-            cert = %cert_path.display(),
-            key = %key_path.display(),
-            "MITM CA saved to disk (reused on proxy restart)"
-        );
-        Ok(())
-    }
-
-    /// Generate a new CA with ECDSA P-256 key.
+    /// **Lifetime**: lives until `Drop`. There is no on-disk copy
+    /// (CA-5 removed `load_or_generate` / `save_to_disk` /
+    /// `load_from_disk`). Running sandboxes that have this CA in
+    /// their trust store will lose TLS trust on proxy restart — the
+    /// remedy is the per-sandbox CA flow (CA-2/3/4) plus a sandbox
+    /// heartbeat (CA-6) that triggers a relaunch with a fresh CA.
     ///
-    /// Valid for 365 days. Persisted to disk by load_or_generate().
+    /// **Validity**: 365 days from `now`. Backdated 24 hours to
+    /// tolerate sandbox/proxy clock skew.
     pub fn generate() -> Result<Self> {
         let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
             .context("Failed to generate CA key pair")?;
@@ -158,7 +90,7 @@ impl EphemeralCA {
             dn.push(DnType::OrganizationName, "Analemma GVM");
             dn
         };
-        // 365-day validity. Persistent CA — not ephemeral per-session.
+        // 365-day validity. RAM-only since CA-5 — no disk persistence.
         let now = time::OffsetDateTime::now_utc();
         params.not_before = now - time::Duration::hours(24);
         let not_after = now + time::Duration::days(365);
@@ -495,25 +427,14 @@ mod tests {
         assert!(!ca.ca_key_pem().is_empty());
     }
 
-    #[test]
-    fn ca_roundtrip_via_disk() {
-        let ca = EphemeralCA::generate().unwrap();
-        let cert_pem = ca.ca_cert_pem().to_vec();
-        let key_pem = ca.ca_key_pem();
-
-        // Write + read should produce identical bytes
-        let dir = std::env::temp_dir().join("gvm-ca-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let cert_path = dir.join("ca.pem");
-        let key_path = dir.join("ca-key.pem");
-        ca.save_to_disk(&cert_path, &key_path).unwrap();
-
-        let loaded = EphemeralCA::load_from_disk(&cert_path, &key_path).unwrap();
-        assert_eq!(loaded.ca_cert_pem(), cert_pem);
-        assert_eq!(loaded.ca_key_pem(), key_pem);
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
+    // Note: CA-5 dropped `load_or_generate` / `save_to_disk` /
+    // `load_from_disk`, so the previous `ca_roundtrip_via_disk` test
+    // is gone. Disk persistence is no longer a contract worth pinning;
+    // pinning the *absence* of disk writes is what matters now, and
+    // is enforced structurally — there is no API surface that writes
+    // CA material to disk, so a tester would have to reintroduce one
+    // to break the property. Watching that code surface in review is
+    // the right enforcement mechanism here.
 
     #[test]
     fn ca_zeroized_on_drop() {

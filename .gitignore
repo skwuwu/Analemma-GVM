@@ -43,6 +43,11 @@ data/wal.log.watermark
 data/wal_emergency.log
 data/proxy.log
 data/proxy.pid
+# MITM CA was previously persisted at these paths. Since CA-5 the
+# legacy CA is RAM-only and per-sandbox CAs are also RAM-only — these
+# files should not exist in any working tree. Kept in .gitignore as a
+# guard so a hand-edited CA file (e.g. for a one-off mitmproxy-style
+# debug session) doesn't accidentally get committed.
 data/mitm-ca.pem
 data/mitm-ca-key.pem
 

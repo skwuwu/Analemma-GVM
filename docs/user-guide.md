@@ -307,11 +307,12 @@ gvm run --sandbox --memory 1g --cpus 0.5 -- node agent.js
 
 > **Note:** Node.js ignores `HTTPS_PROXY`. Sandbox mode solves this — all HTTPS is intercepted regardless of the agent's behavior.
 
-> **Proxy restart recovery:** The MITM CA is persisted to `data/mitm-ca.pem` and reused across proxy restarts, so TLS trust is preserved. However, if the proxy crashes or is restarted, running sandboxes may lose their TCP connections. The agent's HTTP client may not recover automatically. Restart the sandbox:
+> **Proxy restart breaks TLS trust (CA-5):** Since CA-5 the MITM CA is held in proxy memory only — there is no `data/mitm-ca.pem` on disk. A restarted proxy mints a fresh keypair, so any sandbox still trusting the previous CA will fail TLS. The mitigation is a relaunch:
 > ```bash
-> gvm cleanup        # remove orphaned veth/iptables from crashed sandbox
-> gvm run --sandbox --sandbox-timeout 0 -- node agent.js   # fresh start
+> gvm cleanup        # remove orphaned veth/iptables from the dead sandbox
+> gvm run --sandbox --sandbox-timeout 0 -- node agent.js   # fresh CA injected
 > ```
+> This is intentional. Persisting a shared CA's private key to host disk was the larger security risk — anyone who could read `data/mitm-ca-key.pem` could forge any TLS identity until cert expiry. Per-sandbox CAs (provisioned via `POST /gvm/sandbox/launch`, CA-3) restore restart resilience by binding the trust to a single sandbox lifetime.
 
 ### Shadow Mode
 

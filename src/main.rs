@@ -383,13 +383,19 @@ async fn main() {
         }
     };
 
-    // 9.9. Load or generate persistent CA for MITM TLS inspection.
-    // CA is saved to data/mitm-ca.pem + data/mitm-ca-key.pem and reused across
-    // proxy restarts. This ensures running sandboxes (which have the CA in their
-    // trust store) remain valid when the proxy is restarted.
-    // Pattern matches mitmproxy, Burp Suite, Charles Proxy.
-    let mitm_ca = gvm_sandbox::ca::EphemeralCA::load_or_generate()
-        .expect("Failed to load or generate MITM CA");
+    // 9.9. Generate the legacy fallback MITM CA in RAM (CA-5).
+    //
+    // Used for any MITM CONNECT whose peer was NOT provisioned via
+    // `POST /gvm/sandbox/launch` (CA-3) — i.e. older launch paths,
+    // cooperative-loopback, etc. Per-sandbox flows get their own
+    // `SandboxCA` from `CARegistry` and never touch this one.
+    //
+    // The keypair lives in proxy memory only; CA-5 dropped the
+    // `data/mitm-ca-key.pem` persistence because keeping a
+    // long-lived shared CA's key on disk is a larger blast radius
+    // than a restart-induced trust break. Sandboxes that need to
+    // survive proxy restart must use the per-sandbox flow.
+    let mitm_ca = gvm_sandbox::ca::EphemeralCA::generate().expect("Failed to generate MITM CA");
     let mitm_ca_cert_pem = Arc::new(mitm_ca.ca_cert_pem().to_vec());
     let mitm_ca_key_pem = Arc::new(mitm_ca.ca_key_pem());
     // Snapshot CA validity for `/gvm/health` (consumed by `gvm status`).
