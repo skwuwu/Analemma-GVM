@@ -232,17 +232,54 @@ async fn handle_connect_inner(
     // Only loopback (127.0.0.1) cooperative mode is excluded — no CA injection.
     let is_isolated = peer_ip.is_some_and(|ip| !ip.is_loopback());
 
+    // CA-4 routing: if the peer's veth IP maps to a registered sandbox_id
+    // (via the per-PID state file), prefer that sandbox's per-sandbox CA.
+    // Otherwise we fall back to the legacy shared `mitm_resolver` +
+    // `mitm_server_config`, which is the right behavior for sandboxes
+    // provisioned before CA-3 and for Docker-mode launches not yet wired
+    // to /gvm/sandbox/launch.
+    //
+    // The lookup is Linux-only because state files live under /run/gvm,
+    // a Linux-specific tmpfs. On other platforms the helper is absent
+    // and we always use the legacy path — fine, since Windows/macOS
+    // builds don't run sandboxes anyway.
+    type PerSandboxBundle = (
+        std::sync::Arc<crate::tls_proxy::GvmCertResolver>,
+        std::sync::Arc<rustls::ServerConfig>,
+    );
+    #[cfg(target_os = "linux")]
+    let per_sandbox: Option<PerSandboxBundle> = {
+        peer_ip
+            .filter(|ip| !ip.is_loopback())
+            .and_then(|ip| gvm_sandbox::lookup_sandbox_id_by_ip(&ip.to_string()))
+            .and_then(|sandbox_id| {
+                tracing::debug!(
+                    sandbox = %sandbox_id,
+                    "CONNECT MITM: routing to per-sandbox CA (CA-4)"
+                );
+                state.tls_bundle_for_sandbox(&sandbox_id)
+            })
+    };
+    #[cfg(not(target_os = "linux"))]
+    let per_sandbox: Option<PerSandboxBundle> = None;
+
     let host_owned = host.to_string();
     let target_addr = format!("{}:{}", host, port);
-    let mitm_resolver = if is_isolated {
-        state.mitm_resolver.clone()
+    let (mitm_resolver, mitm_sc) = if is_isolated {
+        match per_sandbox {
+            // Per-sandbox path — both Arcs from the same bundle. Pre-warm
+            // hits the per-sandbox resolver's leaf cache, not the legacy
+            // shared one, so the handshake's `resolve()` call is a 0ns
+            // cache hit signed by the right CA.
+            Some((r, sc)) => (Some(r), Some(sc)),
+            // Legacy fallback: shared CA. Same behavior as before CA-4.
+            None => (
+                state.mitm_resolver.clone(),
+                state.mitm_server_config.clone(),
+            ),
+        }
     } else {
-        None
-    };
-    let mitm_sc = if is_isolated {
-        state.mitm_server_config.clone()
-    } else {
-        None
+        (None, None)
     };
     let mitm_cc = if is_isolated {
         state.mitm_client_config.clone()

@@ -234,9 +234,13 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
             mount_paths.push(merged.clone());
             mount_paths.push(PathBuf::from(format!("/run/gvm/ws-overlay-{}", my_pid)));
         }
-        if let Err(e) =
-            record_sandbox_state(&veth_config, &mount_paths, None, dns_target.as_deref())
-        {
+        if let Err(e) = record_sandbox_state(
+            &veth_config,
+            &mount_paths,
+            None,
+            dns_target.as_deref(),
+            config.sandbox_id.as_deref(),
+        ) {
             tracing::debug!(error = %e, "Failed to record sandbox state (orphan cleanup unavailable)");
         }
     }
@@ -291,6 +295,7 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
                         &mount_paths,
                         Some(&cgroup_path),
                         dns_target.as_deref(),
+                        config.sandbox_id.as_deref(),
                     ) {
                         tracing::debug!(error = %e, "Failed to update state with cgroup");
                     }

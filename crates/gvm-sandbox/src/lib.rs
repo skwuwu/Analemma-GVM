@@ -71,6 +71,13 @@ pub struct SandboxConfig {
     /// the CA injected into the sandbox matches the one used by the TLS MITM listener.
     /// None = HTTPS MITM disabled (no CA injection into sandbox).
     pub mitm_ca_cert: Option<Vec<u8>>,
+    /// Per-sandbox CA identity (CA-3/4). Set when the launcher first
+    /// calls `POST /gvm/sandbox/launch` to mint a per-sandbox CA, then
+    /// passes the returned `sandbox_id` here so the sandbox state file
+    /// records it. The MITM TLS resolver in the proxy uses this field
+    /// (via `lookup_sandbox_id_by_ip`) to pick the right per-sandbox
+    /// CA at TLS-handshake time. None = legacy single-CA path.
+    pub sandbox_id: Option<String>,
     /// Sandbox filesystem profile. Controls how much of the host userland is
     /// exposed inside the sandbox.
     pub sandbox_profile: SandboxProfile,
@@ -363,6 +370,12 @@ pub fn cleanup_all_orphans() -> Result<u32> {
 /// progress output (which veth/mount/iptables resources were released).
 #[cfg(target_os = "linux")]
 pub use network::CleanupReport;
+
+/// Per-sandbox CA routing helper (CA-4). Resolves a peer's veth IP back
+/// to the proxy-issued `sandbox_id` so the MITM TLS dispatch can pick
+/// the right per-sandbox CA at handshake time.
+#[cfg(target_os = "linux")]
+pub use network::lookup_sandbox_id_by_ip;
 
 /// Docker bridge iptables integration for `--contained` mode.
 #[cfg(target_os = "linux")]

@@ -446,6 +446,7 @@ async fn main() {
         gvm_toml_path: gvm_toml_path.clone(),
         mitm_ca_pem: Some(mitm_ca_cert_pem.clone()),
         ca_registry: Arc::new(gvm_sandbox::ca::CARegistry::new()),
+        per_sandbox_tls: Arc::new(dashmap::DashMap::new()),
         payload_inspection: config.srr.payload_inspection,
         max_body_bytes: config.srr.max_body_bytes,
         pending_approvals: Arc::new(dashmap::DashMap::new()),

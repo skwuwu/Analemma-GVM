@@ -310,6 +310,7 @@ pub(crate) fn assemble_sandbox_config(
         cpu_limit,
         fs_policy: None, // Caller sets this via pipeline based on fs_governance flag
         mitm_ca_cert,
+        sandbox_id: None, // pipeline.rs fills this in if /gvm/sandbox/launch was called
         sandbox_profile: gvm_sandbox::SandboxProfile::default(),
         extra_env,
     }

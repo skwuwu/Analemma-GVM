@@ -451,6 +451,127 @@ async fn sandbox_revoke_is_idempotent_for_unknown_sandbox() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+// ── CA-4: per-sandbox TLS bundle routing ──
+
+#[tokio::test]
+async fn tls_bundle_for_sandbox_returns_none_for_unregistered() {
+    let (state, _wal) = common::test_state().await;
+    assert!(
+        state.tls_bundle_for_sandbox("sb-not-launched").is_none(),
+        "no CA registered for this sandbox → fallback to legacy path"
+    );
+    assert!(state.per_sandbox_tls.is_empty());
+}
+
+#[tokio::test]
+async fn tls_bundle_for_sandbox_lazy_builds_and_caches() {
+    let (state, _wal) = common::test_state().await;
+
+    // Provision via the launch endpoint so the audit chain is honored.
+    let req = serde_json::json!({
+        "sandbox_id": "sb-tls-cache",
+        "agent_id": "agent",
+    });
+    let resp = gvm_proxy::api::sandbox_launch(
+        State(state.clone()),
+        axum::Json(serde_json::from_value(req).unwrap()),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // First call: cache miss → builds resolver + ServerConfig.
+    let (r1, sc1) = state
+        .tls_bundle_for_sandbox("sb-tls-cache")
+        .expect("registered sandbox returns Some");
+    assert_eq!(state.per_sandbox_tls.len(), 1);
+
+    // Second call: cache hit → same Arcs.
+    let (r2, sc2) = state
+        .tls_bundle_for_sandbox("sb-tls-cache")
+        .expect("cached");
+    assert!(
+        std::sync::Arc::ptr_eq(&r1, &r2),
+        "cached resolver Arc must be reused (same allocation)"
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(&sc1, &sc2),
+        "cached ServerConfig Arc must be reused"
+    );
+}
+
+#[tokio::test]
+async fn revoke_sandbox_clears_tls_bundle_cache() {
+    let (state, _wal) = common::test_state().await;
+
+    let req = serde_json::json!({
+        "sandbox_id": "sb-revoke-cache",
+        "agent_id": "agent",
+    });
+    gvm_proxy::api::sandbox_launch(
+        State(state.clone()),
+        axum::Json(serde_json::from_value(req).unwrap()),
+    )
+    .await;
+    // Populate the bundle cache.
+    let _ = state
+        .tls_bundle_for_sandbox("sb-revoke-cache")
+        .expect("present");
+    assert_eq!(state.per_sandbox_tls.len(), 1);
+
+    // Revoke through the AppState helper — drops both registry and cache.
+    state.revoke_sandbox("sb-revoke-cache");
+    assert!(state.ca_registry.lookup("sb-revoke-cache").is_none());
+    assert!(
+        state.per_sandbox_tls.is_empty(),
+        "revoke must clear the per-sandbox TLS bundle cache so a \
+         later provision with the same sandbox_id cannot serve a leaf \
+         signed by the previous CA"
+    );
+
+    // After revoke, lookup misses (cache empty + registry empty).
+    assert!(state.tls_bundle_for_sandbox("sb-revoke-cache").is_none());
+}
+
+#[tokio::test]
+async fn per_sandbox_resolvers_have_distinct_ca_pubkey_hashes() {
+    // The promised property of CA-4: two sandboxes get cryptographically
+    // independent CAs, and the resolver each uses to sign leaves is
+    // bound to the right one.
+    let (state, _wal) = common::test_state().await;
+
+    for id in ["sb-iso-A", "sb-iso-B"] {
+        let req = serde_json::json!({"sandbox_id": id, "agent_id": "agent"});
+        let resp = gvm_proxy::api::sandbox_launch(
+            State(state.clone()),
+            axum::Json(serde_json::from_value(req).unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // Different SandboxCAs imply different pubkey hashes (already
+    // covered in the gvm-sandbox unit tests). Here we additionally
+    // assert that the lazy bundle build produces *different*
+    // ServerConfig Arcs for different sandboxes — i.e. they are not
+    // accidentally pulling from the legacy shared resolver.
+    let (_r_a, sc_a) = state.tls_bundle_for_sandbox("sb-iso-A").unwrap();
+    let (_r_b, sc_b) = state.tls_bundle_for_sandbox("sb-iso-B").unwrap();
+    assert!(
+        !std::sync::Arc::ptr_eq(&sc_a, &sc_b),
+        "per-sandbox ServerConfigs must be distinct allocations \
+         (otherwise sandbox B's TLS handshake would be served by \
+         sandbox A's CA — exactly the blast-radius bug CA-4 prevents)"
+    );
+
+    let ca_a = state.ca_registry.lookup("sb-iso-A").unwrap();
+    let ca_b = state.ca_registry.lookup("sb-iso-B").unwrap();
+    assert_ne!(
+        ca_a.pubkey_hash(),
+        ca_b.pubkey_hash(),
+        "fresh keypair per sandbox"
+    );
+}
+
 #[tokio::test]
 async fn sandbox_launch_writes_durable_audit_event() {
     let (state, wal_path) = common::test_state().await;

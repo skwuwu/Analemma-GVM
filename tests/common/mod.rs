@@ -47,6 +47,15 @@ use gvm_proxy::vault::Vault;
 /// lifetime of the test so the tempfile isn't garbage-collected; once
 /// the test ends the temp dir is cleaned up automatically.
 pub async fn test_state() -> (AppState, std::path::PathBuf) {
+    // Install rustls CryptoProvider once per test process. The proxy's
+    // `tls_proxy::build_server_config` panics without it; production
+    // installs in main.rs. Idempotent: `install_default` returns Err
+    // on re-install which we deliberately ignore.
+    static RUSTLS_INIT: std::sync::Once = std::sync::Once::new();
+    RUSTLS_INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+
     let wal_path = std::env::temp_dir().join(format!("gvm-test-{}.wal", uuid::Uuid::new_v4()));
 
     // Write an empty TOML file and parse it — this matches what all
@@ -91,6 +100,7 @@ pub async fn test_state() -> (AppState, std::path::PathBuf) {
         gvm_toml_path: None,
         mitm_ca_pem: None,
         ca_registry: Arc::new(gvm_sandbox::ca::CARegistry::new()),
+        per_sandbox_tls: Arc::new(dashmap::DashMap::new()),
         payload_inspection: false,
         max_body_bytes: 65536,
         pending_approvals: Arc::new(dashmap::DashMap::new()),

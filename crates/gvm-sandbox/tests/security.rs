@@ -100,6 +100,7 @@ fn preflight_report_non_linux_has_tc_filter_false() {
             cpu_limit: None,
             fs_policy: None,
             mitm_ca_cert: None,
+            sandbox_id: None,
             sandbox_profile: gvm_sandbox::SandboxProfile::default(),
             extra_env: vec![],
         };
@@ -127,6 +128,7 @@ fn sandbox_config_clone() {
         cpu_limit: None,
         fs_policy: None,
         mitm_ca_cert: None,
+        sandbox_id: None,
         sandbox_profile: gvm_sandbox::SandboxProfile::Standard,
         extra_env: vec![],
     };
@@ -237,6 +239,7 @@ fn launch_on_non_linux_returns_error() {
         cpu_limit: None,
         fs_policy: None,
         mitm_ca_cert: None,
+        sandbox_id: None,
         sandbox_profile: gvm_sandbox::SandboxProfile::Standard,
         extra_env: vec![],
     };

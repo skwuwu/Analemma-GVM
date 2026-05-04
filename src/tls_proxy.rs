@@ -119,6 +119,21 @@ impl GvmCertResolver {
         })
     }
 
+    /// Build a resolver from a per-sandbox CA (CA-4 routing).
+    ///
+    /// Equivalent to [`GvmCertResolver::new`] but takes a borrowed
+    /// [`gvm_sandbox::ca::SandboxCA`] directly instead of separate cert
+    /// and key PEM bytes. The cert PEM is copied; the key PEM is moved
+    /// into the resolver's signing material via the same rcgen path.
+    ///
+    /// Each sandbox gets its own resolver instance — the leaf cache
+    /// is per-resolver, so a leaf signed by sandbox A's CA is never
+    /// reused for sandbox B's TLS handshake (which wouldn't validate
+    /// anyway, since B's trust store carries B's CA cert, not A's).
+    pub fn from_sandbox_ca(ca: &gvm_sandbox::ca::SandboxCA) -> Result<Self> {
+        Self::new(ca.ca_cert_pem(), &ca.ca_key_pem())
+    }
+
     /// Issue a leaf cert for the given domain. Caches the result.
     fn issue_and_cache(&self, domain: &str) -> Option<Arc<CertifiedKey>> {
         // Check cache first (moka handles TTI refresh on access)

@@ -194,6 +194,36 @@ pub struct AppState {
     /// `mitm_ca_pem` (single shared CA) coexists during the migration
     /// window and is removed at CA-5.
     pub ca_registry: Arc<gvm_sandbox::ca::CARegistry>,
+    /// Per-sandbox cached `(GvmCertResolver, ServerConfig)` (CA-4 routing).
+    ///
+    /// Both Arcs are stored together because the TLS handshake path
+    /// needs both: the resolver for `ensure_cached()` pre-warm (blocks
+    /// only the spawn_blocking thread, never the tokio runtime), and
+    /// the `ServerConfig` for `TlsAcceptor::from(_)`. Building one
+    /// without the other would defeat the pre-warm purpose — a
+    /// fresh-on-handshake resolver would hit `issue_and_cache`
+    /// synchronously inside `resolve()`, blocking a tokio worker.
+    ///
+    /// Each entry's resolver is bound to exactly one sandbox's CA.
+    /// The moka leaf-cert cache inside is therefore also per-sandbox:
+    /// a leaf cert minted for sandbox A is never served to a TLS
+    /// client owned by sandbox B (which would fail chain validation
+    /// anyway, since B's trust store carries B's CA cert and not A's).
+    ///
+    /// Lifecycle: populated lazily on first MITM CONNECT for a given
+    /// sandbox_id, cleared by [`AppState::revoke_sandbox`] when the
+    /// sandbox exits. The dropped entry's Arcs are freed once the
+    /// last in-flight handshake using them finishes — same Arc-based
+    /// liveness rule as `CARegistry`.
+    pub per_sandbox_tls: Arc<
+        dashmap::DashMap<
+            String,
+            (
+                Arc<crate::tls_proxy::GvmCertResolver>,
+                Arc<rustls::ServerConfig>,
+            ),
+        >,
+    >,
     /// SRR payload inspection: buffer request body for JSON field matching.
     pub payload_inspection: bool,
     /// Maximum body bytes to buffer for payload inspection.
@@ -257,6 +287,73 @@ impl AppState {
             .read()
             .ok()
             .and_then(|g| g.clone())
+    }
+
+    /// Resolve (and lazily build) the per-sandbox TLS bundle for the
+    /// given `sandbox_id`. Hot path — called once per CONNECT before
+    /// TLS accept(). Returns the resolver (for pre-warm) and the
+    /// `ServerConfig` (for `TlsAcceptor::from`) as a paired tuple.
+    ///
+    /// Cache hit: clones both `Arc`s (cheap).
+    /// Cache miss: looks up the sandbox's CA from `ca_registry`,
+    /// builds a `GvmCertResolver` from it, wraps in a `ServerConfig`
+    /// (HTTP/1.1 ALPN forced, same as the legacy shared resolver),
+    /// inserts both into the cache, returns the pair.
+    /// Returns `None` only if the sandbox is not registered (revoked
+    /// or never provisioned) — caller should fall back to the legacy
+    /// `mitm_resolver` + `mitm_server_config`.
+    pub fn tls_bundle_for_sandbox(
+        &self,
+        sandbox_id: &str,
+    ) -> Option<(
+        Arc<crate::tls_proxy::GvmCertResolver>,
+        Arc<rustls::ServerConfig>,
+    )> {
+        // Fast path: cache hit.
+        if let Some(entry) = self.per_sandbox_tls.get(sandbox_id) {
+            let (r, sc) = entry.value();
+            return Some((Arc::clone(r), Arc::clone(sc)));
+        }
+
+        // Slow path: build from CA. Bail if no CA is registered.
+        let ca = self.ca_registry.lookup(sandbox_id)?;
+        let resolver = match crate::tls_proxy::GvmCertResolver::from_sandbox_ca(&ca) {
+            Ok(r) => Arc::new(r),
+            Err(e) => {
+                tracing::error!(
+                    sandbox = %sandbox_id,
+                    error = %e,
+                    "per-sandbox resolver build failed — falling through to legacy CA"
+                );
+                return None;
+            }
+        };
+        let server_config = match crate::tls_proxy::build_server_config(Arc::clone(&resolver)) {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                tracing::error!(
+                    sandbox = %sandbox_id,
+                    error = %e,
+                    "per-sandbox ServerConfig build failed — falling through to legacy CA"
+                );
+                return None;
+            }
+        };
+        // Insert if absent (a concurrent caller may have raced us; either
+        // pair is fine, both are bound to the same `SandboxCA`).
+        self.per_sandbox_tls
+            .entry(sandbox_id.to_string())
+            .or_insert_with(|| (Arc::clone(&resolver), Arc::clone(&server_config)));
+        Some((resolver, server_config))
+    }
+
+    /// Revoke a sandbox: clear its TLS bundle cache entry, then drop
+    /// its CA from the registry. Order matters — clear the derived
+    /// cache first so a concurrent `tls_bundle_for_sandbox` cannot
+    /// resurrect a stale entry from the still-present CA.
+    pub fn revoke_sandbox(&self, sandbox_id: &str) {
+        self.per_sandbox_tls.remove(sandbox_id);
+        self.ca_registry.revoke(sandbox_id);
     }
 }
 

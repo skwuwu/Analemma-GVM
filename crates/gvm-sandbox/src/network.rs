@@ -874,6 +874,20 @@ pub struct SandboxState {
     /// exclusive per state file, but cleanup must know which chain to remove.
     #[serde(default)]
     pub docker_chain: Option<String>,
+    /// Per-sandbox MITM CA identifier (CA-4 wiring).
+    ///
+    /// Set when the sandbox launcher provisions a per-sandbox CA via
+    /// `POST /gvm/sandbox/launch` and embeds the proxy-issued
+    /// `sandbox_id` in the state file. The MITM TLS resolver in the
+    /// proxy reads back this field via [`lookup_sandbox_id_by_ip`] to
+    /// route the per-sandbox CA at TLS-handshake time.
+    ///
+    /// `None` for sandboxes that pre-date CA-3 (legacy single-CA model)
+    /// or for `--contained` (Docker) launches that haven't been wired
+    /// to the per-sandbox CA flow yet. The MITM dispatch falls back to
+    /// the legacy shared CA in that case.
+    #[serde(default)]
+    pub sandbox_id: Option<String>,
 }
 
 /// Get the state file path for a given PID.
@@ -886,11 +900,17 @@ fn state_file_path(pid: u32) -> PathBuf {
 
 /// Record a sandbox's full resource manifest to a per-PID state file.
 /// Called after host-side network setup succeeds.
+///
+/// `sandbox_id` is the proxy-issued identifier from
+/// `POST /gvm/sandbox/launch` (CA-3). Pass `None` for sandboxes
+/// launched before per-sandbox CA was wired — the proxy MITM will
+/// fall back to the legacy shared CA for those.
 pub fn record_sandbox_state(
     config: &VethConfig,
     mount_paths: &[PathBuf],
     cgroup_path: Option<&str>,
     dns_target: Option<&str>,
+    sandbox_id: Option<&str>,
 ) -> Result<()> {
     let parent_pid = std::process::id();
     let state = SandboxState {
@@ -924,6 +944,7 @@ pub fn record_sandbox_state(
         docker_bridge: None,
         docker_container: None,
         docker_chain: None,
+        sandbox_id: sandbox_id.map(|s| s.to_string()),
     };
 
     let path = state_file_path(state.pid);
@@ -2088,6 +2109,7 @@ pub fn record_docker_state(cfg: &DockerBridgeConfig, container_name: &str) -> Re
         docker_bridge: Some(cfg.bridge.clone()),
         docker_container: Some(container_name.to_string()),
         docker_chain: Some(docker_chain_name(&cfg.bridge)),
+        sandbox_id: None, // Docker path not yet wired to /gvm/sandbox/launch
     };
 
     let path = state_file_path(state.pid);
@@ -2103,6 +2125,74 @@ pub fn record_docker_state(cfg: &DockerBridgeConfig, container_name: &str) -> Re
         "Docker-mode state recorded for orphan cleanup"
     );
     Ok(())
+}
+
+/// Resolve a peer's veth-side IP back to the proxy-issued sandbox_id.
+///
+/// Used by the MITM TLS resolver (CA-4) to route per-sandbox CAs at
+/// handshake time: the rustls `ResolvesServerCert::resolve()` callback
+/// only sees SNI, so per-peer routing must happen earlier — at TLS
+/// accept(), where the peer's `SocketAddr` is known. The proxy strips
+/// the IP, calls this function, gets a `sandbox_id`, looks the
+/// matching `SandboxCA` up in `CARegistry`, and feeds it into the
+/// `ServerConfig` it hands to `TlsAcceptor`.
+///
+/// **Returns** `Some(sandbox_id)` only when:
+/// - A state file in `/run/gvm/gvm-sandbox-*.state` carries a
+///   `sandbox_id` field (set since CA-4),
+/// - And its `sandbox_ip` matches `ip` exactly,
+/// - And the file is parseable JSON.
+///
+/// **Returns** `None` when:
+/// - No matching state file exists (legacy sandbox, cooperative
+///   loopback, or unrelated client). Caller should fall back to the
+///   legacy shared-CA `mitm_server_config`.
+/// - Multiple files match (should not happen — IPs are unique per
+///   running sandbox; we conservatively log and return the first).
+///
+/// Performance: `O(n)` over active sandboxes. Acceptable on the TLS
+/// handshake path because `n` is bounded by `CARegistry::active_count()`
+/// and a typical deployment has fewer than ~100 active sandboxes. The
+/// alternative (an in-memory `DashMap<IpAddr, SandboxId>` index)
+/// would couple sandbox-lifecycle bookkeeping across crates; we keep
+/// the on-disk state file as the single source of truth, scanned on
+/// demand.
+pub fn lookup_sandbox_id_by_ip(ip: &str) -> Option<String> {
+    let state_dir = std::path::Path::new(STATE_DIR);
+    let entries = std::fs::read_dir(state_dir).ok()?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // Filter to only our own state files. STATE_PREFIX/SUFFIX
+        // bracket every legitimate file; anything else under /run/gvm
+        // is unrelated tmpfs noise we should ignore.
+        if !file_name.starts_with(STATE_PREFIX) || !file_name.ends_with(STATE_SUFFIX) {
+            continue;
+        }
+
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(state) = serde_json::from_str::<SandboxState>(&content) else {
+            // Stale / corrupted state file — skip without erroring out.
+            // Cleanup sweep handles removal; a missing match here just
+            // makes us fall through to the legacy CA path.
+            continue;
+        };
+
+        if state.sandbox_ip == ip {
+            // Sandbox launched before CA-3? Then `sandbox_id` is None
+            // and we can't do per-sandbox routing for it. Returning
+            // None lets the proxy fall back to the legacy CA, which
+            // is exactly the right behavior during the migration.
+            return state.sandbox_id;
+        }
+    }
+
+    None
 }
 
 /// Scan for orphan GVM Docker bridge iptables chains whose matching bridge

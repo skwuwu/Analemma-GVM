@@ -1658,7 +1658,7 @@ pub async fn sandbox_launch(
     //    will not proceed (the CLI is expected to abort the sandbox
     //    spawn if this endpoint fails).
     if let Err(e) = state.ledger.append_durable(&event).await {
-        state.ca_registry.revoke(&req.sandbox_id);
+        state.revoke_sandbox(&req.sandbox_id);
         tracing::error!(
             sandbox = %req.sandbox_id,
             error = %e,
@@ -1743,7 +1743,12 @@ pub async fn sandbox_revoke(
     Path(sandbox_id): Path<String>,
     State(state): State<AppState>,
 ) -> Response<Body> {
-    state.ca_registry.revoke(&sandbox_id);
+    // Use the AppState helper so the per-sandbox ServerConfig cache is
+    // cleared atomically with the CA registry entry. Calling
+    // `ca_registry.revoke` alone would leave a stale cached
+    // `ServerConfig` whose resolver still holds a clone of the
+    // (about-to-be-zeroized) `SandboxCA` private key.
+    state.revoke_sandbox(&sandbox_id);
     let body = serde_json::json!({
         "sandbox_id": sandbox_id,
         "revoked": true,
