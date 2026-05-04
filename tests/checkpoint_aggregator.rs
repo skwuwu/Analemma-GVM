@@ -94,7 +94,7 @@ fn duplicate_agent_ids_with_same_hash_yield_same_root_as_single() {
     // duplicates do NOT change the root vs a single occurrence.
     // (BTreeMap-backed live aggregator collapses these naturally.)
     let single = vec![("a".to_string(), [9u8; 32])];
-    let _double = vec![("a".to_string(), [9u8; 32]), ("a".to_string(), [9u8; 32])];
+    let _double = [("a".to_string(), [9u8; 32]), ("a".to_string(), [9u8; 32])];
     // Note: pure function does NOT dedupe; live CheckpointAggregator
     // does (BTreeMap insert-overwrite). Test only what the function
     // promises — see live test below for last-write-wins.

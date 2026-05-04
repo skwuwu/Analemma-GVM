@@ -873,9 +873,9 @@ decision = { type = "Delay", milliseconds = 200 }
             path in "/[a-z0-9/]{0,30}",
         ) {
             let srr = fixed_srr();
-            let r1 = srr.check(&method, &host, &path, None);
-            let r2 = srr.check(&method, &host, &path, None);
-            let r3 = srr.check(&method, &host, &path, None);
+            let r1 = srr.check(method, &host, &path, None);
+            let r2 = srr.check(method, &host, &path, None);
+            let r3 = srr.check(method, &host, &path, None);
             prop_assert_eq!(format!("{:?}", r1.decision), format!("{:?}", r2.decision));
             prop_assert_eq!(format!("{:?}", r2.decision), format!("{:?}", r3.decision));
         }

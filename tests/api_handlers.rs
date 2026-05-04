@@ -66,7 +66,7 @@ type = "Allow"
     assert!(
         matches!(
             result.decision,
-            gvm_types::EnforcementDecision::Allow { .. }
+            gvm_types::EnforcementDecision::Allow
         ),
         "after reload, the new Allow rule must apply; got {:?}",
         result.decision
@@ -147,7 +147,7 @@ type = "Allow"
     assert!(
         matches!(
             result.decision,
-            gvm_types::EnforcementDecision::Allow { .. }
+            gvm_types::EnforcementDecision::Allow
         ),
         "post-failed-reload, original Allow rule for api.github.com/* must still apply; got {:?}",
         result.decision

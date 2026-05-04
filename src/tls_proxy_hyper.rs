@@ -297,12 +297,16 @@ async fn handle_request(
     }
 
     // ── Token budget check (LLM providers only) ──
-    // Two-tier (G1): per-agent quota first, then org-wide ceiling.
+    // Shared two-tier (per-agent then global) via
+    // `enforcement::check_and_reserve_token_budget`. Same single source
+    // of truth as proxy_handler — the order, rollback, and short-circuit
+    // are guaranteed identical between cooperative HTTP and MITM HTTPS.
     let is_llm = crate::llm_trace::identify_llm_provider(&host).is_some();
     if is_llm {
         let agent_id = classify_output.agent_id.as_str();
-        if state.per_agent_budgets.is_enabled() {
-            if let Err(exceeded) = state.per_agent_budgets.check_and_reserve(agent_id) {
+        match crate::enforcement::check_and_reserve_token_budget(state, agent_id) {
+            crate::enforcement::BudgetCheckOutcome::Allowed => {}
+            crate::enforcement::BudgetCheckOutcome::PerAgentDenied(exceeded) => {
                 let reason = if exceeded.tokens_limit == 0
                     && exceeded.cost_limit_millionths == 0
                 {
@@ -333,12 +337,7 @@ async fn handle_request(
                     ))
                     .expect("static response builder"));
             }
-        }
-        if state.token_budget.is_enabled() {
-            if let Err(exceeded) = state.token_budget.check_and_reserve() {
-                if state.per_agent_budgets.is_enabled() {
-                    state.per_agent_budgets.release_reservation(agent_id);
-                }
+            crate::enforcement::BudgetCheckOutcome::GlobalDenied(exceeded) => {
                 let reason = format!(
                     "Token budget exceeded: {}/{} tokens/hr (${:.2}/${:.2})",
                     exceeded.tokens_used,
@@ -621,7 +620,7 @@ async fn handle_request(
                 .map_err(|_: std::convert::Infallible| -> String { unreachable!() })
                 .boxed(),
         )
-        .unwrap();
+        .expect("Request::builder with validated method/uri/headers infallible");
 
     // Dump exactly what we send so a 10s graceful close from upstream is
     // attributable to *our* request, not guesswork. Logs every header that
@@ -764,7 +763,7 @@ async fn handle_request(
             Ok(Response::builder()
                 .status(502)
                 .body(full_body(format!("Upstream request failed: {}", e)))
-                .unwrap())
+                .expect("static response builder"))
         }
     }
 }
@@ -828,7 +827,7 @@ async fn forward_http(
                 .map_err(|_: std::convert::Infallible| -> String { unreachable!() })
                 .boxed(),
         )
-        .unwrap();
+        .expect("Request::builder with validated method/uri/headers infallible");
 
     const UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
     let send_result = match tokio::time::timeout(UPSTREAM_TIMEOUT, sender.send_request(req)).await {
@@ -856,6 +855,6 @@ async fn forward_http(
         Err(e) => Ok(Response::builder()
             .status(502)
             .body(full_body(format!("Dev upstream failed: {}", e)))
-            .unwrap()),
+            .expect("static response builder")),
     }
 }

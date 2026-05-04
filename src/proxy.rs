@@ -526,23 +526,19 @@ pub async fn proxy_handler(
     event.operation_descriptor = Some(crate::operation::http(&request_method, &target.path));
 
     // ── Step 4: Token budget check (LLM providers only) ──
-    // Budget enforcement is independent of SRR — applies to all LLM requests.
-    // Two-tier: per-agent quota first (so a single agent's burst can't drain
-    // the org-wide pool before other agents get to check), then global ceiling.
+    // Two-tier (per-agent then global) is implemented in
+    // `enforcement::check_and_reserve_token_budget` — single source of
+    // truth shared with the MITM path so the order, rollback, and
+    // disabled-tier short-circuit stay identical across transports.
     let is_llm = llm_trace::identify_llm_provider(&target.host).is_some();
     if is_llm {
-        // Caller-side agent_id (header or JWT-verified). For per-agent
-        // budget enforcement we MUST use the verified one when JWT is on.
         let effective_agent_id = gvm_headers
             .as_ref()
             .map(|h| h.agent_id.as_str())
             .unwrap_or("unknown");
-
-        // Per-agent quota: each agent has independent budget, so one
-        // runaway agent does not block its peers. Failing here returns
-        // 429 with a per-agent decision string for telemetry.
-        if state.per_agent_budgets.is_enabled() {
-            if let Err(exceeded) = state.per_agent_budgets.check_and_reserve(effective_agent_id) {
+        match crate::enforcement::check_and_reserve_token_budget(&state, effective_agent_id) {
+            crate::enforcement::BudgetCheckOutcome::Allowed => {}
+            crate::enforcement::BudgetCheckOutcome::PerAgentDenied(exceeded) => {
                 let reason = if exceeded.tokens_limit == 0 && exceeded.cost_limit_millionths == 0 {
                     "Per-agent budget admission rejected (quota table full)".to_string()
                 } else {
@@ -577,19 +573,7 @@ pub async fn proxy_handler(
                     },
                 );
             }
-        }
-
-        // Global org-wide ceiling. Failing here implies either no per-agent
-        // quota was configured OR the global cap is tighter than the
-        // per-agent cap × N.
-        if state.token_budget.is_enabled() {
-            if let Err(exceeded) = state.token_budget.check_and_reserve() {
-                // Roll back the per-agent reservation we just took.
-                if state.per_agent_budgets.is_enabled() {
-                    state
-                        .per_agent_budgets
-                        .release_reservation(effective_agent_id);
-                }
+            crate::enforcement::BudgetCheckOutcome::GlobalDenied(exceeded) => {
                 let reason = format!(
                     "Token budget exceeded: {}/{} tokens/hr (${:.2}/${:.2})",
                     exceeded.tokens_used,

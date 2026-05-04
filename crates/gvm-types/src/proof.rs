@@ -45,6 +45,7 @@ use std::collections::HashMap;
 /// still recompute `event_hash` from the stripped record.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum RedactionLevel {
     /// Raw, unredacted form. Internal use only — proofs that ship over
     /// the wire SHOULD use `Standard` or stricter.
@@ -53,6 +54,7 @@ pub enum RedactionLevel {
     /// the per-event detail salt, the free-form `context` map (which
     /// may carry caller-supplied key/value pairs), and the LLM trace's
     /// `thinking` content. Recommended default for external auditors.
+    #[default]
     Standard,
     /// Standard + strip transport host/path/method (network-level
     /// metadata that may identify a target system). The category and
@@ -60,11 +62,6 @@ pub enum RedactionLevel {
     Strict,
 }
 
-impl Default for RedactionLevel {
-    fn default() -> Self {
-        Self::Standard
-    }
-}
 
 /// An event in either full or redacted form. Both shapes preserve the
 /// canonical inputs to `event_hash` so the verifier can recompute the
@@ -533,8 +530,8 @@ pub fn generate_merkle_proof_path(
             let last = current_level[current_level.len() - 1];
             current_level.push(last);
         }
-        let sibling_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
-        let is_right = idx % 2 == 0;
+        let sibling_idx = if idx.is_multiple_of(2) { idx + 1 } else { idx - 1 };
+        let is_right = idx.is_multiple_of(2);
         proof.push((hex::encode(current_level[sibling_idx]), is_right));
 
         let mut next_level: Vec<[u8; 32]> = Vec::with_capacity(current_level.len() / 2);

@@ -1017,7 +1017,12 @@ pub async fn run_watch(
                         match output_mode {
                             OutputMode::Text => print_live_event_text(event, None),
                             OutputMode::Json => println!("{}", raw_line),
-                            OutputMode::Tui => unreachable!(),
+                            // TUI dispatches through a different path; this
+                            // tail loop runs only for Text/Json. Treat any
+                            // future enum variant as Text-equivalent rather
+                            // than panic — adding a variant should not crash
+                            // a long-running watch session.
+                            _ => print_live_event_text(event, None),
                         }
                     }
                 }
@@ -1056,11 +1061,12 @@ pub async fn run_watch(
             }
         }
 
-        // Session summary
+        // Session summary. TUI dispatches through its own path; this
+        // tail-mode summary runs only for Text/Json. Default any future
+        // variant to text rather than panic.
         match output_mode {
-            OutputMode::Text => print_session_summary_text(&stats, &anomaly),
             OutputMode::Json => print_session_summary_json(&stats, &anomaly),
-            OutputMode::Tui => unreachable!(),
+            _ => print_session_summary_text(&stats, &anomaly),
         }
 
         if output_mode == OutputMode::Text && stats.default_caution_count > 0 {

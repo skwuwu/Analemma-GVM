@@ -1922,7 +1922,7 @@ impl MerkleBatchRecord {
             }
             return Ok(());
         }
-        if self.leaves_blob.len() % 32 != 0 {
+        if !self.leaves_blob.len().is_multiple_of(32) {
             return Err(format!(
                 "leaves_blob length {} is not a multiple of 32",
                 self.leaves_blob.len()

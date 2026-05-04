@@ -1048,7 +1048,7 @@ async fn allow_included_in_merkle_chain_with_deny() {
 
     let events = read_wal_events(&wal_path).await;
     let decisions: Vec<&str> = events.iter().map(|e| e.decision.as_str()).collect();
-    assert!(decisions.iter().any(|d| *d == "Allow"), "Allow present");
+    assert!(decisions.contains(&"Allow"), "Allow present");
     assert!(
         decisions.iter().any(|d| d.starts_with("Deny")),
         "Deny present"

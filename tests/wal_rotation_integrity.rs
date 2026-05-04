@@ -57,7 +57,7 @@ async fn integrity_chain_spans_rotated_segments() {
     // The ledger's record_config_load builds the chain for us.
     let cfg_a = std::env::temp_dir().join(format!("gvm-test-cfg-{}.toml", uuid::Uuid::new_v4()));
     std::fs::write(&cfg_a, "key=\"value\"").unwrap();
-    let cfg_files = vec![("test_cfg".to_string(), cfg_a.clone())];
+    let cfg_files = [("test_cfg".to_string(), cfg_a.clone())];
     let cfg_refs: Vec<(&str, &std::path::Path)> = cfg_files
         .iter()
         .map(|(l, p)| (l.as_str(), p.as_path()))

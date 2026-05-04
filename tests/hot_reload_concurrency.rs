@@ -287,7 +287,7 @@ async fn concurrent_reloads_serialize_without_deadlock() {
             .check("GET", &host, "/anything", None);
         if matches!(
             result.decision,
-            gvm_types::EnforcementDecision::Allow { .. }
+            gvm_types::EnforcementDecision::Allow
         ) {
             allow_winners.push(i);
         }

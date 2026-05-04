@@ -333,7 +333,7 @@ async fn batch_proof_bundles_all_events() {
         "batch proof events count must match batch_record.event_count"
     );
     assert!(
-        bp.events.len() >= 1,
+        !bp.events.is_empty(),
         "batch must bundle at least one event"
     );
     assert_eq!(

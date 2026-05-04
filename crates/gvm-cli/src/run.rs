@@ -811,16 +811,27 @@ pub(crate) async fn run_contained_legacy(
     let abs_script = {
         let s = abs_script.to_string_lossy().to_string();
         let s = s.trim_start_matches(r"\\?\").replace('\\', "/");
-        // Convert "C:/Users/..." to "/c/Users/..." for Docker
-        let s = if s.chars().nth(1) == Some(':') {
-            format!("/{}/{}", s.chars().next().unwrap().to_lowercase(), &s[3..])
-        } else {
-            s
+        // Convert "C:/Users/..." to "/c/Users/..." for Docker. Match
+        // both the drive letter AND the ':' in one pattern so the
+        // nth(1)==':' guard and the chars().next() read are derived
+        // from the same iterator step (no separately-fallible
+        // `unwrap()` chained to a length-checked guard).
+        let s = match s.split_once(':') {
+            Some((drive, rest)) if drive.len() == 1 && rest.starts_with('/') => {
+                let drive_lower = drive.to_ascii_lowercase();
+                format!("/{}{}", drive_lower, rest)
+            }
+            _ => s,
         };
         std::path::PathBuf::from(s)
     };
-    let script_dir = abs_script.parent().unwrap();
-    let script_name = abs_script.file_name().unwrap().to_str().unwrap();
+    let script_dir = abs_script
+        .parent()
+        .with_context(|| format!("Resolved script path has no parent: {}", abs_script.display()))?;
+    let script_name = abs_script
+        .file_name()
+        .and_then(|n| n.to_str())
+        .with_context(|| format!("Resolved script path has no file name: {}", abs_script.display()))?;
     let script_ext = abs_script
         .extension()
         .and_then(|e| e.to_str())
