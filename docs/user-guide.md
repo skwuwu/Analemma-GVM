@@ -314,6 +314,91 @@ gvm run --sandbox --memory 1g --cpus 0.5 -- node agent.js
 > ```
 > This is intentional. Persisting a shared CA's private key to host disk was the larger security risk — anyone who could read `data/mitm-ca-key.pem` could forge any TLS identity until cert expiry. Per-sandbox CAs (provisioned via `POST /gvm/sandbox/launch`, CA-3) restore restart resilience by binding the trust to a single sandbox lifetime.
 
+### Running multiple agents
+
+GVM is designed for **N agents inside a single organization**, sharing one proxy and one ruleset. Spin up the proxy once, then launch each agent in its own session with a unique `--agent-id`:
+
+```bash
+# In separate terminals (or backgrounded jobs):
+gvm run --agent-id agent-analyst   --sandbox -- python analyst.py
+gvm run --agent-id agent-coder-1   --sandbox -- node coder.js
+gvm run --agent-id agent-coder-2   --sandbox -- python coder2.py
+```
+
+**Always pass a unique `--agent-id`** — the default (`"agent-001"`) makes every agent share the same identity, which collapses per-agent budget isolation and audit attribution. There is no automatic uniqueness check; the burden is on you.
+
+**What is isolated per agent_id**:
+
+| Resource | Mechanism |
+|---|---|
+| Token + cost budget | `PerAgentBudgets` — agent A draining its quota does not block agent B |
+| Audit trace | every event in the WAL carries `agent_id`; `gvm events list --agent <id>` filters |
+| Sandbox namespace | `clone(CLONE_NEWUSER\|NEWPID\|NEWNS\|NEWNET)` per launch |
+| MITM CA + leaf cert cache | per-sandbox CA when the launcher provisions via `POST /gvm/sandbox/launch` (CA-3) |
+| veth subnet + iptables FORWARD chain | per-sandbox PID |
+
+**What is shared (organization-wide)**:
+
+- SRR ruleset — single source of truth; agent-specific rules are not supported (intentional, see CLAUDE.md "Code Reuse & Anti-Fragmentation")
+- WAL Merkle chain — one append-only log for the whole organization, with per-agent filtering at query time
+- Vault credentials — secrets are scoped to the organization, not the agent
+- JWT signing secret — every agent's token is signed with the same key, only the `sub` claim differs
+
+**Per-agent quota config** (`gvm.toml`):
+
+```toml
+[budget]
+# Organization-wide ceiling (sum of all agents)
+max_tokens_per_hour     = 1_000_000
+max_cost_per_hour       = 100.0
+reserve_per_request     = 500
+
+# Per-agent ceiling. 0 = disabled.
+# Agent A exhausting its share does not affect agent B.
+per_agent_max_tokens_per_hour = 100_000
+per_agent_max_cost_per_hour   = 10.0
+```
+
+**Identity verification (JWT)**: header-based `X-GVM-Agent-Id` is **spoofable** — any agent can claim to be any agent_id. To prevent this, enable JWT:
+
+```toml
+[jwt]
+secret_env      = "GVM_JWT_SECRET"   # 32+ byte hex string
+token_ttl_secs  = 3600
+```
+
+When JWT is enabled, `gvm run` automatically calls `POST /gvm/auth/token` for the agent's identity and exposes the resulting JWT as the `GVM_JWT_TOKEN` environment variable inside the agent's process. If JWT isn't configured on the proxy, the call returns 503 and the CLI silently falls back to the legacy header-based path.
+
+**SDK-less agents** must read `GVM_JWT_TOKEN` and add it to outbound requests themselves — the proxy will not accept the identity otherwise. The simplest way:
+
+```python
+# Python (without the GVM SDK)
+import os, urllib.request
+
+token = os.environ.get("GVM_JWT_TOKEN")
+req = urllib.request.Request("https://api.openai.com/v1/chat/completions", data=...)
+if token:
+    req.add_header("Authorization", f"Bearer {token}")
+urllib.request.urlopen(req)
+```
+
+```javascript
+// Node.js (without the GVM SDK)
+const token = process.env.GVM_JWT_TOKEN;
+const headers = {};
+if (token) headers["Authorization"] = `Bearer ${token}`;
+fetch("https://api.openai.com/v1/chat/completions", { headers, ... });
+```
+
+Without that header, the proxy logs `"No JWT token provided — using unverified X-GVM-Agent-Id header"` and accepts the self-declared identity. That is fine for dev runs but should NOT be relied on in any setting where one agent's process could pretend to be another.
+
+**Per-agent monitoring**:
+
+```bash
+gvm events list --agent agent-coder-1 --since 5m   # filter by agent
+gvm stats --agent agent-analyst                      # budget usage
+```
+
 ### Shadow Mode
 
 ```bash

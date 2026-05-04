@@ -50,7 +50,24 @@ pub enum LaunchMode {
 
 /// State produced by pre-launch phase, consumed by launch and post-exit.
 pub struct PreLaunchState {
+    /// PEM-encoded CA cert to inject into the sandbox trust store.
+    /// Per-sandbox when `sandbox_id` is `Some` (CA-3 path), shared
+    /// legacy CA when fallback was needed. `None` if MITM is disabled
+    /// (cooperative or `--no-mitm`).
     pub mitm_ca: Option<Vec<u8>>,
+    /// Proxy-issued sandbox identifier from `POST /gvm/sandbox/launch`
+    /// (CA-3). Threaded into `SandboxConfig.sandbox_id` so the
+    /// sandbox state file records it for `lookup_sandbox_id_by_ip`
+    /// (CA-4 routing). `None` means legacy CA path (cooperative
+    /// mode, contained mode, or older proxy that returned 404 on
+    /// the launch endpoint).
+    pub sandbox_id: Option<String>,
+    /// Optional JWT to inject as `GVM_JWT_TOKEN` in the agent's
+    /// environment. `None` when JWT is not configured on the proxy
+    /// (the auth_token endpoint returned 503/404). Agent SDK code
+    /// reads this env and adds `Authorization: Bearer <token>` to
+    /// outbound HTTP calls.
+    pub jwt_token: Option<String>,
     pub wal_offset: u64,
     pub is_binary_mode: bool,
 }
@@ -78,16 +95,66 @@ pub async fn pre_launch(config: &AgentConfig) -> Result<PreLaunchState> {
         }
     }
 
-    // 3. Download MITM CA (sandbox only, skip if --no-mitm).
-    // Docker mode and cooperative mode never use MITM — CA download is
-    // skipped to avoid the admin-API fetch when it isn't needed.
-    let mitm_ca = if config.no_mitm
+    // 3. Provision a per-sandbox CA via /gvm/sandbox/launch (CA-3),
+    //    falling back to the legacy shared CA at /gvm/ca.pem if the
+    //    admin endpoint is unavailable. Cooperative + contained modes
+    //    skip MITM entirely (no CA injection target inside the
+    //    sandbox / no namespace at all for cooperative).
+    let admin_url = run::derive_admin_url(&config.proxy);
+    let (mitm_ca, sandbox_id) = if config.no_mitm
         || config.mode == LaunchMode::Cooperative
         || matches!(config.mode, LaunchMode::Contained { .. })
     {
-        None
+        (None, None)
     } else {
-        run::download_mitm_ca_cert(&config.proxy).await
+        match run::provision_sandbox(&admin_url, &config.agent_id).await {
+            Ok(prov) => {
+                eprintln!(
+                    "  {GREEN}\u{2713}{RESET} Per-sandbox MITM CA provisioned (sandbox_id={}, ca={})",
+                    &prov.sandbox_id[..8.min(prov.sandbox_id.len())],
+                    &prov.ca_pubkey_hash[..8.min(prov.ca_pubkey_hash.len())]
+                );
+                (Some(prov.ca_pem), Some(prov.sandbox_id))
+            }
+            Err(e) => {
+                // Older proxy (pre-CA-3) or admin port unreachable —
+                // fall back to the shared CA so the sandbox still has
+                // working TLS, just without per-sandbox isolation.
+                eprintln!(
+                    "  {YELLOW}\u{26a0}{RESET} Sandbox provisioning unavailable ({}) — using legacy shared CA",
+                    e
+                );
+                (run::download_mitm_ca_cert(&config.proxy).await, None)
+            }
+        }
+    };
+
+    // 3b. Issue JWT for agent identity (CA-6 CLI integration).
+    //     Best-effort — the proxy returns 503 when JWT isn't
+    //     configured, in which case we silently skip. No failure
+    //     is propagated for the no-JWT case because JWT is optional
+    //     and dev workflows may run without it.
+    let jwt_token = match run::issue_jwt_token(&config.proxy, &config.agent_id).await {
+        Ok(Some(token)) => {
+            eprintln!(
+                "  {GREEN}\u{2713}{RESET} JWT issued for agent {}",
+                config.agent_id
+            );
+            Some(token)
+        }
+        Ok(None) => {
+            // JWT not configured on the proxy — fall through to
+            // unverified header-based identity. This is the right
+            // default; making JWT mandatory would block dev runs.
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "  {YELLOW}\u{26a0}{RESET} JWT issuance failed ({}) — proceeding with header-based identity (spoofable)",
+                e
+            );
+            None
+        }
     };
 
     // 4. Record WAL position (for post-exit audit)
@@ -98,6 +165,8 @@ pub async fn pre_launch(config: &AgentConfig) -> Result<PreLaunchState> {
 
     Ok(PreLaunchState {
         mitm_ca,
+        sandbox_id,
+        jwt_token,
         wal_offset,
         is_binary_mode,
     })
@@ -117,19 +186,24 @@ pub async fn launch(config: &AgentConfig, pre: &PreLaunchState) -> Result<i32> {
 
 async fn launch_cooperative(config: &AgentConfig, pre: &PreLaunchState) -> Result<i32> {
     if pre.is_binary_mode {
-        launch_cooperative_binary(config).await
+        launch_cooperative_binary(config, pre).await
     } else {
-        launch_cooperative_script(config).await
+        launch_cooperative_script(config, pre).await
     }
 }
 
-async fn launch_cooperative_binary(config: &AgentConfig) -> Result<i32> {
+async fn launch_cooperative_binary(config: &AgentConfig, pre: &PreLaunchState) -> Result<i32> {
     let binary = &config.command[0];
     let args = &config.command[1..];
 
     let mut cmd = tokio::process::Command::new(binary);
     cmd.args(args);
-    run::inject_proxy_env(&mut cmd, &config.proxy, &config.agent_id);
+    run::inject_proxy_env(
+        &mut cmd,
+        &config.proxy,
+        &config.agent_id,
+        pre.jwt_token.as_deref(),
+    );
     cmd.stdin(std::process::Stdio::null());
     if config.suppress_output {
         cmd.stdout(std::process::Stdio::null())
@@ -146,7 +220,7 @@ async fn launch_cooperative_binary(config: &AgentConfig) -> Result<i32> {
     Ok(status.code().unwrap_or(-1))
 }
 
-async fn launch_cooperative_script(config: &AgentConfig) -> Result<i32> {
+async fn launch_cooperative_script(config: &AgentConfig, pre: &PreLaunchState) -> Result<i32> {
     let abs_script = run::resolve_script(&config.command[0])?;
     let ext = abs_script
         .extension()
@@ -161,7 +235,12 @@ async fn launch_cooperative_script(config: &AgentConfig) -> Result<i32> {
         cmd.arg(arg);
     }
     cmd.current_dir(script_dir);
-    run::inject_proxy_env(&mut cmd, &config.proxy, &config.agent_id);
+    run::inject_proxy_env(
+        &mut cmd,
+        &config.proxy,
+        &config.agent_id,
+        pre.jwt_token.as_deref(),
+    );
     cmd.stdin(std::process::Stdio::null());
     if config.suppress_output {
         cmd.stdout(std::process::Stdio::null())
@@ -231,6 +310,7 @@ async fn launch_sandbox(config: &AgentConfig, pre: &PreLaunchState) -> Result<i3
             config.memory_limit,
             config.cpu_limit,
             pre.mitm_ca.clone(),
+            pre.sandbox_id.clone(),
         )
     } else {
         let abs_script = run::resolve_script(&config.command[0])?;
@@ -261,6 +341,7 @@ async fn launch_sandbox(config: &AgentConfig, pre: &PreLaunchState) -> Result<i3
             config.memory_limit,
             config.cpu_limit,
             pre.mitm_ca.clone(),
+            pre.sandbox_id.clone(),
         )
     };
 

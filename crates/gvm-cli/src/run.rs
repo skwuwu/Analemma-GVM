@@ -116,15 +116,22 @@ pub(crate) fn derive_admin_url(proxy: &str) -> String {
     }
 }
 
-/// Download the MITM CA certificate from the proxy's admin API.
-/// The proxy generates the CA and holds the private key; we only get the public cert.
-/// This cert is injected into the sandbox trust store so TLS verification succeeds.
+/// Download the legacy shared MITM CA certificate from the proxy's
+/// agent-port endpoint (`GET /gvm/ca.pem`).
+///
+/// **Deprecated by `provision_sandbox`** (per-sandbox CA via CA-3).
+/// Kept as a fallback for two scenarios: (a) the proxy is older than
+/// CA-3 and does not expose `POST /gvm/sandbox/launch`, (b) the
+/// admin port is unreachable from the CLI's host (rare). In both
+/// cases we degrade to the shared CA so the sandbox can still
+/// terminate TLS — losing the per-sandbox blast-radius isolation
+/// but keeping HTTPS inspection alive.
 pub(crate) async fn download_mitm_ca_cert(proxy: &str) -> Option<Vec<u8>> {
     let ca_url = format!("{}/gvm/ca.pem", proxy.trim_end_matches('/'));
     match reqwest::get(&ca_url).await {
         Ok(resp) if resp.status().is_success() => match resp.bytes().await {
             Ok(bytes) if !bytes.is_empty() => {
-                eprintln!("  {GREEN}\u{2713}{RESET} MITM CA certificate downloaded from proxy");
+                eprintln!("  {GREEN}\u{2713}{RESET} MITM CA certificate downloaded from proxy (legacy shared)");
                 Some(bytes.to_vec())
             }
             _ => {
@@ -137,6 +144,182 @@ pub(crate) async fn download_mitm_ca_cert(proxy: &str) -> Option<Vec<u8>> {
             None
         }
     }
+}
+
+/// Result of a sandbox provisioning call.
+///
+/// Some fields are recorded but not yet consumed (`launch_event_id`
+/// is for `gvm proof event` correlation in CA-7, `ca_pubkey_hash` is
+/// surfaced as a banner fingerprint and reserved for `gvm sandbox
+/// inspect`). Marking the struct `#[allow(dead_code)]` documents
+/// the schema contract at the source of truth — the CLI's
+/// expectation about the launch response — without splitting the
+/// definition.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct SandboxProvision {
+    /// Proxy-issued sandbox identifier (UUID we sent in the request,
+    /// echoed by the server). Threaded into `SandboxConfig.sandbox_id`
+    /// so the sandbox state file records it for later
+    /// `lookup_sandbox_id_by_ip` calls (CA-4 routing).
+    pub sandbox_id: String,
+    /// PEM-encoded CA cert minted for **this sandbox only** (CA-3).
+    /// Will be injected into the sandbox's tmpfs trust store and
+    /// nowhere else.
+    pub ca_pem: Vec<u8>,
+    /// SHA-256 of the CA's SubjectPublicKeyInfo. Cosmetic for now —
+    /// `gvm sandbox inspect` (CA-7, future) will surface it; stored
+    /// here so the launch banner can echo a fingerprint.
+    pub ca_pubkey_hash: String,
+    /// Audit event id of the durable `gvm.sandbox.launch` row. Future
+    /// enforcement events in this sandbox should reference it via
+    /// `parent_event_id` (CA-6 wiring) so a chain walker can recover
+    /// the cryptographic root.
+    pub launch_event_id: String,
+}
+
+/// Pure parser for the `POST /gvm/sandbox/launch` response body.
+/// Extracted so it can be unit-tested without spinning up a server.
+fn parse_sandbox_launch_response(
+    sandbox_id: String,
+    body: &serde_json::Value,
+) -> Result<SandboxProvision> {
+    let ca_pem_str = body
+        .get("ca_pem")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Missing ca_pem in launch response"))?;
+    let ca_pubkey_hash = body
+        .get("ca_pubkey_hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let launch_event_id = body
+        .get("launch_event_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    Ok(SandboxProvision {
+        sandbox_id,
+        ca_pem: ca_pem_str.as_bytes().to_vec(),
+        ca_pubkey_hash,
+        launch_event_id,
+    })
+}
+
+/// Pure parser for the `POST /gvm/auth/token` response body.
+/// Returns the bearer token string.
+fn parse_auth_token_response(body: &serde_json::Value) -> Result<String> {
+    body.get("token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("Missing token in auth response"))
+}
+
+/// Provision a per-sandbox MITM CA via `POST /gvm/sandbox/launch`
+/// (CA-3 endpoint, admin port).
+///
+/// Generates a fresh `sandbox_id` (UUID v4) on the CLI side, sends it
+/// in the request body, and returns the proxy's response. The proxy's
+/// response carries the per-sandbox CA cert PEM + its pubkey hash +
+/// the durable audit event id — the same data that
+/// `download_mitm_ca_cert` historically returned, but now bound to
+/// one sandbox rather than shared across all of them.
+///
+/// **Returns** `Ok(SandboxProvision)` on success, `Err` if the proxy
+/// is unreachable, returns 4xx/5xx, or its response body cannot be
+/// parsed. The caller (`pre_launch`) treats a `Err` as "fall back to
+/// `download_mitm_ca_cert`" — the legacy path remains valid until
+/// every CLI codepath has migrated.
+pub(crate) async fn provision_sandbox(admin_url: &str, agent_id: &str) -> Result<SandboxProvision> {
+    let sandbox_id = uuid::Uuid::new_v4().to_string();
+    let url = format!("{}/gvm/sandbox/launch", admin_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "sandbox_id": sandbox_id,
+        "agent_id": agent_id,
+    });
+
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {} failed", url))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "Sandbox provisioning failed: HTTP {} — {}",
+            status,
+            body.chars().take(200).collect::<String>()
+        );
+    }
+
+    // The proxy returns plain JSON (see `api::sandbox_launch`'s
+    // `serde_json::json!` body). We deserialize into a `Value` and
+    // hand the body off to `parse_sandbox_launch_response` — keeping
+    // parsing pure so it stays unit-testable without HTTP fixtures.
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .context("Sandbox launch response is not valid JSON")?;
+    parse_sandbox_launch_response(sandbox_id, &json)
+}
+
+/// Issue a JWT for the given agent via `POST /gvm/auth/token`.
+///
+/// **Optional**: when JWT is not configured on the proxy (no
+/// `GVM_JWT_SECRET` set in the proxy environment), the endpoint
+/// returns 503 and we return `Ok(None)` — the caller skips token
+/// injection silently. This is the right behavior because making
+/// JWT mandatory at the CLI layer would block dev workflows that
+/// don't need agent-identity verification.
+///
+/// When a token is issued, the caller injects it into the agent's
+/// environment as `GVM_JWT_TOKEN`. Agent code is then expected to
+/// read it and add `Authorization: Bearer <token>` to outbound
+/// HTTP calls. The SDK does this automatically; SDK-less agents
+/// must do it manually (or use a wrapper — see
+/// `docs/user-guide.md` "Running multiple agents").
+pub(crate) async fn issue_jwt_token(agent_url: &str, agent_id: &str) -> Result<Option<String>> {
+    let url = format!("{}/gvm/auth/token", agent_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "agent_id": agent_id,
+        // tenant_id intentionally omitted — single-org deployment.
+        // Multi-tenant runtimes would set this from CLI flag, but
+        // that's not on the v0.5 roadmap.
+    });
+
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("POST {} failed", url))?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        || status == reqwest::StatusCode::NOT_FOUND
+    {
+        // Proxy doesn't have JWT configured — that's fine, fall
+        // through to header-based identity. (The proxy's hot path
+        // explicitly handles the no-JWT case at proxy/mod.rs:398.)
+        return Ok(None);
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "JWT issuance failed: HTTP {} — {}",
+            status,
+            body.chars().take(200).collect::<String>()
+        );
+    }
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .context("Auth token response is not valid JSON")?;
+    Ok(Some(parse_auth_token_response(&json)?))
 }
 
 /// Parse a memory limit string (e.g. "512m", "1g", "2048m") into bytes.
@@ -252,7 +435,19 @@ pub(crate) fn warn_if_node_cooperative(command: &[String]) {
 }
 
 /// Inject standard GVM proxy environment variables into a Command.
-pub(crate) fn inject_proxy_env(cmd: &mut tokio::process::Command, proxy: &str, agent_id: &str) {
+///
+/// `jwt_token` is the agent's JWT issued by `issue_jwt_token` (CA-6
+/// CLI integration). When `Some`, exposed as `GVM_JWT_TOKEN` in the
+/// child environment so SDK / agent code can pick it up and add
+/// `Authorization: Bearer <token>` to outbound HTTPS calls. Pass
+/// `None` when JWT is disabled on the proxy or when the legacy
+/// header-based identity path is sufficient (single-agent dev).
+pub(crate) fn inject_proxy_env(
+    cmd: &mut tokio::process::Command,
+    proxy: &str,
+    agent_id: &str,
+    jwt_token: Option<&str>,
+) {
     cmd.env("HTTP_PROXY", proxy)
         .env("HTTPS_PROXY", proxy)
         .env("http_proxy", proxy)
@@ -261,6 +456,9 @@ pub(crate) fn inject_proxy_env(cmd: &mut tokio::process::Command, proxy: &str, a
         .env("no_proxy", "127.0.0.1,localhost,::1")
         .env("GVM_AGENT_ID", agent_id)
         .env("GVM_PROXY_URL", proxy);
+    if let Some(token) = jwt_token {
+        cmd.env("GVM_JWT_TOKEN", token);
+    }
 }
 
 /// Check proxy health with user-visible status output.
@@ -281,6 +479,11 @@ pub(crate) async fn check_proxy_health(proxy: &str) -> Result<()> {
 
 /// Assemble a SandboxConfig from pre-resolved fields.
 /// Pure constructor — no I/O, no async.
+///
+/// `sandbox_id` carries the proxy-issued identifier when the launcher
+/// has called `provision_sandbox` (CA-3). Pass `None` for the legacy
+/// shared-CA path so the proxy's MITM dispatch uses the legacy
+/// `mitm_resolver` for this peer.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble_sandbox_config(
     script_path: std::path::PathBuf,
@@ -292,6 +495,7 @@ pub(crate) fn assemble_sandbox_config(
     memory_limit: Option<u64>,
     cpu_limit: Option<f64>,
     mitm_ca_cert: Option<Vec<u8>>,
+    sandbox_id: Option<String>,
 ) -> gvm_sandbox::SandboxConfig {
     // Generate placeholder API key env vars from secrets.toml so agents that
     // validate credentials at startup don't refuse to start. The proxy strips
@@ -310,7 +514,7 @@ pub(crate) fn assemble_sandbox_config(
         cpu_limit,
         fs_policy: None, // Caller sets this via pipeline based on fs_governance flag
         mitm_ca_cert,
-        sandbox_id: None, // pipeline.rs fills this in if /gvm/sandbox/launch was called
+        sandbox_id,
         sandbox_profile: gvm_sandbox::SandboxProfile::default(),
         extra_env,
     }
@@ -1226,6 +1430,128 @@ pub(crate) async fn run_contained_legacy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── CA-3 / multi-agent CLI integration ──
+
+    #[test]
+    fn parse_sandbox_launch_response_extracts_all_fields() {
+        // Mirror the exact JSON shape returned by `api::sandbox_launch`
+        // (see src/api.rs build_sandbox_launch_event-fed handler).
+        let body = serde_json::json!({
+            "sandbox_id": "echo-from-server",
+            "ca_pem": "-----BEGIN CERTIFICATE-----\nMIIB...==\n-----END CERTIFICATE-----\n",
+            "ca_pubkey_hash": "abc123def456",
+            "launch_event_id": "evt-launch-uuid",
+            "ca_not_after": "2026-12-31T00:00:00Z"
+        });
+        let prov = parse_sandbox_launch_response("client-generated-id".to_string(), &body).unwrap();
+        // sandbox_id is the *client's* generated UUID, not whatever the
+        // server echoed in the body. The CLI is the source of truth for
+        // the identifier — the server merely confirms it.
+        assert_eq!(prov.sandbox_id, "client-generated-id");
+        assert!(prov.ca_pem.starts_with(b"-----BEGIN CERTIFICATE-----"));
+        assert_eq!(prov.ca_pubkey_hash, "abc123def456");
+        assert_eq!(prov.launch_event_id, "evt-launch-uuid");
+    }
+
+    #[test]
+    fn parse_sandbox_launch_response_missing_ca_pem_errors() {
+        let body = serde_json::json!({
+            "sandbox_id": "x",
+            "ca_pubkey_hash": "y"
+            // ca_pem missing — proxy contract violated
+        });
+        let err = parse_sandbox_launch_response("sb".to_string(), &body)
+            .expect_err("missing ca_pem must fail");
+        assert!(err.to_string().to_lowercase().contains("ca_pem"));
+    }
+
+    #[test]
+    fn parse_sandbox_launch_response_missing_optional_fields_uses_unknown() {
+        // pubkey hash and launch_event_id are decoration; absent →
+        // "unknown" placeholder. The CLI must not refuse to launch
+        // just because these auxiliary fields drifted.
+        let body = serde_json::json!({
+            "ca_pem": "PEM"
+        });
+        let prov = parse_sandbox_launch_response("sb".to_string(), &body).unwrap();
+        assert_eq!(prov.ca_pubkey_hash, "unknown");
+        assert_eq!(prov.launch_event_id, "unknown");
+    }
+
+    #[test]
+    fn parse_auth_token_response_extracts_token() {
+        let body = serde_json::json!({
+            "token": "eyJhbGciOiJIUzI1NiJ9.payload.sig",
+            "expires_in": 3600,
+            "token_type": "Bearer"
+        });
+        let token = parse_auth_token_response(&body).unwrap();
+        assert_eq!(token, "eyJhbGciOiJIUzI1NiJ9.payload.sig");
+    }
+
+    #[test]
+    fn parse_auth_token_response_missing_token_errors() {
+        let body = serde_json::json!({"expires_in": 3600});
+        assert!(parse_auth_token_response(&body).is_err());
+    }
+
+    #[tokio::test]
+    async fn inject_proxy_env_emits_jwt_token_when_provided() {
+        // Exercise the env contract — when JWT is present, it must
+        // land as `GVM_JWT_TOKEN` in the child env. SDK-less agents
+        // depend on this exact name for the simple `os.environ.get`
+        // pattern documented in user-guide.md.
+        let mut cmd = tokio::process::Command::new("/bin/true");
+        inject_proxy_env(
+            &mut cmd,
+            "http://127.0.0.1:8080",
+            "agent-1",
+            Some("eyJtok.en"),
+        );
+        let envs: std::collections::HashMap<_, _> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().to_string(),
+                    v?.to_string_lossy().to_string(),
+                ))
+            })
+            .collect();
+        assert_eq!(
+            envs.get("GVM_AGENT_ID").map(|s| s.as_str()),
+            Some("agent-1")
+        );
+        assert_eq!(
+            envs.get("GVM_JWT_TOKEN").map(|s| s.as_str()),
+            Some("eyJtok.en")
+        );
+        assert_eq!(
+            envs.get("HTTPS_PROXY").map(|s| s.as_str()),
+            Some("http://127.0.0.1:8080")
+        );
+    }
+
+    #[tokio::test]
+    async fn inject_proxy_env_omits_jwt_token_when_none() {
+        let mut cmd = tokio::process::Command::new("/bin/true");
+        inject_proxy_env(&mut cmd, "http://127.0.0.1:8080", "agent-1", None);
+        let envs: std::collections::HashMap<_, _> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().to_string(),
+                    v?.to_string_lossy().to_string(),
+                ))
+            })
+            .collect();
+        assert!(
+            !envs.contains_key("GVM_JWT_TOKEN"),
+            "JWT token must not be injected when None — agents would otherwise see a stale env from a previous launch"
+        );
+    }
 
     #[test]
     fn test_is_local_proxy_url_localhost() {

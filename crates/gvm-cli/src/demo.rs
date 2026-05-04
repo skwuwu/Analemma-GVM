@@ -169,7 +169,7 @@ async fn launch_agent_script(
     let mut cmd = tokio::process::Command::new("python");
     cmd.arg(script_path.to_str().unwrap_or(""))
         .current_dir(script_dir);
-    crate::run::inject_proxy_env(&mut cmd, proxy_url, "demo");
+    crate::run::inject_proxy_env(&mut cmd, proxy_url, "demo", None);
     cmd.stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
 

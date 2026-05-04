@@ -946,10 +946,14 @@ pub async fn run_watch(
     // Spawn agent via pipeline::launch
     let config_clone = agent_config.clone();
     let mitm_ca = pre.mitm_ca.clone();
+    let sandbox_id = pre.sandbox_id.clone();
+    let jwt_token = pre.jwt_token.clone();
     let is_binary = pre.is_binary_mode;
     let agent_handle = tokio::spawn(async move {
         let pre_state = crate::pipeline::PreLaunchState {
             mitm_ca,
+            sandbox_id,
+            jwt_token,
             wal_offset: 0, // watch manages its own WAL offset
             is_binary_mode: is_binary,
         };
