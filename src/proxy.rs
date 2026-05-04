@@ -121,6 +121,11 @@ pub struct AppState {
     pub ledger: Arc<Ledger>,
     pub vault: Arc<Vault>,
     pub token_budget: Arc<TokenBudget>,
+    /// Per-agent quota — independent budget instance per agent_id.
+    /// One agent exhausting its share does NOT block other agents.
+    /// Composes with `token_budget` (the org-wide ceiling): both
+    /// must pass for an LLM request to proceed.
+    pub per_agent_budgets: Arc<crate::token_budget::PerAgentBudgets>,
     /// Layer 1: Wasm governance engine (immutable policy sandbox).
     /// Only available when compiled with --features wasm.
     #[cfg(feature = "wasm")]
@@ -522,37 +527,98 @@ pub async fn proxy_handler(
 
     // ── Step 4: Token budget check (LLM providers only) ──
     // Budget enforcement is independent of SRR — applies to all LLM requests.
+    // Two-tier: per-agent quota first (so a single agent's burst can't drain
+    // the org-wide pool before other agents get to check), then global ceiling.
     let is_llm = llm_trace::identify_llm_provider(&target.host).is_some();
-    if is_llm && state.token_budget.is_enabled() {
-        if let Err(exceeded) = state.token_budget.check_and_reserve() {
-            let reason = format!(
-                "Token budget exceeded: {}/{} tokens/hr (${:.2}/${:.2})",
-                exceeded.tokens_used,
-                exceeded.tokens_limit,
-                exceeded.cost_used_usd(),
-                exceeded.cost_limit_usd(),
-            );
-            let operation = gvm_headers
-                .as_ref()
-                .map(|h| h.operation.clone())
-                .unwrap_or_else(|| "unknown".to_string());
-            return governance_block_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                GovernanceBlockResponse {
-                    blocked: true,
-                    decision: "BudgetExceeded".to_string(),
-                    event_id: event.event_id.clone(),
-                    trace_id: event.trace_id.clone(),
-                    operation,
-                    reason,
-                    mode: state.on_block.deny.clone(),
-                    next_action: "wait for budget window to slide".to_string(),
-                    retry_after_secs: Some(60),
-                    rollback_hint: None,
-                    matched_rule_id: None,
-                    ic_level: 2,
-                },
-            );
+    if is_llm {
+        // Caller-side agent_id (header or JWT-verified). For per-agent
+        // budget enforcement we MUST use the verified one when JWT is on.
+        let effective_agent_id = gvm_headers
+            .as_ref()
+            .map(|h| h.agent_id.as_str())
+            .unwrap_or("unknown");
+
+        // Per-agent quota: each agent has independent budget, so one
+        // runaway agent does not block its peers. Failing here returns
+        // 429 with a per-agent decision string for telemetry.
+        if state.per_agent_budgets.is_enabled() {
+            if let Err(exceeded) = state.per_agent_budgets.check_and_reserve(effective_agent_id) {
+                let reason = if exceeded.tokens_limit == 0 && exceeded.cost_limit_millionths == 0 {
+                    "Per-agent budget admission rejected (quota table full)".to_string()
+                } else {
+                    format!(
+                        "Per-agent budget exceeded for {}: {}/{} tokens/hr (${:.2}/${:.2})",
+                        effective_agent_id,
+                        exceeded.tokens_used,
+                        exceeded.tokens_limit,
+                        exceeded.cost_used_usd(),
+                        exceeded.cost_limit_usd(),
+                    )
+                };
+                let operation = gvm_headers
+                    .as_ref()
+                    .map(|h| h.operation.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                return governance_block_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    GovernanceBlockResponse {
+                        blocked: true,
+                        decision: "PerAgentBudgetExceeded".to_string(),
+                        event_id: event.event_id.clone(),
+                        trace_id: event.trace_id.clone(),
+                        operation,
+                        reason,
+                        mode: state.on_block.deny.clone(),
+                        next_action: "wait for per-agent budget window to slide".to_string(),
+                        retry_after_secs: Some(60),
+                        rollback_hint: None,
+                        matched_rule_id: None,
+                        ic_level: 2,
+                    },
+                );
+            }
+        }
+
+        // Global org-wide ceiling. Failing here implies either no per-agent
+        // quota was configured OR the global cap is tighter than the
+        // per-agent cap × N.
+        if state.token_budget.is_enabled() {
+            if let Err(exceeded) = state.token_budget.check_and_reserve() {
+                // Roll back the per-agent reservation we just took.
+                if state.per_agent_budgets.is_enabled() {
+                    state
+                        .per_agent_budgets
+                        .release_reservation(effective_agent_id);
+                }
+                let reason = format!(
+                    "Token budget exceeded: {}/{} tokens/hr (${:.2}/${:.2})",
+                    exceeded.tokens_used,
+                    exceeded.tokens_limit,
+                    exceeded.cost_used_usd(),
+                    exceeded.cost_limit_usd(),
+                );
+                let operation = gvm_headers
+                    .as_ref()
+                    .map(|h| h.operation.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                return governance_block_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    GovernanceBlockResponse {
+                        blocked: true,
+                        decision: "BudgetExceeded".to_string(),
+                        event_id: event.event_id.clone(),
+                        trace_id: event.trace_id.clone(),
+                        operation,
+                        reason,
+                        mode: state.on_block.deny.clone(),
+                        next_action: "wait for budget window to slide".to_string(),
+                        retry_after_secs: Some(60),
+                        rollback_hint: None,
+                        matched_rule_id: None,
+                        ic_level: 2,
+                    },
+                );
+            }
         }
     }
 

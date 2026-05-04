@@ -192,21 +192,40 @@ pub struct ProxyConfig {
 ///
 /// ```toml
 /// [budget]
-/// max_tokens_per_hour = 100000  # 0 = unlimited
-/// max_cost_per_hour = 1.00      # 0.0 = unlimited
-/// reserve_per_request = 500     # estimated tokens reserved per in-flight request
+/// max_tokens_per_hour = 100000        # 0 = unlimited (org-wide)
+/// max_cost_per_hour = 1.00            # 0.0 = unlimited (org-wide)
+/// reserve_per_request = 500           # estimated tokens reserved per in-flight request
+/// per_agent_max_tokens_per_hour = 0   # 0 = disabled (no per-agent quota)
+/// per_agent_max_cost_per_hour = 0.0   # 0.0 = disabled
 /// ```
+///
+/// **Per-agent quota** (multi-agent isolation, single org):
+/// - `per_agent_max_*` fields, when nonzero, give each `agent_id` an
+///   independent budget instance. One agent exhausting its share does
+///   NOT consume from another agent's pool. The org-wide
+///   `max_*_per_hour` still applies as a ceiling above all agents.
+/// - Both must pass: an LLM request is admitted only when the agent's
+///   per-agent quota AND the org-wide ceiling have headroom.
+/// - Disabled by default (zeros). Operators turn it on when they want
+///   noisy-neighbor isolation across agents in the same organization.
 #[derive(Deserialize, Clone, Debug)]
 pub struct BudgetConfig {
-    /// Maximum tokens per hour across all agents (0 = unlimited).
+    /// Maximum tokens per hour across all agents (org-wide ceiling, 0 = unlimited).
     #[serde(default)]
     pub max_tokens_per_hour: u64,
-    /// Maximum cost in USD per hour (0.0 = unlimited).
+    /// Maximum cost in USD per hour across all agents (0.0 = unlimited).
     #[serde(default)]
     pub max_cost_per_hour: f64,
     /// Tokens reserved per in-flight LLM request (default: 500).
     #[serde(default = "default_reserve")]
     pub reserve_per_request: u64,
+    /// Per-agent token quota (0 = no per-agent limit; org-wide ceiling
+    /// alone applies).
+    #[serde(default)]
+    pub per_agent_max_tokens_per_hour: u64,
+    /// Per-agent cost quota in USD per hour (0.0 = no per-agent limit).
+    #[serde(default)]
+    pub per_agent_max_cost_per_hour: f64,
 }
 
 impl Default for BudgetConfig {
@@ -215,6 +234,8 @@ impl Default for BudgetConfig {
             max_tokens_per_hour: 0,
             max_cost_per_hour: 0.0,
             reserve_per_request: 500,
+            per_agent_max_tokens_per_hour: 0,
+            per_agent_max_cost_per_hour: 0.0,
         }
     }
 }

@@ -110,6 +110,69 @@ async fn handle_request(
         .unwrap_or_else(|| req.uri().path().to_string());
     let original_headers = req.headers().clone();
 
+    // ── JWT verification (Phase G4: identity enforcement on MITM path) ──
+    // The cooperative HTTP path (proxy_handler) verifies JWT in Step 0.
+    // The MITM path historically did not — meaning HTTPS traffic could
+    // forge `X-GVM-Agent-Id` via SDK headers and bypass identity checks
+    // that the proxy_handler enforced. Close that hole here so identity
+    // enforcement is parity across both transports.
+    //
+    // Convert axum::HeaderMap (auth::extract_bearer_token signature) from
+    // the hyper::HeaderMap we have. They share the same underlying type
+    // crate (`http`) so transmute via re-construction is unnecessary —
+    // we just call extract directly on the hyper map.
+    let verified_identity = if let Some(ref jwt) = state.jwt_config {
+        // Inline Bearer extraction (avoids axum::HeaderMap conversion).
+        let bearer = original_headers
+            .get("Authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .filter(|s| !s.is_empty());
+        match bearer {
+            Some(token) => match crate::auth::verify_token(jwt, token) {
+                Ok(identity) => {
+                    tracing::debug!(
+                        agent = %identity.agent_id,
+                        token_id = %identity.token_id,
+                        "MITM: JWT identity verified"
+                    );
+                    Some(identity)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "MITM: JWT verification failed — rejecting");
+                    return Ok(Response::builder()
+                        .status(401)
+                        .header("Content-Type", "application/json")
+                        .header("X-GVM-Block-Reason", "Invalid or expired JWT")
+                        .body(full_body(
+                            r#"{"blocked":true,"decision":"Unauthorized","reason":"Invalid or expired authentication token"}"#,
+                        ))
+                        .expect("static response builder"));
+                }
+            },
+            None => {
+                // JWT enabled + no Bearer token = reject. The proxy_handler
+                // path is permissive (warns and falls through to header-
+                // based identity) for backward compat with non-SDK clients,
+                // but MITM is HTTPS-terminating — by the time we see the
+                // request the agent has explicitly trusted our CA, so a
+                // missing JWT is operator misconfiguration, not a legacy
+                // client. Reject loud rather than silently downgrade.
+                tracing::warn!("MITM: no Bearer token but JWT is configured — rejecting");
+                return Ok(Response::builder()
+                    .status(401)
+                    .header("Content-Type", "application/json")
+                    .header("X-GVM-Block-Reason", "Missing JWT")
+                    .body(full_body(
+                        r#"{"blocked":true,"decision":"Unauthorized","reason":"Bearer token required but not provided"}"#,
+                    ))
+                    .expect("static response builder"));
+            }
+        }
+    } else {
+        None
+    };
+
     // Real upstream host comes from the TLS handshake SNI (host_hint), not
     // from the agent-supplied Host header. Inside a sandbox the agent's
     // Host is the proxy's veth IP (e.g. 10.200.0.1:8080), so trusting it
@@ -154,7 +217,7 @@ async fn handle_request(
         body: body_ref,
         gvm_headers: None,
     };
-    let classify_output = match crate::enforcement::classify(state, &classify_input) {
+    let mut classify_output = match crate::enforcement::classify(state, &classify_input) {
         Ok(o) => o,
         Err(err_msg) => {
             tracing::error!(error = %err_msg, "MITM classification failed (fail-close)");
@@ -170,6 +233,24 @@ async fn handle_request(
                 .expect("static response builder"));
         }
     };
+
+    // Override classify_output.agent_id with verified JWT identity when
+    // available — otherwise fall back to the (unverified) X-GVM-Agent-Id
+    // header. This ensures every downstream consumer (WAL, per-agent
+    // budget, telemetry) sees the cryptographically verified agent_id
+    // when JWT is enforced.
+    if let Some(ref id) = verified_identity {
+        classify_output.agent_id = id.agent_id.clone();
+    } else if classify_output.agent_id == "unknown" {
+        // No JWT, no SDK headers — try the raw X-GVM-Agent-Id as a
+        // last resort (parity with proxy_handler when JWT is disabled).
+        if let Some(hdr) = original_headers
+            .get("X-GVM-Agent-Id")
+            .and_then(|v| v.to_str().ok())
+        {
+            classify_output.agent_id = hdr.to_string();
+        }
+    }
 
     let decision = &classify_output.classification.decision;
     let is_default_caution = classify_output.is_default_caution;
@@ -216,31 +297,71 @@ async fn handle_request(
     }
 
     // ── Token budget check (LLM providers only) ──
+    // Two-tier (G1): per-agent quota first, then org-wide ceiling.
     let is_llm = crate::llm_trace::identify_llm_provider(&host).is_some();
-    if is_llm && state.token_budget.is_enabled() {
-        if let Err(exceeded) = state.token_budget.check_and_reserve() {
-            let reason = format!(
-                "Token budget exceeded: {}/{} tokens/hr (${:.2}/${:.2})",
-                exceeded.tokens_used,
-                exceeded.tokens_limit,
-                exceeded.cost_used_usd(),
-                exceeded.cost_limit_usd(),
-            );
-            return Ok(Response::builder()
-                .status(429)
-                .header("Content-Type", "application/json")
-                .header("X-GVM-Block-Reason", "Token budget exceeded")
-                .header("Retry-After", "60")
-                .body(full_body(
-                    serde_json::json!({
-                        "blocked": true,
-                        "decision": "BudgetExceeded",
-                        "reason": reason,
-                        "next_action": "wait for budget window to slide"
-                    })
-                    .to_string(),
-                ))
-                .expect("static response builder"));
+    if is_llm {
+        let agent_id = classify_output.agent_id.as_str();
+        if state.per_agent_budgets.is_enabled() {
+            if let Err(exceeded) = state.per_agent_budgets.check_and_reserve(agent_id) {
+                let reason = if exceeded.tokens_limit == 0
+                    && exceeded.cost_limit_millionths == 0
+                {
+                    "Per-agent budget admission rejected (quota table full)".to_string()
+                } else {
+                    format!(
+                        "Per-agent budget exceeded for {}: {}/{} tokens/hr (${:.2}/${:.2})",
+                        agent_id,
+                        exceeded.tokens_used,
+                        exceeded.tokens_limit,
+                        exceeded.cost_used_usd(),
+                        exceeded.cost_limit_usd(),
+                    )
+                };
+                return Ok(Response::builder()
+                    .status(429)
+                    .header("Content-Type", "application/json")
+                    .header("X-GVM-Block-Reason", "Per-agent budget exceeded")
+                    .header("Retry-After", "60")
+                    .body(full_body(
+                        serde_json::json!({
+                            "blocked": true,
+                            "decision": "PerAgentBudgetExceeded",
+                            "agent_id": agent_id,
+                            "reason": reason,
+                        })
+                        .to_string(),
+                    ))
+                    .expect("static response builder"));
+            }
+        }
+        if state.token_budget.is_enabled() {
+            if let Err(exceeded) = state.token_budget.check_and_reserve() {
+                if state.per_agent_budgets.is_enabled() {
+                    state.per_agent_budgets.release_reservation(agent_id);
+                }
+                let reason = format!(
+                    "Token budget exceeded: {}/{} tokens/hr (${:.2}/${:.2})",
+                    exceeded.tokens_used,
+                    exceeded.tokens_limit,
+                    exceeded.cost_used_usd(),
+                    exceeded.cost_limit_usd(),
+                );
+                return Ok(Response::builder()
+                    .status(429)
+                    .header("Content-Type", "application/json")
+                    .header("X-GVM-Block-Reason", "Token budget exceeded")
+                    .header("Retry-After", "60")
+                    .body(full_body(
+                        serde_json::json!({
+                            "blocked": true,
+                            "decision": "BudgetExceeded",
+                            "reason": reason,
+                            "next_action": "wait for budget window to slide"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("static response builder"));
+            }
         }
     }
 

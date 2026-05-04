@@ -427,6 +427,11 @@ async fn main() {
             config.budget.max_cost_per_hour,
             config.budget.reserve_per_request,
         )),
+        per_agent_budgets: Arc::new(gvm_proxy::token_budget::PerAgentBudgets::new(
+            config.budget.per_agent_max_tokens_per_hour,
+            config.budget.per_agent_max_cost_per_hour,
+            config.budget.reserve_per_request,
+        )),
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(wasm_engine),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),

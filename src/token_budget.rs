@@ -9,6 +9,7 @@
 //!   2. Request forwarded → response received → tap-stream extracts usage
 //!   3. record() releases reservation + adds actual tokens/cost to current slot
 
+use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -303,6 +304,153 @@ impl TokenBudget {
 
         self.current_minute.store(new_minute, Ordering::Relaxed);
         self.last_rotation_epoch.store(now, Ordering::Relaxed);
+    }
+}
+
+// ─── Per-agent quota (single-organization N-agent isolation) ───
+//
+// The global `TokenBudget` above is one pool shared by every agent —
+// suitable as an organization-wide ceiling but unsuitable as a
+// per-agent quota: a single buggy or runaway agent can drain the
+// whole budget and block every other agent in the org. Per-agent
+// budgets fix this by giving each agent_id an independent
+// `TokenBudget` instance.
+//
+// Composition with the global budget:
+//   - Global budget = org-wide cap (every request counts toward it)
+//   - Per-agent budget = each agent's individual quota
+//   - Both must pass for a request to proceed
+//   - Either can fail independently — failing the per-agent quota
+//     does NOT consume from the global pool, and vice versa
+//
+// Memory bound: `MAX_PER_AGENT_BUDGETS = 10_000` agents tracked.
+// Beyond that, new agents get a "new agent admission rejected"
+// error — same pattern the checkpoint registry uses.
+//
+// Lifecycle: per-agent budget instances are created lazily on first
+// `check_and_reserve(agent_id)`. They are NOT evicted automatically
+// — for v0.5 the in-memory footprint of a TokenBudget instance is
+// ~5 KB (60 slots × 16 B + overhead), so 10K agents = ~50 MB worst
+// case. Adding LRU eviction is straightforward when the cap
+// becomes a real constraint.
+
+/// Maximum number of distinct agents tracked by per-agent budgets.
+pub const MAX_PER_AGENT_BUDGETS: usize = 10_000;
+
+/// Per-agent quota. Each agent_id has its own `TokenBudget` instance
+/// with the per-agent limits configured at construction. Shares the
+/// parent budget's clock so virtual time advances in lockstep.
+pub struct PerAgentBudgets {
+    agents: DashMap<String, Arc<TokenBudget>>,
+    per_agent_max_tokens_per_hour: u64,
+    per_agent_max_cost_per_hour_millionths: u64,
+    reserve_per_request: u64,
+    clock: Arc<dyn BudgetClock>,
+}
+
+impl PerAgentBudgets {
+    /// Construct with the production system clock.
+    pub fn new(
+        per_agent_max_tokens_per_hour: u64,
+        per_agent_max_cost_per_hour: f64,
+        reserve_per_request: u64,
+    ) -> Self {
+        Self::with_clock(
+            per_agent_max_tokens_per_hour,
+            per_agent_max_cost_per_hour,
+            reserve_per_request,
+            Arc::new(SystemClock),
+        )
+    }
+
+    /// Construct with a caller-supplied clock (used by tests for
+    /// deterministic virtual time).
+    pub fn with_clock(
+        per_agent_max_tokens_per_hour: u64,
+        per_agent_max_cost_per_hour: f64,
+        reserve_per_request: u64,
+        clock: Arc<dyn BudgetClock>,
+    ) -> Self {
+        Self {
+            agents: DashMap::new(),
+            per_agent_max_tokens_per_hour,
+            per_agent_max_cost_per_hour_millionths: (per_agent_max_cost_per_hour * 1_000_000.0)
+                as u64,
+            reserve_per_request,
+            clock,
+        }
+    }
+
+    /// Whether per-agent enforcement is enabled (any limit > 0).
+    pub fn is_enabled(&self) -> bool {
+        self.per_agent_max_tokens_per_hour > 0 || self.per_agent_max_cost_per_hour_millionths > 0
+    }
+
+    /// Look up (or create) the per-agent budget instance.
+    /// Returns `Err(BudgetExceeded { tokens_limit: 0, .. })` with all
+    /// counters zero when admission is rejected because
+    /// MAX_PER_AGENT_BUDGETS is full — the magic-zero `tokens_limit`
+    /// flags this case to callers without inventing a new error type.
+    fn get_or_create(&self, agent_id: &str) -> Result<Arc<TokenBudget>, BudgetExceeded> {
+        // Fast path: agent already tracked.
+        if let Some(b) = self.agents.get(agent_id) {
+            return Ok(Arc::clone(&*b));
+        }
+        // Slow path: insert. Re-check inside the entry to avoid the
+        // race where two threads both miss the fast path.
+        if self.agents.len() >= MAX_PER_AGENT_BUDGETS && !self.agents.contains_key(agent_id) {
+            return Err(BudgetExceeded {
+                tokens_used: 0,
+                tokens_limit: 0,
+                cost_used_millionths: 0,
+                cost_limit_millionths: 0,
+            });
+        }
+        let entry = self.agents.entry(agent_id.to_string()).or_insert_with(|| {
+            Arc::new(TokenBudget::with_clock(
+                self.per_agent_max_tokens_per_hour,
+                self.per_agent_max_cost_per_hour_millionths as f64 / 1_000_000.0,
+                self.reserve_per_request,
+                Arc::clone(&self.clock),
+            ))
+        });
+        Ok(Arc::clone(entry.value()))
+    }
+
+    /// Per-agent check + reserve. Returns the agent's reservation id
+    /// on success or `BudgetExceeded` on quota violation. Agents whose
+    /// admission was rejected (MAX_PER_AGENT_BUDGETS full) get
+    /// `tokens_limit: 0` in the error.
+    pub fn check_and_reserve(&self, agent_id: &str) -> Result<u64, BudgetExceeded> {
+        let budget = self.get_or_create(agent_id)?;
+        budget.check_and_reserve()
+    }
+
+    /// Per-agent record. No-op when the agent is unknown — covers the
+    /// case of `record` arriving after the agent's slot was evicted
+    /// (future feature) without crashing.
+    pub fn record(&self, agent_id: &str, tokens: u64, cost_usd: f64) {
+        if let Some(b) = self.agents.get(agent_id) {
+            b.record(tokens, cost_usd);
+        }
+    }
+
+    /// Per-agent reservation release.
+    pub fn release_reservation(&self, agent_id: &str) {
+        if let Some(b) = self.agents.get(agent_id) {
+            b.release_reservation();
+        }
+    }
+
+    /// Status snapshot for one agent. Returns `None` if the agent has
+    /// never made a reservation.
+    pub fn status(&self, agent_id: &str) -> Option<BudgetStatus> {
+        self.agents.get(agent_id).map(|b| b.status())
+    }
+
+    /// Number of agents currently tracked.
+    pub fn agent_count(&self) -> usize {
+        self.agents.len()
     }
 }
 

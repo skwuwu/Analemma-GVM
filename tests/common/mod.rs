@@ -67,6 +67,7 @@ pub async fn test_state() -> (AppState, std::path::PathBuf) {
     );
     let vault = Arc::new(Vault::new(ledger.clone()).expect("test vault"));
     let token_budget = Arc::new(TokenBudget::new(0, 0.0, 500));
+    let per_agent_budgets = Arc::new(gvm_proxy::token_budget::PerAgentBudgets::new(0, 0.0, 500));
     let http_client =
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
             .build_http();
@@ -77,6 +78,7 @@ pub async fn test_state() -> (AppState, std::path::PathBuf) {
         ledger,
         vault,
         token_budget,
+        per_agent_budgets,
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),

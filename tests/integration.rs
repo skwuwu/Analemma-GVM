@@ -437,6 +437,7 @@ decision = { type = "Delay", milliseconds = 300 }
         ledger,
         vault,
         token_budget,
+        per_agent_budgets: Arc::new(gvm_proxy::token_budget::PerAgentBudgets::new(0, 0.0, 500)),
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
@@ -813,6 +814,7 @@ token = "sk_test_proxy_injected_key"
         ledger: ledger.clone(),
         vault,
         token_budget,
+        per_agent_budgets: Arc::new(gvm_proxy::token_budget::PerAgentBudgets::new(0, 0.0, 500)),
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
@@ -1081,6 +1083,7 @@ token = "sk_test_proxy_injected_bearer"
         ledger: ledger.clone(),
         vault,
         token_budget,
+        per_agent_budgets: Arc::new(gvm_proxy::token_budget::PerAgentBudgets::new(0, 0.0, 500)),
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
@@ -1272,6 +1275,7 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
         ledger,
         vault,
         token_budget,
+        per_agent_budgets: Arc::new(gvm_proxy::token_budget::PerAgentBudgets::new(0, 0.0, 500)),
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
@@ -1656,6 +1660,7 @@ async fn checkpoint_save_restore_merkle_verified() {
         ledger,
         vault,
         token_budget,
+        per_agent_budgets: Arc::new(gvm_proxy::token_budget::PerAgentBudgets::new(0, 0.0, 500)),
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
@@ -2110,6 +2115,7 @@ decision = { type = "Allow" }
         ledger,
         vault,
         token_budget: Arc::new(TokenBudget::new(0, 0.0, 500)),
+        per_agent_budgets: Arc::new(gvm_proxy::token_budget::PerAgentBudgets::new(0, 0.0, 500)),
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
@@ -2263,6 +2269,7 @@ decision = { type = "Allow" }
         ledger,
         vault,
         token_budget: Arc::new(TokenBudget::new(0, 0.0, 500)),
+        per_agent_budgets: Arc::new(gvm_proxy::token_budget::PerAgentBudgets::new(0, 0.0, 500)),
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
@@ -2381,6 +2388,7 @@ decision = { type = "Allow" }
         ledger,
         vault,
         token_budget: Arc::new(TokenBudget::new(0, 0.0, 500)),
+        per_agent_budgets: Arc::new(gvm_proxy::token_budget::PerAgentBudgets::new(0, 0.0, 500)),
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
@@ -2503,6 +2511,7 @@ decision = { type = "Allow" }
         ledger,
         vault,
         token_budget: Arc::new(TokenBudget::new(0, 0.0, 500)),
+        per_agent_budgets: Arc::new(gvm_proxy::token_budget::PerAgentBudgets::new(0, 0.0, 500)),
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
@@ -2593,6 +2602,7 @@ async fn ic3_self_approval_blocked_on_proxy_port() {
         ledger,
         vault,
         token_budget: Arc::new(TokenBudget::new(0, 0.0, 500)),
+        per_agent_budgets: Arc::new(gvm_proxy::token_budget::PerAgentBudgets::new(0, 0.0, 500)),
         #[cfg(feature = "wasm")]
         wasm_engine: Arc::new(gvm_proxy::wasm_engine::WasmEngine::native()),
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
