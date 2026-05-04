@@ -451,6 +451,76 @@ async fn sandbox_revoke_is_idempotent_for_unknown_sandbox() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+// ── CA-7: gvm sandbox list ──
+
+#[tokio::test]
+async fn sandbox_list_empty_when_no_launches() {
+    let (state, _wal) = common::test_state().await;
+    let resp = gvm_proxy::api::sandbox_list(State(state)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["active"], 0);
+    assert!(json["sandboxes"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn sandbox_list_includes_launched_sandboxes_with_metadata() {
+    let (state, _wal) = common::test_state().await;
+
+    // Launch two sandboxes — they should both appear.
+    for (sid, aid) in [("sb-list-1", "analyst"), ("sb-list-2", "coder")] {
+        let req = serde_json::json!({"sandbox_id": sid, "agent_id": aid});
+        let resp = gvm_proxy::api::sandbox_launch(
+            State(state.clone()),
+            axum::Json(serde_json::from_value(req).unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    let resp = gvm_proxy::api::sandbox_list(State(state.clone())).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["active"], 2);
+
+    let sandboxes = json["sandboxes"].as_array().unwrap();
+    let by_id: std::collections::HashMap<&str, &serde_json::Value> = sandboxes
+        .iter()
+        .map(|v| (v["sandbox_id"].as_str().unwrap(), v))
+        .collect();
+
+    let entry_1 = by_id.get("sb-list-1").expect("sb-list-1 present");
+    assert_eq!(entry_1["agent_id"], "analyst");
+    assert_eq!(entry_1["ca_pubkey_hash"].as_str().unwrap().len(), 64);
+    assert!(entry_1["launch_event_id"].as_str().unwrap().len() > 8);
+    assert!(entry_1["launched_at"].as_str().unwrap().contains("T")); // RFC 3339
+
+    let entry_2 = by_id.get("sb-list-2").expect("sb-list-2 present");
+    assert_eq!(entry_2["agent_id"], "coder");
+    assert_ne!(
+        entry_1["ca_pubkey_hash"], entry_2["ca_pubkey_hash"],
+        "each sandbox has its own CA — pubkey hashes must differ (CA-7 inspect surface for the property CA-4 enforces)"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_list_drops_revoked_sandboxes() {
+    let (state, _wal) = common::test_state().await;
+    let req = serde_json::json!({"sandbox_id": "sb-temp", "agent_id": "x"});
+    gvm_proxy::api::sandbox_launch(
+        State(state.clone()),
+        axum::Json(serde_json::from_value(req).unwrap()),
+    )
+    .await;
+
+    state.revoke_sandbox("sb-temp");
+
+    let resp = gvm_proxy::api::sandbox_list(State(state)).await;
+    let json = body_json(resp).await;
+    assert_eq!(json["active"], 0);
+    assert!(json["sandboxes"].as_array().unwrap().is_empty());
+}
+
 // ── CA-4: per-sandbox TLS bundle routing ──
 
 #[tokio::test]

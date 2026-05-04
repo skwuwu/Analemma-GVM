@@ -1673,6 +1673,21 @@ pub async fn sandbox_launch(
         );
     }
 
+    // Record per-sandbox metadata so `gvm sandbox list` (CA-7) can
+    // surface it and the proxy hot path (CA-6 part 2) can stamp
+    // `parent_event_id` on every later enforcement event in this
+    // sandbox. Done AFTER append_durable so we never expose a
+    // sandbox in the inspection list whose launch is not in the
+    // audit chain (fail-close ordering — same as the CA registry).
+    state.per_sandbox_metadata.insert(
+        req.sandbox_id.clone(),
+        crate::proxy::SandboxMetadata {
+            agent_id: req.agent_id.clone(),
+            launch_event_id: launch_event_id.clone(),
+            launched_at: chrono::Utc::now(),
+        },
+    );
+
     let resp_body = serde_json::json!({
         "sandbox_id": req.sandbox_id,
         "ca_pem": String::from_utf8_lossy(ca.ca_cert_pem()),
@@ -1727,6 +1742,61 @@ pub async fn sandbox_ca_pem(
                 .body(Body::empty())
                 .expect("fallback 500 response with empty body cannot fail")
         })
+}
+
+/// `GET /gvm/sandbox` — list all currently-active sandboxes (CA-7).
+///
+/// Joins `CARegistry::snapshot()` (sandbox_id, ca_pubkey_hash,
+/// ca_not_after) with `per_sandbox_metadata` (agent_id,
+/// launch_event_id, launched_at) so the operator-facing `gvm
+/// sandbox list` command can render a single coherent table.
+///
+/// Admin endpoint — same threat-model rationale as launch/revoke:
+/// listing the active sandboxes is privileged because it leaks
+/// fingerprints and identities that an agent should not enumerate.
+///
+/// Returns a JSON array; each entry's schema is documented in the
+/// CLI test (`gvm-cli` `tests/sandbox_list_parse.rs`) so a future
+/// schema change requires updating both endpoints.
+pub async fn sandbox_list(State(state): State<AppState>) -> Response<Body> {
+    let snapshot = state.ca_registry.snapshot();
+    let entries: Vec<serde_json::Value> = snapshot
+        .into_iter()
+        .map(|(sandbox_id, ca_pubkey_hash, ca_not_after)| {
+            // Metadata may be absent if the sandbox was revoked
+            // between `snapshot` and `metadata.get` — extremely
+            // narrow race, return placeholders rather than
+            // dropping the row so the operator still sees the
+            // CA-side knowledge.
+            let metadata = state.per_sandbox_metadata.get(&sandbox_id);
+            let (agent_id, launch_event_id, launched_at) = match metadata.as_deref() {
+                Some(m) => (
+                    m.agent_id.clone(),
+                    m.launch_event_id.clone(),
+                    m.launched_at.to_rfc3339(),
+                ),
+                None => (
+                    "unknown".to_string(),
+                    "unknown".to_string(),
+                    "unknown".to_string(),
+                ),
+            };
+            serde_json::json!({
+                "sandbox_id": sandbox_id,
+                "agent_id": agent_id,
+                "ca_pubkey_hash": ca_pubkey_hash,
+                "launch_event_id": launch_event_id,
+                "launched_at": launched_at,
+                "ca_not_after": ca_not_after.to_string(),
+            })
+        })
+        .collect();
+
+    let body = serde_json::json!({
+        "active": entries.len(),
+        "sandboxes": entries,
+    });
+    json_response(StatusCode::OK, &body)
 }
 
 /// `DELETE /gvm/sandbox/:sandbox_id` — revoke a sandbox's CA.

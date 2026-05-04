@@ -13,6 +13,7 @@ mod proof;
 mod proxy_manager;
 mod reload;
 mod run;
+mod sandbox_inspect;
 mod stats;
 mod status;
 mod suggest;
@@ -425,6 +426,40 @@ enum Commands {
     Fs {
         #[command(subcommand)]
         action: FsAction,
+    },
+
+    /// Inspect active sandboxes (CA-7). Shows per-sandbox CA
+    /// fingerprints, agent identity, launch event id, and uptime —
+    /// the operator's way to verify "which CA is governing which
+    /// agent right now." Calls the proxy's admin API.
+    Sandbox {
+        #[command(subcommand)]
+        action: SandboxAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SandboxAction {
+    /// List all currently-active sandboxes.
+    ///
+    ///   gvm sandbox list             # table view
+    ///   gvm sandbox list --json      # machine-readable JSON
+    List {
+        /// GVM proxy URL (admin port is derived as proxy_port + 1010)
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        proxy: String,
+        /// Emit JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show full details of a single sandbox (filtered list view).
+    ///
+    ///   gvm sandbox inspect sb-7f3a2b
+    Inspect {
+        /// Sandbox identifier (UUID issued by `gvm run` / launch API).
+        sandbox_id: String,
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        proxy: String,
     },
 }
 
@@ -1011,6 +1046,15 @@ async fn main() -> anyhow::Result<()> {
                     fs_approve::Mode::Interactive
                 };
                 fs_approve::run(std::path::Path::new(&staging_root), mode)?;
+            }
+        },
+
+        Commands::Sandbox { action } => match action {
+            SandboxAction::List { proxy, json } => {
+                sandbox_inspect::run_list(&proxy, json).await?;
+            }
+            SandboxAction::Inspect { sandbox_id, proxy } => {
+                sandbox_inspect::run_inspect(&proxy, &sandbox_id).await?;
             }
         },
     }

@@ -130,6 +130,22 @@ const CIRCUIT_BREAKER_THRESHOLD: u64 = 5;
 /// Retry-After header value (seconds) sent in 503 responses when the circuit breaker is open.
 const CIRCUIT_BREAKER_RETRY_SECS: u64 = 30;
 
+/// Per-sandbox metadata captured at launch and read on every event
+/// emitted from that sandbox. Public because `gvm sandbox list`
+/// (CA-7) serializes it as JSON for the admin API response.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SandboxMetadata {
+    /// Stable agent identity that is running inside this sandbox.
+    pub agent_id: String,
+    /// `event_id` of the durable `gvm.sandbox.launch` event in the
+    /// audit chain. Subsequent enforcement events stamp this as
+    /// their `parent_event_id` (CA-6 part 2).
+    pub launch_event_id: String,
+    /// Wall-clock launch time. Used by `gvm sandbox list` for the
+    /// "uptime" column.
+    pub launched_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Shared application state passed to all handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -224,6 +240,24 @@ pub struct AppState {
             ),
         >,
     >,
+    /// Per-sandbox metadata for audit + operator inspection (CA-7).
+    ///
+    /// Recorded by `api::sandbox_launch` alongside `ca_registry.provision`.
+    /// Cleared by `revoke_sandbox`. Holds the agent_id + launch_event_id
+    /// + launched_at so:
+    ///   1. `GET /gvm/sandbox` (CA-7) can list active sandboxes with
+    ///      enough context for the operator to identify each one.
+    ///   2. The proxy hot path (CA-6 part 2) can fetch
+    ///      `launch_event_id` for any sandbox_id and stamp it as
+    ///      `parent_event_id` on the GVMEvents emitted from that
+    ///      sandbox — anchoring every enforcement decision back to
+    ///      the sandbox's launch event in the Merkle chain.
+    ///
+    /// `CARegistry` deliberately doesn't store these fields because
+    /// it lives in `gvm-sandbox` and must not depend on audit types.
+    /// Keeping the metadata here, in the proxy crate, preserves that
+    /// dependency direction.
+    pub per_sandbox_metadata: Arc<dashmap::DashMap<String, SandboxMetadata>>,
     /// SRR payload inspection: buffer request body for JSON field matching.
     pub payload_inspection: bool,
     /// Maximum body bytes to buffer for payload inspection.
@@ -347,12 +381,14 @@ impl AppState {
         Some((resolver, server_config))
     }
 
-    /// Revoke a sandbox: clear its TLS bundle cache entry, then drop
-    /// its CA from the registry. Order matters — clear the derived
-    /// cache first so a concurrent `tls_bundle_for_sandbox` cannot
-    /// resurrect a stale entry from the still-present CA.
+    /// Revoke a sandbox: clear all derived state (TLS bundle cache,
+    /// metadata), then drop its CA from the registry. Order matters
+    /// — clear derived caches first so a concurrent
+    /// `tls_bundle_for_sandbox` or metadata reader cannot resurrect
+    /// a stale entry from the still-present CA.
     pub fn revoke_sandbox(&self, sandbox_id: &str) {
         self.per_sandbox_tls.remove(sandbox_id);
+        self.per_sandbox_metadata.remove(sandbox_id);
         self.ca_registry.revoke(sandbox_id);
     }
 }

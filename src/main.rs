@@ -453,6 +453,7 @@ async fn main() {
         mitm_ca_pem: Some(mitm_ca_cert_pem.clone()),
         ca_registry: Arc::new(gvm_sandbox::ca::CARegistry::new()),
         per_sandbox_tls: Arc::new(dashmap::DashMap::new()),
+        per_sandbox_metadata: Arc::new(dashmap::DashMap::new()),
         payload_inspection: config.srr.payload_inspection,
         max_body_bytes: config.srr.max_body_bytes,
         pending_approvals: Arc::new(dashmap::DashMap::new()),
@@ -610,6 +611,10 @@ async fn main() {
             "/gvm/sandbox/launch",
             axum::routing::post(api::sandbox_launch),
         )
+        // CA-7 list endpoint registered BEFORE the :sandbox_id routes
+        // so axum's matchit doesn't accidentally route GET /gvm/sandbox
+        // through the parameterized path.
+        .route("/gvm/sandbox", axum::routing::get(api::sandbox_list))
         .route(
             "/gvm/sandbox/:sandbox_id/ca.pem",
             axum::routing::get(api::sandbox_ca_pem),
