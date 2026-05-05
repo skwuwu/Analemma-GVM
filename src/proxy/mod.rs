@@ -432,7 +432,7 @@ impl AppState {
         {
             let sandbox_id = gvm_sandbox::lookup_sandbox_id_by_ip(&ip.to_string())?;
             let metadata = self.per_sandbox_metadata.get(&sandbox_id)?;
-            return Some((metadata.agent_id.clone(), metadata.launch_event_id.clone()));
+            Some((metadata.agent_id.clone(), metadata.launch_event_id.clone()))
         }
         #[cfg(not(target_os = "linux"))]
         {

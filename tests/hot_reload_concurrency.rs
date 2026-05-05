@@ -222,6 +222,17 @@ async fn reload_atomically_promotes_new_rules_to_subsequent_classify() {
 // calls complete OK, the post-state is one of the two inputs (last
 // write wins), and no classify call during the storm errors.
 
+/// 8 concurrent writes to the same `srr.toml` path race the file system,
+/// not the proxy's RwLock — and on Windows NTFS those writes aren't
+/// atomic, so a reader can observe `"AABB"` mid-flight and refuse the
+/// TOML parse with a 400. The invariant being tested is platform-
+/// independent (the `RwLock` serialises writers correctly on every
+/// platform), but the test apparatus depends on POSIX small-write
+/// atomicity that NTFS doesn't guarantee. The Linux-side lock-
+/// serialisation tests (`classify_during_reload_*` etc.) cover the
+/// same property without the file race, so ignoring on Windows loses
+/// no coverage.
+#[cfg_attr(target_os = "windows", ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_reloads_serialize_without_deadlock() {
     let path = write_srr(RULES_R1);
