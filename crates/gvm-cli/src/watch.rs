@@ -1,7 +1,7 @@
 use crate::run;
 use crate::ui::{BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
 use anyhow::{Context, Result};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -67,22 +67,32 @@ pub(crate) fn estimate_cost(
     (prompt_tokens as f64 * input_rate + completion_tokens as f64 * output_rate) / 1_000_000.0
 }
 
-// ─── Anomaly detector ───
+// ─── Unknown-host tracker ───
+//
+// Earlier versions of this struct also did burst (>10 req/2s) and
+// loop (>5 identical req/10s) detection. Both were APM territory:
+// they printed warnings without enforcing anything, the thresholds
+// were hardcoded with no operator override, and a streaming LLM
+// agent (Anthropic SSE chunks) routinely tripped the "burst" line
+// during normal operation. The charter review concluded those
+// belong to an external APM (Datadog / OpenLLMetry) — GVM emits the
+// raw event stream via `--json`, the APM analyzes.
+//
+// The unknown-host warning, on the other hand, IS governance signal:
+// every appearance feeds directly into the `gvm suggest` workflow
+// (which reads `default_caution: true` events to propose new SRR
+// rules). It stays.
 
 pub(crate) struct AnomalyDetector {
-    /// Sliding window for burst detection
-    request_times: VecDeque<Instant>,
-    /// Track (method:host:path) -> recent timestamps for loop detection
-    loop_detector: HashMap<String, VecDeque<Instant>>,
-    /// Collected warnings
+    /// Collected warnings — currently only "unknown host" entries.
+    /// Field name kept for source-compat with the existing summary
+    /// printers (they call `.warnings()`); its semantics narrowed.
     warnings: Vec<String>,
 }
 
 impl AnomalyDetector {
     pub(crate) fn new() -> Self {
         Self {
-            request_times: VecDeque::new(),
-            loop_detector: HashMap::new(),
             warnings: Vec::new(),
         }
     }
@@ -91,7 +101,10 @@ impl AnomalyDetector {
         &self.warnings
     }
 
-    /// Record a request and check for anomalies. Returns a warning if detected.
+    /// Record a request and emit an "unknown host" warning the first
+    /// time `default_caution` fires for a given host. Returns a
+    /// message string for the inline-printer; subsequent hits on the
+    /// same host return None so the UI doesn't repeat itself.
     pub(crate) fn record_request(
         &mut self,
         method: &str,
@@ -99,66 +112,19 @@ impl AnomalyDetector {
         path: &str,
         default_caution: bool,
     ) -> Option<String> {
-        let now = Instant::now();
-
-        // --- Burst detection: >10 requests within 2 seconds ---
-        self.request_times.push_back(now);
-        while let Some(&front) = self.request_times.front() {
-            if now.duration_since(front).as_secs_f64() > 2.0 {
-                self.request_times.pop_front();
-            } else {
-                break;
-            }
+        if !default_caution {
+            return None;
         }
-        if self.request_times.len() > 10 {
-            let msg = format!(
-                "Burst detected: {} requests in 2s",
-                self.request_times.len()
-            );
-            // Only warn once per burst (suppress if already warned recently)
-            if !self.warnings.last().is_some_and(|w| w.starts_with("Burst")) {
-                self.warnings.push(msg.clone());
-                return Some(msg);
-            }
+        let host_key = format!("unknown:{}", host);
+        if self.warnings.iter().any(|w| w == &host_key) {
+            return None;
         }
-
-        // --- Loop detection: same (method, host, path) >5 times in 10 seconds ---
-        let key = format!("{}:{}:{}", method, host, path);
-        let times = self.loop_detector.entry(key.clone()).or_default();
-        times.push_back(now);
-        while let Some(&front) = times.front() {
-            if now.duration_since(front).as_secs_f64() > 10.0 {
-                times.pop_front();
-            } else {
-                break;
-            }
-        }
-        if times.len() > 5 {
-            let msg = format!(
-                "Loop detected: {} {} {} called {} times in 10s",
-                method,
-                host,
-                path,
-                times.len()
-            );
-            if !self.warnings.iter().any(|w| w.contains(&key)) {
-                self.warnings.push(msg.clone());
-                return Some(msg);
-            }
-        }
-
-        // --- Unknown host warning (default-to-caution) ---
-        if default_caution {
-            let msg = format!("Unknown host (no SRR rule): {} {}{}", method, host, path);
-            // Only warn once per unique host
-            let host_key = format!("unknown:{}", host);
-            if !self.warnings.iter().any(|w| w.contains(&host_key)) {
-                self.warnings.push(format!("unknown:{}", host));
-                return Some(msg);
-            }
-        }
-
-        None
+        let msg = format!("Unknown host (no SRR rule): {} {}{}", method, host, path);
+        // Store the dedup key (not the human message) so the
+        // "have I warned about this host?" check above stays
+        // host-keyed regardless of method/path drift.
+        self.warnings.push(host_key);
+        Some(msg)
     }
 }
 
@@ -718,19 +684,13 @@ fn print_session_summary_text(stats: &SessionStats, anomaly: &AnomalyDetector) {
         eprintln!();
     }
 
-    // Anomaly warnings
-    let real_warnings: Vec<_> = anomaly
-        .warnings
-        .iter()
-        .filter(|w| !w.starts_with("unknown:"))
-        .collect();
-    if !real_warnings.is_empty() {
-        eprintln!("  {YELLOW}{BOLD}\u{26a0} Anomalies:{RESET}");
-        for w in &real_warnings {
-            eprintln!("    {YELLOW}\u{2022} {}{RESET}", w);
-        }
-        eprintln!();
-    }
+    // (Burst / loop "anomalies" section was removed — those were
+    // APM signals, not governance, and the charter review moved
+    // them outside GVM. The remaining `anomaly.warnings` entries
+    // are all `unknown:<host>` dedup keys for the `gvm suggest`
+    // workflow; they're surfaced inline as each request streams in,
+    // not in the summary.)
+    let _ = anomaly; // suppress unused-binding lint after the removal
 
     // Conversion funnel
     eprintln!("  {DIM}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{RESET}");
@@ -752,12 +712,14 @@ fn print_session_summary_json(stats: &SessionStats, anomaly: &AnomalyDetector) {
     let mut hosts: Vec<_> = stats.hosts.iter().map(|(k, v)| (k.clone(), *v)).collect();
     hosts.sort_by_key(|b| std::cmp::Reverse(b.1));
 
-    let real_warnings: Vec<_> = anomaly
-        .warnings
-        .iter()
-        .filter(|w| !w.starts_with("unknown:"))
-        .cloned()
-        .collect();
+    // `anomalies` field is kept in the JSON shape for backward
+    // compat with any consumer that parses session summaries, but
+    // it's now always an empty array — burst/loop detection moved
+    // out of GVM in the charter cleanup. Consumers that want
+    // real-time anomaly signal should pipe `--json` through their
+    // APM (Datadog / OpenLLMetry / etc.) and analyze there.
+    let real_warnings: Vec<String> = Vec::new();
+    let _ = anomaly; // suppress unused-binding lint
 
     let summary = serde_json::json!({
         "type": "session_summary",
@@ -1161,19 +1123,10 @@ mod tests {
         assert!((cost - 18.00).abs() < 0.01);
     }
 
-    #[test]
-    fn test_anomaly_detector_loop() {
-        let mut ad = AnomalyDetector::new();
-        // 5 calls should not trigger
-        for _ in 0..5 {
-            let w = ad.record_request("POST", "api.openai.com", "/v1/chat/completions", false);
-            assert!(w.is_none());
-        }
-        // 6th should trigger loop
-        let w = ad.record_request("POST", "api.openai.com", "/v1/chat/completions", false);
-        assert!(w.is_some());
-        assert!(w.unwrap().contains("Loop detected"));
-    }
+    // Burst + loop tests removed alongside the burst+loop detection
+    // logic itself (charter cleanup — APM signals that didn't enforce
+    // anything moved out of GVM). The dedup-by-host invariant for
+    // unknown-host warnings stays exercised below.
 
     #[test]
     fn test_anomaly_detector_default_caution() {
@@ -1182,9 +1135,29 @@ mod tests {
         assert!(w.is_some());
         assert!(w.unwrap().contains("Unknown host"));
 
-        // Second call to same host should NOT re-warn
+        // Second call to same host should NOT re-warn — even on a
+        // different path, host-keyed dedup keeps the operator from
+        // seeing the same domain bubble repeatedly. The signal is
+        // "this host has no rule," surfaced once.
         let w2 = ad.record_request("GET", "unknown.api.com", "/bar", true);
         assert!(w2.is_none());
+
+        // Different host → fresh warning.
+        let w3 = ad.record_request("GET", "another.api.com", "/foo", true);
+        assert!(w3.is_some());
+    }
+
+    #[test]
+    fn test_anomaly_detector_skips_when_default_caution_false() {
+        // Charter: burst/loop are gone. When `default_caution=false`
+        // there is nothing for this struct to do — must not allocate
+        // warnings or surface anything to the operator.
+        let mut ad = AnomalyDetector::new();
+        for _ in 0..100 {
+            let w = ad.record_request("POST", "api.openai.com", "/v1/chat/completions", false);
+            assert!(w.is_none());
+        }
+        assert!(ad.warnings().is_empty());
     }
 
     #[test]
