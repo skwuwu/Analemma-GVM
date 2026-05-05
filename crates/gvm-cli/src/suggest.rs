@@ -134,58 +134,134 @@ pub fn suggest_rules_interactive(wal_path: &str, start_offset: u64, srr_file: &s
     let mut rules_added = 0usize;
 
     for (target, count) in &caution_targets {
-        let pattern = format!("{}{}", pretty_host(&target.host), target.path_pattern);
-        println!(
-            "  {YELLOW}\u{26a0}{RESET} {BOLD}{} {}{RESET} {DIM}({} hit{}){RESET}",
-            target.method,
-            pattern,
-            count,
-            if *count > 1 { "s" } else { "" },
-        );
-        println!();
-        println!("    {CYAN}[a]{RESET} Allow     {DIM}(IC-1: instant, no delay){RESET}");
-        println!("    {CYAN}[d]{RESET} Delay     {DIM}(IC-2: 300ms safety delay + audit){RESET}");
-        println!("    {CYAN}[n]{RESET} Deny      {DIM}(IC-3: block completely){RESET}");
-        println!("    {CYAN}[s]{RESET} Skip      {DIM}(leave as Default-to-Caution){RESET}");
-        println!();
-        print!("    {BOLD}Choice [a/d/n/s]:{RESET} ");
-        io::stdout().flush().unwrap_or(());
+        // The path_pattern may already carry one or more `{any}` from
+        // the heuristic generalizer. The operator can additionally
+        // wildcard segments via `[e <nums>]` — useful when a custom
+        // slug or base64-encoded segment slipped past `looks_like_id`.
+        // The loop continues until a decision (a/d/n/s) is picked or
+        // input EOF.
+        let mut current_path = target.path_pattern.clone();
 
-        let mut input = String::new();
-        if reader.read_line(&mut input).is_err() {
-            break;
-        }
+        let (decision_toml, description, final_pattern) = loop {
+            let pattern = format!("{}{}", pretty_host(&target.host), current_path);
+            println!(
+                "  {YELLOW}\u{26a0}{RESET} {BOLD}{} {}{RESET} {DIM}({} hit{}){RESET}",
+                target.method,
+                pattern,
+                count,
+                if *count > 1 { "s" } else { "" },
+            );
+            println!();
+            // Numbered segments — operator references them in `e`.
+            let segs = path_segments(&current_path);
+            if !segs.is_empty() {
+                let mut line = String::from("    ");
+                for (i, s) in segs.iter().enumerate() {
+                    line.push_str(&format!("{DIM}[{}]{RESET} {} ", i + 1, s));
+                }
+                println!("{}", line);
+                println!();
+            }
 
-        let choice = input.trim().to_lowercase();
-        let (decision_toml, description) = match choice.as_str() {
-            "a" | "allow" => (
-                r#"{ type = "Allow" }"#.to_string(),
-                format!("{} {} — explicitly allowed", target.method, pattern),
-            ),
-            "d" | "delay" => (
-                r#"{ type = "Delay", milliseconds = 300 }"#.to_string(),
-                format!("{} {} — monitored with 300ms delay", target.method, pattern),
-            ),
-            "n" | "deny" => (
-                format!(
-                    r#"{{ type = "Deny", reason = "{} {} — blocked by operator" }}"#,
-                    target.method, pattern
-                ),
-                format!("{} {} — blocked by operator", target.method, pattern),
-            ),
-            "s" | "skip" | "" => {
-                println!("    {DIM}Skipped{RESET}");
+            println!("    {CYAN}[a]{RESET} Allow     {DIM}(IC-1: instant, no delay){RESET}");
+            println!(
+                "    {CYAN}[d]{RESET} Delay     {DIM}(IC-2: 300ms safety delay + audit){RESET}"
+            );
+            println!("    {CYAN}[n]{RESET} Deny      {DIM}(IC-3: block completely){RESET}");
+            println!("    {CYAN}[s]{RESET} Skip      {DIM}(leave as Default-to-Caution){RESET}");
+            println!(
+                "    {CYAN}[e <nums>]{RESET} Edit     {DIM}(wildcard segments — e.g. \"e 2 3\"){RESET}"
+            );
+            println!();
+            print!("    {BOLD}Choice:{RESET} ");
+            io::stdout().flush().unwrap_or(());
+
+            let mut input = String::new();
+            if reader.read_line(&mut input).is_err() {
+                // EOF — abandon this target. The outer for loop's
+                // `continue` won't reach because we're inside a
+                // sub-loop; explicit break with a sentinel.
+                break (
+                    String::new(),
+                    String::new(),
+                    String::new(), // empty pattern marks "no rule produced"
+                );
+            }
+
+            let choice = input.trim().to_lowercase();
+
+            // Edit branch — wildcard the requested segments and loop
+            // back to display the new pattern. No rule produced yet.
+            if let Some(indices) = parse_edit_indices(&choice) {
+                if indices.is_empty() {
+                    println!("    {DIM}Edit needs segment numbers, e.g. \"e 2 3\"{RESET}");
+                    println!();
+                    continue;
+                }
+                current_path = apply_segment_edits(&current_path, &indices);
+                println!(
+                    "    {DIM}Pattern updated:{RESET} {}{}",
+                    pretty_host(&target.host),
+                    current_path
+                );
                 println!();
                 continue;
             }
-            _ => {
-                println!("    {DIM}Unknown choice, skipping{RESET}");
-                println!();
-                continue;
+
+            let pattern_for_decision = pattern.clone();
+            match choice.as_str() {
+                "a" | "allow" => {
+                    break (
+                        r#"{ type = "Allow" }"#.to_string(),
+                        format!(
+                            "{} {} — explicitly allowed",
+                            target.method, pattern_for_decision
+                        ),
+                        pattern_for_decision,
+                    )
+                }
+                "d" | "delay" => {
+                    break (
+                        r#"{ type = "Delay", milliseconds = 300 }"#.to_string(),
+                        format!(
+                            "{} {} — monitored with 300ms delay",
+                            target.method, pattern_for_decision
+                        ),
+                        pattern_for_decision,
+                    )
+                }
+                "n" | "deny" => {
+                    break (
+                        format!(
+                            r#"{{ type = "Deny", reason = "{} {} — blocked by operator" }}"#,
+                            target.method, pattern_for_decision
+                        ),
+                        format!(
+                            "{} {} — blocked by operator",
+                            target.method, pattern_for_decision
+                        ),
+                        pattern_for_decision,
+                    )
+                }
+                "s" | "skip" | "" => {
+                    println!("    {DIM}Skipped{RESET}");
+                    println!();
+                    break (String::new(), String::new(), String::new());
+                }
+                _ => {
+                    println!("    {DIM}Unknown choice, try a/d/n/s or \"e <nums>\"{RESET}");
+                    println!();
+                    continue;
+                }
             }
         };
 
-        // Build the TOML rule block
+        // Skip / EOF / unknown all surface as empty pattern → no rule.
+        if final_pattern.is_empty() {
+            continue;
+        }
+
+        // Build the TOML rule block.
         let rule_toml = format!(
             r#"
 [[rules]]
@@ -195,7 +271,7 @@ decision = {decision}
 description = "{description}"
 "#,
             method = target.method,
-            pattern = pattern,
+            pattern = final_pattern,
             decision = decision_toml,
             description = description,
         );
@@ -494,6 +570,73 @@ fn looks_like_id(segment: &str) -> bool {
     false
 }
 
+/// Split `path` on `/` into non-empty segments. The leading `/` and
+/// any duplicate separators are stripped — same convention used by
+/// `generalize_path`. Pure helper, no allocation beyond the returned
+/// `Vec<&str>`.
+fn path_segments(path: &str) -> Vec<&str> {
+    path.split('/').filter(|s| !s.is_empty()).collect()
+}
+
+/// Parse a `e <nums>` edit command. Returns `Some(indices)` (1-based,
+/// in input order, deduped is the caller's job) when the line begins
+/// with `e` followed by whitespace and one or more positive integers.
+/// Returns `None` when the line doesn't start with `e ` (caller falls
+/// through to the decision branch).
+///
+/// Tolerant by design:
+/// - Tabs are accepted as separators (`e\t2\t3`).
+/// - Non-numeric tokens are silently dropped — operator typos like
+///   `e 2,3` partially work (drops the `2,3` token but accepts neither;
+///   we surface "needs segment numbers" if the result is empty).
+/// - Negative / zero / overflow → silently dropped. The caller
+///   bounds-checks against the actual segment count later, so a stray
+///   `999` is harmless.
+fn parse_edit_indices(line: &str) -> Option<Vec<usize>> {
+    let trimmed = line.trim();
+    let rest = trimmed
+        .strip_prefix("e ")
+        .or_else(|| trimmed.strip_prefix("e\t"))?;
+    let indices: Vec<usize> = rest
+        .split_whitespace()
+        .filter_map(|tok| tok.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .collect();
+    Some(indices)
+}
+
+/// Apply 1-based segment-wildcard edits to a path pattern.
+///
+/// `indices` are 1-based positions of segments to replace with
+/// `{any}`. Out-of-range indices are silently ignored — they don't
+/// propagate as errors because the caller (interactive prompt) just
+/// re-displays the pattern and lets the operator try again.
+///
+/// Pure: no I/O, no allocation beyond the returned `String`. Same
+/// input → same output (deterministic), which keeps the operator's
+/// rule-authoring decision reproducible across `gvm suggest` runs.
+fn apply_segment_edits(path: &str, indices: &[usize]) -> String {
+    let segs = path_segments(path);
+    if segs.is_empty() {
+        return path.to_string();
+    }
+    // Use a HashSet for O(1) membership; small enough that allocation
+    // cost is dominated by the format!() below regardless.
+    let to_wildcard: std::collections::HashSet<usize> = indices.iter().copied().collect();
+    let new_segs: Vec<String> = segs
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            if to_wildcard.contains(&(i + 1)) {
+                "{any}".to_string()
+            } else {
+                (*s).to_string()
+            }
+        })
+        .collect();
+    format!("/{}", new_segs.join("/"))
+}
+
 /// Append a TOML rule block to the SRR file.
 fn append_rule_to_file(path: &str, rule_toml: &str) -> io::Result<()> {
     use std::fs::OpenOptions;
@@ -580,5 +723,96 @@ mod tests {
         assert_eq!(host_label("api.bank.com"), "api-bank-com");
         assert_eq!(host_label("api.bank.com:443"), "api-bank-com");
         assert_eq!(host_label("api.demo:9999"), "api-demo:9999");
+    }
+
+    // ── Segment editor (interactive `e <nums>` branch) ──
+
+    #[test]
+    fn parse_edit_indices_recognises_e_prefix() {
+        assert_eq!(parse_edit_indices("e 2 3"), Some(vec![2, 3]));
+        assert_eq!(parse_edit_indices("e 1"), Some(vec![1]));
+        // Tab separator (real shells emit either; pasting from
+        // tmux selection often produces tabs).
+        assert_eq!(parse_edit_indices("e\t2\t3"), Some(vec![2, 3]));
+    }
+
+    #[test]
+    fn parse_edit_indices_returns_none_for_non_edit() {
+        // a/d/n/s and unknown go through the decision branch — the
+        // helper must signal "not an edit" with None so the caller
+        // doesn't accidentally treat "a" as an edit with no indices.
+        assert!(parse_edit_indices("a").is_none());
+        assert!(parse_edit_indices("d").is_none());
+        assert!(parse_edit_indices("skip").is_none());
+        // Bare `e` without space is also not an edit (no indices to
+        // wildcard, no separator either) — falls to "unknown choice".
+        assert!(parse_edit_indices("e").is_none());
+    }
+
+    #[test]
+    fn parse_edit_indices_drops_invalid_tokens_silently() {
+        // `2,3` is a single non-numeric token (because comma);
+        // operator's typo. Drops it; returns the valid `5`.
+        assert_eq!(parse_edit_indices("e 2,3 5"), Some(vec![5]));
+        // Negative / zero are dropped (1-based positions only).
+        assert_eq!(parse_edit_indices("e 0 -1 4"), Some(vec![4]));
+        // All-invalid → empty vec; caller surfaces "needs segment numbers".
+        assert_eq!(parse_edit_indices("e xyz abc"), Some(vec![]));
+    }
+
+    #[test]
+    fn apply_segment_edits_wildcards_specified_positions() {
+        // 1-based, in input order (not deduped; the caller's HashSet
+        // membership check handles duplicates implicitly).
+        assert_eq!(
+            apply_segment_edits("/repos/torvalds/linux/issues/12345", &[2, 3]),
+            "/repos/{any}/{any}/issues/12345"
+        );
+        assert_eq!(apply_segment_edits("/v1/messages", &[2]), "/v1/{any}");
+    }
+
+    #[test]
+    fn apply_segment_edits_ignores_out_of_range() {
+        // Indices past the end are silently ignored — this is the
+        // "operator typed a wrong number" case; no panic, no
+        // partial pattern.
+        assert_eq!(
+            apply_segment_edits("/v1/messages", &[5, 999]),
+            "/v1/messages"
+        );
+        // 0 is invalid (1-based); ignored. Only segment 1 wildcards.
+        assert_eq!(
+            apply_segment_edits("/v1/messages", &[0, 1]),
+            "/{any}/messages"
+        );
+    }
+
+    #[test]
+    fn apply_segment_edits_empty_indices_is_noop() {
+        // No-op: same input → same output. Pinned because the
+        // outer interactive loop relies on this to display the
+        // updated pattern unchanged when the operator types a bare
+        // `e` (caught earlier by the "needs segment numbers"
+        // branch, but defence-in-depth).
+        assert_eq!(apply_segment_edits("/repos/foo/bar", &[]), "/repos/foo/bar");
+    }
+
+    #[test]
+    fn apply_segment_edits_handles_already_wildcarded() {
+        // Path that came from `generalize_path` already has `{any}`
+        // segments. Editor can wildcard further static segments
+        // without breaking the existing markers.
+        assert_eq!(
+            apply_segment_edits("/repos/{any}/issues/abc", &[3]),
+            "/repos/{any}/{any}/abc"
+        );
+    }
+
+    #[test]
+    fn apply_segment_edits_preserves_root() {
+        // Pattern always starts with `/`. Empty path defensively
+        // stays empty rather than producing `//`.
+        assert_eq!(apply_segment_edits("", &[1]), "");
+        assert_eq!(apply_segment_edits("/", &[1]), "/");
     }
 }
