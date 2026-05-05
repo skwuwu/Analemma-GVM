@@ -268,10 +268,57 @@ pub struct DnsGovernanceConfig {
     /// WAL config-load record. See §6.5 of GVM_CODE_STANDARDS.md.
     #[serde(default = "default_dns_window_secs")]
     pub window_secs: u64,
+    /// Tier 3 trigger: number of unique subdomains on the same base
+    /// domain within the window before the tier escalates from 2 to
+    /// 3. Default: 5. Floor: 1 (operator may NOT set this to 0,
+    /// which would disable subdomain-burst detection entirely).
+    /// Raise for CDN-heavy workloads where 5 unique subdomains is
+    /// normal traffic; lower for high-security postures that want
+    /// earlier alerting. The `MIN_TIER3_THRESHOLD` floor in
+    /// `dns_governance.rs` clamps any value below 1 back to 1, so
+    /// a misconfigured TOML can't silently weaken detection.
+    #[serde(default = "default_tier3_unique_threshold")]
+    pub tier3_unique_threshold: usize,
+    /// Tier 4 trigger: total unique subdomain queries across all
+    /// base domains within the window before "flood" tier fires.
+    /// Default: 20. Floor: 1. Same rationale as
+    /// `tier3_unique_threshold`.
+    #[serde(default = "default_tier4_global_threshold")]
+    pub tier4_global_threshold: usize,
+    /// Delay applied to Tier 2 (unknown) queries in milliseconds
+    /// (default: 200). No security floor — this is a cost knob, not
+    /// a detection knob. Sane cap: 60_000 (1 minute) to prevent
+    /// foot-guns from a typo turning every unknown query into a
+    /// minute-long stall.
+    #[serde(default = "default_tier2_delay_ms")]
+    pub tier2_delay_ms: u64,
+    /// Delay applied to Tier 3 (anomalous subdomain burst) in
+    /// milliseconds (default: 3000).
+    #[serde(default = "default_tier3_delay_ms")]
+    pub tier3_delay_ms: u64,
+    /// Delay applied to Tier 4 (flood) in milliseconds (default:
+    /// 10000).
+    #[serde(default = "default_tier4_delay_ms")]
+    pub tier4_delay_ms: u64,
 }
 
 fn default_dns_window_secs() -> u64 {
     60
+}
+fn default_tier3_unique_threshold() -> usize {
+    5
+}
+fn default_tier4_global_threshold() -> usize {
+    20
+}
+fn default_tier2_delay_ms() -> u64 {
+    200
+}
+fn default_tier3_delay_ms() -> u64 {
+    3_000
+}
+fn default_tier4_delay_ms() -> u64 {
+    10_000
 }
 
 impl Default for DnsGovernanceConfig {
@@ -280,6 +327,11 @@ impl Default for DnsGovernanceConfig {
             enabled: true,
             listen_port: 5353,
             window_secs: 60,
+            tier3_unique_threshold: 5,
+            tier4_global_threshold: 20,
+            tier2_delay_ms: 200,
+            tier3_delay_ms: 3_000,
+            tier4_delay_ms: 10_000,
         }
     }
 }

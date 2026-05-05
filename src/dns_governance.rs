@@ -23,12 +23,13 @@ use tokio::net::UdpSocket;
 
 // ─── Tier thresholds ───
 
-/// Delay applied to unknown domains on first encounter.
-const TIER2_DELAY: Duration = Duration::from_millis(200);
-/// Delay for repeated anomalous queries on the same base domain.
-const TIER3_DELAY: Duration = Duration::from_secs(3);
-/// Delay for query flood (global unique subdomain burst).
-const TIER4_DELAY: Duration = Duration::from_secs(10);
+/// Default delay applied to unknown domains on first encounter (200ms).
+/// Operator override via `dns.tier2_delay_ms`; clamped to MAX_TIER_DELAY_MS.
+const DEFAULT_TIER2_DELAY_MS: u64 = 200;
+/// Default delay for repeated anomalous queries on the same base domain (3s).
+const DEFAULT_TIER3_DELAY_MS: u64 = 3_000;
+/// Default delay for query flood (global unique subdomain burst) (10s).
+const DEFAULT_TIER4_DELAY_MS: u64 = 10_000;
 
 /// Default sliding-window duration for per-domain unique subdomain
 /// counting. Operators may override via `dns.window_secs` in proxy
@@ -51,10 +52,52 @@ fn clamp_window_secs(requested: u64) -> u64 {
     requested.max(MIN_WINDOW_SECS)
 }
 
-/// Unique subdomains on an unknown base domain within the window to trigger Tier 3.
-const TIER3_UNIQUE_THRESHOLD: usize = 5;
-/// Global unique subdomain queries across all domains within the window to trigger Tier 4.
-const TIER4_GLOBAL_THRESHOLD: usize = 20;
+/// Clamp a tier threshold to its safety floor. Logs a warning if
+/// the operator-supplied value was below the floor. Public for the
+/// admin endpoint's "what would happen if I set this?" preview.
+fn clamp_threshold(requested: usize, knob_name: &str) -> usize {
+    if requested < MIN_TIER_THRESHOLD {
+        tracing::warn!(
+            knob = knob_name,
+            requested = requested,
+            clamped_to = MIN_TIER_THRESHOLD,
+            "DNS tier threshold below safety floor — clamped UP"
+        );
+        return MIN_TIER_THRESHOLD;
+    }
+    requested
+}
+
+/// Clamp a tier delay to its sanity cap. Logs a warning if the
+/// operator-supplied value was above the cap.
+fn clamp_delay_ms(requested: u64, knob_name: &str) -> Duration {
+    if requested > MAX_TIER_DELAY_MS {
+        tracing::warn!(
+            knob = knob_name,
+            requested_ms = requested,
+            clamped_to_ms = MAX_TIER_DELAY_MS,
+            "DNS tier delay above sanity cap — clamped DOWN"
+        );
+        return Duration::from_millis(MAX_TIER_DELAY_MS);
+    }
+    Duration::from_millis(requested)
+}
+
+/// Default unique subdomains on an unknown base domain within the window to trigger Tier 3.
+/// Operator can override via `dns.tier3_unique_threshold`; the floor below clamps any value < 1.
+const DEFAULT_TIER3_UNIQUE_THRESHOLD: usize = 5;
+/// Default global unique subdomain queries across all domains within the window to trigger Tier 4.
+const DEFAULT_TIER4_GLOBAL_THRESHOLD: usize = 20;
+/// Safety floor for both threshold knobs. Setting either to 0 would
+/// disable detection on that tier entirely; clamp UP so a typo or
+/// permissive override cannot silently weaken the policy.
+const MIN_TIER_THRESHOLD: usize = 1;
+/// Sanity cap for the per-tier delay knobs. 60s × 1000 = 60_000ms.
+/// Above this, a single misconfigured DNS query stalls the agent
+/// for over a minute; operator clamps any larger value DOWN. There
+/// is no security reason to allow longer delays — they hurt agent
+/// usability without strengthening detection.
+const MAX_TIER_DELAY_MS: u64 = 60_000;
 
 /// Maximum tracked domains before oldest are evicted.
 const MAX_TRACKED_DOMAINS: usize = 5_000;
@@ -169,6 +212,19 @@ impl DomainWindow {
             .map(|(_, ts)| now.duration_since(*ts) >= window)
             .unwrap_or(true)
     }
+
+    /// Read-only unique count over still-fresh entries. Used by
+    /// `DnsGovernance::snapshot_state` so the operator-facing
+    /// inspection API doesn't mutate the window's record.
+    fn unique_count(&self, now: Instant, window: Duration) -> usize {
+        let uniques: HashSet<&str> = self
+            .entries
+            .iter()
+            .filter(|(_, ts)| now.duration_since(*ts) < window)
+            .map(|(s, _)| s.as_str())
+            .collect();
+        uniques.len()
+    }
 }
 
 // ─── Global sliding window (cross-domain burst detection) ───
@@ -192,30 +248,85 @@ impl GlobalWindow {
         let uniques: HashSet<&str> = self.entries.iter().map(|(s, _)| s.as_str()).collect();
         uniques.len()
     }
+
+    /// Read-only unique count for the snapshot API. Same semantics
+    /// as `DomainWindow::unique_count`.
+    fn unique_count(&self, now: Instant, window: Duration) -> usize {
+        let uniques: HashSet<&str> = self
+            .entries
+            .iter()
+            .filter(|(_, ts)| now.duration_since(*ts) < window)
+            .map(|(s, _)| s.as_str())
+            .collect();
+        uniques.len()
+    }
 }
 
 // ─── Tier classification result ───
 
 /// The governance tier assigned to a DNS query, determining the delay applied.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Numeric ordering matches escalation severity (Known=0 → Flood=3),
+/// which `DnsGovernance::snapshot_state` uses to sort the operator
+/// inspection table "noisiest first."
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+#[repr(u8)]
 pub enum DnsTier {
     /// Known domain — free pass, no delay.
-    Known,
+    Known = 0,
     /// Unknown domain, first encounter — short delay + log.
-    Unknown,
+    Unknown = 1,
     /// Repeated anomalous pattern on unknown base domain — medium delay + alert.
-    Anomalous,
+    Anomalous = 2,
     /// Query flood — long delay + alert.
-    Flood,
+    Flood = 3,
+}
+
+/// Snapshot of `DnsGovernance` state for `gvm dns status` / the
+/// admin `GET /gvm/dns/state` endpoint. Read-only — the snapshot
+/// does NOT mutate sliding-window record state, so calling it does
+/// not affect classification of in-flight queries.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DnsStateSnapshot {
+    /// How many distinct base domains are currently tracked.
+    pub tracked_base_domains: usize,
+    /// Global unique-domain count in the cross-domain window right
+    /// now. Compare against `tier4_threshold` to see how close the
+    /// system is to flood escalation.
+    pub global_unique_count: usize,
+    /// The threshold at which Tier 4 (flood) fires. Reflects the
+    /// operator's `dns.tier4_global_threshold` override (clamped).
+    pub tier4_threshold: usize,
+    /// The threshold at which Tier 3 (anomalous subdomain burst)
+    /// fires. Reflects the operator's `dns.tier3_unique_threshold`.
+    pub tier3_threshold: usize,
+    /// Sliding-window duration in seconds.
+    pub window_secs: u64,
+    /// Per-base-domain state, sorted by tier desc + unique-count desc.
+    pub domains: Vec<DnsDomainState>,
+}
+
+/// Per-base-domain row in [`DnsStateSnapshot`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DnsDomainState {
+    pub base_domain: String,
+    pub unique_subdomain_count: usize,
+    pub tier: DnsTier,
+    pub oldest_entry_age_secs: u64,
 }
 
 impl DnsTier {
+    /// Default delay constants. **Do not use on the hot path** —
+    /// production config overrides these via
+    /// `DnsGovernance::delay_for_tier`. Kept for tests + any caller
+    /// that doesn't have a `DnsGovernance` instance handy.
     pub fn delay(&self) -> Duration {
         match self {
             DnsTier::Known => Duration::ZERO,
-            DnsTier::Unknown => TIER2_DELAY,
-            DnsTier::Anomalous => TIER3_DELAY,
-            DnsTier::Flood => TIER4_DELAY,
+            DnsTier::Unknown => Duration::from_millis(DEFAULT_TIER2_DELAY_MS),
+            DnsTier::Anomalous => Duration::from_millis(DEFAULT_TIER3_DELAY_MS),
+            DnsTier::Flood => Duration::from_millis(DEFAULT_TIER4_DELAY_MS),
         }
     }
 
@@ -264,22 +375,47 @@ pub struct DnsGovernance {
     /// to keep Tier 3 detection meaningful. Immutable after
     /// construction — no env var or runtime knob can shrink it.
     window: Duration,
+    // ─── Per-instance tier knobs (operator override + safety clamp) ───
+    /// `dns.tier3_unique_threshold`, clamped to ≥ MIN_TIER_THRESHOLD.
+    tier3_unique_threshold: usize,
+    /// `dns.tier4_global_threshold`, clamped to ≥ MIN_TIER_THRESHOLD.
+    tier4_global_threshold: usize,
+    /// `dns.tier2_delay_ms`, clamped to ≤ MAX_TIER_DELAY_MS.
+    tier2_delay: Duration,
+    /// `dns.tier3_delay_ms`, clamped to ≤ MAX_TIER_DELAY_MS.
+    tier3_delay: Duration,
+    /// `dns.tier4_delay_ms`, clamped to ≤ MAX_TIER_DELAY_MS.
+    tier4_delay: Duration,
 }
 
 impl DnsGovernance {
-    /// Construct with the default 60-second window. Used by tests
-    /// and code that does not need an operator override.
+    /// Construct with default knobs. Used by tests and any caller
+    /// that doesn't need an operator override.
     pub fn new(known_hosts: Arc<std::sync::RwLock<HashSet<String>>>) -> Self {
-        Self::with_window_secs(known_hosts, DEFAULT_WINDOW_SECS)
+        Self {
+            known_hosts,
+            domain_windows: Mutex::new(HashMap::new()),
+            global_window: Mutex::new(GlobalWindow::new()),
+            query_count: std::sync::atomic::AtomicU64::new(0),
+            window: Duration::from_secs(DEFAULT_WINDOW_SECS),
+            tier3_unique_threshold: DEFAULT_TIER3_UNIQUE_THRESHOLD,
+            tier4_global_threshold: DEFAULT_TIER4_GLOBAL_THRESHOLD,
+            tier2_delay: Duration::from_millis(DEFAULT_TIER2_DELAY_MS),
+            tier3_delay: Duration::from_millis(DEFAULT_TIER3_DELAY_MS),
+            tier4_delay: Duration::from_millis(DEFAULT_TIER4_DELAY_MS),
+        }
     }
 
     /// Construct with an operator-supplied window (read from
     /// `DnsGovernanceConfig::window_secs`). Values below
-    /// MIN_WINDOW_SECS are clamped UP to that floor.
+    /// `MIN_WINDOW_SECS` are clamped UP to that floor. **Kept for
+    /// callers that only override the window**; the full-config
+    /// constructor below is preferred for production startup.
     pub fn with_window_secs(
         known_hosts: Arc<std::sync::RwLock<HashSet<String>>>,
         window_secs: u64,
     ) -> Self {
+        let mut g = Self::new(known_hosts);
         let clamped = clamp_window_secs(window_secs);
         if clamped != window_secs {
             tracing::warn!(
@@ -290,12 +426,101 @@ impl DnsGovernance {
                 MIN_WINDOW_SECS
             );
         }
-        Self {
-            known_hosts,
-            domain_windows: Mutex::new(HashMap::new()),
-            global_window: Mutex::new(GlobalWindow::new()),
-            query_count: std::sync::atomic::AtomicU64::new(0),
-            window: Duration::from_secs(clamped),
+        g.window = Duration::from_secs(clamped);
+        g
+    }
+
+    /// Construct from the full `DnsGovernanceConfig`. Production
+    /// startup path — applies operator overrides for window,
+    /// tier-3/4 thresholds, and per-tier delays. All overrides go
+    /// through the safety clamps:
+    ///
+    ///   - `window_secs`           → clamped UP to MIN_WINDOW_SECS
+    ///   - `tier3_unique_threshold`→ clamped UP to MIN_TIER_THRESHOLD (1)
+    ///   - `tier4_global_threshold`→ clamped UP to MIN_TIER_THRESHOLD (1)
+    ///   - `tier{2,3,4}_delay_ms`  → clamped DOWN to MAX_TIER_DELAY_MS (60s)
+    ///
+    /// Each clamp logs a warning so the operator sees what was
+    /// adjusted; production binaries cannot be silently weakened
+    /// by an out-of-range TOML value.
+    pub fn with_config(
+        known_hosts: Arc<std::sync::RwLock<HashSet<String>>>,
+        config: &crate::config::DnsGovernanceConfig,
+    ) -> Self {
+        let mut g = Self::with_window_secs(known_hosts, config.window_secs);
+        g.tier3_unique_threshold =
+            clamp_threshold(config.tier3_unique_threshold, "tier3_unique_threshold");
+        g.tier4_global_threshold =
+            clamp_threshold(config.tier4_global_threshold, "tier4_global_threshold");
+        g.tier2_delay = clamp_delay_ms(config.tier2_delay_ms, "tier2_delay_ms");
+        g.tier3_delay = clamp_delay_ms(config.tier3_delay_ms, "tier3_delay_ms");
+        g.tier4_delay = clamp_delay_ms(config.tier4_delay_ms, "tier4_delay_ms");
+        g
+    }
+
+    /// Snapshot the current internal state for `gvm dns status` /
+    /// `GET /gvm/dns/state` — operator visibility into which
+    /// domains are tracked at which tier RIGHT NOW. Read-only;
+    /// acquires the two mutexes in the same order as `classify`
+    /// (global before per-domain) to avoid deadlock with concurrent
+    /// classification.
+    pub fn snapshot_state(&self) -> DnsStateSnapshot {
+        let now = Instant::now();
+        let global_unique = match self.global_window.lock() {
+            Ok(g) => g.unique_count(now, self.window),
+            Err(_) => 0,
+        };
+        let mut domains: Vec<DnsDomainState> = match self.domain_windows.lock() {
+            Ok(w) => w
+                .iter()
+                .map(|(base, win)| {
+                    let unique = win.unique_count(now, self.window);
+                    let age_secs = win
+                        .entries
+                        .first()
+                        .map(|(_, ts)| now.duration_since(*ts).as_secs())
+                        .unwrap_or(0);
+                    let tier = if unique > self.tier3_unique_threshold {
+                        DnsTier::Anomalous
+                    } else {
+                        DnsTier::Unknown
+                    };
+                    DnsDomainState {
+                        base_domain: base.clone(),
+                        unique_subdomain_count: unique,
+                        tier,
+                        oldest_entry_age_secs: age_secs,
+                    }
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        // Sort by tier (Anomalous first, then Unknown), then by
+        // unique count desc — operator sees "noisiest first".
+        domains.sort_by(|a, b| {
+            (b.tier as u8, b.unique_subdomain_count).cmp(&(a.tier as u8, a.unique_subdomain_count))
+        });
+        DnsStateSnapshot {
+            tracked_base_domains: domains.len(),
+            global_unique_count: global_unique,
+            tier4_threshold: self.tier4_global_threshold,
+            tier3_threshold: self.tier3_unique_threshold,
+            window_secs: self.window.as_secs(),
+            domains,
+        }
+    }
+
+    /// Per-instance tier delay lookup. Reads the operator-overridden
+    /// per-tier durations stored at construction time. Used on the
+    /// hot path by the DNS proxy event loop. The bare
+    /// `DnsTier::delay()` method returns the **default** durations
+    /// only — tests + callers without an instance.
+    pub fn delay_for_tier(&self, tier: DnsTier) -> Duration {
+        match tier {
+            DnsTier::Known => Duration::ZERO,
+            DnsTier::Unknown => self.tier2_delay,
+            DnsTier::Anomalous => self.tier3_delay,
+            DnsTier::Flood => self.tier4_delay,
         }
     }
 
@@ -373,7 +598,7 @@ impl DnsGovernance {
         }; // global lock dropped here
 
         // Tier 4 check: global unique query flood
-        if global_uniques > TIER4_GLOBAL_THRESHOLD {
+        if global_uniques > self.tier4_global_threshold {
             tracing::warn!(
                 domain = domain,
                 unique_queries = global_uniques,
@@ -452,7 +677,7 @@ impl DnsGovernance {
                 .map(|(_, ts)| now.duration_since(*ts).as_secs())
                 .unwrap_or(0);
 
-            if unique_count > TIER3_UNIQUE_THRESHOLD {
+            if unique_count > self.tier3_unique_threshold {
                 tracing::warn!(
                     base_domain = base,
                     subdomain = subdomain,
@@ -577,7 +802,7 @@ pub async fn run_dns_proxy(
 
             // Layer 0: DNS classification (synchronous — no I/O under lock)
             let classification = governance.classify(&domain);
-            let delay = classification.tier.delay();
+            let delay = governance.delay_for_tier(classification.tier);
 
             // WAL audit entry for non-known queries, including window state
             // snapshot so auditors can reproduce *why* this tier was assigned
@@ -832,7 +1057,7 @@ mod tests {
         for i in 0..6 {
             w.record(&format!("sub{}", i), start, window);
         }
-        assert!(w.record("sub6", start, window) > TIER3_UNIQUE_THRESHOLD);
+        assert!(w.record("sub6", start, window) > DEFAULT_TIER3_UNIQUE_THRESHOLD);
 
         // After window expires, count should reset
         let future = start + window + Duration::from_secs(1);
@@ -873,7 +1098,7 @@ mod tests {
         for i in 0..3 {
             gov.classify(&format!("sub{}.ATTACKER.COM", i));
         }
-        for i in 3..=TIER3_UNIQUE_THRESHOLD + 1 {
+        for i in 3..=DEFAULT_TIER3_UNIQUE_THRESHOLD + 1 {
             gov.classify(&format!("sub{}.attacker.com", i));
         }
         // Should trigger Tier 3 because all queries hit the same normalized base
@@ -891,7 +1116,7 @@ mod tests {
         let gov = DnsGovernance::new(hosts);
 
         // Send 6 unique subdomains to the same base domain
-        for i in 0..=TIER3_UNIQUE_THRESHOLD {
+        for i in 0..=DEFAULT_TIER3_UNIQUE_THRESHOLD {
             let domain = format!("sub{}.attacker.com", i);
             gov.classify(&domain);
         }
@@ -899,7 +1124,7 @@ mod tests {
         let c = gov.classify("sub99.attacker.com");
         assert_eq!(c.tier, DnsTier::Anomalous);
         assert!(
-            c.unique_subdomain_count > TIER3_UNIQUE_THRESHOLD,
+            c.unique_subdomain_count > DEFAULT_TIER3_UNIQUE_THRESHOLD,
             "WAL audit context must capture the subdomain count"
         );
     }
@@ -915,7 +1140,7 @@ mod tests {
         let t0 = Instant::now();
 
         // Trigger Tier 3 at t0.
-        for i in 0..=TIER3_UNIQUE_THRESHOLD + 2 {
+        for i in 0..=DEFAULT_TIER3_UNIQUE_THRESHOLD + 2 {
             let domain = format!("sub{}.attacker.com", i);
             gov.classify_at(&domain, t0);
         }

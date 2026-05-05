@@ -496,12 +496,12 @@ async fn main() {
             .map(|srr| srr.known_hosts().into_iter().collect())
             .unwrap_or_default();
         let known_hosts = Arc::new(std::sync::RwLock::new(known_set));
-        // Read sliding-window from config (clamped at 5s minimum inside
-        // DnsGovernance::with_window_secs to keep Tier 3 detection
-        // meaningful — see DnsGovernanceConfig::window_secs doc).
-        let dns_gov = Arc::new(dns_governance::DnsGovernance::with_window_secs(
+        // Construct from the full DNS config so operator overrides on
+        // tier3/4 thresholds + per-tier delays apply (clamped against
+        // safety floors / sanity caps inside `with_config`).
+        let dns_gov = Arc::new(dns_governance::DnsGovernance::with_config(
             known_hosts,
-            config.dns.window_secs,
+            &config.dns,
         ));
         state.dns_governance = Some(dns_gov.clone());
 
@@ -616,6 +616,8 @@ async fn main() {
         // so axum's matchit doesn't accidentally route GET /gvm/sandbox
         // through the parameterized path.
         .route("/gvm/sandbox", axum::routing::get(api::sandbox_list))
+        // DNS governance state inspection (admin-only).
+        .route("/gvm/dns/state", axum::routing::get(api::dns_state))
         .route(
             "/gvm/sandbox/:sandbox_id/ca.pem",
             axum::routing::get(api::sandbox_ca_pem),

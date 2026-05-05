@@ -1744,6 +1744,38 @@ pub async fn sandbox_ca_pem(
         })
 }
 
+/// `GET /gvm/dns/state` — operator visibility into DNS governance.
+///
+/// Returns the current sliding-window state (tracked base domains,
+/// unique-subdomain counts, current tier, oldest-entry age) plus the
+/// active threshold knobs. Read-only; classifying queries continues
+/// without blocking. Admin endpoint because the snapshot reveals
+/// which domains a sandboxed agent is contacting and at what cadence
+/// — that's privileged inventory information.
+///
+/// Returns `{ "enabled": false }` when DNS governance is disabled
+/// (config flag) so a `gvm dns status` call doesn't have to special-
+/// case 404 vs a real "no domains tracked yet" answer.
+pub async fn dns_state(State(state): State<AppState>) -> Response<Body> {
+    let Some(ref dns) = state.dns_governance else {
+        return json_response(
+            StatusCode::OK,
+            &serde_json::json!({"enabled": false, "reason": "dns governance disabled in config"}),
+        );
+    };
+    let snapshot = dns.snapshot_state();
+    let body = match serde_json::to_value(&snapshot) {
+        Ok(mut v) => {
+            if let Some(map) = v.as_object_mut() {
+                map.insert("enabled".to_string(), serde_json::Value::Bool(true));
+            }
+            v
+        }
+        Err(_) => serde_json::json!({"error": "snapshot serialization failed"}),
+    };
+    json_response(StatusCode::OK, &body)
+}
+
 /// `GET /gvm/sandbox` — list all currently-active sandboxes (CA-7).
 ///
 /// Joins `CARegistry::snapshot()` (sandbox_id, ca_pubkey_hash,

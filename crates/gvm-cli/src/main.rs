@@ -4,6 +4,7 @@ mod approve;
 mod audit;
 mod check;
 mod demo;
+mod dns_inspect;
 mod events;
 mod fs_approve;
 mod init;
@@ -467,6 +468,31 @@ enum Commands {
     Sandbox {
         #[command(subcommand)]
         action: SandboxAction,
+    },
+
+    /// Inspect DNS governance state. Shows currently-tracked base
+    /// domains, their subdomain unique counts, current tier, and
+    /// global flood-window state. Read-only; doesn't affect
+    /// in-flight classification.
+    ///
+    ///   gvm dns status
+    ///   gvm dns status --json    # machine-readable
+    Dns {
+        #[command(subcommand)]
+        action: DnsAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DnsAction {
+    /// Snapshot current DNS governance state.
+    Status {
+        /// GVM proxy URL (admin port = proxy_port + 1010).
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        proxy: String,
+        /// Emit JSON instead of the human-readable table.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1096,6 +1122,12 @@ async fn main() -> anyhow::Result<()> {
             }
             SandboxAction::Inspect { sandbox_id, proxy } => {
                 sandbox_inspect::run_inspect(&proxy, &sandbox_id).await?;
+            }
+        },
+
+        Commands::Dns { action } => match action {
+            DnsAction::Status { proxy, json } => {
+                dns_inspect::run_status(&proxy, json).await?;
             }
         },
     }
