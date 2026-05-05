@@ -12,6 +12,7 @@ mod preflight;
 mod proof;
 mod proxy_manager;
 mod reload;
+mod replay;
 mod run;
 mod sandbox_inspect;
 mod stats;
@@ -389,6 +390,37 @@ enum Commands {
         /// Proxy URL
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         proxy: String,
+    },
+
+    /// Dry-run an SRR ruleset against historical WAL events (#3
+    /// visibility item). Re-classifies every event in the WAL using
+    /// the proposed rule file, reports the verdict delta.
+    ///
+    /// Read-only: doesn't touch the running proxy, doesn't modify
+    /// the WAL, doesn't load new rules into a live SRR. Pure
+    /// reasoning over saved data — answers "if I had deployed
+    /// THIS rule yesterday, how many requests would it have
+    /// affected?"
+    ///
+    ///   gvm srr replay --wal data/wal.log --rules proposed.toml
+    ///   gvm srr replay --wal data/wal.log --rules proposed.toml --json
+    Replay {
+        /// Path to the existing WAL file holding the events to
+        /// re-classify.
+        #[arg(long, default_value = "data/wal.log")]
+        wal: String,
+        /// Path to the proposed SRR rule file (TOML, same shape as
+        /// `srr_network.toml`).
+        #[arg(long)]
+        rules: String,
+        /// Emit machine-readable JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
+        /// Limit how many events to load from the WAL. Useful when
+        /// the WAL is multi-GB and the operator wants a quick
+        /// sample. 0 = all events.
+        #[arg(long, default_value_t = 0)]
+        limit: usize,
     },
 
     /// Show proxy status: health, SRR rules, WAL state.
@@ -1015,6 +1047,15 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Reload { proxy } => {
             reload::run_reload(&proxy).await?;
+        }
+
+        Commands::Replay {
+            wal,
+            rules,
+            json,
+            limit,
+        } => {
+            replay::run(&wal, &rules, json, limit)?;
         }
 
         Commands::Status { proxy, json } => {

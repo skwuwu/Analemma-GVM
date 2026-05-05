@@ -7,8 +7,10 @@
 //!
 //! Compared to the v0.5.0 simpler aggregator (one leaf per agent),
 //! this design lets the proof export emit a per-step inclusion path:
+//!
 //!   - Per-agent path: step → agent_root.
 //!   - Global path: agent_root → checkpoint_root.
+//!
 //! Verifier composes them to reconstruct the seal's `checkpoint_root`.
 //!
 //! Last-write-wins per (agent, step). Memory is `O(distinct (agent,

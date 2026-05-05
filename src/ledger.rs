@@ -690,10 +690,11 @@ struct BatchFlushOutcome {
 
 /// Flush event data + Merkle batch record in a single fsync.
 ///
-/// 1. Concatenate all pre-serialized event JSON lines
-/// 2. Compute Merkle root from event hashes
-/// 3. Serialize and append MerkleBatchRecord
-/// 4. Single write_all + fsync for the entire buffer (events + batch record)
+/// 1. Concatenate all pre-serialized event JSON lines.
+/// 2. Compute Merkle root from event hashes.
+/// 3. Serialize and append MerkleBatchRecord.
+/// 4. Single write_all + fsync for the entire buffer (events + batch record).
+///
 /// Flush the batch with seal record, Merkle root over (events + seal),
 /// and anchor in a single fsync.
 ///

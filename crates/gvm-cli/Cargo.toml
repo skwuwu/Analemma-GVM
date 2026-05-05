@@ -32,6 +32,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 sha2 = "0.10"
 hex = "0.4"
 gvm-sandbox = { path = "../gvm-sandbox" }
+# Used only by `gvm replay` (gvm_proxy::srr::NetworkSRR) for offline
+# rule re-classification. Heavy dep — accept the binary-size cost
+# rather than splitting SRR into its own crate, since most operators
+# install gvm-cli + gvm-proxy together anyway.
+gvm-proxy = { path = "../.." }
 url = "2"
 which = "7"
 tempfile = "3"

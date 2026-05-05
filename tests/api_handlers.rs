@@ -451,6 +451,67 @@ async fn sandbox_revoke_is_idempotent_for_unknown_sandbox() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+// ── #1 visibility: actionable error headers on block responses ──
+
+#[tokio::test]
+async fn governance_block_response_emits_matched_rule_header() {
+    use gvm_proxy::types::{BlockResponseMode, GovernanceBlockResponse};
+
+    let block = GovernanceBlockResponse {
+        blocked: true,
+        decision: "Deny".to_string(),
+        event_id: "evt-1".to_string(),
+        trace_id: "trace-1".to_string(),
+        operation: "POST api.bank.com/transfer".to_string(),
+        reason: "above transfer limit".to_string(),
+        mode: BlockResponseMode::Halt,
+        next_action: "Contact admin".to_string(),
+        retry_after_secs: None,
+        rollback_hint: None,
+        matched_rule_id: Some("finance-002".to_string()),
+        policy_link: Some("https://gvm-console/rules/finance-002".to_string()),
+        ic_level: 4,
+    };
+    // Round-trip via the JSON body — confirms Serialize emits both
+    // new fields and the older shape stays compatible.
+    let json = serde_json::to_value(&block).unwrap();
+    assert_eq!(json["matched_rule_id"], "finance-002");
+    assert_eq!(json["policy_link"], "https://gvm-console/rules/finance-002");
+
+    // Schema regression: with policy_link=None and matched_rule_id=None,
+    // both fields are skipped in serialization (strict-JSON-schema
+    // consumers shouldn't see literal nulls).
+    let block_minimal = GovernanceBlockResponse {
+        matched_rule_id: None,
+        policy_link: None,
+        ..block
+    };
+    let json_min = serde_json::to_value(&block_minimal).unwrap();
+    assert!(json_min.get("matched_rule_id").is_none());
+    assert!(json_min.get("policy_link").is_none());
+}
+
+#[test]
+fn build_policy_link_substitutes_rule_id() {
+    use gvm_proxy::test_helpers::build_policy_link_for_test;
+    assert_eq!(
+        build_policy_link_for_test(Some("https://console/rules/{rule_id}"), Some("finance-002")),
+        Some("https://console/rules/finance-002".to_string()),
+    );
+}
+
+#[test]
+fn build_policy_link_returns_none_without_template() {
+    use gvm_proxy::test_helpers::build_policy_link_for_test;
+    assert!(build_policy_link_for_test(None, Some("finance-002")).is_none());
+}
+
+#[test]
+fn build_policy_link_returns_none_without_rule_id() {
+    use gvm_proxy::test_helpers::build_policy_link_for_test;
+    assert!(build_policy_link_for_test(Some("https://x/{rule_id}"), None).is_none());
+}
+
 // ── CA-6 part 2: parent_event_id auto-wiring ──
 
 #[tokio::test]

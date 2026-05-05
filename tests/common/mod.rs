@@ -102,6 +102,7 @@ pub async fn test_state() -> (AppState, std::path::PathBuf) {
         ca_registry: Arc::new(gvm_sandbox::ca::CARegistry::new()),
         per_sandbox_tls: Arc::new(dashmap::DashMap::new()),
         per_sandbox_metadata: Arc::new(dashmap::DashMap::new()),
+        policy_link_template: None,
         payload_inspection: false,
         max_body_bytes: 65536,
         pending_approvals: Arc::new(dashmap::DashMap::new()),

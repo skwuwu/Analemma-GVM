@@ -1538,6 +1538,7 @@ dependencies = [
  "clap",
  "crossterm",
  "glob",
+ "gvm-proxy",
  "gvm-sandbox",
  "gvm-types",
  "hex",

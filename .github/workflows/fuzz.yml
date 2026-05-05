@@ -69,7 +69,15 @@ jobs:
           key: fuzz-${{ matrix.target }}
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        # `--locked` was originally used to pin reproducibility, but
+        # cargo-fuzz 0.13.1's bundled Cargo.lock pins a rustix version
+        # that uses perma-unstable rustc attributes
+        # (`rustc_layout_scalar_valid_range_*`) which fail on current
+        # nightly rustc. Without `--locked`, cargo-install resolves
+        # the latest semver-compatible rustix that does compile.
+        # Reproducibility loss is acceptable here — the fuzzer
+        # binaries are not what's audited, the corpus is.
+        run: cargo install cargo-fuzz
 
       - name: Restore corpus
         uses: actions/cache@v4

@@ -381,6 +381,22 @@ pub struct EnforcementConfig {
     /// Delay in milliseconds for Default-to-Caution when default_unknown = "delay" (default: 300).
     #[serde(default = "default_delay_ms")]
     pub default_delay_ms: u64,
+
+    /// Optional URL template stamped on `X-GVM-Policy-Link` for blocked
+    /// requests. The literal string `{rule_id}` is substituted with the
+    /// matched rule id. Empty / unset → no header. Example:
+    ///
+    /// ```toml
+    /// [enforcement]
+    /// policy_link_template = "https://gvm-console.example.com/rules/{rule_id}"
+    /// ```
+    ///
+    /// Why a template instead of a fixed URL: an operator running a
+    /// hosted GVM console wants the rule id baked in. An operator with
+    /// a wiki / runbook system wants `https://wiki/runbooks/srr#{rule_id}`.
+    /// Template keeps both shapes one config field.
+    #[serde(default)]
+    pub policy_link_template: Option<String>,
 }
 
 fn default_ic3_approval_timeout_secs() -> u64 {
@@ -575,6 +591,7 @@ impl Default for ProxyConfig {
                 ic3_approval_timeout_secs: default_ic3_approval_timeout_secs(),
                 default_unknown: "delay".to_string(),
                 default_delay_ms: 300,
+                policy_link_template: None,
             },
             nats: NatsConfig {
                 url: "nats://127.0.0.1:4222".to_string(),

@@ -65,6 +65,15 @@ pub enum RedactionLevel {
 /// An event in either full or redacted form. Both shapes preserve the
 /// canonical inputs to `event_hash` so the verifier can recompute the
 /// hash without holding the unredacted form.
+///
+/// Variant size disparity (~832B Full vs ~376B Redacted) is intentional
+/// and clippy is silenced for this enum specifically: a `GvmProof`
+/// contains exactly one event, and proofs are passed by value at most
+/// a few times during verification — the per-allocation Box overhead
+/// would not pay back the indirection cost in any audit walker we
+/// have today. Re-evaluate if a future API holds a `Vec<GVMEventOrRedacted>`
+/// (`GvmBatchProof.events` already does, but is not in a hot path).
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GVMEventOrRedacted {
@@ -278,6 +287,16 @@ impl ProofVerifyReport {
     }
 }
 
+/// Pluggable anchor-signature verifier callback.
+///
+/// Takes the SHA-256 of the anchor body + the signature record; returns
+/// whether the signature checks out. A `&dyn Fn` boxed at the call
+/// site, not a `fn`, so the closure can capture a `KeyRegistry` or HSM
+/// handle by reference. Borrowed for the lifetime of the closure
+/// scope, so a verifier can hold trust-store state without forcing it
+/// into `'static` storage.
+pub type AnchorSignatureVerifier<'a> = dyn Fn(&[u8; 32], &crate::AnchorSignature) -> bool + 'a;
+
 /// Verify a `GvmProof` offline. The verifier holds (a) the proof and
 /// (b) optionally a `verify_anchor_signature` callback for the anchor
 /// signature variant the operator uses. Returns a per-layer report.
@@ -288,7 +307,7 @@ impl ProofVerifyReport {
 /// to `None`).
 pub fn verify_proof(
     proof: &GvmProof,
-    sig_verifier: Option<&dyn Fn(&[u8; 32], &crate::AnchorSignature) -> bool>,
+    sig_verifier: Option<&AnchorSignatureVerifier<'_>>,
 ) -> ProofVerifyReport {
     let mut report = ProofVerifyReport::default();
 

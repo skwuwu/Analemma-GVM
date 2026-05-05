@@ -16,6 +16,21 @@ use axum::http::{Response, StatusCode};
 
 use super::AppState;
 
+/// Substitute `{rule_id}` in `template` with `matched_rule_id` to
+/// produce the URL surfaced as `X-GVM-Policy-Link`. Returns None
+/// when either input is absent — the link header is then omitted.
+///
+/// Why this lives here rather than as a method on `GovernanceBlockResponse`:
+/// the type is in `gvm-types` and must not depend on operator
+/// configuration. Building the link is a proxy-side concern that
+/// reads `enforcement.policy_link_template` from `AppState`, so the
+/// helper sits next to the response builder.
+pub fn build_policy_link(template: Option<&str>, matched_rule_id: Option<&str>) -> Option<String> {
+    let tmpl = template?;
+    let rule_id = matched_rule_id?;
+    Some(tmpl.replace("{rule_id}", rule_id))
+}
+
 /// Build a JSON error response with optional actionable details.
 pub(super) fn error_response(status: StatusCode, message: &str) -> Response<Body> {
     error_response_detailed(status, message, None, None, None, None)
@@ -168,6 +183,21 @@ pub(super) fn governance_block_response(
     }
     if let Some(ref hint) = block.rollback_hint {
         builder = builder.header("X-GVM-Rollback-Hint", hint.as_str());
+    }
+    // Surface the matched rule and (optional) policy URL on block
+    // responses too, not only on Allow paths. Without these headers
+    // the agent gets `403 Forbidden` and the developer has to grep
+    // proxy logs to know WHY the block fired — the failure mode the
+    // visibility audit explicitly named "no actionable error".
+    if let Some(ref rule_id) = block.matched_rule_id {
+        if let Ok(v) = axum::http::HeaderValue::from_str(rule_id) {
+            builder = builder.header("X-GVM-Matched-Rule", v);
+        }
+    }
+    if let Some(ref link) = block.policy_link {
+        if let Ok(v) = axum::http::HeaderValue::from_str(link) {
+            builder = builder.header("X-GVM-Policy-Link", v);
+        }
     }
     if let Some(secs) = block.retry_after_secs {
         builder = builder.header("Retry-After", secs.to_string());

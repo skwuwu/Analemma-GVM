@@ -16,6 +16,17 @@ mod forward;
 mod headers;
 mod responses;
 
+/// Test-only re-export of the responses helpers. Production code MUST
+/// keep using the `pub(super) use responses::{...}` import below; this
+/// alias exists so `crate::test_helpers` (which integration tests
+/// consume) can reach `build_policy_link` without making the whole
+/// `responses` module `pub`. Compiled out of release builds because
+/// only the doc tests / integration tests reference the alias.
+#[doc(hidden)]
+pub mod responses_for_test {
+    pub use super::responses::build_policy_link;
+}
+
 pub use connect::handle_connect;
 pub use headers::remove_gvm_headers;
 
@@ -130,6 +141,19 @@ const CIRCUIT_BREAKER_THRESHOLD: u64 = 5;
 /// Retry-After header value (seconds) sent in 503 responses when the circuit breaker is open.
 const CIRCUIT_BREAKER_RETRY_SECS: u64 = 30;
 
+/// Per-sandbox `(GvmCertResolver, ServerConfig)` cache (CA-4 routing).
+/// Aliased so the `AppState` field reads cleanly and clippy's
+/// `type_complexity` lint is satisfied without a per-field allow.
+pub type PerSandboxTlsCache = Arc<
+    dashmap::DashMap<
+        String,
+        (
+            Arc<crate::tls_proxy::GvmCertResolver>,
+            Arc<rustls::ServerConfig>,
+        ),
+    >,
+>;
+
 /// Per-sandbox metadata captured at launch and read on every event
 /// emitted from that sandbox. Public because `gvm sandbox list`
 /// (CA-7) serializes it as JSON for the admin API response.
@@ -231,15 +255,7 @@ pub struct AppState {
     /// sandbox exits. The dropped entry's Arcs are freed once the
     /// last in-flight handshake using them finishes — same Arc-based
     /// liveness rule as `CARegistry`.
-    pub per_sandbox_tls: Arc<
-        dashmap::DashMap<
-            String,
-            (
-                Arc<crate::tls_proxy::GvmCertResolver>,
-                Arc<rustls::ServerConfig>,
-            ),
-        >,
-    >,
+    pub per_sandbox_tls: PerSandboxTlsCache,
     /// Per-sandbox metadata for audit + operator inspection (CA-7).
     ///
     /// Recorded by `api::sandbox_launch` alongside `ca_registry.provision`.
@@ -258,6 +274,11 @@ pub struct AppState {
     /// Keeping the metadata here, in the proxy crate, preserves that
     /// dependency direction.
     pub per_sandbox_metadata: Arc<dashmap::DashMap<String, SandboxMetadata>>,
+    /// `enforcement.policy_link_template` from gvm.toml. When `Some`,
+    /// every block response gets an `X-GVM-Policy-Link` header with
+    /// `{rule_id}` substituted. None disables the header. See
+    /// [`crate::config::EnforcementConfig::policy_link_template`].
+    pub policy_link_template: Option<String>,
     /// SRR payload inspection: buffer request body for JSON field matching.
     pub payload_inspection: bool,
     /// Maximum body bytes to buffer for payload inspection.
@@ -695,6 +716,7 @@ pub async fn proxy_handler(
                         retry_after_secs: Some(CIRCUIT_BREAKER_RETRY_SECS),
                         rollback_hint: None,
                         matched_rule_id: None,
+                        policy_link: None,
                         ic_level: 0,
                     },
                 );
@@ -768,6 +790,7 @@ pub async fn proxy_handler(
                         retry_after_secs: Some(60),
                         rollback_hint: None,
                         matched_rule_id: None,
+                        policy_link: None,
                         ic_level: 2,
                     },
                 );
@@ -798,6 +821,7 @@ pub async fn proxy_handler(
                         retry_after_secs: Some(60),
                         rollback_hint: None,
                         matched_rule_id: None,
+                        policy_link: None,
                         ic_level: 2,
                     },
                 );
@@ -864,6 +888,7 @@ pub async fn proxy_handler(
                         retry_after_secs: None,
                         rollback_hint: Some(event.trace_id.clone()),
                         matched_rule_id: None,
+                        policy_link: None,
                         ic_level: 2,
                     },
                 );
@@ -959,6 +984,10 @@ pub async fn proxy_handler(
                         retry_after_secs: Some(10),
                         rollback_hint: Some(event.trace_id.clone()),
                         matched_rule_id: classification.matched_rule_id.clone(),
+                        policy_link: responses::build_policy_link(
+                            state.policy_link_template.as_deref(),
+                            classification.matched_rule_id.as_deref(),
+                        ),
                         ic_level: 3,
                     },
                 );
@@ -1061,6 +1090,10 @@ pub async fn proxy_handler(
                         retry_after_secs: None,
                         rollback_hint: Some(event.trace_id.clone()),
                         matched_rule_id: classification.matched_rule_id.clone(),
+                        policy_link: responses::build_policy_link(
+                            state.policy_link_template.as_deref(),
+                            classification.matched_rule_id.as_deref(),
+                        ),
                         ic_level: 3,
                     },
                 )
@@ -1100,6 +1133,10 @@ pub async fn proxy_handler(
                     retry_after_secs: None,
                     rollback_hint: Some(event.trace_id.clone()),
                     matched_rule_id: classification.matched_rule_id.clone(),
+                    policy_link: responses::build_policy_link(
+                        state.policy_link_template.as_deref(),
+                        classification.matched_rule_id.as_deref(),
+                    ),
                     ic_level: 4,
                 },
             )

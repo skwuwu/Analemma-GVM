@@ -2078,6 +2078,16 @@ pub struct GovernanceBlockResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_rule_id: Option<String>,
 
+    /// Optional URL pointing the operator at the rule's source-of-truth
+    /// page (config repo, runbook, internal console). Built by the
+    /// proxy from `enforcement.policy_link_template` with
+    /// `{rule_id}` substituted. None when the operator hasn't
+    /// configured a template, or when `matched_rule_id` is None.
+    /// Surfaced as `X-GVM-Policy-Link` so debugging the block
+    /// doesn't require log-grep to find the responsible rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_link: Option<String>,
+
     /// Impact Classification level (1-3, higher = more restrictive)
     pub ic_level: u8,
 }

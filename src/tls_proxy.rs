@@ -511,6 +511,15 @@ impl HttpRequest {
 ///
 /// Write an enforcement event (Deny/RequireApproval) to WAL.
 /// Every blocked or rate-limited request must appear in the audit trail.
+///
+/// Eight arguments because each is a distinct semantic field on the
+/// emitted GVMEvent (ledger destination, classification context, host,
+/// request, decision string, HTTP status, caution flag, parent
+/// event id). Grouping into a struct would just shift the noise to
+/// the call site without removing it — the call sites in
+/// `tls_proxy_hyper.rs` already build each value inline anyway. clippy
+/// allow with rationale is the lower-overhead choice here.
+#[allow(clippy::too_many_arguments)]
 pub async fn append_enforcement_event(
     ledger: &std::sync::Arc<crate::ledger::Ledger>,
     classify_output: &crate::enforcement::ClassifyOutput,

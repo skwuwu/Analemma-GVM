@@ -28,3 +28,19 @@ pub mod vault;
 /// policy plugin scenarios only. Do not enable in production.
 #[cfg(feature = "wasm")]
 pub mod wasm_engine;
+
+/// Public helpers that exist solely so integration tests can drive
+/// proxy-internal behavior. Production code does not consume this
+/// module — every entry point delegates to the same `pub(super)`
+/// helper used by the live request path, so the tests are exercising
+/// the same code, not a parallel implementation.
+pub mod test_helpers {
+    /// Test re-export of `proxy::responses::build_policy_link`.
+    /// Pure function; no I/O, no AppState dependency.
+    pub fn build_policy_link_for_test(
+        template: Option<&str>,
+        matched_rule_id: Option<&str>,
+    ) -> Option<String> {
+        crate::proxy::responses_for_test::build_policy_link(template, matched_rule_id)
+    }
+}
