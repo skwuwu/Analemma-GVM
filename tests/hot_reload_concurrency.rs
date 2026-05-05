@@ -75,6 +75,18 @@ milliseconds = 50
 // 1. Concurrent classify during reload — no errors, no panics
 // ════════════════════════════════════════════════════════════════
 
+/// Same Windows-NTFS-non-atomic-write trap as
+/// `concurrent_reloads_serialize_without_deadlock` (which 839a333
+/// already marked Linux-only). The reload writer overwrites the SRR
+/// file with R2 mid-flight; on NTFS a classifier task can read a
+/// partial file before R2 lands and fall through to the
+/// default-to-caution Delay, never observing R2's Allow rule. The
+/// invariant under test is platform-independent (RwLock serialises
+/// writers; classifiers see one consistent state per `read()`), but
+/// the file-write side of the apparatus needs POSIX small-write
+/// atomicity that NTFS doesn't provide. Same trade-off — Linux CI
+/// covers the actual lock semantics; Windows just ignores.
+#[cfg_attr(target_os = "windows", ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn classify_during_reload_never_errors_and_never_observes_partial_state() {
     let path = write_srr(RULES_R1);
