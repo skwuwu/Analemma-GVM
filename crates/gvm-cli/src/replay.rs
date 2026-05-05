@@ -283,7 +283,7 @@ fn print_human_report(report: &ReplayReport, wal_path: &str, rules_path: &str) {
             .or_insert(0) += 1;
     }
     let mut group_vec: Vec<_> = grouped.into_iter().collect();
-    group_vec.sort_by(|a, b| b.1.cmp(&a.1));
+    group_vec.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
     for ((host, original, proposed), count) in group_vec.iter().take(20) {
         println!(
             "    {YELLOW}{:>3}{RESET}× {host:<32} {DIM}{original}{RESET} \u{2192} {BOLD}{proposed}{RESET}",
