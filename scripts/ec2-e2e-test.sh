@@ -3092,8 +3092,20 @@ if should_run 47 && [ "$SKIP_OPENCLAW" = false ]; then
             fail "47d: SRR decision not found for Anthropic call"
         fi
 
-        # 47e: Verify WAL recorded the event
-        WAL_ANTHROPIC=$(cat data/wal.log 2>/dev/null | grep "anthropic" | tail -1)
+        # 47e: Verify WAL recorded the event. Search both the canonical
+        # data/wal.log and any isolated WAL the e2e harness redirected
+        # via GVM_CONFIG to /tmp/gvm-e2e-config-{pid}/.
+        WAL_ANTHROPIC=""
+        for wal_candidate in data/wal.log /tmp/gvm-e2e-config-*/data/wal.log; do
+            for actual in $wal_candidate; do
+                [ -f "$actual" ] || continue
+                hit=$(grep "anthropic" "$actual" 2>/dev/null | tail -1)
+                if [ -n "$hit" ]; then
+                    WAL_ANTHROPIC="$hit"
+                    break 2
+                fi
+            done
+        done
         if [ -n "$WAL_ANTHROPIC" ]; then
             pass "47e: WAL audit trail contains Anthropic API event"
         else
