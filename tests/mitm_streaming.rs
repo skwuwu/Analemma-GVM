@@ -88,6 +88,7 @@ struct MitmFixture {
 ///   - if those two CAs have different subject DNs, leaf.issuer
 ///     fails to match chain[1].subject and rustls returns
 ///     `UnknownIssuer`.
+///
 /// Production avoids this because the production CA is generated with
 /// the matching DN. Tests must do the same.
 fn create_compatible_test_ca() -> (Vec<u8>, Vec<u8>) {
@@ -507,7 +508,7 @@ type = "Allow"
         format!("127.0.0.1:{}", upstream.port()),
     );
     state.host_overrides = overrides;
-    let fixture = spawn_mitm_listener(state, wal).await;
+    let fixture = spawn_mitm_listener(state, wal.path.clone()).await;
 
     let (status, _headers, body) = tls_request(
         fixture.listener_addr,
@@ -559,7 +560,7 @@ type = "Allow"
         format!("127.0.0.1:{}", upstream.port()),
     );
     state.host_overrides = overrides;
-    let fixture = spawn_mitm_listener(state, wal).await;
+    let fixture = spawn_mitm_listener(state, wal.path.clone()).await;
 
     let (status, _headers, body) = tls_request(
         fixture.listener_addr,
@@ -627,7 +628,7 @@ reason = "policy"
         format!("127.0.0.1:{}", addr.port()),
     );
     state.host_overrides = overrides;
-    let fixture = spawn_mitm_listener(state, wal).await;
+    let fixture = spawn_mitm_listener(state, wal.path.clone()).await;
 
     let (status, _headers, body) = tls_request(
         fixture.listener_addr,
@@ -705,7 +706,7 @@ type = "Allow"
         format!("127.0.0.1:{}", addr.port()),
     );
     state.host_overrides = overrides;
-    let fixture = spawn_mitm_listener(state, wal).await;
+    let fixture = spawn_mitm_listener(state, wal.path.clone()).await;
 
     let (s1, _b1, s2, b2) = tls_request_pair_keepalive(
         fixture.listener_addr,
@@ -795,7 +796,7 @@ type = "Allow"
         format!("127.0.0.1:{}", addr.port()),
     );
     state.host_overrides = overrides;
-    let fixture = spawn_mitm_listener(state, wal).await;
+    let fixture = spawn_mitm_listener(state, wal.path.clone()).await;
 
     // The pre-existing tls_request uses `Connection: close`, but on
     // upstream keep-alive (which axum::serve uses), the relay MUST
@@ -868,7 +869,7 @@ type = "Allow"
         format!("127.0.0.1:{}", upstream.port()),
     );
     state.host_overrides = overrides;
-    let fixture = spawn_mitm_listener(state, wal).await;
+    let fixture = spawn_mitm_listener(state, wal.path.clone()).await;
 
     let (status, headers, _body) = tls_request(
         fixture.listener_addr,
@@ -966,7 +967,7 @@ token = "sk-mitm-stream"
         format!("127.0.0.1:{}", addr.port()),
     );
     state.host_overrides = overrides;
-    let fixture = spawn_mitm_listener(state, wal).await;
+    let fixture = spawn_mitm_listener(state, wal.path.clone()).await;
 
     // Try to smuggle a fake Authorization — proxy must overwrite.
     let (status, _h, _b) = tls_request(
@@ -1020,7 +1021,7 @@ type = "Allow"
         format!("127.0.0.1:{}", upstream.port()),
     );
     state.host_overrides = overrides;
-    let fixture = spawn_mitm_listener(state, wal).await;
+    let fixture = spawn_mitm_listener(state, wal.path.clone()).await;
 
     // Manual TLS connect to measure first-byte latency.
     install_default_crypto();

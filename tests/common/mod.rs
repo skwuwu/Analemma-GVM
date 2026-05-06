@@ -20,6 +20,7 @@
 
 #![allow(dead_code)]
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gvm_proxy::api_keys::APIKeyStore;
@@ -28,6 +29,37 @@ use gvm_proxy::proxy::AppState;
 use gvm_proxy::srr::NetworkSRR;
 use gvm_proxy::token_budget::TokenBudget;
 use gvm_proxy::vault::Vault;
+
+/// RAII guard for a temporary WAL file used by integration tests.
+///
+/// The previous design returned a bare `PathBuf` and assumed callers
+/// would keep it alive, but `PathBuf` is just a string — it has no
+/// `Drop` that removes the file. Result: every `cargo test` run leaked
+/// `gvm-test-{uuid}.wal` files into `std::env::temp_dir()`. After
+/// enough runs that's thousands of orphans (we observed 1185 on the
+/// EC2 test instance). This struct fixes the leak by holding a
+/// `tempfile::TempDir` whose `Drop` recursively deletes everything.
+///
+/// Callers that need the WAL path can pass `&TestWal` anywhere a
+/// `&Path` is expected (`Deref<Target=Path>` + `AsRef<Path>` are
+/// implemented), or read `wal.path` directly for a `PathBuf`.
+pub struct TestWal {
+    pub path: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl std::ops::Deref for TestWal {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for TestWal {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
 
 /// Build an `AppState` suitable for integration tests. All fields are
 /// initialised to inert defaults:
@@ -43,10 +75,11 @@ use gvm_proxy::vault::Vault;
 /// state.srr = my_custom_srr;
 /// ```
 ///
-/// Returns (state, wal_path). Caller keeps the `PathBuf` alive for the
-/// lifetime of the test so the tempfile isn't garbage-collected; once
-/// the test ends the temp dir is cleaned up automatically.
-pub async fn test_state() -> (AppState, std::path::PathBuf) {
+/// Returns (state, wal). The `TestWal` guard auto-deletes its temp
+/// directory (and the WAL inside) when dropped at the end of the test.
+/// Callers that don't read the WAL can bind it to `_wal` — the guard
+/// still runs.
+pub async fn test_state() -> (AppState, TestWal) {
     // Install rustls CryptoProvider once per test process. The proxy's
     // `tls_proxy::build_server_config` panics without it; production
     // installs in main.rs. Idempotent: `install_default` returns Err
@@ -56,18 +89,23 @@ pub async fn test_state() -> (AppState, std::path::PathBuf) {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
 
-    let wal_path = std::env::temp_dir().join(format!("gvm-test-{}.wal", uuid::Uuid::new_v4()));
+    // Single temp dir owns both the WAL file and the throwaway SRR
+    // bootstrap file. When the returned TestWal drops, the dir's
+    // recursive removal takes everything with it.
+    let dir = tempfile::Builder::new()
+        .prefix("gvm-test-")
+        .tempdir()
+        .expect("test tempdir must create");
+    let wal_path = dir.path().join("wal.log");
+    let empty_srr_path = dir.path().join("empty-srr.toml");
 
     // Write an empty TOML file and parse it — this matches what all
     // existing integration tests did inline, and keeps NetworkSRR's
     // only constructor (`load`) as the single entry point.
-    let empty_srr_path =
-        std::env::temp_dir().join(format!("gvm-test-srr-{}.toml", uuid::Uuid::new_v4()));
     std::fs::write(&empty_srr_path, "").expect("write empty srr file");
     let srr = Arc::new(std::sync::RwLock::new(
         NetworkSRR::load(&empty_srr_path).expect("empty SRR must parse"),
     ));
-    let _ = std::fs::remove_file(&empty_srr_path);
     let api_keys = Arc::new(APIKeyStore::from_map(std::collections::HashMap::new()));
     let ledger = Arc::new(
         Ledger::new(&wal_path, "", "")
@@ -120,13 +158,19 @@ pub async fn test_state() -> (AppState, std::path::PathBuf) {
         active_integrity_ref: Arc::new(std::sync::RwLock::new(None)),
     };
 
-    (state, wal_path)
+    (
+        state,
+        TestWal {
+            path: wal_path,
+            _dir: dir,
+        },
+    )
 }
 
 /// Shorthand: `test_state()` but with a caller-provided SRR already
 /// installed. For the most common test shape where the point of the
 /// test is "SRR with these rules — does enforcement do X."
-pub async fn test_state_with_srr(srr: NetworkSRR) -> (AppState, std::path::PathBuf) {
+pub async fn test_state_with_srr(srr: NetworkSRR) -> (AppState, TestWal) {
     let (mut state, wal) = test_state().await;
     state.srr = Arc::new(std::sync::RwLock::new(srr));
     (state, wal)

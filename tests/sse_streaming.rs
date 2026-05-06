@@ -91,7 +91,7 @@ async fn spawn_sse_upstream(
 async fn proxy_state_with_upstream(
     virtual_host: &str,
     upstream_addr: std::net::SocketAddr,
-) -> (gvm_proxy::proxy::AppState, std::path::PathBuf) {
+) -> (gvm_proxy::proxy::AppState, common::TestWal) {
     let (mut state, wal) = common::test_state().await;
     let mut overrides = std::collections::HashMap::new();
     overrides.insert(
