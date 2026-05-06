@@ -225,10 +225,7 @@ pub fn spawn_pending_approval_sweeper(
 /// A future enhancement: extend `SandboxLaunchRequest` with the
 /// parent PID so the sweep can use `is_pid_alive` for tighter
 /// detection. Until then TTL is the floor.
-pub fn spawn_sandbox_metadata_sweeper(
-    state: AppState,
-    max_age_secs: u64,
-) {
+pub fn spawn_sandbox_metadata_sweeper(state: AppState, max_age_secs: u64) {
     // Sweep every 5 minutes — entries are bounded by sandbox-launch
     // throughput times TTL, so a coarser cadence is fine. Even a
     // 100-launch/min storm produces only ~30k entries over the TTL
@@ -576,6 +573,61 @@ impl AppState {
         }
     }
 
+    /// Synthesize a `VerifiedIdentity` for a sandboxed peer when the
+    /// agent did not present a JWT Bearer token. Source-IP-based
+    /// identity for traffic that originates inside a GVM-allocated
+    /// sandbox namespace.
+    ///
+    /// **Why this is sound.** The veth IP carrying the request is
+    /// allocated by GVM itself (the proxy minted it, recorded it in
+    /// `/run/gvm/gvm-sandbox-{pid}.state`, and forwarded the sandbox
+    /// child into a network namespace where that IP is the only
+    /// non-loopback source). For an agent process to spoof a
+    /// different agent's IP would require breaking out of its
+    /// network namespace — which is the same threat boundary that
+    /// already protects credential separation between sandboxes.
+    /// In other words, an attacker capable of forging the source IP
+    /// is already capable of bypassing every other sandbox guarantee,
+    /// so trusting `peer_ip → sandbox_id → agent_id` is no weaker
+    /// than the rest of the model.
+    ///
+    /// **Why we still set `token_id` to a synthetic marker.** The
+    /// audit chain records `token_id` from the `VerifiedIdentity`
+    /// for forensics. Real JWTs carry a UUID `jti`; for IP-derived
+    /// identities we emit `sandbox-peer:<sandbox_id>` so a downstream
+    /// reader can tell at a glance that this event was authenticated
+    /// by namespace topology, not by an HMAC-signed token. This
+    /// preserves the auditability of which trust path was taken.
+    ///
+    /// Returns `None` when the peer IP cannot be resolved to a
+    /// registered sandbox — caller falls through to the
+    /// header-based or "unknown" identity path, matching the
+    /// existing behavior of `resolve_sandbox_anchor`.
+    pub fn resolve_identity_from_peer(
+        &self,
+        peer_ip: Option<std::net::IpAddr>,
+    ) -> Option<auth::VerifiedIdentity> {
+        let ip = peer_ip?;
+        if ip.is_loopback() {
+            return None;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let sandbox_id = gvm_sandbox::lookup_sandbox_id_by_ip(&ip.to_string())?;
+            let metadata = self.per_sandbox_metadata.get(&sandbox_id)?;
+            Some(auth::VerifiedIdentity {
+                agent_id: metadata.agent_id.clone(),
+                tenant_id: None,
+                token_id: format!("sandbox-peer:{}", sandbox_id),
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = ip;
+            None
+        }
+    }
+
     /// Revoke a sandbox: clear all derived state (TLS bundle cache,
     /// metadata), then drop its CA from the registry. Order matters
     /// — clear derived caches first so a concurrent
@@ -601,6 +653,21 @@ pub async fn proxy_handler(
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // ── Step 0: Verify JWT identity (if configured) ──
+    //
+    // Two trust paths produce a `VerifiedIdentity`:
+    //   (1) Agent-presented Bearer JWT (HMAC-signed; cryptographic).
+    //   (2) Source-IP → sandbox mapping for traffic that originates
+    //       inside a GVM-allocated network namespace (topological).
+    //
+    // (2) is what makes JWT-enabled deployments work for SDK-less
+    // agents (e.g. plain urllib in a sandbox) without forcing every
+    // agent author to manually add an Authorization header. The
+    // proxy minted the veth IP itself, so resolving peer-IP →
+    // sandbox_id → agent_id is no weaker than the namespace
+    // isolation that already separates sandboxes from each other.
+    // See `AppState::resolve_identity_from_peer` for the soundness
+    // argument.
+    let peer_ip_for_identity = request.extensions().get::<std::net::IpAddr>().copied();
     let verified_identity = if let Some(ref jwt) = state.jwt_config {
         match auth::extract_bearer_token(request.headers()) {
             Some(token) => match auth::verify_token(jwt, token) {
@@ -621,13 +688,29 @@ pub async fn proxy_handler(
                     );
                 }
             },
-            None => {
-                tracing::warn!("No JWT token provided — using unverified X-GVM-Agent-Id header");
-                None
-            }
+            None => match state.resolve_identity_from_peer(peer_ip_for_identity) {
+                Some(identity) => {
+                    tracing::debug!(
+                        agent = %identity.agent_id,
+                        token_id = %identity.token_id,
+                        "Identity derived from sandbox peer IP (no JWT presented)"
+                    );
+                    Some(identity)
+                }
+                None => {
+                    tracing::warn!(
+                        "No JWT token provided and peer is not a known sandbox — \
+                         falling back to unverified X-GVM-Agent-Id header"
+                    );
+                    None
+                }
+            },
         }
     } else {
-        None
+        // JWT disabled globally — still try sandbox-peer mapping so
+        // namespace-derived identity works in dev workflows that ran
+        // without a JWT secret. Falls through to header path on miss.
+        state.resolve_identity_from_peer(peer_ip_for_identity)
     };
 
     // ── Step 1: Parse request ──

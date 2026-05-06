@@ -561,6 +561,91 @@ async fn resolve_sandbox_anchor_uses_per_sandbox_metadata() {
                                                  // construction, no further assertion needed.)
 }
 
+// ── Sandbox-peer identity (CA-6 part 3) ──
+//
+// When JWT is enabled but the agent did not present a Bearer token,
+// the proxy synthesizes a `VerifiedIdentity` from the source-IP →
+// sandbox_id → agent_id mapping. This closes the SDK-less-agent
+// gap: a bare `urllib` request inside `gvm run --sandbox` does load
+// the per-sandbox CA (so MITM works) but does NOT auto-attach
+// `Authorization: Bearer $GVM_JWT_TOKEN`. Without IP-derived
+// identity, those requests would either be rejected (MITM path) or
+// fall through to header-spoofable identity (cooperative path).
+//
+// The full peer_ip → sandbox_id path runs through
+// `gvm_sandbox::lookup_sandbox_id_by_ip` which scans
+// `/run/gvm/*.state` files — those don't exist in unit-test setup,
+// so we don't exercise that branch here. What we DO verify is the
+// shape contract: given metadata recorded by `sandbox_launch`, the
+// helper produces the expected `VerifiedIdentity`.
+
+#[tokio::test]
+async fn resolve_identity_from_peer_loopback_returns_none() {
+    let (state, _wal) = common::test_state().await;
+    // Loopback peers come from cooperative-mode launches that share
+    // the proxy's PID namespace. They carry no sandbox identity.
+    let id = state.resolve_identity_from_peer(Some("127.0.0.1".parse().unwrap()));
+    assert!(
+        id.is_none(),
+        "loopback peer must not produce a synthesized identity"
+    );
+    let id_v6 = state.resolve_identity_from_peer(Some("::1".parse().unwrap()));
+    assert!(
+        id_v6.is_none(),
+        "loopback v6 peer must not produce a synthesized identity"
+    );
+}
+
+#[tokio::test]
+async fn resolve_identity_from_peer_no_peer_returns_none() {
+    let (state, _wal) = common::test_state().await;
+    let id = state.resolve_identity_from_peer(None);
+    assert!(
+        id.is_none(),
+        "absent peer IP must not produce a synthesized identity"
+    );
+}
+
+#[tokio::test]
+async fn resolve_identity_from_peer_unknown_ip_returns_none() {
+    let (state, _wal) = common::test_state().await;
+    // A non-loopback IP that never went through sandbox_launch
+    // should miss both the on-disk state file (no /run/gvm) and the
+    // in-memory metadata map. On non-Linux this falls into the
+    // cfg-gated None branch directly.
+    let id = state.resolve_identity_from_peer(Some("203.0.113.42".parse().unwrap()));
+    assert!(
+        id.is_none(),
+        "unregistered IP must not synthesize an identity"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_launch_records_metadata_consumable_by_identity_resolver() {
+    // The full peer_ip → identity path requires a real /run/gvm
+    // state file (Linux only). Here we verify the in-memory shape
+    // the resolver depends on: per_sandbox_metadata stores the
+    // agent_id we'd surface as VerifiedIdentity.agent_id, and the
+    // launch_event_id we'd surface as the audit token_id.
+    let (state, _wal) = common::test_state().await;
+    let req = serde_json::json!({"sandbox_id": "sb-identity", "agent_id": "agent-identity"});
+    gvm_proxy::api::sandbox_launch(
+        State(state.clone()),
+        axum::Json(serde_json::from_value(req).unwrap()),
+    )
+    .await;
+
+    let metadata = state
+        .per_sandbox_metadata
+        .get("sb-identity")
+        .expect("sandbox_launch must record metadata the identity resolver reads");
+    assert_eq!(metadata.agent_id, "agent-identity");
+    assert!(
+        metadata.launch_event_id.len() > 8,
+        "launch_event_id must be a UUID-shaped string the resolver can place in token_id"
+    );
+}
+
 // ── CA-7: gvm sandbox list ──
 
 #[tokio::test]

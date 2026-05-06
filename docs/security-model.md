@@ -231,6 +231,8 @@ Patterns are pre-compiled at config load time (fail-fast on invalid patterns) an
 - Rate limiter uses verified `agent_id` (spoofing prevented)
 - Backward-compatible: without JWT configured, header-based identity continues
 
+**v1.2 (sandbox-peer fallback)**: For agents running inside `gvm run --sandbox`, identity is also derivable from the veth source IP. The proxy minted that IP itself when it allocated the sandbox network namespace, so the lookup `peer_ip → sandbox_id → agent_id` is no weaker than the namespace-isolation guarantee that already separates sandboxes. This closes the SDK-less-agent gap: a plain `urllib` request inside a sandbox does load the per-sandbox CA but does not auto-attach `Authorization: Bearer $GVM_JWT_TOKEN` from its env, so without IP-derived identity those requests would fall back to the spoofable header path (HTTP) or be hard-rejected with 401 (MITM). The synthesized identity sets `token_id = "sandbox-peer:<sandbox_id>"` so the audit chain records which trust path was taken — JWT-bearer events show a UUID `jti`, IP-derived events show the sandbox tag.
+
 **Remaining limitation**: Token issuance endpoint (`POST /gvm/auth/token`) is unauthenticated in v1. Acceptable for the single-host deployment where `gvm run` and the proxy are co-located on the same trust boundary. Network-exposed token issuance (e.g., when the issuance endpoint is reachable from outside the host) should add mTLS or front it with an upstream auth gateway.
 
 ### 9. IPv4-Mapped IPv6 Bypass (Fixed)

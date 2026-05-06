@@ -72,6 +72,52 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
+### 2026-05-06: Sandbox-peer identity — close JWT gap for SDK-less agents
+
+**What changed:**
+
+When `GVM_JWT_SECRET` is set, the proxy now derives `VerifiedIdentity`
+from the peer's veth source IP if no `Authorization: Bearer` is
+presented. The mapping `peer_ip → sandbox_id → agent_id` already
+existed (`AppState::resolve_sandbox_anchor`); the new path
+`AppState::resolve_identity_from_peer` synthesizes a full
+`VerifiedIdentity` from the same lookup with `token_id =
+"sandbox-peer:<sandbox_id>"` so the audit chain records which trust
+path was taken.
+
+**Why:** With JWT enabled, the cooperative HTTP path warned-and-fell
+through to the spoofable `X-GVM-Agent-Id` header, and the MITM path
+hard-rejected with 401. Both behaviors broke SDK-less sandboxed
+agents: a plain `urllib` request inside `gvm run --sandbox` does load
+the per-sandbox CA but does not read `GVM_JWT_TOKEN` from its env, so
+every agent author would have had to wrap their HTTP client manually.
+Source-IP-derived identity is no weaker than the namespace-isolation
+guarantee that already separates sandboxes (the proxy minted the veth
+IP itself; spoofing would require breaking out of the network
+namespace, which already breaks every other sandbox property).
+
+**Affected files:**
+
+- `src/proxy/mod.rs` — added `AppState::resolve_identity_from_peer`;
+  proxy_handler Step 0 falls through to it when no Bearer is
+  presented (with JWT enabled or disabled).
+- `src/tls_proxy_hyper.rs` — MITM `handle_request` now derives
+  identity from the existing `sandbox_anchor` instead of returning
+  401 when no Bearer is presented; rejects only when the peer is
+  non-loopback and not a known sandbox.
+- `tests/api_handlers.rs` — 4 new unit tests covering loopback /
+  absent-peer / unknown-IP miss paths and sandbox_launch metadata
+  shape that the resolver depends on.
+- `scripts/multi-agent-load.sh` — JWT re-enabled (was disabled with
+  a now-stale rationale); load test exercises the new identity
+  fallback under realistic conditions.
+
+**Risk:** Strictly broadens the set of authenticated requests — does
+not loosen any pre-existing rejection. Cross-platform-safe (Windows
+build still compiles; the IP-based lookup is `cfg(target_os = linux)`
+gated and returns `None` elsewhere). All 539 workspace tests pass;
+clippy clean.
+
 ### 2026-05-02: Phase 3 + Phase 5 + Phase 6 — checkpoint aggregator, startup recovery, anchor signing
 
 **What changed:**

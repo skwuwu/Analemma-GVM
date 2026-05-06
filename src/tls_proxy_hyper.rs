@@ -154,26 +154,64 @@ async fn handle_request(
                 }
             },
             None => {
-                // JWT enabled + no Bearer token = reject. The proxy_handler
-                // path is permissive (warns and falls through to header-
-                // based identity) for backward compat with non-SDK clients,
-                // but MITM is HTTPS-terminating — by the time we see the
-                // request the agent has explicitly trusted our CA, so a
-                // missing JWT is operator misconfiguration, not a legacy
-                // client. Reject loud rather than silently downgrade.
-                tracing::warn!("MITM: no Bearer token but JWT is configured — rejecting");
-                return Ok(Response::builder()
-                    .status(401)
-                    .header("Content-Type", "application/json")
-                    .header("X-GVM-Block-Reason", "Missing JWT")
-                    .body(full_body(
-                        r#"{"blocked":true,"decision":"Unauthorized","reason":"Bearer token required but not provided"}"#,
-                    ))
-                    .expect("static response builder"));
+                // JWT enabled + no Bearer token: try the sandbox-peer
+                // identity path before rejecting. The original design
+                // hard-rejected here on the theory that a sandboxed
+                // agent has explicitly trusted our CA and so cannot
+                // claim "legacy non-SDK client". That theory missed
+                // the SDK-less-but-sandboxed case: a bare `urllib`
+                // request from a `gvm run --sandbox` Python script
+                // does load our CA (so MITM works) but does NOT
+                // auto-attach the JWT we issued — the env var
+                // `GVM_JWT_TOKEN` exists but the stdlib client never
+                // reads it. Rather than force every agent author to
+                // wrap their HTTP client, derive identity from the
+                // veth source IP. The proxy itself allocated that IP,
+                // so the trust path is at least as strong as the
+                // namespace isolation guarantee.
+                //
+                // We still reject loud when neither path succeeds:
+                // a missing JWT from a non-sandbox HTTPS client IS
+                // operator misconfiguration.
+                if let Some((agent_id, launch_event_id)) = sandbox_anchor.as_ref() {
+                    let identity = crate::auth::VerifiedIdentity {
+                        agent_id: agent_id.clone(),
+                        tenant_id: None,
+                        token_id: format!("sandbox-peer:{}", launch_event_id),
+                    };
+                    tracing::debug!(
+                        agent = %identity.agent_id,
+                        token_id = %identity.token_id,
+                        "MITM: identity derived from sandbox peer IP (no JWT presented)"
+                    );
+                    Some(identity)
+                } else {
+                    tracing::warn!(
+                        "MITM: no Bearer token, peer is not a known sandbox — rejecting"
+                    );
+                    return Ok(Response::builder()
+                        .status(401)
+                        .header("Content-Type", "application/json")
+                        .header("X-GVM-Block-Reason", "Missing JWT")
+                        .body(full_body(
+                            r#"{"blocked":true,"decision":"Unauthorized","reason":"Bearer token required but not provided"}"#,
+                        ))
+                        .expect("static response builder"));
+                }
             }
         }
     } else {
-        None
+        // JWT disabled — still derive sandbox-peer identity from the
+        // anchor so per-agent attribution works in dev. The anchor
+        // is `Some` exactly when the CONNECT-handler resolved the
+        // peer IP to a registered sandbox.
+        sandbox_anchor.as_ref().map(
+            |(agent_id, launch_event_id)| crate::auth::VerifiedIdentity {
+                agent_id: agent_id.clone(),
+                tenant_id: None,
+                token_id: format!("sandbox-peer:{}", launch_event_id),
+            },
+        )
     };
 
     // Real upstream host comes from the TLS handshake SNI (host_hint), not
