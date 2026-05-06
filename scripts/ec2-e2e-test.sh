@@ -3178,14 +3178,26 @@ DENYSRR
         fi
 
         # 48b: MITM log shows the deny
-        if grep -q "MITM: request DENIED" "$PROXY_LOG" 2>/dev/null; then
-            pass "48b: MITM logged Deny decision for Anthropic API"
+        if grep -qE "MITM: request DENIED|CONNECT denied.*api\\.anthropic\\.com" "$PROXY_LOG" 2>/dev/null; then
+            pass "48b: proxy logged Deny decision for Anthropic API (MITM or CONNECT level)"
         else
-            fail "48b: 'MITM: request DENIED' not found in log"
+            fail "48b: neither 'MITM: request DENIED' nor CONNECT-level deny for anthropic in log"
         fi
 
         # 48c: WAL contains the denied event
-        if grep "Deny" data/wal.log 2>/dev/null | grep -q "anthropic"; then
+        WAL_HIT=0
+        # Search both the canonical WAL and any isolated test WAL the
+        # ec2-e2e harness may have created (GVM_CONFIG redirect).
+        for f in data/wal.log /tmp/gvm-e2e-config-*/data/wal.log; do
+            for actual in $f; do
+                [ -f "$actual" ] || continue
+                if grep "Deny" "$actual" 2>/dev/null | grep -q "anthropic"; then
+                    WAL_HIT=1
+                    break 2
+                fi
+            done
+        done
+        if [ "$WAL_HIT" -eq 1 ]; then
             pass "48c: WAL audit trail records denied Anthropic call"
         else
             fail "48c: Deny event not found in WAL for Anthropic"
