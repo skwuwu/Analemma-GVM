@@ -1,0 +1,119 @@
+# Comprehensive SRR ruleset — exercises every feature the engine supports.
+#
+# Used by scripts/dual-agent-srr-e2e.sh to drive a concurrent openclaw +
+# hermes run on EC2 while assertion-grade probes fire through the proxy
+# to each rule. The test asserts:
+#
+#   1. Every rule below produces the expected decision when probed.
+#   2. JWT-backed agent_id is preserved across both agents in the WAL.
+#   3. The WAL Merkle / anchor chain stays intact under concurrent traffic.
+#   4. Time-conditioned rules (rules 6/7/8) reproduce deterministically
+#      via gvm replay against event.timestamp.
+#
+# NOTE: hosts under {test,internal,bank,payroll}.example.com are SYNTHETIC.
+# They will never resolve in production — the test drives them through the
+# proxy (HTTP_PROXY=...) so the proxy enforces SRR before any DNS lookup,
+# and the proxy returns the SRR decision (Allow/Deny/Delay/RequireApproval)
+# directly. Real LLM traffic to api.anthropic.com is allowed by rule 0.
+
+# ── Rule 0: Real LLM traffic — both agents need this ──────────────────
+# Without this rule, every Anthropic call gets default-to-caution (300ms),
+# which would distort the test. Allow is the production behaviour an
+# operator would set after seeing the host in `gvm run --interactive`.
+[[rules]]
+method = "*"
+pattern = "api.anthropic.com/{any}"
+decision = { type = "Allow" }
+description = "Anthropic API — required for both agents"
+label = "anthropic-allow"
+
+# ── Rule 1: Exact host + literal method — Allow ───────────────────────
+[[rules]]
+method = "GET"
+pattern = "api.test.example.com/repos/{any}"
+decision = { type = "Allow" }
+description = "Probe target — exact host + GET literal"
+label = "rule-1-exact-allow"
+
+# ── Rule 2: Suffix host pattern — Deny ────────────────────────────────
+# `{host}.database.example.com` matches any subdomain, port-agnostic.
+[[rules]]
+method = "DELETE"
+pattern = "{host}.database.example.com/{any}"
+decision = { type = "Deny", reason = "Database deletion blocked at suffix scope" }
+description = "Probe target — suffix host + DELETE"
+label = "rule-2-suffix-deny"
+
+# ── Rule 3: Wildcard method — Delay ───────────────────────────────────
+[[rules]]
+method = "*"
+pattern = "metrics.test.example.com/{any}"
+decision = { type = "Delay", milliseconds = 500 }
+description = "Probe target — wildcard method, throttle"
+label = "rule-3-wildcard-delay"
+
+# ── Rule 4: path_regex — RequireApproval ──────────────────────────────
+# Versioned admin API across any host; regex is the only way to express
+# “v1, v2, or v3 admin/users|roles|policies, anywhere”.
+[[rules]]
+method = "POST"
+pattern = "{any}"
+path_regex = "^/v[1-3]/admin/(users|roles|policies)(/|$)"
+decision = { type = "RequireApproval" }
+description = "Probe target — path regex + approval gate"
+label = "rule-4-regex-approval"
+
+# ── Rule 5: payload_field + payload_match + max_body_bytes — Deny ─────
+# JSON body inspection. Hits operator-defined high-risk GraphQL ops.
+[[rules]]
+method = "POST"
+pattern = "api.bank.example.com/graphql"
+payload_field = "operationName"
+payload_match = ["TransferFunds", "DeleteAccount"]
+max_body_bytes = 32768
+decision = { type = "Deny", reason = "High-risk GraphQL operation blocked" }
+description = "Probe target — JSON body field match"
+label = "rule-5-payload-deny"
+
+# ── Rule 6: condition.time_window — same-day inside, Asia/Seoul ───────
+# Allow only during 09:00–18:00 KST (00:00–09:00 UTC). Outside window =
+# rule does NOT fire → falls through to catch-all (rule 9, Delay 300ms).
+[[rules]]
+method = "POST"
+pattern = "api.payroll.example.com/{any}"
+decision = { type = "Allow" }
+condition = { kind = "time_window", window = "09:00-18:00", tz = "Asia/Seoul" }
+description = "Probe target — time-window condition (KST biz hours)"
+label = "rule-6-condition-tz"
+
+# ── Rule 7: condition.time_window — cross-midnight ────────────────────
+# Off-hours wire transfer block: 22:00–06:00 KST (13:00–21:00 UTC).
+# Cross-midnight encoding stresses the [start>end] branch of matches().
+[[rules]]
+method = "POST"
+pattern = "api.bank.example.com/transfer/{any}"
+decision = { type = "Deny", reason = "Wire transfer outside permitted hours" }
+condition = { kind = "time_window", window = "22:00-06:00", tz = "Asia/Seoul" }
+description = "Probe target — cross-midnight condition"
+label = "rule-7-condition-crossmidnight"
+
+# ── Rule 8: condition.time_window — outside-inverted ──────────────────
+# Internal admin ONLY during biz hours. `outside = true` flips the match:
+# fires when CURRENT time is OUTSIDE 09:00–18:00 KST.
+[[rules]]
+method = "*"
+pattern = "internal-admin.example.com/{any}"
+decision = { type = "Deny", reason = "Internal admin restricted to biz hours" }
+condition = { kind = "time_window", window = "09:00-18:00", tz = "Asia/Seoul", outside = true }
+description = "Probe target — outside-inverted condition"
+label = "rule-8-condition-outside"
+
+# ── Rule 9: catch-all — Delay (default-to-caution) ────────────────────
+# Any unclassified URL gets a 300ms governance delay. This is the
+# production default for a “learning-mode” deployment.
+[[rules]]
+method = "*"
+pattern = "{any}"
+decision = { type = "Delay", milliseconds = 300 }
+description = "Catch-all — default-to-caution"
+label = "rule-9-default"
