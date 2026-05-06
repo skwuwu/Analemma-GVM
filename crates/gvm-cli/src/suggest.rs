@@ -301,12 +301,38 @@ pub fn suggest_rules_interactive(wal_path: &str, start_offset: u64, srr_file: &s
             // design (the operator decides "deny outside biz hours"),
             // and `gvm suggest` is a baseline-construction tool, not a
             // policy designer. The [t] key surfaces the feature without
-            // making it the default path.
+            // making it the default path. When a condition is already
+            // staged we show a preview of the resulting rule and offer
+            // [c] to clear, [t] to replace.
             if let Some(cond) = &pending_condition {
+                println!("    {CYAN}[t]{RESET} Time      {GREEN}(staged — replace){RESET}");
                 println!(
-                    "    {CYAN}[t]{RESET} Time      {GREEN}(staged: {}){RESET}",
-                    cond
+                    "    {CYAN}[c]{RESET} Clear     {DIM}(drop the staged condition){RESET}"
                 );
+                // Preview block — show the operator the exact TOML
+                // their next decision will produce. Surfacing the
+                // staged condition this way avoids the "I forgot what
+                // I picked" footgun: the operator types `t`, picks a
+                // window, gets distracted, comes back, and now sees
+                // the full rule in front of them before pressing a/d/n.
+                let preview_decision = match pending_condition.as_deref() {
+                    // We don't know yet which decision they'll pick,
+                    // but Allow is the most common pairing with a
+                    // time-window condition ("allow only during biz
+                    // hours"). The preview makes it clear this is
+                    // illustrative — operator's actual a/d/n choice
+                    // overrides the decision line.
+                    Some(_) => r#"{ type = "Allow" }  # ← your a/d/n choice overrides this"#,
+                    None => r#"{ type = "Allow" }"#,
+                };
+                println!();
+                println!("    {DIM}── preview ──{RESET}");
+                println!("    {DIM}[[rules]]{RESET}");
+                println!("    {DIM}method = \"{}\"{RESET}", target.method);
+                println!("    {DIM}pattern = \"{}\"{RESET}", pretty_host(&target.host));
+                println!("    {DIM}decision = {}{RESET}", preview_decision);
+                println!("    {DIM}condition = {}{RESET}", cond);
+                println!();
             } else {
                 println!(
                     "    {CYAN}[t]{RESET} Time      {DIM}(gate by HH:MM-HH:MM in your timezone){RESET}"
@@ -357,7 +383,7 @@ pub fn suggest_rules_interactive(wal_path: &str, start_offset: u64, srr_file: &s
                             pending_condition = Some(cond);
                             println!(
                                 "    {GREEN}condition staged{RESET} \
-                                 {DIM}— now choose decision (a/d/n) to attach it{RESET}"
+                                 {DIM}— now choose decision (a/d/n), or [c] to clear{RESET}"
                             );
                             println!();
                         }
@@ -371,6 +397,19 @@ pub fn suggest_rules_interactive(wal_path: &str, start_offset: u64, srr_file: &s
                             println!();
                         }
                     }
+                    continue;
+                }
+                "c" | "clear" if pending_condition.is_some() => {
+                    // Drop the staged condition without making any other
+                    // change. Useful when the operator stages [t], reads
+                    // the preview, and decides this rule shouldn't be
+                    // time-conditional after all — without this they'd
+                    // either abandon the whole prompt with [s] (losing
+                    // any segment edits they made) or re-stage with a
+                    // fake "always" window.
+                    pending_condition = None;
+                    println!("    {DIM}staged condition cleared{RESET}");
+                    println!();
                     continue;
                 }
                 "a" | "allow" => {
@@ -415,8 +454,14 @@ pub fn suggest_rules_interactive(wal_path: &str, start_offset: u64, srr_file: &s
                     break (String::new(), String::new(), String::new(), None);
                 }
                 _ => {
+                    let extra = if pending_condition.is_some() {
+                        ", c to clear staged condition"
+                    } else {
+                        ""
+                    };
                     println!(
-                        "    {DIM}Unknown choice, try a/d/n/s/t or \"e <nums>\"{RESET}"
+                        "    {DIM}Unknown choice, try a/d/n/s/t or \"e <nums>\"{}{RESET}",
+                        extra
                     );
                     println!();
                     continue;
