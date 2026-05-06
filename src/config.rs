@@ -526,15 +526,33 @@ pub struct SrrConfig {
     pub semantic_file: String,
     pub hot_reload: bool,
     /// Enable request body buffering for SRR payload_field/payload_match rules.
-    /// When false (default), SRR evaluates host/method/path only — body is not inspected.
-    /// When true, the proxy buffers up to `max_body_bytes` of the request body and
-    /// passes it to SRR for JSON field matching. Parse failure → fallback to host/method/path.
-    #[serde(default)]
+    ///
+    /// **Default: true.** Agent governance is the product's primary value
+    /// proposition; silently letting JSON-body-conditioned deny rules be
+    /// no-ops because of an opt-in default contradicts that. Performance-
+    /// sensitive deployments can opt OUT by setting `payload_inspection =
+    /// false` in `[srr]`. When true, the proxy buffers up to
+    /// `max_body_bytes` of the request body and passes it to SRR for
+    /// JSON field matching. Parse failure → fallback to
+    /// host/method/path.
+    ///
+    /// Cost: one heap allocation up to `max_body_bytes` per inspected
+    /// request, ~50µs JSON parse on a 1KB body. The
+    /// `Content-Length > max_body_bytes` short-circuit (line 659 of
+    /// proxy/mod.rs) means oversized requests skip inspection entirely
+    /// rather than blowing the buffer.
+    #[serde(default = "default_payload_inspection")]
     pub payload_inspection: bool,
     /// Maximum request body bytes to buffer for payload inspection (default: 65536 = 64KB).
     /// Requests with Content-Length exceeding this limit skip payload inspection.
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
+}
+
+fn default_payload_inspection() -> bool {
+    // Secure-by-default: payload inspection ON. Operators with strict
+    // perf budgets opt OUT explicitly via `payload_inspection = false`.
+    true
 }
 
 fn default_max_body_bytes() -> usize {
@@ -657,7 +675,7 @@ impl Default for ProxyConfig {
                 network_file: "config/srr_network.toml".to_string(),
                 semantic_file: "config/srr_semantic.toml".to_string(),
                 hot_reload: true,
-                payload_inspection: false,
+                payload_inspection: default_payload_inspection(),
                 max_body_bytes: default_max_body_bytes(),
             },
             policies: None,
@@ -832,7 +850,7 @@ max_tokens_per_hour = 1000
         assert_eq!(config.nats.stream, "gvm-audit");
         assert_eq!(config.redis.url, "redis://127.0.0.1:6379");
         assert!(config.srr.hot_reload);
-        assert!(!config.srr.payload_inspection);
+        assert!(config.srr.payload_inspection);
         assert_eq!(config.srr.max_body_bytes, 65536);
         assert!(config.policies.is_none());
         assert!(config.operations.is_none());

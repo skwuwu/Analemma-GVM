@@ -1052,11 +1052,31 @@ fn inject_ca_cert(new_root: &Path, ca_pem: &[u8]) -> Result<()> {
     merged_bundle.extend_from_slice(b"\n");
     merged_bundle.extend_from_slice(ca_pem);
 
-    let system_bundle = new_root.join("etc/ssl/certs/ca-certificates.crt");
-    std::fs::write(&system_bundle, &merged_bundle).ok();
-
-    let certifi_bundle = new_root.join("etc/ssl/certs/cert.pem");
-    std::fs::write(&certifi_bundle, &merged_bundle).ok();
+    // Write the merged bundle to every distro-typical location so that
+    // libraries doing system-wide bundle lookup find it regardless of
+    // which distro paths their language runtime hardcodes:
+    //
+    //   - Debian/Ubuntu/openSUSE: /etc/ssl/certs/ca-certificates.crt
+    //   - RHEL/CentOS/Fedora:     /etc/pki/tls/certs/ca-bundle.crt
+    //   - certifi-style (Python): /etc/ssl/certs/cert.pem
+    //
+    // The single-distro write was a documented gap: legacy tools / non-
+    // Python runtimes that hardcoded the RHEL path silently saw the
+    // unaugmented bundle, causing intermittent TLS-handshake failures
+    // ("unable to get local issuer certificate") even though the
+    // sandbox shell + modern Python worked. Cost is one extra ~5 KB
+    // tmpfs write per sandbox launch — negligible.
+    for path in &[
+        "etc/ssl/certs/ca-certificates.crt",
+        "etc/pki/tls/certs/ca-bundle.crt",
+        "etc/ssl/certs/cert.pem",
+    ] {
+        let dst = new_root.join(path);
+        if let Some(parent) = dst.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&dst, &merged_bundle).ok();
+    }
 
     tracing::debug!("Ephemeral CA injected into sandbox trust store");
     Ok(())
