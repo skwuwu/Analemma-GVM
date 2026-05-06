@@ -145,7 +145,7 @@ not treat as findings.
 | L4 | LLM SDK key handling | Out of scope | LLM SDKs need the key at client construction. Use env var `ANTHROPIC_API_KEY`; proxy governs subsequent tool-API calls. |
 | L5 | Token issuance endpoint unauth | Single-host scope | `POST /gvm/auth/token` is loopback-only; co-located with proxy. Network-exposed deployments must front with mTLS gateway. |
 | L6 | Wasm runtime | `--features wasm` | Opt-in only; v1 production runs without it. |
-| L7 | `--contained` Docker mode | EXPERIMENTAL | Documented in user-guide.md; not a production path. |
+| L7 | `--contained` Docker mode | Cargo feature `contained` (default OFF) | CLI surface gated as of `84ace18`. The default `cargo build` produces a binary without `--contained`; `cargo build --features contained` opts in. |
 
 ---
 
@@ -156,6 +156,8 @@ the fix.
 
 | Fix | Commit | Test |
 |-----|--------|------|
+| Concurrent veth slot allocation race — every `gvm run --sandbox` started its own atomic counter at zero, causing concurrent launches to all pick slot 0; 19/20 sandboxes silently lost network. | `fc6f7c3` | `scripts/multi-agent-load.sh --agents 20` (verified on EC2 — 0 missed transport events) |
+| `--contained` advertised in default CLI surface despite documented EXPERIMENTAL status | `84ace18` | `cargo build` produces binary that bails on `--contained` with a clear error; `cargo build --features contained` opts in |
 | MITM JWT bypass — HTTPS path skipped JWT verification | `ba47501` | `tests/multi_agent_isolation.rs::mitm_path_enforces_jwt` |
 | Sandbox-peer identity for SDK-less agents | `3ec17bd` | `tests/api_handlers.rs::resolve_identity_from_peer_*` (3 cases) |
 | Test 76 secrets.toml duplicate-key accumulation | `c03878a` | `scripts/ec2-e2e-test.sh` Test 76 idempotency assertion |
