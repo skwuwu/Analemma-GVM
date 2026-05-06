@@ -169,20 +169,8 @@ pub fn spawn_pending_approval_sweeper(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            let now = chrono::Utc::now();
-            let mut swept = 0u32;
-            // Two-phase to avoid holding the dashmap shard lock while
-            // we iterate (other inserts/removes need to make progress).
-            let stale_keys: Vec<String> = pending_approvals
-                .iter()
-                .filter(|entry| now.signed_duration_since(entry.value().timestamp) > stale_after)
-                .map(|entry| entry.key().clone())
-                .collect();
-            for key in stale_keys {
-                if pending_approvals.remove(&key).is_some() {
-                    swept += 1;
-                }
-            }
+            let swept =
+                sweep_stale_pending_approvals(&pending_approvals, chrono::Utc::now(), stale_after);
             if swept > 0 {
                 tracing::warn!(
                     swept,
@@ -195,6 +183,31 @@ pub fn spawn_pending_approval_sweeper(
             }
         }
     });
+}
+
+/// Pure-function core of the pending-approvals sweeper. Returns the
+/// number of entries removed. Caller supplies `now` so tests can
+/// drive the sweep against a synthetic clock without
+/// `tokio::time::pause`. Two-phase iteration (collect keys, then
+/// remove) keeps the dashmap shard locks free during the scan so
+/// concurrent inserts/removes don't stall.
+pub fn sweep_stale_pending_approvals(
+    pending_approvals: &dashmap::DashMap<String, PendingApproval>,
+    now: chrono::DateTime<chrono::Utc>,
+    stale_after: chrono::Duration,
+) -> usize {
+    let stale_keys: Vec<String> = pending_approvals
+        .iter()
+        .filter(|entry| now.signed_duration_since(entry.value().timestamp) > stale_after)
+        .map(|entry| entry.key().clone())
+        .collect();
+    let mut swept = 0;
+    for key in stale_keys {
+        if pending_approvals.remove(&key).is_some() {
+            swept += 1;
+        }
+    }
+    swept
 }
 
 /// Spawn a background task that periodically revokes per-sandbox CA +

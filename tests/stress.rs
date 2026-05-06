@@ -667,5 +667,288 @@ async fn verify_wal_latency_100k_events() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// 7. RATE LIMITER — removed (replaced by token_budget in src/token_budget.rs)
+// 7. IC-3 APPROVAL FLOW STRESS
+// ═══════════════════════════════════════════════════════════════════
+//
+// Strategic-6: the proxy holds a `pending_approvals: DashMap` while
+// IC-3 (RequireApproval) requests wait for a human. Three properties
+// matter under load and are not exercised by the unit tests in
+// `tests/ic3_concurrency.rs` (which top out at a few entries):
+//
+//   1. Routing correctness at fan-out — 1000 simultaneous pending
+//      entries each receive ONLY their matching approve/deny via
+//      the right oneshot channel. No cross-talk.
+//   2. Capacity guard — the documented `MAX_PENDING_APPROVALS = 1000`
+//      cap is real: dashmap stays bounded, no unbounded growth from
+//      a flood of holds.
+//   3. Sweeper correctness — entries older than 2× per-event
+//      timeout are evicted by `sweep_stale_pending_approvals`.
+//      The pure-function sweep accepts a `now` cursor so we can
+//      drive it against a synthetic clock without `tokio::time::pause`.
+//
+// (Throughput-preservation under load — "while N IC-3 holds are
+// queued, non-IC-3 traffic still flows" — needs a real proxy +
+// concurrent client and lives in `scripts/multi-agent-load.sh`,
+// not this in-process suite.)
+
+fn make_pending(
+    event_id: &str,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) -> (
+    gvm_proxy::proxy::PendingApproval,
+    tokio::sync::oneshot::Receiver<bool>,
+) {
+    let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+    (
+        gvm_proxy::proxy::PendingApproval {
+            sender: tx,
+            event_id: event_id.to_string(),
+            operation: "gvm.payment.charge".to_string(),
+            host: "api.stripe.com".to_string(),
+            path: "/v1/charges".to_string(),
+            method: "POST".to_string(),
+            agent_id: "stress-agent".to_string(),
+            timestamp,
+        },
+        rx,
+    )
+}
+
+/// Routing under high fan-out: 1000 simultaneous pending entries,
+/// approvals delivered in shuffled order, every receiver gets the
+/// right decision and no DashMap entry leaks.
+#[tokio::test]
+async fn ic3_high_fanout_1000_pending_settle_in_shuffled_order() {
+    let map: Arc<dashmap::DashMap<String, gvm_proxy::proxy::PendingApproval>> =
+        Arc::new(dashmap::DashMap::new());
+
+    const N: usize = 1000;
+    let now = chrono::Utc::now();
+    let mut receivers: Vec<(String, bool, tokio::sync::oneshot::Receiver<bool>)> =
+        Vec::with_capacity(N);
+
+    // Insert N pending entries, alternating "expected approve" / "expected deny".
+    for i in 0..N {
+        let event_id = format!("evt-{:04}", i);
+        let (pending, rx) = make_pending(&event_id, now);
+        map.insert(event_id.clone(), pending);
+        let expected_approve = i % 2 == 0;
+        receivers.push((event_id, expected_approve, rx));
+    }
+    assert_eq!(map.len(), N, "all {} entries inserted", N);
+
+    // Shuffle the deliver order so we don't accidentally pass on
+    // sequential dispatch. Deterministic shuffle (no rand crate
+    // dep needed) — reverse + every-3rd interleave is enough to
+    // break any insertion-order accident.
+    let mut shuffled_order: Vec<usize> = (0..N).collect();
+    shuffled_order.reverse();
+    let mut interleaved: Vec<usize> = Vec::with_capacity(N);
+    for offset in 0..3 {
+        for &i in shuffled_order.iter().skip(offset).step_by(3) {
+            interleaved.push(i);
+        }
+    }
+    assert_eq!(interleaved.len(), N);
+
+    // Simulate the API handler: take the entry from the dashmap and
+    // send the decision down the channel. Done concurrently to
+    // exercise the dashmap shard-lock contention path.
+    let map_clone = Arc::clone(&map);
+    let receivers_meta: Vec<(String, bool)> = receivers
+        .iter()
+        .map(|(eid, exp, _rx)| (eid.clone(), *exp))
+        .collect();
+    let send_handle = tokio::spawn(async move {
+        let mut send_set = tokio::task::JoinSet::new();
+        for idx in interleaved {
+            let (event_id, expected_approve) = receivers_meta[idx].clone();
+            let m = Arc::clone(&map_clone);
+            send_set.spawn(async move {
+                let pending = m.remove(&event_id).expect("entry must be present").1;
+                pending
+                    .sender
+                    .send(expected_approve)
+                    .expect("receiver must still be alive");
+            });
+        }
+        while send_set.join_next().await.is_some() {}
+    });
+
+    // Receive on every channel — every receiver must get exactly the
+    // value we sent. If routing crossed wires, half the receivers would
+    // get the opposite of what was expected.
+    let mut received_correctly = 0;
+    for (event_id, expected, rx) in receivers {
+        let got = rx.await.expect("send must succeed for every receiver");
+        assert_eq!(
+            got, expected,
+            "receiver for {} expected {}, got {}",
+            event_id, expected, got
+        );
+        received_correctly += 1;
+    }
+    send_handle.await.expect("send task must complete");
+
+    assert_eq!(received_correctly, N);
+    assert_eq!(
+        map.len(),
+        0,
+        "every entry must have been removed by the dispatcher; dashmap leak"
+    );
+}
+
+/// Capacity discipline: the documented `MAX_PENDING_APPROVALS = 1000`
+/// cap means the dashmap is allowed to hold up to N entries; the
+/// proxy_handler is responsible for refusing #N+1. This test pins the
+/// dashmap-side property — at and beyond 1000 entries the structure
+/// remains operational (no panic, no quadratic blowup, removes still
+/// work). The handler-side rejection is exercised by
+/// `tests/ic3_concurrency.rs::capacity_cap`.
+#[tokio::test]
+async fn ic3_dashmap_handles_1500_entries_without_pathology() {
+    let map: Arc<dashmap::DashMap<String, gvm_proxy::proxy::PendingApproval>> =
+        Arc::new(dashmap::DashMap::new());
+
+    const N: usize = 1500; // Beyond the 1000 cap that proxy_handler enforces.
+    let now = chrono::Utc::now();
+    for i in 0..N {
+        let (pending, _rx) = make_pending(&format!("evt-{:04}", i), now);
+        map.insert(format!("evt-{:04}", i), pending);
+    }
+    assert_eq!(map.len(), N);
+
+    // Random-access remove of every entry must complete in bounded
+    // time (sublinear-per-op). 1500 removes on a healthy DashMap is
+    // microseconds; we cap at 5s to catch a regression that would
+    // turn this into O(N²).
+    let start = Instant::now();
+    for i in (0..N).rev() {
+        let removed = map.remove(&format!("evt-{:04}", i));
+        assert!(removed.is_some(), "entry {} must be present", i);
+    }
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed.as_secs() < 5,
+        "removing {} entries took {:?} — possible O(N²) regression",
+        N,
+        elapsed
+    );
+    assert_eq!(map.len(), 0);
+}
+
+/// Sweeper correctness: entries older than `stale_after` are evicted,
+/// fresh entries are not. Drives the pure-function sweep against a
+/// synthetic `now` so the test is deterministic and runs in
+/// microseconds (no tokio::time::pause needed).
+#[test]
+fn ic3_sweeper_evicts_only_entries_older_than_stale_after() {
+    let map: dashmap::DashMap<String, gvm_proxy::proxy::PendingApproval> = dashmap::DashMap::new();
+
+    let now = chrono::Utc::now();
+    let stale_after = chrono::Duration::seconds(600); // 10 min — matches 2x default 300s
+
+    // 100 stale entries (old enough to evict)
+    for i in 0..100 {
+        let ts = now - chrono::Duration::seconds(700);
+        let (pending, _rx) = make_pending(&format!("stale-{}", i), ts);
+        map.insert(format!("stale-{}", i), pending);
+    }
+    // 50 fresh entries (must survive)
+    for i in 0..50 {
+        let ts = now - chrono::Duration::seconds(60);
+        let (pending, _rx) = make_pending(&format!("fresh-{}", i), ts);
+        map.insert(format!("fresh-{}", i), pending);
+    }
+    // 1 boundary entry (exactly at threshold — must survive,
+    // contract is `signed_duration_since(...) > stale_after`)
+    let (boundary_pending, _rx) = make_pending("boundary", now - stale_after);
+    map.insert("boundary".to_string(), boundary_pending);
+
+    assert_eq!(map.len(), 151);
+
+    let swept = gvm_proxy::proxy::sweep_stale_pending_approvals(&map, now, stale_after);
+
+    assert_eq!(
+        swept, 100,
+        "exactly the 100 stale entries should be evicted"
+    );
+    assert_eq!(map.len(), 51, "50 fresh + 1 boundary survive");
+    assert!(
+        map.contains_key("boundary"),
+        "boundary entry (== stale_after) must survive — contract is strictly greater than"
+    );
+    for i in 0..50 {
+        assert!(map.contains_key(&format!("fresh-{}", i)));
+    }
+    for i in 0..100 {
+        assert!(
+            !map.contains_key(&format!("stale-{}", i)),
+            "stale-{} should have been evicted",
+            i
+        );
+    }
+
+    // Idempotent: a second sweep with no new stale entries removes nothing.
+    let swept2 = gvm_proxy::proxy::sweep_stale_pending_approvals(&map, now, stale_after);
+    assert_eq!(swept2, 0);
+    assert_eq!(map.len(), 51);
+}
+
+/// Concurrent inserts + sweeps must not deadlock or double-evict.
+/// The sweep takes a snapshot of stale keys (releasing shard locks
+/// before remove); inserts happening between snapshot and remove
+/// must observe their entry as still present after the sweep
+/// completes (their timestamp is `now`, far younger than `stale_after`).
+#[tokio::test]
+async fn ic3_sweeper_does_not_evict_concurrent_inserts() {
+    let map: Arc<dashmap::DashMap<String, gvm_proxy::proxy::PendingApproval>> =
+        Arc::new(dashmap::DashMap::new());
+
+    let now = chrono::Utc::now();
+    let stale_after = chrono::Duration::seconds(600);
+
+    // Pre-populate with 200 stale entries.
+    for i in 0..200 {
+        let ts = now - chrono::Duration::seconds(700);
+        let (pending, _rx) = make_pending(&format!("stale-{}", i), ts);
+        map.insert(format!("stale-{}", i), pending);
+    }
+
+    // Race: launch 100 concurrent inserts AND a sweep at the same time.
+    let inserter_map = Arc::clone(&map);
+    let inserter = tokio::spawn(async move {
+        for i in 0..100 {
+            let (pending, _rx) = make_pending(&format!("fresh-{}", i), chrono::Utc::now());
+            inserter_map.insert(format!("fresh-{}", i), pending);
+        }
+    });
+    let sweeper_map = Arc::clone(&map);
+    let sweep_now = now;
+    let sweeper = tokio::spawn(async move {
+        gvm_proxy::proxy::sweep_stale_pending_approvals(&sweeper_map, sweep_now, stale_after)
+    });
+
+    inserter.await.expect("inserter completes");
+    let swept = sweeper.await.expect("sweeper completes");
+
+    assert_eq!(
+        swept, 200,
+        "the 200 pre-populated stale entries should all be evicted"
+    );
+    // Fresh entries: 100 of them, each younger than stale_after. They
+    // may have been inserted before or after the sweep snapshot — both
+    // outcomes are fine, but no fresh entry should have been REMOVED.
+    let surviving_fresh = (0..100)
+        .filter(|i| map.contains_key(&format!("fresh-{}", i)))
+        .count();
+    assert_eq!(
+        surviving_fresh, 100,
+        "every fresh entry should survive the sweep"
+    );
+    assert_eq!(map.len(), 100, "0 stale + 100 fresh remain");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 8. RATE LIMITER — removed (replaced by token_budget in src/token_budget.rs)
 // Token budget unit tests are in src/token_budget.rs
