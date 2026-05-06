@@ -1,0 +1,187 @@
+# ════════════════════════════════════════════════════════════════════
+# GVM Proxy — Production Configuration Template
+# ════════════════════════════════════════════════════════════════════
+#
+# How to use:
+#   cp config/proxy.production.toml.example /etc/gvm/proxy.toml
+#   chown gvm:gvm /etc/gvm/proxy.toml && chmod 0640 /etc/gvm/proxy.toml
+#   GVM_ENV=production GVM_CONFIG=/etc/gvm/proxy.toml gvm-proxy
+#
+# What's different from config/proxy.toml (the dev default):
+#   1. JWT identity is REQUIRED (not optional). secrets are managed
+#      out of the proxy process via env vars and a sealed secrets file.
+#   2. WAL tuning trades off latency for durability under sustained load.
+#   3. Default-on-unknown is `require_approval`, not `delay`.
+#   4. Shadow mode is `strict`, not `disabled`.
+#   5. There is NO [dev] section. Host overrides are dev-only.
+#   6. Secrets file lives outside the repo (e.g. /etc/gvm/secrets.toml).
+#   7. Admin API binds to localhost ONLY. Operators reach it via SSH
+#      tunnel or a sidecar reverse-proxy with mTLS.
+# ════════════════════════════════════════════════════════════════════
+
+[server]
+# Bind to localhost when fronting the proxy with a TLS-terminating
+# reverse-proxy (recommended). For direct-to-agent deployment on a
+# private network, "0.0.0.0:8080" is acceptable as long as the
+# network itself enforces the trust boundary.
+listen = "127.0.0.1:8080"
+
+# Privileged endpoints (POST /gvm/approve, POST /gvm/reload, GET
+# /gvm/info). NEVER expose this beyond loopback. Operators reach it
+# via SSH tunnel or a sidecar with strong mTLS.
+admin_listen = "127.0.0.1:9090"
+
+# How long to wait for in-flight requests during graceful shutdown.
+# Set higher than your slowest synchronous LLM call (P99 + 1s headroom)
+# so SIGTERM doesn't cut off agents mid-response. A lower value
+# accelerates redeployment but risks emitting partial WAL batches.
+drain_timeout_secs = 30
+
+[enforcement]
+# What to do for an SRR rule that decides "Delay" without specifying ms.
+# In production, prefer the conservative 1s — long enough to make
+# scripted-bot loops obvious in logs, short enough to be invisible
+# to a human-paced agent.
+default_decision = { type = "Delay", milliseconds = 1000 }
+
+# IC-1 fast-path async ledger writes. ON in production: the loss
+# ceiling (default 0.1%) is the same audit guarantee, with substantial
+# throughput gain on Allow-heavy traffic.
+ic1_async_ledger = true
+ic1_loss_threshold = 0.001
+
+# Default decision for URLs that match no SRR rule.
+#   "delay"            — admit after delay (dev default; bad for prod)
+#   "require_approval" — hold for human approval (recommended for prod)
+#   "deny"             — block immediately (strict lockdown)
+default_unknown = "require_approval"
+default_delay_ms = 1000
+
+# How long the proxy holds an IC-3 request waiting for `gvm approve`
+# before auto-denying. Long enough for a human reviewer to see and
+# act, short enough that genuinely-dropped approvals don't pile up
+# as zombie requests.
+ic3_approval_timeout_secs = 600
+
+[enforcement.on_block]
+# Hint passed back to agents in the X-GVM-Block-Action response
+# header. SDK clients use it to choose between halt / soft-pivot /
+# rollback flows.
+deny = "halt"
+require_approval = "soft_pivot"
+throttle = "rollback"
+infrastructure_failure = "halt"
+
+[wal]
+# WAL location. Move to a dedicated disk (or LUKS-encrypted volume)
+# in production. Avoid placing on the same disk as agent scratch.
+path = "/var/lib/gvm/wal.log"
+
+# Group commit window. Higher = better throughput, more latency on
+# the response path. 5ms is the sweet spot for prod: average wait
+# is 2.5ms which is invisible, batching factor 50–100x at 10k req/s.
+batch_window_ms = 5
+
+# Max events per batch. Raise for very high-throughput deployments;
+# lower if disk IOPS are the bottleneck.
+max_batch_size = 256
+
+# Rotate when current segment exceeds this. 100MB is fine for most.
+# Larger segments reduce verifier walks but slow startup recovery.
+max_wal_bytes = 104857600
+
+# Keep this many rotated segments before pruning the oldest. WAL
+# pruning is what bounds disk growth; size budget = max_wal_bytes
+# × max_wal_segments. Tune to your retention requirement (auditors
+# typically want 90+ days; that's a planning input for this knob).
+max_wal_segments = 30
+
+[srr]
+# SRR rule files. Keep these in a config-management system (Ansible,
+# Terraform) so changes are reviewed and version-controlled.
+network_file = "/etc/gvm/srr_network.toml"
+semantic_file = "/etc/gvm/srr_semantic.toml"
+
+# Hot-reload on SIGHUP. ON in production: rules can be tightened
+# without process restart. The audit chain records every reload as
+# a config_load event so you can correlate a rule change to the
+# events that came after it.
+hot_reload = true
+
+[secrets]
+# Encrypted credentials file. NEVER commit this to git.
+file = "/etc/gvm/secrets.toml"
+
+# Env var holding the AES-256-GCM master key (hex, 64 chars).
+# Provision via systemd EnvironmentFile= or your secrets manager
+# (Vault, AWS Secrets Manager, GCP Secret Manager).
+key_env = "GVM_SECRETS_KEY"
+
+[jwt]
+# JWT identity REQUIRED in production. Without [jwt], identity falls
+# back to spoofable X-GVM-Agent-Id headers.
+#
+# The secret env var must hold a hex-encoded HMAC-SHA256 key, min
+# 32 bytes. Generate with: openssl rand -hex 32
+secret_env = "GVM_JWT_SECRET"
+
+# Token TTL. 1h is the default; lower (15m) for high-sensitivity
+# deployments where the cost of a token compromise outweighs the
+# CPU cost of more-frequent reissue.
+token_ttl_secs = 3600
+
+[shadow]
+# Shadow Mode: requires MCP-style intent declaration before outbound
+# requests. Production SHOULD run "strict" or "cautious":
+#   "strict"     — Deny 403 for unverified requests
+#   "cautious"   — Add cautious_delay_ms + audit warning
+#   "permissive" — Allow + audit warning (monitoring only)
+#   "disabled"   — No verification (dev-only)
+mode = "strict"
+
+# How long an `gvm_declare_intent` call stays valid. Short enough to
+# prevent replay; long enough to cover the legitimate window between
+# tool selection and tool invocation.
+intent_ttl_secs = 30
+
+# Cautious-mode delay for unverified requests. Visible in agent
+# latency, makes "agent forgot to declare" loud during rollout.
+cautious_delay_ms = 5000
+
+[budget]
+# Org-wide ceiling. Set this to your monthly spend / 720 = hourly
+# ceiling, then tune up after a week of normal traffic. 0 = unlimited.
+max_tokens_per_hour = 5_000_000
+max_cost_per_hour = 50.00
+
+# Per-agent quotas. Production with multiple agents SHOULD set these
+# to prevent a single runaway agent from exhausting the org budget.
+# Default 0 = no per-agent limit (org ceiling alone applies).
+per_agent_max_tokens_per_hour = 500_000
+per_agent_max_cost_per_hour = 5.00
+
+# Tokens reserved per in-flight LLM request. Don't lower below 500
+# unless you've measured your distribution and know your P99 fits.
+reserve_per_request = 500
+
+[dns]
+# DNS soft governance. ON in production — exfiltration via subdomain
+# tunneling is a real risk and the cost is a delay on the suspicious
+# query, not a hard deny.
+enabled = true
+listen_port = 5353
+
+# Default Tier 3/4 thresholds are suitable for most deployments;
+# raise the unique-subdomain threshold (default 5) for CDN-heavy
+# workloads, lower for high-security postures.
+# tier3_unique_threshold = 5
+# tier4_global_threshold = 20
+# window_secs = 60
+
+# ──────────────────────────────────────────────────────────────────
+# NO [dev] SECTION IN PRODUCTION.
+#
+# host_overrides is dev-only by design; the runtime drops it when
+# GVM_ENV=production. We omit the section entirely so that a
+# config audit cannot find it.
+# ──────────────────────────────────────────────────────────────────
