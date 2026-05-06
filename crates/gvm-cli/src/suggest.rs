@@ -35,6 +35,125 @@ fn host_label(host: &str) -> String {
     pretty_host(host).replace('.', "-")
 }
 
+/// Validate a `"HH:MM-HH:MM"` window without dragging in the proxy's
+/// private parser. Same rules as `gvm_proxy::srr::parse_time_window`:
+/// HH ∈ 0..23, MM ∈ 0..59, start ≠ end.
+///
+/// Returns Ok(()) on success. Validation lives here so the prompt
+/// rejects bad input immediately instead of writing a TOML file the
+/// proxy will refuse to load.
+fn validate_window_str(window: &str) -> Result<(), String> {
+    let (start, end) = window
+        .split_once('-')
+        .ok_or_else(|| format!("expected HH:MM-HH:MM, got '{}'", window))?;
+    let parse_hhmm = |s: &str| -> Result<u16, String> {
+        let (h, m) = s
+            .trim()
+            .split_once(':')
+            .ok_or_else(|| format!("expected HH:MM, got '{}'", s))?;
+        let h: u16 = h
+            .parse()
+            .map_err(|_| format!("invalid hour '{}' in '{}'", h, s))?;
+        let m: u16 = m
+            .parse()
+            .map_err(|_| format!("invalid minute '{}' in '{}'", m, s))?;
+        if h >= 24 {
+            return Err(format!("hour must be 0..23, got {}", h));
+        }
+        if m >= 60 {
+            return Err(format!("minute must be 0..59, got {}", m));
+        }
+        Ok(h * 60 + m)
+    };
+    let s = parse_hhmm(start)?;
+    let e = parse_hhmm(end)?;
+    if s == e {
+        return Err(format!(
+            "window '{}' has zero duration (start equals end)",
+            window
+        ));
+    }
+    Ok(())
+}
+
+/// Prompt the operator for a time_window condition. Returns:
+///   Ok(Some(toml_fragment)) on success — fragment is the inline-table
+///     value for the rule's `condition = ...` line.
+///   Ok(None) if the operator cancels (empty input on first prompt).
+///   Err(msg) on validation failure.
+///
+/// Validation runs here so an obviously broken value (`25:00-30:00`,
+/// `Mars/Olympus`) is rejected before the file is touched.
+fn prompt_time_condition<R: std::io::BufRead>(reader: &mut R) -> Result<Option<String>, String> {
+    use crate::ui::{BOLD, DIM, RESET};
+
+    let mut buf = String::new();
+
+    println!();
+    println!(
+        "    {DIM}Time-conditional rule — fires only when request timestamp matches.{RESET}"
+    );
+    println!(
+        "    {DIM}Replay (`gvm replay`) is deterministic via event.timestamp.{RESET}"
+    );
+    println!();
+
+    // Window
+    print!(
+        "      {BOLD}window{RESET} {DIM}(HH:MM-HH:MM, default 09:00-18:00):{RESET} "
+    );
+    std::io::stdout().flush().ok();
+    buf.clear();
+    if reader.read_line(&mut buf).is_err() {
+        return Ok(None);
+    }
+    let window = match buf.trim() {
+        "" => "09:00-18:00".to_string(),
+        s => s.to_string(),
+    };
+    validate_window_str(&window)?;
+
+    // Timezone
+    print!(
+        "      {BOLD}timezone{RESET} {DIM}(IANA, default UTC):{RESET} "
+    );
+    std::io::stdout().flush().ok();
+    buf.clear();
+    if reader.read_line(&mut buf).is_err() {
+        return Ok(None);
+    }
+    let tz = match buf.trim() {
+        "" => "UTC".to_string(),
+        s => s.to_string(),
+    };
+    if tz.parse::<chrono_tz::Tz>().is_err() {
+        return Err(format!(
+            "unknown IANA timezone '{}' (try 'Asia/Seoul', 'America/New_York', 'UTC')",
+            tz
+        ));
+    }
+
+    // Inside vs outside
+    print!(
+        "      {BOLD}fires{RESET} {DIM}([i]nside or [o]utside the window, default i):{RESET} "
+    );
+    std::io::stdout().flush().ok();
+    buf.clear();
+    if reader.read_line(&mut buf).is_err() {
+        return Ok(None);
+    }
+    let outside = match buf.trim().to_lowercase().as_str() {
+        "" | "i" | "in" | "inside" => false,
+        "o" | "out" | "outside" => true,
+        other => return Err(format!("expected i or o, got '{}'", other)),
+    };
+
+    Ok(Some(format!(
+        r#"{{ kind = "time_window", window = "{}", tz = "{}", outside = {} }}"#,
+        window, tz, outside
+    )))
+}
+
 /// Scan WAL events for Default-to-Caution hits and interactively suggest rules.
 ///
 /// Called after the agent run when `--interactive` is set. Reads new WAL entries,
@@ -141,8 +260,13 @@ pub fn suggest_rules_interactive(wal_path: &str, start_offset: u64, srr_file: &s
         // The loop continues until a decision (a/d/n/s) is picked or
         // input EOF.
         let mut current_path = target.path_pattern.clone();
+        // Optional time-window gate. Stays None unless the operator
+        // explicitly invokes [t] — interactive mode never auto-suggests
+        // a condition (that would be policy design, which `gvm suggest`
+        // is not). When Some(_), the next a/d/n decision attaches it.
+        let mut pending_condition: Option<String> = None;
 
-        let (decision_toml, description, final_pattern) = loop {
+        let (decision_toml, description, final_pattern, condition_toml) = loop {
             let pattern = format!("{}{}", pretty_host(&target.host), current_path);
             println!(
                 "  {YELLOW}\u{26a0}{RESET} {BOLD}{} {}{RESET} {DIM}({} hit{}){RESET}",
@@ -172,6 +296,22 @@ pub fn suggest_rules_interactive(wal_path: &str, start_offset: u64, srr_file: &s
             println!(
                 "    {CYAN}[e <nums>]{RESET} Edit     {DIM}(wildcard segments — e.g. \"e 2 3\"){RESET}"
             );
+            // Time-conditional is opt-in: shown as a peer choice but no
+            // auto-suggestion. Reason: condition.time_window is policy
+            // design (the operator decides "deny outside biz hours"),
+            // and `gvm suggest` is a baseline-construction tool, not a
+            // policy designer. The [t] key surfaces the feature without
+            // making it the default path.
+            if let Some(cond) = &pending_condition {
+                println!(
+                    "    {CYAN}[t]{RESET} Time      {GREEN}(staged: {}){RESET}",
+                    cond
+                );
+            } else {
+                println!(
+                    "    {CYAN}[t]{RESET} Time      {DIM}(gate by HH:MM-HH:MM in your timezone){RESET}"
+                );
+            }
             println!();
             print!("    {BOLD}Choice:{RESET} ");
             io::stdout().flush().unwrap_or(());
@@ -185,6 +325,7 @@ pub fn suggest_rules_interactive(wal_path: &str, start_offset: u64, srr_file: &s
                     String::new(),
                     String::new(),
                     String::new(), // empty pattern marks "no rule produced"
+                    None,
                 );
             }
 
@@ -210,6 +351,28 @@ pub fn suggest_rules_interactive(wal_path: &str, start_offset: u64, srr_file: &s
 
             let pattern_for_decision = pattern.clone();
             match choice.as_str() {
+                "t" | "time" => {
+                    match prompt_time_condition(&mut reader) {
+                        Ok(Some(cond)) => {
+                            pending_condition = Some(cond);
+                            println!(
+                                "    {GREEN}condition staged{RESET} \
+                                 {DIM}— now choose decision (a/d/n) to attach it{RESET}"
+                            );
+                            println!();
+                        }
+                        Ok(None) => {
+                            // operator cancelled the subprompt
+                            println!("    {DIM}cancelled — no condition staged{RESET}");
+                            println!();
+                        }
+                        Err(e) => {
+                            println!("    {RED}invalid input: {}{RESET}", e);
+                            println!();
+                        }
+                    }
+                    continue;
+                }
                 "a" | "allow" => {
                     break (
                         r#"{ type = "Allow" }"#.to_string(),
@@ -218,6 +381,7 @@ pub fn suggest_rules_interactive(wal_path: &str, start_offset: u64, srr_file: &s
                             target.method, pattern_for_decision
                         ),
                         pattern_for_decision,
+                        pending_condition.clone(),
                     )
                 }
                 "d" | "delay" => {
@@ -228,6 +392,7 @@ pub fn suggest_rules_interactive(wal_path: &str, start_offset: u64, srr_file: &s
                             target.method, pattern_for_decision
                         ),
                         pattern_for_decision,
+                        pending_condition.clone(),
                     )
                 }
                 "n" | "deny" => {
@@ -241,15 +406,18 @@ pub fn suggest_rules_interactive(wal_path: &str, start_offset: u64, srr_file: &s
                             target.method, pattern_for_decision
                         ),
                         pattern_for_decision,
+                        pending_condition.clone(),
                     )
                 }
                 "s" | "skip" | "" => {
                     println!("    {DIM}Skipped{RESET}");
                     println!();
-                    break (String::new(), String::new(), String::new());
+                    break (String::new(), String::new(), String::new(), None);
                 }
                 _ => {
-                    println!("    {DIM}Unknown choice, try a/d/n/s or \"e <nums>\"{RESET}");
+                    println!(
+                        "    {DIM}Unknown choice, try a/d/n/s/t or \"e <nums>\"{RESET}"
+                    );
                     println!();
                     continue;
                 }
@@ -261,18 +429,24 @@ pub fn suggest_rules_interactive(wal_path: &str, start_offset: u64, srr_file: &s
             continue;
         }
 
-        // Build the TOML rule block.
+        // Build the TOML rule block. The optional `condition` line is
+        // appended only if the operator explicitly staged one via [t].
+        let condition_line = match &condition_toml {
+            Some(c) => format!("condition = {}\n", c),
+            None => String::new(),
+        };
         let rule_toml = format!(
             r#"
 [[rules]]
 method = "{method}"
 pattern = "{pattern}"
 decision = {decision}
-description = "{description}"
+{condition_line}description = "{description}"
 "#,
             method = target.method,
             pattern = final_pattern,
             decision = decision_toml,
+            condition_line = condition_line,
             description = description,
         );
 
@@ -650,6 +824,25 @@ fn append_rule_to_file(path: &str, rule_toml: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_window_str_accepts_canonical() {
+        assert!(validate_window_str("09:00-18:00").is_ok());
+        assert!(validate_window_str("22:00-06:00").is_ok()); // cross-midnight
+        assert!(validate_window_str("00:00-23:59").is_ok());
+        // Whitespace tolerance — operators retype these from prose
+        assert!(validate_window_str("09:00 - 18:00").is_ok());
+    }
+
+    #[test]
+    fn validate_window_str_rejects_garbage() {
+        assert!(validate_window_str("25:00-30:00").is_err());
+        assert!(validate_window_str("9-18").is_err()); // missing :MM
+        assert!(validate_window_str("09:60-10:00").is_err()); // minute oob
+        assert!(validate_window_str("09:00-09:00").is_err()); // zero duration
+        assert!(validate_window_str("not a window").is_err());
+        assert!(validate_window_str("").is_err());
+    }
 
     #[test]
     fn generalize_short_static_path() {
