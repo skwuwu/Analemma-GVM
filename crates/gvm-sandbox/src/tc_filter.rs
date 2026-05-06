@@ -108,7 +108,7 @@ pub fn attach_tc_filter(
     proxy_port: u16,
 ) -> Result<TcFilterGuard> {
     // 1. Add clsact qdisc (multi-attach qdisc for ingress/egress classification)
-    let output = Command::new("tc")
+    let output = Command::new(crate::tools::resolve_tool("tc"))
         .args(["qdisc", "add", "dev", interface, "clsact"])
         .output()
         .context("Failed to execute 'tc' command")?;
@@ -264,7 +264,7 @@ pub fn try_attach_tc_filter(
 /// Remove TC filters from an interface (cleanup).
 pub fn detach_tc_filter(interface: &str) {
     // Remove clsact qdisc (removes all attached filters)
-    let _ = Command::new("tc")
+    let _ = Command::new(crate::tools::resolve_tool("tc"))
         .args(["qdisc", "del", "dev", interface, "clsact"])
         .output();
 
@@ -309,7 +309,7 @@ fn command_exists(cmd: &str) -> bool {
 
 /// Run a `tc` command, returning an error on failure.
 fn run_tc(args: &[&str]) -> Result<()> {
-    let output = Command::new("tc")
+    let output = Command::new(crate::tools::resolve_tool("tc"))
         .args(args)
         .output()
         .context("Failed to execute 'tc' command")?;

@@ -31,8 +31,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
 const HEARTBEAT_DIR: &str = "/run/gvm";
-const HEARTBEAT_PREFIX: &str = "gvm-";
-const HEARTBEAT_SUFFIX: &str = ".heartbeat";
+/// File-name prefix for parent heartbeat lockfiles (`gvm-{pid}.heartbeat`).
+/// `pub(crate)` so `network::cleanup_all_orphans_report` can construct a
+/// glob over orphan lockfiles whose state file never landed.
+pub(crate) const HEARTBEAT_PREFIX: &str = "gvm-";
+pub(crate) const HEARTBEAT_SUFFIX: &str = ".heartbeat";
 
 /// Returns the heartbeat directory.
 ///
@@ -44,6 +47,13 @@ const HEARTBEAT_SUFFIX: &str = ".heartbeat";
 /// crate is built with `--cfg test`), so an attacker who can set
 /// env vars on the production gvm-proxy process cannot redirect
 /// heartbeat files and bypass orphan detection.
+/// `pub(crate)` accessor so the orphan-heartbeat sweep in
+/// `network::cleanup_all_orphans_report` honors the same
+/// `GVM_HEARTBEAT_DIR_TEST_ONLY` override the rest of the module uses.
+pub(crate) fn heartbeat_dir_for_test_or_default() -> String {
+    heartbeat_dir()
+}
+
 fn heartbeat_dir() -> String {
     #[cfg(test)]
     {

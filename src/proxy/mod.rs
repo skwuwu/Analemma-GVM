@@ -132,6 +132,141 @@ impl Drop for ApprovalGuard {
     }
 }
 
+/// Spawn a background task that periodically sweeps `pending_approvals`
+/// for entries that have outlived `2 * timeout_secs` — defense-in-depth
+/// against the narrow race between `pending_approvals.insert` and
+/// `ApprovalGuard::new` in `proxy_handler`.
+///
+/// The guard already covers the dominant failure mode (handler future
+/// dropped after the guard is on the stack). The remaining hole is:
+/// the handler future is dropped between `insert` and the `let guard =
+/// ...` line — a sync stack-frame window with no `.await`, so it can
+/// only fire if a parent task explicitly cancels the handler. Rare,
+/// but the consequence (a "ghost" approval that `gvm approve` sees but
+/// can never deliver to) is bad enough to warrant a periodic sweep.
+///
+/// The sweep is also a generic safety net for any future bug that
+/// leaks entries — proxy never accumulates pending entries indefinitely
+/// even if a new code path forgets to install the guard.
+pub fn spawn_pending_approval_sweeper(
+    pending_approvals: std::sync::Arc<dashmap::DashMap<String, PendingApproval>>,
+    timeout_secs: u64,
+) {
+    // Run every 60s — finer cadence is wasteful (entries are bounded
+    // to MAX_PENDING_APPROVALS = 1000 and naturally evicted by the
+    // per-entry timeout); coarser cadence delays cleanup of leaked
+    // entries but doesn't lose correctness.
+    let interval = std::time::Duration::from_secs(60);
+    // Anything older than 2x the per-entry timeout is definitely
+    // unreachable from the original handler — the inner timeout has
+    // long since expired and the entry should have been removed.
+    // Keep a generous safety multiplier so we don't fight the normal
+    // expiry path under clock skew.
+    let stale_after = chrono::Duration::seconds((timeout_secs * 2) as i64);
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let now = chrono::Utc::now();
+            let mut swept = 0u32;
+            // Two-phase to avoid holding the dashmap shard lock while
+            // we iterate (other inserts/removes need to make progress).
+            let stale_keys: Vec<String> = pending_approvals
+                .iter()
+                .filter(|entry| now.signed_duration_since(entry.value().timestamp) > stale_after)
+                .map(|entry| entry.key().clone())
+                .collect();
+            for key in stale_keys {
+                if pending_approvals.remove(&key).is_some() {
+                    swept += 1;
+                }
+            }
+            if swept > 0 {
+                tracing::warn!(
+                    swept,
+                    stale_after_secs = stale_after.num_seconds(),
+                    "pending_approvals sweeper removed stale entries — \
+                     these are typically handler futures that were cancelled \
+                     between insert and the ApprovalGuard installation. \
+                     Rare race; investigate if non-zero counts persist."
+                );
+            }
+        }
+    });
+}
+
+/// Spawn a background task that periodically revokes per-sandbox CA +
+/// TLS-bundle entries whose `launched_at` is older than `max_age_secs`.
+///
+/// `revoke_sandbox` is normally driven by:
+///   1. `DELETE /gvm/sandbox/{id}` from the CLI on normal sandbox exit
+///   2. `gvm cleanup` (GAP-13) when an orphan state file is processed
+///
+/// Neither covers the case where a sandbox was launched but its
+/// parent process was SIGKILLed / OOM-killed before `gvm cleanup` ever
+/// ran on this host. `per_sandbox_metadata` and `ca_registry` would
+/// keep the dead sandbox's entries until the proxy itself restarts —
+/// under high churn the unbounded growth becomes a slow RAM leak.
+///
+/// The sweeper enforces a wall-clock TTL: a sandbox that's been
+/// registered for longer than `max_age_secs` (default 6h) is
+/// unconditionally revoked. This isn't a tight liveness check — a
+/// long-running but legitimate sandbox would also be evicted. That's
+/// acceptable because:
+///   - Typical agent sandboxes are short-lived (minutes, not hours).
+///   - A revoked sandbox's next request gets `UnknownIssuer` and the
+///     CLI re-launches with a fresh CA — the failure mode is "noisy
+///     reconnect", not "broken governance".
+///   - Operators can override the TTL via `GVM_SANDBOX_METADATA_TTL_SECS`
+///     for unusual deployments.
+///
+/// A future enhancement: extend `SandboxLaunchRequest` with the
+/// parent PID so the sweep can use `is_pid_alive` for tighter
+/// detection. Until then TTL is the floor.
+pub fn spawn_sandbox_metadata_sweeper(
+    state: AppState,
+    max_age_secs: u64,
+) {
+    // Sweep every 5 minutes — entries are bounded by sandbox-launch
+    // throughput times TTL, so a coarser cadence is fine. Even a
+    // 100-launch/min storm produces only ~30k entries over the TTL
+    // window, and DashMap iteration is O(n) per shard.
+    let interval = std::time::Duration::from_secs(300);
+    let max_age = chrono::Duration::seconds(max_age_secs as i64);
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let now = chrono::Utc::now();
+            // Two-phase to avoid holding shard locks across revoke calls
+            // (revoke_sandbox touches three DashMaps + ca_registry).
+            let stale: Vec<String> = state
+                .per_sandbox_metadata
+                .iter()
+                .filter(|entry| now.signed_duration_since(entry.value().launched_at) > max_age)
+                .map(|entry| entry.key().clone())
+                .collect();
+            let count = stale.len();
+            for sandbox_id in stale {
+                state.revoke_sandbox(&sandbox_id);
+            }
+            if count > 0 {
+                tracing::warn!(
+                    swept = count,
+                    ttl_secs = max_age_secs,
+                    "Sandbox metadata sweeper revoked stale entries — \
+                     parent process likely died before normal cleanup ran. \
+                     Investigate if non-zero counts persist."
+                );
+            }
+        }
+    });
+}
+
 // ─── Circuit Breaker Configuration ───
 
 /// Number of consecutive primary WAL failures before the circuit breaker opens.

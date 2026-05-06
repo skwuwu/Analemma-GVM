@@ -306,6 +306,8 @@ mod network;
 mod seccomp;
 #[cfg(target_os = "linux")]
 pub mod tc_filter;
+#[cfg(target_os = "linux")]
+mod tools;
 
 #[cfg(target_os = "linux")]
 mod sandbox_impl;

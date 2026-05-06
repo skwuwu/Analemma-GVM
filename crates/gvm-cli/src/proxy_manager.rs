@@ -275,8 +275,18 @@ async fn start_daemon(proxy: &str, workspace: &Path, require_tls: bool) -> Resul
         fix_file_ownership(&secrets_path);
     }
 
-    // Log file (append mode)
+    // Log file (append mode) — with size-based rotation at spawn time.
+    //
+    // The proxy daemon writes to proxy.log indefinitely. Without rotation,
+    // long-running deployments hit disk-full → primary WAL fail-close
+    // (proxy refuses to serve any request that would create a WAL event,
+    // i.e. all of them). The fix is conservative: rotate at spawn — the
+    // only moment we have a writable handle without coordinating with
+    // the live tracing subscriber. A daemon that runs for weeks without
+    // a `gvm stop` / `gvm run` cycle will need an external logrotate;
+    // every routine restart trims the log to a bounded number of segments.
     let log_path = data_dir.join("proxy.log");
+    rotate_proxy_log_if_oversized(&log_path);
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -472,6 +482,74 @@ fn is_process_alive(pid: u32) -> bool {
         let _ = pid;
         false
     }
+}
+
+/// Maximum size of `data/proxy.log` before rotation kicks in (100 MB).
+/// Daemon writes to this file unbuffered for the lifetime of the proxy;
+/// every restart is an opportunity to bound it.
+const PROXY_LOG_MAX_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Maximum number of rotated segments to keep (`proxy.log.1` through
+/// `proxy.log.{N}`). Older segments are pruned during rotation.
+const PROXY_LOG_MAX_SEGMENTS: usize = 5;
+
+/// Rotate `proxy.log` if it exceeds `PROXY_LOG_MAX_BYTES`, keeping at most
+/// `PROXY_LOG_MAX_SEGMENTS` rotated segments.
+///
+/// Strategy: shift every existing segment up by one
+/// (`proxy.log.4` → `proxy.log.5`, `proxy.log.3` → `proxy.log.4`, …,
+/// `proxy.log` → `proxy.log.1`), then drop the oldest beyond the cap.
+/// Best-effort — any error is logged via `eprintln!` (the tracing
+/// subscriber isn't installed yet at spawn time) and the daemon
+/// continues without rotation rather than blocking startup.
+fn rotate_proxy_log_if_oversized(log_path: &Path) {
+    let size = match std::fs::metadata(log_path) {
+        Ok(m) => m.len(),
+        Err(_) => return, // doesn't exist yet — nothing to rotate
+    };
+    if size < PROXY_LOG_MAX_BYTES {
+        return;
+    }
+
+    // Shift segments down: rename .{N-1} → .{N}, working from oldest to newest.
+    // Pruning happens implicitly: we drop anything that would land beyond N.
+    let parent = log_path.parent().unwrap_or(Path::new("."));
+    let stem = log_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("proxy.log");
+
+    // Step 1: drop the file that's about to fall off the end.
+    let oldest = parent.join(format!("{}.{}", stem, PROXY_LOG_MAX_SEGMENTS));
+    let _ = std::fs::remove_file(&oldest);
+
+    // Step 2: shift .{i} → .{i+1} from highest to lowest so we never overwrite
+    // a file we haven't moved yet.
+    for i in (1..PROXY_LOG_MAX_SEGMENTS).rev() {
+        let src = parent.join(format!("{}.{}", stem, i));
+        let dst = parent.join(format!("{}.{}", stem, i + 1));
+        if src.exists() {
+            let _ = std::fs::rename(&src, &dst);
+        }
+    }
+
+    // Step 3: rotate the live file → .1
+    let rotated = parent.join(format!("{}.1", stem));
+    if let Err(e) = std::fs::rename(log_path, &rotated) {
+        eprintln!(
+            "  warning: proxy.log rotation rename failed ({}): {}",
+            log_path.display(),
+            e
+        );
+        return;
+    }
+
+    eprintln!(
+        "  rotated {} ({} bytes → {})",
+        log_path.display(),
+        size,
+        rotated.display()
+    );
 }
 
 /// Fix ownership of a file to SUDO_UID:SUDO_GID if running as root via sudo.

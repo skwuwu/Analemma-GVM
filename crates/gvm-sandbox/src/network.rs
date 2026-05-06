@@ -155,7 +155,7 @@ pub fn setup_host_network(config: &VethConfig) -> Result<String> {
     .ok();
     // Also enable on the default outbound interface (e.g., ens5 on EC2)
     // so that DNAT'd packets can be forwarded out.
-    if let Ok(output) = std::process::Command::new("ip")
+    if let Ok(output) = std::process::Command::new(resolve_tool("ip"))
         .args(["route", "get", "8.8.8.8"])
         .output()
     {
@@ -673,7 +673,20 @@ pub fn cleanup_host_network(config: &VethConfig, dns_target_override: Option<&st
 ///
 /// Cannot use 127.0.0.53 (systemd-resolved stub) because it binds to `lo` only —
 /// packets arriving on veth with DNAT to 127.0.0.53 are silently dropped.
-const IP_FORWARD_SAVED_PATH: &str = "/tmp/gvm-ip-forward-original";
+/// Path to the original ip_forward state save file.
+///
+/// Lives under `/run/gvm/` (tmpfs on every distro we support — wiped at
+/// reboot) rather than `/tmp/`. Earlier versions used
+/// `/tmp/gvm-ip-forward-original`; that path is NOT tmpfs on every distro
+/// (`/tmp` is real disk on Ubuntu unless explicitly remounted), so the
+/// "original" value persisted across reboots. Combined with the
+/// "first sandbox wins" guard below, that meant: every sandbox after the
+/// first crash captured `1` as the "original" forever, and host
+/// ip_forward never went back to `0`. Moving to `/run/gvm/` makes the
+/// reboot path self-healing — and the `cleanup_all_orphans_report`
+/// sweep below mops up the live-system case after the last sandbox
+/// state file vanishes.
+const IP_FORWARD_SAVED_PATH: &str = "/run/gvm/ip-forward-original";
 
 /// Save the original ip_forward state before enabling it.
 /// Only saves if the file doesn't already exist (first sandbox wins).
@@ -681,6 +694,10 @@ fn save_ip_forward_state() {
     if std::path::Path::new(IP_FORWARD_SAVED_PATH).exists() {
         return; // Already saved by a previous sandbox
     }
+    // Ensure /run/gvm exists — usually created by `record_sandbox_state`
+    // earlier in the launch path, but `save_ip_forward_state` is called
+    // from `setup_host_network` which runs first on a cold boot.
+    let _ = std::fs::create_dir_all("/run/gvm");
     let original = std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
         .unwrap_or_else(|_| "0".to_string());
     let _ = std::fs::write(IP_FORWARD_SAVED_PATH, original.trim());
@@ -756,9 +773,11 @@ fn resolve_host_dns() -> String {
     "8.8.8.8".to_string()
 }
 
+use crate::tools::resolve_tool;
+
 /// Run an `ip` command, returning an error on failure.
 fn run_ip(args: &[&str]) -> Result<()> {
-    let output = Command::new("ip")
+    let output = Command::new(resolve_tool("ip"))
         .args(args)
         .output()
         .context("Failed to execute 'ip' command")?;
@@ -772,7 +791,7 @@ fn run_ip(args: &[&str]) -> Result<()> {
 
 /// Run an `iptables` command, returning an error on failure.
 fn run_iptables(args: &[&str]) -> Result<()> {
-    let output = Command::new("iptables")
+    let output = Command::new(resolve_tool("iptables"))
         .args(args)
         .output()
         .context("Failed to execute 'iptables' command")?;
@@ -1180,35 +1199,55 @@ fn cleanup_state_resources(state: &SandboxState) -> StateCleanupCounts {
     }
 
     // 3. Clean up network (veth + iptables + TC filter)
-    let veth_exists = Command::new("ip")
+    //
+    // We always run the cleanup sequence — gating it on `ip link show`
+    // success was the failure mode in GAP-10: when the `ip` binary is
+    // OOM-killed mid-sweep (or PATH-stripped, or briefly slow under load),
+    // the gate flipped to `false` and we silently skipped iptables + tc
+    // cleanup, leaving NAT rules orphaned even though the state file
+    // got removed seconds later. `cleanup_host_network` itself is
+    // already best-effort — every iptables call uses `.ok()` and is
+    // idempotent against absent rules, so running it on a missing veth
+    // is a no-op, not an error.
+    //
+    // We DO still probe veth existence — but only to set the
+    // `counts.veth` flag accurately (don't claim we cleaned a veth that
+    // wasn't there). Cleanup runs unconditionally regardless of probe.
+    let veth_existed_before = Command::new(resolve_tool("ip"))
         .args(["link", "show", &state.veth_host])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
 
-    if veth_exists {
-        let veth_config = VethConfig {
-            host_iface: state.veth_host.clone(),
-            sandbox_iface: state.veth_sandbox.clone(),
-            host_ip: state.host_ip.clone(),
-            sandbox_ip: state.sandbox_ip.clone(),
-            cidr: 30,
-            child_pid: state.pid,
-            proxy_addr: SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                state.proxy_port,
-            ),
-            slot: 0, // Cleanup path — slot not needed, only veth/IP matter
-        };
-        // TC filter must be detached BEFORE veth deletion (cleanup_host_network
-        // deletes the veth). Reversing this order makes detach a no-op.
-        crate::tc_filter::detach_tc_filter(&state.veth_host);
-        cleanup_host_network(&veth_config, state.dns_target.as_deref());
+    let veth_config = VethConfig {
+        host_iface: state.veth_host.clone(),
+        sandbox_iface: state.veth_sandbox.clone(),
+        host_ip: state.host_ip.clone(),
+        sandbox_ip: state.sandbox_ip.clone(),
+        cidr: 30,
+        child_pid: state.pid,
+        proxy_addr: SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            state.proxy_port,
+        ),
+        slot: 0, // Cleanup path — slot not needed, only veth/IP matter
+    };
+    // TC filter must be detached BEFORE veth deletion (cleanup_host_network
+    // deletes the veth). Reversing this order makes detach a no-op.
+    crate::tc_filter::detach_tc_filter(&state.veth_host);
+    cleanup_host_network(&veth_config, state.dns_target.as_deref());
+    if veth_existed_before {
         counts.veth = true;
-        // Per-sandbox iptables chain GVM-{veth_host} + DNAT/MASQUERADE rules.
-        counts.iptables_chains += 1;
-        tracing::debug!(iface = %state.veth_host, "Cleaned orphan: TC filter + iptables + veth");
     }
+    // Per-sandbox iptables chain GVM-{veth_host} + DNAT/MASQUERADE rules.
+    // Counted unconditionally — even a missing veth may have left chains
+    // behind (the prior gate hid this case entirely).
+    counts.iptables_chains += 1;
+    tracing::debug!(
+        iface = %state.veth_host,
+        veth_present_at_cleanup = veth_existed_before,
+        "Cleaned orphan: TC filter + iptables (+ veth if present)"
+    );
 
     // 4. Docker bridge + container + iptables (set only by `--contained`).
     //    Fields are `None` for sandbox state files, so this block is a no-op
@@ -1253,6 +1292,12 @@ pub struct CleanupReport {
     pub iptables_chains: u32,
     /// Defense-in-depth: orphan veths with no matching state file.
     pub orphan_veths_swept: u32,
+    /// `sandbox_id` strings recovered from cleaned state files. The CLI
+    /// uses this list to POST `DELETE /gvm/sandbox/{id}` so the running
+    /// proxy drops its in-memory CA + per-sandbox TLS bundle for the
+    /// dead sandbox. Without this, the proxy would keep stale entries
+    /// until restart (RAM leak under heavy sandbox churn).
+    pub revoked_sandbox_ids: Vec<String>,
 }
 
 impl CleanupReport {
@@ -1373,6 +1418,13 @@ pub fn cleanup_all_orphans_report() -> Result<CleanupReport> {
             report.veth_interfaces += 1;
             report.veth_names.push(state.veth_host.clone());
         }
+        // Surface the sandbox_id (if recorded) so the CLI can revoke
+        // the proxy-side per-sandbox CA + TLS bundle. State files
+        // written before sandbox_id was added (v0.4 and earlier) leave
+        // this as None and the CLI skips them — no harm.
+        if let Some(sid) = state.sandbox_id.clone() {
+            report.revoked_sandbox_ids.push(sid);
+        }
         report.sandboxes += 1;
         let _ = std::fs::remove_file(&path);
         // The parent for this state file is gone — its heartbeat
@@ -1472,7 +1524,7 @@ pub fn cleanup_all_orphans_report() -> Result<CleanupReport> {
     }
 
     // 3. Defense-in-depth: find veth-gvm-* interfaces with no state file
-    if let Ok(output) = Command::new("ip").args(["-o", "link", "show"]).output() {
+    if let Ok(output) = Command::new(resolve_tool("ip")).args(["-o", "link", "show"]).output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
             if let Some(iface) = line
@@ -1501,7 +1553,7 @@ pub fn cleanup_all_orphans_report() -> Result<CleanupReport> {
                         );
                         // Clean iptables chain for this veth before deleting it
                         cleanup_orphan_iptables_chain(iface);
-                        let _ = Command::new("ip").args(["link", "del", iface]).output();
+                        let _ = Command::new(resolve_tool("ip")).args(["link", "del", iface]).output();
                         report.orphan_veths_swept += 1;
                         report.veth_names.push(iface.to_string());
                         report.iptables_chains += 1;
@@ -1599,6 +1651,103 @@ pub fn cleanup_all_orphans_report() -> Result<CleanupReport> {
     report.mount_paths += stale_dirs;
     cleaned += stale_dirs;
 
+    // 8. Defense-in-depth: sweep `/run/gvm/gvm-{pid}.heartbeat` lockfiles
+    //    whose owning PID is no longer alive AND that has no matching
+    //    state file in step 1.
+    //
+    // The normal cleanup path (network.rs:1379) already removes the
+    // heartbeat for any PID whose state file we processed. The gap is
+    // when the parent crashed AFTER `ParentHeartbeat::acquire` ran but
+    // BEFORE `record_sandbox_state` wrote the state file — there's no
+    // state-file path back to the heartbeat, so the file leaks until
+    // PID re-use confuses a future check.
+    //
+    // We use the same liveness signal the per-PID flow uses:
+    // `parent_state` reports Dead when the kernel released the flock.
+    // Parents still alive (and visible to /proc) keep their heartbeat,
+    // so this sweep is safe even during a concurrent launch.
+    let heartbeat_pattern = format!(
+        "{}/{}*{}",
+        crate::heartbeat::heartbeat_dir_for_test_or_default(),
+        crate::heartbeat::HEARTBEAT_PREFIX,
+        crate::heartbeat::HEARTBEAT_SUFFIX
+    );
+    for entry in glob::glob(&heartbeat_pattern).unwrap_or_else(|_| glob::glob("").unwrap()) {
+        let path = match entry {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // Filename: gvm-{pid}.heartbeat — strip prefix + suffix to recover PID.
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        let pid_str = name
+            .strip_prefix(crate::heartbeat::HEARTBEAT_PREFIX)
+            .and_then(|s| s.strip_suffix(crate::heartbeat::HEARTBEAT_SUFFIX));
+        let pid: u32 = match pid_str.and_then(|s| s.parse().ok()) {
+            Some(p) => p,
+            None => continue, // Not our naming convention; leave alone.
+        };
+        // Use Dead-only check (NOT Hung) — Hung means the parent is
+        // still alive in /proc but its heartbeat thread stopped, which
+        // is a "force orphan cleanup" signal for the resource-bearing
+        // state-file sweep, not a "delete the lockfile" signal. The
+        // lockfile is still held and removing it would race with a
+        // recovery path.
+        if matches!(
+            crate::heartbeat::parent_state(pid, crate::heartbeat::HEARTBEAT_STALE_THRESHOLD),
+            crate::heartbeat::ParentState::Dead
+        ) {
+            if std::fs::remove_file(&path).is_ok() {
+                tracing::warn!(
+                    pid,
+                    path = %path.display(),
+                    "Removed orphan heartbeat lockfile (parent dead, no state file)"
+                );
+                cleaned += 1;
+            }
+        }
+    }
+
+    // 7. Host-state restoration when no sandbox state files remain.
+    //
+    // Two host-global pieces of state survive the per-sandbox cleanup
+    // path because they're shared across every concurrent sandbox:
+    //
+    //   (a) /proc/sys/net/ipv4/ip_forward — flipped to 1 by the first
+    //       sandbox, restored by the LAST sandbox via restore_ip_forward_state.
+    //   (b) iptables FORWARD ESTABLISHED,RELATED ACCEPT — installed by
+    //       the first sandbox, removed by the same restore path.
+    //
+    // If every sandbox crashed before its normal cleanup ran, neither
+    // restoration fires. The state files are gone (this sweep removed
+    // them above), but the host is left with ip_forward=1 and an
+    // orphan FORWARD rule until manual intervention.
+    //
+    // GAP-2 / GAP-3 fix: after the per-sandbox sweep finishes and zero
+    // live state files remain, run the same host-state restore the
+    // normal path would have run. is_pid_alive_with_starttime keeps
+    // this safe in the presence of a freshly-launching sandbox — the
+    // glob below counts files that survived our PID liveness checks
+    // earlier in the function, so a still-running sandbox holds its
+    // file and we leave host state alone.
+    let active_after_sweep = glob::glob(&pattern)
+        .ok()
+        .map(|entries| entries.filter_map(|e| e.ok()).count())
+        .unwrap_or(0);
+    if active_after_sweep == 0 {
+        // Use the existing restore helper (which is itself gated on the
+        // active-count check, so calling it twice when the count is
+        // zero is harmless — the second call just no-ops because the
+        // saved-state file was already deleted by the first).
+        restore_ip_forward_state();
+        // restore_ip_forward_state silently returns when the saved file
+        // is missing, so a host that never enabled ip_forward via GVM
+        // pays nothing here. When the file IS present, this is the
+        // last-resort path that recovers the host kernel toggle.
+    }
+
     if cleaned > 0 {
         tracing::info!(count = cleaned, "Orphan sandbox cleanup complete");
     }
@@ -1613,9 +1762,16 @@ pub fn cleanup_all_orphans_report() -> Result<CleanupReport> {
 /// only fires when the veth is still listed by `ip link show`). On a host
 /// where the veth has been deleted but its NAT rules linger, neither of
 /// those covers the stranded rules — this function does.
+/// GVM sandbox subnet — every veth gets a `/30` slot inside this `/16`.
+/// Used to recognise our NAT rules even when they match by source address
+/// rather than interface name (the kernel re-emits user-supplied rules
+/// after token-merging, so a rule installed with `-i veth-gvm-h0` may be
+/// stored without the `-i` clause if a route lookup made it redundant).
+const GVM_SANDBOX_SUBNET_PREFIX: &str = "10.200.";
+
 fn cleanup_stale_nat_rules() -> usize {
     let mut cleaned = 0usize;
-    let output = match Command::new("iptables-save").args(["-t", "nat"]).output() {
+    let output = match Command::new(resolve_tool("iptables-save")).args(["-t", "nat"]).output() {
         Ok(o) => o,
         Err(_) => return 0,
     };
@@ -1628,10 +1784,30 @@ fn cleanup_stale_nat_rules() -> usize {
         if !line.starts_with("-A ") {
             continue;
         }
-        // Token-bounded match — must contain ` veth-gvm-h` so we don't
-        // accidentally delete a rule referring to a hostname that happens
-        // to contain "veth-gvm-h" as a substring.
-        if !line.split_whitespace().any(|t| t.starts_with("veth-gvm-h")) {
+        // We recognise GVM-installed rules by either:
+        //   1. an interface token starting with `veth-gvm-h` (our naming
+        //      convention for the host side of every sandbox veth pair), OR
+        //   2. a source/destination address inside `10.200.0.0/16` (our
+        //      hardcoded sandbox subnet — every sandbox gets a /30 slot).
+        //
+        // Earlier versions only checked (1), which missed MASQUERADE rules
+        // like `-A POSTROUTING -s 10.200.0.0/30 -p tcp --dport 8080 -j ...`
+        // — those are written with a source-address matcher and no `-i`
+        // clause, so they survived every previous cleanup sweep. The
+        // residue accumulated indefinitely on long-running test instances
+        // (we observed dozens of orphan POSTROUTING entries on EC2, each
+        // a different /30 slot from a sandbox that crashed before its
+        // state file was written).
+        let mentions_gvm_veth = line
+            .split_whitespace()
+            .any(|t| t.starts_with("veth-gvm-h"));
+        let mentions_gvm_subnet = line.split_whitespace().any(|t| {
+            // -s 10.200.x.x/cidr or -d 10.200.x.x/cidr etc. — match the
+            // address part, ignoring the cidr suffix.
+            t.starts_with(GVM_SANDBOX_SUBNET_PREFIX)
+                || t.split('/').next().is_some_and(|h| h.starts_with(GVM_SANDBOX_SUBNET_PREFIX))
+        });
+        if !mentions_gvm_veth && !mentions_gvm_subnet {
             continue;
         }
         let delete_rule = line.replacen("-A ", "-D ", 1);
@@ -1646,10 +1822,110 @@ fn cleanup_stale_nat_rules() -> usize {
     if cleaned > 0 {
         tracing::warn!(
             count = cleaned,
-            "Cleaned stranded NAT rules referencing veth-gvm-h*"
+            "Cleaned stranded NAT rules (veth-gvm-h* or 10.200.0.0/16 source/dest)"
         );
     }
     cleaned
+}
+
+#[cfg(test)]
+mod nat_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn iptables_save_lines_with_gvm_subnet_are_recognised() {
+        // The exact orphan-rule shape we observed on EC2 — no -i clause,
+        // just a source-subnet match. Earlier impl missed this.
+        let line = "-A POSTROUTING -s 10.200.0.0/30 -p tcp -m tcp --dport 8080 -j MASQUERADE";
+        let mentions_subnet = line.split_whitespace().any(|t| {
+            t.starts_with(GVM_SANDBOX_SUBNET_PREFIX)
+                || t.split('/').next().is_some_and(|h| h.starts_with(GVM_SANDBOX_SUBNET_PREFIX))
+        });
+        assert!(
+            mentions_subnet,
+            "regression: cleanup must recognise -s 10.200.x.x/cidr rules"
+        );
+    }
+
+    #[test]
+    fn unrelated_rules_are_not_matched() {
+        // A rule with a totally different subnet must NOT be matched —
+        // we don't want to flush other people's NAT setup.
+        let line = "-A POSTROUTING -s 192.168.1.0/24 -j MASQUERADE";
+        let mentions_veth = line
+            .split_whitespace()
+            .any(|t| t.starts_with("veth-gvm-h"));
+        let mentions_subnet = line.split_whitespace().any(|t| {
+            t.starts_with(GVM_SANDBOX_SUBNET_PREFIX)
+                || t.split('/').next().is_some_and(|h| h.starts_with(GVM_SANDBOX_SUBNET_PREFIX))
+        });
+        assert!(!mentions_veth);
+        assert!(!mentions_subnet);
+    }
+
+    #[test]
+    fn veth_named_rule_still_matched() {
+        // The legacy detection path — interface name token — still works.
+        let line = "-A FORWARD -i veth-gvm-h0 -j ACCEPT";
+        let mentions_veth = line
+            .split_whitespace()
+            .any(|t| t.starts_with("veth-gvm-h"));
+        assert!(mentions_veth);
+    }
+
+    // ── GAP-8 regression: substring-collision in cleanup_orphan_iptables_chain ──
+    //
+    // Before the fix, `line.contains("veth-gvm-h1")` returned true for
+    // any line mentioning `veth-gvm-h10`, `veth-gvm-h100`, etc. — so a
+    // cleanup of slot 1 silently `-D`'d slot 10's NAT rules. The fix
+    // moved the check into `rule_references_iface_exactly`, which only
+    // matches the exact token after `-i` / `-o`.
+
+    #[test]
+    fn rule_references_iface_exactly_matches_target() {
+        let line = "-A POSTROUTING -o veth-gvm-h1 -j MASQUERADE";
+        assert!(rule_references_iface_exactly(line, "veth-gvm-h1"));
+    }
+
+    #[test]
+    fn rule_references_iface_exactly_rejects_substring_collision() {
+        // The regression case: cleaning up h1 must NOT match h10 / h100.
+        let line = "-A POSTROUTING -o veth-gvm-h10 -p tcp --dport 8080 -j MASQUERADE";
+        assert!(
+            !rule_references_iface_exactly(line, "veth-gvm-h1"),
+            "GAP-8 regression: cleanup of slot 1 must not match slot 10's rule"
+        );
+        let line2 = "-A PREROUTING -i veth-gvm-h100 -j DNAT --to-destination 127.0.0.1:8080";
+        assert!(
+            !rule_references_iface_exactly(line2, "veth-gvm-h1"),
+            "GAP-8 regression: cleanup of slot 1 must not match slot 100's rule"
+        );
+    }
+
+    #[test]
+    fn rule_references_iface_exactly_handles_both_directions() {
+        // Either -i or -o with the exact iface name should match.
+        assert!(rule_references_iface_exactly(
+            "-A FORWARD -i veth-gvm-h7 -j ACCEPT",
+            "veth-gvm-h7"
+        ));
+        assert!(rule_references_iface_exactly(
+            "-A FORWARD -o veth-gvm-h7 -j ACCEPT",
+            "veth-gvm-h7"
+        ));
+    }
+
+    #[test]
+    fn rule_references_iface_exactly_ignores_iface_in_other_positions() {
+        // A line that mentions the iface name as something OTHER than
+        // an `-i`/`-o` argument (e.g., in a comment or destination)
+        // must not match. Defense against future flag additions.
+        let line = "-A POSTROUTING -s 10.200.0.0/30 -m comment --comment veth-gvm-h1 -j MASQUERADE";
+        assert!(
+            !rule_references_iface_exactly(line, "veth-gvm-h1"),
+            "iface name in a comment is not a real reference"
+        );
+    }
 }
 
 /// Defense-in-depth: remove leaked /run/gvm/ per-sandbox directories whose
@@ -1660,6 +1936,24 @@ fn cleanup_stale_nat_rules() -> usize {
 /// run on a previous binary used a slightly different cleanup order. The
 /// directories are tiny but they confuse `gvm status` and clutter
 /// /run/gvm/, so we sweep them out unconditionally.
+/// True when `path` appears as a mount point in /proc/mounts at this
+/// instant. Re-reads /proc/mounts on every call — the file is small
+/// (~few KB) and the cost is dominated by the syscall, not parsing.
+/// Used by `cleanup_stale_run_gvm_dirs` to close the TOCTOU window
+/// where a single up-front snapshot becomes stale across iterations.
+fn path_is_mounted(path: &str) -> bool {
+    let mounts = match std::fs::read_to_string("/proc/mounts") {
+        Ok(s) => s,
+        Err(_) => return false, // /proc unavailable → don't block cleanup
+    };
+    mounts.lines().any(|l| {
+        l.split_whitespace()
+            .nth(1)
+            .map(|m| m == path)
+            .unwrap_or(false)
+    })
+}
+
 fn cleanup_stale_run_gvm_dirs() -> usize {
     let mut cleaned = 0usize;
     let prefixes = [
@@ -1669,6 +1963,11 @@ fn cleanup_stale_run_gvm_dirs() -> usize {
         "home-overlay-",
         "ws-merged-",
         "ws-overlay-",
+        // GAP-7: legacy / future overlay names. `try_mount_overlayfs` in
+        // mount.rs creates `gvm-overlay-{pid}` in some failure paths.
+        // Without this entry the sweep skipped them and they accumulated
+        // as empty dirents under /run/gvm/.
+        "gvm-overlay-",
     ];
     // Fixed names without a PID suffix. These come from child-side mkdirs
     // inside the sandbox mount namespace — Linux still creates the dirent
@@ -1677,20 +1976,23 @@ fn cleanup_stale_run_gvm_dirs() -> usize {
     // handles them via pivot_root + umount, but a SIGKILL'd or panicked
     // child leaves the empty dirent behind. Always safe to rmdir if empty
     // and not currently a mount point.
+    //
+    // GAP-6 (TOCTOU): we re-read /proc/mounts before EACH path check.
+    // The previous implementation read once at the top of the function
+    // and then iterated, which leaves a window where a concurrent launch
+    // can mount onto a path AFTER our snapshot says "unmounted" but
+    // BEFORE our umount2/rmdir runs — yanking the source from under the
+    // freshly-launching sandbox. /proc/mounts is small (typically <8 KB
+    // even on heavily-mounted hosts), so re-reading is cheap and
+    // eliminates the race window.
     let fixed_names = ["sandbox-root", "sandbox-staging-ws"];
-    let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
     for name in fixed_names {
         let path = format!("/run/gvm/{}", name);
         let p = std::path::Path::new(&path);
         if !p.exists() {
             continue;
         }
-        if mounts.lines().any(|l| {
-            l.split_whitespace()
-                .nth(1)
-                .map(|m| m == path.as_str())
-                .unwrap_or(false)
-        }) {
+        if path_is_mounted(&path) {
             continue;
         }
         if std::fs::remove_dir(&path).is_ok() {
@@ -1724,14 +2026,8 @@ fn cleanup_stale_run_gvm_dirs() -> usize {
             continue;
         }
         let path = format!("/run/gvm/{}", name);
-        // Skip anything still mounted (mount table check is cheaper than
-        // a stat-based heuristic and matches what /proc/mounts reports).
-        let is_mounted = mounts.lines().any(|l| {
-            l.split_whitespace()
-                .nth(1)
-                .map(|m| m == path.as_str())
-                .unwrap_or(false)
-        });
+        // Re-check mount state per-iteration (see GAP-6 note above).
+        let is_mounted = path_is_mounted(&path);
         if is_mounted {
             // Lazy unmount. Do NOT follow with remove_dir_all — see the
             // detailed note on the data-loss bug in cleanup_state_resources
@@ -1766,25 +2062,54 @@ fn cleanup_orphan_iptables_chain(host_iface: &str) {
     run_iptables(&["-F", &chain_name]).ok();
     run_iptables(&["-X", &chain_name]).ok();
 
-    // Clean NAT rules that reference this interface (PREROUTING DNAT + POSTROUTING MASQUERADE).
-    // These rules use -i {host_iface} so we can identify them.
-    // Use iptables-save + grep to find and delete specific rules.
-    if let Ok(output) = Command::new("iptables-save").args(["-t", "nat"]).output() {
+    // Clean NAT rules that reference this interface (PREROUTING DNAT +
+    // POSTROUTING MASQUERADE). These rules use `-i {host_iface}` or
+    // `-o {host_iface}` so we identify them by exact-token match on
+    // those flag values.
+    //
+    // GAP-8 (fixed): the previous implementation used `line.contains(host_iface)`,
+    // which is a substring match. With slot numbering (`veth-gvm-h0`,
+    // `veth-gvm-h1`, …, `veth-gvm-h10`, `veth-gvm-h100`) this caused
+    // sandbox slot 1's cleanup to silently delete slot 10's NAT rules
+    // — `veth-gvm-h1` is a substring of `veth-gvm-h10`. The active
+    // sandbox loses its MASQUERADE/DNAT entries with no error surface
+    // (every `run_iptables(...).ok()` swallows the result), and traffic
+    // routing breaks until the next manual cleanup or restart.
+    if let Ok(output) = Command::new(resolve_tool("iptables-save")).args(["-t", "nat"]).output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
-            if line.contains(host_iface) && line.starts_with("-A ") {
-                // Convert "-A PREROUTING ..." to "-D PREROUTING ..." for deletion
-                let delete_rule = line.replacen("-A ", "-D ", 1);
-                let args: Vec<&str> = std::iter::once("-t")
-                    .chain(std::iter::once("nat"))
-                    .chain(delete_rule.split_whitespace())
-                    .collect();
-                run_iptables(&args).ok();
+            if !line.starts_with("-A ") {
+                continue;
             }
+            if !rule_references_iface_exactly(line, host_iface) {
+                continue;
+            }
+            // Convert "-A PREROUTING ..." to "-D PREROUTING ..." for deletion
+            let delete_rule = line.replacen("-A ", "-D ", 1);
+            let args: Vec<&str> = std::iter::once("-t")
+                .chain(std::iter::once("nat"))
+                .chain(delete_rule.split_whitespace())
+                .collect();
+            run_iptables(&args).ok();
         }
     }
 
     tracing::debug!(chain = %chain_name, "Cleaned orphan iptables chain + NAT rules for {}", host_iface);
+}
+
+/// Token-bounded check: does an iptables-save line reference `iface` via
+/// `-i <iface>` or `-o <iface>`? Mirrors the logic in
+/// `cleanup_verify::nat_rule_references_iface`. Used by
+/// `cleanup_orphan_iptables_chain` to avoid the substring-collision bug
+/// where `veth-gvm-h1` would naively match `veth-gvm-h10` / `veth-gvm-h100`.
+fn rule_references_iface_exactly(line: &str, iface: &str) -> bool {
+    let mut tokens = line.split_whitespace();
+    while let Some(t) = tokens.next() {
+        if (t == "-i" || t == "-o") && tokens.next() == Some(iface) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Scan iptables FORWARD chains for stale GVM-* entries that have no corresponding veth interface.
@@ -1809,7 +2134,7 @@ fn cleanup_stale_forward_chains() -> usize {
                     let iface = &chain_name[4..]; // strip "GVM-"
 
                     // Check if veth still exists
-                    let veth_exists = Command::new("ip")
+                    let veth_exists = Command::new(resolve_tool("ip"))
                         .args(["link", "show", iface])
                         .output()
                         .map(|o| o.status.success())
@@ -2224,7 +2549,7 @@ pub fn cleanup_stale_docker_chains() -> usize {
         let bridge = &chain_name[4..];
 
         // Check if bridge interface still exists
-        let bridge_exists = Command::new("ip")
+        let bridge_exists = Command::new(resolve_tool("ip"))
             .args(["link", "show", bridge])
             .output()
             .map(|o| o.status.success())

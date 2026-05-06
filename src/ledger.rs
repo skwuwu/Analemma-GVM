@@ -54,8 +54,30 @@ pub struct TripleState {
 /// to prevent concurrent file open/close races (critical on Windows where
 /// append-mode concurrent opens can cause lost writes).
 struct EmergencyWAL {
-    file: tokio::sync::Mutex<tokio::fs::File>,
+    /// Live append handle and the path so rotation can re-open. The byte
+    /// counter is checked under the same mutex to avoid concurrent rotates.
+    inner: tokio::sync::Mutex<EmergencyWalInner>,
+    path: PathBuf,
+    /// Maximum size in bytes before rotation. Past this point we rename
+    /// `wal_emergency.log` → `wal_emergency.log.1` (overwriting any prior
+    /// `.1`) and open a fresh file. One archive segment is kept — there's
+    /// no merge-back path yet, so accumulating more segments would just
+    /// be silent disk growth without recovery value.
+    max_bytes: u64,
 }
+
+struct EmergencyWalInner {
+    file: tokio::fs::File,
+    bytes_written: u64,
+}
+
+/// Default size cap before EmergencyWAL rotation.
+///
+/// 100 MB matches the primary WAL's `max_wal_bytes` default. Earlier the
+/// emergency WAL had no cap at all — a prolonged primary-WAL outage would
+/// fill the disk uncapped, eventually breaking the emergency path too
+/// (the documented fallback-of-the-fallback).
+const DEFAULT_EMERGENCY_WAL_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
 impl EmergencyWAL {
     async fn open(path: &Path) -> Result<Self> {
@@ -67,15 +89,36 @@ impl EmergencyWAL {
             .append(true)
             .open(path)
             .await?;
-        tracing::info!(path = %path.display(), "Emergency WAL initialized");
+        // Seed the byte counter from the existing file size so a daemon
+        // restart on a half-full emergency WAL doesn't immediately blow
+        // past the cap.
+        let bytes_written = tokio::fs::metadata(path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        tracing::info!(
+            path = %path.display(),
+            initial_bytes = bytes_written,
+            "Emergency WAL initialized"
+        );
         Ok(Self {
-            file: tokio::sync::Mutex::new(file),
+            inner: tokio::sync::Mutex::new(EmergencyWalInner {
+                file,
+                bytes_written,
+            }),
+            path: path.to_path_buf(),
+            max_bytes: DEFAULT_EMERGENCY_WAL_MAX_BYTES,
         })
     }
 
     /// Best-effort append: serialize event as JSON line, write to persistent handle.
     /// Mutex ensures serialized writes — no interleaving under concurrent load.
     /// Returns Ok(()) on success, Err on I/O failure.
+    ///
+    /// Triggers rotation when the on-disk size would exceed `max_bytes`.
+    /// Rotation is best-effort — if rename fails (disk full, FS readonly)
+    /// we log a warning and keep appending to the live file. The intent
+    /// of EmergencyWAL is "never lose an event" first, "stay bounded" second.
     async fn append(&self, event: &GVMEvent) -> Result<()> {
         let hash = compute_event_hash(event);
         let mut stamped = event.clone();
@@ -83,12 +126,69 @@ impl EmergencyWAL {
 
         let mut data = serde_json::to_vec(&stamped)?;
         data.push(b'\n');
+        let line_len = data.len() as u64;
 
-        let mut file = self.file.lock().await;
-        file.write_all(&data).await?;
+        let mut inner = self.inner.lock().await;
+
+        // Rotate BEFORE writing if this append would push us past the cap.
+        if inner.bytes_written + line_len > self.max_bytes {
+            self.rotate(&mut inner).await;
+        }
+
+        inner.file.write_all(&data).await?;
         // Best-effort fsync — don't fail if sync fails
-        let _ = file.sync_data().await;
+        let _ = inner.file.sync_data().await;
+        inner.bytes_written += line_len;
         Ok(())
+    }
+
+    /// Rename current emergency WAL → `.1` (overwriting any prior `.1`),
+    /// then open a fresh file. One archive segment is kept by design.
+    async fn rotate(&self, inner: &mut EmergencyWalInner) {
+        // Flush + drop the old handle before rename. tokio::fs::File on
+        // Linux survives rename (inode-based handle), but on Windows the
+        // file is locked while the handle is open. We can't `drop` the
+        // old handle in place because the struct still owns it — instead
+        // we close-by-replace below.
+        let _ = inner.file.sync_data().await;
+
+        let archive = self.path.with_extension("log.1");
+        if let Err(e) = tokio::fs::rename(&self.path, &archive).await {
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %e,
+                "Emergency WAL rotation rename failed — continuing on the live file"
+            );
+            return;
+        }
+
+        match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .await
+        {
+            Ok(new_file) => {
+                inner.file = new_file;
+                inner.bytes_written = 0;
+                tracing::warn!(
+                    archive = %archive.display(),
+                    "Emergency WAL rotated (size cap hit). Older archive overwritten — \
+                     prolonged primary-WAL outage detected, investigate disk health."
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    path = %self.path.display(),
+                    error = %e,
+                    "Emergency WAL rotation: failed to reopen fresh file. \
+                     Subsequent appends will fail until disk recovers."
+                );
+                // Best we can do — leave inner.file pointing at the closed
+                // (post-rename) file. Subsequent writes will Err and the
+                // ledger's failure counter advances toward fail-close.
+            }
+        }
     }
 }
 
@@ -1581,4 +1681,119 @@ impl Ledger {
 pub struct RecoveryReport {
     pub pending_found: u64,
     pub expired_marked: u64,
+}
+
+#[cfg(test)]
+mod emergency_wal_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn synthetic_event(idx: u32) -> GVMEvent {
+        GVMEvent {
+            event_id: format!("evt-{idx:08x}"),
+            trace_id: "trace-test".to_string(),
+            parent_event_id: None,
+            agent_id: "test".to_string(),
+            tenant_id: None,
+            session_id: "s".to_string(),
+            timestamp: chrono::Utc::now(),
+            operation: "test.op".to_string(),
+            resource: crate::types::ResourceDescriptor::default(),
+            context: std::collections::HashMap::new(),
+            transport: None,
+            decision: "Allow".to_string(),
+            decision_source: "test".to_string(),
+            matched_rule_id: None,
+            enforcement_point: "test".to_string(),
+            status: crate::types::EventStatus::Confirmed,
+            payload: crate::types::PayloadDescriptor::default(),
+            nats_sequence: None,
+            event_hash: None,
+            llm_trace: None,
+            default_caution: false,
+            config_integrity_ref: None,
+            operation_descriptor: None,
+        }
+    }
+
+    /// Verifies the EmergencyWAL rotates when the live file would exceed
+    /// `max_bytes`, that exactly one archive segment is kept, and that
+    /// the live file is empty after rotation. Without this guard, a
+    /// prolonged primary-WAL outage would fill disk uncapped (GAP-5).
+    #[tokio::test]
+    async fn emergency_wal_rotates_at_size_cap() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("wal_emergency.log");
+
+        // Open with a tiny cap so a few small events trigger rotation.
+        let wal = EmergencyWAL::open(&path).await.expect("open");
+        let cap_bytes = 1024u64;
+        // Override the cap on the constructed instance via the field
+        // — exposed only for tests; production uses DEFAULT_*.
+        let mut wal = wal;
+        wal.max_bytes = cap_bytes;
+
+        // Write enough events to cross the cap at least once.
+        // Each serialized event is roughly 600-800 bytes.
+        for i in 0..5u32 {
+            wal.append(&synthetic_event(i)).await.expect("append");
+        }
+
+        let live_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            live_size <= cap_bytes,
+            "live file must stay under cap after rotation, got {} > {}",
+            live_size,
+            cap_bytes
+        );
+
+        let archive = path.with_extension("log.1");
+        assert!(
+            archive.exists(),
+            "archive segment {} must exist after rotation",
+            archive.display()
+        );
+        let archive_size = std::fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
+        assert!(archive_size > 0, "archive segment should hold the rotated lines");
+
+        // Write more — only ONE archive segment must exist (older overwritten).
+        for i in 5..10u32 {
+            wal.append(&synthetic_event(i)).await.expect("append");
+        }
+        // No `.2` — design choice (no merge-back path warrants more).
+        let extra = path.with_extension("log.2");
+        assert!(
+            !extra.exists(),
+            "EmergencyWAL keeps only one archive segment, found {}",
+            extra.display()
+        );
+    }
+
+    /// Re-opening an existing emergency WAL must seed the byte counter
+    /// from the on-disk size so subsequent appends respect the cap.
+    /// Otherwise a daemon restart on a half-full file would let the
+    /// next session blow past the limit unbounded.
+    #[tokio::test]
+    async fn emergency_wal_byte_counter_seeded_from_disk() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("wal_emergency.log");
+
+        // Pre-populate the file beyond the cap.
+        std::fs::write(&path, vec![b'x'; 2000]).expect("seed file");
+
+        // Open with a small cap.
+        let wal = EmergencyWAL::open(&path).await.expect("open");
+        let mut wal = wal;
+        wal.max_bytes = 1024;
+
+        // First append should immediately trigger rotation since the seeded
+        // counter (2000) already exceeds the cap (1024).
+        wal.append(&synthetic_event(42)).await.expect("append");
+
+        let archive = path.with_extension("log.1");
+        assert!(
+            archive.exists(),
+            "rotation must fire on first append when re-opened above cap"
+        );
+    }
 }

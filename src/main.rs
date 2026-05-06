@@ -542,6 +542,26 @@ async fn main() {
         tracing::info!("DNS governance disabled (--no-dns-governance or dns.enabled=false)");
     }
 
+    // Spawn the pending-approvals sweeper before any request can reach
+    // the proxy handler. The sweeper is defense-in-depth against a
+    // narrow cancellation race between `insert` and the `ApprovalGuard`
+    // RAII; see `proxy::spawn_pending_approval_sweeper` doc comment.
+    gvm_proxy::proxy::spawn_pending_approval_sweeper(
+        state.pending_approvals.clone(),
+        state.ic3_approval_timeout_secs,
+    );
+
+    // Spawn the sandbox-metadata TTL sweeper (GAP-12) so per-sandbox
+    // CA + TLS-bundle entries don't accumulate unbounded when a parent
+    // process dies before its `DELETE /gvm/sandbox/{id}` runs and
+    // `gvm cleanup` is never invoked. Default 6h TTL — override via
+    // `GVM_SANDBOX_METADATA_TTL_SECS`.
+    let sandbox_ttl_secs: u64 = std::env::var("GVM_SANDBOX_METADATA_TTL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6 * 60 * 60);
+    gvm_proxy::proxy::spawn_sandbox_metadata_sweeper(state.clone(), sandbox_ttl_secs);
+
     // Clone state for CONNECT handler before moving into axum router
     let connect_state = state.clone();
 

@@ -968,6 +968,23 @@ async fn main() -> anyhow::Result<()> {
                                         report.orphan_veths_swept
                                     );
                                 }
+                                // Notify the running proxy (if any) to drop
+                                // its in-memory CA + TLS bundle for each
+                                // dead sandbox. Best-effort: a missing
+                                // proxy or revoke failure is logged but
+                                // doesn't fail the cleanup command.
+                                if !report.revoked_sandbox_ids.is_empty() {
+                                    let revoked = revoke_sandboxes_on_proxy(
+                                        &report.revoked_sandbox_ids,
+                                    )
+                                    .await;
+                                    if revoked > 0 {
+                                        eprintln!(
+                                            "  \u{2713} {} sandbox CA(s) revoked from running proxy",
+                                            revoked
+                                        );
+                                    }
+                                }
                                 eprintln!("Done. All runtime resources released.");
                                 eprintln!(
                                     "Persistent data preserved in data/ (wal.log, proxy.log, mitm-ca.pem)."
@@ -1286,4 +1303,62 @@ fn run_stop() -> anyhow::Result<()> {
     );
     eprintln!();
     Ok(())
+}
+
+/// Best-effort `DELETE /gvm/sandbox/{id}` for each cleaned sandbox.
+///
+/// `gvm cleanup` removes filesystem + iptables + cgroup state for dead
+/// sandboxes, but the running proxy still holds per-sandbox CAs and
+/// TLS server-config caches in memory. Without this notify the proxy
+/// keeps stale entries until restart — under heavy churn this is an
+/// unbounded RAM leak (gap GAP-13 in the cleanup audit).
+///
+/// Behaviour:
+///   - Resolve admin URL from default proxy address (port 9090).
+///   - Send each DELETE with a 2s per-request timeout.
+///   - 404 / connection-refused are NOT errors — they mean no proxy is
+///     running, which is fine for the offline-cleanup case.
+///   - Returns the count that succeeded for the operator-facing summary.
+#[cfg(target_os = "linux")]
+async fn revoke_sandboxes_on_proxy(sandbox_ids: &[String]) -> usize {
+    use crate::ui::{RESET, YELLOW};
+    use std::time::Duration;
+    let proxy_url =
+        std::env::var("GVM_PROXY_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+    let admin_url = run::derive_admin_url(&proxy_url);
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    let mut succeeded = 0usize;
+    for sid in sandbox_ids {
+        let url = format!("{}/gvm/sandbox/{}", admin_url.trim_end_matches('/'), sid);
+        match client.delete(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                succeeded += 1;
+            }
+            Ok(resp) => {
+                // 404 = no such sandbox in the proxy's registry. That's
+                // expected when the proxy was restarted after the
+                // sandbox crashed but before `gvm cleanup` ran.
+                if resp.status().as_u16() != 404 {
+                    eprintln!(
+                        "  {YELLOW}\u{26a0}{RESET} sandbox revoke {} returned HTTP {}",
+                        sid,
+                        resp.status()
+                    );
+                }
+            }
+            Err(_) => {
+                // Connection refused / timeout — proxy not running.
+                // First failure is enough to know; bail without
+                // spamming the operator with N identical errors.
+                return succeeded;
+            }
+        }
+    }
+    succeeded
 }
