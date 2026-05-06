@@ -102,6 +102,12 @@ struct ReplayReport {
     /// Total number of changes (may exceed `changes.len()` when
     /// truncated for human output).
     total_changes: usize,
+    /// Events whose `timestamp` field couldn't be parsed as RFC3339.
+    /// In non-strict mode (default) these are skipped from the
+    /// proposed-decision count and surfaced here so the operator can
+    /// see how much of the WAL fell back. Strict mode aborts the run
+    /// the moment one is encountered.
+    timestamp_missing: usize,
 }
 
 const MAX_CHANGE_SAMPLES: usize = 50;
@@ -117,6 +123,12 @@ enum EventClass {
     NotAnEvent,
     /// A system event (config_load, sandbox.launch) with no `transport`.
     SystemEvent,
+    /// A request event whose `timestamp` field couldn't be parsed as
+    /// RFC3339. `strict` mode treats this as a hard error (exit 1);
+    /// non-strict mode falls back to `Utc::now()` and counts the event
+    /// as `timestamp_fallback`. The event_id is surfaced so the
+    /// operator can locate it in the WAL.
+    MissingTimestamp { event_id: String },
     /// A classified request event with original + proposed verdicts.
     Classified {
         method: String,
@@ -177,12 +189,29 @@ fn classify_one(srr: &gvm_proxy::srr::NetworkSRR, value: &serde_json::Value) -> 
     // `Utc::now()` here would silently flip "biz-hours-only allow"
     // to/from "always allow" depending on when the operator runs the
     // report — a critical determinism break for audit replay.
+    //
+    // When the timestamp can't be parsed we surface it as a distinct
+    // `EventClass::MissingTimestamp`. The caller decides whether to
+    // (a) fall back to `Utc::now()` (legacy behaviour, non-strict mode)
+    // or (b) abort the entire replay run (strict mode). We never silently
+    // substitute here — keeping the determinism break visible at the
+    // single chokepoint that controls it.
     let event_timestamp = value
         .get("timestamp")
         .and_then(|v| v.as_str())
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .unwrap_or_else(chrono::Utc::now);
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+    let event_timestamp = match event_timestamp {
+        Some(ts) => ts,
+        None => {
+            let event_id = value
+                .get("event_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<no-event_id>")
+                .to_string();
+            return EventClass::MissingTimestamp { event_id };
+        }
+    };
 
     // `body=None` — payload-rule matchers skip without firing (the WAL
     // doesn't store the request body; payload-deny rules can't replay).
@@ -198,7 +227,13 @@ fn classify_one(srr: &gvm_proxy::srr::NetworkSRR, value: &serde_json::Value) -> 
     }
 }
 
-pub fn run(wal_path: &str, rules_path: &str, emit_json: bool, limit: usize) -> Result<()> {
+pub fn run(
+    wal_path: &str,
+    rules_path: &str,
+    emit_json: bool,
+    limit: usize,
+    strict: bool,
+) -> Result<()> {
     // 1. Load proposed SRR. Reuses the production loader, so any
     //    parse error here means the ruleset wouldn't have started
     //    the proxy either — exactly the early-warning we want.
@@ -219,6 +254,7 @@ pub fn run(wal_path: &str, rules_path: &str, emit_json: bool, limit: usize) -> R
         proposed: DecisionCounts::default(),
         changes: Vec::new(),
         total_changes: 0,
+        timestamp_missing: 0,
     };
 
     for line in content.lines() {
@@ -234,6 +270,28 @@ pub fn run(wal_path: &str, rules_path: &str, emit_json: bool, limit: usize) -> R
             EventClass::SystemEvent => {
                 report.events_skipped += 1;
                 continue;
+            }
+            EventClass::MissingTimestamp { event_id } => {
+                if strict {
+                    // Strict mode: any unparseable timestamp aborts the
+                    // entire run with a non-zero exit. Use this in CI /
+                    // compliance reports where a silent fallback would
+                    // turn time-conditioned rules into "evaluated against
+                    // current wall-clock" — the determinism property the
+                    // audit chain exists to preserve.
+                    anyhow::bail!(
+                        "replay --strict: event {} has no parseable RFC3339 `timestamp` \
+                         field. Time-conditioned rules cannot be replayed deterministically \
+                         without it. Re-run without --strict to fall back to Utc::now() \
+                         on missing timestamps (NOT recommended for compliance reports).",
+                        event_id
+                    );
+                }
+                // Non-strict: count it and skip. Don't quietly run the
+                // event through `Utc::now()` — that's the silent
+                // determinism break we explicitly designed away.
+                report.timestamp_missing += 1;
+                report.events_skipped += 1;
             }
             EventClass::Classified {
                 method,
@@ -535,6 +593,7 @@ mod tests {
             proposed: DecisionCounts::default(),
             changes: Vec::new(),
             total_changes: 0,
+            timestamp_missing: 0,
         };
         for i in 0..(MAX_CHANGE_SAMPLES + 5) {
             report.total_changes += 1;
@@ -550,5 +609,77 @@ mod tests {
         }
         assert_eq!(report.changes.len(), MAX_CHANGE_SAMPLES);
         assert_eq!(report.total_changes, MAX_CHANGE_SAMPLES + 5);
+    }
+
+    #[test]
+    fn classify_one_reports_missing_timestamp_distinctly() {
+        // The replay determinism property hinges on `event.timestamp`
+        // being parseable for every classified event. Earlier code
+        // silently fell back to `Utc::now()` when parse failed —
+        // turning every time-conditioned rule into "evaluated against
+        // the operator's wall-clock at replay time", the exact
+        // non-determinism the audit chain was designed to prevent.
+        //
+        // `classify_one` now surfaces missing timestamps as a separate
+        // EventClass variant. Strict mode aborts the run; non-strict
+        // mode counts them. This test pins the variant boundary so a
+        // future "let me just default it to now()" patch can't bring
+        // back the silent fallback.
+        let srr = srr_from_inline(
+            r#"
+            [[rules]]
+            method = "GET"
+            pattern = "{any}"
+            decision = { type = "Allow" }
+            description = "any-allow"
+        "#,
+        );
+
+        let event_no_ts = serde_json::json!({
+            "event_id": "evt-no-ts",
+            "agent_id": "test",
+            // intentionally omit "timestamp"
+            "transport": { "method": "GET", "host": "h.example.com", "path": "/" },
+            "decision": "Allow",
+            "operation": "unknown",
+        });
+        match classify_one(&srr, &event_no_ts) {
+            EventClass::MissingTimestamp { event_id } => {
+                assert_eq!(event_id, "evt-no-ts");
+            }
+            other => panic!(
+                "missing timestamp must surface as MissingTimestamp, got {:?}",
+                std::any::type_name_of_val(&other)
+            ),
+        }
+
+        // Unparseable timestamp string also classifies as missing —
+        // the parser returns None and we don't substitute now().
+        let event_bad_ts = serde_json::json!({
+            "event_id": "evt-bad-ts",
+            "agent_id": "test",
+            "timestamp": "not an RFC3339 string",
+            "transport": { "method": "GET", "host": "h.example.com", "path": "/" },
+            "decision": "Allow",
+            "operation": "unknown",
+        });
+        assert!(matches!(
+            classify_one(&srr, &event_bad_ts),
+            EventClass::MissingTimestamp { .. }
+        ));
+
+        // Parseable timestamp classifies normally.
+        let event_ok = serde_json::json!({
+            "event_id": "evt-ok",
+            "agent_id": "test",
+            "timestamp": "2026-05-05T04:00:00Z",
+            "transport": { "method": "GET", "host": "h.example.com", "path": "/" },
+            "decision": "Allow",
+            "operation": "unknown",
+        });
+        assert!(matches!(
+            classify_one(&srr, &event_ok),
+            EventClass::Classified { .. }
+        ));
     }
 }

@@ -422,6 +422,20 @@ enum Commands {
         /// sample. 0 = all events.
         #[arg(long, default_value_t = 0)]
         limit: usize,
+        /// Treat any event missing a parseable RFC3339 `timestamp`
+        /// field as a hard error (exit 1) instead of silently
+        /// substituting `Utc::now()`.
+        ///
+        /// Use this when the replay output is going into a regression
+        /// gate / CI / compliance report — the silent fallback turns
+        /// time-conditioned rules into "evaluated against current
+        /// wall-clock", which is the exact non-determinism this whole
+        /// audit chain exists to prevent. Default off because
+        /// pre-v3 WAL events from before timestamp-was-Merkle-anchored
+        /// can legitimately lack the field; strict mode guards new
+        /// runs without breaking historical replay.
+        #[arg(long)]
+        strict: bool,
     },
 
     /// Show proxy status: health, SRR rules, WAL state.
@@ -1097,8 +1111,9 @@ async fn main() -> anyhow::Result<()> {
             rules,
             json,
             limit,
+            strict,
         } => {
-            replay::run(&wal, &rules, json, limit)?;
+            replay::run(&wal, &rules, json, limit, strict)?;
         }
 
         Commands::Status { proxy, json } => {
