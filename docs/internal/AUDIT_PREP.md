@@ -117,7 +117,7 @@ The adversary CANNOT (by sandbox guarantee):
 | JWT signing | HMAC-SHA256 | `hmac`, `sha2` | ✅ alg:none, RS256 confusion, future iat all rejected with tests |
 | Vault sealing | AES-256-GCM (12-byte random nonce) | `aes-gcm` | ✅ tampered/truncated ciphertext, nonce uniqueness tested |
 | Audit-chain hashing | SHA-256 with domain-separation prefix | `sha2` | ✅ prefix per leaf type prevents collision across leaf classes |
-| Anchor signing | Ed25519 (optional, behind config flag) | `ed25519-dalek` | ⚠️ not yet load-tested at scale |
+| Anchor signing | Ed25519 (optional via `[anchor] enabled = true`) | `ed25519-dalek` | ✅ wired into `Ledger::with_config_and_signer`; fail-close on missing/malformed key file; `tests/anchor_signing.rs` covers round-trip verify; not yet load-tested at scale |
 | Sandbox CA | ECDSA P-256, RAM-only, 8h TTL | `rcgen` | ✅ per-sandbox isolation tested |
 | Random | `OsRng` everywhere | `rand_core` | — |
 
@@ -125,9 +125,16 @@ Key handling:
 - All long-lived keys are wiped via `zeroize::ZeroizeOnDrop` on drop.
 - `GVM_SECRETS_KEY` is read once at startup, held in `JwtSecret`
   with `zeroize` impl, never logged, never serialized.
-- Anchor signing key (when configured) lives in
-  `data/anchor.{ed25519,priv}` — operator must provision file mode
-  0600 owned by the proxy uid.
+- Anchor signing key, when `[anchor] enabled = true`, lives at the
+  operator-chosen `key_path` (production template recommends
+  `/etc/gvm/anchor.key`, mode 0600, owned by the proxy uid). The
+  matching public key is at `<key_path>.pub` (mode 0644). Both
+  files are produced atomically by `gvm anchor keygen --out
+  <path> --key-id <label>`, which embeds `key_id` in both files
+  so a verifier can map signature → public key without out-of-band
+  metadata. Loss of the secret forces rotation to a new `key_id`
+  (existing signed anchors stay verifiable; new anchors require
+  the auditor to add the new public key to their registry).
 
 ---
 
@@ -156,6 +163,8 @@ the fix.
 
 | Fix | Commit | Test |
 |-----|--------|------|
+| Anchor signing wired up — runtime had a `SelfSignedSigner` impl + `with_config_and_signer` constructor but `main.rs` never called it, so production anchors landed unsigned. Added `[anchor]` config section, `gvm anchor keygen` CLI, fail-close on missing/malformed key file, AUDIT_PREP/proxy.production docs aligned with reality. | (this commit) | `crates/gvm-cli/src/anchor.rs` 4 unit tests (keygen round-trip, refuse-clobber, key_id validation); `tests/anchor_signing.rs` covers signer round-trip |
+| NATS / Redis ghost integrations advertised in `proxy.toml` but the runtime only emitted a "NATS publish (stub)" debug line — never connected. Removed the config sections, struct fields, and event field; external streaming is now explicitly operator-managed (tail the WAL with rsync/fluentd/etc.) | `f3d274c` | All 800 workspace tests; backward-compat for legacy proxy.toml verified by `proxy_config_load_from_file` |
 | Concurrent veth slot allocation race — every `gvm run --sandbox` started its own atomic counter at zero, causing concurrent launches to all pick slot 0; 19/20 sandboxes silently lost network. | `fc6f7c3` | `scripts/multi-agent-load.sh --agents 20` (verified on EC2 — 0 missed transport events) |
 | `--contained` advertised in default CLI surface despite documented EXPERIMENTAL status | `84ace18` | `cargo build` produces binary that bails on `--contained` with a clear error; `cargo build --features contained` opts in |
 | MITM JWT bypass — HTTPS path skipped JWT verification | `ba47501` | `tests/multi_agent_isolation.rs::mitm_path_enforces_jwt` |

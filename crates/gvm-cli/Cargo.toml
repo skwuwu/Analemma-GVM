@@ -63,6 +63,11 @@ glob = "0.3"
 libc = "0.2"
 ratatui = "0.30"
 crossterm = "0.29"
+# Used only by `gvm anchor keygen` for Ed25519 keypair generation.
+# Same crate the proxy already depends on (transitively via gvm-proxy
+# anchor verification path), so this doesn't grow the dep tree.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
 
 [dev-dependencies]
 # `tempfile` is only used by `replay::tests::srr_from_inline` — keeping

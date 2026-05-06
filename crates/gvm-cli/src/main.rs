@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod anchor;
 mod approve;
 mod audit;
 mod check;
@@ -505,6 +506,66 @@ enum Commands {
     Dns {
         #[command(subcommand)]
         action: DnsAction,
+    },
+
+    /// Manage the Ed25519 anchor signing key. The proxy uses this
+    /// key to sign every WAL anchor record so external auditors
+    /// can verify the chain's origin without trusting the
+    /// operator's runtime. The keypair is generated on the
+    /// operator host and never leaves it; only the public key
+    /// (`.pub` file) is shared with auditors.
+    ///
+    ///   gvm anchor keygen --out /etc/gvm/anchor.key --key-id gvm-prod-1
+    Anchor {
+        #[command(subcommand)]
+        action: AnchorAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AnchorAction {
+    /// Generate a new Ed25519 keypair for anchor signing. Writes
+    /// the secret to `--out` (mode 0600) and the matching public
+    /// key to `<out>.pub` (mode 0644). Both files are TOML; the
+    /// secret file is consumed by the proxy at startup, the
+    /// `.pub` file is what an external auditor receives.
+    ///
+    /// **Operator checklist after running this:**
+    ///   1. Set `[anchor] enabled = true` and `key_path = "<out>"`
+    ///      in proxy.toml.
+    ///   2. Distribute `<out>.pub` to your auditor via your normal
+    ///      key-distribution channel (signed email, internal PKI,
+    ///      whatever your trust model uses).
+    ///   3. BACK UP `<out>` somewhere encrypted-at-rest. If the
+    ///      file is lost, every signed anchor produced under this
+    ///      key remains verifiable, but no NEW anchors can be
+    ///      signed under the same `key_id` — you'd have to rotate
+    ///      to a new key_id and have auditors trust both.
+    Keygen {
+        /// Path to write the secret key file. The directory must
+        /// exist; the parent permissions should already enforce
+        /// operator-only access (e.g. /etc/gvm/ owned root:root
+        /// mode 0700).
+        #[arg(long)]
+        out: String,
+
+        /// Operator-assigned label embedded in every signature
+        /// produced by this key. Auditors look up the
+        /// `VerifyingKey` for this `key_id` in their registry to
+        /// know "which key signed which anchor". Use a stable,
+        /// human-readable label like `gvm-prod-1` or
+        /// `acme-finance-2026q2`. Once anchors are signed under a
+        /// `key_id`, retiring it requires distributing the new
+        /// public key to auditors — pick something durable.
+        #[arg(long)]
+        key_id: String,
+
+        /// Overwrite an existing file. By default the command
+        /// refuses to clobber, because losing a key file mid-life
+        /// invalidates every prior anchor signature for that
+        /// key_id (see backup checklist above).
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1170,6 +1231,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::Dns { action } => match action {
             DnsAction::Status { proxy, json } => {
                 dns_inspect::run_status(&proxy, json).await?;
+            }
+        },
+
+        Commands::Anchor { action } => match action {
+            AnchorAction::Keygen { out, key_id, force } => {
+                anchor::keygen(&out, &key_id, force)?;
             }
         },
     }

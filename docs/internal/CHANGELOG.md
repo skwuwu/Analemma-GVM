@@ -72,6 +72,96 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
+### 2026-05-07: Activate Ed25519 anchor signing (Strategic-5)
+
+**What changed:**
+
+The runtime had a working `SelfSignedSigner` (Ed25519 via
+`ed25519-dalek`), a `Ledger::with_config_and_signer` constructor,
+and round-trip tests in `tests/anchor_signing.rs` — but `main.rs`
+only called `Ledger::with_config`, which defaulted to `NoopSigner`.
+So production anchors landed unsigned despite AUDIT_PREP listing
+Ed25519 anchor signing in the crypto inventory.
+
+Closing the gap:
+
+1. **`src/config.rs`** adds `AnchorSigningConfig { enabled,
+   key_path }` and `AnchorKeyFile { key_id, algorithm,
+   secret_hex, created_at }`. The latter has `load(path)` that
+   validates algorithm == "ed25519", non-empty key_id, 64-char
+   hex secret. Errors are intentionally specific so operators
+   diagnose without dumping secret bytes.
+
+2. **`src/main.rs`** wires `SelfSignedSigner::from_secret` into
+   `Ledger::with_config_and_signer` when the config has
+   `[anchor] enabled = true`. **Fail-close**: every error path
+   (missing key_path, missing file, bad hex, wrong algorithm,
+   wrong length, etc.) prints a specific message and exits with
+   code 1. The alternative — silently downgrading to NoopSigner
+   when an operator turned signing on — would mean unsigned
+   anchors land in the WAL exactly when the operator thought
+   they were getting signed audit. We removed that anti-pattern
+   in the NATS/Redis cleanup; we are not reintroducing it here.
+
+3. **`gvm anchor keygen`** (new CLI subcommand,
+   `crates/gvm-cli/src/anchor.rs`) generates a fresh Ed25519
+   keypair, writes the secret to `--out` (mode 0600) and the
+   public key to `<out>.pub` (mode 0644), both as TOML with
+   `key_id` embedded in the file (not just in the filename).
+   Refuses to clobber an existing file unless `--force` is
+   passed (overwriting invalidates every prior anchor signature
+   for that `key_id`). Prints next-steps + the public hex so the
+   operator immediately has what they need to update proxy.toml
+   and brief their auditor. 4 unit tests cover round-trip
+   keygen → load → derive public, refuse-clobber, empty key_id,
+   whitespace key_id.
+
+4. **`config/proxy.production.toml.example`** gains an `[anchor]`
+   section with the operator checklist (file mode, encryption-at-rest,
+   backup hygiene, no-git, public-key distribution, rotation
+   runbook). **`docs/internal/AUDIT_PREP.md`** crypto-inventory
+   row is updated from "⚠️ not yet load-tested" to "✅ wired into
+   `Ledger::with_config_and_signer`; fail-close on missing/malformed
+   key file" — the doc and runtime now agree.
+
+**Why:**
+
+CLAUDE.md "Never claim more than implemented." The audit prep doc
+listed Ed25519 anchor signing in the crypto inventory while the
+binary shipped with NoopSigner. That's the same false-promise
+class as the NATS/Redis ghost feature we just removed; both ship
+together as the "honest about what we do" pass.
+
+The operational design (TOML key file with key_id-in-file, fail-
+close on misconfig, separate `.pub` for auditors, refuse-clobber
+default on keygen, embedded backup checklist) follows the
+reviewer's design critique:
+- key_id is the verifier-registry lookup key, must travel with
+  the file, not just in the filename.
+- enabled=true with bad key MUST refuse startup, never silently
+  downgrade.
+- Auditor needs the public key as a distinct artifact.
+
+**Affected files:**
+
+- `src/config.rs` (+`AnchorSigningConfig`, `AnchorKeyFile`)
+- `src/main.rs` (signer wiring + fail-fast paths)
+- `crates/gvm-cli/src/anchor.rs` (NEW — keygen handler + 4 tests)
+- `crates/gvm-cli/src/main.rs` (`Anchor` command + dispatch)
+- `crates/gvm-cli/Cargo.toml` (+`ed25519-dalek`, `rand`)
+- `config/proxy.production.toml.example` (+`[anchor]` section)
+- `docs/internal/AUDIT_PREP.md` (crypto inventory + key-handling
+  notes corrected; `Recently fixed` table appended)
+
+**Risk:**
+
+Default deployments are unchanged: `[anchor]` defaults to absent →
+NoopSigner with an explicit "ANCHOR SIGNING DISABLED" log line at
+startup. Existing operators upgrade with no action required.
+Operators who want signed anchors run `gvm anchor keygen` once,
+edit two lines of proxy.toml, and restart. 804 workspace tests
+pass; fmt + clippy clean.
+
 ### 2026-05-07: Drop NATS / Redis ghost integrations from runtime + config
 
 **What changed:**

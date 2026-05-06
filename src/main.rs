@@ -226,9 +226,82 @@ async fn main() {
         max_wal_segments: config.wal.max_wal_segments,
         ..Default::default()
     };
-    let ledger = Ledger::with_config(
+
+    // Anchor signing: load operator-supplied Ed25519 key when
+    // `[anchor] enabled = true`. Fail-close — if config says
+    // signed-anchors-required but the key is missing, malformed,
+    // or wrong-algorithm, we REFUSE to start. The alternative is
+    // a silent downgrade to NoopSigner, which would mean an operator
+    // who turned signing on actually got unsigned anchors. That's
+    // exactly the kind of false-promise we removed in the
+    // NATS/Redis cleanup; we will not reintroduce it here.
+    let anchor_signer: std::sync::Arc<dyn gvm_proxy::sign::AnchorSigner> = match config
+        .anchor
+        .as_ref()
+    {
+        Some(cfg) if cfg.enabled => {
+            let key_path = cfg.key_path.as_deref().unwrap_or_else(|| {
+                eprintln!();
+                eprintln!("  ERROR: [anchor] enabled = true but key_path is missing.");
+                eprintln!("  Either:");
+                eprintln!("    a) Set key_path = \"/etc/gvm/anchor.key\" (after running");
+                eprintln!("       `gvm anchor keygen --out /etc/gvm/anchor.key --key-id <label>`)");
+                eprintln!("    b) Set enabled = false to run with unsigned anchors (NOT recommended for production)");
+                eprintln!();
+                std::process::exit(1);
+            });
+            let key_file = match gvm_proxy::config::AnchorKeyFile::load(Path::new(key_path)) {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!();
+                    eprintln!("  ERROR: failed to load anchor signing key.");
+                    eprintln!("  Path: {}", key_path);
+                    eprintln!("  Detail: {}", e);
+                    eprintln!();
+                    eprintln!("  Generate one with:");
+                    eprintln!(
+                        "    gvm anchor keygen --out {} --key-id <stable-label>",
+                        key_path
+                    );
+                    eprintln!();
+                    std::process::exit(1);
+                }
+            };
+            let secret_bytes = match key_file.secret_bytes() {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!();
+                    eprintln!("  ERROR: anchor key file decoded but secret material is invalid.");
+                    eprintln!("  Detail: {}", e);
+                    eprintln!();
+                    std::process::exit(1);
+                }
+            };
+            let key_id = key_file.key_id.clone();
+            let signer =
+                gvm_proxy::sign::SelfSignedSigner::from_secret(key_id.clone(), secret_bytes);
+            let pubkey_hex = hex::encode(signer.verifying_key().to_bytes());
+            tracing::info!(
+                key_id = %key_id,
+                pubkey_hex = %pubkey_hex,
+                "Ed25519 anchor signing ENABLED — every WAL anchor will carry a SelfSigned signature"
+            );
+            std::sync::Arc::new(signer)
+        }
+        _ => {
+            tracing::info!(
+                "Anchor signing DISABLED — anchors recorded without signatures \
+                 (WAL Merkle integrity still detects internal tamper). \
+                 Production deployments should configure [anchor] enabled = true."
+            );
+            std::sync::Arc::new(gvm_proxy::sign::NoopSigner)
+        }
+    };
+
+    let ledger = Ledger::with_config_and_signer(
         Path::new(&std::env::var("GVM_WAL_PATH").unwrap_or_else(|_| config.wal.path.clone())),
         wal_config,
+        anchor_signer,
     )
     .await
     .expect("Failed to initialize ledger");

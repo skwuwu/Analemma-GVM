@@ -130,6 +130,35 @@ secret_env = "GVM_JWT_SECRET"
 # CPU cost of more-frequent reissue.
 token_ttl_secs = 3600
 
+[anchor]
+# Ed25519 anchor signing — every WAL anchor record carries a
+# signature so external auditors can verify the chain originated
+# from a key your organization declared. Production deployments
+# SHOULD enable this. The proxy refuses to start if `enabled = true`
+# but the key file is missing/malformed/wrong-algorithm — fail-close
+# means an operator who turned signing on cannot accidentally end
+# up with unsigned anchors.
+#
+# To provision a key (run on the operator host, ONCE):
+#   sudo install -d -o gvm -g gvm -m 0700 /etc/gvm
+#   gvm anchor keygen --out /etc/gvm/anchor.key --key-id gvm-prod-1
+#
+# Then distribute /etc/gvm/anchor.key.pub to your auditor via your
+# normal trusted key-distribution channel. The .pub file is what
+# they use to verify; the secret never leaves this host.
+#
+# Operator checklist:
+#   [ ] /etc/gvm/anchor.key is 0600 and owned by the gvm runtime user
+#   [ ] /etc/gvm/anchor.key is on encrypted-at-rest storage (LUKS/EBS)
+#   [ ] /etc/gvm/anchor.key is backed up encrypted (NEVER plaintext)
+#   [ ] /etc/gvm/anchor.key is NOT in any git repo
+#   [ ] /etc/gvm/anchor.key.pub has been delivered to the auditor
+#   [ ] Auditor's verifier registry maps key_id -> public_hex
+#   [ ] Rotation runbook: how to mint a new key_id, distribute new
+#       .pub, atomically swap the key file, document cutover time
+enabled = true
+key_path = "/etc/gvm/anchor.key"
+
 [shadow]
 # Shadow Mode: requires MCP-style intent declaration before outbound
 # requests. Production SHOULD run "strict" or "cautious":
