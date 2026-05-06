@@ -1,6 +1,7 @@
 use crate::types::EnforcementDecision;
 use anyhow::{Context, Result};
 use base64::Engine as _;
+use chrono::{DateTime, Timelike, Utc};
 use gvm_types::split_host_port;
 use regex::Regex;
 use serde::Deserialize;
@@ -32,6 +33,28 @@ pub struct NetworkRuleConfig {
     pub description: Option<String>,
     /// Human-readable label (used in warnings and logs)
     pub label: Option<String>,
+    /// Optional gating condition. When set, the rule only fires if the
+    /// condition matches against the request's evaluation timestamp.
+    /// Today only `time_window` is defined; future variants land here.
+    pub condition: Option<RuleConditionConfig>,
+}
+
+/// TOML-side condition config. Tagged enum; future variants (e.g.,
+/// `request_count`, `header_value`) extend by adding new `kind` values.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RuleConditionConfig {
+    /// Time-of-day window in a given timezone.
+    /// `window` is `"HH:MM-HH:MM"`. Cross-midnight ranges (e.g., `"22:00-06:00"`)
+    /// are allowed. `tz` is an IANA name (default `"UTC"`).
+    /// `outside = true` inverts the match (fires when *outside* the window).
+    TimeWindow {
+        window: String,
+        #[serde(default)]
+        tz: Option<String>,
+        #[serde(default)]
+        outside: bool,
+    },
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -72,6 +95,130 @@ pub struct NetworkRule {
     /// True if this rule is a catch-all (method="*" + pattern="{any}").
     /// Catch-all matches are flagged as default-to-caution for the CLI.
     pub is_catch_all: bool,
+    /// Optional compiled gating condition. None = unconditional (legacy
+    /// behaviour). Some(_) = rule fires only when the condition matches
+    /// against the evaluation timestamp.
+    pub condition: Option<Condition>,
+}
+
+/// Compiled gating condition. Pure function of (rule, evaluation timestamp).
+///
+/// **Determinism contract**: evaluation must be reproducible from the WAL.
+/// `event.timestamp` is committed to the Merkle leaf in `compute_event_hash`,
+/// so an auditor running `gvm replay --wal` against the same rule set with
+/// `check_at(event.timestamp)` reproduces the producer's decision exactly,
+/// no system-clock dependence. This is the same audit guarantee that
+/// unconditional rules carry; the timestamp dependency adds no new trust
+/// assumption because the timestamp is already anchor-signed.
+#[derive(Clone, Debug)]
+pub enum Condition {
+    /// Time-of-day window match. Stored as minutes-from-midnight in the
+    /// rule's timezone. Cross-midnight is encoded by `start_min > end_min`.
+    TimeWindow {
+        /// Inclusive start, in minutes from midnight (0..1440).
+        start_min: u16,
+        /// Exclusive end, in minutes from midnight (0..1440).
+        end_min: u16,
+        /// Timezone the operator wrote the window in.
+        tz: chrono_tz::Tz,
+        /// If true, condition matches when the time is *outside* the window.
+        outside: bool,
+    },
+}
+
+impl Condition {
+    /// Evaluate the condition against an explicit timestamp. The caller
+    /// passes the evaluation time — `Utc::now()` for live traffic, or
+    /// `event.timestamp` for replay. No internal `now()` call.
+    pub fn matches(&self, now: DateTime<Utc>) -> bool {
+        match self {
+            Condition::TimeWindow {
+                start_min,
+                end_min,
+                tz,
+                outside,
+            } => {
+                let local = now.with_timezone(tz);
+                let mins = local.hour() * 60 + local.minute();
+                let mins = mins as u16;
+                let inside = if start_min <= end_min {
+                    // Same-day window: [start, end)
+                    mins >= *start_min && mins < *end_min
+                } else {
+                    // Cross-midnight window: [start, 24:00) ∪ [0:00, end)
+                    mins >= *start_min || mins < *end_min
+                };
+                inside != *outside
+            }
+        }
+    }
+}
+
+/// Parse a `"HH:MM-HH:MM"` window into `(start_min, end_min)` in
+/// minutes-from-midnight. Rejects malformed input — operator config
+/// errors fail fast at load.
+fn parse_time_window(window: &str) -> Result<(u16, u16)> {
+    let (start, end) = window
+        .split_once('-')
+        .with_context(|| format!("time window must be HH:MM-HH:MM, got '{}'", window))?;
+    let start_min = parse_hhmm(start.trim())
+        .with_context(|| format!("invalid window start '{}' in '{}'", start, window))?;
+    let end_min = parse_hhmm(end.trim())
+        .with_context(|| format!("invalid window end '{}' in '{}'", end, window))?;
+    if start_min == end_min {
+        anyhow::bail!(
+            "time window '{}' has zero duration (start equals end); \
+             use a non-empty range or omit the condition",
+            window
+        );
+    }
+    Ok((start_min, end_min))
+}
+
+fn parse_hhmm(s: &str) -> Result<u16> {
+    let (h, m) = s
+        .split_once(':')
+        .with_context(|| format!("expected HH:MM, got '{}'", s))?;
+    let h: u16 = h
+        .parse()
+        .with_context(|| format!("invalid hour '{}' in '{}'", h, s))?;
+    let m: u16 = m
+        .parse()
+        .with_context(|| format!("invalid minute '{}' in '{}'", m, s))?;
+    if h >= 24 {
+        anyhow::bail!("hour must be 0..23, got {}", h);
+    }
+    if m >= 60 {
+        anyhow::bail!("minute must be 0..59, got {}", m);
+    }
+    Ok(h * 60 + m)
+}
+
+/// Compile a TOML-side condition into the runtime form. Errors here
+/// fail config load — fail-fast over silent rule omission.
+fn compile_condition(cfg: &RuleConditionConfig) -> Result<Condition> {
+    match cfg {
+        RuleConditionConfig::TimeWindow {
+            window,
+            tz,
+            outside,
+        } => {
+            let (start_min, end_min) = parse_time_window(window)?;
+            let tz_name = tz.as_deref().unwrap_or("UTC");
+            let tz: chrono_tz::Tz = tz_name.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "unknown timezone '{}'. Use IANA names like 'Asia/Seoul', 'America/New_York', 'UTC'",
+                    tz_name
+                )
+            })?;
+            Ok(Condition::TimeWindow {
+                start_min,
+                end_min,
+                tz,
+                outside: *outside,
+            })
+        }
+    }
 }
 
 /// Result of an SRR check, including metadata about which rule matched.
@@ -200,6 +347,12 @@ impl NetworkSRR {
             let decision = parse_decision(&rule_cfg.decision)?;
             let (host_pattern, path_pattern) = parse_pattern(&rule_cfg.pattern);
 
+            // Pre-compile gating condition at load time (fail-fast on bad windows / tz)
+            let condition = match &rule_cfg.condition {
+                Some(c) => Some(compile_condition(c)?),
+                None => None,
+            };
+
             // Pre-compile path regex at load time (fail-fast on invalid patterns)
             let compiled_path_regex = match &rule_cfg.path_regex {
                 Some(pattern) => {
@@ -242,6 +395,7 @@ impl NetworkSRR {
                     payload_match: rule_cfg.payload_match.clone(),
                     max_body_bytes: rule_cfg.max_body_bytes.unwrap_or(65536),
                     is_catch_all,
+                    condition: condition.clone(),
                 });
             }
         }
@@ -323,6 +477,11 @@ impl NetworkSRR {
             let decision = parse_decision(&rule_cfg.decision)?;
             let (host_pattern, path_pattern) = parse_pattern(&rule_cfg.pattern);
 
+            let condition = match &rule_cfg.condition {
+                Some(c) => Some(compile_condition(c)?),
+                None => None,
+            };
+
             let compiled_path_regex = match &rule_cfg.path_regex {
                 Some(pattern) => {
                     const MAX_REGEX_LEN: usize = 10_000;
@@ -363,6 +522,7 @@ impl NetworkSRR {
                     payload_match: rule_cfg.payload_match.clone(),
                     max_body_bytes: rule_cfg.max_body_bytes.unwrap_or(65536),
                     is_catch_all,
+                    condition: condition.clone(),
                 });
             }
         }
@@ -516,12 +676,34 @@ impl NetworkSRR {
         }
     }
 
+    /// Check a request, using `Utc::now()` as the evaluation timestamp.
+    ///
+    /// For replay (`gvm replay --wal`), use [`check_at`] with `event.timestamp`
+    /// instead — that produces a deterministic decision recoverable from the
+    /// audit chain alone, with no system-clock dependence.
     pub fn check(
         &self,
         method: &str,
         host: &str,
         path: &str,
         body: Option<&[u8]>,
+    ) -> SrrCheckResult {
+        self.check_at(method, host, path, body, Utc::now())
+    }
+
+    /// Check a request at an explicit evaluation timestamp.
+    ///
+    /// `now` is the time used to evaluate any [`Condition`] gates on rules.
+    /// Producers pass `Utc::now()`; replay tools pass `event.timestamp`.
+    /// Time-conditioned rules whose condition does not match are skipped
+    /// (treated as if they did not match — fall through to the next rule).
+    pub fn check_at(
+        &self,
+        method: &str,
+        host: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        now: DateTime<Utc>,
     ) -> SrrCheckResult {
         // Normalize method: uppercase once here to match rule storage format.
         // Rules are stored as uppercase (line 135). HTTP methods from hyper are
@@ -551,6 +733,17 @@ impl NetworkSRR {
             // Host match
             if !match_host(&rule.host_pattern, &effective_host) {
                 continue;
+            }
+
+            // Gating condition: a time-window rule that doesn't match the
+            // evaluation timestamp falls through. Evaluated AFTER method/host
+            // (cheap) but BEFORE path/regex/payload (expensive) — minute-cost
+            // path is for rules that already passed the cheap filters and
+            // are about to do work.
+            if let Some(cond) = &rule.condition {
+                if !cond.matches(now) {
+                    continue;
+                }
             }
 
             // Path match: if path_regex is set, use regex; otherwise use prefix/exact match.
@@ -1778,6 +1971,313 @@ mod tests {
             !allow("a.demo:8888", "/x", &srr),
             "Suffix pattern with port must enforce port"
         );
+    }
+
+    // ── Condition: time_window ─────────────────────────────────────────
+    //
+    // Contract:
+    //  - Rules with `condition` only fire when the condition matches the
+    //    evaluation timestamp.
+    //  - `check_at(t)` is deterministic: same (rules, t) → same decision.
+    //    This is the audit-replay contract — `event.timestamp` is in the
+    //    Merkle leaf, so `verify_proof` can recompute the same decision.
+    //  - Cross-midnight windows ("22:00-06:00") work.
+    //  - `outside = true` inverts the match.
+    //  - Timezone is honoured (operator writes in local time).
+
+    fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .expect("test timestamp parses")
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn condition_time_window_inside_fires() {
+        let srr = srr_from_toml(
+            r#"
+            [[rules]]
+            method = "POST"
+            pattern = "api.bank.com/transfer/{any}"
+            decision = { type = "Deny", reason = "Wire transfer blocked outside biz hours" }
+            condition = { kind = "time_window", window = "09:00-18:00", tz = "UTC", outside = true }
+        "#,
+        );
+
+        // 03:00 UTC — outside business hours → condition matches (outside=true) → rule fires
+        let r = srr.check_at(
+            "POST",
+            "api.bank.com",
+            "/transfer/123",
+            None,
+            at("2026-05-05T03:00:00Z"),
+        );
+        assert!(
+            matches!(r.decision, EnforcementDecision::Deny { .. }),
+            "outside biz hours → deny, got {:?}",
+            r.decision
+        );
+
+        // 12:00 UTC — inside business hours → condition does NOT match → rule skipped
+        let r = srr.check_at(
+            "POST",
+            "api.bank.com",
+            "/transfer/123",
+            None,
+            at("2026-05-05T12:00:00Z"),
+        );
+        // Falls through to default-to-caution (300ms delay)
+        assert!(
+            matches!(r.decision, EnforcementDecision::Delay { milliseconds: 300 }),
+            "inside biz hours → fall-through to default, got {:?}",
+            r.decision
+        );
+    }
+
+    #[test]
+    fn condition_time_window_inverted_fires_only_outside() {
+        let srr = srr_from_toml(
+            r#"
+            [[rules]]
+            method = "POST"
+            pattern = "api.bank.com/transfer/{any}"
+            decision = { type = "Allow" }
+            condition = { kind = "time_window", window = "09:00-18:00" }
+        "#,
+        );
+
+        // 12:00 UTC — inside window → fires → Allow
+        let r = srr.check_at(
+            "POST",
+            "api.bank.com",
+            "/transfer/123",
+            None,
+            at("2026-05-05T12:00:00Z"),
+        );
+        assert!(matches!(r.decision, EnforcementDecision::Allow));
+
+        // 23:00 UTC — outside window → skipped → default-to-caution
+        let r = srr.check_at(
+            "POST",
+            "api.bank.com",
+            "/transfer/123",
+            None,
+            at("2026-05-05T23:00:00Z"),
+        );
+        assert!(matches!(
+            r.decision,
+            EnforcementDecision::Delay { milliseconds: 300 }
+        ));
+    }
+
+    #[test]
+    fn condition_cross_midnight_window() {
+        // "22:00-06:00" — overnight window, e.g. "deny during off-hours"
+        let srr = srr_from_toml(
+            r#"
+            [[rules]]
+            method = "POST"
+            pattern = "api.bank.com/transfer/{any}"
+            decision = { type = "Deny", reason = "After-hours transfer" }
+            condition = { kind = "time_window", window = "22:00-06:00" }
+        "#,
+        );
+
+        // 23:00 — inside window → deny
+        let r = srr.check_at(
+            "POST",
+            "api.bank.com",
+            "/transfer/x",
+            None,
+            at("2026-05-05T23:00:00Z"),
+        );
+        assert!(matches!(r.decision, EnforcementDecision::Deny { .. }));
+
+        // 02:00 — inside window (post-midnight half) → deny
+        let r = srr.check_at(
+            "POST",
+            "api.bank.com",
+            "/transfer/x",
+            None,
+            at("2026-05-05T02:00:00Z"),
+        );
+        assert!(matches!(r.decision, EnforcementDecision::Deny { .. }));
+
+        // 14:00 — outside window → fall through
+        let r = srr.check_at(
+            "POST",
+            "api.bank.com",
+            "/transfer/x",
+            None,
+            at("2026-05-05T14:00:00Z"),
+        );
+        assert!(matches!(
+            r.decision,
+            EnforcementDecision::Delay { milliseconds: 300 }
+        ));
+    }
+
+    #[test]
+    fn condition_timezone_is_honoured() {
+        // Operator writes "09:00-18:00 Asia/Seoul" (KST = UTC+9).
+        // 09:00 KST = 00:00 UTC, 18:00 KST = 09:00 UTC.
+        let srr = srr_from_toml(
+            r#"
+            [[rules]]
+            method = "POST"
+            pattern = "api.bank.com/transfer/{any}"
+            decision = { type = "Allow" }
+            condition = { kind = "time_window", window = "09:00-18:00", tz = "Asia/Seoul" }
+        "#,
+        );
+
+        // 03:00 UTC = 12:00 KST — INSIDE Seoul biz hours → Allow
+        let r = srr.check_at(
+            "POST",
+            "api.bank.com",
+            "/transfer/x",
+            None,
+            at("2026-05-05T03:00:00Z"),
+        );
+        assert!(matches!(r.decision, EnforcementDecision::Allow));
+
+        // 15:00 UTC = 00:00 KST (next day) — OUTSIDE biz hours → fall through
+        let r = srr.check_at(
+            "POST",
+            "api.bank.com",
+            "/transfer/x",
+            None,
+            at("2026-05-05T15:00:00Z"),
+        );
+        assert!(matches!(
+            r.decision,
+            EnforcementDecision::Delay { milliseconds: 300 }
+        ));
+    }
+
+    #[test]
+    fn condition_replay_determinism() {
+        // The same (rules, timestamp) MUST yield the same decision —
+        // this is the audit-replay contract. We assert by calling
+        // check_at twice with identical inputs separated by check()s
+        // that use Utc::now() in between (which would diverge).
+        let srr = srr_from_toml(
+            r#"
+            [[rules]]
+            method = "POST"
+            pattern = "api.bank.com/transfer/{any}"
+            decision = { type = "Deny", reason = "Off-hours" }
+            condition = { kind = "time_window", window = "22:00-06:00" }
+        "#,
+        );
+
+        let t = at("2026-05-05T23:30:00Z");
+        let r1 = srr.check_at("POST", "api.bank.com", "/transfer/abc", None, t);
+        // sandwich a Utc::now()-based call
+        let _ = srr.check("POST", "api.bank.com", "/transfer/abc", None);
+        let r2 = srr.check_at("POST", "api.bank.com", "/transfer/abc", None, t);
+
+        // r1 and r2 must agree (deterministic on t)
+        assert_eq!(
+            format!("{:?}", r1.decision),
+            format!("{:?}", r2.decision),
+            "check_at must be deterministic on timestamp"
+        );
+        assert!(matches!(r1.decision, EnforcementDecision::Deny { .. }));
+    }
+
+    #[test]
+    fn condition_invalid_window_rejected_at_load() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("bad_window.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[rules]]
+            method = "GET"
+            pattern = "example.com"
+            decision = { type = "Allow" }
+            condition = { kind = "time_window", window = "25:00-30:00" }
+        "#,
+        )
+        .unwrap();
+
+        let result = NetworkSRR::load(&path);
+        assert!(
+            result.is_err(),
+            "out-of-range hour must be rejected at load"
+        );
+    }
+
+    #[test]
+    fn condition_invalid_tz_rejected_at_load() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("bad_tz.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[rules]]
+            method = "GET"
+            pattern = "example.com"
+            decision = { type = "Allow" }
+            condition = { kind = "time_window", window = "09:00-18:00", tz = "Mars/Olympus" }
+        "#,
+        )
+        .unwrap();
+
+        let result = NetworkSRR::load(&path);
+        assert!(
+            result.is_err(),
+            "unknown IANA timezone must be rejected at load"
+        );
+    }
+
+    #[test]
+    fn condition_zero_duration_window_rejected() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("zero_window.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [[rules]]
+            method = "GET"
+            pattern = "example.com"
+            decision = { type = "Allow" }
+            condition = { kind = "time_window", window = "09:00-09:00" }
+        "#,
+        )
+        .unwrap();
+
+        let result = NetworkSRR::load(&path);
+        assert!(
+            result.is_err(),
+            "zero-duration window must be rejected (operator likely meant 24h)"
+        );
+    }
+
+    #[test]
+    fn condition_unconditional_rule_unaffected() {
+        // Rule WITHOUT condition must keep firing regardless of timestamp.
+        let srr = srr_from_toml(
+            r#"
+            [[rules]]
+            method = "POST"
+            pattern = "api.bank.com/transfer/{any}"
+            decision = { type = "Deny", reason = "Always denied" }
+        "#,
+        );
+
+        for t in &[
+            "2026-05-05T03:00:00Z",
+            "2026-05-05T12:00:00Z",
+            "2026-05-05T23:59:59Z",
+        ] {
+            let r = srr.check_at("POST", "api.bank.com", "/transfer/x", None, at(t));
+            assert!(
+                matches!(r.decision, EnforcementDecision::Deny { .. }),
+                "unconditional rule must fire at {}",
+                t
+            );
+        }
     }
 
     #[test]
