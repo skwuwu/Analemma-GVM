@@ -3302,7 +3302,7 @@ if should_run 50; then
         # 50a: overlayfs mount — verify agent can write anywhere in /workspace
         # In legacy mode, only /workspace/output is writable. With overlayfs,
         # the agent can write to any path (changes go to upper layer).
-        OVERLAY_RESULT=$(sudo timeout 30 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
+        OVERLAY_RESULT=$(sudo timeout 30 "$GVM_BIN" run </dev/null --sandbox --fs-governance -- python3 -c "
 import os, sys
 
 # Test 1: Write to /workspace root (not just /workspace/output)
@@ -3416,7 +3416,7 @@ if should_run 51; then
         ensure_proxy || { fail "51: proxy not available"; }
 
         # Run agent that creates files of each category
-        sudo timeout 30 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
+        sudo timeout 30 "$GVM_BIN" run </dev/null --sandbox --fs-governance -- python3 -c "
 import os
 
 # Auto-merge candidates
@@ -3726,7 +3726,7 @@ if should_run 56; then
         # Agent creates files that could match multiple categories.
         # The priority must be: discard > manual_commit > auto_merge > default
         # This is consistent with SRR's max_strict principle.
-        PRIORITY_RESULT=$(sudo timeout 30 "$GVM_BIN" run </dev/null --sandbox -- python3 -c "
+        PRIORITY_RESULT=$(sudo timeout 30 "$GVM_BIN" run </dev/null --sandbox --fs-governance -- python3 -c "
 import os
 
 # Create test files in /workspace/output (always writable)
