@@ -280,7 +280,16 @@ The full matrix:
 |---|---|---|---|
 | **Cooperative** (default) | `gvm run --watch a.py` | `gvm run a.py` | `gvm run -i a.py` |
 | **Sandbox** (`--sandbox`) | `sudo gvm run --watch --sandbox a.py` | `sudo gvm run --sandbox a.py` | `sudo gvm run -i --sandbox a.py` |
-| **Contained** (`--contained`, Linux/WSL2) | `gvm run --watch --contained a.py` | `gvm run --contained a.py` | `gvm run -i --contained a.py` |
+| **Contained** (`--contained`, Linux/WSL2) — **EXPERIMENTAL** | `gvm run --watch --contained a.py` | `gvm run --contained a.py` | `gvm run -i --contained a.py` |
+
+> **`--contained` status — experimental.** Docker isolation
+> primitives work (read-only FS, NET_ADMIN drop, no-new-privileges,
+> resource limits, session UX, orphan cleanup). In-container DNAT
+> to MITM, CA injection into the container trust store at runtime,
+> and `HTTPS_PROXY` env-var stripping are NOT yet implemented; the
+> host-side iptables egress lock catches bypass attempts but
+> transparent HTTPS interception inside the container does not work
+> today. Use `--sandbox` on Linux for full HTTPS L7 inspection.
 
 All twelve cells work. `--watch` and `-i` are mutually exclusive (watch means
 "no rules," interactive means "suggest rules for caution hits" — one

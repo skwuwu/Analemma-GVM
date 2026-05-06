@@ -123,6 +123,17 @@ enum Commands {
         sandbox: bool,
 
         /// Use Docker containment (Layer 3: network isolation).
+        ///
+        /// **EXPERIMENTAL — under construction.** Docker isolation
+        /// primitives work (read-only FS, no-new-privileges, NET_ADMIN
+        /// drop, resource limits, session UX, orphan cleanup). The
+        /// in-container DNAT to MITM, runtime CA injection into the
+        /// container trust store, and `HTTPS_PROXY` env-strip are
+        /// NOT yet wired — the host-side iptables egress lock catches
+        /// bypass attempts but transparent HTTPS interception inside
+        /// the container does not work today. For full HTTPS L7
+        /// inspection use `--sandbox` on Linux. See
+        /// `docs/quickstart.md` and `docs/reference.md` for details.
         #[arg(long)]
         contained: bool,
 

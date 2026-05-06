@@ -972,8 +972,28 @@ pub(crate) async fn run_contained_legacy(
             if dockerfile.exists() {
                 println!("  {YELLOW}Building gvm-agent image (first time only)...{RESET}");
                 let build_ctx = dockerfile.parent().unwrap_or(std::path::Path::new("."));
+                // `--network host` for the build phase: on hosts where
+                // GVM has installed iptables rules for sandbox traffic
+                // governance, Docker's default `bridge` network can lose
+                // DNS resolution from inside the build container — npm
+                // and pip then fail with `EAI_AGAIN`/`getaddrinfo` even
+                // though the host itself has working DNS. The same
+                // network-namespace isolation that protects sandboxes
+                // bites the build phase. `--network host` reuses the
+                // host's network stack for the build only; the runtime
+                // container still uses our managed bridge with proper
+                // governance. Reproduced on EC2 with the standard
+                // gvm + docker setup; the legacy default-bridge build
+                // worked only on hosts that hadn't set up sandbox iptables.
                 let build = tokio::process::Command::new("docker")
-                    .args(["build", "-t", "gvm-agent:latest", "-f"])
+                    .args([
+                        "build",
+                        "--network",
+                        "host",
+                        "-t",
+                        "gvm-agent:latest",
+                        "-f",
+                    ])
                     .arg(&dockerfile)
                     .arg(build_ctx)
                     .stdout(std::process::Stdio::null())
@@ -989,7 +1009,7 @@ pub(crate) async fn run_contained_legacy(
                         "  {RED}Failed to build gvm-agent image: {}{RESET}",
                         err.lines().last().unwrap_or("")
                     );
-                    println!("  {DIM}Build with: docker build -t gvm-agent:latest -f Dockerfile.agent .{RESET}");
+                    println!("  {DIM}Build with: docker build --network host -t gvm-agent:latest -f Dockerfile.agent .{RESET}");
                     return Ok(());
                 }
             } else {

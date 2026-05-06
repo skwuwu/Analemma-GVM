@@ -48,10 +48,20 @@ That's it. `gvm run` auto-configures the proxy, routes all HTTP traffic through 
 ```bash
 gvm run my_agent.py              # Lite:  HTTP proxy only (dev/testing)
 gvm run --sandbox my_agent.py    # Hard:  + Linux namespaces + seccomp (production)
-gvm run --contained my_agent.py  # Docker isolation (Linux + WSL2)
+gvm run --contained my_agent.py  # Docker isolation (Linux + WSL2) [EXPERIMENTAL]
 ```
 
-> **Non-Linux?** `--sandbox` is Linux-only (production). `--contained` (Docker) is stable on **Linux + WSL2**: host-side iptables on a dedicated bridge force all container egress through the proxy, catching non-cooperative clients (Node.js raw `https`, raw sockets). On native Windows / macOS the Docker host VM's iptables is inaccessible, so contained mode falls back to cooperative HTTP_PROXY only (Node.js can bypass). For guaranteed enforcement on Windows, run `gvm` from WSL2.
+> **Non-Linux?** `--sandbox` is Linux-only (production-ready).
+>
+> **`--contained` is EXPERIMENTAL.** The Docker isolation primitives
+> (read-only FS, no-new-privileges, NET_ADMIN drop, resource limits,
+> session-summary UX) work, but the in-container DNAT to MITM, CA
+> injection into the container trust store, and `HTTPS_PROXY` env
+> handling are still being wired up. Today the host-side iptables
+> egress lock catches bypass attempts but transparent HTTPS
+> interception inside the container is a no-op. For guaranteed L7
+> HTTPS inspection use `--sandbox` on Linux. We're tracking the
+> remaining contained-mode work in `docs/internal/CHANGELOG.md`.
 
 ---
 

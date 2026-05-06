@@ -271,8 +271,8 @@ gvm run agent.py                     # Basic
 gvm run --agent-id custom-id agent.py  # Custom audit identity
 gvm run -i agent.py                  # Interactive: suggest rules after run
 gvm run --sandbox agent.py           # Linux namespace isolation
-gvm run --contained agent.py         # Docker isolation
-gvm run --contained --detach agent.py  # Docker in background
+gvm run --contained agent.py         # Docker isolation [EXPERIMENTAL — see note]
+gvm run --contained --detach agent.py  # Docker in background [EXPERIMENTAL]
 
 # Binary mode: run any command through GVM proxy
 gvm run -- openclaw gateway            # Arbitrary binary + args
@@ -385,14 +385,30 @@ Configuration fields for `gvm run --sandbox` (Linux-native isolation). Defined i
 
 | Platform | Proxy | SDK | `--sandbox` | `--contained` |
 |----------|-------|-----|-------------|---------------|
-| Linux | Native | Native | **Production** (with MITM) | **Production** (no MITM) |
-| Windows (WSL2) | Native | Native | Not supported | **Production** (run gvm from WSL2) |
+| Linux | Native | Native | **Production** (with MITM) | **Experimental** (no MITM) |
+| Windows (WSL2) | Native | Native | Not supported | **Experimental** (run gvm from WSL2) |
 | Windows (native) | Native | Native | Not supported | Cooperative fallback |
 | macOS | Native | Native | Not supported | Cooperative fallback |
 
-> **`--contained` design**: Host-side iptables on a dedicated `gvm-docker-{slot}` bridge force all container egress through the proxy port. Non-cooperative HTTP clients (Node.js raw `https`, raw sockets) that would bypass `HTTP_PROXY` are dropped at the host. No MITM — use `--sandbox` on Linux for HTTPS payload inspection.
+> **`--contained` is EXPERIMENTAL** — under active construction. The
+> following pieces work today: read-only root filesystem,
+> `no-new-privileges`, NET_ADMIN drop, resource limits, host-side
+> iptables egress lock, session-summary UX, orphan cleanup. The
+> following are NOT yet wired:
+> - DNAT inside the container's network namespace (HTTPS in the
+>   container currently fails to reach the proxy on its own — agents
+>   must explicitly use `HTTP_PROXY` env var; non-cooperative clients
+>   are dropped by the host iptables lock rather than transparently
+>   redirected)
+> - CA injection into the container trust store at runtime
+> - Conditional `HTTPS_PROXY` env strip (the env var is currently set
+>   unconditionally; the host iptables DROP catches bypass attempts
+>   but `Proxy env vars present — CONNECT bypass possible`-style
+>   tests fail)
 >
-> **Cooperative fallback** (native Windows / macOS): Docker Desktop's host VM iptables is inaccessible to `gvm`, so Docker mode sets `HTTP_PROXY` only. Non-cooperative clients can bypass — the same caveat as plain cooperative mode. For guaranteed enforcement on Windows, run `gvm` from WSL2.
+> For HTTPS L7 inspection use `--sandbox` on Linux. `--contained` is
+> the right answer for Windows / WSL2 deployments where Linux
+> namespaces aren't an option, but read its limitations carefully.
 
 ### Sandbox Prerequisites (Linux only)
 

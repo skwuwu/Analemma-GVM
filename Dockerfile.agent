@@ -1,5 +1,15 @@
 # GVM Agent Container — Layer 3: OS-Level Containment
 #
+# **EXPERIMENTAL — under construction.** This Dockerfile builds the
+# `gvm-agent:latest` image that `gvm run --contained` runs scripts
+# inside. The Docker isolation primitives work (read-only FS,
+# no-new-privileges, NET_ADMIN drop, resource limits). The
+# in-container DNAT to MITM, CA injection, and HTTPS_PROXY env-strip
+# are not yet implemented; today's contained mode relies on the
+# host-side iptables egress lock for governance, not in-container
+# transparent interception. For full HTTPS L7 inspection use
+# `--sandbox` on Linux.
+#
 # Multi-runtime agent image: Python 3.12 + Node.js 22 + OpenClaw.
 # Supports Python agents (requests, SDK) and TypeScript agents (OpenClaw).
 #
@@ -50,7 +60,18 @@ WORKDIR /home/agent/workspace
 # Don't switch to non-root yet — entrypoint may need root for iptables DNAT.
 # The actual agent process drops privileges after setup.
 
-# Default entrypoint: detect script type and run appropriate interpreter.
-# Overridden by gvm run --contained which passes explicit command.
-ENTRYPOINT ["python"]
-CMD ["agent.py"]
+# No ENTRYPOINT: `gvm run --contained` always passes the full command
+# (interpreter + script path) as the CMD, so a hardcoded ENTRYPOINT
+# would prepend itself and double-up the interpreter.
+#
+# Earlier this image had `ENTRYPOINT ["python"]`. With
+# `gvm run --contained agent.py` the CLI passed
+# `["python", "/home/agent/workspace/agent.py"]` to docker, which
+# combined with the entrypoint became `python python /home/agent/...`
+# — python treated the first "python" as the script path and failed
+# with `can't open file '.../python'`. Removing the entrypoint lets
+# CMD stand alone, matching exactly what the CLI builds.
+#
+# Default CMD is a noisy notice if someone runs the image directly
+# without going through gvm — we don't want a silent shell.
+CMD ["echo", "Run via: gvm run --contained <script>"]
