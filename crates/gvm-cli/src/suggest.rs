@@ -90,18 +90,12 @@ fn prompt_time_condition<R: std::io::BufRead>(reader: &mut R) -> Result<Option<S
     let mut buf = String::new();
 
     println!();
-    println!(
-        "    {DIM}Time-conditional rule — fires only when request timestamp matches.{RESET}"
-    );
-    println!(
-        "    {DIM}Replay (`gvm replay`) is deterministic via event.timestamp.{RESET}"
-    );
+    println!("    {DIM}Time-conditional rule — fires only when request timestamp matches.{RESET}");
+    println!("    {DIM}Replay (`gvm replay`) is deterministic via event.timestamp.{RESET}");
     println!();
 
     // Window
-    print!(
-        "      {BOLD}window{RESET} {DIM}(HH:MM-HH:MM, default 09:00-18:00):{RESET} "
-    );
+    print!("      {BOLD}window{RESET} {DIM}(HH:MM-HH:MM, default 09:00-18:00):{RESET} ");
     std::io::stdout().flush().ok();
     buf.clear();
     if reader.read_line(&mut buf).is_err() {
@@ -114,9 +108,7 @@ fn prompt_time_condition<R: std::io::BufRead>(reader: &mut R) -> Result<Option<S
     validate_window_str(&window)?;
 
     // Timezone
-    print!(
-        "      {BOLD}timezone{RESET} {DIM}(IANA, default UTC):{RESET} "
-    );
+    print!("      {BOLD}timezone{RESET} {DIM}(IANA, default UTC):{RESET} ");
     std::io::stdout().flush().ok();
     buf.clear();
     if reader.read_line(&mut buf).is_err() {
@@ -134,9 +126,7 @@ fn prompt_time_condition<R: std::io::BufRead>(reader: &mut R) -> Result<Option<S
     }
 
     // Inside vs outside
-    print!(
-        "      {BOLD}fires{RESET} {DIM}([i]nside or [o]utside the window, default i):{RESET} "
-    );
+    print!("      {BOLD}fires{RESET} {DIM}([i]nside or [o]utside the window, default i):{RESET} ");
     std::io::stdout().flush().ok();
     buf.clear();
     if reader.read_line(&mut buf).is_err() {
@@ -306,9 +296,7 @@ pub fn suggest_rules_interactive(wal_path: &str, start_offset: u64, srr_file: &s
             // [c] to clear, [t] to replace.
             if let Some(cond) = &pending_condition {
                 println!("    {CYAN}[t]{RESET} Time      {GREEN}(staged — replace){RESET}");
-                println!(
-                    "    {CYAN}[c]{RESET} Clear     {DIM}(drop the staged condition){RESET}"
-                );
+                println!("    {CYAN}[c]{RESET} Clear     {DIM}(drop the staged condition){RESET}");
                 // Preview block — show the operator the exact TOML
                 // their next decision will produce. Surfacing the
                 // staged condition this way avoids the "I forgot what
@@ -329,7 +317,10 @@ pub fn suggest_rules_interactive(wal_path: &str, start_offset: u64, srr_file: &s
                 println!("    {DIM}── preview ──{RESET}");
                 println!("    {DIM}[[rules]]{RESET}");
                 println!("    {DIM}method = \"{}\"{RESET}", target.method);
-                println!("    {DIM}pattern = \"{}\"{RESET}", pretty_host(&target.host));
+                println!(
+                    "    {DIM}pattern = \"{}\"{RESET}",
+                    pretty_host(&target.host)
+                );
                 println!("    {DIM}decision = {}{RESET}", preview_decision);
                 println!("    {DIM}condition = {}{RESET}", cond);
                 println!();

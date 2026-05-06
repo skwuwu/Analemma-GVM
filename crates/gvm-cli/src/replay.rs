@@ -468,7 +468,12 @@ mod tests {
         s
     }
 
-    fn make_event(timestamp_rfc3339: &str, method: &str, host: &str, path: &str) -> serde_json::Value {
+    fn make_event(
+        timestamp_rfc3339: &str,
+        method: &str,
+        host: &str,
+        path: &str,
+    ) -> serde_json::Value {
         serde_json::json!({
             "event_id": "evt-test-1",
             "agent_id": "test",

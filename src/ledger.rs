@@ -1754,7 +1754,10 @@ mod emergency_wal_tests {
             archive.display()
         );
         let archive_size = std::fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
-        assert!(archive_size > 0, "archive segment should hold the rotated lines");
+        assert!(
+            archive_size > 0,
+            "archive segment should hold the rotated lines"
+        );
 
         // Write more — only ONE archive segment must exist (older overwritten).
         for i in 5..10u32 {

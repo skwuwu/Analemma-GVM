@@ -1524,7 +1524,10 @@ pub fn cleanup_all_orphans_report() -> Result<CleanupReport> {
     }
 
     // 3. Defense-in-depth: find veth-gvm-* interfaces with no state file
-    if let Ok(output) = Command::new(resolve_tool("ip")).args(["-o", "link", "show"]).output() {
+    if let Ok(output) = Command::new(resolve_tool("ip"))
+        .args(["-o", "link", "show"])
+        .output()
+    {
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
             if let Some(iface) = line
@@ -1553,7 +1556,9 @@ pub fn cleanup_all_orphans_report() -> Result<CleanupReport> {
                         );
                         // Clean iptables chain for this veth before deleting it
                         cleanup_orphan_iptables_chain(iface);
-                        let _ = Command::new(resolve_tool("ip")).args(["link", "del", iface]).output();
+                        let _ = Command::new(resolve_tool("ip"))
+                            .args(["link", "del", iface])
+                            .output();
                         report.orphan_veths_swept += 1;
                         report.veth_names.push(iface.to_string());
                         report.iptables_chains += 1;
@@ -1771,7 +1776,10 @@ const GVM_SANDBOX_SUBNET_PREFIX: &str = "10.200.";
 
 fn cleanup_stale_nat_rules() -> usize {
     let mut cleaned = 0usize;
-    let output = match Command::new(resolve_tool("iptables-save")).args(["-t", "nat"]).output() {
+    let output = match Command::new(resolve_tool("iptables-save"))
+        .args(["-t", "nat"])
+        .output()
+    {
         Ok(o) => o,
         Err(_) => return 0,
     };
@@ -1798,14 +1806,14 @@ fn cleanup_stale_nat_rules() -> usize {
         // (we observed dozens of orphan POSTROUTING entries on EC2, each
         // a different /30 slot from a sandbox that crashed before its
         // state file was written).
-        let mentions_gvm_veth = line
-            .split_whitespace()
-            .any(|t| t.starts_with("veth-gvm-h"));
+        let mentions_gvm_veth = line.split_whitespace().any(|t| t.starts_with("veth-gvm-h"));
         let mentions_gvm_subnet = line.split_whitespace().any(|t| {
             // -s 10.200.x.x/cidr or -d 10.200.x.x/cidr etc. — match the
             // address part, ignoring the cidr suffix.
             t.starts_with(GVM_SANDBOX_SUBNET_PREFIX)
-                || t.split('/').next().is_some_and(|h| h.starts_with(GVM_SANDBOX_SUBNET_PREFIX))
+                || t.split('/')
+                    .next()
+                    .is_some_and(|h| h.starts_with(GVM_SANDBOX_SUBNET_PREFIX))
         });
         if !mentions_gvm_veth && !mentions_gvm_subnet {
             continue;
@@ -1839,7 +1847,9 @@ mod nat_cleanup_tests {
         let line = "-A POSTROUTING -s 10.200.0.0/30 -p tcp -m tcp --dport 8080 -j MASQUERADE";
         let mentions_subnet = line.split_whitespace().any(|t| {
             t.starts_with(GVM_SANDBOX_SUBNET_PREFIX)
-                || t.split('/').next().is_some_and(|h| h.starts_with(GVM_SANDBOX_SUBNET_PREFIX))
+                || t.split('/')
+                    .next()
+                    .is_some_and(|h| h.starts_with(GVM_SANDBOX_SUBNET_PREFIX))
         });
         assert!(
             mentions_subnet,
@@ -1852,12 +1862,12 @@ mod nat_cleanup_tests {
         // A rule with a totally different subnet must NOT be matched —
         // we don't want to flush other people's NAT setup.
         let line = "-A POSTROUTING -s 192.168.1.0/24 -j MASQUERADE";
-        let mentions_veth = line
-            .split_whitespace()
-            .any(|t| t.starts_with("veth-gvm-h"));
+        let mentions_veth = line.split_whitespace().any(|t| t.starts_with("veth-gvm-h"));
         let mentions_subnet = line.split_whitespace().any(|t| {
             t.starts_with(GVM_SANDBOX_SUBNET_PREFIX)
-                || t.split('/').next().is_some_and(|h| h.starts_with(GVM_SANDBOX_SUBNET_PREFIX))
+                || t.split('/')
+                    .next()
+                    .is_some_and(|h| h.starts_with(GVM_SANDBOX_SUBNET_PREFIX))
         });
         assert!(!mentions_veth);
         assert!(!mentions_subnet);
@@ -1867,9 +1877,7 @@ mod nat_cleanup_tests {
     fn veth_named_rule_still_matched() {
         // The legacy detection path — interface name token — still works.
         let line = "-A FORWARD -i veth-gvm-h0 -j ACCEPT";
-        let mentions_veth = line
-            .split_whitespace()
-            .any(|t| t.starts_with("veth-gvm-h"));
+        let mentions_veth = line.split_whitespace().any(|t| t.starts_with("veth-gvm-h"));
         assert!(mentions_veth);
     }
 
@@ -2075,7 +2083,10 @@ fn cleanup_orphan_iptables_chain(host_iface: &str) {
     // sandbox loses its MASQUERADE/DNAT entries with no error surface
     // (every `run_iptables(...).ok()` swallows the result), and traffic
     // routing breaks until the next manual cleanup or restart.
-    if let Ok(output) = Command::new(resolve_tool("iptables-save")).args(["-t", "nat"]).output() {
+    if let Ok(output) = Command::new(resolve_tool("iptables-save"))
+        .args(["-t", "nat"])
+        .output()
+    {
         let stdout = String::from_utf8_lossy(&output.stdout);
         for line in stdout.lines() {
             if !line.starts_with("-A ") {

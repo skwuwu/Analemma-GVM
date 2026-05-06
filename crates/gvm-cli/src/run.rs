@@ -986,14 +986,7 @@ pub(crate) async fn run_contained_legacy(
                 // gvm + docker setup; the legacy default-bridge build
                 // worked only on hosts that hadn't set up sandbox iptables.
                 let build = tokio::process::Command::new("docker")
-                    .args([
-                        "build",
-                        "--network",
-                        "host",
-                        "-t",
-                        "gvm-agent:latest",
-                        "-f",
-                    ])
+                    .args(["build", "--network", "host", "-t", "gvm-agent:latest", "-f"])
                     .arg(&dockerfile)
                     .arg(build_ctx)
                     .stdout(std::process::Stdio::null())

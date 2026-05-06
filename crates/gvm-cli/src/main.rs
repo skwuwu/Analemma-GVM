@@ -999,10 +999,9 @@ async fn main() -> anyhow::Result<()> {
                                 // proxy or revoke failure is logged but
                                 // doesn't fail the cleanup command.
                                 if !report.revoked_sandbox_ids.is_empty() {
-                                    let revoked = revoke_sandboxes_on_proxy(
-                                        &report.revoked_sandbox_ids,
-                                    )
-                                    .await;
+                                    let revoked =
+                                        revoke_sandboxes_on_proxy(&report.revoked_sandbox_ids)
+                                            .await;
                                     if revoked > 0 {
                                         eprintln!(
                                             "  \u{2713} {} sandbox CA(s) revoked from running proxy",
