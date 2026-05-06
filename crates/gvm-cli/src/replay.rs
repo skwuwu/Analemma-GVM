@@ -106,6 +106,98 @@ struct ReplayReport {
 
 const MAX_CHANGE_SAMPLES: usize = 50;
 
+/// Outcome of trying to classify one WAL line.
+///
+/// Extracted from the inner loop so the per-event logic is unit-testable
+/// without hijacking stdout — important because the determinism guarantee
+/// (replay against `event.timestamp`) is the load-bearing property and
+/// regressions would silently change verdicts on time-conditioned rules.
+enum EventClass {
+    /// Not an event (seal/anchor/batch record, malformed JSON, missing event_id).
+    NotAnEvent,
+    /// A system event (config_load, sandbox.launch) with no `transport`.
+    SystemEvent,
+    /// A classified request event with original + proposed verdicts.
+    Classified {
+        method: String,
+        host: String,
+        path: String,
+        original: String,
+        proposed: String,
+    },
+}
+
+fn classify_one(srr: &gvm_proxy::srr::NetworkSRR, value: &serde_json::Value) -> EventClass {
+    // Filter to actual events. Seal records have `seal_id`,
+    // anchor records have `anchor_hash`, batch records have
+    // `merkle_root` + `batch_id`. Events have `event_id` and
+    // (typically) `transport`.
+    if !value.is_object()
+        || !value
+            .get("event_id")
+            .map(|v| v.is_string())
+            .unwrap_or(false)
+    {
+        return EventClass::NotAnEvent;
+    }
+    if value.get("seal_id").is_some() || value.get("anchor_hash").is_some() {
+        return EventClass::NotAnEvent;
+    }
+
+    let transport = match value.get("transport") {
+        Some(t) if !t.is_null() => t,
+        _ => return EventClass::SystemEvent,
+    };
+
+    let method = transport
+        .get("method")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let host = transport
+        .get("host")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let path = transport
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let original = value
+        .get("decision")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown")
+        .to_string();
+
+    // Pull the WAL event's timestamp so condition evaluation is
+    // reproducible. `event.timestamp` is committed to the Merkle leaf
+    // and anchor-signed, so re-classifying with `check_at(ts)` produces
+    // a deterministic verdict regardless of when replay runs. Using
+    // `Utc::now()` here would silently flip "biz-hours-only allow"
+    // to/from "always allow" depending on when the operator runs the
+    // report — a critical determinism break for audit replay.
+    let event_timestamp = value
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(chrono::Utc::now);
+
+    // `body=None` — payload-rule matchers skip without firing (the WAL
+    // doesn't store the request body; payload-deny rules can't replay).
+    let result = srr.check_at(&method, &host, &path, None, event_timestamp);
+    let proposed = format!("{:?}", result.decision);
+
+    EventClass::Classified {
+        method,
+        host,
+        path,
+        original,
+        proposed,
+    }
+}
+
 pub fn run(wal_path: &str, rules_path: &str, emit_json: bool, limit: usize) -> Result<()> {
     // 1. Load proposed SRR. Reuses the production loader, so any
     //    parse error here means the ruleset wouldn't have started
@@ -137,65 +229,35 @@ pub fn run(wal_path: &str, rules_path: &str, emit_json: bool, limit: usize) -> R
             Ok(v) => v,
             Err(_) => continue, // skip malformed
         };
-        // Filter to actual events. Seal records have `seal_id`,
-        // anchor records have `anchor_hash`, batch records have
-        // `merkle_root` + `batch_id`. Events have `event_id` and
-        // (typically) `transport`.
-        if !value.is_object()
-            || !value
-                .get("event_id")
-                .map(|v| v.is_string())
-                .unwrap_or(false)
-        {
-            continue;
-        }
-        if value.get("seal_id").is_some() || value.get("anchor_hash").is_some() {
-            continue;
-        }
-
-        let transport = match value.get("transport") {
-            Some(t) if !t.is_null() => t,
-            _ => {
-                // System events (config_load, sandbox.launch, etc.)
-                // have no transport — count as skipped so the
-                // operator's denominator stays honest.
+        match classify_one(&srr, &value) {
+            EventClass::NotAnEvent => continue,
+            EventClass::SystemEvent => {
                 report.events_skipped += 1;
                 continue;
             }
-        };
+            EventClass::Classified {
+                method,
+                host,
+                path,
+                original,
+                proposed,
+            } => {
+                report.events_evaluated += 1;
+                report.original.add(&original);
+                report.proposed.add(&proposed);
 
-        let method = transport
-            .get("method")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let host = transport.get("host").and_then(|v| v.as_str()).unwrap_or("");
-        let path = transport.get("path").and_then(|v| v.as_str()).unwrap_or("");
-        let original_decision = value
-            .get("decision")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Unknown")
-            .to_string();
-
-        // Re-classify against the proposed ruleset. `body=None`
-        // means payload-rule matchers will skip without firing —
-        // see module docs.
-        let result = srr.check(method, host, path, None);
-        let proposed_decision = format!("{:?}", result.decision);
-
-        report.events_evaluated += 1;
-        report.original.add(&original_decision);
-        report.proposed.add(&proposed_decision);
-
-        if original_decision != proposed_decision {
-            report.total_changes += 1;
-            if report.changes.len() < MAX_CHANGE_SAMPLES {
-                report.changes.push(VerdictChange {
-                    method: method.to_string(),
-                    host: host.to_string(),
-                    path: path.to_string(),
-                    original: original_decision,
-                    proposed: proposed_decision,
-                });
+                if original != proposed {
+                    report.total_changes += 1;
+                    if report.changes.len() < MAX_CHANGE_SAMPLES {
+                        report.changes.push(VerdictChange {
+                            method,
+                            host,
+                            path,
+                            original,
+                            proposed,
+                        });
+                    }
+                }
             }
         }
     }
@@ -333,6 +395,131 @@ mod tests {
         assert_eq!(c.audit_only, 1);
         assert_eq!(c.other, 1);
         assert_eq!(c.total(), 7);
+    }
+
+    /// Compile a NetworkSRR from inline TOML for tests.
+    fn srr_from_inline(toml: &str) -> gvm_proxy::srr::NetworkSRR {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let p = dir.path().join("rules.toml");
+        std::fs::write(&p, toml).unwrap();
+        let s = gvm_proxy::srr::NetworkSRR::load(&p).expect("rules load");
+        // tempdir is dropped here, but NetworkSRR has already read and
+        // compiled the rules — no further file access. Keep dir alive
+        // by leaking it; tests run in tempdir, OS will reclaim.
+        std::mem::forget(dir);
+        s
+    }
+
+    fn make_event(timestamp_rfc3339: &str, method: &str, host: &str, path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "event_id": "evt-test-1",
+            "agent_id": "test",
+            "timestamp": timestamp_rfc3339,
+            "transport": { "method": method, "host": host, "path": path },
+            "decision": "Allow",
+            "operation": "unknown",
+        })
+    }
+
+    #[test]
+    fn replay_evaluates_condition_against_event_timestamp() {
+        // Critical determinism property: a time-conditioned rule MUST
+        // produce the same verdict whenever replay is run, by evaluating
+        // the rule against `event.timestamp` (committed to the Merkle
+        // leaf), NOT against `Utc::now()`. We assert this with two
+        // events whose timestamps fall on opposite sides of the same
+        // condition window — they must yield DIFFERENT proposed
+        // verdicts, regardless of when the test runs.
+        let srr = srr_from_inline(
+            r#"
+            [[rules]]
+            method = "POST"
+            pattern = "api.payroll.example.com/{any}"
+            decision = { type = "Allow" }
+            condition = { kind = "time_window", window = "09:00-18:00", tz = "Asia/Seoul" }
+            description = "biz-hours-only allow"
+
+            [[rules]]
+            method = "*"
+            pattern = "{any}"
+            decision = { type = "Delay", milliseconds = 300 }
+            description = "default"
+        "#,
+        );
+
+        // 04:00 UTC = 13:00 KST → INSIDE 09:00-18:00 KST → Allow fires
+        let inside = make_event(
+            "2026-05-05T04:00:00Z",
+            "POST",
+            "api.payroll.example.com",
+            "/run",
+        );
+        // 14:00 UTC = 23:00 KST → OUTSIDE → falls through to default Delay
+        let outside = make_event(
+            "2026-05-05T14:00:00Z",
+            "POST",
+            "api.payroll.example.com",
+            "/run",
+        );
+
+        let inside_proposed = match classify_one(&srr, &inside) {
+            EventClass::Classified { proposed, .. } => proposed,
+            _ => panic!("inside event must classify"),
+        };
+        let outside_proposed = match classify_one(&srr, &outside) {
+            EventClass::Classified { proposed, .. } => proposed,
+            _ => panic!("outside event must classify"),
+        };
+
+        assert!(
+            inside_proposed.starts_with("Allow"),
+            "INSIDE the window should fire Allow, got {}",
+            inside_proposed
+        );
+        assert!(
+            outside_proposed.starts_with("Delay"),
+            "OUTSIDE the window should fall through to default Delay, got {}",
+            outside_proposed
+        );
+        assert_ne!(
+            inside_proposed, outside_proposed,
+            "regression: replay must use event.timestamp, not Utc::now() — \
+             same rule + same URL across two timestamps must yield distinct verdicts"
+        );
+    }
+
+    #[test]
+    fn replay_classify_one_idempotent_on_same_event() {
+        // Calling classify_one twice on the same event must give the
+        // same answer — reinforces that there's no hidden state /
+        // current-time dependency that would creep back in.
+        let srr = srr_from_inline(
+            r#"
+            [[rules]]
+            method = "POST"
+            pattern = "api.payroll.example.com/{any}"
+            decision = { type = "Allow" }
+            condition = { kind = "time_window", window = "09:00-18:00", tz = "Asia/Seoul" }
+            description = "biz-hours-only allow"
+        "#,
+        );
+
+        let event = make_event(
+            "2026-05-05T04:00:00Z",
+            "POST",
+            "api.payroll.example.com",
+            "/x",
+        );
+
+        let a = match classify_one(&srr, &event) {
+            EventClass::Classified { proposed, .. } => proposed,
+            _ => panic!("must classify"),
+        };
+        let b = match classify_one(&srr, &event) {
+            EventClass::Classified { proposed, .. } => proposed,
+            _ => panic!("must classify"),
+        };
+        assert_eq!(a, b);
     }
 
     #[test]
