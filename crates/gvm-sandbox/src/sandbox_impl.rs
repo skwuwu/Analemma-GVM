@@ -209,9 +209,43 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
         write_uid_map(child_pid)?;
     }
 
-    // 2. Set up veth network pair (monotonic counter — no PID-based IP collisions)
-    let veth_config = VethConfig::new(child_pid.as_raw() as u32, config.proxy_addr);
-    let network_result = setup_host_network(&veth_config);
+    // 2. Set up veth network pair.
+    //
+    // `VethConfig::new` allocates a unique slot under a system-wide
+    // file lock and creates the kernel veth pair as the claim. This
+    // serialises concurrent `gvm run --sandbox` processes on the slot
+    // pick + create window, which used to race because each process
+    // started its own atomic counter at zero (silently producing
+    // duplicate slot 0 allocations under parallel launch). If
+    // allocation fails (no free slots, flock error, kernel rejected
+    // the new interface), surface the same Err shape that
+    // `setup_host_network` would have produced — downstream code
+    // already handles the "sandbox limps along without network" case
+    // by gating recording and cleanup on `network_result.is_ok()`.
+    let (veth_config, network_result) = match VethConfig::new(
+        child_pid.as_raw() as u32,
+        config.proxy_addr,
+    ) {
+        Ok(cfg) => {
+            let r = setup_host_network(&cfg);
+            (cfg, r)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "veth slot allocation failed — sandbox will have no network");
+            // Synthetic placeholder config so downstream code that
+            // logs / signals child / runs idempotent cleanup has a
+            // valid `veth_config.slot` etc. Slot u32::MAX is outside
+            // the allocator's range, so it cannot collide with a
+            // real allocation and cleanup of "veth-gvm-h4294967295"
+            // is a no-op when the interface doesn't exist.
+            let dummy = VethConfig::from_slot(
+                u32::MAX,
+                child_pid.as_raw() as u32,
+                config.proxy_addr,
+            );
+            (dummy, Err(e))
+        }
+    };
 
     // dns_target is recorded in state file for deterministic cleanup.
     // If DNS changes between setup and cleanup (DHCP renewal), cleanup

@@ -37,15 +37,176 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Monotonic counter for unique veth/subnet allocation.
-/// Eliminates PID-based IP collisions: same process never reuses a slot,
-/// and process restart resets the counter (previous sandboxes are dead).
-static SANDBOX_COUNTER: AtomicU32 = AtomicU32::new(0);
+/// Maximum slot number for sandbox veth allocation.
+/// `slot % 256` is the third octet of the /16 subnet (10.200.X.Y).
+/// 16k slots is well past any realistic concurrent-sandbox count
+/// while leaving headroom in the address space.
+const MAX_VETH_SLOTS: u32 = 16384;
+
+/// Path of the system-wide flock that serialises veth slot allocation
+/// across concurrent `gvm run --sandbox` processes.
+///
+/// Why a file lock and not a process-local atomic counter:
+///   Each `gvm run --sandbox` is its own process. The earlier design
+///   used `static SANDBOX_COUNTER: AtomicU32`, which made every
+///   process start at 0 and pick slot 0 for its first sandbox. Two
+///   parallel `gvm run --sandbox` invocations therefore both tried
+///   `ip link add veth-gvm-h0` — one won, the rest failed silently
+///   ("Cannot find device" once the half-created interface was
+///   removed by error cleanup), leaving sandboxes with no network
+///   connectivity. Observed empirically on EC2 with 5+ concurrent
+///   launches.
+///
+///   A file lock is the only correct primitive for this case
+///   because the racing parties are separate processes; an
+///   in-process Mutex (or static AtomicU32) cannot synchronise
+///   across `fork`/`exec` boundaries. flock is auto-released on
+///   process exit / SIGKILL by the kernel, so a holder cannot
+///   strand the lock the way a userspace mutex (e.g. pthread)
+///   could.
+const NETWORK_LOCK_PATH: &str = "/run/gvm/network.lock";
+
+/// RAII guard around a process-scoped exclusive flock on
+/// [`NETWORK_LOCK_PATH`]. Closing the file (Drop) releases the lock.
+struct NetworkLock {
+    _file: std::fs::File,
+}
+
+impl NetworkLock {
+    /// Acquire an exclusive flock, blocking until other holders release.
+    /// flock is per-process and auto-released on close/exit, so a
+    /// SIGKILL'd holder cannot leak the lock.
+    fn acquire() -> Result<Self> {
+        std::fs::create_dir_all(STATE_DIR).ok();
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(NETWORK_LOCK_PATH)
+            .with_context(|| format!("Failed to open {}", NETWORK_LOCK_PATH))?;
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            anyhow::bail!(
+                "flock(LOCK_EX, {}) failed: {}",
+                NETWORK_LOCK_PATH,
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+/// Scan kernel state for currently-allocated veth slots.
+///
+/// Source of truth: `ip -o link show`. Parses interface names that
+/// match `veth-gvm-h<N>` and collects the N values. Used under the
+/// network-allocation flock to pick the lowest free slot.
+///
+/// We deliberately consult kernel state rather than the per-PID
+/// state files in `/run/gvm/`: state files are written *after*
+/// `setup_host_network` succeeds, so an in-flight allocation
+/// (parent has already created the veth, child still racing
+/// through namespace setup) is not yet represented on disk.
+/// Kernel state is the single point that updates atomically with
+/// `ip link add`.
+fn scan_used_veth_slots() -> Result<HashSet<u32>> {
+    let output = Command::new(resolve_tool("ip"))
+        .args(["-o", "link", "show"])
+        .output()
+        .context("ip link show")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("ip link show failed: {}", stderr.trim());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut used = HashSet::new();
+    for line in stdout.lines() {
+        // `ip -o link show` lines look like:
+        //   "5: veth-gvm-h0@if4: <BROADCAST,...>"
+        // We want the iface name (between first ":" and the "@" /
+        // next ":").
+        let after_idx = match line.split_once(':') {
+            Some((_, rest)) => rest.trim_start(),
+            None => continue,
+        };
+        let iface = after_idx
+            .split(|c: char| c == '@' || c == ':')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if let Some(n) = iface.strip_prefix("veth-gvm-h") {
+            if let Ok(slot) = n.parse::<u32>() {
+                used.insert(slot);
+            }
+        }
+    }
+    Ok(used)
+}
+
+/// Test for the existence of a network interface by name. Used by
+/// `setup_host_network` to make veth-pair creation idempotent: when
+/// `VethConfig::new` has already claimed the slot under the
+/// allocation flock, the interface is already present, and a second
+/// `ip link add` would fail spuriously with "File exists".
+fn veth_exists(name: &str) -> bool {
+    Command::new(resolve_tool("ip"))
+        .args(["link", "show", name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Allocate a free veth slot under the system-wide network lock and
+/// claim it by creating the veth pair.
+///
+/// The kernel's `ip link add` is atomic for interface name uniqueness
+/// — once this returns Ok, no other process scanning under the same
+/// lock will see this slot as free, even before the per-PID state
+/// file is written. Lock release happens on file close (Drop), so
+/// the lock window covers both scan and claim.
+fn allocate_and_claim_veth_slot() -> Result<u32> {
+    let _lock = NetworkLock::acquire()?;
+
+    let used = scan_used_veth_slots()?;
+    let slot = (0..MAX_VETH_SLOTS)
+        .find(|s| !used.contains(s))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "No free veth slot — all {} slots in use. Run `gvm cleanup`.",
+                MAX_VETH_SLOTS
+            )
+        })?;
+
+    let host_iface = format!("veth-gvm-h{}", slot);
+    let sandbox_iface = format!("veth-gvm-s{}", slot);
+    run_ip(&[
+        "link",
+        "add",
+        &host_iface,
+        "type",
+        "veth",
+        "peer",
+        "name",
+        &sandbox_iface,
+    ])
+    .with_context(|| {
+        format!(
+            "Failed to claim veth slot {} (created by another process between scan and claim?)",
+            slot
+        )
+    })?;
+
+    Ok(slot)
+}
 
 /// Network configuration for the sandbox.
 pub struct VethConfig {
@@ -68,16 +229,22 @@ pub struct VethConfig {
 }
 
 impl VethConfig {
-    /// Allocate a unique veth config using a monotonic counter.
+    /// Allocate a unique veth config across concurrent `gvm run --sandbox`
+    /// processes and create the kernel-level veth pair as the claim.
     ///
-    /// Previous design derived IPs from child PID, which could collide when
-    /// `pid % 256` and `(pid / 256) % 64` matched across concurrent sandboxes.
-    /// The counter guarantees uniqueness within a process lifetime.
-    /// On process restart the counter resets to 0, but all previous sandboxes
-    /// are dead (orphan cleanup runs at launch), so no collision is possible.
-    pub fn new(child_pid: u32, proxy_addr: SocketAddr) -> Self {
-        let slot = SANDBOX_COUNTER.fetch_add(1, Ordering::Relaxed);
-        Self::from_slot(slot, child_pid, proxy_addr)
+    /// Returns `Result` because the previous design (process-local atomic
+    /// counter) silently produced duplicate slot numbers across processes
+    /// — every fresh `gvm run --sandbox` started at 0, so two parallel
+    /// invocations both picked slot 0 and only the first `ip link add`
+    /// succeeded. The current implementation holds an exclusive flock on
+    /// `/run/gvm/network.lock` while it (a) scans `ip link show` for
+    /// in-use `veth-gvm-h*` interfaces, (b) picks the lowest free slot,
+    /// and (c) creates the veth pair. By the time the lock is released
+    /// the slot is committed in kernel state, so concurrent allocators
+    /// see the new interface and skip its slot.
+    pub fn new(child_pid: u32, proxy_addr: SocketAddr) -> Result<Self> {
+        let slot = allocate_and_claim_veth_slot()?;
+        Ok(Self::from_slot(slot, child_pid, proxy_addr))
     }
 
     /// Create a VethConfig from a known slot (for child-side reconstruction).
@@ -100,20 +267,31 @@ impl VethConfig {
     }
 }
 
-/// Host-side network setup: create veth pair, move one end into sandbox, configure routing.
-/// Returns the DNS target used for DNAT (for deterministic cleanup).
+/// Host-side network setup: create veth pair (if not already), move
+/// one end into sandbox, configure routing. Returns the DNS target
+/// used for DNAT (for deterministic cleanup).
+///
+/// Step 1 is idempotent: `VethConfig::new` already creates the veth
+/// pair under the network-allocation flock as part of slot claim, so
+/// the common path through this function finds the interface present
+/// and skips creation. Re-creating would fail with "File exists" and
+/// trigger spurious cleanup. Tests / legacy callers that build a
+/// `VethConfig` via `from_slot` without claiming still get the
+/// interface created here.
 pub fn setup_host_network(config: &VethConfig) -> Result<String> {
-    // 1. Create veth pair
-    run_ip(&[
-        "link",
-        "add",
-        &config.host_iface,
-        "type",
-        "veth",
-        "peer",
-        "name",
-        &config.sandbox_iface,
-    ])?;
+    // 1. Create veth pair (idempotent — see above).
+    if !veth_exists(&config.host_iface) {
+        run_ip(&[
+            "link",
+            "add",
+            &config.host_iface,
+            "type",
+            "veth",
+            "peer",
+            "name",
+            &config.sandbox_iface,
+        ])?;
+    }
 
     // 2. Move sandbox end into child's network namespace
     run_ip(&[
