@@ -238,11 +238,8 @@ pub fn launch(config: SandboxConfig) -> Result<SandboxResult> {
             // the allocator's range, so it cannot collide with a
             // real allocation and cleanup of "veth-gvm-h4294967295"
             // is a no-op when the interface doesn't exist.
-            let dummy = VethConfig::from_slot(
-                u32::MAX,
-                child_pid.as_raw() as u32,
-                config.proxy_addr,
-            );
+            let dummy =
+                VethConfig::from_slot(u32::MAX, child_pid.as_raw() as u32, config.proxy_addr);
             (dummy, Err(e))
         }
     };

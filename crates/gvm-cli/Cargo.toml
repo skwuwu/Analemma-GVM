@@ -20,6 +20,22 @@ pkg-fmt = "zip"
 name = "gvm"
 path = "src/main.rs"
 
+[features]
+default = []
+# `--contained` (Docker-isolation mode). EXPERIMENTAL — the Docker
+# isolation primitives (read-only FS, no-new-privileges, NET_ADMIN
+# drop, resource limits) work, but the in-container DNAT to MITM,
+# CA injection, and HTTPS_PROXY env handling are not yet wired.
+# Today's contained mode relies on the host-side iptables egress
+# lock for governance, NOT on transparent in-container HTTPS
+# inspection.
+#
+# Off by default so the production binary surface does not advertise
+# a flag whose semantics are still being finalised. Builds that need
+# Docker isolation pass `--features contained`. For full HTTPS L7
+# inspection on Linux, use `--sandbox` instead — production-ready.
+contained = []
+
 [dependencies]
 gvm-types = { path = "../gvm-types" }
 clap = { version = "4", features = ["derive"] }

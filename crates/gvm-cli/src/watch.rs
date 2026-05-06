@@ -875,17 +875,35 @@ pub async fn run_watch(
 
     // Build pipeline config and run pre-launch + launch via pipeline.
     // Watch uses pipeline directly (not run_agent) to avoid duplicate banners/audit.
+    #[cfg(not(feature = "contained"))]
+    if contained {
+        anyhow::bail!(
+            "--contained mode is EXPERIMENTAL and not enabled in this build. \
+             Rebuild with `cargo build --release --features contained` or use --sandbox."
+        );
+    }
     let mode = if sandbox {
         crate::pipeline::LaunchMode::Sandbox
-    } else if contained {
-        crate::pipeline::LaunchMode::Contained {
-            image: image.to_string(),
-            memory: memory.to_string(),
-            cpus: cpus.to_string(),
-            detach: false,
-        }
     } else {
-        crate::pipeline::LaunchMode::Cooperative
+        #[cfg(feature = "contained")]
+        {
+            if contained {
+                crate::pipeline::LaunchMode::Contained {
+                    image: image.to_string(),
+                    memory: memory.to_string(),
+                    cpus: cpus.to_string(),
+                    detach: false,
+                }
+            } else {
+                crate::pipeline::LaunchMode::Cooperative
+            }
+        }
+        #[cfg(not(feature = "contained"))]
+        {
+            // bail above guarantees contained == false here
+            let _ = (image, memory, cpus);
+            crate::pipeline::LaunchMode::Cooperative
+        }
     };
 
     let agent_config = crate::pipeline::AgentConfig {

@@ -35,18 +35,45 @@ pub async fn run_agent(
     if sandbox && contained {
         anyhow::bail!("Cannot use --sandbox and --contained together. Choose one isolation mode.");
     }
+    // Block --contained when the cargo feature is off. Default builds
+    // omit Docker-mode code entirely; users who want it must rebuild
+    // with `cargo build --features contained` after acknowledging the
+    // EXPERIMENTAL status.
+    #[cfg(not(feature = "contained"))]
+    if contained {
+        anyhow::bail!(
+            "--contained mode is EXPERIMENTAL and not enabled in this build. \
+             For Linux production, use --sandbox (kernel namespaces + seccomp + MITM). \
+             To opt into Docker isolation rebuild with `cargo build --release \
+             --features contained` after reviewing docs/quickstart.md."
+        );
+    }
 
     let mode = if sandbox {
         crate::pipeline::LaunchMode::Sandbox
-    } else if contained {
-        crate::pipeline::LaunchMode::Contained {
-            image: image.to_string(),
-            memory: memory.to_string(),
-            cpus: cpus.to_string(),
-            detach,
-        }
     } else {
-        crate::pipeline::LaunchMode::Cooperative
+        #[cfg(feature = "contained")]
+        {
+            if contained {
+                crate::pipeline::LaunchMode::Contained {
+                    image: image.to_string(),
+                    memory: memory.to_string(),
+                    cpus: cpus.to_string(),
+                    detach,
+                }
+            } else {
+                crate::pipeline::LaunchMode::Cooperative
+            }
+        }
+        #[cfg(not(feature = "contained"))]
+        {
+            // The bail above guarantees `contained == false` here, so we
+            // unconditionally land on Cooperative. The unused parameters
+            // (image/memory/cpus/detach) are kept in the signature so the
+            // CLI surface is stable across feature configurations.
+            let _ = (image, memory, cpus, detach);
+            crate::pipeline::LaunchMode::Cooperative
+        }
     };
 
     // MITM is only available in --sandbox mode (Linux kernel namespace +
@@ -57,6 +84,7 @@ pub async fn run_agent(
     if no_mitm && mode == crate::pipeline::LaunchMode::Sandbox {
         eprintln!("  {YELLOW}\u{26a0}{RESET} MITM disabled (--no-mitm). HTTPS uses CONNECT relay (domain-level only).");
     }
+    #[cfg(feature = "contained")]
     if matches!(mode, crate::pipeline::LaunchMode::Contained { .. }) {
         eprintln!(
             "  {DIM}Note: Docker mode uses SNI-level SRR (no MITM payload inspection). \
@@ -926,6 +954,9 @@ fn is_governance_event(event: &serde_json::Value) -> bool {
 ///   - Linux + WSL2 only (iptables lives in the Docker host kernel).
 ///     macOS / native Windows fall back to cooperative HTTP_PROXY only,
 ///     with a clear warning.
+///
+/// Gated behind the `contained` cargo feature — see Cargo.toml.
+#[cfg(feature = "contained")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_contained_legacy(
     script: &str,

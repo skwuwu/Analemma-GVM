@@ -40,6 +40,13 @@ pub struct AgentConfig {
 pub enum LaunchMode {
     Cooperative,
     Sandbox,
+    /// Docker-isolation mode. Gated behind the `contained` cargo feature
+    /// because the in-container DNAT to MITM, CA injection, and proxy
+    /// env handling are not yet wired — see `Cargo.toml [features]
+    /// contained` for the rationale. Default builds omit this variant
+    /// entirely so the CLI surface does not advertise an experimental
+    /// flag.
+    #[cfg(feature = "contained")]
     Contained {
         image: String,
         memory: String,
@@ -101,9 +108,13 @@ pub async fn pre_launch(config: &AgentConfig) -> Result<PreLaunchState> {
     //    skip MITM entirely (no CA injection target inside the
     //    sandbox / no namespace at all for cooperative).
     let admin_url = run::derive_admin_url(&config.proxy);
+    #[cfg(feature = "contained")]
+    let is_contained = matches!(config.mode, LaunchMode::Contained { .. });
+    #[cfg(not(feature = "contained"))]
+    let is_contained = false;
     let (mitm_ca, sandbox_id) = if config.no_mitm
         || config.mode == LaunchMode::Cooperative
-        || matches!(config.mode, LaunchMode::Contained { .. })
+        || is_contained
     {
         (None, None)
     } else {
@@ -180,6 +191,7 @@ pub async fn launch(config: &AgentConfig, pre: &PreLaunchState) -> Result<i32> {
     match &config.mode {
         LaunchMode::Cooperative => launch_cooperative(config, pre).await,
         LaunchMode::Sandbox => launch_sandbox(config, pre).await,
+        #[cfg(feature = "contained")]
         LaunchMode::Contained { .. } => launch_contained_wrapper(config, pre).await,
     }
 }
@@ -576,6 +588,7 @@ pub fn print_cleanup_verification(v: &gvm_sandbox::CleanupVerification) {
     }
 }
 
+#[cfg(feature = "contained")]
 async fn launch_contained_wrapper(config: &AgentConfig, _pre: &PreLaunchState) -> Result<i32> {
     // Contained mode delegates to run.rs's existing run_contained which has
     // complex Docker-specific logic (image building, volume mounts, DNAT entrypoint).
@@ -775,6 +788,7 @@ fn print_banner(config: &AgentConfig) {
             eprintln!("{BOLD}Analemma GVM \u{2014} Sandbox Mode (Layer 2 + 3){RESET}");
             eprintln!("{DIM}Kernel isolation: namespace + seccomp + veth + TC filter.{RESET}");
         }
+        #[cfg(feature = "contained")]
         LaunchMode::Contained { .. } => {
             eprintln!("{BOLD}Analemma-GVM \u{2014} Agent Containment (Layer 3){RESET}");
         }
@@ -794,7 +808,12 @@ fn print_security_layers(config: &AgentConfig) {
     match &config.mode {
         LaunchMode::Cooperative => {
             eprintln!("    {GREEN}\u{2713}{RESET} Layer 2: Enforcement Proxy");
+            #[cfg(feature = "contained")]
             eprintln!("    {DIM}\u{25cb}{RESET} Layer 3: OS Containment {DIM}(add --sandbox or --contained){RESET}");
+            #[cfg(not(feature = "contained"))]
+            eprintln!(
+                "    {DIM}\u{25cb}{RESET} Layer 3: OS Containment {DIM}(add --sandbox){RESET}"
+            );
         }
         LaunchMode::Sandbox => {
             eprintln!("    {GREEN}\u{2713}{RESET} Layer 2: Enforcement Proxy");
@@ -807,6 +826,7 @@ fn print_security_layers(config: &AgentConfig) {
             eprintln!("      {DIM}\u{2022} Seccomp-BPF: syscall whitelist{RESET}");
             eprintln!("      {DIM}\u{2022} Transparent MITM: ephemeral CA, full L7 HTTPS inspection{RESET}");
         }
+        #[cfg(feature = "contained")]
         LaunchMode::Contained { .. } => {
             eprintln!("    {GREEN}\u{2713}{RESET} Layer 2: Enforcement Proxy");
             eprintln!("    {GREEN}\u{2713}{RESET} Layer 3: Docker Containment");
