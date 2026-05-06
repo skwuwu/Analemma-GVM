@@ -5,9 +5,6 @@ edition = "2021"
 description = "Linux-native agent sandboxing — namespace, seccomp-BPF, and network isolation"
 license = "Apache-2.0"
 
-[features]
-default = []
-
 [dependencies]
 anyhow = "1"
 tracing = "0.1"

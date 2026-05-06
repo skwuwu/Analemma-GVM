@@ -27,18 +27,23 @@ tokio = { version = "1", features = ["full"] }
 arc-swap = "1"
 axum = "0.7"
 tower = { version = "0.4", features = ["limit", "util"] }
-tower-http = { version = "0.5", features = ["trace", "limit", "catch-panic"] }
-hyper = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["limit", "catch-panic"] }
+# `hyper` features pinned to the minimum the proxy actually exercises:
+# server + client over HTTP/1. We never call into HTTP/2 — the upstream
+# LLM hop happens through CONNECT tunnels (raw TCP), and inbound clients
+# negotiate http/1.1 via ALPN at the MITM listener. `full` was pulling
+# in the entire h2 + hpack stack for code that never runs.
+hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
 http-body-util = "0.1"
 async-stream = "0.3"
 futures-util = "0.3"
-matchit = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 sha2 = "0.10"
 hmac = "0.12"
 base64 = "0.22"
