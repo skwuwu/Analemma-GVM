@@ -76,6 +76,33 @@ impl GvmCertResolver {
     /// PEM back to Certificate). Both the original and reconstructed certs share
     /// the same key, so signatures are valid against either.
     pub fn new(ca_cert_pem: &[u8], ca_key_pem: &[u8]) -> Result<Self> {
+        // Default DN matches the proxy-wide MITM CA reconstructed by
+        // `gvm_sandbox::ca::SandboxCA::generate` (legacy shared CA path).
+        Self::new_with_dn(ca_cert_pem, ca_key_pem, "GVM MITM CA", "Analemma GVM")
+    }
+
+    /// Build a resolver, using the supplied (`common_name`, `organization`)
+    /// pair when reconstructing the CA cert.
+    ///
+    /// **DN match contract**: `common_name` and `organization` MUST equal
+    /// the DN of the original CA cert in `ca_cert_pem`. The reconstructed
+    /// `ca_cert` is what rcgen uses as the *issuer* when minting leaf
+    /// certs (`leaf_cert.signed_by(... &self.ca_cert ...)` at line ~159).
+    /// The original CA cert DER goes into the chain at position 1
+    /// (`chain[1]`). If the DNs disagree, the leaf's `issuer` field will
+    /// point to one DN while `chain[1].subject` carries another — every
+    /// strict TLS verifier (rustls, OpenSSL, BoringSSL) walks `leaf →
+    /// chain[1]` by matching `leaf.issuer == chain[1].subject` and
+    /// reports `unable to get local issuer certificate` (errno 20) when
+    /// they differ. The previous hardcoded `"GVM MITM CA"` worked for
+    /// the legacy shared CA but silently broke `from_sandbox_ca`, where
+    /// every per-sandbox CA carries `CN = "GVM Sandbox CA ({sandbox_id})"`.
+    pub fn new_with_dn(
+        ca_cert_pem: &[u8],
+        ca_key_pem: &[u8],
+        common_name: &str,
+        organization: &str,
+    ) -> Result<Self> {
         let ca_key_str = std::str::from_utf8(ca_key_pem).context("CA key not valid UTF-8")?;
 
         let ca_key = KeyPair::from_pem(ca_key_str).context("Failed to parse CA key PEM")?;
@@ -88,15 +115,14 @@ impl GvmCertResolver {
             .context("Failed to parse CA cert PEM")?
             .to_vec();
 
-        // Reconstruct CA cert from key (self-signed)
+        // Reconstruct CA cert from key (self-signed). DN comes from the
+        // caller — see `new_with_dn` doc for the match contract.
         let mut params = CertificateParams::default();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        // DN must match ca.rs exactly. Mismatch causes "unable to get
-        // local issuer certificate" — leaf issuer DN ≠ chain CA subject DN.
         params.distinguished_name = {
             let mut dn = DistinguishedName::new();
-            dn.push(DnType::CommonName, "GVM MITM CA");
-            dn.push(DnType::OrganizationName, "Analemma GVM");
+            dn.push(DnType::CommonName, common_name);
+            dn.push(DnType::OrganizationName, organization);
             dn
         };
         // Backdate not_before for clock drift tolerance
@@ -131,7 +157,17 @@ impl GvmCertResolver {
     /// reused for sandbox B's TLS handshake (which wouldn't validate
     /// anyway, since B's trust store carries B's CA cert, not A's).
     pub fn from_sandbox_ca(ca: &gvm_sandbox::ca::SandboxCA) -> Result<Self> {
-        Self::new(ca.ca_cert_pem(), &ca.ca_key_pem())
+        // The per-sandbox CA's CN encodes the sandbox_id (see
+        // `SandboxCA::generate_for_sandbox` — `format!("GVM Sandbox CA
+        // ({})", sandbox_id)`). Pass that exact DN through so the
+        // reconstructed `ca_cert` (used as issuer for minted leaves)
+        // matches the original CA in `chain[1]`. Without this, every
+        // leaf signed by a per-sandbox CA fails strict verification
+        // with `unable to get local issuer certificate` (errno 20),
+        // because `leaf.issuer == "GVM MITM CA"` (hardcoded default)
+        // didn't equal `chain[1].subject == "GVM Sandbox CA (...)"`.
+        let cn = format!("GVM Sandbox CA ({})", ca.sandbox_id());
+        Self::new_with_dn(ca.ca_cert_pem(), &ca.ca_key_pem(), &cn, "Analemma GVM")
     }
 
     /// Issue a leaf cert for the given domain. Caches the result.

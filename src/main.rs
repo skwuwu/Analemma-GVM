@@ -1189,6 +1189,41 @@ async fn handle_tls_connection(
     let peer_ip = stream.peer_addr().ok().map(|a| a.ip());
     let sandbox_anchor = state.resolve_sandbox_anchor(peer_ip);
 
+    // CA-4 routing for the transparent-DNAT MITM listener: resolve the
+    // peer's veth IP to a registered `sandbox_id` and prefer that
+    // sandbox's per-sandbox CA bundle. The CONNECT path
+    // (`proxy::connect.rs::handle_connect_inner`) already does this; the
+    // TLS listener was using the proxy-wide shared MITM CA only, which
+    // mismatched the per-sandbox CA injected into each sandbox's trust
+    // store at launch — sandboxes received a leaf signed by the shared
+    // CA, validated against a trust store containing only the
+    // per-sandbox CA, and rejected with `unknown CA (560)` on every
+    // direct HTTPS call routed through DNAT. Mirroring the CONNECT
+    // logic here makes the two MITM entry points use the same CA bundle
+    // for the same sandbox.
+    type PerSandboxBundle = (
+        std::sync::Arc<gvm_proxy::tls_proxy::GvmCertResolver>,
+        std::sync::Arc<rustls::ServerConfig>,
+    );
+    #[cfg(target_os = "linux")]
+    let per_sandbox: Option<PerSandboxBundle> = peer_ip
+        .filter(|ip| !ip.is_loopback())
+        .and_then(|ip| gvm_sandbox::lookup_sandbox_id_by_ip(&ip.to_string()))
+        .and_then(|sandbox_id| {
+            tracing::debug!(
+                sandbox = %sandbox_id,
+                "TLS listener: routing to per-sandbox CA (CA-4)"
+            );
+            state.tls_bundle_for_sandbox(&sandbox_id)
+        });
+    #[cfg(not(target_os = "linux"))]
+    let per_sandbox: Option<PerSandboxBundle> = None;
+
+    let (effective_resolver, effective_sc) = match per_sandbox {
+        Some((r, sc)) => (r, sc),
+        None => (resolver, server_config),
+    };
+
     // 1. Pre-warm cert cache: peek SNI from raw TCP, generate cert on blocking
     //    thread pool. This prevents CPU-bound keygen from starving tokio workers.
     //    We also keep the SNI string itself to pass to the MITM handler — it's
@@ -1196,13 +1231,17 @@ async fn handle_tls_connection(
     //    Without it the handler falls back to the client's Host header, which
     //    inside a sandbox is the proxy's own veth IP, causing the upstream
     //    relay to connect back to itself and hang.
+    //
+    //    Pre-warm runs on the EFFECTIVE resolver (per-sandbox or shared) so
+    //    the TLS handshake's `resolve()` call is a 0ns cache hit signed by
+    //    the right CA — no fallback to a different leaf at handshake time.
     let sni = peek_sni(&stream).await;
     if let Some(ref s) = sni {
-        resolver.ensure_cached(s.clone()).await;
+        effective_resolver.ensure_cached(s.clone()).await;
     }
 
     // 2. TLS handshake with timeout (SNI → cache hit from step 1)
-    let acceptor = TlsAcceptor::from(server_config);
+    let acceptor = TlsAcceptor::from(effective_sc);
     let tls_stream = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
         .await
         .map_err(|_| anyhow::anyhow!("TLS handshake timed out"))??;
