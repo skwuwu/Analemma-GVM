@@ -42,7 +42,6 @@ fn evt(id: &str, decision: &str) -> GVMEvent {
         enforcement_point: "test".to_string(),
         status: EventStatus::Confirmed,
         payload: PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,
@@ -140,7 +139,7 @@ async fn mixed_priority_batch_shares_single_anchor() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
     let ledger = Arc::new(
-        Ledger::with_config(&wal_path, "", "", batch_window_50ms())
+        Ledger::with_config(&wal_path, batch_window_50ms())
             .await
             .unwrap(),
     );
@@ -206,7 +205,7 @@ async fn high_priority_event_does_not_wait_behind_low_burst() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
     let ledger = Arc::new(
-        Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+        Ledger::with_config(&wal_path, one_event_per_batch())
             .await
             .unwrap(),
     );
@@ -263,7 +262,7 @@ async fn high_priority_event_does_not_wait_behind_low_burst() {
 async fn within_lane_order_is_preserved_fifo() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+    let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
         .await
         .unwrap();
 
@@ -299,7 +298,7 @@ async fn shutdown_drains_pending_events_in_all_lanes() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
     let ledger = Arc::new(
-        Ledger::with_config(&wal_path, "", "", batch_window_50ms())
+        Ledger::with_config(&wal_path, batch_window_50ms())
             .await
             .unwrap(),
     );

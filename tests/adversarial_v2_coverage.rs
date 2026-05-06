@@ -58,7 +58,6 @@ fn make_v2_event(id: &str) -> GVMEvent {
         enforcement_point: "test".to_string(),
         status: EventStatus::Confirmed,
         payload: PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,
@@ -93,7 +92,7 @@ async fn v2_event_tampered_detail_digest_breaks_hash_recompute() {
     // stored hash — verify_wal flags it as tampered.
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+    let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
         .await
         .unwrap();
     ledger
@@ -142,7 +141,7 @@ async fn v2_event_stripped_descriptor_breaks_hash_recompute() {
     // different hash than the v2 hash that was stored. Tamper flagged.
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+    let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
         .await
         .unwrap();
     ledger
@@ -183,7 +182,7 @@ async fn v2_batch_with_inserted_event_invalidates_root() {
     // root and verify_wal flags the batch invalid.
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+    let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
         .await
         .unwrap();
     ledger
@@ -227,7 +226,7 @@ async fn cli_audit_verify_does_not_misreport_v2_as_tampered() {
     // record we can read off disk.
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+    let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
         .await
         .unwrap();
     for i in 0..3 {
@@ -312,7 +311,7 @@ async fn proof_with_truncated_leaves_blob_is_rejected_by_verifier() {
     // we claim to include is no longer recoverable from the blob.
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+    let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
         .await
         .unwrap();
     ledger
@@ -343,11 +342,7 @@ async fn aggregator_concurrent_register_converges_to_deterministic_root() {
     // the root computed offline from the union of all
     // registrations — irrespective of insertion order.
     let dir = tempfile::tempdir().unwrap();
-    let mut ledger = Arc::new(
-        Ledger::new(&dir.path().join("wal.log"), "", "")
-            .await
-            .unwrap(),
-    );
+    let mut ledger = Arc::new(Ledger::new(&dir.path().join("wal.log")).await.unwrap());
     let agg = CheckpointAggregator::new(Arc::clone(&ledger));
 
     // Plan: 8 agents × 4 steps each, 32 concurrent register calls.
@@ -446,7 +441,7 @@ async fn happy_path_v2_event_recomputes_clean() {
     // every batch — a CLEAN v2 WAL must report zero tampered_events.
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+    let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
         .await
         .unwrap();
     ledger

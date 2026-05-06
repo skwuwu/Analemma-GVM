@@ -72,6 +72,71 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
+### 2026-05-07: Drop NATS / Redis ghost integrations from runtime + config
+
+**What changed:**
+
+The `[nats]` and `[redis]` sections of `proxy.toml` previously
+configured external streaming integrations that the runtime never
+actually performed. The only NATS code path was a `tokio::spawn` that
+emitted a `tracing::debug!("NATS publish (stub)")` line and returned
+— no client, no connection, no publish. Likewise `RedisBackend` was
+mentioned in `Vault` doc examples but no implementation existed.
+
+Removed:
+- `Ledger::{new, with_config, with_config_and_signer}` — drop
+  `nats_url` and `stream_name` parameters from all four constructors
+  (135 callers migrated).
+- `Ledger` struct — drop `nats_url`, `stream_name` fields.
+- `append_durable` — drop the no-op `tokio::spawn` block that
+  pretended to publish to NATS.
+- `append_async` — replace the same stub with an empty body
+  (reserved as a sink for future operator-supplied forwarders).
+- `GVMEvent.nats_sequence` — drop the field entirely (was always
+  `None` everywhere; not part of either v1 or v2 event_hash
+  canonical input, so removing it does not affect chain integrity).
+- `src/config.rs::NatsConfig` and `RedisConfig` structs — gone.
+  `ProxyConfig.nats` and `.redis` are now `Option<toml::Value>` for
+  forward parser tolerance: older `proxy.toml` files with `[nats]`
+  / `[redis]` sections still load without error, the values are
+  just ignored at runtime.
+- `config/proxy.toml` and the three `config/templates/*/proxy.toml`
+  files — `[nats]` / `[redis]` sections removed with a replacement
+  comment explaining the operator-managed-replication model.
+
+**Why:**
+
+CLAUDE.md "Never claim more than implemented" — shipping a
+`proxy.toml` that prompts the operator to configure
+`nats://localhost:4222` while the runtime ignores the value is the
+exact false promise the standard prohibits. External streaming
+(NATS / Redis / Kafka / SIEM) is the operator's responsibility:
+tail the WAL with rsync, fluentd, vector, syslog, or S3 backup —
+whatever fits the deployment. The local WAL is the single source
+of truth.
+
+**Affected files:**
+
+- `src/ledger.rs` (struct + constructors + append paths)
+- `src/main.rs` (Ledger::with_config call site)
+- `src/proxy/mod.rs` (test Ledger::new caller migrated)
+- `src/config.rs` (struct + tests + defaults)
+- `crates/gvm-types/src/lib.rs` (`GVMEvent.nats_sequence` removed)
+- `config/proxy.toml`, `config/templates/{finance,healthcare,saas}/proxy.toml`
+- `benches/pipeline.rs`, ~25 test files (mechanical migration)
+
+**Risk:**
+
+Backward-compat: WAL files written by previous code carry
+`"nats_sequence": null` per event; serde's default ignores unknown
+fields so they still parse cleanly into the new `GVMEvent`.
+Forward-compat: WAL files written by new code are MISSING the
+field; old binaries reading them would error on the now-mandatory
+`nats_sequence: Option<u64>` deserialize, but operators are
+expected to upgrade the verifier alongside the producer.
+
+All 800 workspace tests pass; fmt + clippy clean.
+
 ### 2026-05-06: Sandbox-peer identity — close JWT gap for SDK-less agents
 
 **What changed:**

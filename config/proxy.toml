@@ -14,13 +14,13 @@ require_approval = "soft_pivot"  # IC-3: suggest alternatives, allow retry
 throttle = "rollback"            # Rate limit: roll back and retry later
 infrastructure_failure = "halt"  # WAL/disk failure: halt for safety
 
-[nats]
-url = "nats://localhost:4222"
-stream = "gvm-audit"
-max_age_days = 2555
-
-[redis]
-url = "redis://localhost:6379"
+# External streaming (NATS / Redis / Kafka / SIEM) is operator-managed.
+# GVM does not connect to external systems on the operator's behalf —
+# the local WAL is the single source of truth. To replicate audit
+# events off-host, tail `data/wal.log` with your own forwarder
+# (rsync, fluentd, vector, syslog, S3 backup — operator's choice).
+# Older proxy.toml files with `[nats]` / `[redis]` sections still
+# parse (the runtime ignores them) so upgrading is a no-op.
 
 [wal]
 # batch_window_ms = 2          # Group commit window (higher = more throughput, more latency)

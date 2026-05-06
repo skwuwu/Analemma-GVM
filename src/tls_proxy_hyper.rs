@@ -437,7 +437,6 @@ async fn handle_request(
         enforcement_point: "mitm".to_string(),
         status: gvm_types::EventStatus::Pending,
         payload: gvm_types::PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: is_default_caution,

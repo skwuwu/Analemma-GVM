@@ -41,7 +41,6 @@ fn make_test_event(id: &str) -> GVMEvent {
         enforcement_point: "test".to_string(),
         status: EventStatus::Pending,
         payload: PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,
@@ -243,7 +242,7 @@ async fn vault_10k_encrypt_decrypt_no_leak() {
         ..Default::default()
     };
     let ledger = Arc::new(
-        Ledger::with_config(&wal_path, "", "", config)
+        Ledger::with_config(&wal_path, config)
             .await
             .expect("ledger with valid path must initialize"),
     );
@@ -284,7 +283,7 @@ async fn vault_1mb_value_roundtrip() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
+        Ledger::new(&wal_path)
             .await
             .expect("ledger with valid path must initialize"),
     );
@@ -318,7 +317,7 @@ async fn wal_1000_concurrent_durable_appends() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
+        Ledger::new(&wal_path)
             .await
             .expect("ledger with valid path must initialize"),
     );
@@ -384,7 +383,7 @@ async fn wal_sustained_load_10k_events() {
     };
 
     let ledger = Arc::new(
-        Ledger::with_config(&wal_path, "", "", config)
+        Ledger::with_config(&wal_path, config)
             .await
             .expect("ledger with valid config must initialize"),
     );
@@ -544,7 +543,7 @@ async fn wal_throughput_all_allow() {
     };
 
     let ledger = Arc::new(
-        Ledger::with_config(&wal_path, "", "", config)
+        Ledger::with_config(&wal_path, config)
             .await
             .expect("ledger init"),
     );
@@ -607,7 +606,7 @@ async fn verify_wal_latency_100k_events() {
     };
 
     let ledger = Arc::new(
-        Ledger::with_config(&wal_path, "", "", config)
+        Ledger::with_config(&wal_path, config)
             .await
             .expect("ledger init"),
     );

@@ -108,7 +108,7 @@ pub async fn test_state() -> (AppState, TestWal) {
     ));
     let api_keys = Arc::new(APIKeyStore::from_map(std::collections::HashMap::new()));
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
+        Ledger::new(&wal_path)
             .await
             .expect("test ledger must initialize"),
     );

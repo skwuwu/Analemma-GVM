@@ -167,7 +167,6 @@ pub fn build_sandbox_launch_event(
         enforcement_point: "sandbox-launcher".to_string(),
         status: EventStatus::Confirmed,
         payload: PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None, // Ledger fills in on append
         llm_trace: None,
         default_caution: false,

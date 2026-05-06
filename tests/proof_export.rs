@@ -50,7 +50,6 @@ fn make_event(id: &str) -> GVMEvent {
         enforcement_point: "test".to_string(),
         status: EventStatus::Confirmed,
         payload: PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,
@@ -70,7 +69,7 @@ fn one_event_per_batch() -> GroupCommitConfig {
 }
 
 async fn write_one_event(wal_path: &std::path::Path, event_id: &str) {
-    let mut ledger = Ledger::with_config(wal_path, "", "", one_event_per_batch())
+    let mut ledger = Ledger::with_config(wal_path, one_event_per_batch())
         .await
         .unwrap();
     ledger.append_durable(&make_event(event_id)).await.unwrap();
@@ -128,7 +127,7 @@ async fn tampered_merkle_path_fails_inclusion() {
     // Need at least 2 leaves to have a non-trivial path. Append two
     // more events to the same WAL so the inclusion path has siblings.
     {
-        let mut ledger = Ledger::with_config(&wal_path, "", "", {
+        let mut ledger = Ledger::with_config(&wal_path, {
             // Force batches of size 4 so all events end up in the same
             // batch with multiple leaves.
             GroupCommitConfig {
@@ -286,8 +285,6 @@ async fn batch_proof_bundles_all_events() {
     let wal_path = dir.path().join("wal.log");
     let ledger = Ledger::with_config(
         &wal_path,
-        "",
-        "",
         GroupCommitConfig {
             batch_window: std::time::Duration::from_millis(50),
             max_batch_size: 16,

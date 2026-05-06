@@ -153,8 +153,18 @@ pub fn load_gvm_toml() -> Option<GvmConfig> {
 pub struct ProxyConfig {
     pub server: ServerConfig,
     pub enforcement: EnforcementConfig,
-    pub nats: NatsConfig,
-    pub redis: RedisConfig,
+    /// Legacy NATS streaming config. Ignored — GVM does not connect
+    /// to external streaming systems on the operator's behalf
+    /// (off-host audit replication is operator-managed: tail the WAL
+    /// with rsync / fluentd / vector / S3 backup). Kept as optional
+    /// so older `proxy.toml` files with a `[nats]` section still
+    /// parse without erroring at startup.
+    #[serde(default)]
+    pub nats: Option<toml::Value>,
+    /// Legacy Redis backend config. Ignored — same rationale as
+    /// `nats` above.
+    #[serde(default)]
+    pub redis: Option<toml::Value>,
     pub srr: SrrConfig,
     /// Legacy ABAC policy config. Ignored (ABAC removed). Kept as optional
     /// so existing proxy.toml files with [policies] section still parse.
@@ -509,18 +519,6 @@ pub struct DefaultDecisionConfig {
 }
 
 #[derive(Deserialize, Clone, Debug)]
-pub struct NatsConfig {
-    pub url: String,
-    pub stream: String,
-    pub max_age_days: u64,
-}
-
-#[derive(Deserialize, Clone, Debug)]
-pub struct RedisConfig {
-    pub url: String,
-}
-
-#[derive(Deserialize, Clone, Debug)]
 pub struct SrrConfig {
     pub network_file: String,
     pub semantic_file: String,
@@ -663,14 +661,8 @@ impl Default for ProxyConfig {
                 default_delay_ms: 300,
                 policy_link_template: None,
             },
-            nats: NatsConfig {
-                url: "nats://127.0.0.1:4222".to_string(),
-                stream: "gvm-audit".to_string(),
-                max_age_days: 2555,
-            },
-            redis: RedisConfig {
-                url: "redis://127.0.0.1:6379".to_string(),
-            },
+            nats: None,
+            redis: None,
             srr: SrrConfig {
                 network_file: "config/srr_network.toml".to_string(),
                 semantic_file: "config/srr_semantic.toml".to_string(),
@@ -846,9 +838,8 @@ max_tokens_per_hour = 1000
         assert_eq!(config.enforcement.ic3_approval_timeout_secs, 300);
         assert_eq!(config.enforcement.default_unknown, "delay");
         assert_eq!(config.enforcement.default_delay_ms, 300);
-        assert_eq!(config.nats.url, "nats://127.0.0.1:4222");
-        assert_eq!(config.nats.stream, "gvm-audit");
-        assert_eq!(config.redis.url, "redis://127.0.0.1:6379");
+        assert!(config.nats.is_none());
+        assert!(config.redis.is_none());
         assert!(config.srr.hot_reload);
         assert!(config.srr.payload_inspection);
         assert_eq!(config.srr.max_body_bytes, 65536);
@@ -875,6 +866,9 @@ ic1_loss_threshold = 0.01
 [enforcement.default_decision]
 type = "Allow"
 
+# Legacy [nats] section — silently ignored. Kept here so the
+# parser-tolerance is exercised: loading an old proxy.toml with
+# external-streaming sections must not fail at startup.
 [nats]
 url = "nats://10.0.0.1:4222"
 stream = "test-stream"
@@ -899,7 +893,11 @@ key_env = "MY_KEY"
         assert_eq!(config.server.listen, "127.0.0.1:9999");
         assert_eq!(config.server.admin_listen, "127.0.0.1:9090"); // default
         assert!(!config.enforcement.ic1_async_ledger);
-        assert_eq!(config.nats.url, "nats://10.0.0.1:4222");
+        // Legacy [nats]/[redis] sections parse into Option<toml::Value>
+        // and are then ignored by the runtime. Kept for backward compat
+        // so older proxy.toml files don't error at startup.
+        assert!(config.nats.is_some());
+        assert!(config.redis.is_some());
         assert!(!config.srr.hot_reload);
     }
 

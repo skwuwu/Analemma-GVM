@@ -992,14 +992,28 @@ async fn rotate_wal(
     Ok(())
 }
 
-// ─── Ledger: WAL-first local write + async NATS JetStream forwarding ───
+// ─── Ledger: durable local WAL ───
 
-/// Ledger: WAL-first local write + async NATS JetStream forwarding.
+/// Ledger: WAL-first local write.
 ///
-/// Design (PART 5.3, v8.2 errata):
-/// - IC-2/3 (durable): WAL append (group commit fsync) → async NATS publish
-/// - IC-1 (async): skip WAL, fire-and-forget NATS publish (loss tolerated)
-/// - Crash recovery: replay WAL, re-publish events missing from NATS
+/// External integrations (NATS JetStream, Redis, etc.) are
+/// deliberately out of scope: GVM does not connect to external
+/// audit/streaming systems on the operator's behalf. The local
+/// WAL is the single source of truth, and operators forward it to
+/// downstream systems via their own mechanism (rsync, fluentd,
+/// vector, syslog, S3 backup — pick whatever fits the
+/// deployment). Earlier prototype code emitted a "NATS configured
+/// (connection deferred)" log line when `nats_url` was non-empty
+/// but never actually connected; that "ghost feature" has been
+/// removed because it promised something the runtime did not
+/// deliver. See `docs/internal/CHANGELOG.md` for the removal
+/// rationale.
+///
+/// Design:
+/// - IC-2/3 (durable): WAL append (group commit fsync).
+/// - IC-1 (async): skip WAL, fire-and-forget (loss tolerated).
+/// - Emergency WAL: degraded-but-auditable fallback for disk
+///   issues with the primary WAL.
 pub struct Ledger {
     wal: WAL,
     /// Emergency fallback WAL for when the primary WAL fails.
@@ -1010,15 +1024,11 @@ pub struct Ledger {
     primary_failures: AtomicU64,
     /// Total events written to the emergency WAL (observable metric).
     emergency_writes: AtomicU64,
-    // NATS JetStream connection — stubbed for MVP, will be connected in production
-    nats_url: String,
-    stream_name: String,
     /// Monotonic WAL sequence number.
-    /// Guarantees ordering: NATS consumers can reconstruct WAL order
-    /// even if async-published messages arrive out of order.
-    ///
-    /// Initialized from WAL event count during recovery to avoid
-    /// duplicate sequences across restarts.
+    /// Guarantees ordering across batch boundaries — useful for
+    /// downstream consumers that tail the WAL and need to resume
+    /// from a known point. Initialized from WAL event count during
+    /// recovery to avoid duplicate sequences across restarts.
     wal_sequence: AtomicU64,
 }
 
@@ -1058,32 +1068,16 @@ impl Ledger {
         self.wal.triple.load_full()
     }
 
-    /// Initialize the ledger with WAL and NATS configuration.
-    pub async fn new(wal_path: &Path, nats_url: &str, stream_name: &str) -> Result<Self> {
-        Self::with_config(
-            wal_path,
-            nats_url,
-            stream_name,
-            GroupCommitConfig::default(),
-        )
-        .await
+    /// Initialize the ledger backed by the WAL at `wal_path`. Uses
+    /// the default group-commit configuration. External integrations
+    /// (NATS, Redis, etc.) are user-managed — see the struct doc.
+    pub async fn new(wal_path: &Path) -> Result<Self> {
+        Self::with_config(wal_path, GroupCommitConfig::default()).await
     }
 
     /// Initialize the ledger with explicit group commit configuration.
-    pub async fn with_config(
-        wal_path: &Path,
-        nats_url: &str,
-        stream_name: &str,
-        config: GroupCommitConfig,
-    ) -> Result<Self> {
-        Self::with_config_and_signer(
-            wal_path,
-            nats_url,
-            stream_name,
-            config,
-            Arc::new(NoopSigner),
-        )
-        .await
+    pub async fn with_config(wal_path: &Path, config: GroupCommitConfig) -> Result<Self> {
+        Self::with_config_and_signer(wal_path, config, Arc::new(NoopSigner)).await
     }
 
     /// Phase 6: initialize the ledger with a custom anchor signer.
@@ -1093,8 +1087,6 @@ impl Ledger {
     /// not block (the trait method is sync-by-design).
     pub async fn with_config_and_signer(
         wal_path: &Path,
-        nats_url: &str,
-        stream_name: &str,
         config: GroupCommitConfig,
         signer: Arc<dyn AnchorSigner>,
     ) -> Result<Self> {
@@ -1104,36 +1096,31 @@ impl Ledger {
         let emergency_path = wal_path.with_file_name("wal_emergency.log");
         let emergency_wal = EmergencyWAL::open(&emergency_path).await?;
 
-        // NATS connection will be established when available
-        if !nats_url.is_empty() {
-            tracing::info!(
-                url = nats_url,
-                stream = stream_name,
-                "NATS configured (connection deferred)"
-            );
-        }
-
         Ok(Self {
             wal,
             emergency_wal,
             primary_failures: AtomicU64::new(0),
             emergency_writes: AtomicU64::new(0),
-            nats_url: nats_url.to_string(),
-            stream_name: stream_name.to_string(),
             wal_sequence: AtomicU64::new(0),
         })
     }
 
-    /// IC-2/3 durable write: WAL append first, then async NATS publish.
+    /// IC-2/3 durable write: WAL append (group-commit fsync + Merkle).
     ///
     /// Fallback behavior:
     /// - Primary WAL succeeds → normal path, reset failure counter
     /// - Primary WAL fails → attempt emergency WAL → if emergency succeeds,
     ///   return Ok (degraded mode) and increment failure counter
     /// - Both fail → return Err (true Fail-Close, request must be rejected)
+    ///
+    /// External streaming (NATS / Redis / Kafka / SIEM) is NOT performed
+    /// here — operators tail the WAL via their own process if they want
+    /// off-host replication.
     pub async fn append_durable(&self, event: &GVMEvent) -> Result<()> {
-        // 1. Assign monotonic WAL sequence (atomic, lock-free)
-        let wal_seq = self.wal_sequence.fetch_add(1, Ordering::SeqCst);
+        // 1. Assign monotonic WAL sequence (atomic, lock-free).
+        //    Useful as a resume cursor for downstream consumers that
+        //    tail the WAL.
+        let _wal_seq = self.wal_sequence.fetch_add(1, Ordering::SeqCst);
 
         // 2. Local WAL append (group commit — batched fsync + Merkle)
         match self.wal.append(event).await {
@@ -1176,27 +1163,6 @@ impl Ledger {
                 }
             }
         }
-
-        // 3. Async NATS publish (background, non-blocking)
-        // wal_seq is included so NATS consumers can reconstruct WAL order
-        // even if tokio::spawn tasks execute out of order.
-        let event_json = serde_json::to_vec(event)?;
-        let nats_url = self.nats_url.clone();
-        let subject = format!("{}.events", self.stream_name);
-
-        tokio::spawn(async move {
-            if nats_url.is_empty() {
-                return;
-            }
-            // NATS publish — stubbed for MVP
-            // In production: include wal_seq as NATS header for ordering
-            tracing::debug!(
-                subject = subject,
-                event_bytes = event_json.len(),
-                wal_sequence = wal_seq,
-                "NATS publish (stub)"
-            );
-        });
 
         Ok(())
     }
@@ -1298,7 +1264,6 @@ impl Ledger {
             enforcement_point: "startup".to_string(),
             status: EventStatus::Confirmed,
             payload: crate::types::PayloadDescriptor::default(),
-            nats_sequence: None,
             event_hash: None,
             llm_trace: None,
             default_caution: false,
@@ -1419,7 +1384,6 @@ pub fn build_dns_event(
         enforcement_point: "dns-proxy".to_string(),
         status: crate::types::EventStatus::Confirmed,
         payload: crate::types::PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: true,
@@ -1432,32 +1396,26 @@ pub fn build_dns_event(
 
 impl Ledger {
     /// Low-audit-value, high-frequency events (DNS Tier 1 `Known`,
-    /// Vault read / list_keys). Publishes to NATS only; WAL is
-    /// **deliberately excluded from the audit chain** to bound log growth.
+    /// Vault read / list_keys) that are deliberately excluded from
+    /// the durable Merkle chain to bound log growth. The current
+    /// implementation is a no-op — the events are dropped on the
+    /// floor.
     ///
-    /// **Do not use for governance decisions** (Allow / AuditOnly / Delay /
-    /// RequireApproval / Deny). Those must go through [`append_durable`] so
-    /// they reach the Merkle chain and are available for compliance
-    /// verification, notarization, and `gvm suggest` rule generation.
-    pub async fn append_async(&self, event: GVMEvent) {
-        let event_json = match serde_json::to_vec(&event) {
-            Ok(j) => j,
-            Err(_) => return,
-        };
-
-        let nats_url = self.nats_url.clone();
-        let subject = format!("{}.events", self.stream_name);
-
-        tokio::spawn(async move {
-            if nats_url.is_empty() {
-                return;
-            }
-            tracing::debug!(
-                subject = subject,
-                event_bytes = event_json.len(),
-                "NATS async publish (stub)"
-            );
-        });
+    /// **Do not use for governance decisions** (Allow / AuditOnly /
+    /// Delay / RequireApproval / Deny). Those must go through
+    /// [`append_durable`] so they reach the Merkle chain and are
+    /// available for compliance verification, notarization, and
+    /// `gvm suggest` rule generation.
+    ///
+    /// Earlier prototype code emitted these into a NATS-publish
+    /// stub; that stub never made any network call and has been
+    /// removed (external streaming integrations are user-managed —
+    /// see the `Ledger` struct doc).
+    pub async fn append_async(&self, _event: GVMEvent) {
+        // Intentionally empty. Reserved as a sink for future
+        // operator-supplied off-chain forwarders (e.g. a callback
+        // registered at Ledger construction time). Until then,
+        // these events are not retained.
     }
 
     /// Crash recovery: scan WAL for Pending events and reconcile.
@@ -1707,7 +1665,6 @@ mod emergency_wal_tests {
             enforcement_point: "test".to_string(),
             status: crate::types::EventStatus::Confirmed,
             payload: crate::types::PayloadDescriptor::default(),
-            nats_sequence: None,
             event_hash: None,
             llm_trace: None,
             default_caution: false,

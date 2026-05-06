@@ -41,7 +41,6 @@ fn evt(id: &str) -> GVMEvent {
         enforcement_point: "test".to_string(),
         status: EventStatus::Confirmed,
         payload: PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,
@@ -64,7 +63,7 @@ fn one_event_per_batch() -> GroupCommitConfig {
 async fn fresh_wal_starts_at_genesis() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+    let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
         .await
         .unwrap();
 
@@ -93,7 +92,7 @@ async fn restart_recovers_last_anchor_into_chain() {
     let session1_last_anchor: String;
     let session1_last_batch_id: u64;
     {
-        let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+        let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
             .await
             .unwrap();
         for i in 0..3 {
@@ -116,7 +115,7 @@ async fn restart_recovers_last_anchor_into_chain() {
 
     // Session 2: open the same WAL, write one batch, shut down.
     {
-        let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+        let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
             .await
             .unwrap();
         ledger.append_durable(&evt("s2-0")).await.unwrap();
@@ -150,7 +149,7 @@ async fn restart_recovers_prev_batch_root() {
 
     let session1_last_root: String;
     {
-        let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+        let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
             .await
             .unwrap();
         ledger.append_durable(&evt("s1-0")).await.unwrap();
@@ -165,7 +164,7 @@ async fn restart_recovers_prev_batch_root() {
     }
 
     {
-        let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+        let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
             .await
             .unwrap();
         ledger.append_durable(&evt("s2-0")).await.unwrap();
@@ -198,7 +197,7 @@ async fn restart_recovers_active_context_hash() {
 
     let recovered_context: String;
     {
-        let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+        let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
             .await
             .unwrap();
         recovered_context = ledger
@@ -209,7 +208,7 @@ async fn restart_recovers_active_context_hash() {
     }
 
     {
-        let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+        let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
             .await
             .unwrap();
         // Triple-state snapshot must already carry the recovered context.
@@ -247,7 +246,7 @@ async fn cross_session_chain_passes_verify_audit() {
     let wal_path = dir.path().join("wal.log");
 
     {
-        let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+        let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
             .await
             .unwrap();
         for i in 0..2 {
@@ -259,7 +258,7 @@ async fn cross_session_chain_passes_verify_audit() {
         ledger.shutdown().await;
     }
     {
-        let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+        let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
             .await
             .unwrap();
         for i in 0..2 {
@@ -299,7 +298,7 @@ async fn malformed_wal_falls_back_to_genesis_safely() {
     // Write garbage that is not valid JSON.
     std::fs::write(&wal_path, b"this is not json\nneither is this\n").unwrap();
 
-    let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+    let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
         .await
         .unwrap();
     ledger.append_durable(&evt("post-garbage")).await.unwrap();
@@ -326,7 +325,7 @@ async fn recovered_chain_with_break_is_still_caught() {
     let wal_path = dir.path().join("wal.log");
 
     {
-        let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+        let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
             .await
             .unwrap();
         for i in 0..2 {

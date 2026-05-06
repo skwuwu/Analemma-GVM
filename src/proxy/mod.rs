@@ -1411,7 +1411,7 @@ mod tests {
     async fn make_test_ledger() -> (Arc<Ledger>, std::path::PathBuf) {
         let wal_path =
             std::env::temp_dir().join(format!("gvm-proxy-test-{}.wal", uuid::Uuid::new_v4()));
-        let ledger = Ledger::new(&wal_path, "", "gvm_test")
+        let ledger = Ledger::new(&wal_path)
             .await
             .expect("ledger init should succeed");
         (Arc::new(ledger), wal_path)
@@ -1436,7 +1436,6 @@ mod tests {
             enforcement_point: "proxy".to_string(),
             status: EventStatus::Pending,
             payload: PayloadDescriptor::default(),
-            nats_sequence: None,
             event_hash: None,
             llm_trace: None,
             default_caution: false,

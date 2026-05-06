@@ -64,7 +64,6 @@ fn evt(i: u64) -> GVMEvent {
         enforcement_point: "test".to_string(),
         status: EventStatus::Confirmed,
         payload: PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,
@@ -106,7 +105,7 @@ async fn shutdown_after_burst_flushes_every_event() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
 
-    let mut ledger = Ledger::new(&wal_path, "", "").await.expect("ledger init");
+    let mut ledger = Ledger::new(&wal_path).await.expect("ledger init");
 
     const N: u64 = 200;
     for i in 0..N {
@@ -147,7 +146,7 @@ async fn shutdown_returns_under_three_seconds_on_happy_path() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
 
-    let mut ledger = Ledger::new(&wal_path, "", "").await.expect("ledger init");
+    let mut ledger = Ledger::new(&wal_path).await.expect("ledger init");
 
     // Single small event so the batch task is unambiguously idle when
     // shutdown is called.
@@ -195,7 +194,7 @@ async fn concurrent_appends_during_shutdown_do_not_silently_drop() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
 
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger init"));
+    let ledger = Arc::new(Ledger::new(&wal_path).await.expect("ledger init"));
 
     const N: u64 = 200;
     const SHUTDOWN_AFTER: u64 = 60; // fire shutdown when ~30% have completed
@@ -290,7 +289,7 @@ async fn wal_is_readable_after_shutdown() {
     let wal_path = dir.path().join("wal.log");
 
     {
-        let mut ledger = Ledger::new(&wal_path, "", "").await.expect("ledger init");
+        let mut ledger = Ledger::new(&wal_path).await.expect("ledger init");
         for i in 0..50u64 {
             ledger
                 .append_durable(&evt(i))

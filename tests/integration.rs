@@ -27,7 +27,7 @@ async fn event_status_transitions_pending_to_confirmed_and_failed() {
     let wal_path = dir.path().join("wal.log");
 
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
+        Ledger::new(&wal_path)
             .await
             .expect("ledger with valid WAL path must initialize"),
     );
@@ -107,7 +107,7 @@ async fn event_status_transitions_pending_to_confirmed_and_failed() {
 
     // ── Phase 5: Crash recovery → Pending becomes Expired ──
     // Create a NEW ledger on the same WAL file (simulates restart)
-    let ledger2 = Ledger::new(&wal_path, "", "")
+    let ledger2 = Ledger::new(&wal_path)
         .await
         .expect("ledger must initialize from existing WAL file");
     let report = ledger2
@@ -159,7 +159,7 @@ async fn wal_nats_sequence_ordering_and_crash_recovery() {
 
     // Use a stub NATS URL to exercise the NATS publish path (no real connection)
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "nats://stub:4222", "gvm-stream")
+        Ledger::new(&wal_path)
             .await
             .expect("ledger with stub NATS config must initialize"),
     );
@@ -205,7 +205,7 @@ async fn wal_nats_sequence_ordering_and_crash_recovery() {
         .expect("appending crash-scenario pending event must succeed");
 
     // ── Phase 4: Crash recovery on new ledger instance ──
-    let ledger2 = Ledger::new(&wal_path, "nats://stub:4222", "gvm-stream")
+    let ledger2 = Ledger::new(&wal_path)
         .await
         .expect("ledger must initialize from existing WAL for recovery");
     let report = ledger2
@@ -419,7 +419,7 @@ decision = { type = "Delay", milliseconds = 300 }
     let api_keys =
         Arc::new(APIKeyStore::load(&secrets_path).expect("valid secrets config must parse"));
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
+        Ledger::new(&wal_path)
             .await
             .expect("ledger must initialize for end-to-end test"),
     );
@@ -612,7 +612,7 @@ async fn config_file_hashes_recorded_in_merkle_chain() {
     let expected_srr_hash = format!("{:x}", Sha256::digest(srr_content));
 
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
+        Ledger::new(&wal_path)
             .await
             .expect("ledger must initialize"),
     );
@@ -673,7 +673,7 @@ async fn config_hash_records_unavailable_for_missing_files() {
     let wal_path = dir.path().join("wal.log");
 
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
+        Ledger::new(&wal_path)
             .await
             .expect("ledger must initialize"),
     );
@@ -793,11 +793,7 @@ token = "sk_test_proxy_injected_key"
         NetworkSRR::load(&srr_path).expect("valid SRR config must parse"),
     ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("valid secrets must parse"));
-    let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
-            .await
-            .expect("ledger must init"),
-    );
+    let ledger = Arc::new(Ledger::new(&wal_path).await.expect("ledger must init"));
     let vault = Arc::new(Vault::new(ledger.clone()).expect("vault must init"));
     let token_budget = Arc::new(TokenBudget::new(0, 0.0, 500));
     let http_client =
@@ -1063,11 +1059,7 @@ token = "sk_test_proxy_injected_bearer"
         NetworkSRR::load(&srr_path).expect("valid SRR config must parse"),
     ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("valid secrets must parse"));
-    let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
-            .await
-            .expect("ledger must init"),
-    );
+    let ledger = Arc::new(Ledger::new(&wal_path).await.expect("ledger must init"));
     let vault = Arc::new(Vault::new(ledger.clone()).expect("vault must init"));
     let token_budget = Arc::new(TokenBudget::new(0, 0.0, 500));
     let http_client =
@@ -1269,11 +1261,7 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
         NetworkSRR::load(&srr_path).expect("valid SRR config must parse"),
     ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("valid secrets must parse"));
-    let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
-            .await
-            .expect("ledger must init"),
-    );
+    let ledger = Arc::new(Ledger::new(&wal_path).await.expect("ledger must init"));
     let vault = Arc::new(Vault::new(ledger.clone()).expect("vault must init"));
     let token_budget = Arc::new(TokenBudget::new(0, 0.0, 500));
     let http_client =
@@ -1483,11 +1471,7 @@ async fn emergency_wal_to_primary_recovery_path() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
 
-    let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
-            .await
-            .expect("ledger must init"),
-    );
+    let ledger = Arc::new(Ledger::new(&wal_path).await.expect("ledger must init"));
 
     // Phase 1: Write normally to primary WAL
     let event1 = make_test_event("normal-001", "gvm.storage.read");
@@ -1616,7 +1600,6 @@ fn make_test_event(event_id: &str, operation: &str) -> GVMEvent {
         enforcement_point: "test".to_string(),
         status: EventStatus::Pending,
         payload: Default::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,
@@ -1658,11 +1641,7 @@ async fn checkpoint_save_restore_merkle_verified() {
         NetworkSRR::load(&srr_path).expect("empty SRR must parse"),
     ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("empty secrets must parse"));
-    let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
-            .await
-            .expect("ledger must init"),
-    );
+    let ledger = Arc::new(Ledger::new(&wal_path).await.expect("ledger must init"));
     let vault = Arc::new(Vault::new(ledger.clone()).expect("vault must init"));
     let token_budget = Arc::new(TokenBudget::new(0, 0.0, 500));
     let http_client =
@@ -2116,11 +2095,7 @@ decision = { type = "Allow" }
         NetworkSRR::load(&srr_path).expect("SRR must parse"),
     ));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).expect("secrets must parse"));
-    let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
-            .await
-            .expect("ledger must init"),
-    );
+    let ledger = Arc::new(Ledger::new(&wal_path).await.expect("ledger must init"));
     let vault = Arc::new(Vault::new(ledger.clone()).expect("vault must init"));
     let http_client =
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
@@ -2280,7 +2255,7 @@ decision = { type = "Allow" }
 
     let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).unwrap()));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).unwrap());
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
+    let ledger = Arc::new(Ledger::new(&wal_path).await.unwrap());
     let vault = Arc::new(Vault::new(ledger.clone()).unwrap());
     let http_client =
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
@@ -2403,7 +2378,7 @@ decision = { type = "Allow" }
 
     let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).unwrap()));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).unwrap());
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
+    let ledger = Arc::new(Ledger::new(&wal_path).await.unwrap());
     let vault = Arc::new(Vault::new(ledger.clone()).unwrap());
     let http_client =
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
@@ -2530,7 +2505,7 @@ decision = { type = "Allow" }
 
     let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).unwrap()));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).unwrap());
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
+    let ledger = Arc::new(Ledger::new(&wal_path).await.unwrap());
     let vault = Arc::new(Vault::new(ledger.clone()).unwrap());
     let http_client =
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
@@ -2625,7 +2600,7 @@ async fn ic3_self_approval_blocked_on_proxy_port() {
 
     let srr = Arc::new(std::sync::RwLock::new(NetworkSRR::load(&srr_path).unwrap()));
     let api_keys = Arc::new(APIKeyStore::load(&secrets_path).unwrap());
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
+    let ledger = Arc::new(Ledger::new(&wal_path).await.unwrap());
     let vault = Arc::new(Vault::new(ledger.clone()).unwrap());
     let http_client =
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())

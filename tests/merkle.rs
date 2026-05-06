@@ -37,7 +37,6 @@ fn make_test_event(agent_id: &str) -> GVMEvent {
         enforcement_point: "test".to_string(),
         status: EventStatus::Pending,
         payload: Default::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,
@@ -55,7 +54,7 @@ fn make_test_event(agent_id: &str) -> GVMEvent {
 async fn merkle_event_hash_embedded_in_wal() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Ledger::new(&wal_path, "", "")
+    let ledger = Ledger::new(&wal_path)
         .await
         .expect("ledger with valid path must initialize");
 
@@ -134,7 +133,7 @@ async fn merkle_event_hash_unique_per_event() {
 async fn merkle_batch_record_written_to_wal() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Ledger::new(&wal_path, "", "")
+    let ledger = Ledger::new(&wal_path)
         .await
         .expect("ledger with valid path must initialize");
 
@@ -178,7 +177,7 @@ async fn merkle_batch_record_written_to_wal() {
 async fn merkle_batch_root_recomputable() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Ledger::new(&wal_path, "", "")
+    let ledger = Ledger::new(&wal_path)
         .await
         .expect("ledger with valid path must initialize");
 
@@ -250,7 +249,7 @@ async fn merkle_inter_batch_chain() {
         channel_capacity: 32,
         ..Default::default()
     };
-    let ledger = Ledger::with_config(&wal_path, "", "", config)
+    let ledger = Ledger::with_config(&wal_path, config)
         .await
         .expect("ledger with valid config must initialize");
 
@@ -318,7 +317,7 @@ async fn merkle_inter_batch_chain() {
 async fn merkle_wal_verification_valid() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Ledger::new(&wal_path, "", "")
+    let ledger = Ledger::new(&wal_path)
         .await
         .expect("ledger with valid path must initialize");
 
@@ -353,7 +352,7 @@ async fn merkle_wal_verification_valid() {
 async fn merkle_wal_verification_detects_tampered_event() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Ledger::new(&wal_path, "", "")
+    let ledger = Ledger::new(&wal_path)
         .await
         .expect("ledger with valid path must initialize");
 
@@ -439,7 +438,7 @@ async fn merkle_wal_verification_detects_tampered_event() {
 async fn merkle_wal_verification_detects_tampered_event_hash() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Ledger::new(&wal_path, "", "")
+    let ledger = Ledger::new(&wal_path)
         .await
         .expect("ledger with valid path must initialize");
 
@@ -490,7 +489,7 @@ async fn merkle_wal_verification_detects_broken_chain() {
         channel_capacity: 32,
         ..Default::default()
     };
-    let ledger = Ledger::with_config(&wal_path, "", "", config)
+    let ledger = Ledger::with_config(&wal_path, config)
         .await
         .expect("ledger with valid config must initialize");
 
@@ -549,7 +548,7 @@ async fn merkle_wal_verification_detects_broken_chain() {
 async fn merkle_proof_proves_event_in_batch() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Ledger::new(&wal_path, "", "")
+    let ledger = Ledger::new(&wal_path)
         .await
         .expect("ledger with valid path must initialize");
 
@@ -628,7 +627,7 @@ async fn merkle_concurrent_writes_produce_valid_roots() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
+        Ledger::new(&wal_path)
             .await
             .expect("ledger with valid path must initialize"),
     );
@@ -672,7 +671,7 @@ async fn merkle_all_event_hashes_unique() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
+        Ledger::new(&wal_path)
             .await
             .expect("ledger with valid path must initialize"),
     );
@@ -738,7 +737,7 @@ async fn integrity_context_recorded_on_config_load() {
         )
     };
 
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger init"));
+    let ledger = Arc::new(Ledger::new(&wal_path).await.expect("ledger init"));
 
     let config_files: Vec<(&str, &std::path::Path)> = vec![("gvm_toml", config_path.as_path())];
     let context_hash = ledger
@@ -837,7 +836,7 @@ async fn chain_integrity_valid_on_single_load() {
     let config_path = dir.path().join("test.toml");
     std::fs::write(&config_path, b"test = true").expect("write");
 
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger init"));
+    let ledger = Arc::new(Ledger::new(&wal_path).await.expect("ledger init"));
 
     let config_files: Vec<(&str, &std::path::Path)> = vec![("test", config_path.as_path())];
     ledger
@@ -936,7 +935,7 @@ async fn chain_integrity_detects_tampered_wal() {
     let config_path = dir.path().join("test.toml");
     std::fs::write(&config_path, b"version = 1").expect("write");
 
-    let ledger = Arc::new(Ledger::new(&wal_path, "", "").await.expect("ledger init"));
+    let ledger = Arc::new(Ledger::new(&wal_path).await.expect("ledger init"));
 
     // First load
     let config_files: Vec<(&str, &std::path::Path)> = vec![("test", config_path.as_path())];
@@ -996,7 +995,7 @@ async fn read_wal_events(wal_path: &std::path::Path) -> Vec<GVMEvent> {
 async fn allow_events_persist_to_wal() {
     let dir = tempfile::tempdir().expect("tempdir");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Ledger::new(&wal_path, "", "").await.expect("ledger init");
+    let ledger = Ledger::new(&wal_path).await.expect("ledger init");
 
     let mut allow_event = make_test_event("agent-allow");
     allow_event.decision = "Allow".to_string();
@@ -1026,7 +1025,7 @@ async fn allow_events_persist_to_wal() {
 async fn allow_included_in_merkle_chain_with_deny() {
     let dir = tempfile::tempdir().expect("tempdir");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Ledger::new(&wal_path, "", "").await.expect("ledger init");
+    let ledger = Ledger::new(&wal_path).await.expect("ledger init");
 
     let mut allow = make_test_event("agent-mixed-allow");
     allow.decision = "Allow".to_string();
@@ -1078,7 +1077,7 @@ async fn allow_included_in_merkle_chain_with_deny() {
 async fn connect_deny_persists_to_wal() {
     let dir = tempfile::tempdir().expect("tempdir");
     let wal_path = dir.path().join("wal.log");
-    let ledger = Ledger::new(&wal_path, "", "").await.expect("ledger init");
+    let ledger = Ledger::new(&wal_path).await.expect("ledger init");
 
     let mut deny_event = make_test_event("agent-connect-deny");
     deny_event.operation = "connect:api.bank.com".to_string();

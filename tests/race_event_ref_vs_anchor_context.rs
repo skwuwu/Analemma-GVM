@@ -59,7 +59,6 @@ fn make_event_with_ref(id: &str, ref_hash: &str) -> GVMEvent {
         enforcement_point: "test".to_string(),
         status: EventStatus::Confirmed,
         payload: PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,
@@ -78,8 +77,6 @@ async fn event_ref_and_anchor_context_can_diverge_within_one_batch() {
     // running its drain → seal sequence.
     let mut ledger = Ledger::with_config(
         &wal_path,
-        "",
-        "",
         GroupCommitConfig {
             batch_window: std::time::Duration::from_millis(80),
             max_batch_size: 16,
@@ -214,8 +211,6 @@ async fn no_race_event_ref_and_anchor_match_when_no_reload() {
     let wal_path = dir.path().join("wal.log");
     let mut ledger = Ledger::with_config(
         &wal_path,
-        "",
-        "",
         GroupCommitConfig {
             batch_window: std::time::Duration::ZERO,
             max_batch_size: 1,

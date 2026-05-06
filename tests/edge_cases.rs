@@ -283,7 +283,7 @@ async fn edge_concurrent_status_update_no_crash() {
     let dir = tempfile::tempdir().expect("temp directory creation must succeed");
     let wal_path = dir.path().join("wal.log");
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
+        Ledger::new(&wal_path)
             .await
             .expect("ledger initialization must succeed"),
     );
@@ -317,7 +317,6 @@ async fn edge_concurrent_status_update_no_crash() {
                     }
                 },
                 payload: PayloadDescriptor::default(),
-                nats_sequence: None,
                 event_hash: None,
                 llm_trace: None,
                 default_caution: false,
@@ -393,7 +392,7 @@ async fn edge_recovery_no_pending_events() {
         }
     }
 
-    let ledger = Ledger::new(&wal_path, "", "")
+    let ledger = Ledger::new(&wal_path)
         .await
         .expect("ledger must initialize from pre-written WAL");
     let report = ledger

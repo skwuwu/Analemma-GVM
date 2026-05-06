@@ -935,7 +935,7 @@ async fn nats_channel_backpressure_bounded() {
     };
 
     let ledger = Arc::new(
-        Ledger::with_config(&wal_path, "", "", config)
+        Ledger::with_config(&wal_path, config)
             .await
             .expect("ledger with valid config must initialize"),
     );
@@ -986,7 +986,7 @@ async fn nats_empty_url_wal_only_mode() {
     let wal_path = dir.path().join("wal.log");
 
     // Empty NATS URL = WAL-only mode
-    let ledger = Ledger::new(&wal_path, "", "")
+    let ledger = Ledger::new(&wal_path)
         .await
         .expect("WAL-only ledger must initialize without NATS");
 
@@ -1022,7 +1022,7 @@ async fn nats_wal_sequence_monotonic() {
     let wal_path = dir.path().join("wal.log");
 
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
+        Ledger::new(&wal_path)
             .await
             .expect("WAL-only ledger must initialize"),
     );
@@ -1103,7 +1103,7 @@ async fn vault_large_value_roundtrip() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
+        Ledger::new(&wal_path)
             .await
             .expect("WAL-only ledger must initialize"),
     );
@@ -1140,7 +1140,7 @@ async fn vault_key_collision_between_agents() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
+        Ledger::new(&wal_path)
             .await
             .expect("WAL-only ledger must initialize"),
     );
@@ -1256,7 +1256,7 @@ async fn vault_concurrent_read_write_same_key() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
+        Ledger::new(&wal_path)
             .await
             .expect("WAL-only ledger must initialize"),
     );
@@ -1322,7 +1322,7 @@ async fn vault_delete_then_read_returns_none() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
+        Ledger::new(&wal_path)
             .await
             .expect("WAL-only ledger must initialize"),
     );
@@ -1362,7 +1362,7 @@ async fn vault_empty_value_roundtrip() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
+        Ledger::new(&wal_path)
             .await
             .expect("WAL-only ledger must initialize"),
     );
@@ -1390,7 +1390,7 @@ async fn vault_key_crlf_injection_rejected() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
+        Ledger::new(&wal_path)
             .await
             .expect("ledger must initialize"),
     );
@@ -1432,7 +1432,7 @@ async fn vault_key_limit_toctou_documented() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
+        Ledger::new(&wal_path)
             .await
             .expect("ledger must initialize"),
     );
@@ -1559,7 +1559,6 @@ fn make_test_event(event_id: &str) -> GVMEvent {
         enforcement_point: "test".to_string(),
         status: EventStatus::Pending,
         payload: Default::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,

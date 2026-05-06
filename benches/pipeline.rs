@@ -29,7 +29,6 @@ fn make_test_event(id: &str) -> GVMEvent {
         enforcement_point: "bench".to_string(),
         status: EventStatus::Pending,
         payload: PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,
@@ -140,7 +139,7 @@ fn bench_vault(c: &mut Criterion) {
 
     let ledger = rt.block_on(async {
         Arc::new(
-            Ledger::new(&wal_path, "nats://localhost:4222", "gvm-bench")
+            Ledger::new(&wal_path)
                 .await
                 .expect("ledger must initialize with valid WAL path"),
         )
@@ -204,7 +203,7 @@ fn bench_wal(c: &mut Criterion) {
             let tmp_dir =
                 tempfile::tempdir().expect("temp directory must be creatable for bench setup");
             let wal_path = tmp_dir.path().join("bench_wal.log");
-            let ledger = Ledger::new(&wal_path, "nats://localhost:4222", "gvm-bench")
+            let ledger = Ledger::new(&wal_path)
                 .await
                 .expect("ledger must initialize with valid WAL path");
 
@@ -230,7 +229,7 @@ fn bench_wal(c: &mut Criterion) {
             let tmp_dir =
                 tempfile::tempdir().expect("temp directory must be creatable for bench setup");
             let wal_path = tmp_dir.path().join("bench_wal.log");
-            let ledger = Ledger::new(&wal_path, "nats://localhost:4222", "gvm-bench")
+            let ledger = Ledger::new(&wal_path)
                 .await
                 .expect("ledger must initialize with valid WAL path");
 
@@ -302,7 +301,7 @@ fn bench_wal_group_commit(c: &mut Criterion) {
                         .expect("temp directory must be creatable for bench setup");
                     let wal_path = tmp_dir.path().join("bench_gc_wal.log");
                     let ledger = Arc::new(
-                        Ledger::new(&wal_path, "", "")
+                        Ledger::new(&wal_path)
                             .await
                             .expect("ledger must initialize with valid WAL path"),
                     );
@@ -432,7 +431,7 @@ fn bench_vault_large(c: &mut Criterion) {
 
     let ledger = rt.block_on(async {
         Arc::new(
-            Ledger::new(&wal_path, "", "")
+            Ledger::new(&wal_path)
                 .await
                 .expect("ledger must initialize with valid WAL path"),
         )
@@ -644,7 +643,7 @@ fn bench_vault_p99(c: &mut Criterion) {
 
     let ledger = rt.block_on(async {
         Arc::new(
-            Ledger::new(&wal_path, "", "")
+            Ledger::new(&wal_path)
                 .await
                 .expect("ledger must initialize with valid WAL path"),
         )
@@ -750,7 +749,7 @@ fn bench_vault_contention_p99(c: &mut Criterion) {
 
     let ledger = rt.block_on(async {
         Arc::new(
-            Ledger::new(&wal_path, "", "")
+            Ledger::new(&wal_path)
                 .await
                 .expect("ledger must initialize with valid WAL path"),
         )

@@ -212,7 +212,13 @@ async fn main() {
         tracing::info!("API key store loaded");
     }
 
-    // 6. Initialize Ledger (WAL + NATS stub)
+    // 6. Initialize Ledger (durable local WAL).
+    //
+    // External streaming integrations (NATS / Redis / Kafka / SIEM)
+    // are user-managed: GVM does not connect to them on the
+    // operator's behalf. If you need off-host audit replication,
+    // tail the WAL with your own forwarder (rsync, fluentd, vector,
+    // syslog, S3 backup — operator's choice).
     let wal_config = gvm_proxy::ledger::GroupCommitConfig {
         batch_window: std::time::Duration::from_millis(config.wal.batch_window_ms),
         max_batch_size: config.wal.max_batch_size,
@@ -222,8 +228,6 @@ async fn main() {
     };
     let ledger = Ledger::with_config(
         Path::new(&std::env::var("GVM_WAL_PATH").unwrap_or_else(|_| config.wal.path.clone())),
-        &config.nats.url,
-        &config.nats.stream,
         wal_config,
     )
     .await

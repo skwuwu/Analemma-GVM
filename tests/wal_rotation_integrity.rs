@@ -47,7 +47,7 @@ async fn integrity_chain_spans_rotated_segments() {
         max_wal_bytes: 2_048,
         max_wal_segments: 100,
     };
-    let mut ledger = Ledger::with_config(&wal_path, "", "", config)
+    let mut ledger = Ledger::with_config(&wal_path, config)
         .await
         .expect("ledger init");
 
@@ -161,7 +161,6 @@ fn mk_evt() -> gvm_types::GVMEvent {
         enforcement_point: "test".to_string(),
         status: gvm_types::EventStatus::Confirmed,
         payload: gvm_types::PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,

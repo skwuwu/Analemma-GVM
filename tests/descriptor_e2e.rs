@@ -46,7 +46,7 @@ fn read_events_with_op(wal_path: &std::path::Path, op: &str) -> Vec<GVMEvent> {
 async fn dns_event_carries_descriptor_with_domain_as_detail() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Ledger::new(&wal_path, "", "").await.unwrap();
+    let mut ledger = Ledger::new(&wal_path).await.unwrap();
 
     let event = gvm_proxy::ledger::build_dns_event(
         "customer-12345.attacker.example",
@@ -92,7 +92,7 @@ async fn vault_write_and_delete_carry_descriptors_in_durable_wal() {
     // construction is unit-pinned in tests/descriptor_migration.rs.
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
+    let mut ledger = Arc::new(Ledger::new(&wal_path).await.unwrap());
     let vault = Vault::new(Arc::clone(&ledger)).expect("vault init");
 
     vault
@@ -157,7 +157,7 @@ async fn vault_write_and_delete_carry_descriptors_in_durable_wal() {
 async fn config_load_descriptor_is_category_only() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Ledger::new(&wal_path, "", "").await.unwrap();
+    let mut ledger = Ledger::new(&wal_path).await.unwrap();
     ledger
         .record_config_load(&[], None)
         .await
@@ -273,7 +273,6 @@ fn build_canonical_event(id: &str, descriptor: OperationDescriptor) -> GVMEvent 
         enforcement_point: "test".to_string(),
         status: EventStatus::Confirmed,
         payload: PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,
@@ -303,8 +302,6 @@ async fn checkpoint_inclusion_round_trips_in_proof_json() {
     let mut ledger = Arc::new(
         Ledger::with_config(
             &wal_path,
-            "",
-            "",
             GroupCommitConfig {
                 batch_window: std::time::Duration::ZERO,
                 max_batch_size: 1,

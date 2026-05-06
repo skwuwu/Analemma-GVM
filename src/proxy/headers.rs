@@ -144,7 +144,6 @@ pub(super) fn build_event(
         },
         status: EventStatus::Pending,
         payload: PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None, // Computed by Ledger during WAL write
         llm_trace: None,
         default_caution: false, // Set by caller after build_event

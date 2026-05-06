@@ -42,7 +42,6 @@ fn evt(op: &str) -> GVMEvent {
         enforcement_point: "test".to_string(),
         status: EventStatus::Confirmed,
         payload: PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,
@@ -358,7 +357,7 @@ fn signed_anchor_count_is_informational() {
 async fn real_ledger_anchors_pass_audit() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Ledger::new(&wal_path, "", "").await.unwrap();
+    let mut ledger = Ledger::new(&wal_path).await.unwrap();
 
     // Three batches separated so each becomes its own anchor.
     ledger.append_durable(&evt("op-1")).await.unwrap();
@@ -384,7 +383,7 @@ async fn real_ledger_anchors_pass_audit() {
 async fn tampered_real_ledger_is_caught() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Ledger::new(&wal_path, "", "").await.unwrap();
+    let mut ledger = Ledger::new(&wal_path).await.unwrap();
     ledger.append_durable(&evt("op-1")).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     ledger.append_durable(&evt("op-2")).await.unwrap();

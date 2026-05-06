@@ -211,7 +211,6 @@ fn evt(id: &str, agent_id: &str, decision: &str) -> GVMEvent {
         enforcement_point: "test".to_string(),
         status: EventStatus::Confirmed,
         payload: PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,
@@ -243,7 +242,7 @@ async fn multi_agent_burst_high_priority_lands_in_earlier_batch() {
         max_wal_bytes: 0,
         max_wal_segments: 0,
     };
-    let ledger = Arc::new(Ledger::with_config(&wal_path, "", "", cfg).await.unwrap());
+    let ledger = Arc::new(Ledger::with_config(&wal_path, cfg).await.unwrap());
 
     // Fire 8 Allow + 2 Deny concurrently. The exact interleaving is
     // unpredictable, but priority drainage should bias B's Denies to
@@ -351,7 +350,7 @@ async fn multi_agent_atomicity_preserved_under_burst() {
         max_wal_bytes: 0,
         max_wal_segments: 0,
     };
-    let ledger = Arc::new(Ledger::with_config(&wal_path, "", "", cfg).await.unwrap());
+    let ledger = Arc::new(Ledger::with_config(&wal_path, cfg).await.unwrap());
 
     let agents_decisions = vec![
         ("agent-A", "Allow"),

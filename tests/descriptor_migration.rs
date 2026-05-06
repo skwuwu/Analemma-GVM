@@ -49,7 +49,6 @@ fn evt(op: &str) -> GVMEvent {
         enforcement_point: "test".to_string(),
         status: EventStatus::Confirmed,
         payload: PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,
@@ -134,7 +133,7 @@ fn dispatcher_uses_v2_when_event_has_http_descriptor() {
 async fn config_load_writes_category_only_descriptor() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Ledger::new(&wal_path, "", "").await.unwrap();
+    let mut ledger = Ledger::new(&wal_path).await.unwrap();
 
     ledger
         .record_config_load(&[], None)
@@ -173,7 +172,7 @@ async fn vault_write_writes_descriptor_with_key_as_detail() {
 
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Arc::new(Ledger::new(&wal_path, "", "").await.unwrap());
+    let mut ledger = Arc::new(Ledger::new(&wal_path).await.unwrap());
     let vault = Vault::new(Arc::clone(&ledger)).expect("vault init");
 
     vault

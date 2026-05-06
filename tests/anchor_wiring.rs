@@ -42,7 +42,6 @@ fn evt(label: &str) -> GVMEvent {
         enforcement_point: "test".to_string(),
         status: EventStatus::Confirmed,
         payload: PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,
@@ -122,7 +121,7 @@ async fn single_batch_writes_event_seal_batchrecord_anchor() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
 
-    let mut ledger = Ledger::new(&wal_path, "", "").await.expect("ledger init");
+    let mut ledger = Ledger::new(&wal_path).await.expect("ledger init");
     ledger
         .append_durable(&evt("a"))
         .await
@@ -156,7 +155,7 @@ async fn single_batch_writes_event_seal_batchrecord_anchor() {
 async fn anchor_self_hash_verifies() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Ledger::new(&wal_path, "", "").await.unwrap();
+    let mut ledger = Ledger::new(&wal_path).await.unwrap();
     ledger.append_durable(&evt("v")).await.unwrap();
     ledger.shutdown().await;
 
@@ -176,7 +175,7 @@ async fn anchor_self_hash_verifies() {
 async fn leaves_blob_includes_seal_as_last_leaf() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Ledger::new(&wal_path, "", "").await.unwrap();
+    let mut ledger = Ledger::new(&wal_path).await.unwrap();
 
     // Three events. Bind the events to locals so they outlive the
     // join! futures' borrows.
@@ -231,7 +230,7 @@ async fn leaves_blob_includes_seal_as_last_leaf() {
 async fn seal_hash_matches_last_leaf_in_batch_record() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Ledger::new(&wal_path, "", "").await.unwrap();
+    let mut ledger = Ledger::new(&wal_path).await.unwrap();
     ledger.append_durable(&evt("seal-leaf")).await.unwrap();
     ledger.shutdown().await;
 
@@ -256,7 +255,7 @@ async fn seal_hash_matches_last_leaf_in_batch_record() {
 async fn anchor_chain_links_consecutive_batches() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Ledger::new(&wal_path, "", "").await.unwrap();
+    let mut ledger = Ledger::new(&wal_path).await.unwrap();
 
     // Force two distinct batches by awaiting between appends so each
     // append flushes its own batch (batch_window expires).
@@ -303,7 +302,7 @@ async fn anchor_chain_links_consecutive_batches() {
 async fn context_hash_published_before_batch_appears_in_seal() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Ledger::new(&wal_path, "", "").await.unwrap();
+    let mut ledger = Ledger::new(&wal_path).await.unwrap();
 
     // Genesis: first event flushes with context_hash = GENESIS_HASH_HEX
     // (no update_context_hash call yet, snapshot reads None →
@@ -346,7 +345,7 @@ async fn context_hash_published_before_batch_appears_in_seal() {
 async fn anchor_inherits_context_from_seal() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Ledger::new(&wal_path, "", "").await.unwrap();
+    let mut ledger = Ledger::new(&wal_path).await.unwrap();
     ledger.update_context_hash("ff".repeat(32));
     ledger.append_durable(&evt("inh")).await.unwrap();
     ledger.shutdown().await;
@@ -372,7 +371,7 @@ async fn anchor_inherits_context_from_seal() {
 async fn triple_snapshot_reflects_updates_immediately() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let ledger = Ledger::new(&wal_path, "", "").await.unwrap();
+    let ledger = Ledger::new(&wal_path).await.unwrap();
 
     // Initial: all None.
     let snap0 = ledger.triple_snapshot();

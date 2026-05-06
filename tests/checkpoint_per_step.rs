@@ -152,11 +152,7 @@ fn agent_proof_for_missing_step_is_none() {
 #[tokio::test]
 async fn live_aggregator_last_write_wins_per_step() {
     let dir = tempfile::tempdir().unwrap();
-    let mut ledger = Arc::new(
-        Ledger::new(&dir.path().join("wal.log"), "", "")
-            .await
-            .unwrap(),
-    );
+    let mut ledger = Arc::new(Ledger::new(&dir.path().join("wal.log")).await.unwrap());
     let agg = CheckpointAggregator::new(Arc::clone(&ledger));
 
     agg.register("agent-1", 5, [1u8; 32]).await.unwrap();
@@ -186,11 +182,7 @@ async fn live_aggregator_last_write_wins_per_step() {
 #[tokio::test]
 async fn live_aggregator_independent_agents_dont_invalidate_each_other() {
     let dir = tempfile::tempdir().unwrap();
-    let mut ledger = Arc::new(
-        Ledger::new(&dir.path().join("wal.log"), "", "")
-            .await
-            .unwrap(),
-    );
+    let mut ledger = Arc::new(Ledger::new(&dir.path().join("wal.log")).await.unwrap());
     let agg = CheckpointAggregator::new(Arc::clone(&ledger));
 
     // Register agent-A's step 0.
@@ -256,7 +248,6 @@ fn make_event(event_id: &str) -> gvm_types::GVMEvent {
         enforcement_point: "test".to_string(),
         status: EventStatus::Confirmed,
         payload: PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,
@@ -272,8 +263,6 @@ async fn checkpoint_inclusion_path_verifies_against_anchor_checkpoint_root() {
     let mut ledger = Arc::new(
         Ledger::with_config(
             &wal_path,
-            "",
-            "",
             GroupCommitConfig {
                 batch_window: std::time::Duration::ZERO,
                 max_batch_size: 1,

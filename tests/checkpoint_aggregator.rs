@@ -106,11 +106,7 @@ fn duplicate_agent_ids_with_same_hash_yield_same_root_as_single() {
 #[tokio::test]
 async fn live_aggregator_publishes_root_into_triple_state() {
     let dir = tempfile::tempdir().unwrap();
-    let mut ledger = Arc::new(
-        Ledger::new(&dir.path().join("wal.log"), "", "")
-            .await
-            .unwrap(),
-    );
+    let mut ledger = Arc::new(Ledger::new(&dir.path().join("wal.log")).await.unwrap());
     let agg = CheckpointAggregator::new(Arc::clone(&ledger));
 
     // Pre-register: triple state has no checkpoint_root.
@@ -146,11 +142,7 @@ async fn live_aggregator_publishes_root_into_triple_state() {
 #[tokio::test]
 async fn live_aggregator_last_write_wins_per_agent() {
     let dir = tempfile::tempdir().unwrap();
-    let mut ledger = Arc::new(
-        Ledger::new(&dir.path().join("wal.log"), "", "")
-            .await
-            .unwrap(),
-    );
+    let mut ledger = Arc::new(Ledger::new(&dir.path().join("wal.log")).await.unwrap());
     let agg = CheckpointAggregator::new(Arc::clone(&ledger));
 
     // Same agent, two checkpoints in succession. The second
@@ -188,8 +180,6 @@ async fn checkpoint_root_appears_in_anchor_after_register() {
     let mut ledger = Arc::new(
         Ledger::with_config(
             &wal_path,
-            "",
-            "",
             GroupCommitConfig {
                 batch_window: std::time::Duration::ZERO,
                 max_batch_size: 1,
@@ -256,7 +246,6 @@ fn make_event(event_id: &str) -> gvm_types::GVMEvent {
         enforcement_point: "test".to_string(),
         status: EventStatus::Confirmed,
         payload: PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,

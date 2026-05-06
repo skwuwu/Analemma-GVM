@@ -71,7 +71,6 @@ fn evt(seq: u64) -> GVMEvent {
         enforcement_point: "test".to_string(),
         status: EventStatus::Confirmed,
         payload: PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,
@@ -81,7 +80,7 @@ fn evt(seq: u64) -> GVMEvent {
 }
 
 async fn write_clean_wal(path: &std::path::Path, n: u64) {
-    let mut ledger = Ledger::new(path, "", "").await.expect("ledger init");
+    let mut ledger = Ledger::new(path).await.expect("ledger init");
     for i in 0..n {
         ledger.append_durable(&evt(i)).await.expect("append");
     }

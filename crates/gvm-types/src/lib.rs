@@ -308,10 +308,6 @@ pub struct GVMEvent {
     pub payload: PayloadDescriptor,
 
     // ── Integrity ──
-    /// NATS JetStream sequence number (real-time integrity anchor).
-    /// Hash chain verification runs in a separate async process.
-    pub nats_sequence: Option<u64>,
-
     /// SHA-256 hash of this event's canonical fields (Merkle leaf).
     /// Computed before WAL write. Used for batch Merkle root verification.
     #[serde(default)]

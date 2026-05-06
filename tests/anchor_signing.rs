@@ -45,7 +45,6 @@ fn evt(id: &str) -> GVMEvent {
         enforcement_point: "test".to_string(),
         status: EventStatus::Confirmed,
         payload: PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,
@@ -68,7 +67,7 @@ fn one_event_per_batch() -> GroupCommitConfig {
 async fn default_ledger_uses_noop_signer_no_signatures_in_wal() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+    let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
         .await
         .unwrap();
     for i in 0..3 {
@@ -99,15 +98,10 @@ async fn explicit_noop_signer_matches_default_behavior() {
     // identical to omitting the signer.
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Ledger::with_config_and_signer(
-        &wal_path,
-        "",
-        "",
-        one_event_per_batch(),
-        Arc::new(NoopSigner),
-    )
-    .await
-    .unwrap();
+    let mut ledger =
+        Ledger::with_config_and_signer(&wal_path, one_event_per_batch(), Arc::new(NoopSigner))
+            .await
+            .unwrap();
     ledger.append_durable(&evt("e1")).await.unwrap();
     ledger.shutdown().await;
 
@@ -128,7 +122,7 @@ async fn self_signed_ledger_writes_verifiable_signatures() {
     let verifying_key = signer.verifying_key();
 
     let mut ledger =
-        Ledger::with_config_and_signer(&wal_path, "", "", one_event_per_batch(), Arc::new(signer))
+        Ledger::with_config_and_signer(&wal_path, one_event_per_batch(), Arc::new(signer))
             .await
             .unwrap();
     for i in 0..3 {
@@ -174,15 +168,10 @@ async fn signature_does_not_verify_under_unrelated_key() {
     let signer_a = SelfSignedSigner::generate("a");
     let signer_b = SelfSignedSigner::generate("b");
 
-    let mut ledger = Ledger::with_config_and_signer(
-        &wal_path,
-        "",
-        "",
-        one_event_per_batch(),
-        Arc::new(signer_a),
-    )
-    .await
-    .unwrap();
+    let mut ledger =
+        Ledger::with_config_and_signer(&wal_path, one_event_per_batch(), Arc::new(signer_a))
+            .await
+            .unwrap();
     ledger.append_durable(&evt("e1")).await.unwrap();
     ledger.shutdown().await;
 
@@ -213,7 +202,7 @@ async fn tampered_anchor_hash_breaks_signature_verification() {
     let verifying_key = signer.verifying_key();
 
     let mut ledger =
-        Ledger::with_config_and_signer(&wal_path, "", "", one_event_per_batch(), Arc::new(signer))
+        Ledger::with_config_and_signer(&wal_path, one_event_per_batch(), Arc::new(signer))
             .await
             .unwrap();
     ledger.append_durable(&evt("e1")).await.unwrap();
@@ -247,7 +236,7 @@ async fn audit_reports_signed_anchor_count_after_signing_ledger() {
     let signer = SelfSignedSigner::generate("k");
 
     let mut ledger =
-        Ledger::with_config_and_signer(&wal_path, "", "", one_event_per_batch(), Arc::new(signer))
+        Ledger::with_config_and_signer(&wal_path, one_event_per_batch(), Arc::new(signer))
             .await
             .unwrap();
     for i in 0..4 {
@@ -275,7 +264,7 @@ async fn audit_reports_signed_anchor_count_after_signing_ledger() {
 async fn audit_reports_zero_signed_count_for_noop_signer() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("wal.log");
-    let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+    let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
         .await
         .unwrap();
     for i in 0..2 {

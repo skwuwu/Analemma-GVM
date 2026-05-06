@@ -170,7 +170,7 @@ async fn wal_tampered_entry_does_not_crash_recovery() {
     }
 
     // Recovery must not crash even with corrupted entries
-    let ledger = Ledger::new(&wal_path, "", "")
+    let ledger = Ledger::new(&wal_path)
         .await
         .expect("ledger must initialize with tampered WAL");
     let report = ledger
@@ -200,7 +200,7 @@ async fn vault_concurrent_writes_to_same_key() {
     let wal_path = dir.path().join("wal.log");
 
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
+        Ledger::new(&wal_path)
             .await
             .expect("ledger must initialize for vault test"),
     );
@@ -441,7 +441,7 @@ async fn ledger_concurrent_spawns_stay_bounded() {
     let wal_path = dir.path().join("wal.log");
 
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
+        Ledger::new(&wal_path)
             .await
             .expect("ledger must initialize for backpressure test"),
     );
@@ -471,7 +471,6 @@ async fn ledger_concurrent_spawns_stay_bounded() {
                 enforcement_point: "test".to_string(),
                 status: gvm_proxy::types::EventStatus::Pending,
                 payload: Default::default(),
-                nats_sequence: None,
                 event_hash: None,
                 llm_trace: None,
                 default_caution: false,
@@ -581,7 +580,7 @@ async fn group_commit_primary_fail_emergency_wal_catches() {
     let wal_path = dir.path().join("wal.log");
 
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
+        Ledger::new(&wal_path)
             .await
             .expect("ledger must initialize for fail-close test"),
     );
@@ -606,7 +605,6 @@ async fn group_commit_primary_fail_emergency_wal_catches() {
             enforcement_point: "test".to_string(),
             status: gvm_proxy::types::EventStatus::Pending,
             payload: Default::default(),
-            nats_sequence: None,
             event_hash: None,
             llm_trace: None,
             default_caution: false,
@@ -645,7 +643,6 @@ async fn group_commit_primary_fail_emergency_wal_catches() {
                 enforcement_point: "test".to_string(),
                 status: gvm_proxy::types::EventStatus::Pending,
                 payload: Default::default(),
-                nats_sequence: None,
                 event_hash: None,
                 llm_trace: None,
                 default_caution: false,
@@ -707,7 +704,6 @@ async fn group_commit_primary_fail_emergency_wal_catches() {
         enforcement_point: "test".to_string(),
         status: gvm_proxy::types::EventStatus::Confirmed,
         payload: Default::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,
@@ -1155,7 +1151,7 @@ async fn emergency_wal_catches_events_when_primary_fails() {
     let wal_path = dir.path().join("wal.log");
 
     let ledger = Arc::new(
-        Ledger::new(&wal_path, "", "")
+        Ledger::new(&wal_path)
             .await
             .expect("ledger must initialize for emergency WAL test"),
     );
@@ -1183,7 +1179,6 @@ async fn emergency_wal_catches_events_when_primary_fails() {
             enforcement_point: "test".to_string(),
             status: gvm_proxy::types::EventStatus::Pending,
             payload: Default::default(),
-            nats_sequence: None,
             event_hash: None,
             llm_trace: None,
             default_caution: false,
@@ -1261,7 +1256,6 @@ async fn emergency_wal_catches_events_when_primary_fails() {
         enforcement_point: "test".to_string(),
         status: gvm_proxy::types::EventStatus::Confirmed,
         payload: Default::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,

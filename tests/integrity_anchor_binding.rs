@@ -158,7 +158,6 @@ fn make_event(id: &str) -> gvm_types::GVMEvent {
         enforcement_point: "test".to_string(),
         status: EventStatus::Confirmed,
         payload: PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution: false,
@@ -176,7 +175,7 @@ async fn first_config_load_records_no_prev_anchor() {
     let policy_path = dir.path().join("policy.toml");
     std::fs::write(&policy_path, b"rules = []").unwrap();
 
-    let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+    let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
         .await
         .unwrap();
     ledger
@@ -202,7 +201,7 @@ async fn config_load_after_sealed_batch_carries_prior_anchor() {
     let policy_path = dir.path().join("policy.toml");
     std::fs::write(&policy_path, b"rules = []").unwrap();
 
-    let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+    let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
         .await
         .unwrap();
     // First config_load (genesis): triple.last_anchor is None.
@@ -256,7 +255,7 @@ async fn verify_chain_counts_v3_anchor_bindings() {
     let policy_path = dir.path().join("policy.toml");
     std::fs::write(&policy_path, b"rules = []").unwrap();
 
-    let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+    let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
         .await
         .unwrap();
     let h1 = ledger
@@ -305,7 +304,7 @@ async fn replay_with_phantom_anchor_hash_is_caught() {
     let policy_path = dir.path().join("policy.toml");
     std::fs::write(&policy_path, b"rules = []").unwrap();
 
-    let mut ledger = Ledger::with_config(&wal_path, "", "", one_event_per_batch())
+    let mut ledger = Ledger::with_config(&wal_path, one_event_per_batch())
         .await
         .unwrap();
     let h1 = ledger

@@ -600,7 +600,6 @@ pub async fn append_enforcement_event(
             gvm_types::EventStatus::Confirmed
         },
         payload: gvm_types::PayloadDescriptor::default(),
-        nats_sequence: None,
         event_hash: None,
         llm_trace: None,
         default_caution,
