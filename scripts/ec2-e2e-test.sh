@@ -337,7 +337,22 @@ fi
 # (no hot-reload) — must happen before ensure_proxy. Backup is restored
 # in cleanup().
 SECRETS_FILE="$REPO_DIR/config/secrets.toml"
+# Idempotency: strip any leftover synthetic block from a previous
+# crashed run BEFORE backing up — otherwise the backup carries the
+# pollution forward and post-test restore returns to a polluted
+# state. The next run's append then produces a TOML duplicate-key
+# error, the proxy starts with `Loaded 0 API credentials`, and Test 76
+# silently fails despite the synthetic block being syntactically fine.
 if [ -f "$SECRETS_FILE" ]; then
+    if grep -q "proxy_injected_bearer_e2e\|proxy_injected_apikey_e2e" "$SECRETS_FILE" 2>/dev/null; then
+        python3 -c "
+import re
+p = '$SECRETS_FILE'
+t = open(p).read()
+t = re.sub(r'\n# ── Synthetic credentials for ec2-e2e-test Test 76.*\Z', '', t, flags=re.DOTALL)
+open(p, 'w').write(t.rstrip() + '\n')
+" 2>/dev/null || true
+    fi
     cp "$SECRETS_FILE" "${SECRETS_FILE}.bak"
 fi
 cat >> "$SECRETS_FILE" 2>/dev/null << 'CREDSEOF' || true
@@ -353,6 +368,15 @@ type = "ApiKey"
 header = "x-api-key"
 value = "SG.proxy_injected_apikey_e2e"
 CREDSEOF
+# Hand the file to the user the proxy will run as (proxy drops to
+# SUDO_USER on launch). Without chown the file stays root-owned 0600
+# from earlier sudo runs and the proxy logs
+# 'No API keys configured — passthrough mode' silently — Test 76's
+# Bearer/ApiKey injection assertions then all fail despite the
+# synthetic block being correct.
+if [ -n "${SUDO_USER:-}" ]; then
+    chown "$SUDO_USER":"$(id -gn "$SUDO_USER")" "$SECRETS_FILE" 2>/dev/null || true
+fi
 chmod 600 "$SECRETS_FILE" 2>/dev/null || true
 echo "  Test credentials appended to secrets.toml"
 echo ""
