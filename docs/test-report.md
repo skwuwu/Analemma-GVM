@@ -496,19 +496,34 @@ ed25519-dalek (anchor signing, activated in `72fa90b`) and the
 ratatui/crossterm TUI deps account for most of the size growth
 versus older snapshots.
 
-### HTTP overhead — direct vs sandbox MITM
+### HTTP overhead — layered measurement
 
-| Path | TTFB median | Total median | Range |
-|------|-------------|--------------|-------|
-| A1 Direct (no GVM) | **751 ms** | 760 ms | 705-1017 ms TTFB |
-| A3 Sandbox MITM (full GVM path) | **1266 ms** | 1265 ms | 1217-1582 ms TTFB |
-| **MITM overhead** | **+515 ms median** | +505 ms | — |
+The original bench-overhead.sh A2 case (cooperative proxy without
+sandbox) returned 0.000 × 20 because the default proxy rules reject
+`httpbin.org` without an explicit allow rule. We re-ran a layered
+bench (`/tmp/bench-layered.sh` on EC2, n=20 fresh-TLS curl per case,
+SRR explicitly allowing `httpbin.org`) to isolate each layer's
+contribution:
 
-A2 (proxy without sandbox) returned 0.000 × 20 — the proxy
-default-rules reject `httpbin.org` without an explicit allow rule,
-so the bench script's A2 case is a methodology bug. A1 vs A3 is
-the production-relevant comparison; investigation tracked
-separately.
+| Path | TTFB median | Δ vs direct | What's added |
+|------|-------------|-------------|--------------|
+| B1 Direct (no GVM) | **756 ms** | — | baseline |
+| B2 Cooperative proxy + MITM | **971 ms** | **+215 ms** | TLS termination + per-domain leaf-cert mint + the proxy's own (fresh) upstream TLS handshake — the proxy doesn't pipeline the agent↔proxy handshake with the proxy↔upstream handshake |
+| A3 Sandbox + MITM + DNS gov | **1266 ms** | **+510 ms** | adds sandbox veth + iptables DNAT + DNS-governance Tier-2 delay (200 ms per fresh DNS lookup; httpbin.org is "Unknown" by default) on top of B2 |
+
+Layer attributions:
+- **MITM-only (cooperative): +215 ms** — measured cleanly via B2.
+- **Sandbox path + DNS gov (combined): +295 ms** — the difference
+  between A3 and B2. We attempted to separate this further by
+  running a fourth case with `--no-dns-governance`, but that flag
+  also disables the iptables DNAT that the sandbox depends on for
+  egress, so the case produced no data (`Connection refused` from
+  every iteration). Treat the +295 ms as a combined sandbox + DNS
+  cost until that script gap is closed.
+
+Real-world agents using HTTP/2 or keep-alive amortise most of the
+TLS handshake cost across many requests; the numbers above are the
+worst case (fresh TLS every request).
 
 ### Concurrent throughput (10 parallel `httpbin.org` GETs)
 
@@ -533,22 +548,30 @@ separately.
 | `gvm-proxy` after sustained `httpbin.org` workload | **17.2 MB** |
 | Agent process (no GVM) | 3.7 MB |
 
-### LLM provider (Anthropic API, "Say hi" prompt, n=5)
+### LLM provider (Anthropic Claude Haiku 4.5, raw `curl` "hi" prompt, n=20)
 
-| Path | Wall time median |
-|------|-----------------|
-| Direct (no GVM) | **10 531 ms** |
-| Sandbox MITM | **16 169 ms** |
-| **Overhead** | **+5638 ms** |
+| Path | Wall time median | p95 | Range |
+|------|-----------------|-----|-------|
+| Direct (no GVM) | **880 ms** | 1971 ms | 784-1971 ms |
+| Cooperative proxy + MITM | **908 ms** | 2393 ms | 771-2393 ms |
+| **MITM-only overhead** | **+28 ms** | — | — |
 
-The LLM-overhead number is much larger than the basic HTTP overhead
-because the response body is multi-KB streamed JSON; MITM TLS
-re-encryption for the entire stream, plus per-chunk SRR pass
-through the policy engine, dominates. Operators who care about
-latency on LLM calls in production should size their proxy host
-accordingly or use cooperative mode (HTTP_PROXY without TLS
-termination) for the LLM endpoint specifically — which still
-captures the request-side decision and credential injection.
+This is dramatically smaller than the HTTP/1.1 `httpbin.org`
+overhead (+215 ms) because the Anthropic API is HTTP/2 — the
+proxy maintains one persistent multiplexed upstream connection
+and amortises the upstream TLS handshake across many agent
+requests. The agent ↔ proxy handshake is still per-request
+(curl `--no-keepalive`), but it's localhost-fast.
+
+**Methodology correction.** An earlier run of this bench
+(`scripts/bench-overhead.sh` test C) reported `+5638 ms` LLM
+overhead. That measurement put the LLM call inside an OpenClaw
+agent loop and timed the full agent invocation, which includes
+multiple internal HTTP calls + agent-loop bookkeeping. The
+overhead it captured was almost entirely OpenClaw's, not GVM's.
+The figures above are raw `curl` against the Anthropic
+`/v1/messages` endpoint with no agent runtime — the actual
+GVM proxy overhead on a single LLM API call.
 
 ### Methodology gap with prior reports
 

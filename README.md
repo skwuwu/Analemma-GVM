@@ -99,9 +99,21 @@ Use cooperative mode for agents you trust or wrote yourself (Python `requests`, 
 
 - Rust, two binaries totaling ~35MB on Linux x86_64 (gvm 17MB + gvm-proxy 18MB; ~29MB on Windows). Measured on `cargo build --release` of commit at the time of writing — anchor signing (`ed25519-dalek`) and CLI runtime deps account for the bulk.
 - gvm-proxy RSS: ~14MB idle, ~17MB after a sustained `httpbin.org` workload (measured on EC2 t3.medium)
-- HTTP TTFB to `httpbin.org` from EC2: 751ms direct vs **1266ms via sandbox MITM** (median of 20). MITM overhead = **+515ms median** for a real-world TLS round trip with proxy-side TLS termination + re-encrypt. ([raw bench, 2026-05-07](docs/test-report.md#bench-overhead-2026-05-07-ec2-t3medium))
-- Sandbox cold start: **876ms median** (832-881ms range, n=5) — comparable to `docker run`
-- 10-parallel concurrent throughput: 1104ms direct vs 1269ms via proxy = **+165ms median**
+- Per-request overhead is **dominated by the upstream's protocol**, not by the proxy itself. Two reference points (n=20 fresh-TLS curl, EC2 Seoul → US, medians):
+
+  | Upstream | Direct | Coop. proxy + MITM | MITM-only overhead | Why |
+  |----------|--------|--------------------|--------------------|----|
+  | `httpbin.org` (HTTP/1.1) | 756 ms | 971 ms | **+215 ms** | proxy does fresh upstream TLS handshake per request — HTTP/1.1 doesn't multiplex |
+  | Anthropic API `claude-haiku-4-5` ("hi", 16 tokens) | 880 ms | 908 ms | **+28 ms** | proxy reuses one HTTP/2 upstream connection across many agent requests — TLS handshake amortizes |
+
+  Modern LLM and SaaS APIs are HTTP/2; expect ~tens of milliseconds of MITM overhead, not hundreds. Plain `curl --no-keepalive` against an HTTP/1.1 endpoint is the worst case.
+
+- Full sandbox path (MITM + iptables DNAT + DNS Tier-2 governance) on `httpbin.org`: **1266 ms** → +510 ms total over baseline. The MITM piece is the +215 ms above; the remaining ~295 ms is the sandbox network route + the 200 ms Tier-2 delay applied to "Unknown" domain lookups. Pre-classify hot domains via `gvm suggest` to move them to Tier 1 (no DNS delay).
+
+- ([raw bench, 2026-05-07](docs/test-report.md#bench-overhead-2026-05-07-ec2-t3medium))
+
+- Sandbox cold start: **876ms median** (832-881ms range, n=5) — comparable to `docker run`.
+- 10-parallel concurrent `httpbin.org`: 1104 ms direct vs 1269 ms via proxy = **+165 ms median**.
 - Policy evaluation < 1μs (SRR, Criterion benchmark)
 - WAL with Merkle chain + optional Ed25519 anchor signing (run `gvm anchor keygen` to generate the operator-managed keypair, set `[anchor] enabled = true`). Size-based rotation (100MB x 10 segments by default). Local storage — for off-host audit replication, tail the WAL with rsync / fluentd / vector / S3 backup.
 - **808 Windows tests / 852 Linux tests** across 49 binaries, fmt + clippy `-D warnings` clean. 30-min chaos stress test (proxy kill, network partition, disk pressure) — [PASS](docs/test-report.md#hermes-agent-validation-2026-04-15-ec2-t3medium)

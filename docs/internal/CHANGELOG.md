@@ -72,13 +72,47 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
-### 2026-05-07: Bench refresh — measured numbers replace stale README claims
+### 2026-05-07: Bench refresh — corrected after two methodology errors caught in review
 
-Re-ran `scripts/bench-overhead.sh` on EC2 t3.medium (Ubuntu 24.04,
-kernel 6.17.0-1009-aws) against real `https://httpbin.org/get`,
-n=20 medians. The README + test-report numbers were left over from
-a 2026-04-06 measurement and several were significantly off after
-the anchor-signing / sandbox-peer / IC-3 stress work landed.
+Initial pass against `scripts/bench-overhead.sh` on EC2 t3.medium
+(kernel 6.17.0-1009-aws) reported `+515 ms` HTTP MITM overhead and
+`+5638 ms` LLM call overhead. Both numbers were misattributed once
+the bench design was inspected:
+
+1. **HTTP `+515 ms` was not all MITM.** It was the full sandbox
+   stack overhead (MITM + sandbox iptables DNAT + DNS-governance
+   Tier-2 delay). A layered re-bench (`/tmp/bench-layered.sh`,
+   cooperative-mode B2 vs sandbox-mode A3) attributes:
+   - **MITM-only: +215 ms** (cooperative proxy, no sandbox)
+   - **Sandbox + DNS-gov on top: +295 ms additional** (sandbox
+     veth/iptables + the 200 ms Tier-2 delay applied to the
+     "Unknown" `httpbin.org` DNS lookup)
+   We attempted to separate sandbox-route from DNS-gov by running
+   with `--no-dns-governance`, but that flag also disables the
+   iptables DNAT the sandbox depends on for egress, so the case
+   produced no data. Tracked as a script gap, not blocking.
+
+2. **LLM `+5638 ms` was OpenClaw, not GVM.** The original C-test
+   wrapped the LLM call in an OpenClaw agent invocation
+   (`openclaw agent ... -m 'Say hi'`), which does its own
+   multiple-HTTP-call agent-loop bookkeeping. That overhead was
+   attributed to GVM. Re-measured with raw `curl` against
+   `/v1/messages` (`claude-haiku-4-5`, "hi", 16 tokens, n=20):
+   - Direct: 880 ms median (p95 1971 ms, variance from
+     Anthropic backend latency)
+   - Cooperative proxy + MITM: 908 ms median (p95 2393 ms)
+   - **MITM-only overhead: +28 ms** (~70× smaller than the
+     original claim)
+
+   The `httpbin.org` `+215 ms` vs Anthropic `+28 ms` gap is
+   protocol-driven: HTTP/1.1 requires a fresh proxy↔upstream
+   handshake per request, while HTTP/2 multiplexes a long-lived
+   upstream connection so the handshake amortises across many
+   agent requests. Production agents talking to modern LLM /
+   SaaS APIs see the small number, not the large one.
+
+Updated numbers (current authoritative, README + test-report.md
+both refreshed):
 
 **Updated numbers (current authoritative)**:
 
@@ -88,29 +122,36 @@ the anchor-signing / sandbox-peer / IC-3 stress work landed.
 | Binary total (Windows) | not stated | **29MB** (gvm 14 + gvm-proxy 15) |
 | `gvm-proxy` RSS idle | "~11MB" | **14.3MB** |
 | `gvm-proxy` RSS loaded | "~13MB" | **17.2MB** |
-| Sandbox MITM TTFB overhead | "+14ms" | **+515ms median** (real httpbin.org) |
-| Sandbox cold start | "~928ms" | **876ms median** (832-881 range) |
-| 10-parallel concurrent overhead | not stated | **+165ms** (1104→1269ms) |
-| LLM call (Anthropic, "Say hi") overhead | not stated | **+5638ms** (10531→16169ms) |
+| HTTP/1.1 MITM-only overhead (cooperative, httpbin.org) | not measured cleanly | **+215 ms median** |
+| HTTP/2 MITM-only overhead (cooperative, Anthropic API) | not measured | **+28 ms median** |
+| Full sandbox stack on httpbin.org (MITM + iptables + DNS-gov) | "+14ms" | **+510 ms median** |
+| Sandbox cold start | "~928ms" | **876 ms median** (832-881 range) |
+| 10-parallel concurrent overhead | not stated | **+165 ms** (1104→1269 ms) |
 | Workspace test count (Win/Lin) | "729 / 762" | **808 / 852** (49 binaries) |
 
-**Significant: MITM overhead `+14ms` vs `+515ms`.** The original
-+14ms figure does not reproduce against a real internet endpoint
-from EC2; we suspect the prior measurement used a localhost mock
-upstream (sub-ms RTT), but the original raw data is gone so we
-can't confirm. The 515ms figure is the current authoritative
-number for an internet round-trip with proxy-side TLS termination.
-Operators who run GVM in front of an LLM provider should expect
-the +5638ms LLM overhead (multi-KB response stream goes through
-SRR + MITM re-encryption per chunk) and size accordingly.
+**Why the original `+14 ms` claim doesn't reproduce.** The original
+figure was attributed to "MITM overhead" but the methodology to
+generate it is no longer in the tree. Possibilities:
+- A localhost mock upstream (sub-ms RTT, so MITM overhead reduces
+  to cert-mint cost, ~10-30 ms);
+- Or an HTTP/2 endpoint that hid the per-request handshake cost
+  the way our Anthropic case does (we now measure +28 ms on
+  Anthropic, comparable to what the old number might have meant).
+We don't have raw data to confirm. The new authoritative numbers
+are the table above, with each protocol separated explicitly.
 
-**Methodology bug noted but not fixed in this commit**: The bench
-script's A2 case (proxy without sandbox) returned 0.000 × 20
-because the default proxy rules reject `httpbin.org` without an
-explicit allow. A3 (sandbox MITM) avoided this because the
-sandbox launch path prewarms an Allow rule for the test target.
-Tracked for the next bench run; A1 vs A3 is the production
-comparison anyway.
+**Methodology gaps noted but not fixed in this commit**:
+- `scripts/bench-overhead.sh` A2 case (cooperative proxy, no
+  sandbox) returned 0.000 × 20 because the default proxy rules
+  reject `httpbin.org` without an explicit allow. The
+  `bench-layered.sh` script we ran instead writes its own SRR
+  config and works around this; `bench-overhead.sh` should be
+  updated similarly.
+- `--no-dns-governance` disables the iptables DNAT the sandbox
+  needs for egress, so the case can't be used to isolate
+  sandbox-route from DNS-gov contributions. Treating the +295 ms
+  sandbox-stack overhead as "sandbox + DNS-gov combined" until
+  that's untangled.
 
 **Affected files**: README.md (Technical facts section);
 docs/test-report.md (header + new "bench-overhead 2026-05-07"
