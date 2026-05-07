@@ -96,7 +96,8 @@ Reads the audit log (WAL or watch session JSON) and emits an SRR rule for every 
 
 ### SRR Rules (`gvm.toml` — `[[rules]]`)
 
-URL pattern matching. No SDK needed.
+URL pattern matching enforced by the proxy. Works with any agent
+that talks HTTP/HTTPS — no client library required.
 
 ```toml
 # Allow GitHub reads
@@ -171,7 +172,7 @@ value = "SG.your_sendgrid_key"
 
 Existing agents with hardcoded keys work immediately — no code changes. When ready, move keys to `gvm.toml` for centralized management. File permissions must be `0600` (checked at load).
 
-> **Scope:** HTTP headers only. LLM SDKs require keys at initialization — use `ANTHROPIC_API_KEY` env var for that. Credential injection is for tool API calls (Stripe, Slack, GitHub, etc.).
+> **Scope:** HTTP headers only. LLM client libraries (Anthropic, OpenAI, Cohere, …) require keys at construction — use `ANTHROPIC_API_KEY` env var for that. Credential injection is for tool API calls (Stripe, Slack, GitHub, etc.).
 
 ### `gvm approve` — Human-in-the-Loop Approvals
 
@@ -368,22 +369,45 @@ per_agent_max_tokens_per_hour = 100_000
 per_agent_max_cost_per_hour   = 10.0
 ```
 
-**Identity verification (JWT)**: header-based `X-GVM-Agent-Id` is **spoofable** — any agent can claim to be any agent_id. To prevent this, enable JWT:
+**Identity verification**. The proxy resolves an agent's identity in
+this order of preference (first match wins):
+
+1. **`Authorization: Bearer <jwt>`** — cryptographically verified.
+   Enable by setting `GVM_JWT_SECRET` env var on the proxy and adding
+   a `[jwt]` section to `proxy.toml`. The agent must include the
+   header explicitly; clients that don't construct the header pass
+   to the next step.
+
+2. **Sandboxed peer (`gvm run --sandbox`)** — automatic. The proxy
+   resolves the source IP of the veth pair to the sandbox's
+   `agent_id` registered at launch time. The proxy minted that IP
+   itself, so the trust path is no weaker than the namespace
+   isolation that already separates sandboxes. Bare `urllib`,
+   `requests`, `curl`, anything that opens an HTTP socket gets
+   the right `agent_id` in the audit chain with **zero code
+   changes**.
+
+3. **Self-declared `X-GVM-Agent-Id` header** — spoofable, dev only.
+   The proxy logs a warning when this path is taken.
+
+4. None of the above → the request is recorded with `agent=unknown`
+   in the WAL.
 
 ```toml
+# proxy.toml — JWT is the recommended identity for cooperative-mode
+# (non-sandboxed) clients. Sandboxed agents are covered automatically.
 [jwt]
-secret_env      = "GVM_JWT_SECRET"   # 32+ byte hex string
-token_ttl_secs  = 3600
+secret_env     = "GVM_JWT_SECRET"   # 32+ byte hex secret
+token_ttl_secs = 3600
 ```
 
-When JWT is enabled, `gvm run` automatically calls `POST /gvm/auth/token` for the agent's identity and exposes the resulting JWT as the `GVM_JWT_TOKEN` environment variable inside the agent's process. If JWT isn't configured on the proxy, the call returns 503 and the CLI silently falls back to the legacy header-based path.
-
-**SDK-less agents** must read `GVM_JWT_TOKEN` and add it to outbound requests themselves — the proxy will not accept the identity otherwise. The simplest way:
+When JWT is enabled, `gvm run` calls `POST /gvm/auth/token` and
+exposes the result as `GVM_JWT_TOKEN` in the agent's environment.
+Agents that already set `Authorization: Bearer …` themselves use
+that token (sample for plain `urllib` / `fetch`):
 
 ```python
-# Python (without the GVM SDK)
 import os, urllib.request
-
 token = os.environ.get("GVM_JWT_TOKEN")
 req = urllib.request.Request("https://api.openai.com/v1/chat/completions", data=...)
 if token:
@@ -392,14 +416,14 @@ urllib.request.urlopen(req)
 ```
 
 ```javascript
-// Node.js (without the GVM SDK)
 const token = process.env.GVM_JWT_TOKEN;
 const headers = {};
 if (token) headers["Authorization"] = `Bearer ${token}`;
 fetch("https://api.openai.com/v1/chat/completions", { headers, ... });
 ```
 
-Without that header, the proxy logs `"No JWT token provided — using unverified X-GVM-Agent-Id header"` and accepts the self-declared identity. That is fine for dev runs but should NOT be relied on in any setting where one agent's process could pretend to be another.
+Sandboxed agents (`gvm run --sandbox`) do NOT need to do this —
+the peer-IP lookup covers them.
 
 **Per-agent monitoring**:
 
@@ -677,10 +701,12 @@ segfault, etc.), `gvm status` will tell you loudly:
 
 - [ ] Remove `[dev] host_overrides` from proxy.toml
 - [ ] Set `GVM_SECRETS_KEY` and `GVM_VAULT_KEY`
-- [ ] Configure NATS for WAL replication (**critical for long-term audit retention** — without NATS, rotated WAL segments are permanently deleted after 1GB local storage)
+- [ ] Set `GVM_JWT_SECRET` (`openssl rand -hex 32`) and add `[jwt]` section
+- [ ] Run `gvm anchor keygen --out /etc/gvm/anchor.key --key-id <stable-label>`, then `[anchor] enabled = true` in proxy.toml. Distribute the matching `.pub` file to your auditor.
+- [ ] Set `[wal] max_wal_segments` to fit your retention policy. The local WAL is the single source of truth — for off-host replication, tail `data/wal.log` with rsync / fluentd / vector / S3 backup. GVM does not connect to external streaming systems on the operator's behalf.
 - [ ] Set credential policy to `Deny` (not Passthrough)
 - [ ] Enable `--shadow-mode strict`
-- [ ] `chmod 600 gvm.toml`
+- [ ] `chmod 600 gvm.toml` and `chmod 600 /etc/gvm/anchor.key`
 - [ ] Review SRR: no catch-all Allow
 - [ ] Set up `gvm stats` + `gvm audit verify` in cron
 - [ ] Test with `gvm check` before deploying policy changes

@@ -7,7 +7,7 @@
 
 ## Configuration
 
-GVM uses a single unified config file: `gvm.toml`. Everything the user cares about (rules, credentials, cost budget, filesystem patterns, seccomp) lives there. `proxy.toml` remains as an optional infrastructure-tuning file (server port, WAL paths, NATS, DNS listen port); most users don't need it.
+GVM uses a single unified config file: `gvm.toml`. Everything the user cares about (rules, credentials, cost budget, filesystem patterns, seccomp) lives there. `proxy.toml` remains as an optional infrastructure-tuning file (server port, WAL paths, JWT/anchor key paths, DNS listen port); most users don't need it.
 
 ### Config File Location
 
@@ -28,7 +28,9 @@ Optional `proxy.toml` is loaded from `config/proxy.toml` or `~/.config/gvm/proxy
 | `GVM_ENV` | `production` disables dev features (host overrides) | `development` |
 | `GVM_VAULT_KEY` | AES-256 key for Vault encryption (64 hex chars) | Random ephemeral key |
 | `GVM_SECRETS_KEY` | Encryption key for credential block in `gvm.toml` | None (plaintext + `0600`) |
-| `GVM_PROXY_URL` | Override proxy URL in Python SDK | `http://127.0.0.1:8080` |
+| `GVM_PROXY_URL` | Proxy URL hint published by `gvm run` to the agent's environment (e.g. `HTTP_PROXY=$GVM_PROXY_URL`) | `http://127.0.0.1:8080` |
+| `GVM_JWT_SECRET` | HMAC-SHA256 secret (hex, ≥ 32 bytes) — enables JWT identity verification | None (JWT disabled) |
+| `GVM_JWT_TOKEN` | JWT issued by `gvm run` and exposed inside the agent's environment | None |
 | `GVM_SHADOW_MODE` | Shadow Mode: `strict`, `cautious`, `permissive`, `disabled` | `disabled` |
 | `RUST_LOG` | Proxy log level | `info` |
 
@@ -96,12 +98,36 @@ ic1_loss_threshold = 0.001    # Tolerate 0.1% WAL loss for IC-1
 enabled = true
 listen_port = 5353
 
+# JWT identity (recommended for production cooperative-mode clients;
+# sandboxed agents are covered automatically by source-IP attribution)
+[jwt]
+secret_env     = "GVM_JWT_SECRET"
+token_ttl_secs = 3600
+
+# Ed25519 anchor signing (every WAL anchor record is signed; auditors
+# verify offline with the matching .pub file). Generate the key with
+# `gvm anchor keygen --out /etc/gvm/anchor.key --key-id <stable-label>`.
+# Proxy refuses to start if enabled = true and the file is missing or
+# malformed (fail-close).
+[anchor]
+enabled  = true
+key_path = "/etc/gvm/anchor.key"
+
 # Dev-only: remap hosts to local mock server. Ignored when GVM_ENV=production.
 [dev]
 host_overrides = { "gmail.googleapis.com" = "127.0.0.1:9090" }
 ```
 
-Fields not listed here (NATS, Redis URLs, JWT keys, WAL tuning) retain built-in defaults. See `src/config.rs` for the complete schema.
+Fields not listed here (WAL tuning, IC-3 timeout, etc.) retain
+built-in defaults. See `src/config.rs` for the complete schema.
+
+> **External streaming integrations are operator-managed.** GVM does
+> not connect to NATS, Redis, Kafka, or SIEM systems on the
+> operator's behalf — the local WAL is the single source of truth.
+> For off-host audit replication, tail `data/wal.log` with rsync,
+> fluentd, vector, syslog, or your S3 backup tool. Older
+> `proxy.toml` files with `[nats]` / `[redis]` sections still load
+> without erroring; the values are silently ignored.
 
 ---
 
@@ -153,60 +179,45 @@ SRR is the sole enforcement layer on Layer 1. Decisions are deterministic — sa
 
 ---
 
-## SDK Reference
+## Agent integration — what your code needs
 
-### GVMAgent Constructor
+**Nothing.** Governance is enforced at the proxy. Plain `requests`,
+`urllib`, `node-fetch`, `curl`, or any HTTP/HTTPS client works
+unmodified — the proxy classifies and enforces every request that
+passes through it.
 
-```python
-GVMAgent(
-    agent_id="finance-001",           # Required
-    tenant_id="acme",                 # Optional: org-scoped tag for audit correlation
-    session_id="custom-session",      # Optional: auto-generated if omitted
-    proxy_url="http://custom:8080",   # Optional: overrides GVM_PROXY_URL
-    auto_checkpoint="ic2+",           # Optional: None | "ic2+" | "ic3" | "all"
-    max_history_turns=100,            # Optional: default 50
-)
-```
+The only situation where the agent's process needs to read anything
+GVM-specific is when JWT identity is enabled in cooperative mode
+(non-sandboxed). In that case the CLI exposes the agent's JWT as
+`GVM_JWT_TOKEN` in the environment, and the agent's HTTP client
+must add `Authorization: Bearer $GVM_JWT_TOKEN` to outbound
+requests. See [User Guide → Identity verification](user-guide.md)
+for the minimal Python / Node snippets.
 
-### `@ic` Decorator
+For sandboxed agents (`gvm run --sandbox`), even that is not
+required: the proxy resolves identity from the source IP of the
+veth pair it allocated, so plain HTTP clients are correctly
+attributed in the audit chain with zero code changes.
 
-```python
-@ic(
-    operation="gvm.payment.charge",     # Auto-generated if omitted
-    checkpoint=True,                    # Force checkpoint (optional)
-)
-```
-
-The decorator attaches operation metadata and optionally snapshots agent state for rollback. Enforcement decisions come from SRR on the proxy — the decorator does not evaluate policy.
-
-### Error Hierarchy
+A response carries the proxy's decision in HTTP headers that the
+agent's HTTP library treats as ordinary 403/200 responses:
 
 ```
-GVMError                         # Base
-├── GVMDeniedError               # 403 — Deny decision
-├── GVMApprovalRequiredError     # 403 — RequireApproval
-└── GVMRollbackError             # 403 — Denied + state rolled back
-    ├── .operation               # Blocked operation name
-    ├── .reason                  # Why it was blocked
-    └── .rolled_back_to          # Checkpoint step restored to
+X-GVM-Decision: Deny | Allow | RequireApproval | Delay | AuditOnly
+X-GVM-Event-Id: <uuid>
+X-GVM-Block-Reason: <human-readable reason, on Deny only>
 ```
 
-All exceptions include `event_id` for audit trail correlation.
-
-### Checkpoint Modes
-
-| Mode | Checkpoints before |
-|------|--------------------|
-| `None` | Never (use `@ic(checkpoint=True)` per-operation) |
-| `"all"` | Every `@ic` operation |
-
-Limits: 5MB per checkpoint, 10 retained, conversation history truncated to `max_history_turns`.
+Catch HTTP status codes the way you would for any external API
+(`requests.HTTPError`, `fetch().ok === false`, etc.) — there is no
+GVM-specific exception type to import.
 
 ---
 
 ## CLI Reference
 
-All commands read from the WAL — no separate database required. Use `--wal-file data/wal.log` if NATS is not connected.
+All commands read from the WAL — no separate database required.
+Use `--wal-file data/wal.log` to point at a non-default location.
 
 ### Events
 
@@ -267,17 +278,21 @@ Watch mode generates a temporary allow-all SRR config in the OS temp directory a
 ### Agent Execution
 
 ```bash
-gvm run agent.py                     # Basic
+gvm run agent.py                       # Basic
 gvm run --agent-id custom-id agent.py  # Custom audit identity
-gvm run -i agent.py                  # Interactive: suggest rules after run
-gvm run --sandbox agent.py           # Linux namespace isolation
-gvm run --contained agent.py         # Docker isolation [EXPERIMENTAL — see note]
-gvm run --contained --detach agent.py  # Docker in background [EXPERIMENTAL]
+gvm run -i agent.py                    # Interactive: suggest rules after run
+gvm run --sandbox agent.py             # Linux namespace + seccomp + MITM (recommended for production)
 
 # Binary mode: run any command through GVM proxy
 gvm run -- openclaw gateway            # Arbitrary binary + args
 gvm run --sandbox -- openclaw gateway  # Binary in Linux sandbox
 ```
+
+> **`--contained` (Docker isolation)** is gated behind
+> `cargo build --features contained` and is not in the default
+> binary. The default `gvm run --help` does not advertise it.
+> See [Platform Support](#platform-support) for the current
+> readiness of that mode.
 
 ### Sandbox Cleanup
 
@@ -294,7 +309,7 @@ Auto-cleanup also runs at the start of every `gvm run --sandbox` — you only ne
 
 When the argument after `--` is not a recognized script file (`.py`, `.js`, `.ts`, `.sh`, `.bash`) or when multiple arguments follow `--`, `gvm run` enters **binary mode**. The specified command is executed with `HTTP_PROXY` and `HTTPS_PROXY` set to route all outbound traffic through the GVM proxy.
 
-Binary mode provides full SRR enforcement (URL/method/payload matching). No SDK headers are injected; all audit output goes to stderr to keep stdout clean for piping.
+Binary mode provides full SRR enforcement (URL/method/payload matching). All audit output goes to stderr to keep stdout clean for piping.
 
 With `--sandbox`, binary mode uses Linux-native isolation (namespaces + seccomp + veth + TC filter) — the same security layers as script sandbox mode.
 
@@ -317,7 +332,7 @@ Hot-reload SRR rules from the config file. Atomically swaps the rule set. On par
 
 ### `POST /gvm/intent`
 
-Register a Shadow Mode intent for pre-flight verification. MCP tools or SDK call this before the agent makes an outbound HTTP request.
+Register a Shadow Mode intent for pre-flight verification. MCP tools (or any pre-call gate) call this before the agent's outbound HTTP request.
 
 | Field | Value |
 |-------|-------|
@@ -383,32 +398,29 @@ Configuration fields for `gvm run --sandbox` (Linux-native isolation). Defined i
 
 ## Platform Support
 
-| Platform | Proxy | SDK | `--sandbox` | `--contained` |
-|----------|-------|-----|-------------|---------------|
-| Linux | Native | Native | **Production** (with MITM) | **Experimental** (no MITM) |
-| Windows (WSL2) | Native | Native | Not supported | **Experimental** (run gvm from WSL2) |
-| Windows (native) | Native | Native | Not supported | Cooperative fallback |
-| macOS | Native | Native | Not supported | Cooperative fallback |
+| Platform | Proxy | `--sandbox` |
+|----------|-------|-------------|
+| Linux | Native | **Production** (kernel namespaces + seccomp + MITM) |
+| Windows (WSL2) | Native | Not supported (use Linux directly inside WSL2) |
+| Windows (native) | Native | Not supported (proxy enforces, no kernel-level isolation) |
+| macOS | Native | Not supported (proxy enforces, no kernel-level isolation) |
 
-> **`--contained` is EXPERIMENTAL** — under active construction. The
-> following pieces work today: read-only root filesystem,
-> `no-new-privileges`, NET_ADMIN drop, resource limits, host-side
-> iptables egress lock, session-summary UX, orphan cleanup. The
-> following are NOT yet wired:
-> - DNAT inside the container's network namespace (HTTPS in the
->   container currently fails to reach the proxy on its own — agents
->   must explicitly use `HTTP_PROXY` env var; non-cooperative clients
->   are dropped by the host iptables lock rather than transparently
->   redirected)
-> - CA injection into the container trust store at runtime
-> - Conditional `HTTPS_PROXY` env strip (the env var is currently set
->   unconditionally; the host iptables DROP catches bypass attempts
->   but `Proxy env vars present — CONNECT bypass possible`-style
->   tests fail)
->
-> For HTTPS L7 inspection use `--sandbox` on Linux. `--contained` is
-> the right answer for Windows / WSL2 deployments where Linux
-> namespaces aren't an option, but read its limitations carefully.
+On non-Linux hosts, the cooperative HTTP-proxy mode still enforces
+SRR rules and credential injection — only kernel-level isolation is
+unavailable. For production isolation use Linux + `--sandbox`.
+
+> **`--contained` (Docker isolation)** is gated behind the
+> `contained` cargo feature and **not** in the default binary.
+> Default builds do not show `--contained` in `gvm run --help`.
+> The mode is unfinished: the in-container DNAT to MITM, runtime
+> CA injection, and `HTTPS_PROXY` env handling are not yet wired,
+> so transparent HTTPS interception inside the container does not
+> work today. Builds that opt into Docker isolation
+> (`cargo build --release --features contained`) get the host-side
+> iptables egress lock as the only governance signal in the
+> container; agents that don't honour `HTTP_PROXY` are dropped by
+> the lock rather than transparently redirected. For HTTPS L7
+> inspection use `--sandbox` on Linux.
 
 ### Sandbox Prerequisites (Linux only)
 
@@ -421,7 +433,7 @@ Configuration fields for `gvm run --sandbox` (Linux-native isolation). Defined i
 
 ## LLM Provider Governance
 
-Proxy-level inspection of LLM API calls — no SDK needed:
+Proxy-level inspection of LLM API calls — no client library required:
 
 - **Model pinning**: Whitelist allowed models via `payload_field = "model"` in SRR rules
 - **Endpoint restriction**: Allow `chat/completions` only, block `fine-tuning`

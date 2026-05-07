@@ -2,6 +2,11 @@
 
 **Zero code changes. Your agent doesn't know it's being governed.**
 
+Governance is enforced by a Rust proxy in front of your agent. There is
+no Python SDK to import, no decorator to add, no client library to wrap
+your code. Plain `requests`, `urllib`, `node-fetch`, `curl`, or anything
+else that talks HTTP/HTTPS works unmodified.
+
 ---
 
 ## 1. Launch
@@ -29,7 +34,7 @@ That's it. `gvm run` auto-configures the proxy, routes all HTTP traffic through 
   Security layers active:
     ✓ SRR enforcement (request pattern matching)
     ✓ Proxy interception (HTTP + MITM TLS)
-    ○ OS containment (add --sandbox or --contained)
+    ○ OS containment (add --sandbox)
 
   --- Agent output below ---
   ...
@@ -47,21 +52,18 @@ That's it. `gvm run` auto-configures the proxy, routes all HTTP traffic through 
 
 ```bash
 gvm run my_agent.py              # Lite:  HTTP proxy only (dev/testing)
-gvm run --sandbox my_agent.py    # Hard:  + Linux namespaces + seccomp (production)
-gvm run --contained my_agent.py  # Docker isolation (Linux + WSL2) [EXPERIMENTAL]
+gvm run --sandbox my_agent.py    # Hard:  + Linux namespaces + seccomp + MITM (production, Linux)
 ```
 
-> **Non-Linux?** `--sandbox` is Linux-only (production-ready).
+> **Non-Linux?** `--sandbox` is Linux-only. For development on macOS or
+> Windows, the cooperative HTTP-proxy mode still enforces SRR rules and
+> credential injection — only kernel-level isolation is unavailable.
 >
-> **`--contained` is EXPERIMENTAL.** The Docker isolation primitives
-> (read-only FS, no-new-privileges, NET_ADMIN drop, resource limits,
-> session-summary UX) work, but the in-container DNAT to MITM, CA
-> injection into the container trust store, and `HTTPS_PROXY` env
-> handling are still being wired up. Today the host-side iptables
-> egress lock catches bypass attempts but transparent HTTPS
-> interception inside the container is a no-op. For guaranteed L7
-> HTTPS inspection use `--sandbox` on Linux. We're tracking the
-> remaining contained-mode work in `docs/internal/CHANGELOG.md`.
+> **`--contained`** (Docker isolation) is gated behind the
+> `cargo build --features contained` flag and is **not** in the default
+> binary. It is unfinished — the in-container DNAT to MITM and CA
+> injection are not yet wired — and will not appear in `gvm run --help`
+> on a default build. For full HTTPS L7 inspection use `--sandbox`.
 
 ---
 
@@ -108,7 +110,7 @@ This means existing agents with hardcoded keys work immediately — just add the
 
 **Scope and limitations:**
 - Credential injection operates at the **HTTP layer** (headers). It cannot inject credentials into request bodies (e.g., GraphQL variables).
-- **LLM SDKs** (Anthropic, OpenAI) require API keys at **client initialization time** (before HTTP requests). The proxy cannot help with SDK initialization — agents must have the LLM key in their environment (`ANTHROPIC_API_KEY`). Credential injection is for **tool API calls** (Stripe, Slack, GitHub, etc.) that the agent makes via HTTP after receiving tool_use from the LLM.
+- **LLM client libraries** (Anthropic, OpenAI, Cohere, …) require API keys at **client initialization time** (before HTTP requests). The proxy cannot help with library initialization — agents must have the LLM key in their environment (`ANTHROPIC_API_KEY`). Credential injection is for **tool API calls** (Stripe, Slack, GitHub, etc.) that the agent makes via HTTP after receiving tool_use from the LLM.
 - For LLM keys, use the standard `ANTHROPIC_API_KEY` environment variable. The proxy governs what the agent *does* with LLM responses, not how it authenticates to the LLM.
 
 ---
@@ -117,7 +119,7 @@ This means existing agents with hardcoded keys work immediately — just add the
 
 ### Block by URL Pattern (`gvm.toml` — `[[rules]]`)
 
-No SDK needed. Works with any language.
+Works with any language. No client library needed — the rules are evaluated by the proxy.
 
 ```toml
 [[rules]]
@@ -133,45 +135,90 @@ Decisions available (strictness order): `Allow < AuditOnly < Delay < RequireAppr
 
 ---
 
-## 5. Try the Demo (No API Key Needed)
+## 5. Identity for Sandboxed Agents — Automatic
 
-```bash
-cargo run                       # Terminal 1: proxy
-python -m gvm.mock_demo         # Terminal 2: mock LLM, real enforcement
-```
+When you launch an agent with `gvm run --sandbox`, the proxy resolves
+its identity from the source IP of the veth pair it allocated (the
+proxy minted that IP itself, so source spoofing requires breaking out
+of the network namespace — the same boundary that already separates
+sandboxes from each other). Bare `urllib`, `requests`, `node-fetch`,
+or anything else that opens an HTTP socket is automatically attributed
+to the right `agent_id` in the audit chain. **No SDK, no header, no
+JWT for the agent author to wire up.**
 
-The demo runs 4 pre-scripted actions through the real proxy — read inbox (Allow), send email (Delay 300ms), wire transfer (Deny), delete emails (Deny) — and prints a full governance audit.
+If you also enable JWT-based identity (`GVM_JWT_SECRET` env var,
+`[jwt]` config section), the proxy's order of precedence is:
 
----
+1. Valid `Authorization: Bearer <jwt>` → identity from claims
+2. Sandboxed peer (recognized veth IP) → identity from sandbox metadata
+3. Self-declared `X-GVM-Agent-Id` header → unverified, dev only
+4. None of the above → request flagged as `agent=unknown` in WAL
 
-## 6. Add the SDK (Experimental)
-
-> **The proxy enforces governance without the SDK.** URL blocking, credential injection, and audit trail all work at full strength with zero code changes. The SDK is an experimental add-on — not required for production governance.
-
-The SDK adds intent verification (`@ic` decorator) and checkpoint/rollback. These features are **not yet stabilized** — the proxy-only path is the recommended approach.
-
-```python
-from gvm import ic, gvm_session
-
-@ic(operation="gvm.messaging.send")
-def send_email(to, subject, body):
-    return gvm_session().post("http://gmail.googleapis.com/...", json={...}).json()
-```
-
-**Without SDK vs. With SDK:**
-
-- Without: URL blocking, key injection, audit trail — **all work at full strength (recommended)**
-- With: + semantic intent verification, + checkpoint/rollback (experimental), + token savings on deny
-
-```bash
-pip install -e sdk/python       # Install once
-```
+Production deployments should configure JWT for cooperative-mode
+clients and rely on the sandbox-peer fallback for `--sandbox`
+agents.
 
 ---
 
-## 7. MCP Integration — Claude Desktop / Cursor
+## 6. Try the Demo (No API Key Needed)
 
-GVM provides MCP tools for AI assistants that support the Model Context Protocol. This lets Claude Desktop, Cursor, or any MCP-compatible client govern agent API calls through GVM.
+```bash
+cargo run                # Terminal 1: proxy
+gvm demo finance         # Terminal 2: pre-scripted agent against the proxy
+```
+
+The demo runs 4 pre-scripted actions through the real proxy — read
+inbox (Allow), send email (Delay 300ms), wire transfer (Deny), delete
+emails (Deny) — and prints a full governance audit. Other scenarios:
+`gvm demo assistant`, `gvm demo devops`, `gvm demo data`.
+
+---
+
+## 7. Tamper-Proof Audit (Optional, Recommended for Production)
+
+Every WAL anchor record can be Ed25519-signed by an operator-managed
+key. External auditors verify the chain offline using only the matching
+public key — no need to trust the runtime.
+
+```bash
+# One-time keygen on the operator host
+sudo install -d -o gvm -g gvm -m 0700 /etc/gvm
+gvm anchor keygen --out /etc/gvm/anchor.key --key-id gvm-prod-1
+```
+
+This produces:
+- `/etc/gvm/anchor.key` — secret, mode 0600, NEVER committed or distributed
+- `/etc/gvm/anchor.key.pub` — public, mode 0644, sent to the auditor
+
+Then in `proxy.toml`:
+
+```toml
+[anchor]
+enabled = true
+key_path = "/etc/gvm/anchor.key"
+```
+
+The proxy refuses to start if `enabled = true` but the key file is
+missing or malformed (fail-close — operators who turned signing on
+cannot accidentally end up with unsigned anchors).
+
+Auditors verify with the public key only:
+
+```bash
+gvm audit verify --wal /path/to/wal.log
+```
+
+For the full operator checklist (file mode, encryption-at-rest,
+backup hygiene, rotation runbook), see
+[`config/proxy.production.toml.example`](../config/proxy.production.toml.example).
+
+---
+
+## 8. MCP Integration — Claude Desktop / Cursor
+
+GVM provides MCP tools for AI assistants that support the Model Context
+Protocol. This lets Claude Desktop, Cursor, or any MCP-compatible
+client govern agent API calls through GVM.
 
 ### Setup
 
@@ -220,7 +267,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 Shadow Mode adds a 2-phase verification: the MCP tool declares what it's about to do (`gvm_declare_intent`), then the proxy verifies the actual request matches the declaration.
 
 ```toml
-# config/proxy.toml
+# proxy.toml
 [shadow]
 mode = "cautious"       # strict | cautious | permissive | disabled
 intent_ttl_secs = 30    # how long an intent stays valid
@@ -263,9 +310,8 @@ Claude: "I can't delete repositories — that operation is blocked by governance
 | **Full usage guide** — CLI commands, policy writing, debugging, CI/CD | **[User Guide →](user-guide.md)** |
 | Configure rules, credentials, budget in `gvm.toml` | [Reference Guide →](reference.md) |
 | Understand the architecture | [Architecture Overview →](overview.md) |
-| Connect Claude Desktop / Cursor via MCP | [Section 7 above](#7-mcp-integration--claude-desktop--cursor) |
-| See the full SDK API | [Python SDK →](architecture/sdk.md) |
+| Connect Claude Desktop / Cursor via MCP | [Section 8 above](#8-mcp-integration--claude-desktop--cursor) |
 | Write custom SRR rules | [Network SRR →](srr.md) |
 | Debug a blocked agent | [User Guide →](user-guide.md) |
-| Production deployment | [User Guide →](user-guide.md) |
+| Production deployment | [User Guide →](user-guide.md) and [`config/proxy.production.toml.example`](../config/proxy.production.toml.example) |
 | Run tests | `cargo test --workspace --all-targets` |

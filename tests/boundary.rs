@@ -4,7 +4,7 @@
 //! 1. Wasm <-> Rust Host: engine evaluation edge cases, FFI serialization
 //! 2. Proxy <-> Agent (inbound HTTP): header injection, decision spoofing, duplicate headers
 //! 3. Proxy <-> External API (outbound): SSRF prevention, API key leak defense
-//! 4. NATS boundary: channel backpressure, WAL-only fallback
+//! 4. WAL boundary: channel backpressure, single-source-of-truth contract
 //! 5. Vault/Redis boundary: large value, key collision, encryption integrity
 //! 6. Docker isolation: documented as infrastructure-dependent (cfg-gated)
 //!
@@ -914,13 +914,13 @@ fn srr_redirect_target_blocked() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 4. NATS Boundary
+// 4. WAL Boundary
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // ── 4.1 WAL channel backpressure: bounded channel prevents unbounded growth ──
 
 #[tokio::test]
-async fn nats_channel_backpressure_bounded() {
+async fn wal_channel_backpressure_bounded() {
     use gvm_proxy::ledger::{GroupCommitConfig, Ledger};
 
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
@@ -976,28 +976,28 @@ async fn nats_channel_backpressure_bounded() {
     );
 }
 
-// ── 4.2 WAL-only fallback: NATS URL empty = WAL-only mode, no crash ──
+// ── 4.2 WAL is the single source of truth (no external streaming) ──
 
 #[tokio::test]
-async fn nats_empty_url_wal_only_mode() {
+async fn wal_only_mode_no_external_streaming() {
     use gvm_proxy::ledger::Ledger;
 
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
 
-    // Empty NATS URL = WAL-only mode
+    // Local WAL only — GVM does not connect to external streaming systems
     let ledger = Ledger::new(&wal_path)
         .await
-        .expect("WAL-only ledger must initialize without NATS");
+        .expect("local-WAL-only ledger must initialize");
 
-    // Durable writes should work without NATS
+    // Durable writes work against the local WAL alone
     let event = make_test_event("wal-only-1");
     ledger
         .append_durable(&event)
         .await
         .expect("durable write must succeed in WAL-only mode");
 
-    // Async writes should work without NATS (fire-and-forget)
+    // Async writes are fire-and-forget (currently a no-op sink)
     let event2 = make_test_event("wal-only-2");
     ledger.append_async(event2).await;
 
@@ -1015,7 +1015,7 @@ async fn nats_empty_url_wal_only_mode() {
 // ── 4.3 WAL sequence monotonicity under concurrent load ──
 
 #[tokio::test]
-async fn nats_wal_sequence_monotonic() {
+async fn wal_sequence_monotonic() {
     use gvm_proxy::ledger::Ledger;
 
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
@@ -1497,7 +1497,7 @@ async fn vault_key_limit_toctou_documented() {
 //     - Restart proxy, verify agent reconnects
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Infrastructure-dependent tests (NATS, TLS, Slowloris, etc.)
+// Infrastructure-dependent tests (TLS, Slowloris, etc.)
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // The following tests require running infrastructure and are documented

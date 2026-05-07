@@ -161,12 +161,12 @@ match serde_json::from_str::<GVMEvent>(line) {
 
 ### 8.3.5 Task Leak Prevention (Backpressure)
 
-**Threat**: Each NATS publish spawns a `tokio::spawn` task. Under high load, unbounded task spawning could exhaust memory.
+**Threat**: Per-event `tokio::spawn` for downstream forwarding could exhaust memory under load.
 
 **Mitigation**:
-- WAL mutex serializes durable writes (bounded I/O concurrency)
-- NATS tasks are fire-and-forget stubs in MVP (no real network I/O)
-- In production: bounded channels or semaphores for NATS publish backpressure
+- WAL is the single source of truth — there is no per-event spawn for external streaming. The earlier prototype emitted a NATS-publish stub on every event; that stub was removed in `f3d274c` because it never made any network call (false promise).
+- Group-commit batches serialize durable writes (bounded I/O concurrency).
+- Operators who need off-host audit replication tail `data/wal.log` with their own forwarder (rsync, fluentd, vector, syslog, S3 backup) — running outside the proxy process, with its own backpressure profile.
 
 **Verification**: `ledger_concurrent_spawns_stay_bounded` — 500 concurrent durable appends complete in < 10 seconds with exactly 500 WAL entries.
 
@@ -208,7 +208,7 @@ match serde_json::from_str::<GVMEvent>(line) {
 | 6 | WAL corruption | JSON parse skip, recovery continues | Done | `wal_tampered_entry_does_not_crash_recovery` |
 | 7 | Side-channel timing | Rate limiter blocks statistical attacks; end-to-end difference is inherent to proxy architecture | Done | `srr_decision_time_is_roughly_constant` |
 | 8 | Decryption error leak | Generic error, internal log only | Done | `test_wrong_key_returns_integrity_error` |
-| 9 | Task leak / backpressure | Bounded WAL mutex, stub NATS | Done | `ledger_concurrent_spawns_stay_bounded` |
+| 9 | Task leak / backpressure | Bounded WAL mutex, group-commit batches | Done | `ledger_concurrent_spawns_stay_bounded` |
 | 10 | Intermediate key exposure | `bytes.zeroize()` on all paths | Done | Code review |
 
 ---
@@ -345,8 +345,8 @@ The proxy layer (`proxy.rs`) and all enforcement logic (SRR, WAL, Vault) remain 
 
 | Enhancement | Priority | Description |
 |-------------|----------|-------------|
-| Bounded NATS channels | High | Replace `tokio::spawn` with bounded `mpsc` channel for NATS publish |
-| Key rotation support | High | Automatic re-encryption of vault data on key change |
+| Anchor key rotation runbook | High | Document the cutover procedure when an operator-managed Ed25519 anchor key is rotated (existing signed anchors stay verifiable; auditor's verifier registry must be updated to map the new `key_id` → public key) |
+| Vault key rotation support | High | Automatic re-encryption of vault data on key change |
 | mlock for key pages | Medium | Pin key memory pages to prevent swap-to-disk |
 | Fuzzing CI pipeline | High | Continuous fuzzing with `cargo-fuzz` or AFL — SRR regex matching and JSON payload parsing process adversarial external input directly, making fuzzing high-value for discovering edge cases |
 | Constant-time SRR | Low | Pad all code paths to fixed execution time — low priority because rate limiter already prevents statistical timing attacks and end-to-end timing difference is inherent to proxy architecture |
@@ -355,4 +355,4 @@ The proxy layer (`proxy.rs`) and all enforcement logic (SRR, WAL, Vault) remain 
 
 ---
 
-[← Part 7: Python SDK](architecture/sdk.md) | [Part 9: Test Coverage Report →](test-report.md)
+[← Architecture Overview](../overview.md) | [Test Coverage Report →](../test-report.md) | [Internal Security Review →](../internal/SECURITY_REVIEW.md)

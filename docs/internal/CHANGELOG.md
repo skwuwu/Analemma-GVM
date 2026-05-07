@@ -72,6 +72,94 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
+### 2026-05-07: Drop SDK from the repo + correct misleading audit doc
+
+**What changed:**
+
+1. **`sdk/python/` removed** (5071 LOC). The optional Python SDK
+   (`@ic` decorator, `gvm_session`, `GVMAgent`, langchain wrappers,
+   demo agents) lived in this tree but contributed near-zero to v1
+   governance: enforcement is at the proxy, identity attribution
+   for sandboxed agents is automatic via `resolve_identity_from_peer`
+   (commit `3ec17bd`), JWT for cooperative-mode agents is a
+   2-line `Authorization` header, and the SDK's checkpoint/rollback
+   feature was documented as "not yet stabilized." Keeping a
+   prominent "Add the SDK (Experimental)" section in quickstart
+   while pitching "zero code change governance" was a contradiction;
+   the SDK is the wrong thing to evangelize for v1.
+
+2. **`examples/agents/{data_exfil,devops,email_assistant,finance}_agent.py`
+   removed**. All four imported `gvm.langchain_tools` /
+   `gvm.domain_agents` and demonstrated the SDK path; with the SDK
+   gone, they no longer build.
+
+3. **`docs/architecture/sdk.md` removed**. Cross-references
+   updated in `quickstart.md`, `overview.md`, `architecture/proxy.md`,
+   `architecture/memory-security.md`.
+
+4. **`docs/internal/AUDIT_PREP.md` → `docs/internal/SECURITY_REVIEW.md`,
+   tone corrected.** The previous filename + opening
+   ("Snapshot for an external auditor", "designed to bootstrap a
+   1–2 week engagement", "When the engagement starts, the auditor
+   receives") read as if an external audit was scheduled or in
+   progress. None has been engaged. The renamed doc opens with an
+   explicit "internal self-review — no external audit has been
+   engaged" disclaimer; conditional language ("an auditor would")
+   replaces the previous active-engagement framing throughout.
+   Sections 5 (Recently fixed), 3 (Crypto inventory), 4 (Known
+   limitations) are factual and unchanged in content; only framing
+   was corrected.
+
+5. **All user-facing docs swept for outdated content + SDK
+   references**: `quickstart.md` (rewritten), `user-guide.md`
+   (sandbox-peer + anchor procedures, JWT precedence order),
+   `overview.md` (drop SDK from the "three enforcement models"
+   table), `reference.md` (drop SDK Reference section, add `[anchor]`
+   + `[jwt]` config blocks, drop NATS/Redis hints, soften
+   `--contained` to "feature-gated, not in default binary"),
+   `srr.md` (drop "agent SDK" wording in design principle),
+   `governance-coverage.md` (drop SDK from out-of-scope table),
+   `security-model.md` (drop SDK Python references, soften
+   "comprehensive security audit was conducted" → "internal review",
+   update IC-3 and Deny-response paragraphs to drop SDK exception
+   types), `test-report.md` (rename test entry from `sdk_*` to
+   `agent_*`), `architecture/proxy.md` (drop "SDK-Routed vs Direct
+   HTTP" branch — there is no SDK to route through anymore),
+   `architecture/memory-security.md` (drop NATS task-leak roadmap
+   item), `README.md` (drop SDK requirement line, soften
+   `--contained` callout).
+
+6. **Test source renames** (`tests/{integration,boundary}.rs`):
+   - `nats_channel_backpressure_bounded` → `wal_channel_backpressure_bounded`
+   - `nats_empty_url_wal_only_mode` → `wal_only_mode_no_external_streaming`
+   - `nats_wal_sequence_monotonic` → `wal_sequence_monotonic`
+   - `wal_nats_sequence_ordering_and_crash_recovery` → `wal_sequence_ordering_and_crash_recovery`
+   - `sdk_headers_to_proxy_classification_end_to_end` → `agent_headers_to_proxy_classification_end_to_end`
+   - `sdk_proxy_header_contract_resource_and_context_json` → `agent_header_contract_resource_and_context_json`
+   - Comments inside those tests updated to drop "SDK"/"NATS" wording where it described removed capabilities.
+
+**Why:**
+
+CLAUDE.md "Never claim more than implemented." Two misleading
+artifacts shipped in the repo:
+- A prominent SDK section + sdk.md architecture doc, despite the
+  product strategy being "transparent governance, no client
+  library." Readers landed on quickstart and saw "Add the SDK
+  (Experimental)" — wrong message.
+- An "External Security Audit — Preparation" doc + "We accept
+  findings via..." section, with no actual external audit scheduled.
+  Readers (potential users / auditors / hires) could reasonably
+  conclude an engagement was in progress.
+
+Both removed/corrected. v1 launch surface now matches what's
+actually in the box.
+
+**Affected files:** ~30 files modified, 5071 LOC of SDK source
+removed, 1 file renamed, ~250 lines of docs rewritten.
+
+**Risk:** No Rust code depends on `sdk/python/`. All workspace
+tests still pass.
+
 ### 2026-05-07: Activate Ed25519 anchor signing (Strategic-5)
 
 **What changed:**

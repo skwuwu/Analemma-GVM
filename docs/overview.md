@@ -65,18 +65,17 @@ When in doubt, block. The system defaults to **Delay 300ms** (Default-to-Caution
 
 ## Why HTTP Proxy?
 
-### Three Enforcement Models and Their Tradeoffs
+### Two Enforcement Models and Their Tradeoffs
 
 | Model | Strength | Weakness |
 |-------|----------|----------|
-| **SDK only** | Rich semantic context (operation name, resource attributes, caller-declared intent) | Agent can bypass by not using the SDK |
 | **Sandbox only** (seccomp/gVisor) | Impossible to bypass from userspace | Semantic blindness — sees `write(fd, buf, len)`, not "transfer $50K to account X" |
-| **Proxy only** | Framework-agnostic, no agent cooperation needed | Cannot see agent-internal intent |
+| **Proxy only** | Framework-agnostic, no agent cooperation needed | Without OS isolation, an agent can ignore `HTTP_PROXY` env vars and reach the network directly |
 
-No single model covers all requirements. GVM uses a **proxy + sandbox hybrid**:
+GVM combines both into a **proxy + sandbox hybrid**:
 
-- **Level 0 (proxy only)**: Zero agent changes. SRR inspects URLs and payloads, API keys are injected by the proxy, all proxied traffic is audited.
-- **Level 1 (+ `gvm run --sandbox`)**: Network namespace + seccomp containment for agents launched via `gvm run`. Proxy bypass is structurally impossible: iptables OUTPUT chain inside the sandbox namespace only allows TCP to the proxy port and UDP 53 (DNS) on the host veth IP — all other egress is dropped. IPv6 is fully disabled. Optional in v1; roadmap moves toward mandatory deployment profiles.
+- **Level 0 (proxy only)**: Zero agent changes. SRR inspects URLs and payloads, API keys are injected by the proxy, all proxied traffic is audited. Suitable for development; in production an agent could in principle bypass the proxy by ignoring `HTTP_PROXY`.
+- **Level 1 (+ `gvm run --sandbox`)**: Network namespace + seccomp containment for agents launched via `gvm run`. Proxy bypass is structurally impossible: iptables OUTPUT chain inside the sandbox namespace only allows TCP to the proxy port and UDP 53 (DNS) on the host veth IP — all other egress is dropped. IPv6 is fully disabled. Identity attribution for plain HTTP clients in this mode is automatic via the peer-IP → sandbox_id → agent_id lookup the proxy already maintains. **This is the recommended production posture on Linux.**
 
 ### Why HTTP Layer, Not Syscall Layer
 
@@ -134,9 +133,9 @@ Internal design documents for contributors and code reviewers.
 | [WAL-First Ledger & Audit](architecture/ledger.md) | `src/ledger.rs` |
 | [Encrypted Vault](architecture/vault.md) | `src/vault.rs` |
 | [Proxy Pipeline](architecture/proxy.md) | `src/proxy.rs` |
-| [Python SDK](architecture/sdk.md) | `sdk/python/gvm/` (experimental) |
 | [Memory & Runtime Security](architecture/memory-security.md) | `crates/gvm-sandbox/` |
 | [Changelog](internal/CHANGELOG.md) | Roadmap, implementation log |
+| [Internal Security Review](internal/SECURITY_REVIEW.md) | Self-review + threat model + crypto inventory |
 
 ---
 
@@ -154,7 +153,7 @@ See [Part 8: Memory & Runtime Security](architecture/memory-security.md) for ful
 | WAL corruption | JSON parse skip, recovery continues | `wal_tampered_entry_does_not_crash_recovery` |
 | Side-channel timing | Measured <10x variance | `srr_decision_time_is_roughly_constant` |
 | Decryption error leak | Generic error, internal log only | `test_wrong_key_returns_integrity_error` |
-| Task leak / backpressure | Bounded WAL mutex, NATS spawn is fire-and-forget | `ledger_concurrent_spawns_stay_bounded` |
+| Task leak / backpressure | Bounded WAL mutex, group-commit batches | `ledger_concurrent_spawns_stay_bounded` |
 
 ---
 

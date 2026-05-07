@@ -115,7 +115,8 @@ Use cooperative mode for agents you trust or wrote yourself (Python `requests`, 
 - **Sandbox mode** (recommended for production): Linux only. Requires `iproute2` (`ip`), `iptables`, and `ip6tables` on the host (preinstalled on most server distros). Either run as `sudo` or grant capabilities: `sudo setcap 'cap_net_admin,cap_sys_admin,cap_sys_ptrace+ep' ./gvm`. Run `gvm preflight` to check what's available.
 - **Cooperative / watch modes**: any OS — Linux, macOS, Windows. No system tools required beyond the agent's own runtime (Python, Node, etc.).
 - **Pre-built binary**: Linux x86_64 / glibc (Ubuntu 20.04+, Debian 11+, RHEL 8+, Amazon Linux 2023). On macOS or Windows, build from source with `cargo build --release`.
-- **`--contained` mode** (experimental): Docker on the host instead of the kernel features above.
+- **Zero client-side library required.** Plain `requests`, `urllib`, `node-fetch`, `curl`, anything that talks HTTP/HTTPS works unmodified — governance is enforced at the proxy.
+- **`--contained` mode** (Docker isolation, unfinished): gated behind `cargo build --features contained` and **not** in the default binary. Default `gvm run --help` does not advertise it. For HTTPS L7 inspection on Linux use `--sandbox` instead.
 
 ## Quick Start
 

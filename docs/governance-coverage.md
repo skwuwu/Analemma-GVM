@@ -233,14 +233,13 @@ These are architectural boundaries, not missing features:
 |---------|-----------------|------------|
 | **Agent stdin/stdout** | Not network traffic | Agent spawned with `stdin(Stdio::null())` |
 | **Prompt injection detection** | Requires semantic analysis (ML/LLM) | Use an LLM WAF upstream. GVM + LLM WAF are complementary. |
-| **Agent internal state** | SDK-only (agent must use `@ic()` decorator) | Tier 1 (proxy-only) governs actions; Tier 2 (SDK) adds intent verification |
+| **Agent internal state** | Out of scope — GVM governs actions (HTTP requests, file writes), not the agent's reasoning | Use a Shadow Mode `gvm_declare_intent` gate ahead of the call if you want pre-flight intent verification |
 | **LLM response content** | Privacy — response bodies not stored by default | Thinking hash stored for forensics (SHA-256, opt-in raw) |
 
 DNS is governed only in `--sandbox` mode. The design is deliberately
 Delay-Alert, not Deny: known hosts pass, unknown domains are delayed and
 logged, subdomain bursts/floods escalate delay, and the window decays when
-the behavior stops. Cooperative and contained modes do not provide DNS
-governance.
+the behavior stops. Cooperative mode does not provide DNS governance.
 
 ---
 

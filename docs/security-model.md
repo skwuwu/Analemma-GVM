@@ -82,9 +82,9 @@ If an attacker has root access to the host, GVM — like any userspace process �
 **Impact**: Complete policy bypass — no enforcement, no audit trail.
 
 **Current (v1)**:
-- Cooperative default: SDK sets `HTTP_PROXY` via `GVMAgent.create_session()`.
+- Cooperative default: `gvm run` injects `HTTP_PROXY` / `HTTPS_PROXY` into the agent's environment. Standard HTTP libraries honor these env vars; agents that don't fall through to the OS-isolation modes below.
 - **Enforced mode**: `gvm run --sandbox` (Linux namespace + veth + TC filter + iptables + seccomp). Three-layer defense-in-depth: (1) TC ingress filter on host-side veth (kernel-enforced, no userspace bypass), (2) iptables OUTPUT chain inside sandbox, (3) seccomp AF_NETLINK blocking prevents iptables modification.
-- Docker containment: `gvm run --contained` is production-ready on Linux and WSL2. It uses a dedicated Docker bridge plus host-side iptables egress lock to prevent direct network bypass, but it deliberately does not perform MITM; HTTPS enforcement is SNI/domain-level only. On native macOS or native Windows outside WSL2, Docker Desktop's hidden VM prevents host iptables control, so contained mode falls back to cooperative proxy routing with a visible warning.
+- Docker containment (`--contained`) is gated behind a cargo feature and not in the default binary; it is unfinished — see [reference.md](reference.md#platform-support) for the current readiness.
 - Limitation: containment is opt-in and process-scoped. Processes not launched via `gvm run` still rely on cooperative proxy routing.
 
 `gvm run --sandbox` interception path (implemented):
@@ -171,15 +171,15 @@ Patterns are pre-compiled at config load time (fail-fast on invalid patterns) an
 
 ### 5. Checkpoint Step Authorization
 
-**Attack**: An agent could potentially craft a `restore_step` value to roll back to an arbitrary checkpoint, not just the last approved one.
+**Attack**: A caller (any client that talks to the proxy's checkpoint endpoint) could craft a `restore_step` value to roll back to an arbitrary checkpoint, not just the last approved one.
 
-**Preconditions**: Agent can influence the checkpoint restore logic (requires code-level access or a bug in the SDK).
+**Preconditions**: Caller can reach the proxy's checkpoint API.
 
 **Impact**: State rollback to an unintended point, potentially replaying approved operations.
 
-**Current mitigation (v0.2)**: Merkle tree verification on checkpoint restore. Each checkpoint's `SHA-256(plaintext)` is a leaf in a per-agent Merkle tree — the same tree structure used for WAL audit batch verification (`merkle.rs`). On save, the proxy appends the leaf and recomputes the tree root. On restore, the proxy generates an O(log N) Merkle proof for the requested leaf and verifies it against the root via `verify_merkle_proof()`. The SDK performs additional client-side hash verification. Tampering with any checkpoint invalidates the root, detected on any subsequent restore.
+**Current mitigation (v0.2)**: Merkle tree verification on checkpoint restore. Each checkpoint's `SHA-256(plaintext)` is a leaf in a per-agent Merkle tree — the same tree structure used for WAL audit batch verification (`merkle.rs`). On save, the proxy appends the leaf and recomputes the tree root. On restore, the proxy generates an O(log N) Merkle proof for the requested leaf and verifies it against the root via `verify_merkle_proof()`. Tampering with any checkpoint invalidates the root, detected on any subsequent restore.
 
-**Planned (v2)**: HMAC-signed checkpoint IDs with proxy-held signing key. The current Merkle tree prevents content tampering but does not prevent step ID spoofing (which requires code-level SDK access).
+**Planned (v2)**: HMAC-signed checkpoint IDs with proxy-held signing key. The current Merkle tree prevents content tampering but does not prevent step ID spoofing.
 
 ---
 
@@ -231,7 +231,7 @@ Patterns are pre-compiled at config load time (fail-fast on invalid patterns) an
 - Rate limiter uses verified `agent_id` (spoofing prevented)
 - Backward-compatible: without JWT configured, header-based identity continues
 
-**v1.2 (sandbox-peer fallback)**: For agents running inside `gvm run --sandbox`, identity is also derivable from the veth source IP. The proxy minted that IP itself when it allocated the sandbox network namespace, so the lookup `peer_ip → sandbox_id → agent_id` is no weaker than the namespace-isolation guarantee that already separates sandboxes. This closes the SDK-less-agent gap: a plain `urllib` request inside a sandbox does load the per-sandbox CA but does not auto-attach `Authorization: Bearer $GVM_JWT_TOKEN` from its env, so without IP-derived identity those requests would fall back to the spoofable header path (HTTP) or be hard-rejected with 401 (MITM). The synthesized identity sets `token_id = "sandbox-peer:<sandbox_id>"` so the audit chain records which trust path was taken — JWT-bearer events show a UUID `jti`, IP-derived events show the sandbox tag.
+**v1.2 (sandbox-peer fallback)**: For agents running inside `gvm run --sandbox`, identity is also derivable from the veth source IP. The proxy minted that IP itself when it allocated the sandbox network namespace, so the lookup `peer_ip → sandbox_id → agent_id` is no weaker than the namespace-isolation guarantee that already separates sandboxes. This means a plain `urllib` / `requests` / `node-fetch` call inside a sandbox is correctly attributed in the audit chain with **zero code changes** — no client library, no header to inject, no JWT for the agent author to wire up. The synthesized identity sets `token_id = "sandbox-peer:<sandbox_id>"` so the audit chain records which trust path was taken — JWT-bearer events show a UUID `jti`, IP-derived events show the sandbox tag.
 
 **Remaining limitation**: Token issuance endpoint (`POST /gvm/auth/token`) is unauthenticated in v1. Acceptable for the single-host deployment where `gvm run` and the proxy are co-located on the same trust boundary. Network-exposed token issuance (e.g., when the issuance endpoint is reachable from outside the host) should add mTLS or front it with an upstream auth gateway.
 
@@ -263,7 +263,7 @@ Patterns are pre-compiled at config load time (fail-fast on invalid patterns) an
 
 **Current (v1)**: Standard IEEE 754 `f64` comparison. Sufficient for most use cases where amounts are integer cents or have limited decimal places.
 
-**Planned mitigation**: Decimal-based comparison for currency fields, or integer-cent normalization at the SDK layer. For now, operators should write rules with appropriate margins (e.g., `>= 500` instead of `> 499.99`).
+**Planned mitigation**: Decimal-based comparison for currency fields. For now, operators should write rules with appropriate margins (e.g., `>= 500` instead of `> 499.99`).
 
 ---
 
@@ -302,7 +302,7 @@ Patterns are pre-compiled at config load time (fail-fast on invalid patterns) an
 - Inter-batch `prev_root` carries over across rotation — Merkle chain integrity maintained across segment boundaries
 - Configurable via `[wal]` section in `proxy.toml`
 
-**Remaining gap**: No compaction (old events within a segment cannot be removed). Segment pruning is the current mitigation. **Retention warning**: Without NATS JetStream, pruned segments are permanently lost. Default settings (100MB x 10 segments = 1GB) can fill within days under high request volume. Long-running deployments requiring audit trail retention must configure NATS replication.
+**Remaining gap**: No compaction (old events within a segment cannot be removed). Segment pruning is the current mitigation. **Retention warning**: Pruned segments are permanently lost from the local WAL. Default settings (100MB × 10 segments = 1GB) can fill within days under high request volume. Long-running deployments requiring audit-trail retention beyond the local cap should tail `data/wal.log` to off-host storage with their own forwarder (rsync, fluentd, vector, S3 backup) — GVM does not perform external streaming on the operator's behalf.
 
 ---
 
@@ -316,7 +316,7 @@ self.wal_sequence.store(event_count, Ordering::SeqCst);
 // "WAL sequence initialized from existing events (monotonic across restarts)"
 ```
 
-**Remaining gap**: NATS JetStream integration is stubbed — sequence numbers are local-only until JetStream is connected.
+**Note**: WAL sequence numbers are local-only by design. External streaming integrations (NATS / Kafka / SIEM) are operator-managed; GVM does not connect to them.
 
 ---
 
@@ -435,10 +435,11 @@ GVM enforces governance at the HTTP proxy layer. The proxy returns standard HTTP
 
 ### What Happens When an Agent is Denied
 
-GVM returns an HTTP 403 response. **What the agent does next is entirely the agent's design responsibility**, not GVM's:
+GVM returns an HTTP 403 response with `X-GVM-Decision: Deny` and a
+human-readable `X-GVM-Block-Reason` header. **What the agent does
+next is entirely the agent's design responsibility**, not GVM's:
 
-- An agent using the Python SDK receives a `GVMDeniedError` exception, which can trigger checkpoint rollback.
-- An agent using raw HTTP receives a 403 status code and must handle it in its own error handling logic.
+- The agent's HTTP library raises a 4xx error (e.g., `requests.HTTPError`, `fetch().ok === false`) which the agent's own error-handling code observes.
 - GVM does **not** kill, pause, or signal the agent process. The agent remains running and can attempt other operations.
 
 This is by design: GVM governs individual I/O operations at the proxy boundary, not agent process lifecycle. An agent that receives a Deny can retry (and be denied again), fall back to alternative logic, or crash — all of which are agent-level design decisions.
@@ -456,11 +457,11 @@ This is by design: GVM governs individual I/O operations at the proxy boundary, 
 Human-in-the-loop (HITL) approval workflows are application-layer concerns. The mechanism for collecting approval (Slack bot, admin dashboard, email, CLI prompt) varies by deployment context. GVM's role is to **enforce the block** and **record the event** — the approval workflow is built on top of GVM's audit trail, not inside it.
 
 **Practical IC-3 implementation pattern:**
-1. Agent calls an IC-3 operation → proxy returns 403 with `RequireApproval`
-2. Agent SDK catches the error and halts that workflow branch (agent design)
-3. External system (monitoring, Slack bot, dashboard) reads WAL event and notifies approver
-4. Approver updates policy (temporary Allow rule or one-time override)
-5. Agent retries → proxy now returns Allow
+1. Agent calls an IC-3 operation → proxy holds the request on the admin port and returns 403 with `RequireApproval` after the timeout (or sooner if a human delivers a decision via `gvm approve`)
+2. The agent's own error handler observes the 4xx and halts that workflow branch
+3. External system (monitoring, Slack bot, dashboard) reads the pending entry from the admin port and notifies an approver
+4. Approver runs `gvm approve <event_id> --approve|--deny` (or any HTTP client to `POST /gvm/approve`)
+5. Agent retries → proxy returns Allow
 
 This pattern keeps GVM focused on enforcement and audit, while approval UX is delegated to the deployment environment.
 
@@ -489,9 +490,13 @@ The following issues have been identified and **fixed** as they affect normal op
 
 ---
 
-## Audit Results (2026-03-16)
+## Internal review notes (2026-03-16)
 
-A comprehensive security audit was conducted covering all Rust proxy modules, Python SDK, and configuration files. The following reported items were analyzed and determined to be **non-issues** in the current architecture:
+These items were raised during an **internal** code review of the
+Rust proxy and configuration files (no external audit has been
+engaged — see [`docs/internal/SECURITY_REVIEW.md`](internal/SECURITY_REVIEW.md)
+for the current self-review posture). Each was analyzed and
+determined to be a **non-issue** in the current architecture:
 
 | Reported Item | Analysis | Why Not a Vulnerability |
 |---|---|---|
@@ -501,9 +506,9 @@ A comprehensive security audit was conducted covering all Rust proxy modules, Py
 | Checkpoint step u64::MAX | `format!("checkpoint:agent:{}", u64::MAX)` = ~50 byte string | No integer overflow, no memory issue. Normal HashMap key |
 | SRR body size bypass | Payload rule skip → next rule continues → Default-to-Caution (Delay) | By design: URL-only rules and fallback catch unmatched requests |
 | Vault `list_keys()` cross-agent | No API endpoint exposes this function | Internal method; not callable from outside the proxy |
-| SDK credential headers pass-through | Proxy `api_keys.rs` already strips Authorization, Cookie, X-API-Key, ApiKey | Enforcement is at proxy (Layer 3), not SDK. Double stripping unnecessary |
-| Rate limiter agent ID spoofing | Same root cause as unauthenticated proxy access | Not a separate vulnerability; addressed by deployment-level authentication |
-| WAL event forgery / batch reordering | Requires WAL file write access | Covered by existing item #6 (WAL periodic re-verification) |
+| Caller-supplied credential headers pass-through | Proxy `api_keys.rs` strips Authorization, Cookie, X-API-Key, ApiKey before forwarding | Enforcement is at the proxy boundary; no client-side stripping is required |
+| Rate limiter agent ID spoofing | Same root cause as unauthenticated proxy access | Addressed by JWT identity (`[jwt]`) and the sandbox-peer fallback |
+| WAL event forgery / batch reordering | Requires WAL file write access | Covered by existing item #6 (WAL periodic re-verification); Ed25519 anchor signing additionally proves chain origin to an external verifier |
 | Host override config injection | Requires `proxy.toml` write access | Covered by threat model boundary ("Attacker modifies config at rest" = out of scope) |
 
 ---
@@ -751,9 +756,9 @@ Use `--no-mitm` to disable MITM and fall back to CONNECT relay (domain-level onl
 | **Windows Docker large responses** | Docker Desktop WSL2 network bridge may drop TCP >500KB | Use Linux for production. Windows works for small-medium responses |
 | **Content-Encoding (gzip/br)** | Compressed bodies not decompressed for payload inspection | URL-pattern SRR works regardless. Payload inspection requires uncompressed (future) |
 | **Timeout chaining** | MITM adds ~300ms overhead; agent timeout may fire first | Set agent timeouts > proxy upstream timeout (30s). Streaming SSE is unaffected (first chunk fast) |
-| **LLM thinking trace** | MITM relay streams response chunks — cannot buffer full body for trace extraction | Thinking hash not captured on MITM path. Use cooperative mode with SDK for full trace capture |
-| **IC-3 RequireApproval** | MITM cannot hold TLS keep-alive stream for human approval | IC-3 treated as Deny on MITM path. Use cooperative mode with SDK for IC-3 approval flow |
-| **Shadow Mode** | MITM has no SDK headers for intent verification | Intent store claim/verify not supported on MITM path. SRR enforcement still active |
+| **LLM thinking trace** | MITM relay streams response chunks — cannot buffer full body for trace extraction | Thinking hash not captured on MITM path; cooperative mode (HTTP_PROXY without TLS termination) preserves the full trace |
+| **IC-3 RequireApproval** | MITM cannot hold a TLS keep-alive stream for human approval | IC-3 treated as Deny on the MITM path; use cooperative mode for the IC-3 hold-and-release flow |
+| **Shadow Mode** | MITM has no `gvm_declare_intent` claim path (the intent endpoint is on the admin port) | Intent store claim/verify not supported on the MITM path. SRR enforcement still active |
 | **WAL coverage gaps (P2 remaining)** | Pre-classification failures (JWT 401, missing host 400) do not record to WAL — these occur before governance classification and have no decision to audit. Circuit breaker (503) is intentionally unrecorded (WAL already failing). All P1 gaps fixed: SRR lock poison, token budget exceeded, shadow STRICT, Deny, RequireApproval, classification error — all record to WAL on both MITM and proxy paths. |
 | **Intermittent CONNECT TLS handshake eof** | Node.js undici HTTP client occasionally resets the 2nd CONNECT before sending ClientHello. Self-recovers on 3rd attempt (~2s delay). No data loss — WAL records all successful requests. | Under investigation. Likely client-side connection pool race condition after CONNECT tunnel close. `Connection: close` header added to CONNECT response to prevent upgrade reuse. Does not affect stress test pass rate (289 API calls, 0 TLS errors in steady state). |
 

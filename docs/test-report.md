@@ -15,7 +15,7 @@ The Linux delta (+33) is sandbox/seccomp/network tests that don't run on Windows
 
 > Test count grows with each feature. Run `cargo test --workspace` to verify current count.
 >
-> **Architecture note:** SRR is the authoritative network enforcement layer; SDK headers are convenience metadata and cannot downgrade transport-level SRR decisions. The decision set is 5 variants (`Allow < AuditOnly < Delay < RequireApproval < Deny`), and `max_strict` resolves cross-layer conflicts. Unknown or unclassified traffic must fall to Default-to-Caution (`Delay 300ms`), not `Allow`. Earlier ABAC/Registry/`Throttle` sections were removed from this report when those subsystems were deleted from the codebase.
+> **Architecture note:** SRR is the authoritative network enforcement layer; declarative `X-GVM-*` headers are convenience metadata and cannot downgrade transport-level SRR decisions. The decision set is 5 variants (`Allow < AuditOnly < Delay < RequireApproval < Deny`), and `max_strict` resolves cross-layer conflicts. Unknown or unclassified traffic must fall to Default-to-Caution (`Delay 300ms`), not `Allow`. Earlier ABAC/Registry/`Throttle` sections were removed from this report when those subsystems were deleted from the codebase.
 
 ## Design Compliance Baseline
 
@@ -23,12 +23,12 @@ These are the design principles every test in this report is interpreted against
 
 | Principle | Test expectation |
 |-----------|------------------|
-| Proxy/SRR is authority | Agent-declared SDK headers cannot make a dangerous URL safer. Host, method, path, and inspected payload drive enforcement. |
+| Proxy/SRR is authority | Agent-declared headers cannot make a dangerous URL safer. Host, method, path, and inspected payload drive enforcement. |
 | Fail-close / Default-to-Caution | Unknown input, malformed payloads, oversized bodies, and unmatched URLs must return `Delay` or stricter, never `Allow`. |
-| `max_strict` monotonicity | Tenant/SDK/semantic context may raise strictness, but cannot lower SRR `Deny` or `Delay`. |
+| `max_strict` monotonicity | Tenant / declarative context may raise strictness, but cannot lower SRR `Deny` or `Delay`. |
 | Auditability | Decisions on proxy and MITM paths must emit governance headers and WAL metadata where classification exists. |
-| DNS governance scope | DNS hostile tests must expect tiered delay/logging in sandbox mode, not DNS Deny. Cooperative and contained modes do not claim DNS control. |
-| Mode boundary honesty | Contained mode is Linux/WSL2 egress-lock without MITM; Sandbox is the full L7 MITM security boundary. |
+| DNS governance scope | DNS hostile tests must expect tiered delay/logging in sandbox mode, not DNS Deny. Cooperative mode does not claim DNS control. |
+| Mode boundary honesty | Sandbox mode is the full L7 MITM security boundary on Linux. `--contained` is gated behind a cargo feature and is not part of the default test surface. |
 
 ## Overview
 
@@ -215,9 +215,9 @@ test vault_empty_value_roundtrip ... ok
 test vault_delete_then_read_returns_none ... ok
 test vault_tampered_ciphertext_detected ... ok
 test vault_concurrent_read_write_same_key ... ok
-test nats_empty_url_wal_only_mode ... ok
-test nats_wal_sequence_monotonic ... ok
-test nats_channel_backpressure_bounded ... ok
+test wal_only_mode_no_external_streaming ... ok
+test wal_sequence_monotonic ... ok
+test wal_channel_backpressure_bounded ... ok
 test wasm_oversized_input_handled_gracefully ... ok
 test vault_large_value_roundtrip ... ok
 test result: ok. 25 passed; 0 failed; 0 ignored; finished in 0.35s
@@ -252,8 +252,8 @@ test result: ok. 11 passed; 0 failed; 0 ignored; finished in 0.04s
 running 9 tests                               (tests/integration.rs)
 test api_key_injection_bearer_and_apikey_types ... ok
 test event_status_transitions_pending_to_confirmed_and_failed ... ok
-test wal_nats_sequence_ordering_and_crash_recovery ... ok
-test sdk_headers_to_proxy_classification_end_to_end ... ok
+test wal_sequence_ordering_and_crash_recovery ... ok
+test agent_headers_to_proxy_classification_end_to_end ... ok
 test config_file_hashes_recorded_in_merkle_chain ... ok
 test config_hash_records_unavailable_for_missing_files ... ok
 test e2e_proxy_forwards_to_upstream_and_strips_response_headers ... ok
@@ -395,15 +395,15 @@ test result: ok. 9 passed; 0 failed; 0 ignored; finished in 6.63s
 
 | # | Test | Scenario | Verification |
 |---|------|----------|--------------|
-| 1 | [`sdk_headers_to_proxy_classification_end_to_end`](tests/integration.rs) | SDK headers → SRR classification | classify() returns correct decision, agent_id/operation surfaced for audit |
+| 1 | [`agent_headers_to_proxy_classification_end_to_end`](tests/integration.rs) | Declarative `X-GVM-*` headers → SRR classification | classify() returns correct decision, agent_id/operation surfaced for audit |
 | 2 | [`event_status_transitions_pending_to_confirmed_and_failed`](tests/integration.rs) | Create Pending → update to Confirmed/Failed | Status field transitions correctly |
-| 3 | [`wal_nats_sequence_ordering_and_crash_recovery`](tests/integration.rs) | 50 concurrent WAL writes + recovery | WAL ordering preserved, Pending → Expired on crash |
+| 3 | [`wal_sequence_ordering_and_crash_recovery`](tests/integration.rs) | 50 concurrent WAL writes + recovery | WAL ordering preserved, Pending → Expired on crash |
 | 4 | [`api_key_injection_bearer_and_apikey_types`](tests/integration.rs) | APIKeyStore inject Bearer + ApiKey | Headers `Authorization: Bearer sk-xxx` and `X-Api-Key: key123` |
 | 5 | [`config_file_hashes_recorded_in_merkle_chain`](tests/integration.rs) | Config files → WAL system event | SHA-256 hashes correct, event_hash present (Merkle) |
 | 6 | [`config_hash_records_unavailable_for_missing_files`](tests/integration.rs) | Missing config file | Hash recorded as `"unavailable"`, no error |
 | 7 | [`e2e_proxy_forwards_to_upstream_and_strips_response_headers`](tests/integration.rs) | Real mock upstream → proxy forward → response | Upstream receives request, X-GVM-* response headers stripped, API key injected, non-GVM headers preserved |
 | 8 | [`governance_block_response_contains_all_required_fields`](tests/integration.rs) | Deny-triggering request → 403 JSON | Response contains all GovernanceBlockResponse fields (blocked, decision, event_id, trace_id, operation, reason, mode, next_action, ic_level) |
-| 9 | [`sdk_proxy_header_contract_resource_and_context_json`](tests/integration.rs) | SDK JSON in X-GVM-Resource/Context headers + SRR Deny on `api.bank.com/transfer/*` | SDK self-declared `approved=true` / `risk=low` cannot downgrade SRR Deny — metadata stays as audit data only |
+| 9 | [`agent_header_contract_resource_and_context_json`](tests/integration.rs) | JSON in X-GVM-Resource/Context headers + SRR Deny on `api.bank.com/transfer/*` | Self-declared `approved=true` / `risk=low` cannot downgrade SRR Deny — metadata stays as audit data only |
 | 10 | [`emergency_wal_to_primary_recovery_path`](tests/integration.rs) | Primary WAL fail → emergency fallback → recovery | Emergency WAL has event_hash but no MerkleBatchRecord, primary failure counter tracks correctly |
 
 ### Edge Cases (10 tests) — [tests/edge_cases.rs](tests/edge_cases.rs)
@@ -457,9 +457,9 @@ test result: ok. 9 passed; 0 failed; 0 ignored; finished in 6.63s
 | 15 | Outbound API | [`ssrf_private_ip_ranges_blocked_by_srr`](tests/boundary.rs) | `10.0.0.1`, `192.168.1.1`, `172.16.0.1` → Deny; `8.8.8.8` → Allow |
 | 16 | Outbound API | [`api_key_not_leaked_via_gvm_headers`](tests/boundary.rs) | X-GVM-Context with `api_key` stripped before forwarding |
 | 17 | Outbound API | [`srr_redirect_target_blocked`](tests/boundary.rs) | `httpbin.org/redirect/10` → Deny |
-| 18 | NATS | [`nats_channel_backpressure_bounded`](tests/boundary.rs) | 200 events through 32-capacity channel → all succeed, no deadlock |
-| 19 | NATS | [`nats_empty_url_wal_only_mode`](tests/boundary.rs) | Empty NATS URL → WAL-only, durable+async writes work, recovery works |
-| 20 | NATS | [`nats_wal_sequence_monotonic`](tests/boundary.rs) | 50 concurrent appends → WAL has exactly 50 entries |
+| 18 | NATS | [`wal_channel_backpressure_bounded`](tests/boundary.rs) | 200 events through 32-capacity channel → all succeed, no deadlock |
+| 19 | NATS | [`wal_only_mode_no_external_streaming`](tests/boundary.rs) | Empty NATS URL → WAL-only, durable+async writes work, recovery works |
+| 20 | NATS | [`wal_sequence_monotonic`](tests/boundary.rs) | 50 concurrent appends → WAL has exactly 50 entries |
 | 21 | Vault | [`vault_large_value_roundtrip`](tests/boundary.rs) | 1MB value encrypt/decrypt → exact match |
 | 22 | Vault | [`vault_key_collision_between_agents`](tests/boundary.rs) | Agent-1 writes, Agent-2 overwrites → Agent-2's data returned |
 | 23 | Vault | [`vault_tampered_ciphertext_detected`](tests/boundary.rs) | Write → read succeeds with correct data |

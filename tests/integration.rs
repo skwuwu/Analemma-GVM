@@ -1,10 +1,10 @@
 //! Integration tests — proves end-to-end enforcement pipeline correctness.
 //!
 //! Test 1: EventStatus state transitions (Pending → Confirmed/Failed/Expired)
-//! Test 2: WAL → NATS async ordering + crash recovery re-publish
+//! Test 2: WAL sequence ordering + crash recovery
 //! Test 3: (removed — ABAC deleted)
 //! Test 4: API key injection into forwarded requests
-//! Test 5: SDK @ic headers → Proxy classification → enforcement decision
+//! Test 5: declarative X-GVM-* headers → Proxy classification → enforcement decision
 //! Test 6: Checkpoint save → read → Merkle verification round-trip
 //! Test 7: LLM thinking trace extraction from OpenAI/Anthropic response bodies
 
@@ -149,19 +149,19 @@ async fn event_status_transitions_pending_to_confirmed_and_failed() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Test 2: WAL → NATS Async Ordering + Crash Recovery Re-Publish
+// Test 2: WAL Sequence Ordering + Crash Recovery
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn wal_nats_sequence_ordering_and_crash_recovery() {
+async fn wal_sequence_ordering_and_crash_recovery() {
     let dir = tempfile::tempdir().expect("temp dir creation must succeed");
     let wal_path = dir.path().join("wal.log");
 
-    // Use a stub NATS URL to exercise the NATS publish path (no real connection)
+    // Local WAL only — no external streaming.
     let ledger = Arc::new(
         Ledger::new(&wal_path)
             .await
-            .expect("ledger with stub NATS config must initialize"),
+            .expect("ledger must initialize for WAL-only sequence test"),
     );
 
     // ── Phase 1: Rapid-fire 50 durable writes ──
@@ -373,11 +373,11 @@ expires_at = "2027-01-01T00:00:00Z"
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Test 5: SDK @ic Headers → Proxy Classification → Enforcement Decision
+// Test 5: Declarative X-GVM-* Headers → Proxy Classification → Enforcement Decision
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn sdk_headers_to_proxy_classification_end_to_end() {
+async fn agent_headers_to_proxy_classification_end_to_end() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use axum::Router;
@@ -474,7 +474,7 @@ decision = { type = "Delay", milliseconds = 300 }
     let app = Router::new().fallback(proxy_handler).with_state(state);
 
     // ── Scenario A: Header Forgery — agent lies about operation ──
-    // SDK sends: operation=gvm.storage.read (Allow)
+    // Agent declares: operation=gvm.storage.read (Allow)
     // But targets: api.bank.com/transfer/123 (SRR Deny)
     // Expected: max_strict(Allow, Deny) = DENY → HTTP 403
     let request = Request::builder()
@@ -514,7 +514,7 @@ decision = { type = "Delay", milliseconds = 300 }
     // Scenario B (RequireApproval via ABAC) removed — ABAC system deleted.
 
     // ── Scenario C: IC-1 Allow — safe read operation on safe URL ──
-    // SDK sends: operation=gvm.storage.read
+    // Agent declares: operation=gvm.storage.read
     // Target: api.example.com/data (no SRR deny)
     // Policy: Allow for reads
     // SRR: Default-to-Caution (Delay 300ms)
@@ -1393,15 +1393,15 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Test 10: SDK ↔ Proxy Header Contract — Verify SDK header format matches
+// Test 10: Declarative-Header ↔ Proxy Contract — Verify header format matches
 //          what the proxy expects to parse
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Test: SDK resource/context headers are audit metadata only. SRR remains the
+// Test: Resource/context headers are audit metadata only. SRR remains the
 // enforcement source, so self-declared low-risk metadata must not downgrade a
 // network-level deny.
 #[tokio::test]
-async fn sdk_proxy_header_contract_resource_and_context_json() {
+async fn agent_header_contract_resource_and_context_json() {
     let srr_path = tempfile::NamedTempFile::new()
         .expect("temp srr file")
         .into_temp_path();
@@ -1447,12 +1447,12 @@ decision = { type = "Delay", milliseconds = 300 }
     let decision = srr.check("POST", "api.bank.com", "/transfer/123", None);
     assert!(
         matches!(decision.decision, EnforcementDecision::Deny { .. }),
-        "SRR deny must hold even when SDK metadata claims a safe operation/resource"
+        "SRR deny must hold even when declarative metadata claims a safe operation/resource"
     );
     assert_eq!(
         headers.context.get("risk").and_then(|v| v.as_str()),
         Some("low"),
-        "SDK context remains available for audit"
+        "declarative context remains available for audit"
     );
     assert!(matches!(
         headers.resource.as_ref().map(|r| &r.sensitivity),

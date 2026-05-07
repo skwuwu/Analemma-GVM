@@ -8,7 +8,7 @@
 
 The Network SRR (Simple Request Rules) is the sole enforcement layer in GVM. It provides **transport-layer defense** independent of agent-declared semantics. Even if an agent tries to misrepresent its operation, SRR inspects the actual HTTP target and enforces rules based on method, host, path, and optionally request body.
 
-**Design principle**: The SRR is the bypass-proof safety net. The agent SDK cannot influence SRR evaluation because it operates on transport-layer data (URL, method), not semantic headers.
+**Design principle**: The SRR is the bypass-proof safety net. No client-side library or declarative header can influence SRR evaluation because it operates on transport-layer data (URL, method), not semantic claims — even if an agent fabricates `X-GVM-Operation` or any other declarative header, the SRR's URL/method/payload match still fires.
 
 ---
 
@@ -238,13 +238,13 @@ decision = { type = "Delay", milliseconds = 300 }
 The SRR's primary security value: it **ignores** the semantic operation header (`X-GVM-Operation`).
 
 **Attack scenario**:
-1. Agent declares `@ic(operation="gvm.storage.read")` → SDK sets `X-GVM-Operation: gvm.storage.read`
+1. Agent (or any tool the agent uses) sets `X-GVM-Operation: gvm.storage.read` to misrepresent the call
 2. Agent targets `POST https://api.bank.com/transfer/123` (wire transfer)
-3. Policy engine evaluates `gvm.storage.read` → Allow (IC-1)
+3. Any classifier that trusted the declarative header would log a benign `gvm.storage.read` event
 4. **SRR evaluates the URL** → `POST api.bank.com/transfer/*` → **Deny**
-5. `max_strict(Allow, Deny)` → **Deny**
+5. The denial fires regardless of the declared operation; the audit event records the URL the proxy actually saw
 
-The agent's lie is caught at Layer 2 regardless of what it declared at Layer 1.
+The agent's lie about its intent is caught at the transport layer regardless of any client-side declaration.
 
 ---
 

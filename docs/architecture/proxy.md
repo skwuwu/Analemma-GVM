@@ -8,9 +8,9 @@
 
 ## 6.1 Overview
 
-The Proxy Pipeline is the central enforcement point. Every HTTP request — whether SDK-routed or direct — passes through SRR classification, decision, and conditional forwarding. The pipeline integrates: SRR engine, TokenBudget, Credential injection, Ledger (WAL), and Vault.
+The Proxy Pipeline is the central enforcement point. Every HTTP request that flows through the proxy — whether the agent set declarative `X-GVM-*` headers or not — passes through SRR classification, decision, and conditional forwarding. The pipeline integrates: SRR engine, TokenBudget, Credential injection, Ledger (WAL), and Vault.
 
-**Design principle**: The proxy is a transparent enforcement layer. Agent code is unchanged. The agent's HTTP traffic is routed through the proxy (via `HTTP_PROXY` env or SDK configuration), and the proxy enforces governance before forwarding.
+**Design principle**: The proxy is a transparent enforcement layer. Agent code is unchanged. The agent's HTTP traffic is routed through the proxy (via `HTTP_PROXY` env injected by `gvm run`, or via the iptables redirect inside `--sandbox`), and the proxy enforces governance before forwarding.
 
 ---
 
@@ -34,27 +34,20 @@ Agent HTTP Request
 │  - Extract target (X-GVM-Target-Host or Host)       │
 └────────────────────────┬────────────────────────────┘
                          │
-                ┌────────┴────────┐
-                │ GVM headers?    │
-                ▼                 ▼
-       SDK-Routed            Direct HTTP
-                │                 │
-                ▼                 ▼
-  ┌─────────────────┐  ┌─────────────────┐
-  │ Layer 1: ABAC   │  │ Layer 2: SRR    │
-  │ Policy Engine   │  │ (URL-based)     │
-  │ + Layer 2: SRR  │  │                 │
-  │                 │  │                 │
-  │ max_strict(     │  │ decision =      │
-  │   srr, policy)  │  │   srr.check()   │
-  └────────┬────────┘  └────────┬────────┘
-           │                    │
-           └────────┬───────────┘
-                    │
-                    ▼
+                         ▼
+            ┌────────────────────────────┐
+            │ Layer 2: SRR (URL-based)   │
+            │                            │
+            │ decision = srr.check(      │
+            │   method, host, path,      │
+            │   body                     │
+            │ )                          │
+            └────────────┬───────────────┘
+                         │
+                         ▼
 ┌─────────────────────────────────────────────────────┐
-│  Rate Limit Check (if Throttle decision)            │
-│  Token-bucket per agent_id                          │
+│  TokenBudget Check (per-agent + org-wide)           │
+│  Sliding window, fail-close on cap exceeded         │
 └────────────────────────┬────────────────────────────┘
                          │
                          ▼
@@ -81,24 +74,17 @@ Agent HTTP Request
 
 ---
 
-## 6.3 Classification Paths
+## 6.3 Classification Path
 
-### SDK-Routed (GVM Headers Present)
+Every request goes through the same SRR pipeline regardless of which
+client made it (raw `curl`, `requests`, `node-fetch`, MCP client, …):
 
-When `X-GVM-Agent-Id` is present, the request came through the SDK's `@ic()` decorator:
+1. Evaluate SRR: `srr.check(method, host, path, body)` → **final decision**
 
-1. Build `OperationMetadata` from GVM headers
-2. Evaluate ABAC policy: `policy.evaluate(operation)` → policy decision
-3. Evaluate SRR: `srr.check(method, host, path, body)` → srr decision
-4. Combine: `max_strict(srr_decision, policy_decision)` → **final decision**
-
-### Direct HTTP (No GVM Headers)
-
-When no GVM headers are present, the request bypassed the SDK:
-
-1. Evaluate SRR only: `srr.check(method, host, path, body)` → **final decision**
-
-This ensures that even raw HTTP calls (e.g., `curl`) are subject to Layer 2 enforcement.
+If the request carries declarative `X-GVM-*` headers (`X-GVM-Operation`,
+`X-GVM-Resource`, `X-GVM-Context`), they are recorded as **audit
+metadata** but **cannot** influence the SRR decision — that is the
+header-forgery defense (see [SRR §3.10](../srr.md#310-header-forgery-defense)).
 
 ---
 
@@ -127,7 +113,7 @@ All `X-GVM-*` headers are **stripped** before forwarding to upstream APIs. The u
 ### Allow (IC-1)
 ```
 → Forward immediately
-→ Async ledger (no WAL, fire-and-forget NATS)
+→ Async ledger (skip durable WAL, loss tolerated < 0.1%)
 → Event status: Confirmed
 ```
 Latency: ~0ms enforcement overhead.
@@ -217,22 +203,26 @@ The Tower middleware stack provides three layers of runtime protection:
 ## 6.8 Startup Sequence
 
 ```
-1. Load config (proxy.toml)                    ← Fail: panic
-2. Load Operation Registry (registry.toml)     ← Fail: panic
-3. Load Network SRR rules (srr_network.toml)   ← Fail: panic
-4. Load ABAC Policy Engine (policies/*.toml)   ← Fail: panic
-5. Load API Key Store (secrets.toml)           ← Fail: panic
-6. Initialize Ledger (WAL + NATS stub)         ← Fail: panic
-7. WAL Crash Recovery                          ← Fail: warn (first boot)
-8. Initialize Vault (AES-256-GCM)              ← Fail: panic
-9. Build HTTP client                           ← —
-10. Compose AppState                           ← —
-11. Build Router + middleware                   ← —
-12. Bind TCP listener                          ← Fail: panic
-13. Serve                                      ← Running
+1.  Load config (proxy.toml)                       ← Fail: exit 1
+2.  Load Network SRR rules                         ← Fail: exit 1
+3.  Load API Key Store (secrets.toml)              ← Fail: exit 1
+4.  Resolve anchor signer (NoopSigner OR Ed25519)  ← Fail-close on misconfig
+5.  Initialize Ledger (durable local WAL)          ← Fail: exit 1
+6.  WAL Crash Recovery                             ← Fail: warn (first boot)
+7.  Initialize Vault (AES-256-GCM)                 ← Fail: exit 1
+8.  Initialize JWT identity (optional)             ← Fail-close on bad secret
+9.  Build HTTP client                              ← —
+10. Compose AppState                                ← —
+11. Build Router + middleware                       ← —
+12. Bind TCP listener                               ← Fail: exit 1
+13. Serve                                           ← Running
 ```
 
-**Fail-Close**: Steps 1–6 and 8 are fatal. If any component fails to initialize, the proxy does not start. This prevents a partially configured proxy from silently allowing traffic.
+**Fail-Close**: Steps 1–5, 7, and 12 are fatal. Steps 4 and 8 are
+fatal *only when their config asks for the feature* — `[anchor]
+enabled = true` with a missing/malformed key file refuses startup,
+as does `[jwt]` with `GVM_JWT_SECRET` set to invalid hex. The proxy
+never silently downgrades a feature the operator turned on.
 
 ---
 
