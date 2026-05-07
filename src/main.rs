@@ -520,6 +520,7 @@ async fn main() {
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
         on_block: config.enforcement.on_block.clone(),
         http_client,
+        upstream_pool: gvm_proxy::upstream_pool::UpstreamPool::new(),
         host_overrides,
         jwt_config,
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(

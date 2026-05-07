@@ -72,6 +72,67 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
+### 2026-05-08: MITM upstream connection pool — amortise HTTP/1.1 handshake
+
+**Background.** Layered bench from earlier today attributed +215 ms
+median MITM overhead on `httpbin.org` to a fresh upstream
+TCP+TLS+`hyper::client::conn::http1::handshake` per request. Trace
+in `src/tls_proxy_hyper.rs::handle_request` confirmed: every
+intercepted request opened a new `TcpStream::connect` and discarded
+the connection on response complete. HTTP/2 hosts (Anthropic API)
+saw only +28 ms because the proxy reused the inner connection across
+multiplexed streams; HTTP/1.1 had no equivalent.
+
+**Fix.** New `src/upstream_pool.rs` module — bounded LIFO pool of
+`hyper::client::conn::http1::SendRequest<BoxBody<Bytes,String>>`
+keyed by `host:port`, default 4 idle per host with 30 s TTL.
+Connections return to the pool when the response body's
+`SenderReturnerBody::poll_frame` reaches EOF or the inner body's
+`is_end_stream()` becomes true after a successful frame.
+Liveness verified by `SendRequest::ready()` on take; stale senders
+fall back to a fresh connect. The pool is held by
+`AppState.upstream_pool` and threaded through `handle_request`
+where the inline TLS-connect path now first tries
+`pool.try_take(host)` and only opens a fresh connection on miss
+or stale.
+
+**`is_end_stream` quirk caught at bench time.** The first
+implementation only fired the put-back finalizer on
+`Poll::Ready(None)`. For Content-Length-bounded HTTP/1.1
+responses, hyper's `Incoming` returns the entire body as a single
+data frame and signals completion via `is_end_stream()` rather
+than a follow-up `Ready(None)` — and hyper's server-side writer
+honours `is_end_stream()` after each frame, dropping the body
+without polling again. Result: pool stayed empty (0/20 hits).
+Fix: after every `Ready(Some(Ok(_)))`, ask the inner body if it
+is now exhausted; if so, return the sender immediately.
+
+**Bench validation (EC2 t3.medium, sandbox + MITM,
+n=20 GET https://httpbin.org/get):**
+
+| | median | p95 | min | max |
+|--|--|--|--|--|
+| Direct (no GVM) | 736 ms | 1010 ms | 717 ms | 1010 ms |
+| Sandbox + MITM, **before pool** | 1264 ms | 1739 ms | 1217 ms | 4341 ms |
+| Sandbox + MITM, **with pool**   | **709 ms**  | 1254 ms | 706 ms | 1254 ms |
+
+Pool counters from this run: 19 reuses, 1 fresh connect, 0 stale
+evicts, 1 upstream TLS handshake total. Effective MITM overhead
+on the hot path collapses from +528 ms to ~0 ms; per-request
+overhead is now bounded by sandbox veth + MITM cert-mint, not
+by upstream handshake.
+
+**Affected files**: new `src/upstream_pool.rs`; `src/lib.rs`
+(module export); `src/main.rs`, `src/proxy/mod.rs`,
+`tests/common/mod.rs`, `tests/integration.rs` (AppState init);
+`src/tls_proxy_hyper.rs` (pool-aware connect + body wrap).
+
+**Risk.** Medium. Body-finalizer pattern is a non-trivial change to
+the TLS relay path; staging-bench-then-roll-forward recommended
+once production config-path bug is in. Workspace tests remain
+0 failures; 3 unit tests in `upstream_pool.rs` cover empty take,
+default tuning, and total-idle counter.
+
 ### 2026-05-07: Bench refresh — corrected after two methodology errors caught in review
 
 Initial pass against `scripts/bench-overhead.sh` on EC2 t3.medium

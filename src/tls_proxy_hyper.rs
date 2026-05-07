@@ -491,122 +491,160 @@ async fn handle_request(
         return Ok(resp);
     }
 
-    // Production: TLS upstream
-    let connector = tokio_rustls::TlsConnector::from(client_config);
+    // Production: TLS upstream — try pool first, fall through to fresh
+    // TCP+TLS+HTTP/1.1 handshake on miss or stale pooled sender.
+    //
+    // Without pooling, every MITM-intercepted request paid a fresh
+    // upstream TCP+TLS handshake (~+200ms median against `httpbin.org`
+    // from EC2 Seoul). With pooling the hot path collapses to just
+    // sending the request on an existing keep-alive connection.
+    // See `crate::upstream_pool` for the LIFO + body-finalizer design.
     let upstream_addr = format!("{}:443", upstream_host);
-    tracing::info!(upstream_addr = %upstream_addr, "MITM: connecting to upstream TCP");
+    let pool_key = upstream_addr.clone();
 
-    // Bound the TCP connect — DNS hangs and unreachable hosts would otherwise
-    // sit here for the OS default (~2 minutes) and the agent's client timeout
-    // would fire first, masking the proxy as the cause.
-    const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-    let upstream_tcp = match tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        tokio::net::TcpStream::connect(&upstream_addr),
-    )
-    .await
-    {
-        Ok(Ok(tcp)) => {
-            tracing::info!(upstream_addr = %upstream_addr, "MITM: TCP connected");
-            tcp
+    let pooled = state.upstream_pool.try_take(&pool_key);
+    let pool_hit = pooled.is_some();
+    let mut maybe_sender: Option<crate::upstream_pool::SendRequestT> = if let Some(mut s) = pooled {
+        // Sender came from pool — verify the underlying connection is
+        // still alive. `ready().await` returns Err if the upstream
+        // (or our driver task) dropped the connection while it was
+        // idle. On Err we drop the sender and fall through to fresh.
+        match s.ready().await {
+            Ok(_) => {
+                tracing::info!(host = %upstream_host, "MITM: reusing pooled upstream connection");
+                Some(s)
+            }
+            Err(e) => {
+                tracing::debug!(host = %upstream_host, error = %e, "MITM: pooled sender stale — falling back to fresh");
+                None
+            }
         }
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, host = %upstream_host, "MITM: upstream connect failed");
-            return Ok(Response::builder()
-                .status(502)
-                .body(full_body(format!("Upstream connect failed: {}", e)))
-                .expect("static response builder"));
-        }
-        Err(_) => {
-            tracing::warn!(
-                host = %upstream_host,
-                timeout_secs = CONNECT_TIMEOUT.as_secs(),
-                "MITM: upstream TCP connect timed out"
-            );
-            return Ok(Response::builder()
-                .status(504)
-                .body(full_body(format!(
-                    "Upstream {} TCP connect timed out after {}s",
-                    upstream_host,
-                    CONNECT_TIMEOUT.as_secs()
-                )))
-                .expect("static response builder"));
-        }
+    } else {
+        None
     };
 
-    let server_name = match rustls::pki_types::ServerName::try_from(upstream_host.to_string()) {
-        Ok(sn) => sn,
-        Err(e) => {
-            return Ok(Response::builder()
-                .status(502)
-                .body(full_body(format!("Invalid server name: {}", e)))
-                .expect("static response builder"));
-        }
-    };
+    if maybe_sender.is_none() {
+        let _ = pool_hit; // (no-op — kept for potential future metrics)
+        let connector = tokio_rustls::TlsConnector::from(client_config);
+        tracing::info!(upstream_addr = %upstream_addr, "MITM: connecting to upstream TCP (no pool hit)");
 
-    tracing::info!(host = %upstream_host, "MITM: starting upstream TLS handshake");
-    const TLS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-    let upstream_tls =
-        match tokio::time::timeout(TLS_TIMEOUT, connector.connect(server_name, upstream_tcp)).await
+        // Bound the TCP connect — DNS hangs and unreachable hosts would otherwise
+        // sit here for the OS default (~2 minutes) and the agent's client timeout
+        // would fire first, masking the proxy as the cause.
+        const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        let upstream_tcp = match tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            tokio::net::TcpStream::connect(&upstream_addr),
+        )
+        .await
         {
-            Ok(Ok(tls)) => {
-                tracing::info!(host = %upstream_host, "MITM: upstream TLS handshake complete");
-                tls
+            Ok(Ok(tcp)) => {
+                tracing::info!(upstream_addr = %upstream_addr, "MITM: TCP connected");
+                tcp
             }
             Ok(Err(e)) => {
-                tracing::warn!(error = %e, host = %upstream_host, "MITM: upstream TLS failed");
+                tracing::warn!(error = %e, host = %upstream_host, "MITM: upstream connect failed");
                 return Ok(Response::builder()
                     .status(502)
-                    .body(full_body(format!("Upstream TLS failed: {}", e)))
+                    .body(full_body(format!("Upstream connect failed: {}", e)))
                     .expect("static response builder"));
             }
             Err(_) => {
                 tracing::warn!(
                     host = %upstream_host,
-                    timeout_secs = TLS_TIMEOUT.as_secs(),
-                    "MITM: upstream TLS handshake timed out"
+                    timeout_secs = CONNECT_TIMEOUT.as_secs(),
+                    "MITM: upstream TCP connect timed out"
                 );
                 return Ok(Response::builder()
                     .status(504)
                     .body(full_body(format!(
-                        "Upstream {} TLS handshake timed out after {}s",
+                        "Upstream {} TCP connect timed out after {}s",
                         upstream_host,
-                        TLS_TIMEOUT.as_secs()
+                        CONNECT_TIMEOUT.as_secs()
                     )))
                     .expect("static response builder"));
             }
         };
 
-    let io = hyper_util::rt::TokioIo::new(upstream_tls);
-    tracing::info!(host = %upstream_host, "MITM: starting HTTP/1.1 handshake");
-    let (mut sender, conn) = match hyper::client::conn::http1::handshake(io).await {
-        Ok(parts) => {
-            tracing::info!(host = %upstream_host, "MITM: HTTP/1.1 handshake complete");
-            parts
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, host = %upstream_host, "MITM: HTTP handshake failed");
-            return Ok(Response::builder()
-                .status(502)
-                .body(full_body(format!("Upstream HTTP handshake failed: {}", e)))
-                .expect("static response builder"));
-        }
-    };
+        let server_name = match rustls::pki_types::ServerName::try_from(upstream_host.to_string()) {
+            Ok(sn) => sn,
+            Err(e) => {
+                return Ok(Response::builder()
+                    .status(502)
+                    .body(full_body(format!("Invalid server name: {}", e)))
+                    .expect("static response builder"));
+            }
+        };
 
-    // Drive upstream connection in background.
-    // Log the driver's outcome at INFO so a silent failure here is visible —
-    // a dropped driver makes sender.send_request() hang indefinitely.
-    let driver_host = upstream_host.to_string();
-    tokio::spawn(async move {
-        match conn.await {
-            Ok(()) => {
-                tracing::info!(host = %driver_host, "MITM: upstream conn driver ended cleanly")
+        tracing::info!(host = %upstream_host, "MITM: starting upstream TLS handshake");
+        const TLS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+        let upstream_tls =
+            match tokio::time::timeout(TLS_TIMEOUT, connector.connect(server_name, upstream_tcp))
+                .await
+            {
+                Ok(Ok(tls)) => {
+                    tracing::info!(host = %upstream_host, "MITM: upstream TLS handshake complete");
+                    tls
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, host = %upstream_host, "MITM: upstream TLS failed");
+                    return Ok(Response::builder()
+                        .status(502)
+                        .body(full_body(format!("Upstream TLS failed: {}", e)))
+                        .expect("static response builder"));
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        host = %upstream_host,
+                        timeout_secs = TLS_TIMEOUT.as_secs(),
+                        "MITM: upstream TLS handshake timed out"
+                    );
+                    return Ok(Response::builder()
+                        .status(504)
+                        .body(full_body(format!(
+                            "Upstream {} TLS handshake timed out after {}s",
+                            upstream_host,
+                            TLS_TIMEOUT.as_secs()
+                        )))
+                        .expect("static response builder"));
+                }
+            };
+
+        let io = hyper_util::rt::TokioIo::new(upstream_tls);
+        tracing::info!(host = %upstream_host, "MITM: starting HTTP/1.1 handshake");
+        let (sender, conn) = match hyper::client::conn::http1::handshake(io).await {
+            Ok(parts) => {
+                tracing::info!(host = %upstream_host, "MITM: HTTP/1.1 handshake complete");
+                parts
             }
             Err(e) => {
-                tracing::warn!(error = %e, host = %driver_host, "MITM: upstream conn driver errored")
+                tracing::warn!(error = %e, host = %upstream_host, "MITM: HTTP handshake failed");
+                return Ok(Response::builder()
+                    .status(502)
+                    .body(full_body(format!("Upstream HTTP handshake failed: {}", e)))
+                    .expect("static response builder"));
             }
-        }
-    });
+        };
+
+        // Drive upstream connection in background.
+        // Log the driver's outcome at INFO so a silent failure here is visible —
+        // a dropped driver makes sender.send_request() hang indefinitely.
+        let driver_host = upstream_host.to_string();
+        tokio::spawn(async move {
+            match conn.await {
+                Ok(()) => {
+                    tracing::info!(host = %driver_host, "MITM: upstream conn driver ended cleanly")
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, host = %driver_host, "MITM: upstream conn driver errored")
+                }
+            }
+        });
+        maybe_sender = Some(sender);
+    }
+
+    let mut sender = maybe_sender
+        .expect("sender must be set by either pool hit path or fresh-connect path above");
 
     // Build upstream request with original headers.
     //
@@ -732,11 +770,25 @@ async fn handle_request(
             }
             let _ = state.ledger.append_durable(&updated).await;
 
+            // Wrap the upstream body so that when the agent finishes
+            // reading the response (or the body errors), the sender
+            // is returned to the upstream pool — see
+            // `crate::upstream_pool::SenderReturnerBody`. This is the
+            // signal that the underlying HTTP/1.1 connection is back
+            // to a reusable state; without it the sender would be
+            // dropped here and the connection torn down.
+            let (mut parts, body) = resp.into_parts();
+            let body = crate::upstream_pool::SenderReturnerBody::new(
+                body,
+                sender,
+                state.upstream_pool.clone(),
+                pool_key.clone(),
+            );
+
             // LLM trace extraction via tap-stream (non-blocking, no TTFB penalty)
             let llm_provider = crate::llm_trace::identify_llm_provider(&host);
             if let Some(provider) = llm_provider {
-                if resp.status().is_success() {
-                    let (mut parts, body) = resp.into_parts();
+                if parts.status.is_success() {
                     stamp_governance_headers(
                         &mut parts.headers,
                         &wal_event.event_id,
@@ -766,7 +818,9 @@ async fn handle_request(
 
                     use futures_util::StreamExt;
 
-                    // Convert hyper Incoming → Stream<Result<Bytes, String>>
+                    // Convert wrapped body → Stream<Result<Bytes, String>>;
+                    // the SenderReturnerBody finalizer fires when this
+                    // stream observes EOF.
                     let body_stream = http_body_util::BodyDataStream::new(body)
                         .map(|r| r.map_err(|e| e.to_string()));
 
@@ -788,8 +842,8 @@ async fn handle_request(
                 }
             }
 
-            // Non-LLM or non-2xx: forward as-is
-            let (mut parts, body) = resp.into_parts();
+            // Non-LLM or non-2xx: forward as-is. SenderReturnerBody
+            // returns the sender to the pool when the body completes.
             stamp_governance_headers(&mut parts.headers, &wal_event.event_id, &wal_event.decision);
             let boxed = body.map_err(|e| e.to_string()).boxed();
             Ok(Response::from_parts(parts, boxed))

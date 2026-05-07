@@ -349,6 +349,13 @@ pub struct AppState {
         hyper_util::client::legacy::connect::HttpConnector,
         Body,
     >,
+    /// Upstream HTTPS connection pool used by the MITM relay
+    /// (`tls_proxy_hyper::handle_request`). Without this, every
+    /// MITM-intercepted request triggers a fresh TCP+TLS+HTTP/1.1
+    /// handshake to the upstream — which added ~200ms to every
+    /// HTTP/1.1 request before it was wired in. See
+    /// `crate::upstream_pool` for the LIFO + body-finalizer design.
+    pub upstream_pool: crate::upstream_pool::UpstreamPool,
     /// Per-decision block response mode configuration.
     /// Controls how agents should react to blocked operations.
     pub on_block: OnBlockConfig,

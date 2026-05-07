@@ -131,6 +131,7 @@ pub async fn test_state() -> (AppState, TestWal) {
         checkpoint_registry: gvm_proxy::api::CheckpointRegistry::new(),
         on_block: gvm_proxy::config::OnBlockConfig::default(),
         http_client,
+        upstream_pool: gvm_proxy::upstream_pool::UpstreamPool::new(),
         host_overrides: std::collections::HashMap::new(),
         jwt_config: None,
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(30)),
