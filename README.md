@@ -99,18 +99,18 @@ Use cooperative mode for agents you trust or wrote yourself (Python `requests`, 
 
 - Rust, two binaries totaling ~35MB on Linux x86_64 (gvm 17MB + gvm-proxy 18MB; ~29MB on Windows). Measured on `cargo build --release` of commit at the time of writing — anchor signing (`ed25519-dalek`) and CLI runtime deps account for the bulk.
 - gvm-proxy RSS: ~14MB idle, ~17MB after a sustained `httpbin.org` workload (measured on EC2 t3.medium)
-- Per-request overhead is **dominated by the upstream's protocol**, not by the proxy itself. Two reference points (n=20 fresh-TLS curl, EC2 Seoul → US, medians):
+- Per-request MITM overhead — reported as the **delta vs a direct curl from the same host on the same run**, since the absolute timings are dominated by upstream RTT, not by GVM (n=20 fresh-TLS curl, EC2 Seoul → US, medians):
 
-  | Upstream | Direct | Coop. proxy + MITM | MITM-only overhead | Why |
-  |----------|--------|--------------------|--------------------|----|
-  | `httpbin.org` (HTTP/1.1) | 756 ms | 971 ms | **+215 ms** | proxy does fresh upstream TLS handshake per request — HTTP/1.1 doesn't multiplex |
-  | Anthropic API `claude-haiku-4-5` ("hi", 16 tokens) | 880 ms | 908 ms | **+28 ms** | proxy reuses one HTTP/2 upstream connection across many agent requests — TLS handshake amortizes |
+  | Upstream | Δ vs direct (median) | Notes |
+  |----------|----------------------|-------|
+  | `httpbin.org` (HTTP/1.1) | **~0 ms** (warm pool, 19/20 reuses) | the first request pays one TCP+TLS+HTTP/1.1 handshake; subsequent requests within 30 s reuse the cached upstream connection |
+  | Anthropic API `claude-haiku-4-5` ("hi", 16 tokens) | **+28 ms** | HTTP/2 — hyper internally multiplexes per-stream over a single connection so handshake amortises natively |
 
-  Modern LLM and SaaS APIs are HTTP/2; expect ~tens of milliseconds of MITM overhead, not hundreds. Plain `curl --no-keepalive` against an HTTP/1.1 endpoint is the worst case.
+  Plain `curl --no-keepalive` against an HTTP/1.1 endpoint without the upstream pool used to be the worst case at +215 ms (cooperative) / +528 ms (sandbox + DNS gov); the [bounded LIFO upstream pool](src/upstream_pool.rs) landed 2026-05-08 brings that delta to ~0 ms once the pool is warm.
 
-- Full sandbox path (MITM + iptables DNAT + DNS Tier-2 governance) on `httpbin.org`: **1266 ms** → +510 ms total over baseline. The MITM piece is the +215 ms above; the remaining ~295 ms is the sandbox network route + the 200 ms Tier-2 delay applied to "Unknown" domain lookups. Pre-classify hot domains via `gvm suggest` to move them to Tier 1 (no DNS delay).
+- Full sandbox path on `httpbin.org` (MITM + iptables DNAT + DNS Tier-2 governance, with pool warm): **~0 ms** MITM contribution + ~95–295 ms sandbox+DNS-gov contribution depending on whether the agent's first request has hit the 200 ms Tier-2 delay yet. Pre-classify hot domains via `gvm suggest` to move them to Tier 1 (no DNS delay).
 
-- ([raw bench, 2026-05-07](docs/test-report.md#bench-overhead-2026-05-07-ec2-t3medium))
+- ([raw bench, 2026-05-08](docs/test-report.md#http-overhead--layered-measurement) — pre-pool baseline kept for context)
 
 - Sandbox cold start: **876ms median** (832-881ms range, n=5) — comparable to `docker run`.
 - 10-parallel concurrent `httpbin.org`: 1104 ms direct vs 1269 ms via proxy = **+165 ms median**.

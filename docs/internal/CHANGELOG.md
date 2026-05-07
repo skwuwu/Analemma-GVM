@@ -164,20 +164,28 @@ without polling again. Result: pool stayed empty (0/20 hits).
 Fix: after every `Ready(Some(Ok(_)))`, ask the inner body if it
 is now exhausted; if so, return the sender immediately.
 
-**Bench validation (EC2 t3.medium, sandbox + MITM,
-n=20 GET https://httpbin.org/get):**
+**Bench validation (EC2 t3.medium Seoul, sandbox + MITM,
+n=20 GET https://httpbin.org/get).** Numbers reported as the *delta
+over direct* (median sandbox+MITM minus median direct curl from the
+same host on the same run) so the public-internet RTT to httpbin.org
+does not contaminate the GVM-attributable cost:
 
-| | median | p95 | min | max |
-|--|--|--|--|--|
-| Direct (no GVM) | 736 ms | 1010 ms | 717 ms | 1010 ms |
-| Sandbox + MITM, **before pool** | 1264 ms | 1739 ms | 1217 ms | 4341 ms |
-| Sandbox + MITM, **with pool**   | **709 ms**  | 1254 ms | 706 ms | 1254 ms |
+| Configuration | MITM overhead (median delta) |
+|--|--|
+| Sandbox + MITM, **before pool** | **+528 ms** (1264 − 736) |
+| Sandbox + MITM, **with pool**   | **−11 ms** (719 − 730) — within noise |
 
-Pool counters from this run: 19 reuses, 1 fresh connect, 0 stale
-evicts, 1 upstream TLS handshake total. Effective MITM overhead
-on the hot path collapses from +528 ms to ~0 ms; per-request
-overhead is now bounded by sandbox veth + MITM cert-mint, not
-by upstream handshake.
+Direct baseline was ~730 ms median both runs; that is httpbin.org's
+own response time from Seoul, not GVM. The +528 ms delta before the
+pool was the redundant upstream TCP+TLS+HTTP/1.1 handshake the proxy
+paid per request; with pooling that handshake amortises across the
+batch. Pool counters from the validating run: 19 reuses / 1 fresh /
+0 stale-evict / 1 upstream TLS handshake total.
+
+For HTTP/2 endpoints (Anthropic API) the delta is much smaller
+(+28 ms median, measured separately on 2026-05-07) because hyper
+internally multiplexes per-stream over a single TCP+TLS connection,
+so the redundant handshake never existed in the first place.
 
 **Affected files**: new `src/upstream_pool.rs`; `src/lib.rs`
 (module export); `src/main.rs`, `src/proxy/mod.rs`,

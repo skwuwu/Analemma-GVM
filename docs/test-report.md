@@ -498,20 +498,24 @@ versus older snapshots.
 
 ### HTTP overhead — layered measurement
 
-The original bench-overhead.sh A2 case (cooperative proxy without
-sandbox) returned 0.000 × 20 because the default proxy rules reject
-`httpbin.org` without an explicit allow rule. We re-ran a layered
-bench (`/tmp/bench-layered.sh` on EC2, n=20 fresh-TLS curl per case,
-SRR explicitly allowing `httpbin.org`) to isolate each layer's
-contribution:
+Reported as the **delta over a direct curl from the same host on the
+same run** (so the public-internet RTT to `httpbin.org` does not
+contaminate GVM-attributable cost). Absolute timings in this section
+are dominated by the upstream's own response time (~730 ms median
+from EC2 Seoul to `httpbin.org`); only the deltas reflect what GVM
+adds.
 
-| Path | TTFB median | Δ vs direct | What's added |
-|------|-------------|-------------|--------------|
-| B1 Direct (no GVM) | **756 ms** | — | baseline |
-| B2 Cooperative proxy + MITM | **971 ms** | **+215 ms** | TLS termination + per-domain leaf-cert mint + the proxy's own (fresh) upstream TLS handshake — the proxy doesn't pipeline the agent↔proxy handshake with the proxy↔upstream handshake |
-| A3 Sandbox + MITM + DNS gov | **1266 ms** | **+510 ms** | adds sandbox veth + iptables DNAT + DNS-governance Tier-2 delay (200 ms per fresh DNS lookup; httpbin.org is "Unknown" by default) on top of B2 |
+#### Pre-pool measurement (2026-05-07, baseline before commit `68820c2`)
 
-Layer attributions:
+`/tmp/bench-layered.sh` on EC2, n=20 fresh-TLS curl per case, SRR
+explicitly allowing `httpbin.org`:
+
+| Path | Δ vs direct (median) | What's added |
+|------|---------------------|--------------|
+| B2 Cooperative proxy + MITM | **+215 ms** | TLS termination + per-domain leaf-cert mint + the proxy's own (fresh) upstream TLS handshake every request — the proxy did not amortise the upstream handshake across requests |
+| A3 Sandbox + MITM + DNS gov | **+510 ms** | adds sandbox veth + iptables DNAT + DNS-governance Tier-2 delay (200 ms per fresh DNS lookup; httpbin.org is "Unknown" by default) on top of B2 |
+
+Layer attributions from this run:
 - **MITM-only (cooperative): +215 ms** — measured cleanly via B2.
 - **Sandbox path + DNS gov (combined): +295 ms** — the difference
   between A3 and B2. We attempted to separate this further by
@@ -521,9 +525,29 @@ Layer attributions:
   every iteration). Treat the +295 ms as a combined sandbox + DNS
   cost until that script gap is closed.
 
-Real-world agents using HTTP/2 or keep-alive amortise most of the
-TLS handshake cost across many requests; the numbers above are the
-worst case (fresh TLS every request).
+#### Post-pool measurement (2026-05-08, on commit `60c2cf8`)
+
+The MITM relay now keeps a bounded LIFO pool of upstream
+HTTP/1.1 `SendRequest` handles (`src/upstream_pool.rs`). Sandbox +
+MITM bench, n=20 fresh-TLS curl from inside the sandbox to
+`httpbin.org`, validated on origin/master HEAD:
+
+| Path | Δ vs direct (median) | Notes |
+|------|---------------------|-------|
+| Sandbox + MITM, **before pool** | **+528 ms** | 1264 − 736; same workload as A3 above, re-bench captured at commit time |
+| Sandbox + MITM, **with pool**   | **−11 ms** (within noise) | 719 − 730; pool counters: 19 reuses / 1 fresh / 0 stale-evict on n=20 |
+
+Effective MITM overhead on the HTTP/1.1 hot path collapses from
++528 ms to ~0 ms once the pool is warm. The first request still
+pays the fresh upstream handshake; every subsequent request to the
+same `host:port` (within the 30 s idle TTL) reuses the cached
+connection. Per-request hot-path overhead is now bounded by sandbox
+veth + MITM cert-mint, not by upstream handshake.
+
+Real-world agents using HTTP/2 or HTTP/1.1 keep-alive amortise the
+upstream TLS handshake natively. The pool restores that property to
+the proxy↔upstream leg of the relay so HTTP/1.1 agents see HTTP/2-
+like overhead.
 
 ### Concurrent throughput (10 parallel `httpbin.org` GETs)
 
@@ -556,12 +580,13 @@ worst case (fresh TLS every request).
 | Cooperative proxy + MITM | **908 ms** | 2393 ms | 771-2393 ms |
 | **MITM-only overhead** | **+28 ms** | — | — |
 
-This is dramatically smaller than the HTTP/1.1 `httpbin.org`
-overhead (+215 ms) because the Anthropic API is HTTP/2 — the
-proxy maintains one persistent multiplexed upstream connection
-and amortises the upstream TLS handshake across many agent
-requests. The agent ↔ proxy handshake is still per-request
-(curl `--no-keepalive`), but it's localhost-fast.
+This was small even *before* the upstream-pool work because the
+Anthropic API is HTTP/2 — hyper internally multiplexes per-stream
+over a single TCP+TLS connection, so the redundant per-request
+handshake never existed in the first place. The HTTP/1.1
+`httpbin.org` case (+528 ms before pool, ~0 ms after) used to look
+much worse than this and now looks comparable; HTTP/2 was already
+where HTTP/1.1 needed to land.
 
 **Methodology correction.** An earlier run of this bench
 (`scripts/bench-overhead.sh` test C) reported `+5638 ms` LLM
