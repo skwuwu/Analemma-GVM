@@ -6,7 +6,7 @@ I wanted to run multiple autonomous AI agents (such as OpenClaw) for my personal
 
 Existing answers (such as NemoClaw, OPA+Envoy) required Docker, an embedded Kubernetes cluster, NVIDIA GPUs, or Envoy sidecars. I wanted a lightweight alternative that doesn't need infrastructure setup and strictly enforces what agents do.
 
-So I built GVM (Governance Virtual Machine) — a lightweight security runtime for AI agents. Two small Rust binaries (CLI + proxy, ~22MB total), no Kubernetes, no service mesh, no GPU. It sits between your agent and its actions, and assumes the agent can't be fully trusted.
+So I built GVM (Governance Virtual Machine) — a lightweight security runtime for AI agents. Two small Rust binaries (CLI + proxy, ~35MB total on Linux), no Kubernetes, no service mesh, no GPU. It sits between your agent and its actions, and assumes the agent can't be fully trusted.
 
 ## Demo — Watch, Suggest, Enforce in 3 commands
 
@@ -97,13 +97,14 @@ Use cooperative mode for agents you trust or wrote yourself (Python `requests`, 
 
 ## Technical facts
 
-- Rust, two binaries totaling ~22MB on Linux x86_64 (gvm-proxy ~13MB + gvm CLI ~10MB)
-- gvm-proxy RSS: ~11MB idle, ~13MB under load (measured on EC2 t3.medium)
-- Sandbox MITM overhead: +14ms TTFB per request ([measured on EC2 t3.medium](docs/test-report.md#912-end-to-end-overhead-benchmark-2026-04-06-ec2-t3medium))
-- Sandbox startup: ~928ms one-time (comparable to `docker run`)
+- Rust, two binaries totaling ~35MB on Linux x86_64 (gvm 17MB + gvm-proxy 18MB; ~29MB on Windows). Measured on `cargo build --release` of commit at the time of writing — anchor signing (`ed25519-dalek`) and CLI runtime deps account for the bulk.
+- gvm-proxy RSS: ~14MB idle, ~17MB after a sustained `httpbin.org` workload (measured on EC2 t3.medium)
+- HTTP TTFB to `httpbin.org` from EC2: 751ms direct vs **1266ms via sandbox MITM** (median of 20). MITM overhead = **+515ms median** for a real-world TLS round trip with proxy-side TLS termination + re-encrypt. ([raw bench, 2026-05-07](docs/test-report.md#bench-overhead-2026-05-07-ec2-t3medium))
+- Sandbox cold start: **876ms median** (832-881ms range, n=5) — comparable to `docker run`
+- 10-parallel concurrent throughput: 1104ms direct vs 1269ms via proxy = **+165ms median**
 - Policy evaluation < 1μs (SRR, Criterion benchmark)
-- WAL with Merkle chain, size-based rotation (100MB x 10 segments). Local storage — bring your own retention (S3, GCS, etc)
-- 329 tests, 30-min chaos stress test (proxy kill, network partition, disk pressure) — [PASS](docs/test-report.md#hermes-agent-validation-2026-04-15-ec2-t3medium)
+- WAL with Merkle chain + optional Ed25519 anchor signing (run `gvm anchor keygen` to generate the operator-managed keypair, set `[anchor] enabled = true`). Size-based rotation (100MB x 10 segments by default). Local storage — for off-host audit replication, tail the WAL with rsync / fluentd / vector / S3 backup.
+- **808 Windows tests / 852 Linux tests** across 49 binaries, fmt + clippy `-D warnings` clean. 30-min chaos stress test (proxy kill, network partition, disk pressure) — [PASS](docs/test-report.md#hermes-agent-validation-2026-04-15-ec2-t3medium)
 - Tested with [OpenClaw](https://github.com/openclaw/openclaw) and [hermes-agent](https://github.com/NousResearch/hermes-agent) — GVM is framework-independent; any agent that makes HTTP calls is governed
 - seccomp-BPF with ~130 whitelisted syscalls, ENOSYS default for unknown
 - All data stays local. No telemetry, no phone-home.

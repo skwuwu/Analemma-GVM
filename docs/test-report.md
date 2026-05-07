@@ -1,11 +1,11 @@
 # Test & Benchmark Report
 
-**Last Verified: 2026-05-02** (post-v3 audit refactor + bench update)
-- Windows: `cargo test --workspace` → **729 passed / 0 failed / 5 ignored**
-- Linux (EC2 t3.medium, kernel 6.17.0-1009-aws): `cargo test --release --workspace` → **762 passed / 0 failed / 4 ignored**
-- EC2 E2E subset (Tests 35, 53, 58, 76 — v3-relevant): **13 PASS / 0 FAIL / 1 skipped**
+**Last Verified: 2026-05-07** (post launch-pre cleanup + bench refresh on EC2 t3.medium, kernel 6.17.0-1009-aws)
+- Windows: `cargo test --workspace` → **808 passed / 0 failed / 7 ignored** across 49 binaries
+- Linux: `cargo test --release --workspace` → **852 passed / 0 failed / 5 ignored** across 49 binaries
+- `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets -- -D warnings` clean
 
-The Linux delta (+33) is sandbox/seccomp/network tests that don't run on Windows. (When the gvm-proxy package is tested in isolation — `cargo test` without `--workspace` — Windows shows 565/Linux 598; the workspace-level numbers above include lib-tests from gvm-types, gvm-cli, gvm-engine, and gvm-sandbox.)
+The Linux delta (+44) is sandbox/seccomp/network tests that don't run on Windows. Per-binary counts in older sections of this document are historical snapshots; the current authoritative number is the workspace total above. Run `cargo test --workspace` to regenerate.
 
 > **Note on snapshots:** Per-suite test names listed in this document are
 > historical snapshots. Names rotate as the suite evolves. After the v3
@@ -474,6 +474,91 @@ test result: ok. 9 passed; 0 failed; 0 ignored; finished in 6.63s
 ---
 
 # D. Benchmarks
+
+---
+
+## bench-overhead 2026-05-07 (EC2 t3.medium)
+
+**Source**: [scripts/bench-overhead.sh](../scripts/bench-overhead.sh)
+**Platform**: EC2 t3.medium (2 vCPU, 4 GB RAM), Ubuntu 24.04, kernel 6.17.0-1009-aws
+**Target**: `https://httpbin.org/get` (real internet endpoint, not localhost mock)
+**Iterations**: 20 per case unless noted; medians reported below
+
+### Binary size
+
+| Binary | Linux x86_64 | Windows x86_64 |
+|--------|--------------|----------------|
+| `gvm` (CLI) | 17 MB | 14 MB |
+| `gvm-proxy` | 18 MB | 15 MB |
+| **Total** | **35 MB** | **29 MB** |
+
+ed25519-dalek (anchor signing, activated in `72fa90b`) and the
+ratatui/crossterm TUI deps account for most of the size growth
+versus older snapshots.
+
+### HTTP overhead — direct vs sandbox MITM
+
+| Path | TTFB median | Total median | Range |
+|------|-------------|--------------|-------|
+| A1 Direct (no GVM) | **751 ms** | 760 ms | 705-1017 ms TTFB |
+| A3 Sandbox MITM (full GVM path) | **1266 ms** | 1265 ms | 1217-1582 ms TTFB |
+| **MITM overhead** | **+515 ms median** | +505 ms | — |
+
+A2 (proxy without sandbox) returned 0.000 × 20 — the proxy
+default-rules reject `httpbin.org` without an explicit allow rule,
+so the bench script's A2 case is a methodology bug. A1 vs A3 is
+the production-relevant comparison; investigation tracked
+separately.
+
+### Concurrent throughput (10 parallel `httpbin.org` GETs)
+
+| Path | Wall time |
+|------|-----------|
+| Direct | **1104 ms** |
+| Via proxy | **1269 ms** |
+| **Overhead** | **+165 ms** |
+
+### Sandbox cold start
+
+| Iteration | Time |
+|-----------|------|
+| Median (n=5) | **876 ms** |
+| Range | 832 – 881 ms |
+
+### Memory (RSS)
+
+| Process | RSS |
+|---------|-----|
+| `gvm-proxy` idle | **14.3 MB** |
+| `gvm-proxy` after sustained `httpbin.org` workload | **17.2 MB** |
+| Agent process (no GVM) | 3.7 MB |
+
+### LLM provider (Anthropic API, "Say hi" prompt, n=5)
+
+| Path | Wall time median |
+|------|-----------------|
+| Direct (no GVM) | **10 531 ms** |
+| Sandbox MITM | **16 169 ms** |
+| **Overhead** | **+5638 ms** |
+
+The LLM-overhead number is much larger than the basic HTTP overhead
+because the response body is multi-KB streamed JSON; MITM TLS
+re-encryption for the entire stream, plus per-chunk SRR pass
+through the policy engine, dominates. Operators who care about
+latency on LLM calls in production should size their proxy host
+accordingly or use cooperative mode (HTTP_PROXY without TLS
+termination) for the LLM endpoint specifically — which still
+captures the request-side decision and credential injection.
+
+### Methodology gap with prior reports
+
+The README previously claimed `+14 ms TTFB` for sandbox MITM. That
+number does not reproduce against `httpbin.org` from EC2 — the
+real overhead is two orders of magnitude larger. Possible
+explanations: the prior measurement used a localhost mock
+upstream (sub-ms RTT), or measured a different code path. We do
+not have the original raw data to confirm. The 515 ms figure
+above is the current authoritative number.
 
 ---
 

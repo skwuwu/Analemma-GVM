@@ -72,6 +72,50 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
+### 2026-05-07: Bench refresh — measured numbers replace stale README claims
+
+Re-ran `scripts/bench-overhead.sh` on EC2 t3.medium (Ubuntu 24.04,
+kernel 6.17.0-1009-aws) against real `https://httpbin.org/get`,
+n=20 medians. The README + test-report numbers were left over from
+a 2026-04-06 measurement and several were significantly off after
+the anchor-signing / sandbox-peer / IC-3 stress work landed.
+
+**Updated numbers (current authoritative)**:
+
+| Metric | Old README | New measured |
+|--------|-----------|--------------|
+| Binary total (Linux) | "~22MB" | **35MB** (gvm 17 + gvm-proxy 18) |
+| Binary total (Windows) | not stated | **29MB** (gvm 14 + gvm-proxy 15) |
+| `gvm-proxy` RSS idle | "~11MB" | **14.3MB** |
+| `gvm-proxy` RSS loaded | "~13MB" | **17.2MB** |
+| Sandbox MITM TTFB overhead | "+14ms" | **+515ms median** (real httpbin.org) |
+| Sandbox cold start | "~928ms" | **876ms median** (832-881 range) |
+| 10-parallel concurrent overhead | not stated | **+165ms** (1104→1269ms) |
+| LLM call (Anthropic, "Say hi") overhead | not stated | **+5638ms** (10531→16169ms) |
+| Workspace test count (Win/Lin) | "729 / 762" | **808 / 852** (49 binaries) |
+
+**Significant: MITM overhead `+14ms` vs `+515ms`.** The original
++14ms figure does not reproduce against a real internet endpoint
+from EC2; we suspect the prior measurement used a localhost mock
+upstream (sub-ms RTT), but the original raw data is gone so we
+can't confirm. The 515ms figure is the current authoritative
+number for an internet round-trip with proxy-side TLS termination.
+Operators who run GVM in front of an LLM provider should expect
+the +5638ms LLM overhead (multi-KB response stream goes through
+SRR + MITM re-encryption per chunk) and size accordingly.
+
+**Methodology bug noted but not fixed in this commit**: The bench
+script's A2 case (proxy without sandbox) returned 0.000 × 20
+because the default proxy rules reject `httpbin.org` without an
+explicit allow. A3 (sandbox MITM) avoided this because the
+sandbox launch path prewarms an Allow rule for the test target.
+Tracked for the next bench run; A1 vs A3 is the production
+comparison anyway.
+
+**Affected files**: README.md (Technical facts section);
+docs/test-report.md (header + new "bench-overhead 2026-05-07"
+section before D.1).
+
 ### 2026-05-07: Drop SDK from the repo + correct misleading audit doc
 
 **What changed:**
