@@ -72,6 +72,63 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 ## Implementation Log
 
+### 2026-05-08: Proxy config-path discovery — deterministic across CWDs
+
+**Symptom.** Running `sudo gvm run --sandbox -- ...` from a directory
+that did not happen to be the dev repo root surfaced
+`Proxy exited immediately. Common causes: Missing config/proxy.toml
+(run from project root)` after a 15 s health-check timeout. The
+proxy autostart silently picked the operator's CWD as its workspace,
+booted with built-in defaults (no SRR rules, port 8080 from default),
+and the CLI eventually gave up. A bench script run from `/tmp` hit
+this on every invocation; production installs (`/usr/local/bin/gvm`
++ `/etc/gvm/proxy.toml`) would hit it the first time the operator
+ran from anywhere except a directory with `config/proxy.toml`.
+
+**Root cause.** Two coupled bugs in `crates/gvm-cli/src/`:
+
+1. `run.rs::workspace_root_for_proxy` only matched dev-repo markers
+   (`gvm.toml`, `config/gvm.toml`, `config/srr_network.toml`,
+   `config/proxy.toml`). Production install layouts
+   (`/etc/gvm/proxy.toml`, `~/.config/gvm/proxy.toml` — flat layout
+   without a `config/` subdirectory) never matched. When no marker
+   matched it silently returned `current_dir()`, masking the failure.
+
+2. `proxy_manager.rs::start_daemon` set `cmd.current_dir(workspace)`
+   for the spawned proxy but did not pin the resolved config path
+   into the child's environment. The child re-did its own discovery
+   from the new CWD; if `GVM_CONFIG` was inherited but relative,
+   it resolved differently in parent and child.
+
+**Fix.**
+
+- `workspace_root_for_proxy` now (a) recognises both layouts via an
+  expanded marker list including bare `proxy.toml` / `srr_network.toml`,
+  (b) derives a workspace from `$GVM_CONFIG` when set (using
+  config's parent or grandparent depending on whether it sits inside
+  a `config/` directory), (c) walks up from CWD and from the
+  executable's directory so `cd subdir && gvm run` works inside a
+  dev repo, (d) checks `$XDG_CONFIG_HOME/gvm`, `~/.config/gvm`,
+  `/etc/gvm` as production fallbacks, and (e) replaces the silent
+  CWD fallback with a stderr diagnostic listing every searched path
+  so the failure mode is loud.
+- `start_daemon` now resolves the proxy.toml + gvm.toml paths
+  ahead of spawn (via `resolve_proxy_config_path` /
+  `resolve_gvm_toml_path` mirroring the proxy's own discovery
+  order) and `bail!`s with the searched-path list when none exists,
+  turning a 15 s health timeout into an immediate actionable error.
+  The resolved absolute paths are pinned into the child's
+  `GVM_CONFIG` / `GVM_TOML` env so its discovery is identical
+  regardless of CWD.
+
+**Affected files**: `crates/gvm-cli/src/run.rs`,
+`crates/gvm-cli/src/proxy_manager.rs`.
+
+**Risk.** Low. The lenient `workspace_root_for_proxy` signature is
+preserved (still returns `PathBuf`); strictness is at `start_daemon`
+where a bad workspace already broke the operator. Workspace tests
+unchanged at 0 failures.
+
 ### 2026-05-08: MITM upstream connection pool — amortise HTTP/1.1 handshake
 
 **Background.** Layered bench from earlier today attributed +215 ms

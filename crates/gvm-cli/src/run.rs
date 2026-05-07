@@ -654,53 +654,169 @@ pub(crate) async fn proxy_healthy(proxy: &str) -> bool {
     matches!(reqwest::get(&health_url).await, Ok(resp) if resp.status().is_success())
 }
 
+/// Files whose presence in a directory marks it as a GVM workspace.
+///
+/// Two layouts are recognised:
+/// - **Dev repo / unpacked release**: configs in `config/` subdirectory
+///   (e.g. `config/proxy.toml`, `config/gvm.toml`).
+/// - **Production install / user install**: configs flat in the directory
+///   itself (e.g. `/etc/gvm/proxy.toml`, `~/.config/gvm/proxy.toml`).
+///
+/// Both `gvm.toml` (unified config) and the legacy split files
+/// (`proxy.toml`, `srr_network.toml`) qualify a directory as a workspace.
+const WORKSPACE_MARKERS: &[&str] = &[
+    "gvm.toml",
+    "proxy.toml",
+    "srr_network.toml",
+    "config/gvm.toml",
+    "config/srr_network.toml",
+    "config/proxy.toml",
+];
+
+fn has_workspace_marker(dir: &std::path::Path) -> bool {
+    WORKSPACE_MARKERS.iter().any(|m| dir.join(m).exists())
+}
+
 /// Resolve the workspace root for proxy startup at runtime.
 ///
 /// Priority:
 ///   1. `GVM_WORKSPACE` env var (explicit override)
-///   2. Current working directory if it contains `config/operation_registry.toml`
-///   3. Directory containing the running executable (unpacked release archive)
-///   4. Fallback: current working directory (downstream surfaces a clean
-///      "config not found" error if it really is missing)
+///   2. Workspace derived from `GVM_CONFIG` (config dir, or its parent
+///      when the config sits inside a `config/` subdirectory)
+///   3. Current working directory if it carries a workspace marker
+///   4. Walk up from the CWD looking for a marker (handles `cd subdir &&
+///      gvm run` from inside a dev repo)
+///   5. Directory containing the running executable, walked up similarly
+///      (unpacked release archive — `gvm` and `config/` are siblings)
+///   6. Standard production locations (`$XDG_CONFIG_HOME/gvm`,
+///      `~/.config/gvm`, `/etc/gvm`)
+///   7. Fallback: current working directory with a stderr diagnostic
+///      listing every path that was tried
 ///
 /// Compile-time `env!("CARGO_MANIFEST_DIR")` was previously used here, which
 /// baked the build host's path into release binaries — breaking every
 /// distributed artifact (e.g. GitHub Actions runner paths leaking into the
 /// Windows release zip). Resolution is now fully runtime-driven.
+///
+/// The fallback case used to silently return CWD, which made every
+/// "proxy starts in the wrong directory" bug invisible until the proxy
+/// died with a misleading "missing config/proxy.toml" message. The
+/// diagnostic preserves backward compatibility (caller still gets a
+/// PathBuf) while making the failure mode loud.
 pub(crate) fn workspace_root_for_proxy() -> std::path::PathBuf {
-    // Detect workspace by presence of gvm.toml or config/srr_network.toml
-    let markers: &[&str] = &[
-        "gvm.toml",
-        "config/gvm.toml",
-        "config/srr_network.toml",
-        "config/proxy.toml",
-    ];
+    use std::path::PathBuf;
+    let mut searched: Vec<PathBuf> = Vec::new();
 
-    let has_marker =
-        |dir: &std::path::Path| -> bool { markers.iter().any(|m| dir.join(m).exists()) };
+    let try_dir = |dir: PathBuf, searched: &mut Vec<PathBuf>| -> Option<PathBuf> {
+        if has_workspace_marker(&dir) {
+            Some(dir)
+        } else {
+            searched.push(dir);
+            None
+        }
+    };
 
+    // 1. Explicit override.
     if let Ok(p) = std::env::var("GVM_WORKSPACE") {
-        let path = std::path::PathBuf::from(p);
-        if has_marker(&path) {
-            return path;
+        if let Some(found) = try_dir(PathBuf::from(p), &mut searched) {
+            return found;
         }
     }
 
-    if let Ok(cwd) = std::env::current_dir() {
-        if has_marker(&cwd) {
-            return cwd;
-        }
-    }
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            if has_marker(dir) {
-                return dir.to_path_buf();
+    // 2. Derive from GVM_CONFIG: if the user has pinned a config path,
+    //    treat that file's directory as the workspace. If the config
+    //    sits inside a `config/` subdirectory (`<root>/config/proxy.toml`),
+    //    use the parent of `config/` so relative paths in the config
+    //    (e.g. `wal.path = "data/wal.log"`) resolve under the project
+    //    root, matching the dev-repo layout the proxy was originally
+    //    built around.
+    if let Ok(cfg) = std::env::var("GVM_CONFIG") {
+        let cfg_path = PathBuf::from(cfg);
+        if let Some(parent) = cfg_path.parent() {
+            let parent = parent.to_path_buf();
+            if parent.file_name().and_then(|s| s.to_str()) == Some("config") {
+                if let Some(grand) = parent.parent() {
+                    if let Some(found) = try_dir(grand.to_path_buf(), &mut searched) {
+                        return found;
+                    }
+                }
+            }
+            if let Some(found) = try_dir(parent, &mut searched) {
+                return found;
             }
         }
     }
 
-    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+    // 3 & 4. CWD, then walk up.
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut cursor: Option<&std::path::Path> = Some(&cwd);
+        let mut depth = 0;
+        while let Some(dir) = cursor {
+            if has_workspace_marker(dir) {
+                return dir.to_path_buf();
+            }
+            searched.push(dir.to_path_buf());
+            depth += 1;
+            if depth >= 8 {
+                break;
+            }
+            cursor = dir.parent();
+        }
+    }
+
+    // 5. Executable's directory, walked up similarly. Handles the
+    //    unpacked release tarball (`gvm` next to `config/proxy.toml`)
+    //    AND the case where `gvm` lives in a child dir like `bin/`.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(start) = exe.parent() {
+            let mut cursor: Option<&std::path::Path> = Some(start);
+            let mut depth = 0;
+            while let Some(dir) = cursor {
+                if has_workspace_marker(dir) {
+                    return dir.to_path_buf();
+                }
+                searched.push(dir.to_path_buf());
+                depth += 1;
+                if depth >= 4 {
+                    break;
+                }
+                cursor = dir.parent();
+            }
+        }
+    }
+
+    // 6. Standard production locations.
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        let dir = PathBuf::from(xdg).join("gvm");
+        if let Some(found) = try_dir(dir, &mut searched) {
+            return found;
+        }
+    }
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        if let Some(found) = try_dir(PathBuf::from(&home).join(".config/gvm"), &mut searched) {
+            return found;
+        }
+    }
+    if let Some(found) = try_dir(PathBuf::from("/etc/gvm"), &mut searched) {
+        return found;
+    }
+
+    // 7. Fallback with diagnostic so the failure mode isn't silent.
+    let cwd_fallback = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    eprintln!();
+    eprintln!("  warning: no GVM workspace marker found. Searched:");
+    for p in &searched {
+        eprintln!("    - {}", p.display());
+    }
+    eprintln!("  expected one of: {}", WORKSPACE_MARKERS.join(", "));
+    eprintln!(
+        "  falling back to CWD: {} (proxy may fail to start)",
+        cwd_fallback.display()
+    );
+    eprintln!("  fix: run from a directory containing config/proxy.toml, or set");
+    eprintln!("       GVM_WORKSPACE / GVM_CONFIG explicitly.");
+    eprintln!();
+    cwd_fallback
 }
 
 /// Read WAL entries that were added during the agent run and display audit summary.

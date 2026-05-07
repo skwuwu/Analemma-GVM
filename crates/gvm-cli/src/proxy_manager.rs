@@ -247,9 +247,93 @@ pub async fn ensure_available(proxy: &str, workspace: &Path, require_tls: bool) 
     start_daemon(proxy, workspace, require_tls).await
 }
 
+/// Resolve the proxy.toml path the spawned proxy will read.
+///
+/// Mirrors `ProxyConfig::load_or_default`'s candidate order so the CLI
+/// can fail-fast BEFORE spawning if no config will be found — and so we
+/// can pin the resolved path into the spawned process's `GVM_CONFIG`
+/// env var instead of letting it re-do discovery from a different
+/// CWD or with a different inherited environment.
+fn resolve_proxy_config_path(workspace: &Path) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("GVM_CONFIG") {
+        let path = PathBuf::from(p);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    let candidates = [
+        workspace.join("config/proxy.toml"),
+        workspace.join("proxy.toml"),
+        std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .ok()
+            .map(|h| PathBuf::from(h).join(".config/gvm/proxy.toml"))
+            .unwrap_or_default(),
+        PathBuf::from("/etc/gvm/proxy.toml"),
+    ];
+    for cand in &candidates {
+        if !cand.as_os_str().is_empty() && cand.exists() {
+            return Some(cand.clone());
+        }
+    }
+    None
+}
+
+/// Same shape as `resolve_proxy_config_path` for the unified gvm.toml
+/// (rules + credentials + budget). Optional — the proxy boots fine
+/// without it as long as `proxy.toml` is present.
+fn resolve_gvm_toml_path(workspace: &Path) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("GVM_TOML") {
+        let path = PathBuf::from(p);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    let candidates = [
+        workspace.join("gvm.toml"),
+        workspace.join("config/gvm.toml"),
+        std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .ok()
+            .map(|h| PathBuf::from(h).join(".config/gvm/gvm.toml"))
+            .unwrap_or_default(),
+    ];
+    for cand in &candidates {
+        if !cand.as_os_str().is_empty() && cand.exists() {
+            return Some(cand.clone());
+        }
+    }
+    None
+}
+
 /// Start the proxy as an independent daemon process.
 async fn start_daemon(proxy: &str, workspace: &Path, require_tls: bool) -> Result<()> {
     let binary = find_proxy_binary(workspace)?;
+
+    // Verify a proxy.toml will be reachable from the workspace BEFORE
+    // we spawn — otherwise the daemon wakes up, finds nothing, falls
+    // back to built-in defaults (listen 0.0.0.0:8080, no SRR rules),
+    // and the CLI eventually times out with the misleading
+    // "missing config/proxy.toml (run from project root)" hint.
+    // Producing the diagnostic up front turns this from a 15s health
+    // poll timeout into an immediate, actionable error.
+    let resolved_proxy_config = resolve_proxy_config_path(workspace);
+    if resolved_proxy_config.is_none() {
+        anyhow::bail!(
+            "No proxy.toml found. Searched (in order):\n  \
+             - $GVM_CONFIG ({})\n  \
+             - {}\n  \
+             - {}\n  \
+             - $HOME/.config/gvm/proxy.toml\n  \
+             - /etc/gvm/proxy.toml\n\n\
+             Fix: run from a directory containing config/proxy.toml, or set\n  \
+             GVM_CONFIG=/absolute/path/to/proxy.toml before invoking gvm.",
+            std::env::var("GVM_CONFIG").unwrap_or_else(|_| "<unset>".into()),
+            workspace.join("config/proxy.toml").display(),
+            workspace.join("proxy.toml").display(),
+        );
+    }
+    let resolved_gvm_toml = resolve_gvm_toml_path(workspace);
 
     // Before starting, kill any stale process occupying our port.
     // This handles the case where a proxy was started outside proxy_manager
@@ -306,14 +390,45 @@ async fn start_daemon(proxy: &str, workspace: &Path, require_tls: bool) -> Resul
     // - working directory: workspace root (config/ and data/ relative paths work)
     // - stdout/stderr: proxy.log (not /dev/null)
     // - stdin: /dev/null
+    //
+    // We pin the resolved config paths into the child's environment
+    // even when the parent already had them set. Two reasons:
+    // (a) the child's CWD is `workspace` rather than the operator's
+    //     shell CWD, so any *relative* GVM_CONFIG would resolve
+    //     differently in the child; passing an absolute path makes the
+    //     contract identical regardless of where `gvm` was invoked.
+    // (b) future env-clearing / namespace changes don't silently
+    //     re-introduce the discovery race that caused the proxy to
+    //     boot with built-in defaults from an unexpected CWD.
+    let proxy_config_abs = resolved_proxy_config
+        .as_ref()
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .or_else(|| resolved_proxy_config.clone());
+    let gvm_toml_abs = resolved_gvm_toml
+        .as_ref()
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .or_else(|| resolved_gvm_toml.clone());
+
+    let configure_cmd = |cmd: &mut std::process::Command| {
+        cmd.current_dir(workspace)
+            .stdin(std::process::Stdio::null());
+        if let Some(p) = &proxy_config_abs {
+            cmd.env("GVM_CONFIG", p);
+        }
+        if let Some(p) = &gvm_toml_abs {
+            cmd.env("GVM_TOML", p);
+        }
+        if let Ok(p) = std::env::var("GVM_WAL_PATH") {
+            cmd.env("GVM_WAL_PATH", p);
+        }
+    };
+
     #[cfg(unix)]
     let child = {
         use std::os::unix::process::CommandExt;
         let mut cmd = std::process::Command::new(&binary);
-        cmd.current_dir(workspace)
-            .stdin(std::process::Stdio::null())
-            .stdout(log_file)
-            .stderr(stderr_file);
+        configure_cmd(&mut cmd);
+        cmd.stdout(log_file).stderr(stderr_file);
 
         // If running as root via sudo, drop back to the original user.
         // The proxy doesn't need root — only the sandbox does.
@@ -342,10 +457,9 @@ async fn start_daemon(proxy: &str, workspace: &Path, require_tls: bool) -> Resul
 
     #[cfg(not(unix))]
     let child = {
-        std::process::Command::new(&binary)
-            .current_dir(workspace)
-            .stdin(std::process::Stdio::null())
-            .stdout(log_file)
+        let mut cmd = std::process::Command::new(&binary);
+        configure_cmd(&mut cmd);
+        cmd.stdout(log_file)
             .stderr(stderr_file)
             .spawn()
             .with_context(|| format!("Failed to spawn proxy: {}", binary.display()))?
@@ -374,8 +488,11 @@ async fn start_daemon(proxy: &str, workspace: &Path, require_tls: bool) -> Resul
                 eprintln!("  Check log: {}", log_path.display());
                 eprintln!("  Common causes:");
                 eprintln!("    - Port 8080 already in use (another proxy or service)");
-                eprintln!("    - Missing config/proxy.toml (run from project root)");
-                eprintln!("    - data/ directory not writable (check permissions)");
+                eprintln!("    - data/ directory not writable: {}", data_dir.display());
+                eprintln!("    - Invalid TOML in proxy.toml / gvm.toml");
+                if let Some(p) = &resolved_proxy_config {
+                    eprintln!("  Config used: {}", p.display());
+                }
                 anyhow::bail!("Proxy failed to start. See {}", log_path.display());
             }
             eprintln!("  {RED}Proxy started but not responding to health checks.{RESET}");
