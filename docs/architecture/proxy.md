@@ -68,9 +68,52 @@ Agent HTTP Request
 │  1. Inject API credentials (Layer 3)                │
 │  2. Remove X-GVM-* headers                          │
 │  3. Build outbound URI                              │
-│  4. HTTP client → upstream                          │
+│  4. MITM relay: try upstream pool first (§6.2.1)    │
+│     ├─ pool hit  → reuse pooled SendRequest         │
+│     └─ pool miss → fresh TCP+TLS+http1 handshake    │
+│  5. Send request, wrap response body in             │
+│     SenderReturnerBody → returns sender to pool     │
+│     when body reaches EOF / is_end_stream           │
 └─────────────────────────────────────────────────────┘
 ```
+
+### 6.2.1 Upstream connection pool (`src/upstream_pool.rs`)
+
+The MITM relay keeps a bounded LIFO pool of
+`hyper::client::conn::http1::SendRequest<BoxBody<Bytes,String>>`
+handles, keyed by upstream `host:port`. Default tuning: **4 idle
+connections per host, 30-second idle TTL**. The pool exists because
+the relay terminates the agent's TLS connection and opens a separate
+TLS connection to the upstream — without pooling that proxy↔upstream
+handshake fired on every single agent request, costing **+528 ms
+median** on HTTP/1.1 hot paths from EC2 Seoul to public endpoints
+(measured 2026-05-08; see [CHANGELOG](../internal/CHANGELOG.md)).
+
+Lifecycle:
+
+- **Take**: `pool.try_take(host)` pops the most-recently-returned
+  sender (LIFO) for the given key, dropping any whose `last_used`
+  age exceeds the idle TTL. The caller verifies liveness via
+  `SendRequest::ready()` before sending; a stale sender (upstream
+  closed mid-idle) falls through to a fresh connect.
+- **Put-back**: the upstream `Incoming` body is wrapped in
+  `SenderReturnerBody`. When the body's `poll_frame` reaches clean
+  EOF (or the inner body's `is_end_stream()` becomes true after a
+  successful frame — hyper's server-side writer drops
+  Content-Length-bounded bodies via the latter and never emits the
+  former), the wrapped sender is returned to the pool. Errors and
+  premature drops discard the sender so the connection terminates.
+- **Cap**: when a host's pool is full, the *oldest* idle sender is
+  evicted; LIFO take ensures the most recently used (= most likely
+  still alive) is preferred on re-take.
+
+HTTP/2 hosts (Anthropic API, OpenAI API, modern SaaS) already
+multiplex per-stream over a single internal connection in hyper, so
+the pool's marginal benefit there is small (+28 ms unchanged). The
+pool primarily restores HTTP/2-like upstream-handshake amortisation
+to the HTTP/1.1 path. After the pool warms (1 fresh connect for the
+first request to a new host:port), per-request MITM overhead on the
+HTTP/1.1 hot path is **~0 ms** vs direct curl from the same host.
 
 ---
 
