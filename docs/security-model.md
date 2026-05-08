@@ -755,7 +755,7 @@ Use `--no-mitm` to disable MITM and fall back to CONNECT relay (domain-level onl
 | **Certificate pinning** | Agents pinning expected certs will reject MITM-generated certs | Use `--no-mitm` |
 | **Windows Docker large responses** | Docker Desktop WSL2 network bridge may drop TCP >500KB | Use Linux for production. Windows works for small-medium responses |
 | **Content-Encoding (gzip/br)** | Compressed bodies not decompressed for payload inspection | URL-pattern SRR works regardless. Payload inspection requires uncompressed (future) |
-| **Timeout chaining** | MITM adds ~300ms overhead; agent timeout may fire first | Set agent timeouts > proxy upstream timeout (30s). Streaming SSE is unaffected (first chunk fast) |
+| **Timeout chaining** | After the upstream pool warms (commit `68820c2`, 2026-05-08) MITM adds ~0 ms median on HTTP/1.1 hot paths and +28 ms on HTTP/2; the first request to a new `host:port` still pays one fresh upstream TLS handshake (cold-start +200-500 ms depending on RTT). Set agent timeouts > proxy upstream timeout (30s). Streaming SSE is unaffected (first chunk fast) |
 | **LLM thinking trace** | MITM relay streams response chunks — cannot buffer full body for trace extraction | Thinking hash not captured on MITM path; cooperative mode (HTTP_PROXY without TLS termination) preserves the full trace |
 | **IC-3 RequireApproval** | MITM cannot hold a TLS keep-alive stream for human approval | IC-3 treated as Deny on the MITM path; use cooperative mode for the IC-3 hold-and-release flow |
 | **Shadow Mode** | MITM has no `gvm_declare_intent` claim path (the intent endpoint is on the admin port) | Intent store claim/verify not supported on the MITM path. SRR enforcement still active |

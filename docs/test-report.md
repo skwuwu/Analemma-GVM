@@ -1230,14 +1230,29 @@ Before rules: all requests hit Default-to-Caution (300ms delay). After rules: al
 
 ---
 
-## D.2 End-to-End Overhead Benchmark (2026-04-06, EC2 t3.medium)
+## D.2 End-to-End Overhead Benchmark (2026-04-06, EC2 t3.medium) — SUPERSEDED
+
+> **Status (2026-05-08): SUPERSEDED.** The numbers in this section
+> were captured before the upstream-pool work (commit `68820c2`) and
+> before the bench methodology corrections recorded in the
+> [2026-05-07 CHANGELOG entry](internal/CHANGELOG.md#2026-05-07-bench-refresh--corrected-after-two-methodology-errors-caught-in-review).
+> The +14 ms / +683 ms / +225 ms figures in particular do not
+> reproduce against the current build. Read the
+> ["HTTP overhead — layered measurement" section above](#http-overhead--layered-measurement)
+> and the
+> [LLM provider section](#llm-provider-anthropic-claude-haiku-45-raw-curl-hi-prompt-n20)
+> for the current authoritative numbers (delta-framed, n=20,
+> validated against origin/master HEAD `60c2cf8` on 2026-05-08).
+> The body of D.2 below is preserved as a historical record of what
+> we believed at the time, plus the methodology gap (we now know
+> the +14 ms claim was likely a localhost-mock artifact).
 
 **Script**: [`scripts/bench-overhead.sh`](../scripts/bench-overhead.sh)
 **Platform**: EC2 t3.medium, Ubuntu 24.04, kernel 6.17.0-1009-aws
 
 Measures actual network latency overhead of GVM proxy and sandbox compared to direct connections. All measurements are median values from 20 iterations (HTTP) or 5 iterations (LLM).
 
-### HTTP Request Overhead (httpbin.org/get)
+### HTTP Request Overhead (httpbin.org/get) — SUPERSEDED
 
 | Path | TTFB (median) | Overhead |
 |------|---------------|----------|
@@ -1245,7 +1260,12 @@ Measures actual network latency overhead of GVM proxy and sandbox compared to di
 | Proxy (CONNECT tunnel) | 965ms | **+225ms** |
 | Sandbox MITM (DNAT) | 754ms | **+14ms** |
 
-**Key insight**: Sandbox MITM adds only +14ms per request. This is the TLS termination + leaf cert lookup (cache hit) + SRR check + WAL batch append + upstream relay overhead. The CONNECT tunnel path is slower (+225ms) because it requires HTTP CONNECT handshake + TLS renegotiation on every new connection.
+> The +14 ms claim does not reproduce against the public internet
+> from EC2 Seoul on the current build; the current measured delta
+> for sandbox + MITM with the upstream pool warm is **~0 ms**
+> (HTTP/1.1 hot path) and **+28 ms** (HTTP/2). See the
+> [HTTP overhead section above](#http-overhead--layered-measurement)
+> for the validated numbers.
 
 ### Sandbox Startup (one-time)
 
@@ -1254,16 +1274,22 @@ Measures actual network latency overhead of GVM proxy and sandbox compared to di
 | Median | 928ms |
 | Range | 910ms – 10,398ms |
 
-Sandbox startup includes: clone(CLONE_NEWPID\|NEWNS\|NEWNET\|NEWUSER), overlayfs $HOME mount, veth pair creation, iptables DNAT rules, seccomp-BPF installation, CA cert injection, and cert pre-warm. The 10s outlier is first-run CA key generation (P-256 keygen).
+Sandbox startup includes: clone(CLONE_NEWPID\|NEWNS\|NEWNET\|NEWUSER), overlayfs $HOME mount, veth pair creation, iptables DNAT rules, seccomp-BPF installation, CA cert injection, and cert pre-warm. The 10s outlier is first-run CA key generation (P-256 keygen). Re-measured 2026-05-07: median 876 ms (832-881 ms range, n=5).
 
-### LLM Call Overhead (Anthropic API, "Say hi")
+### LLM Call Overhead (Anthropic API, "Say hi") — SUPERSEDED
 
 | Path | Time (median) | Overhead |
 |------|---------------|----------|
 | Direct (no proxy) | 10,562ms | baseline |
 | Sandbox MITM | 11,245ms | **+683ms (6.5%)** |
 
-Measured inside an already-running sandbox (startup excluded). The +683ms includes MITM TLS termination + chunked SSE relay + WAL append per request. On a 10-second LLM call, this is negligible.
+> The +683 ms attributed to "MITM" in this row was almost entirely
+> OpenClaw agent-loop overhead, not GVM. The 2026-05-07 re-measure
+> with raw `curl` against the Anthropic `/v1/messages` endpoint —
+> `claude-haiku-4-5`, "hi", 16 tokens, n=20 — gives **+28 ms**
+> median MITM overhead. See the
+> [LLM provider section above](#llm-provider-anthropic-claude-haiku-45-raw-curl-hi-prompt-n20)
+> for the corrected methodology.
 
 ### Concurrent Throughput (10 parallel requests)
 
@@ -1272,27 +1298,34 @@ Measured inside an already-running sandbox (startup excluded). The +683ms includ
 | Direct | 1,005ms | baseline |
 | Via proxy | 1,479ms | **+474ms** |
 
-Proxy handles 10 concurrent HTTPS connections with linear scaling. No contention or serialization observed.
+Re-measured 2026-05-07 against `httpbin.org`: 1104 ms direct vs 1269 ms via proxy = +165 ms median (without the upstream pool). Post-pool concurrent throughput has not been re-measured separately; the per-request HTTP/1.1 delta now landing at ~0 ms suggests the concurrent figure has fallen too, but the bench should be re-run to confirm.
 
-### Summary — Operational Overhead
+### Summary — Operational Overhead — SUPERSEDED
 
-| Component | Overhead | When | Impact on Agent |
-|-----------|----------|------|-----------------|
+> The numbers in the table below pre-date both the bench-methodology
+> corrections (2026-05-07) and the upstream-pool work (2026-05-08).
+> Use the
+> [HTTP overhead — layered measurement section above](#http-overhead--layered-measurement)
+> as the authoritative summary.
+
+| Component | Overhead (historical, 2026-04-06) | When | Impact on Agent |
+|-----------|------------------------------------|------|-----------------|
 | SRR rule matching | <1µs | Every request (Criterion) | **Zero** — within CPU noise |
-| MITM per request (DNAT) | +14ms TTFB | Every HTTPS request | **Imperceptible** — 0.01% of typical LLM call |
-| Sandbox startup | ~928ms | One-time per `gvm run --sandbox` | **Docker-equivalent** — comparable to `docker run` (1-5s) |
-| LLM per request | +683ms | Every LLM API call | **6.5%** on 10s call — within API variance |
+| MITM per request (DNAT) | +14ms TTFB | Every HTTPS request | (does not reproduce — see superseded note) |
+| Sandbox startup | ~928ms | One-time per `gvm run --sandbox` | **Docker-equivalent** |
+| LLM per request | +683ms | Every LLM API call | (mostly OpenClaw, not GVM — see superseded note) |
 | CONNECT tunnel | +225ms | Per connection (cooperative mode) | Connection setup only, amortized over keep-alive |
 
-### Practical Impact Analysis
+### Practical Impact Analysis — SUPERSEDED
 
-**The core proxy overhead is +14ms per request.** This is the cost of MITM TLS termination (leaf cert cache hit, ~0ns) + SRR check (<1µs) + WAL batch append (~50µs) + upstream TCP connect + TLS handshake. On a typical LLM API call (2-30 seconds), this adds **0.05-0.7%** — well within the natural variance of API response times.
-
-The +683ms measured in LLM tests includes OpenClaw SDK initialization overhead per call and intermittent CONNECT retry (known Node.js undici edge case), not pure proxy cost. The pure proxy path (DNAT MITM) is +14ms.
-
-**Sandbox startup (928ms)** is a one-time cost. In persistent gateway mode (`--sandbox-timeout 0`), the agent runs indefinitely in a single sandbox — hundreds of LLM calls amortize the startup to effectively zero. This is comparable to Docker container startup (1-5s) and faster than Kubernetes pod scheduling (5-30s).
-
-**Governance adds no user-perceptible latency to agent operations.** The proxy is transparent — agents cannot distinguish governed from ungoverned operation by timing alone. This is a fundamental design requirement: governance must not degrade the agent experience, or operators will disable it.
+> The +14 ms / +683 ms claims below were both shown not to reproduce
+> in 2026-05-07's re-measurement. Current authoritative numbers:
+> ~0 ms median MITM delta on HTTP/1.1 (with upstream pool warm) and
+> +28 ms median on HTTP/2. The qualitative conclusion — governance
+> adds no user-perceptible latency to typical LLM API calls — still
+> holds, but for entirely different reasons than the 2026-04-06
+> numbers suggested. See the
+> [authoritative HTTP overhead section](#http-overhead--layered-measurement).
 
 ---
 
