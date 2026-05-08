@@ -1,4 +1,4 @@
-# Analemma-GVM
+# Analemma-GVM: Lightweight AI Agent Governance Runtime
 
 **A lightweight secure runtime for autonomous AI agents.** Governs every outbound HTTP call, isolates the filesystem, and locks down syscalls — using a Rust proxy and Linux kernel primitives.
 
@@ -16,6 +16,41 @@ So I built GVM (Governance Virtual Machine) — a lightweight security runtime f
 Replay interactively with `asciinema play docs/assets/gvm-demo.cast`.*
 
 The demo runs on a real Ubuntu 24.04 host. Agent code is not changed between steps — only the rules and flags differ.
+
+### What you see in the GIF, second by second
+
+1. **0:00 – 0:07 — Watch mode boots.** The operator runs
+   `gvm run --watch demo_agent.py`. GVM prints "Watch Mode (observation
+   only)" and forwards every request the agent makes to its real
+   destination — no rules exist yet, nothing is blocked. Each call is
+   labelled `Allow` and recorded as a structured event in the WAL audit
+   log.
+2. **0:07 – 0:19 — Agent traffic streams past.** The demo agent makes
+   a handful of HTTP calls (GitHub API, Anthropic API, an unknown
+   internal host). They show up live in the watch terminal with their
+   method, host, path, and decision. At the end GVM hints what to run
+   next: `gvm run --interactive` to learn rules interactively, or
+   `gvm run --sandbox` to add Linux-kernel isolation on top.
+3. **0:19 – 0:29 — `gvm suggest` turns the recording into rules.**
+   The operator runs `gvm suggest --from data/wal.log` and GVM emits
+   TOML rules — one `[[rules]]` block per host pattern that appeared
+   in the watch session, each with `decision = { type = "Allow" }`.
+   These get appended to the agent's rule file and become the
+   ground-truth for what this agent is allowed to do.
+4. **0:29 – 0:33 — Enforce mode catches the new behaviour.** The
+   operator re-runs the agent under the freshly suggested rules. The
+   previously-seen calls pass instantly. A *new* URL the agent didn't
+   touch during watch (`api.demo:9999` — represents an exfiltration
+   attempt or a behaviour change) hits Default-to-Caution: marked
+   `Delay { milliseconds: 300 }`, recorded with a full causal trace
+   ID. The audit log now has a verifiable record of "agent tried
+   something not in its known surface."
+
+The point of the demo: governance for an existing agent costs three
+commands and zero code changes. Watch records what the agent does,
+suggest turns that into rules, enforce makes those rules binding —
+and any future drift away from that surface is flagged in the audit
+log on the first request.
 
 ---
 
