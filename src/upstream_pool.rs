@@ -196,23 +196,19 @@ impl Body for SenderReturnerBody {
                     self.pool.put_back(self.host.clone(), s);
                 }
             }
-            Poll::Ready(Some(Ok(_frame))) => {
-                // Successful frame. For Content-Length-bounded HTTP/1.1
-                // responses, hyper's `Incoming` returns the body as a
-                // single data frame and then signals completion via
-                // `is_end_stream()` rather than a follow-up
-                // `Ready(None)`. Hyper's server-side writer checks
-                // `is_end_stream()` after each frame and stops polling
-                // when it returns true — so a finalizer that only
-                // fires on `Ready(None)` will be missed.
-                //
-                // Ask the inner body if it's now exhausted; if so,
-                // return the sender immediately rather than waiting
-                // for a `Ready(None)` that will never arrive.
-                if self.body.is_end_stream() {
-                    if let Some(s) = self.sender_slot.take() {
-                        self.pool.put_back(self.host.clone(), s);
-                    }
+            // Successful frame AND inner body is now exhausted: for
+            // Content-Length-bounded HTTP/1.1 responses, hyper's
+            // `Incoming` returns the body as a single data frame and
+            // then signals completion via `is_end_stream()` rather
+            // than a follow-up `Ready(None)`. Hyper's server-side
+            // writer checks `is_end_stream()` after each frame and
+            // stops polling when it returns true — so a finalizer
+            // that only fires on `Ready(None)` will be missed. The
+            // match guard runs `is_end_stream()` after the borrow on
+            // `self.body` from `poll_frame` has been released.
+            Poll::Ready(Some(Ok(_frame))) if self.body.is_end_stream() => {
+                if let Some(s) = self.sender_slot.take() {
+                    self.pool.put_back(self.host.clone(), s);
                 }
             }
             Poll::Ready(Some(Err(_))) => {
