@@ -22,11 +22,11 @@ would erase that property. Multi-tenancy is solved at the deployment
 layer (separate processes / containers / VMs), not inside the GVM
 runtime.
 
-### Current (v0.5.0)
+### Current (v0.5.3)
 
-HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key isolation, IC classification (Allow/Delay/RequireApproval/Deny), Merkle tree audit ledger with WAL group commit, AES-256-GCM encrypted state cache, Wasm runtime (optional, behind `--features wasm`), JWT agent identity, TC ingress filter (kernel-level proxy enforcement), seccomp BPF sandbox with dual filter stacking, DNS soft governance (4-tier delay + alert), filesystem governance (overlayfs Trust-on-Pattern), IC-3 human approval workflow (admin port separation), MITM TLS proxy (sole HTTPS inspection mechanism — uprobe removed).
+HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key isolation, IC classification (Allow/Delay/RequireApproval/Deny), Merkle tree audit ledger with WAL group commit + Ed25519 anchor signing, AES-256-GCM encrypted state cache, Wasm runtime (optional, behind `--features wasm`), JWT agent identity, TC ingress filter (kernel-level proxy enforcement), seccomp BPF sandbox with dual filter stacking, DNS soft governance (4-tier delay + alert), filesystem governance (overlayfs Trust-on-Pattern), IC-3 human approval workflow (admin port separation), MITM TLS proxy with bounded LIFO upstream connection pool (sole HTTPS inspection mechanism — uprobe removed).
 
-**Release history**: v0.2 (Shadow Mode, CONNECT tunnel, SRR hot-reload, MITM), v0.3 (sandbox cleanup, overlayfs, seccomp audit), v0.4 (IC-3 approval, stress testing, contained mode), v0.5 (DNS governance, placeholder credentials, proxy hardening).
+**Release history**: v0.2 (Shadow Mode, CONNECT tunnel, SRR hot-reload, MITM), v0.3 (sandbox cleanup, overlayfs, seccomp audit), v0.4 (IC-3 approval, stress testing, contained mode), v0.5.0 (DNS governance, placeholder credentials, proxy hardening), v0.5.2 (per-sandbox CA routing, payload_inspection default ON, cleanup audit), **v0.5.3** (upstream connection pool — HTTP/1.1 MITM overhead +528ms → ~0ms, deterministic config-path discovery, Ed25519 anchor signing activated, --contained behind feature flag, segment editor + time-window SRR conditions, NATS/Redis ghost integrations removed, bench methodology corrections).
 
 ### Planned
 

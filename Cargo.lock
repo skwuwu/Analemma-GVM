@@ -1541,7 +1541,7 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "gvm-cli"
-version = "0.5.0"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1571,7 +1571,7 @@ dependencies = [
 
 [[package]]
 name = "gvm-engine"
-version = "0.5.0"
+version = "0.5.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -1579,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "gvm-proxy"
-version = "0.5.0"
+version = "0.5.3"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1634,7 +1634,7 @@ dependencies = [
 
 [[package]]
 name = "gvm-sandbox"
-version = "0.5.0"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "dashmap",
@@ -1656,7 +1656,7 @@ dependencies = [
 
 [[package]]
 name = "gvm-types"
-version = "0.5.0"
+version = "0.5.3"
 dependencies = [
  "base64 0.22.1",
  "chrono",
