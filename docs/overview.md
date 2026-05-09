@@ -10,7 +10,7 @@ Version: 0.1.0 | Date: 2026-03-14
 
 Analemma-GVM is a transparent enforcement proxy for AI agent I/O operations. It enforces security policies at the infrastructure level, ensuring that no agent — regardless of framework, language, or behavior — can bypass governance controls. The system operates as a "security kernel" sitting between AI agents and external APIs.
 
-**Core thesis**: Security must be structural, not behavioral. Agent code is unchanged. In `--sandbox` mode, enforcement is structurally guaranteed by kernel-level redirection; in cooperative mode it depends on the agent honouring `HTTP_PROXY`.
+**Core thesis**: Security must be structural, not behavioral. Agent code is unchanged. GVM ships three enforcement modes: **cooperative** (HTTP_PROXY env-var injection — runs everywhere), **`--sandbox`** (Linux kernel namespaces + seccomp-BPF + iptables DNAT + MITM — production default; structurally guaranteed), and **`--contained`** (Docker isolation — *experimental, opt-in via `cargo build --release --features contained`*; the production binary does not advertise this flag). In `--sandbox` mode enforcement is structurally guaranteed by kernel-level redirection; in cooperative mode it depends on the agent honouring `HTTP_PROXY`.
 
 ---
 
@@ -40,6 +40,7 @@ Analemma-GVM is a transparent enforcement proxy for AI agent I/O operations. It 
 |-------|------|----------|-------------|
 | 0 | DNS | Tiered delay on DNS queries (known=0ms, unknown=200ms, burst=3s, flood=10s). No Deny. | iptables DNAT forces all UDP 53 through governance proxy; seccomp blocks direct external DNS |
 | 1 | HTTP (SRR) | URL/method/payload rule matching with cost governance | iptables DNAT forces all TCP 443 through MITM; TC ingress filter on host veth |
+| 1+ | MITM upstream pool | Bounded LIFO pool of upstream HTTP/1.1 `SendRequest` handles (4 idle/host, 30 s TTL) — amortises the proxy↔upstream TLS handshake across requests, collapsing per-request MITM overhead from +528 ms to ~0 ms once the pool is warm. See [proxy.md §6.2.1](architecture/proxy.md#621-upstream-connection-pool-srcupstream_poolrs). | First request to a new host:port still pays one fresh handshake; subsequent requests reuse the cached connection until idle TTL expires |
 | 2 | Filesystem | overlayfs copy-on-write + human approval | Mount namespace isolation; writes go to tmpfs upper layer |
 | 3 | Capability Token | API key injection post-enforcement | Agent env has no external API keys; proxy injects after governance pass |
 

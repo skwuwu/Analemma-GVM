@@ -115,6 +115,43 @@ to the HTTP/1.1 path. After the pool warms (1 fresh connect for the
 first request to a new host:port), per-request MITM overhead on the
 HTTP/1.1 hot path is **~0 ms** vs direct curl from the same host.
 
+### 6.2.2 Per-sandbox MITM CA routing
+
+> Source: `src/api.rs` (sandbox launch endpoint) + `src/tls_proxy.rs` (TLS resolver). Landed in `bf0af7e`.
+
+
+When the proxy runs alongside `gvm run --sandbox`, **each sandbox
+gets its own MITM CA** — provisioned at sandbox launch, scoped to a
+single sandbox's lifetime, and discarded at sandbox cleanup. The
+proxy's TLS listener routes the inbound connection to the right CA
+by matching on the sandbox's veth source IP, so a sandbox is offered
+only the leaf certificate that chains up to *its* CA, never the CA
+of a peer sandbox running alongside it.
+
+**Why this matters.** A single shared MITM CA is a tempting
+simplification but creates two ugly properties:
+
+1. *Cross-sandbox impersonation.* Sandbox A could pin Sandbox B's
+   leaf cert if both chained up to the same root, blurring the
+   trust boundary that namespace + iptables otherwise provides.
+2. *Catastrophic blast radius on CA leak.* If a sandbox finds an
+   exfiltration path for the CA private key (e.g. a
+   misconfigured `/proc` mount), every other sandbox on the host
+   becomes mitm-able with that one key.
+
+Per-sandbox CA collapses both: leaks are scoped to one sandbox's
+lifetime, and the cert chain offered to sandbox A is provably
+unrelated to anything sandbox B ever saw. The proxy holds one
+`(sandbox_id → (CA cert, CA key))` map indexed by source IP; the
+MITM TLS listener's `ResolvesServerCert` callback dispatches into
+that map per accepted connection. The CA key never leaves the
+proxy process — the sandbox only ever sees the CA *certificate*
+(injected into its `/etc/ssl/certs` overlay at provision time).
+Anchored in WAL: every sandbox launch records a
+`sandbox_launch: per-sandbox MITM CA provisioned + audit anchored`
+event with the CA pubkey hash, so a forensic audit can prove which
+CA chain a given request was offered.
+
 ---
 
 ## 6.3 Classification Path

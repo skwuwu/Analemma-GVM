@@ -82,7 +82,7 @@ Each expansion creates a separate compiled rule, ensuring O(1) method comparison
 
 ## 3.6 Payload Inspection (GraphQL/gRPC Defense)
 
-For APIs that multiplex operations over a single URL (e.g., GraphQL), SRR supports body inspection:
+For APIs that multiplex operations over a single URL (e.g., GraphQL), SRR supports body inspection. Payload inspection is **on by default since v0.5.2** (`fix(security): payload_inspection default ON`) — it activates implicitly on any rule that declares both `payload_field` and `payload_match`. There is no separate global on/off toggle; if a rule wants body inspection, it sets those two fields. The default `max_body_bytes` cap (65 536) applies regardless of whether the operator names it explicitly, so a body-rule cannot accidentally degenerate into an unbounded read.
 
 ```toml
 [[rules]]
@@ -173,7 +173,87 @@ description = "Telegram message send — review delay"
 
 ---
 
-## 3.8 SRR Hot-Reload
+## 3.8 Time-Window Conditions
+
+A rule can carry an optional `condition` block that gates when the rule fires. The current implementation defines one condition kind — `time_window` — but the schema is a tagged enum (`#[serde(tag = "kind")]`), so future variants (`request_count`, `header_value`, …) extend without breaking existing TOML.
+
+```toml
+# Allow Slack only during business hours (Asia/Seoul, 09:00-18:00).
+# Outside the window the rule does not fire — the request falls through
+# to the next matching rule (or to Default-to-Caution).
+[[rules]]
+method = "POST"
+pattern = "api.slack.com/{any}"
+decision = { type = "Allow" }
+condition = { kind = "time_window", window = "09:00-18:00", tz = "Asia/Seoul" }
+
+# Inverse — block deploys outside business hours.
+[[rules]]
+method = "POST"
+pattern = "api.github.com/repos/{any}/deployments"
+decision = { type = "Deny", reason = "Deploys only during business hours" }
+condition = { kind = "time_window", window = "09:00-18:00", tz = "Asia/Seoul", outside = true }
+
+# Cross-midnight ranges are supported (start_min > end_min).
+[[rules]]
+method = "*"
+pattern = "{any}"
+decision = { type = "Delay", milliseconds = 1000 }
+condition = { kind = "time_window", window = "22:00-06:00", tz = "UTC" }
+```
+
+**Field reference**:
+
+| Field | Required | Default | Notes |
+|-------|----------|---------|-------|
+| `window` | yes | — | `"HH:MM-HH:MM"`, both endpoints in the rule's `tz`. Cross-midnight (`"22:00-06:00"`) is encoded as `start_min > end_min` internally. |
+| `tz` | no | `"UTC"` | IANA name. Validated at load via `chrono-tz`; an unknown zone fails the rule's compile, surfaced as a parse error on `gvm reload`. |
+| `outside` | no | `false` | Inverts the match — rule fires *outside* the window. |
+
+**Determinism contract.** Conditions evaluate against the request's timestamp, which is committed to the Merkle leaf in `compute_event_hash`. An auditor running `gvm replay --wal` against the same rule set with `check_at(event.timestamp)` reproduces the producer's decision exactly — no system-clock dependence. `Condition` carries the same audit guarantee as unconditional rules; the timestamp dependency adds no new trust assumption because the timestamp itself is anchor-signed. See `src/srr/mod.rs::Condition` for the compiled form and `crates/gvm-cli/src/replay.rs` for the replay path.
+
+**`--strict` flag for replay.** `gvm replay --wal <path> --strict` rejects any WAL event whose `timestamp` cannot parse as RFC 3339 instead of falling back to `Utc::now()`. For audits of time-window-conditional rules `--strict` is the right mode — without it a malformed-timestamp event would silently re-evaluate against the auditor's wall clock, possibly flipping the decision. Production replays should pass `--strict`; the lenient default exists for incremental WAL inspection during development.
+
+---
+
+## 3.9 Interactive Rule Builder (`gvm suggest --interactive`)
+
+`gvm suggest` can run interactively, walking through every unknown URL the agent hit during `gvm watch` and asking the operator to make a per-target decision. The interactive flow is what most operators actually use — direct hand-editing of TOML is the escape hatch.
+
+For each unknown target the prompt lists the path segmented and indexed, followed by the available choices:
+
+```
+GET api.github.com/repos/foo/orders/12345
+
+   [1] repos  [2] foo  [3] orders  [4] 12345
+
+   [a] Allow     (IC-1: instant, no delay)
+   [d] Delay     (IC-2: 300ms safety delay + audit)
+   [n] Deny      (IC-3: block completely)
+   [s] Skip      (leave as Default-to-Caution)
+   [e <nums>] Edit     (wildcard segments — e.g. "e 2 3")
+   [t] Time      (gate by HH:MM-HH:MM in your timezone)
+
+   Choice: e 2 4
+```
+
+Key shortcuts:
+
+| Key | Effect |
+|-----|--------|
+| `a` / `d` / `n` | Stage the rule with Allow / Delay 300ms / Deny respectively |
+| `s` | Skip — let the URL fall to Default-to-Caution at runtime |
+| `e <nums>` | Replace the listed path segments with `{any}`. `"e 2 3"` turns `/repos/foo/orders/...` into `/repos/{any}/{any}/...`. Loops back to the prompt with the new pattern so the operator can iterate. |
+| `t` | Prompts for an HH:MM-HH:MM window + timezone, stages a `condition.time_window` block on the rule. After staging, the prompt re-displays with a **preview** of the resulting `[[rules]]` block so the operator can sanity-check before pressing `a`/`d`/`n`. |
+| `c` | Visible only after `[t]` has staged a condition. Drops the staged condition. |
+
+The segment editor exists because `gvm suggest`'s built-in `looks_like_id` heuristic (numeric / UUID / hex hash detection) misses domain-specific identifiers — base64 IDs, slug-like tokens, custom serialisation. Rather than re-running watch with a different agent path, the operator wildcards the right segments interactively.
+
+The time-window condition is intentionally NOT auto-suggested. `gvm suggest` is a baseline-construction tool; condition design ("deny outside biz hours") is policy authoring and stays operator-driven. The `[t]` key surfaces the feature without making it the default path.
+
+---
+
+## 3.10 SRR Hot-Reload
 
 The SRR rule set can be reloaded at runtime without restarting the proxy via `POST /gvm/reload`.
 
@@ -194,7 +274,7 @@ POST /gvm/reload → 400 {"reloaded": false, "error": "Parse failed: ... Existin
 
 ---
 
-## 3.9 Configuration Example
+## 3.11 Configuration Example
 
 ```toml
 # Block wire transfers
@@ -233,7 +313,7 @@ decision = { type = "Delay", milliseconds = 300 }
 
 ---
 
-## 3.10 Header Forgery Defense
+## 3.12 Header Forgery Defense
 
 The SRR's primary security value: it **ignores** the semantic operation header (`X-GVM-Operation`).
 
@@ -248,7 +328,7 @@ The agent's lie about its intent is caught at the transport layer regardless of 
 
 ---
 
-## 3.11 Test Coverage
+## 3.13 Test Coverage
 
 | Test | Assertion |
 |------|-----------|

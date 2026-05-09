@@ -67,7 +67,9 @@ If an attacker has root access to the host, GVM — like any userspace process �
 
 **Impact (when enabled)**: Arbitrary policy logic execution within the Wasm sandbox boundary.
 
-**Roadmap mitigation**: (1) Hot-path Wasm activation with parity tests against native decisions, (2) Ed25519 signature verification + hash pinning, and (3) fail-close startup when Wasm mode is required.
+**Mitigation status**:
+- *Implemented (v0.5.3)*: Ed25519 anchor signature verification on the audit chain — `gvm anchor keygen` provisions the operator-managed keypair, the proxy attests every batch anchor with it, and `gvm audit verify` rejects WALs with bad or missing signatures. Tampered policy evaluation paths surface as anchor-chain breaks, not just silently-wrong decisions.
+- *Roadmap*: (1) Hot-path Wasm activation with parity tests against native decisions, (2) Wasm module hash pinning + signature verification (separate from the anchor signing already in place), (3) fail-close startup when Wasm mode is required.
 
 **Status**: Roadmap hardening item. Not active on the default runtime path.
 
@@ -401,6 +403,8 @@ The CA key flow was audited end-to-end:
 5. `EphemeralCA::drop()` zeroizes both the cert PEM and a serialized copy of the key PEM.
 
 **Architecture**: The proxy process runs outside all sandboxed namespaces. The agent process runs inside user/PID/mount/net namespaces with seccomp-BPF. These are separate processes with no shared memory. The CA key exists only in the proxy's address space.
+
+**Per-sandbox CA routing (v0.5.2, `bf0af7e`)**: Each `gvm run --sandbox` invocation provisions its **own** CA — the proxy holds a `(sandbox_id → (CA cert, CA key))` map indexed by the sandbox's veth source IP, and the MITM TLS listener's `ResolvesServerCert` callback dispatches per-connection. The earlier "one CA per host" model was replaced because (a) it allowed sandbox A to pin sandbox B's leaf cert if both chained to the same root, blurring trust boundaries that the namespace + iptables stack otherwise enforced, and (b) a CA leak from any single sandbox would have made every other sandbox on the host MITM-able with that one key. With per-sandbox CA, leaks are scoped to one sandbox's lifetime and the cert chain offered to sandbox A is provably unrelated to anything sandbox B ever saw. Each sandbox launch records a `sandbox_launch: per-sandbox MITM CA provisioned + audit anchored` event in the WAL with the CA pubkey hash, so a forensic audit can prove which CA chain a given request was offered. See [proxy.md §6.2.2](architecture/proxy.md#622-per-sandbox-mitm-ca-routing) for the dispatch internals.
 
 **Trust store coverage and limitations**:
 

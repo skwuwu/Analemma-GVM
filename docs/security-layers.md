@@ -76,8 +76,10 @@ GVM occupies the **action governance** layer — between the agent runtime and e
 **What makes GVM different:**
 - **Graduated enforcement**: Allow → AuditOnly → Delay → RequireApproval → Deny. Not just binary allow/deny
 - **Credential isolation**: Agent never holds API keys. Proxy injects post-enforcement
-- **Durable audit**: WAL with Merkle chain. Every decision recorded before forwarding
+- **Durable audit**: WAL with Merkle chain + Ed25519 anchor signing (v0.5.3). Every decision recorded before forwarding; tamper detection without trusting the storage layer
 - **Runtime isolation**: `gvm run --sandbox` provides namespace+seccomp+MITM. The agent physically cannot bypass the proxy
+- **Per-sandbox MITM CA** (v0.5.2): each sandbox gets its own CA, dispatched by veth source IP. A compromised sandbox cannot impersonate or MITM its peers
+- **Zero-config sandbox identity**: Agents launched under `gvm run --sandbox` are identified automatically by network-namespace binding (`token_id = sandbox-peer:<sandbox_id>`) with no JWT setup or SDK changes — the alternative governance stacks all require code-side identity work
 - **Provider-agnostic**: Works with any LLM, any framework, any language. It's an HTTP proxy
 - **Transport-layer truth**: SRR reads the actual HTTP method, host, path, and body — not agent-declared headers. An agent cannot lie about what URL it contacts
 
