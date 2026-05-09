@@ -138,11 +138,7 @@ fn scan_used_veth_slots() -> Result<HashSet<u32>> {
             Some((_, rest)) => rest.trim_start(),
             None => continue,
         };
-        let iface = after_idx
-            .split(|c: char| c == '@' || c == ':')
-            .next()
-            .unwrap_or("")
-            .trim();
+        let iface = after_idx.split(['@', ':']).next().unwrap_or("").trim();
         if let Some(n) = iface.strip_prefix("veth-gvm-h") {
             if let Ok(slot) = n.parse::<u32>() {
                 used.insert(slot);
@@ -1881,15 +1877,14 @@ pub fn cleanup_all_orphans_report() -> Result<CleanupReport> {
         if matches!(
             crate::heartbeat::parent_state(pid, crate::heartbeat::HEARTBEAT_STALE_THRESHOLD),
             crate::heartbeat::ParentState::Dead
-        ) {
-            if std::fs::remove_file(&path).is_ok() {
-                tracing::warn!(
-                    pid,
-                    path = %path.display(),
-                    "Removed orphan heartbeat lockfile (parent dead, no state file)"
-                );
-                cleaned += 1;
-            }
+        ) && std::fs::remove_file(&path).is_ok()
+        {
+            tracing::warn!(
+                pid,
+                path = %path.display(),
+                "Removed orphan heartbeat lockfile (parent dead, no state file)"
+            );
+            cleaned += 1;
         }
     }
 
