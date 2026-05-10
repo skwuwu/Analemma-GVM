@@ -38,11 +38,30 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 - **Audit Phase 5b — cross-rotation anchor recovery**: extend `scan_wal_for_recovery` to fall back to the highest-numbered `wal.log.<N>` segment when the active `wal.log` carries no anchor (rotation-then-shutdown corner case). Today recovery falls back to genesis in that window — true positive on the rule, false positive on the operator's situation.
 - **Audit Phase 4 — leaves-only checkpoint persistence**: snapshot the `CheckpointAggregator` `BTreeMap` to disk at shutdown (and periodically on a tokio timer), reload at `Ledger::with_config_and_signer` so `checkpoint_root` survives restart. Today the in-memory aggregator resets to empty on startup, leaving anchors with `checkpoint_root: None` until checkpoints re-register. Snapshot must itself hash into the next anchor (so a tampered snapshot file is detected at first batch).
 
+**v0.7 — Per-agent authorization with optional capability elevation**
+
+Today the SRR ruleset is global — every agent in one GVM runtime sees identical rules. JWT identity is verified and audit-logged but never participates in policy evaluation. v0.7 closes that gap so an operator can run several agents with different permissions inside one runtime, without paying the operational cost of one `gvm run --sandbox` per agent. The granularity boundary documented in [`docs/security-model.md`](../security-model.md) is preserved — this still operates at OS-process granularity, sub-agents inside one process remain a single identity by design.
+
+Three phases, each independently shippable:
+
+- **Phase 1 — per-agent rule scoping via JWT scope claim.** `NetworkRuleConfig` gains `required_scope: Option<String>`. The JWT `scope` field already exists in `Claims` (`src/auth.rs:86`) but is currently free-form and unchecked; v0.7 makes it authoritative. `srr.check` accepts the request's verified scope and skips rules whose `required_scope` does not match. Backward compatible: rules without `required_scope` fire for every agent, current behaviour preserved.
+- **Phase 2 — implicit capability elevation.** A new `[[implicit_elevation]]` rule shape lets the proxy auto-grant a higher scope when an agent's request matches a declarative policy (`agent_match` glob, `target_scope`, `max_per_hour` rate limit, optional `require_recent_human_session`). The agent's code is unchanged — the elevation is invisible to the agent and recorded in the WAL as a `gvm.auth.elevation_implicit` event for audit. Preserves the SDK-less thesis: agents make plain HTTP, proxy decides what they can do.
+- **Phase 3 — explicit elevation API.** `POST /gvm/token/elevate` for high-stakes scopes that require an audit-record reason and (optionally) human approval via the existing IC-3 mechanism. Returns a short-lived JWT bound to the requesting agent. This is the path operators take for `admin` / `production-write`-class scopes where the marginal SDK requirement (the agent must call `/gvm/token/elevate` first) is itself a security feature — the friction documents intent.
+
+Per-agent / per-tenant resource accounting (memory, request rate, token budget) ties into the same `agent_id` / `scope` axis so an operator can say "agents in scope `readonly` get 256 MB and 100 req/min; agents in scope `payments` get 1 GB and 1000 req/min." Implementation reuses the v1.1 cgroup parent slice (below) — each scope or agent_id maps to a sub-slice with its own caps.
+
 **v1.1 — Hardening**
 
 Performance + observability:
 - HashMap/Trie index for O(1) SRR host+method lookup (current path is linear scan; ~300µs at 1k rules per `tests/hostile.rs::srr_100_concurrent_checks`)
 - `Cow<'a, str>` in SRR normalize paths (avoid allocations on the no-normalization-needed common case)
+
+Resource limits + accounting:
+- **Proxy self-cap.** `gvm-proxy` currently has no internal memory ceiling — RSS is whatever steady-state demand drives it (~17 MB measured under sustained load, but no hard upper bound). Ship a `MemoryMax=512M` in the `packaging/systemd/gvm-cleanup.service` companion unit, plus an in-process advisory check that warns when RSS approaches a configured threshold. Operators who want stricter caps already have systemd / cgroup wrappers, but the default unit should fail-loud rather than silently grow.
+- **Aggregate sandbox cgroup parent slice.** Today each `gvm run --sandbox` creates a flat `/sys/fs/cgroup/gvm-agent-{pid}` cgroup ([`crates/gvm-sandbox/src/cgroup.rs:40`](../../crates/gvm-sandbox/src/cgroup.rs#L40)). Move under a parent slice (`gvm.slice/agent-{pid}`) so an operator can cap "all GVM-spawned sandboxes combined" via one `MemoryMax` on `gvm.slice/`. Required substrate for the per-agent / per-scope accounting in v0.7 (each scope can become its own parent slice — `gvm.slice/scope-readonly/agent-{pid}`).
+- **Default sane-cap toggle in CLI.** Currently `gvm run --sandbox` without `--memory` / `--cpus` is unlimited (Docker convention). Add `[sandbox] default_memory = "1g"`, `default_cpus = "1.0"` config keys that the CLI applies when the operator hasn't overridden — gives a less-experienced operator a safe default without breaking the no-arguments-needed quickstart.
+
+Audit + crypto:
 
 Audit + crypto:
 - **Vault Argon2id KDF** + versioned vault file format. Today `LocalKeyProvider` accepts a 32-byte raw key from `GVM_VAULT_KEY`; an operator who wants password-derived encryption (with brute-force cost) has no path. Tracked as `△-7` in [`COVERAGE_HARDENING_PLAN.md`](COVERAGE_HARDENING_PLAN.md). Co-implemented with the KMS path (below) — operators choosing KMS bypass KDF entirely.
