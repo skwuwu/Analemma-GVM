@@ -104,4 +104,16 @@ GVM governs what agents *do* (HTTP calls). LLM WAFs analyze what agents *say* (p
 
 ---
 
+## Granularity Boundary
+
+GVM enforces at the OS process / network namespace level. Practical implications for multi-agent designs:
+
+- **Strict permission separation between agents** → run them as **separate `gvm run --sandbox` invocations** (recommended). Each gets its own namespace, MITM CA, JWT identity, and audit attribution — these boundaries are structural, not cooperative.
+- **Single-instance multi-agent control via JWT scope** is **planned** (see roadmap in `docs/internal/CHANGELOG.md`). Multiple agents inside one GVM runtime get different permissions via the JWT `scope` claim plus rule-side `required_scope` matching. Same OS-process granularity applies.
+- **Sub-agents inside one agent process** (LangGraph nodes, AutoGen workers, CrewAI roles, async coroutines, threads) are **out of scope**. From GVM's view, they share one identity, one MITM CA, one namespace, one WAL `agent_id`. A `requests.get(...)` from any of them is indistinguishable on the wire. This is a direct consequence of the structural-not-behavioral design — boundaries that exist only in the orchestrator's code organization are unenforceable from outside that process. Self-declared sub-agent headers (`X-GVM-Sub-Agent: search`) are recorded as audit metadata but never used as enforcement input (header-forgery defense, see `docs/srr.md §3.12`).
+
+If two responsibilities need different permissions, give them different processes. See [`docs/security-model.md` "Granularity Boundary"](security-model.md#granularity-boundary--what-gvm-can-and-cannot-separate) for the full treatment.
+
+---
+
 [← Security Model](security-model.md) | [Overview →](overview.md)

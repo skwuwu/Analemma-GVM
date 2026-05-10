@@ -35,6 +35,22 @@ If an attacker has root access to the host, GVM — like any userspace process �
 
 ---
 
+## Granularity Boundary — What GVM Can and Cannot Separate
+
+GVM enforces at the **OS process / network namespace level**. Every governance primitive — per-sandbox MITM CA, per-sandbox `iptables FORWARD` chain, per-sandbox veth pair, JWT identity, WAL `agent_id` attribution — is scoped to one `gvm run --sandbox` invocation. Two such invocations get different namespaces, different CAs, different identities, and different routing — that is the boundary GVM was built to enforce.
+
+**What this means for multi-agent designs**:
+
+- **Strict permission separation between agents → run them as separate GVM instances (or separate `gvm run --sandbox` invocations within one instance).** This is the strongest recommendation. Each agent gets its own namespace, its own veth IP, its own MITM CA, its own JWT identity, its own audit-trail attribution. The cross-sandbox isolation discussed in [§3 Proxy Bypass via Direct HTTP](#3-proxy-bypass-via-direct-http) is what makes this separation structural rather than cooperative.
+
+- **Single-instance multi-agent control via JWT scope** — *planned*. Per-agent rule scoping inside a single GVM runtime is on the roadmap (see [`docs/internal/CHANGELOG.md`](internal/CHANGELOG.md) "Per-agent authorization with optional capability elevation"). The design uses the existing JWT `scope` claim plus rule-side `required_scope` filtering, with optional capability elevation flows for high-stakes operations. This addresses the case where an operator wants several agents inside one GVM runtime to carry different permissions without paying the operational cost of separate instances. **However, this only works at the OS-process granularity** — see the next bullet.
+
+- **Sub-agents within a single agent process are out of scope.** A common multi-agent framework pattern is one orchestrator process internally spawning "agents" as coroutines, threads, or framework-level abstractions (LangGraph nodes, AutoGen workers, CrewAI roles). From GVM's perspective, all of those are **one identity**: they share a PID/network/mount namespace, a JWT, an MITM CA, and a single `agent_id` in the WAL. A coroutine that calls `requests.get(...)` is indistinguishable on the wire from any other coroutine in the same process making the same call. GVM cannot enforce different permissions on them, and any header the orchestrator might set (e.g. `X-GVM-Sub-Agent: search-agent`) is recorded as audit metadata only — never as enforcement input, per the [§3.10 header-forgery defense in SRR](srr.md#310-header-forgery-defense). This is not a missing feature; it is a direct consequence of the [structural-not-behavioral](overview.md) design principle. Boundaries that exist only in the orchestrator's code organization — not at the OS level — are by definition unenforceable from outside that process.
+
+**Operator guidance**: if two responsibilities need different permissions, give them different processes. The orchestration overhead of running multiple `gvm run --sandbox` workers is the price of having structural enforcement between them, and it is the right price — internal-process boundaries are imaginary to the kernel and to GVM.
+
+---
+
 ## Known Adversarial Attack Vectors
 
 ### 1. Timing Side Channel
