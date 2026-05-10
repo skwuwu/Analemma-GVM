@@ -32,41 +32,56 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 
 **v0.6**
 - Anomaly detection (low-and-slow exfiltration — cumulative volume tracking)
-- WebSocket proxy support
-- Overlayfs periodic scan (long-running agents): tokio timer → scan_upper_layer() at interval
-- Overlayfs inotify-based real-time scan (event-driven alternative to periodic)
+- WebSocket proxy support — `gvm.operation::ws_upgrade` descriptor exists for audit logging, but the MITM relay does not yet handle the HTTP `Upgrade: websocket` handshake. v0.6 adds a real WS relay so SRR rules can govern WS connections and individual frames.
+- Overlayfs periodic scan (long-running agents): tokio timer → `scan_upper_layer()` at interval. The function exists in `crates/gvm-sandbox/src/filesystem.rs:68` but is only called once at sandbox exit; v0.6 wires a periodic invocation for agents that run for hours/days.
+- Overlayfs inotify-based real-time scan (event-driven alternative to the periodic scan)
 - **Audit Phase 5b — cross-rotation anchor recovery**: extend `scan_wal_for_recovery` to fall back to the highest-numbered `wal.log.<N>` segment when the active `wal.log` carries no anchor (rotation-then-shutdown corner case). Today recovery falls back to genesis in that window — true positive on the rule, false positive on the operator's situation.
 - **Audit Phase 4 — leaves-only checkpoint persistence**: snapshot the `CheckpointAggregator` `BTreeMap` to disk at shutdown (and periodically on a tokio timer), reload at `Ledger::with_config_and_signer` so `checkpoint_root` survives restart. Today the in-memory aggregator resets to empty on startup, leaving anchors with `checkpoint_root: None` until checkpoints re-register. Snapshot must itself hash into the next anchor (so a tampered snapshot file is detected at first batch).
 
 **v1.1 — Hardening**
-- SRR hot-path execution via Wasm engine
-- Ed25519 module signature verification + hash pinning
-- Decimal-based numeric comparison for financial precision
-- HashMap/Trie index for O(1) SRR host+method lookup
-- `Cow<'a, str>` in SRR normalize paths
-- File permission check on `secrets.toml`
-- HMAC-signed checkpoint step
-- Configurable `MAX_CHECKPOINT_SIZE` / `MAX_HISTORY_TURNS` per agent
-- **Audit Phase 6b — HSM-backed anchor signing**: implement `verify_anchor_signature` for the `AnchorSignature::Hsm` variant. Backends to evaluate: PKCS#11 (YubiHSM, CloudHSM), Vault Transit, AWS KMS asymmetric. Trait already in place (`AnchorSigner`); only the Hsm verify path returns "not implemented" today.
-- **Audit Phase 6c — RFC 3161 TSA attestation**: implement `AnchorSignature::Tsa` end-to-end (signing layer fetches a TimeStampToken from a configured TSA, verifier validates the token chain). This is the only attestation variant that defeats clock rewind; SelfSigned alone proves "GVM produced this anchor" but not "by this wall-clock time." Cost amortization pattern: every Nth anchor TSA-attested, every anchor SelfSigned.
+
+Performance + observability:
+- HashMap/Trie index for O(1) SRR host+method lookup (current path is linear scan; ~300µs at 1k rules per `tests/hostile.rs::srr_100_concurrent_checks`)
+- `Cow<'a, str>` in SRR normalize paths (avoid allocations on the no-normalization-needed common case)
+
+Audit + crypto:
+- **Vault Argon2id KDF** + versioned vault file format. Today `LocalKeyProvider` accepts a 32-byte raw key from `GVM_VAULT_KEY`; an operator who wants password-derived encryption (with brute-force cost) has no path. Tracked as `△-7` in [`COVERAGE_HARDENING_PLAN.md`](COVERAGE_HARDENING_PLAN.md). Co-implemented with the KMS path (below) — operators choosing KMS bypass KDF entirely.
+- KMS integration (AWS / GCP / PKCS#11). Trait abstraction (`KeyProvider`) is already in place (`src/vault.rs`); only `LocalKeyProvider` is implemented today. v1.1 adds at least one KMS provider impl plus operator docs for the production path.
+- HMAC-signed checkpoint step (current `register_agent_root` is unauthenticated; an attacker with `gvm-proxy` socket access could inject a checkpoint root).
+- Configurable `MAX_CHECKPOINT_SIZE` / `MAX_HISTORY_TURNS` per agent — currently constants in `crates/gvm-sandbox`; per-agent tuning lets operators give long-running analyst agents room without raising the cap globally.
+- **Audit Phase 6b — HSM-backed anchor signing**: implement `verify_anchor_signature` for the `AnchorSignature::Hsm` variant. Backends to evaluate: PKCS#11 (YubiHSM, CloudHSM), Vault Transit, AWS KMS asymmetric. Trait already in place (`AnchorSigner` in `src/sign.rs`); the enum variant is defined but the verify path returns `"HSM signature verification not implemented"` today.
+- **Audit Phase 6c — RFC 3161 TSA attestation**: implement `AnchorSignature::Tsa` end-to-end (signing layer fetches a TimeStampToken from a configured TSA, verifier validates the token chain). This is the only attestation variant that defeats clock rewind; `SelfSigned` alone proves "GVM produced this anchor" but not "by this wall-clock time." Cost amortization pattern: every Nth anchor TSA-attested, every anchor SelfSigned.
 - **Audit follow-up — `BatchSealRecord.checkpoint_root` integrity**: today the seal records the live aggregator root but NOT the per-leaf set, so a tampered checkpoint snapshot would change the root without leaving a witness in the WAL. Bind the leaf set hash (or a Merkle proof of the leaves) into the seal so the seal alone is sufficient to verify the aggregator state at seal time.
 
+Wasm (precondition for ever flipping `[features] default = ["wasm"]`):
+- SRR hot-path execution via Wasm engine + parity tests against the native engine.
+- Wasm module hash pinning + signature verification at load time. Tracked as `△-2` in [`COVERAGE_HARDENING_PLAN.md`](COVERAGE_HARDENING_PLAN.md). Wasm is currently disabled in the default build (`[features] default = []`), so the threat surface is empty in v0.5.3 and these mitigations are preconditions for activation rather than currently-missing defenses.
+
 **v2.0 — Runtime & Infrastructure**
-- Mandatory-by-default interception profile
-- macOS/Windows host-level interception fallback
-- NATS JetStream WAL publish, Redis Vault backend, Policy hot-reload (`SIGHUP`)
-- KMS integration (AWS/GCP), Redis VaultBackend, key rotation, KDF (Argon2id)
+- Mandatory-by-default interception profile (sandbox-mode default rather than cooperative-mode default)
+- macOS / Windows host-level interception fallback (today these platforms only get cooperative-mode HTTP_PROXY)
 - Proxy-controlled step numbers, full LLM response storage, incremental checkpoints
-- TypeScript/Node.js SDK, Go SDK
-- Prometheus metrics, Grafana dashboard
-- gRPC detection + passthrough, pluggable isolation backend (namespace/firecracker/docker)
+- gRPC detection + passthrough, pluggable isolation backend (namespace / firecracker / docker)
 
 **v3.0 — Platform**
 - Generic outbound capability governance (filesystem, shell, database)
-- Protocol expansion (WebSocket, gRPC method-level, SMTP)
+- Protocol expansion (gRPC method-level governance, SMTP)
 - Cross-agent collusion detection, trust delegation, inter-agent governance
   (within a single GVM runtime — see "Deployment model" above)
 - Envoy filter mode, OPA compatibility layer, SOC 2 / ISO 27001
+
+---
+
+**Removed from this roadmap on 2026-05-10** (implemented or scope-changed):
+
+- *v1.1 Decimal-based numeric comparison for financial precision* — code review during the `△-11` hardening pass found the cap comparison was already exact `u64` (millionths fixed-point); the only `f64` step was at the input boundary, fixed by switching truncate→round-to-nearest plus adding `record_millionths` for callers with integer input. No drift in realistic per-call cost ranges; sub-millionth-per-call inputs use the integer API. See `tests/budget_precision.rs`.
+- *v1.1 File permission check on `secrets.toml`* — implemented in `src/api_keys.rs` and `src/config.rs`. Both check `meta.permissions().mode() & 0o077` and auto-fix to `0600` with a `tracing::warn!` when group/other bits are set.
+- *v2.0 NATS JetStream WAL publish, Redis Vault backend* — direction changed in commit `f3d274c` (`refactor(ledger): remove NATS/Redis ghost integrations`). The runtime no longer ships built-in publish/storage integrations; off-host audit replication and remote vault backends are operator-managed via the WAL file (rsync / fluentd / vector / S3 tail) and the `KeyProvider` trait. See [`docs/architecture/ledger.md §4.1`](../architecture/ledger.md#41-overview).
+- *v2.0 Policy hot-reload via `SIGHUP`* — `POST /gvm/reload` on the admin port already provides atomic SRR hot-reload with validate-then-swap semantics. SIGHUP would be an additional trigger for operators who prefer signal-based control; the lack of urgency moved this off the active roadmap. Not categorically excluded — re-add if operator demand surfaces.
+- *v2.0 TypeScript / Node.js SDK, Go SDK* — sdk-less pivot in commit `0df121a`. The whole Python SDK was removed and the `docs/quickstart.md` rewrite explicitly states "no Python SDK to import, no decorator to add, no client library to wrap your code." Sandbox mode + cooperative-mode `HTTP_PROXY` cover every HTTP-speaking agent without language-specific bindings.
+- *v2.0 Prometheus metrics, Grafana dashboard* — explicitly out of scope per [`docs/internal/CLAUDE.md`](../../CLAUDE.md) Observability section: "Application metrics and agent internals are out of scope — use Prometheus and application-level tooling for those." GVM exposes governance decisions / cost / audit via the WAL + CLI; infrastructure metrics are the operator's existing stack.
+- *v3.0 Protocol expansion item "WebSocket"* — already covered as a v0.6 line item (basic proxy support); v3.0's protocol-expansion entry now reads "(gRPC method-level governance, SMTP)" without the duplicate WebSocket bullet.
+- *v2.0 KMS / Argon2id KDF entry* — consolidated with the v1.1 Vault hardening item above (KMS path + `△-7` KDF). Was redundantly listed in two phases; one canonical home is enough.
 
 ---
 
