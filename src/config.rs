@@ -527,11 +527,108 @@ pub struct ServerConfig {
     /// This prevents a sandboxed agent from self-approving IC-3 requests.
     #[serde(default = "default_admin_listen")]
     pub admin_listen: String,
+    /// Permit binding `admin_listen` to a non-loopback address.
+    ///
+    /// **Default: `false` (fail-close).** The admin port carries
+    /// privileged endpoints — IC-3 approval, SRR hot-reload, sandbox
+    /// launch — and the security model assumes only the operator's
+    /// shell on the same host (or a trusted operator process) can
+    /// reach them. If the operator binds `admin_listen` to a public
+    /// address (`0.0.0.0`, a routable IP, the IPv6 wildcard `[::]`)
+    /// without flipping this flag, the proxy refuses to start with a
+    /// clear error rather than silently exposing the admin surface
+    /// to anyone who can reach the port.
+    ///
+    /// Setting this to `true` is an explicit operator opt-in for
+    /// deployments that front the admin port with their own
+    /// authentication layer (mTLS terminator, VPN, IAP). The proxy
+    /// emits a startup `WARN` line so the choice is visible in logs.
+    /// Until [Phase △-8b follow-up](../docs/internal/COVERAGE_HARDENING_PLAN.md#-8b)
+    /// lands mTLS verification in the proxy itself, the operator owns
+    /// the trust boundary above this line.
+    #[serde(default)]
+    pub allow_non_loopback_admin: bool,
     /// Graceful shutdown drain timeout in seconds (default: 5).
     /// After receiving SIGTERM/SIGINT, the proxy stops accepting new connections
     /// and waits up to this many seconds for in-flight requests to complete.
     #[serde(default = "default_drain_timeout_secs")]
     pub drain_timeout_secs: u64,
+}
+
+impl ServerConfig {
+    /// Result of `enforce_admin_loopback_policy`.
+    pub fn admin_bind_acceptable(&self) -> std::result::Result<AdminBindCheck, String> {
+        admin_bind_check(&self.admin_listen, self.allow_non_loopback_admin)
+    }
+}
+
+/// Outcome of admin-bind validation. Distinguishes the three states
+/// the operator might end up in:
+/// - `Loopback` — bound to 127.0.0.1 / ::1 / localhost. Default,
+///   safe, no message needed.
+/// - `NonLoopbackAllowed` — non-loopback bind explicitly opted in
+///   via `allow_non_loopback_admin = true`. Caller emits a `WARN`
+///   so the choice shows up in startup logs.
+/// - the `Err` arm of `admin_bind_check` (refused) carries a human
+///   message suitable for `bail!`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdminBindCheck {
+    Loopback,
+    NonLoopbackAllowed { addr: String },
+}
+
+fn admin_bind_check(
+    admin_listen: &str,
+    allow_non_loopback: bool,
+) -> std::result::Result<AdminBindCheck, String> {
+    use std::net::ToSocketAddrs;
+
+    let addrs: Vec<std::net::SocketAddr> = match admin_listen.to_socket_addrs() {
+        Ok(it) => it.collect(),
+        Err(e) => {
+            return Err(format!(
+                "admin_listen \"{admin_listen}\" is not a parseable socket address: {e}"
+            ));
+        }
+    };
+    if addrs.is_empty() {
+        return Err(format!(
+            "admin_listen \"{admin_listen}\" resolved to no addresses"
+        ));
+    }
+
+    // If EVERY resolved IP is loopback, accept unconditionally.
+    // The "any" check intentionally — DNS may give a mixed
+    // (loopback + non-loopback) result for `localhost` on
+    // mis-configured hosts; in that mixed case we treat the bind as
+    // non-loopback because the proxy will end up listening on the
+    // first one that succeeds, which could be the public-facing
+    // address.
+    let all_loopback = addrs.iter().all(|a| a.ip().is_loopback());
+    if all_loopback {
+        return Ok(AdminBindCheck::Loopback);
+    }
+
+    if allow_non_loopback {
+        return Ok(AdminBindCheck::NonLoopbackAllowed {
+            addr: admin_listen.to_string(),
+        });
+    }
+
+    Err(format!(
+        "admin_listen \"{admin_listen}\" resolves to a non-loopback address \
+         ({}). The admin port carries privileged endpoints (IC-3 approval, \
+         SRR hot-reload, sandbox launch); binding it to a public address \
+         exposes those endpoints to anyone who can reach the port. \
+         If this is intentional (you're fronting the admin port with mTLS, \
+         VPN, or IAP), set [server] allow_non_loopback_admin = true in \
+         proxy.toml. Otherwise, bind admin_listen to 127.0.0.1 or [::1].",
+        addrs
+            .iter()
+            .map(|a| a.ip().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 fn default_admin_listen() -> String {
@@ -776,6 +873,7 @@ impl Default for ProxyConfig {
             server: ServerConfig {
                 listen: "0.0.0.0:8080".to_string(),
                 admin_listen: default_admin_listen(),
+                allow_non_loopback_admin: false,
                 drain_timeout_secs: 5,
             },
             enforcement: EnforcementConfig {

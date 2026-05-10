@@ -762,6 +762,34 @@ async fn main() {
     tracing::info!(address = %config.server.listen, "GVM Proxy listening (HTTP)");
 
     // 12.5. Start admin API listener on a separate port (not reachable by agent)
+    //
+    // Pre-flight: refuse to bind the privileged admin port to a
+    // non-loopback address unless the operator explicitly opted in
+    // via `[server] allow_non_loopback_admin = true`. The admin port
+    // carries IC-3 approval / SRR reload / sandbox launch — silently
+    // exposing it to a routable interface is the kind of misconfig
+    // that turns into a CVE.
+    match config.server.admin_bind_acceptable() {
+        Ok(gvm_proxy::config::AdminBindCheck::Loopback) => {
+            // Default, expected, no log line.
+        }
+        Ok(gvm_proxy::config::AdminBindCheck::NonLoopbackAllowed { ref addr }) => {
+            tracing::warn!(
+                address = %addr,
+                "GVM Admin API bound to a non-loopback address — \
+                 allow_non_loopback_admin = true is set. The operator is \
+                 responsible for the trust boundary above this port \
+                 (mTLS terminator, VPN, IAP, etc.)."
+            );
+        }
+        Err(msg) => {
+            eprintln!();
+            eprintln!("  ERROR: {msg}");
+            eprintln!();
+            tracing::error!(error = %msg, "Refusing to start: admin port bind policy violation");
+            std::process::exit(1);
+        }
+    }
     let admin_addr = config.server.admin_listen.clone();
     tokio::spawn(async move {
         match tokio::net::TcpListener::bind(&admin_addr).await {

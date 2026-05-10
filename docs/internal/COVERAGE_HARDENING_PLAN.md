@@ -208,7 +208,14 @@ to "production-ready"; fuzz target updated to include KDF inputs.
 
 ---
 
-## △-8b — Token issuance endpoint unauth (security-model.md §8b)
+## △-8b — Token issuance endpoint unauth (security-model.md §8b) — **CLOSED 2026-05-10**
+
+**Status: ✓ CLOSED.** `[server] allow_non_loopback_admin = false` is the
+default; non-loopback `admin_listen` (`0.0.0.0`, `[::]`, RFC 1918 LAN
+addresses) refuses to start with a clear error message. Operator can
+opt in for deployments fronting the admin port with mTLS / VPN / IAP.
+Validation lives in `src/config.rs::admin_bind_check`; pinned by
+`tests/admin_port_loopback_only.rs` (9 tests).
 
 **What's tested today**
 
@@ -299,7 +306,26 @@ defense-in-depth".
 
 ---
 
-## △-11 — Numeric precision in policy (security-model.md §11)
+## △-11 — Numeric precision in policy (security-model.md §11) — **CLOSED 2026-05-10**
+
+**Status: ✓ CLOSED.** Audit traced the path and found the
+accumulation slot is already `AtomicU64` (millionths fixed-point) —
+exact integer arithmetic. The only f64 hop was at
+`record(tokens, cost_usd: f64)` where `cost_usd * 1e6 as u64`
+**truncated**, biasing drift downward by up to 1 millionth per call.
+Two changes:
+1. Truncate → **round-to-nearest** in `record`, plus rejection of
+   non-finite / negative inputs (return-zero fail-closed).
+2. New `record_millionths(tokens: u64, cost_millionths: u64)` for
+   callers that already have an integer-millionths cost — bypasses
+   f64 entirely, exact end-to-end.
+
+Pinned by `tests/budget_precision.rs` (7 tests): exact-millionth
+records bit-exact; round-to-nearest unbiased; sub-millionth-per-call
+cost documented as the case `record_millionths` exists for; mixing
+the two APIs composes exactly. Original plan's "decimal-based
+comparison roadmap" was a misdiagnosis — comparison was always
+exact; the lossy step was the input boundary.
 
 **What's tested today**
 

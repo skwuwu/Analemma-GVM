@@ -221,7 +221,36 @@ impl TokenBudget {
     }
 
     /// Record actual token usage after LLM response. Releases reservation.
+    ///
+    /// `cost_usd` is converted to integer millionths (1 USD = 1e6
+    /// millionths) and atomically added to the current minute slot.
+    /// The accumulation path is exact u64 arithmetic; the only
+    /// precision loss is at the f64 → u64 conversion, where the
+    /// `cost_usd * 1e6` product is **rounded to the nearest** integer
+    /// rather than truncated. Earlier code truncated, which biased
+    /// the drift downward by up to 1 millionth per record (≈ $1
+    /// over 1M calls). Round-to-nearest is unbiased — expected drift
+    /// is 0 with a per-call magnitude of at most 0.5 millionth — so
+    /// the budget cap remains an honest ceiling under sustained
+    /// load. See `tests/budget_precision.rs` for the regression pin.
+    ///
+    /// Callers that already have an integer-millionths cost should
+    /// use [`Self::record_millionths`] to skip the f64 hop entirely.
     pub fn record(&self, tokens: u64, cost_usd: f64) {
+        let cost_millionths = if cost_usd.is_finite() && cost_usd >= 0.0 {
+            (cost_usd * 1_000_000.0).round() as u64
+        } else {
+            0
+        };
+        self.record_millionths(tokens, cost_millionths);
+    }
+
+    /// Record actual token usage with the cost expressed in
+    /// integer millionths of USD. Skips the f64 boundary entirely —
+    /// arithmetic is exact end-to-end. Prefer this over `record`
+    /// when you already have a fixed-point cost (e.g., when the
+    /// rate card is encoded as millionths-per-token upstream).
+    pub fn record_millionths(&self, tokens: u64, cost_millionths: u64) {
         // Release reservation. Must be a single atomic op — the prior
         // `load(); store(prev - reserve)` pattern lost decrements
         // under real CPU-parallel contention (verified at 47,400-token
@@ -235,7 +264,6 @@ impl TokenBudget {
         self.rotate_if_needed();
         let idx = self.current_minute.load(Ordering::Relaxed) as usize % SLOTS;
         self.slots[idx].tokens.fetch_add(tokens, Ordering::Relaxed);
-        let cost_millionths = (cost_usd * 1_000_000.0) as u64;
         self.slots[idx]
             .cost_millionths
             .fetch_add(cost_millionths, Ordering::Relaxed);
