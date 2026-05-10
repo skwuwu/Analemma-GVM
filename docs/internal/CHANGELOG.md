@@ -68,7 +68,11 @@ Wasm (precondition for ever flipping `[features] default = ["wasm"]`):
 - Protocol expansion (gRPC method-level governance, SMTP)
 - Cross-agent collusion detection, trust delegation, inter-agent governance
   (within a single GVM runtime — see "Deployment model" above)
-- Envoy filter mode, OPA compatibility layer, SOC 2 / ISO 27001
+- **Compliance support**: concrete deliverables that help operators pursue SOC 2 / ISO 27001 / similar audits. Not pursuit of certification *for GVM* (that's organizational, not a feature):
+  - `gvm compliance export --framework soc2 --period 90d` — structured evidence bundle (WAL excerpt with anchor signatures, config-integrity-context chain, IC-3 approval log) suitable as primary or compensating evidence for CC6.1 (Logical Access), CC7.2 (Monitor Activity), CC9.1 (Boundary Protection).
+  - Documented control mappings — one-time docs effort cross-referencing SOC 2 Trust Service Criteria + ISO 27001 Annex A controls (A.8.16, A.8.32, A.8.34) against the proxy features that satisfy them. Lets an audit team check off boxes without reverse-engineering the WAL schema.
+  - Retention policy enforcement surfaced explicitly — WAL rotation parameters are already configurable; v3.0 adds a `[compliance] retention_days` field that ties WAL retention + checkpoint persistence to a policy-stated retention window with auto-pruning.
+  - Tamper-evident audit chain export with offline verifier — operator hands the auditor a single `.gvm-evidence` file + a static verifier binary; auditor reproduces the merkle/anchor verification with no GVM runtime needed.
 
 ---
 
@@ -82,6 +86,9 @@ Wasm (precondition for ever flipping `[features] default = ["wasm"]`):
 - *v2.0 Prometheus metrics, Grafana dashboard* — explicitly out of scope per [`docs/internal/CLAUDE.md`](../../CLAUDE.md) Observability section: "Application metrics and agent internals are out of scope — use Prometheus and application-level tooling for those." GVM exposes governance decisions / cost / audit via the WAL + CLI; infrastructure metrics are the operator's existing stack.
 - *v3.0 Protocol expansion item "WebSocket"* — already covered as a v0.6 line item (basic proxy support); v3.0's protocol-expansion entry now reads "(gRPC method-level governance, SMTP)" without the duplicate WebSocket bullet.
 - *v2.0 KMS / Argon2id KDF entry* — consolidated with the v1.1 Vault hardening item above (KMS path + `△-7` KDF). Was redundantly listed in two phases; one canonical home is enough.
+- *v3.0 "Envoy filter mode"* — contradicted the project's positioning. README §1 explicitly cites OPA+Envoy as "existing answers I wanted a lightweight alternative to," and `docs/security-layers.md` puts service-to-service authorization (Envoy's domain) and AI agent governance (GVM's domain) in different rows. Building GVM as an Envoy filter would (a) require operators to run Envoy, contradicting the "no Kubernetes / no service mesh" pitch, (b) duplicate Envoy's own ext_authz + RBAC + rate-limit primitives, (c) maintain a second codebase against the Envoy filter ABI. No upside that justifies any of those costs.
+- *v3.0 "OPA compatibility layer"* — same family of contradictions. SRR is intentionally narrow (URL/method/payload patterns + time-window) and that narrowness IS the security model — Rego-style arbitrary expression evaluation expands the attack surface and weakens the header-forgery defense in security-model.md §3.10. OPA users' Rego policies are mostly RBAC + JWT-claim shaped (service-to-service authz), and don't translate to agent governance shape — there is no migration path that meaningfully reuses an existing Rego policy file. If interoperability with the OPA ecosystem becomes useful later, the right shape is **one-way export** (`gvm srr export --format rego` so OPA-shaped tooling can read GVM's rules read-only) rather than acceptance of arbitrary Rego on the input side.
+- *v3.0 "SOC 2 / ISO 27001"* (vague certification line) — replaced with a concrete "Compliance support" sub-section listing actionable deliverables (evidence export CLI, documented control mappings, retention enforcement, offline tamper-evident verifier). GVM-the-software doesn't pursue an organizational certification; what it can ship is the artifacts that help an *operator's* deployment pursue one.
 
 ---
 
