@@ -379,6 +379,13 @@ pub use network::CleanupReport;
 #[cfg(target_os = "linux")]
 pub use network::lookup_sandbox_id_by_ip;
 
+/// Veth pair configuration. Re-exported so external tests can exercise
+/// the slot allocator (`VethConfig::new`) — needed by
+/// `tests/veth_slot_collision.rs`'s concurrent-allocator regression
+/// pin. Production callers stay inside the crate.
+#[cfg(target_os = "linux")]
+pub use network::VethConfig;
+
 /// Docker bridge iptables integration for `--contained` mode.
 #[cfg(target_os = "linux")]
 pub use network::{
