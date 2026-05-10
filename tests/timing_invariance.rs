@@ -57,6 +57,24 @@ const CROSS_RULE_MEDIAN_BOUND: f64 = 3.0;
 /// the URL doesn't tell the attacker which sub-path took.
 const WITHIN_RULE_MEDIAN_BOUND: f64 = 1.6;
 
+/// Absolute-time ceiling for the largest cross-scenario median
+/// **delta**, in nanoseconds. The point of measuring this in
+/// absolute time rather than as a ratio is to evaluate the
+/// **network-exploitability** of the leak. The TCP RTT jitter
+/// floor on a typical loopback is ~50 µs (50,000 ns), and on a
+/// LAN ~500 µs. A timing delta below the jitter floor is
+/// statistically invisible to a remote attacker — they would
+/// need ~10⁶ samples to average it out, and the token-budget cap
+/// (60 slots × 1 hr) rate-limits them long before that.
+///
+/// 5 µs (5000 ns) is a conservative ceiling: even on the slowest
+/// CI runner the entire SRR hot path completes in under 5 µs per
+/// call, so a leak above this would imply the policy engine is
+/// fundamentally too slow regardless of side-channel concerns.
+/// In practice on modern hardware the cross-scenario delta is
+/// 1-2 µs (see test diagnostics).
+const ABSOLUTE_DELTA_CEILING_NS: u128 = 5_000;
+
 /// How many timed iterations per scenario. Higher is more
 /// statistically stable; lower keeps CI fast. 10_000 with single-
 /// digit microsecond per-call cost gives ~50ms total per scenario,
@@ -288,6 +306,28 @@ fn srr_timing_is_input_invariant_within_bound() {
          See test diagnostics above.",
         within_ratio,
         WITHIN_RULE_MEDIAN_BOUND
+    );
+
+    // Invariant 3: ABSOLUTE-time delta — the spread between the
+    // fastest and slowest scenario medians stays under
+    // `ABSOLUTE_DELTA_CEILING_NS`. This is the network-
+    // exploitability check: any leak below the TCP RTT jitter
+    // floor (~50 µs loopback, ~500 µs LAN) is statistically
+    // invisible to a remote attacker, regardless of how the
+    // ratio reads. The ratio invariants above are
+    // regression-detection scaffolding; this absolute-time
+    // bound is the operational guarantee the threat model
+    // actually depends on.
+    let min_med = measured.iter().map(|s| s.2).min().unwrap();
+    let max_med = measured.iter().map(|s| s.2).max().unwrap();
+    let absolute_delta_ns = max_med - min_med;
+    assert!(
+        absolute_delta_ns < ABSOLUTE_DELTA_CEILING_NS,
+        "absolute cross-scenario median delta {absolute_delta_ns} ns exceeds the \
+         {ABSOLUTE_DELTA_CEILING_NS} ns ceiling — even the slowest scenario should \
+         complete with a delta below the network jitter floor (~50 µs loopback, \
+         ~500 µs LAN). A delta this large suggests the policy engine has acquired \
+         a synchronous I/O step or unintended allocation. See diagnostics above."
     );
 }
 

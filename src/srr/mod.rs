@@ -1074,18 +1074,32 @@ fn parse_decision(cfg: &NetworkDecisionConfig) -> Result<EnforcementDecision> {
 /// false positive blocks a benign query, which is the right
 /// direction for security.
 ///
-/// **Phase 1 limitations** (acceptable for the documented threat
+/// **Phase 1 → Phase 2 evolution**: the original Phase 1 scan
+/// flagged any identifier matching the protected list anywhere in
+/// the (scrubbed) query. That was conservative-correct — no false
+/// negatives — but produced false positives when the protected
+/// name appeared as an argument name (`mutation { x(transferFunds: 1) }`)
+/// or a directive argument. Phase 2 (this implementation, △-10
+/// follow-up) tracks structural state during the walk so identifiers
+/// inside argument lists `(...)` and directive blocks `@name(...)`
+/// are skipped — they cannot be selection field names by the
+/// GraphQL grammar. False-negative resistance is preserved (every
+/// genuine selection field name is still scanned); false-positive
+/// rate drops materially on real-world queries that share argument
+/// names with mutation names.
+///
+/// **Phase 2 limitations** (acceptable for the documented threat
 /// model, tracked in `COVERAGE_HARDENING_PLAN.md △-10`):
 ///
-/// - No GraphQL fragment expansion. A mutation invocation hidden
-///   inside a fragment definition that is later spread into the
-///   selection set is not detected by this scan. Phase 2's full
-///   GraphQL parser closes that gap.
-/// - No directive-stripping; directives like `@skip(if: $x)` are
-///   left in the input but their argument names cannot collide
-///   with our configured mutation names because GraphQL
-///   directive names use `@` as a sigil.
-/// - Identifier matching is case-sensitive (matches GraphQL spec).
+/// - **Fragment definitions are scanned identically to operation
+///   bodies**. A protected name inside `fragment Foo on T { ... }`
+///   is detected — which means a fragment that defines an aliased
+///   protected invocation, then is spread into the operation, is
+///   caught. Distinguishing fragment-body selections from operation
+///   selections (refining false-positive rate further) requires a
+///   real GraphQL parser; tracked as a v0.7 line item.
+/// - **Identifier matching is case-sensitive** (matches GraphQL
+///   spec).
 pub fn scan_graphql_query_for_invocation(query: &str, names: &[String]) -> bool {
     if names.is_empty() {
         return false;
@@ -1096,25 +1110,67 @@ pub fn scan_graphql_query_for_invocation(query: &str, names: &[String]) -> bool 
     // request and the SRR engine documents <1µs hot path budget.
     use std::collections::HashSet;
     let target: HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
-    // Walk identifiers in the scrubbed input. An identifier is a
-    // maximal run of [_A-Za-z0-9] starting with [_A-Za-z]. Anything
-    // else is a separator.
     let bytes = scrubbed.as_bytes();
     let mut i = 0;
+    // Argument-list nesting depth. `>0` means we're inside `(...)`.
+    // Identifiers inside argument lists are GraphQL argument names
+    // or scalar values, never selection field names — skip them
+    // for matching purposes, so e.g.
+    //   mutation { wrapper(transferFunds: 1) { id } }
+    // does NOT trip the scan on `transferFunds` here (it's an
+    // argument name on `wrapper`, not an invocation).
+    let mut paren_depth: u32 = 0;
+    // Directive-context flag. After an `@`, we treat the following
+    // identifier as a directive name (skipped) and any subsequent
+    // `(...)` argument list as directive arguments (also skipped).
+    // The flag clears once we leave the directive's argument list
+    // or hit a non-`@` separator that isn't part of the directive.
+    let mut in_directive_name = false;
     while i < bytes.len() {
         let b = bytes[i];
-        let is_id_start = b == b'_' || b.is_ascii_alphabetic();
-        if !is_id_start {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < bytes.len() && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric()) {
-            i += 1;
-        }
-        let ident = &scrubbed[start..i];
-        if target.contains(ident) {
-            return true;
+        match b {
+            b'(' => {
+                paren_depth = paren_depth.saturating_add(1);
+                in_directive_name = false;
+                i += 1;
+            }
+            b')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                in_directive_name = false;
+                i += 1;
+            }
+            b'@' => {
+                in_directive_name = true;
+                i += 1;
+            }
+            b if b == b'_' || b.is_ascii_alphabetic() => {
+                // Identifier. Read its full span, then decide whether
+                // to treat it as a candidate selection field name.
+                let start = i;
+                while i < bytes.len() && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric()) {
+                    i += 1;
+                }
+                let ident = &scrubbed[start..i];
+                let in_args = paren_depth > 0;
+                let was_directive = in_directive_name;
+                in_directive_name = false; // identifier consumes the directive flag
+                                           // Skip identifiers that are:
+                                           //   - Inside an argument list (arg names / scalar values)
+                                           //   - The name immediately following `@` (directive name)
+                if in_args || was_directive {
+                    continue;
+                }
+                if target.contains(ident) {
+                    return true;
+                }
+            }
+            _ => {
+                // Any other separator. Most don't need to clear
+                // `in_directive_name` (e.g. whitespace right after
+                // `@` is fine). The directive flag is cleared by
+                // the next identifier or `(`.
+                i += 1;
+            }
         }
     }
     false

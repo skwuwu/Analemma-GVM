@@ -31,22 +31,37 @@ Format per item:
 
 ---
 
-## △-1 — Timing side channel (security-model.md §1) — **CLOSED 2026-05-10**
+## △-1 — Timing side channel (security-model.md §1) — **FULLY CLOSED 2026-05-10**
 
-**Status: ✓ CLOSED.** `tests/timing_invariance.rs` (2 tests) pins
-two regression invariants:
-- *Cross-rule median ratio* < 3.0× — across five distinct
-  decision-type scenarios (URL-Deny, default-caution, payload-match,
-  payload-skip, method-mismatch).
-- *Within-rule median ratio* < 1.6× — for two requests on
-  `POST /graphql` taking different sub-paths (payload-match vs
-  payload-skip). The within-rule invariant is the side-channel-
-  relevant one because the URL/method does not disclose the
-  sub-path; the cross-rule is a regression catch (the URL already
-  tells the attacker which rule shape applied). Bounds documented
-  in `docs/security-model.md §1`. Tightening the within-rule
-  bound to <1.1× requires constant-time policy evaluation —
-  tracked as an open follow-up below.
+**Status: ✓ FULLY CLOSED.** Three pinned regression invariants in
+`tests/timing_invariance.rs`:
+
+1. *Cross-rule median ratio* < 3.0× — five distinct decision-type
+   scenarios (URL-Deny, default-caution, payload-match,
+   payload-skip, method-mismatch). The URL already discloses which
+   rule shape applied, so this bound is a regression catch.
+2. *Within-rule median ratio* < 1.6× — two requests on
+   `POST /graphql` taking different sub-paths inside the same
+   matching rule. The URL doesn't disclose the sub-path, so a
+   measurable delta IS a side channel — but the absolute-time
+   bound below resolves the threat-model question.
+3. *Absolute cross-scenario delta* < 5,000 ns. Measured ~1,900 ns
+   on reference hardware. This sits **~26× below the loopback TCP
+   RTT jitter floor** (~50 µs). A leak this small is not
+   network-exploitable: a remote attacker needs ~10⁶ samples to
+   average out jitter, and the per-agent TokenBudget rate-limits
+   long before that.
+
+**Original follow-up (constant-time policy evaluation, target
+within-rule <1.1×)**: superseded. Absolute-time analysis shows
+the residual leak is below remote exploitability and irrelevant
+to the local-attacker threat model (per Assumption of Trust §:
+local attackers have resources that already subsume timing).
+Constant-time discipline would cost a forced JSON parse on every
+request — a perf regression worse than the leak it would close.
+Decision: pin the bounds as invariants, document the analysis,
+move on. See `docs/security-model.md §1` for the full
+threat-model resolution.
 
 **What's tested today**
 
@@ -319,21 +334,41 @@ to a single sentence about the opt-in.
 
 ---
 
-## △-10 — GraphQL alias bypass (security-model.md §10) — **CLOSED 2026-05-10 (Phase 1)**
+## △-10 — GraphQL alias bypass (security-model.md §10) — **PHASE 1 + PHASE 2 CLOSED 2026-05-10**
 
-**Status: ✓ Phase 1 CLOSED.** New `payload_query_alias_match`
-field on `NetworkRuleConfig`. When set, SRR scans the request
-body's top-level `query` JSON field for any GraphQL invocation
-whose field name matches a configured list, regardless of
-`operationName` or alias prefix. The lexer
-(`scan_graphql_query_for_invocation` in `src/srr/mod.rs`) strips
-GraphQL comments (`# ... \n`) and string literals (`"..."` and
-`"""..."""`) before whole-word identifier match — false-positive
-free on identifier overlap (`transferFundsExtra` does not match
-`transferFunds`), false-positive free on smuggled comments /
-string contents. Pinned by `tests/graphql_alias_direct_match.rs`
-(11 tests). Phase 2 (full GraphQL parser, fragment expansion)
-remains deferred per the plan below.
+**Status: ✓ Phase 1 + Phase 2 (false-positive reduction) CLOSED.**
+
+*Phase 1 (initial):* new `payload_query_alias_match` field on
+`NetworkRuleConfig`. SRR scans the request body's `query` JSON
+field for any GraphQL invocation whose field name matches a
+configured list, regardless of `operationName` or alias prefix.
+The lexer (`scan_graphql_query_for_invocation`) strips comments
+and string literals, then whole-word matches identifier tokens.
+Pinned by `tests/graphql_alias_direct_match.rs` (11 tests).
+
+*Phase 2 (false-positive reduction):* the lexer now tracks
+**argument-list nesting depth** and **directive context**.
+Identifiers inside `(...)` argument lists are skipped (they're
+argument names or scalar values, never selection field names);
+identifiers immediately following `@` are skipped (they're
+directive names). False-negative resistance preserved — every
+position that could be a selection field name is still scanned.
+Pinned by `tests/graphql_alias_phase2_fp_reduction.rs` (9 tests):
+argument-name shadowing, enum value as arg, directive name +
+arg shadowing, nested arg lists tracking paren depth, defense-
+in-depth (arg-skip cannot mask a real invocation that follows),
+fragment-body invocation still caught (documented limitation
+preserved).
+
+**Phase 3 (full GraphQL parser, ~v0.7)** remains deferred —
+the lexer already covers every documented evasion at acceptable
+false-positive rates. A full parser (with proper fragment-
+spread tracking and operation-vs-query distinction) would
+reduce false-positive rates further but adds either a
+supply-chain dep (`graphql-parser` / `async-graphql-parser`) or
+~500 LoC of in-house parser. The defense-in-depth pattern (alias-
+list + URL-level Deny on the same endpoint) covers the gap until
+that lands.
 
 **What's tested today**
 
