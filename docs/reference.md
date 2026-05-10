@@ -278,14 +278,14 @@ Watch mode generates a temporary allow-all SRR config in the OS temp directory a
 ### Agent Execution
 
 ```bash
-gvm run agent.py                       # Basic
-gvm run --agent-id custom-id agent.py  # Custom audit identity
-gvm run -i agent.py                    # Interactive: suggest rules after run
-gvm run --sandbox agent.py             # Linux namespace + seccomp + MITM (recommended for production)
+gvm run agent.py                            # Basic (cooperative, no sudo)
+gvm run --agent-id custom-id agent.py       # Custom audit identity
+gvm run -i agent.py                         # Interactive: suggest rules after run
+sudo gvm run --sandbox agent.py             # Linux namespace + seccomp + MITM (recommended for production; root required)
 
 # Binary mode: run any command through GVM proxy
-gvm run -- openclaw gateway            # Arbitrary binary + args
-gvm run --sandbox -- openclaw gateway  # Binary in Linux sandbox
+gvm run -- openclaw gateway                 # Arbitrary binary + args (cooperative)
+sudo gvm run --sandbox -- openclaw gateway  # Binary in Linux sandbox
 ```
 
 > **`--contained` (Docker isolation)** is gated behind
@@ -482,7 +482,7 @@ Two filesystem modes for sandbox:
 
 **Legacy mode** (default — no `--fs-governance`):
 ```bash
-gvm run --sandbox agent.py
+sudo gvm run --sandbox agent.py
 ```
 - Agent can only write to `workspace/output/` directory
 - All other paths are read-only
@@ -491,7 +491,7 @@ gvm run --sandbox agent.py
 
 **Governance mode** (`--fs-governance`):
 ```bash
-gvm run --sandbox --fs-governance agent.py
+sudo gvm run --sandbox --fs-governance agent.py
 ```
 - Agent can write anywhere in workspace (overlayfs copy-on-write)
 - Writes are captured in an overlay layer, not applied directly

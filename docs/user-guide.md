@@ -5,21 +5,38 @@
 You don't need to write rules. GVM learns from your agent's traffic and suggests them.
 
 ```bash
-# 1. Watch — see what your agent calls (no rules needed)
-gvm watch my_agent.py
+# 1. Watch — see what your agent calls (no rules, nothing blocked)
+sudo gvm run --sandbox --watch my_agent.py
 
 # 2. Suggest — auto-generate rules from the audit log
 gvm suggest --from data/wal.log >> gvm.toml
 
-# 3. Run — enforce the generated rules
-gvm run my_agent.py
+# 3. Enforce — apply the generated rules
+sudo gvm run --sandbox my_agent.py
 ```
 
-Step 1 records every API call to the audit log (`data/wal.log`). Step 2 reads that log and generates Allow rules for every URL that was seen. Step 3 enforces those rules — anything not in the list gets delayed and flagged.
+Step 1 records every API call into the WAL audit log. Step 2 reads it and generates Allow rules for every URL that was seen. Step 3 enforces — anything not in the list gets delayed and flagged.
+
+The examples above use `--sandbox` (kernel-isolated, production default on Linux). On macOS / Windows or for fast dev iteration, drop `sudo --sandbox` for cooperative mode (HTTP_PROXY env injection only — see the [reference](reference.md) for trust-model differences). `--sandbox` requires root because it sets up user/PID/mount/network namespaces, iptables DNAT, and per-sandbox MITM CA.
 
 That's the entire workflow. Everything below is optional — use it when you need it.
 
-> **First time on a fresh checkout?** Run `gvm init --industry saas` (or `--industry finance`) to drop a starter `gvm.toml` (unified config: rules + credentials + budget + filesystem + seccomp). Skip this if you already have a config you want to keep.
+### First-time setup (only on fresh install)
+
+The first `gvm run` from a directory without `config/proxy.toml` (or `gvm.toml`) drops you into an interactive industry-template chooser:
+
+```
+  ⚡ First Run Detected
+
+  Choose an industry template to get started:
+    1  finance  — Wire transfers blocked, payments need IC-3 approval
+    2  saas     — Default-to-Caution, balanced security for SaaS agents
+    3  Skip     — Exit and configure manually
+
+  Select [1/2/3]:
+```
+
+Pick `1` or `2` and the template lands in `./config/`. In CI / non-interactive shells the prompt is skipped — wire it explicitly with `gvm init --industry saas` (or `--industry finance`) before running. The unified config file is `gvm.toml` — rules + credentials + budget + filesystem + seccomp all in one place.
 
 ---
 
@@ -309,18 +326,18 @@ Resource limits are **opt-in**. Without `--memory` or `--cpus`, the agent runs w
 
 ```bash
 # Unlimited (default) — agent uses all available memory
-gvm run --sandbox -- node agent.js
+sudo gvm run --sandbox -- node agent.js
 
 # Restrict to 1GB memory and half a CPU
-gvm run --sandbox --memory 1g --cpus 0.5 -- node agent.js
+sudo gvm run --sandbox --memory 1g --cpus 0.5 -- node agent.js
 ```
 
 > **Note:** Node.js ignores `HTTPS_PROXY`. Sandbox mode solves this — all HTTPS is intercepted regardless of the agent's behavior.
 
 > **Proxy restart breaks TLS trust (CA-5):** Since CA-5 the MITM CA is held in proxy memory only — there is no `data/mitm-ca.pem` on disk. A restarted proxy mints a fresh keypair, so any sandbox still trusting the previous CA will fail TLS. The mitigation is a relaunch:
 > ```bash
-> gvm cleanup        # remove orphaned veth/iptables from the dead sandbox
-> gvm run --sandbox --sandbox-timeout 0 -- node agent.js   # fresh CA injected
+> sudo gvm cleanup   # remove orphaned veth/iptables from the dead sandbox
+> sudo gvm run --sandbox --sandbox-timeout 0 -- node agent.js   # fresh CA injected
 > ```
 > This is intentional. Persisting a shared CA's private key to host disk was the larger security risk — anyone who could read `data/mitm-ca-key.pem` could forge any TLS identity until cert expiry. Per-sandbox CAs (provisioned via `POST /gvm/sandbox/launch`, CA-3) restore restart resilience by binding the trust to a single sandbox lifetime.
 
@@ -330,9 +347,9 @@ GVM is designed for **N agents inside a single organization**, sharing one proxy
 
 ```bash
 # In separate terminals (or backgrounded jobs):
-gvm run --agent-id agent-analyst   --sandbox -- python analyst.py
-gvm run --agent-id agent-coder-1   --sandbox -- node coder.js
-gvm run --agent-id agent-coder-2   --sandbox -- python coder2.py
+sudo gvm run --agent-id agent-analyst   --sandbox -- python analyst.py
+sudo gvm run --agent-id agent-coder-1   --sandbox -- node coder.js
+sudo gvm run --agent-id agent-coder-2   --sandbox -- python coder2.py
 ```
 
 **Always pass a unique `--agent-id`** — the default (`"agent-001"`) makes every agent share the same identity, which collapses per-agent budget isolation and audit attribution. There is no automatic uniqueness check; the burden is on you.
@@ -511,13 +528,13 @@ The DNS proxy classifies each query into a tier based on whether the domain is k
 
 ```bash
 # 1. Watch mode learns which domains the agent uses
-gvm run --sandbox --watch agent.py
+sudo gvm run --sandbox --watch agent.py
 
 # 2. gvm suggest generates rules — these become the "known hosts" for DNS free-pass
 gvm suggest --from session.jsonl >> gvm.toml
 
 # 3. Enforce mode — known domains resolve instantly, unknown get 200ms delay
-gvm run --sandbox agent.py
+sudo gvm run --sandbox agent.py
 ```
 
 After step 2, domains like `api.github.com` and `api.anthropic.com` that appeared in the watch session are classified as Tier 1 (known) and resolve with zero governance delay.
@@ -526,7 +543,7 @@ After step 2, domains like `api.github.com` and `api.anthropic.com` that appeare
 
 ```bash
 # CLI flag
-gvm run --sandbox --no-dns-governance agent.py
+sudo gvm run --sandbox --no-dns-governance agent.py
 
 # Or in proxy.toml
 [dns]

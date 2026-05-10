@@ -85,18 +85,20 @@ You don't need to write rules by hand. Watch what your agent does, let GVM gener
 
 ```bash
 # 1. Watch — observe every API call, no blocking
-gvm run --sandbox --watch agent.py
+sudo gvm run --sandbox --watch agent.py
 
 # 2. Suggest — turn the recorded session into rules
 gvm suggest --from session.jsonl >> gvm.toml
 
 # 3. Enforce — apply those rules
-gvm run --sandbox agent.py
+sudo gvm run --sandbox agent.py
 ```
 
 After step 3, known URLs pass instantly. A new URL the agent tries to call — one that wasn't in the watch session — hits Default-to-Caution and gets delayed, flagged in the audit trail.
 
-You can also discover rules interactively: `gvm run -i --sandbox agent.py` enforces and then prompts you to create rules for any unknown hosts on exit.
+`--sandbox` requires `sudo` because it sets up user/PID/mount/network namespaces, iptables DNAT, and a per-sandbox MITM CA. The proxy itself drops back to the original (`SUDO_UID`) user once those primitives are in place; only the kernel-isolation setup phase needs root.
+
+You can also discover rules interactively: `sudo gvm run -i --sandbox agent.py` enforces and then prompts you to create rules for any unknown hosts on exit.
 
 ---
 
@@ -181,10 +183,10 @@ cargo build --release
 ```
 
 ```bash
-# Production: sandbox mode (Linux)
-gvm run --sandbox my_agent.py
+# Production: sandbox mode (Linux, root required for namespace + iptables setup)
+sudo gvm run --sandbox my_agent.py
 
-# Quick run: cooperative mode (any OS)
+# Quick run: cooperative mode (any OS, no sudo)
 gvm run my_agent.py
 ```
 
