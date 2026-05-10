@@ -53,7 +53,12 @@ If an attacker has root access to the host, GVM — like any userspace process �
 - **The signal is redundant**: Deny decisions are explicitly communicated via HTTP 403 and `X-GVM-Decision: Deny` headers. Timing reveals nothing the response doesn't already state.
 - **Constant-time padding conflicts with design**: IC-2 Delay (300+ ms) is an intentionally visible timing signal for enforcement feedback.
 
-**Status**: Not constant-time by design. Timing attack is impractical due to rate limiting. Constant-time SRR matching is a low-priority future consideration, not a v2 target.
+**Regression invariants (pinned in `tests/timing_invariance.rs`)**:
+
+- *Cross-rule median ratio* < 3.0× — across five distinct rule shapes (URL-Deny, default-caution catch-all, payload-match, payload-skip, method-mismatch fall-through). Catches whole-scale slowdowns where one decision branch becomes 5×+ slower than a peer. **Not** a side-channel guarantee — the URL/method already discloses which rule shape applied. The bound is a *regression catch*: a refactor that, e.g., introduced a synchronous network call into the SRR hot path would surface here.
+- *Within-rule median ratio* < 1.6× — for two requests that match the SAME URL pattern but take different sub-paths inside the matching rule (specifically: `POST /graphql` with `operationName=TransferFunds` versus `POST /graphql` with no `operationName` field, where the rule's payload check matches in one case and skips in the other). The URL/method **does not** disclose the sub-path here, so a measurable timing delta IS a side channel. The 1.6× bound corresponds to the natural cost of an `if let Some` short-circuit inside an already-running JSON inspection — observable by a tightly-coupled co-located attacker, but not by a remote attacker working through normal network jitter.
+
+**Status**: Not constant-time by design. Timing attack on the cross-rule axis is impractical because the axis is observable through the URL anyway; on the within-rule axis the 1.6× bound is a measured-and-pinned ceiling. Constant-time policy evaluation (eliminating the within-rule delta entirely) is a roadmap item — see [`docs/internal/COVERAGE_HARDENING_PLAN.md △-1`](internal/COVERAGE_HARDENING_PLAN.md#-1--timing-side-channel-security-modelmd-1).
 
 ---
 
@@ -63,15 +68,15 @@ If an attacker has root access to the host, GVM — like any userspace process �
 
 **Preconditions**: Deployment explicitly enables Wasm decision mode and an attacker has write access to the Wasm module path or config.
 
-**Current (v1)**: Request hot-path decisions are evaluated by the native policy engine. A Wasm loader exists, but it is not the default enforcement path.
+**Current (v0.5.3)**: Request hot-path decisions are evaluated by the native policy engine. A Wasm loader exists in the source tree but is **gated behind a non-default Cargo feature** (`[features] default = []` in `Cargo.toml`; `wasmtime` and `wasmtime-wasi` are `optional = true` and every callsite is `#[cfg(feature = "wasm")]`). Default `cargo build --release` produces a binary that does not link wasmtime at all and logs `Layer 1: Native policy engine (Wasm disabled)` at startup. The five known `wasmtime` CVEs and ~10 MB of binary cost are both absent from the production binary; the attack surface for this threat is empty unless an operator explicitly opts in via `cargo build --features wasm`.
 
 **Impact (when enabled)**: Arbitrary policy logic execution within the Wasm sandbox boundary.
 
 **Mitigation status**:
 - *Implemented (v0.5.3)*: Ed25519 anchor signature verification on the audit chain — `gvm anchor keygen` provisions the operator-managed keypair, the proxy attests every batch anchor with it, and `gvm audit verify` rejects WALs with bad or missing signatures. Tampered policy evaluation paths surface as anchor-chain breaks, not just silently-wrong decisions.
-- *Roadmap*: (1) Hot-path Wasm activation with parity tests against native decisions, (2) Wasm module hash pinning + signature verification (separate from the anchor signing already in place), (3) fail-close startup when Wasm mode is required.
+- *Roadmap (precondition for ever flipping `default = ["wasm"]`)*: (1) Wasm module hash pinning + signature verification at load time (operator pins `[wasm] module_sha256` in proxy.toml; mismatch is fail-close), (2) hot-path Wasm activation with parity tests against the native engine, (3) fail-close startup when Wasm mode is required and the module is missing or corrupt. Tracked as `△-2 (deferred)` in [`docs/internal/COVERAGE_HARDENING_PLAN.md`](internal/COVERAGE_HARDENING_PLAN.md#-2--wasm-runtime-integrity-security-modelmd-2--deferred-2026-05-10-no-production-exposure).
 
-**Status**: Roadmap hardening item. Not active on the default runtime path.
+**Status**: Roadmap hardening item. Not active on the default runtime path. The threat surface for this entry is **empty in v0.5.3** because Wasm is disabled in the default build; the listed mitigations are preconditions that must land before that changes.
 
 ---
 

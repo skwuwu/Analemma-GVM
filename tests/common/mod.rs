@@ -156,6 +156,7 @@ pub async fn test_state() -> (AppState, TestWal) {
         ca_expires_days: None,
         dns_governance: None,
         wal_path: wal_path.to_string_lossy().into_owned(),
+        wal_chain_health: gvm_proxy::wal_background_reverify::WalChainHealth::new(),
         active_integrity_ref: Arc::new(std::sync::RwLock::new(None)),
     };
 

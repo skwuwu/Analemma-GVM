@@ -557,8 +557,33 @@ async fn main() {
         ca_expires_days: mitm_ca_expires_days,
         dns_governance: None, // populated below if enabled
         wal_path: std::env::var("GVM_WAL_PATH").unwrap_or_else(|_| config.wal.path.clone()),
+        wal_chain_health: gvm_proxy::wal_background_reverify::WalChainHealth::new(),
         active_integrity_ref: active_integrity_ref.clone(),
     };
+
+    // 11.5. Background WAL re-verification (△-6, opt-in).
+    //
+    // Default-off (`background_reverify_interval_secs = 0`). When the
+    // operator opts in, a tokio task periodically reads the active
+    // WAL and runs `merkle::verify_wal()`. A break flips
+    // `state.wal_chain_health.is_intact() → false`, surfaced in
+    // `/gvm/health.wal_chain_intact`. The flag is monotonic — once
+    // tripped it stays tripped until the next restart, so a transient
+    // I/O hiccup in the verifier can't mask a subsequent real break.
+    let reverify_interval = config.wal.background_reverify_interval_secs;
+    if reverify_interval > 0 {
+        let wal_path_for_reverify = std::path::PathBuf::from(&state.wal_path);
+        tracing::info!(
+            interval_secs = reverify_interval,
+            wal_path = %wal_path_for_reverify.display(),
+            "WAL background re-verification enabled (△-6)"
+        );
+        gvm_proxy::wal_background_reverify::spawn(
+            wal_path_for_reverify,
+            reverify_interval,
+            state.wal_chain_health.clone(),
+        );
+    }
 
     // 11a. DNS governance proxy (Delay-Alert, no Deny)
     let dns_governance_enabled = config.dns.enabled

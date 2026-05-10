@@ -39,6 +39,7 @@ fn allow_rule(host: &str, condition: Option<RuleConditionConfig>) -> NetworkRule
         path_regex: None,
         payload_field: None,
         payload_match: None,
+        payload_query_alias_match: None,
         max_body_bytes: None,
         description: Some("test rule".to_string()),
         label: None,

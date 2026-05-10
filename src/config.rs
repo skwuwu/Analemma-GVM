@@ -833,6 +833,28 @@ pub struct WalConfig {
     /// Oldest segments are deleted when this count is exceeded.
     #[serde(default = "default_max_wal_segments")]
     pub max_wal_segments: usize,
+    /// Background WAL re-verification interval in seconds.
+    ///
+    /// `0` (default) disables the background scan. A positive value
+    /// spawns a tokio task that periodically reads the active WAL,
+    /// re-runs `merkle::verify_wal()`, and:
+    ///
+    /// 1. Flips `wal_chain_intact: false` in `/gvm/health` if the
+    ///    Merkle chain breaks. The flag never recovers within the
+    ///    same process lifetime — once corruption is observed it
+    ///    is treated as permanent and the operator must
+    ///    investigate.
+    /// 2. Logs a `tracing::warn!` line with the report contents.
+    ///
+    /// Tracked as `△-6` in
+    /// [`docs/internal/COVERAGE_HARDENING_PLAN.md`](../../docs/internal/COVERAGE_HARDENING_PLAN.md).
+    /// Default-off because: (a) it doubles WAL read pressure on the
+    /// host, (b) tampering between restarts is already detected by
+    /// `gvm audit verify` at the operator's discretion, and (c) the
+    /// background path's behaviour under WAL rotation is still
+    /// being characterised in production.
+    #[serde(default)]
+    pub background_reverify_interval_secs: u64,
 }
 
 impl Default for WalConfig {
@@ -843,6 +865,7 @@ impl Default for WalConfig {
             max_batch_size: 128,
             max_wal_bytes: 100 * 1024 * 1024, // 100MB
             max_wal_segments: 10,
+            background_reverify_interval_secs: 0,
         }
     }
 }

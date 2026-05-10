@@ -1077,6 +1077,7 @@ pub async fn health(State(state): State<AppState>) -> Response<Body> {
     };
 
     let dns_governance = state.dns_governance.is_some();
+    let wal_chain_intact = state.wal_chain_health.is_intact();
 
     json_response(
         StatusCode::OK,
@@ -1088,6 +1089,7 @@ pub async fn health(State(state): State<AppState>) -> Response<Body> {
             "tls_ready": tls_ready,
             "wal": wal_status,
             "wal_failures": wal_failures,
+            "wal_chain_intact": wal_chain_intact,
             "emergency_writes": emergency_writes,
             "pending_approvals": pending,
             "uptime_secs": uptime_secs,

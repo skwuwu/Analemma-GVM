@@ -23,6 +23,7 @@ pub mod token_budget;
 pub mod types;
 pub mod upstream_pool;
 pub mod vault;
+pub mod wal_background_reverify;
 /// Wasm policy engine — UNSUPPORTED EXPERIMENTAL FEATURE.
 /// Disabled by default. The native Rust policy engine handles all enforcement.
 /// Enabling adds ~10MB to binary + 5 wasmtime CVEs. For future third-party

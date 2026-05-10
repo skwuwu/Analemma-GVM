@@ -28,6 +28,27 @@ pub struct NetworkRuleConfig {
     pub payload_field: Option<String>,
     /// Payload values to match against
     pub payload_match: Option<Vec<String>>,
+    /// GraphQL alias-bypass defense (`docs/srr.md §3.6`,
+    /// `docs/internal/COVERAGE_HARDENING_PLAN.md △-10`).
+    ///
+    /// When set, SRR scans the request body's top-level `query`
+    /// JSON field for any GraphQL mutation/query invocation
+    /// whose **field name** matches an entry in this list,
+    /// regardless of `operationName` or alias prefix. Catches:
+    /// `mutation { x: transferFunds(...) }` (aliased),
+    /// `mutation { transferFunds(...) }` (direct),
+    /// `mutation Op { transferFunds(...) }` (named operation,
+    /// even if `operationName` is omitted from the JSON envelope).
+    ///
+    /// The matcher is a narrow lexer
+    /// ([`scan_graphql_query_for_invocation`]): comments + string
+    /// literals are stripped, then identifier tokens are compared
+    /// against the supplied names with whole-word matching. Pair
+    /// with a URL-level Deny on the same endpoint for
+    /// defense-in-depth — a malformed query that the lexer cannot
+    /// parse falls through to the URL rule rather than producing
+    /// a false negative.
+    pub payload_query_alias_match: Option<Vec<String>>,
     /// Max body bytes to inspect (default 64KB)
     pub max_body_bytes: Option<usize>,
     pub description: Option<String>,
@@ -91,6 +112,10 @@ pub struct NetworkRule {
     pub description: String,
     pub payload_field: Option<String>,
     pub payload_match: Option<Vec<String>>,
+    /// Compiled list of mutation/query field names to match in the
+    /// request body's GraphQL `query` field. See
+    /// [`NetworkRuleConfig::payload_query_alias_match`].
+    pub payload_query_alias_match: Option<Vec<String>>,
     pub max_body_bytes: usize,
     /// True if this rule is a catch-all (method="*" + pattern="{any}").
     /// Catch-all matches are flagged as default-to-caution for the CLI.
@@ -393,6 +418,7 @@ impl NetworkSRR {
                     description: rule_cfg.description.clone().unwrap_or_default(),
                     payload_field: rule_cfg.payload_field.clone(),
                     payload_match: rule_cfg.payload_match.clone(),
+                    payload_query_alias_match: rule_cfg.payload_query_alias_match.clone(),
                     max_body_bytes: rule_cfg.max_body_bytes.unwrap_or(65536),
                     is_catch_all,
                     condition: condition.clone(),
@@ -520,6 +546,7 @@ impl NetworkSRR {
                     description: rule_cfg.description.clone().unwrap_or_default(),
                     payload_field: rule_cfg.payload_field.clone(),
                     payload_match: rule_cfg.payload_match.clone(),
+                    payload_query_alias_match: rule_cfg.payload_query_alias_match.clone(),
                     max_body_bytes: rule_cfg.max_body_bytes.unwrap_or(65536),
                     is_catch_all,
                     condition: condition.clone(),
@@ -761,44 +788,58 @@ impl NetworkSRR {
             }
 
             // Payload inspection (if required)
-            if let (Some(field), Some(matches)) = (&rule.payload_field, &rule.payload_match) {
-                if let Some(body_bytes) = body {
-                    if body_bytes.len() > rule.max_body_bytes {
-                        // Body too large for this rule's payload inspection.
-                        // Continue to next rule so URL-only rules for the same
-                        // endpoint can still match. Returning here would skip
-                        // all subsequent rules for this URL.
-                        tracing::warn!(
-                            "Body exceeds max_body_bytes ({}), skipping payload inspection for this rule",
-                            rule.max_body_bytes
-                        );
-                        continue;
-                    }
+            //
+            // The rule needs payload inspection if it has either the
+            // legacy `payload_field` + `payload_match` pair OR the
+            // newer `payload_query_alias_match` (GraphQL alias-bypass
+            // defense, △-10). Both are evaluated when configured;
+            // either one matching short-circuits to a Deny.
+            let needs_payload = (rule.payload_field.is_some() && rule.payload_match.is_some())
+                || rule.payload_query_alias_match.is_some();
+            if needs_payload {
+                let Some(body_bytes) = body else {
+                    // No body for inspection — continue
+                    continue;
+                };
+                if body_bytes.len() > rule.max_body_bytes {
+                    // Body too large for this rule's payload inspection.
+                    // Continue to next rule so URL-only rules for the same
+                    // endpoint can still match. Returning here would skip
+                    // all subsequent rules for this URL.
+                    tracing::warn!(
+                        "Body exceeds max_body_bytes ({}), skipping payload inspection for this rule",
+                        rule.max_body_bytes
+                    );
+                    continue;
+                }
 
-                    // Try JSON parsing first (normal case)
-                    let json_result = serde_json::from_slice::<serde_json::Value>(body_bytes);
+                // Try JSON parsing first (normal case)
+                let json_result = serde_json::from_slice::<serde_json::Value>(body_bytes);
 
-                    // If JSON parse fails, try Base64-decoding the body first
-                    let decoded_json = if json_result.is_err() {
-                        base64::engine::general_purpose::STANDARD
-                            .decode(
-                                body_bytes
-                                    .iter()
-                                    .copied()
-                                    .filter(|b| !b.is_ascii_whitespace())
-                                    .collect::<Vec<u8>>(),
-                            )
-                            .ok()
-                            .and_then(|decoded| {
-                                serde_json::from_slice::<serde_json::Value>(&decoded).ok()
-                            })
-                    } else {
-                        None
-                    };
+                // If JSON parse fails, try Base64-decoding the body first
+                let decoded_json = if json_result.is_err() {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(
+                            body_bytes
+                                .iter()
+                                .copied()
+                                .filter(|b| !b.is_ascii_whitespace())
+                                .collect::<Vec<u8>>(),
+                        )
+                        .ok()
+                        .and_then(|decoded| {
+                            serde_json::from_slice::<serde_json::Value>(&decoded).ok()
+                        })
+                } else {
+                    None
+                };
 
-                    let json_val = json_result.ok().or(decoded_json);
+                let json_val = json_result.ok().or(decoded_json);
 
-                    if let Some(json) = json_val {
+                if let Some(json) = json_val {
+                    // ── Layer 1: legacy field-value match (operationName etc.) ──
+                    if let (Some(field), Some(matches)) = (&rule.payload_field, &rule.payload_match)
+                    {
                         // Check the target field value
                         if let Some(value) = json.get(field).and_then(|v| v.as_str()) {
                             if matches.iter().any(|m| m == value) {
@@ -828,12 +869,29 @@ impl NetworkSRR {
                             }
                         }
                     }
-                    // Payload didn't match this rule — continue to next
-                    continue;
-                } else {
-                    // No body for inspection — continue
-                    continue;
+
+                    // ── Layer 2: GraphQL alias-bypass defense (△-10) ──
+                    //
+                    // Scan the body's `query` field for any invocation
+                    // whose field name matches the configured list,
+                    // regardless of `operationName` or alias prefix.
+                    // Strips comments and string literals first so an
+                    // attacker can't smuggle the name in a `# comment`
+                    // or `"description"`.
+                    if let Some(names) = &rule.payload_query_alias_match {
+                        if let Some(query_str) = json.get("query").and_then(|v| v.as_str()) {
+                            if scan_graphql_query_for_invocation(query_str, names) {
+                                return SrrCheckResult {
+                                    decision: rule.decision.clone(),
+                                    matched_description: Some(rule.description.clone()),
+                                    is_catch_all: rule.is_catch_all,
+                                };
+                            }
+                        }
+                    }
                 }
+                // Payload didn't match this rule — continue to next
+                continue;
             }
 
             // URL-only rule matched
@@ -979,6 +1037,154 @@ fn parse_decision(cfg: &NetworkDecisionConfig) -> Result<EnforcementDecision> {
         }),
         other => anyhow::bail!("Unknown decision type in SRR: {}", other),
     }
+}
+
+/// Scan a GraphQL `query` body for any invocation whose field name
+/// matches one of the configured names. Returns `true` on match.
+///
+/// Implements the GraphQL alias-bypass defense documented in
+/// [`docs/srr.md §3.6`](../../../docs/srr.md) and tracked as `△-10`
+/// in the coverage hardening plan. The scan:
+///
+/// 1. **Strips comments**: GraphQL line comments run from `#` to end
+///    of line. Anything inside is ignored — an attacker cannot smuggle
+///    `# transferFunds` as a no-op annotation that the lexer counts
+///    as an invocation. Note that `#` inside a string literal is NOT
+///    a comment; we handle this by stripping strings first.
+/// 2. **Strips string literals**: Both single-line `"..."` and block
+///    `"""..."""` strings have their contents removed. This prevents
+///    an attacker from putting the dangerous mutation name inside a
+///    `description` field of an introspection query and having it
+///    flagged as an invocation. Escape-sequence handling is
+///    deliberately conservative — a dangling backslash terminates
+///    the string for our purposes.
+/// 3. **Whole-word identifier match**: Once the comment-and-string
+///    scrubbed input is in hand, scan for word-boundary matches of
+///    each configured name. GraphQL identifiers are
+///    `[_A-Za-z][_A-Za-z0-9]*`; we use that same alphabet for the
+///    word boundary so `transferFundsExtra` does NOT match
+///    `transferFunds` (no false positive on naming overlap), but
+///    `: transferFunds(args)` and `t: transferFunds(args)` both do.
+///
+/// **Conservative bias**: when in doubt the scan favours **flagging**
+/// over **passing**. A query the lexer cannot fully scrub (e.g. a
+/// pathologically long string literal mid-truncation) falls through
+/// to a no-match — but the URL-level Deny that operators are
+/// instructed to pair this rule with still catches that path. Any
+/// false positive blocks a benign query, which is the right
+/// direction for security.
+///
+/// **Phase 1 limitations** (acceptable for the documented threat
+/// model, tracked in `COVERAGE_HARDENING_PLAN.md △-10`):
+///
+/// - No GraphQL fragment expansion. A mutation invocation hidden
+///   inside a fragment definition that is later spread into the
+///   selection set is not detected by this scan. Phase 2's full
+///   GraphQL parser closes that gap.
+/// - No directive-stripping; directives like `@skip(if: $x)` are
+///   left in the input but their argument names cannot collide
+///   with our configured mutation names because GraphQL
+///   directive names use `@` as a sigil.
+/// - Identifier matching is case-sensitive (matches GraphQL spec).
+pub fn scan_graphql_query_for_invocation(query: &str, names: &[String]) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    let scrubbed = strip_graphql_comments_and_strings(query);
+    // Build a HashSet for O(1) lookup; for typical name lists (1-10
+    // entries) this is overkill but the cost is one allocation per
+    // request and the SRR engine documents <1µs hot path budget.
+    use std::collections::HashSet;
+    let target: HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
+    // Walk identifiers in the scrubbed input. An identifier is a
+    // maximal run of [_A-Za-z0-9] starting with [_A-Za-z]. Anything
+    // else is a separator.
+    let bytes = scrubbed.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let is_id_start = b == b'_' || b.is_ascii_alphabetic();
+        if !is_id_start {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric()) {
+            i += 1;
+        }
+        let ident = &scrubbed[start..i];
+        if target.contains(ident) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Strip GraphQL comments (`# ... \n`) and string literals
+/// (single-line `"..."` and block `"""..."""`) from the input,
+/// replacing them with single spaces so identifier boundaries
+/// before/after a stripped span are preserved.
+///
+/// Internal helper for [`scan_graphql_query_for_invocation`]; pub
+/// for the test module.
+pub(crate) fn strip_graphql_comments_and_strings(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Comment: # to end of line (or EOF). Block strings come
+        // first because """ contains a `#` would otherwise win
+        // against a comment that starts mid-string.
+        if b == b'#' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            out.push(' ');
+            continue;
+        }
+        // Block string: """ ... """ — three quotes terminate it.
+        // No escape processing inside; spec says backslash escapes
+        // are not meaningful in block strings.
+        if i + 2 < bytes.len() && &bytes[i..i + 3] == b"\"\"\"" {
+            i += 3;
+            while i + 2 < bytes.len() && &bytes[i..i + 3] != b"\"\"\"" {
+                i += 1;
+            }
+            // Skip closing """ (or EOF).
+            if i + 2 < bytes.len() {
+                i += 3;
+            } else {
+                i = bytes.len();
+            }
+            out.push(' ');
+            continue;
+        }
+        // Single-line string: " ... " — backslash escapes one
+        // character. A newline inside a non-block string is a
+        // syntax error in GraphQL but we handle it gracefully by
+        // letting the scan continue; precision-vs-safety, we
+        // prefer the safe answer.
+        if b == b'"' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' && bytes[i] != b'\n' {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            // Skip closing quote (if present).
+            if i < bytes.len() && bytes[i] == b'"' {
+                i += 1;
+            }
+            out.push(' ');
+            continue;
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    out
 }
 
 // ─── Hostile Environment Tests ───

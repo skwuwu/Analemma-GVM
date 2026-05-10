@@ -466,6 +466,11 @@ pub struct AppState {
     pub dns_governance: Option<Arc<crate::dns_governance::DnsGovernance>>,
     /// WAL file path for dashboard read-only access.
     pub wal_path: String,
+    /// Background-reverify WAL chain health flag (`△-6`).
+    /// Read by `/gvm/health`; written by the background task in
+    /// `crate::wal_background_reverify`. Always-`true` when the
+    /// background task is disabled (`background_reverify_interval_secs = 0`).
+    pub wal_chain_health: crate::wal_background_reverify::WalChainHealth,
     /// Active integrity context hash. Updated on config load/reload.
     /// Behavioral events reference this to map "which config version
     /// was active when this event happened" without per-event overhead.

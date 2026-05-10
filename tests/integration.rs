@@ -469,6 +469,7 @@ decision = { type = "Delay", milliseconds = 300 }
         ca_expires_days: None,
         dns_governance: None,
         wal_path: "data/wal.log".to_string(),
+        wal_chain_health: gvm_proxy::wal_background_reverify::WalChainHealth::new(),
         active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
     };
 
@@ -847,6 +848,7 @@ token = "sk_test_proxy_injected_key"
         ca_expires_days: None,
         dns_governance: None,
         wal_path: "data/wal.log".to_string(),
+        wal_chain_health: gvm_proxy::wal_background_reverify::WalChainHealth::new(),
         active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
     };
 
@@ -1117,6 +1119,7 @@ token = "sk_test_proxy_injected_bearer"
         ca_expires_days: None,
         dns_governance: None,
         wal_path: "data/wal.log".to_string(),
+        wal_chain_health: gvm_proxy::wal_background_reverify::WalChainHealth::new(),
         active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
     };
 
@@ -1310,6 +1313,7 @@ decision = { type = "Deny", reason = "Wire transfer blocked by SRR" }
         ca_expires_days: None,
         dns_governance: None,
         wal_path: "data/wal.log".to_string(),
+        wal_chain_health: gvm_proxy::wal_background_reverify::WalChainHealth::new(),
         active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
     };
 
@@ -1691,6 +1695,7 @@ async fn checkpoint_save_restore_merkle_verified() {
         ca_expires_days: None,
         dns_governance: None,
         wal_path: "data/wal.log".to_string(),
+        wal_chain_health: gvm_proxy::wal_background_reverify::WalChainHealth::new(),
         active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
     };
 
@@ -2147,6 +2152,7 @@ decision = { type = "Allow" }
         ca_expires_days: None,
         dns_governance: None,
         wal_path: "data/wal.log".to_string(),
+        wal_chain_health: gvm_proxy::wal_background_reverify::WalChainHealth::new(),
         active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
     };
 
@@ -2306,6 +2312,7 @@ decision = { type = "Allow" }
         ca_expires_days: None,
         dns_governance: None,
         wal_path: "data/wal.log".to_string(),
+        wal_chain_health: gvm_proxy::wal_background_reverify::WalChainHealth::new(),
         active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
     };
 
@@ -2430,6 +2437,7 @@ decision = { type = "Allow" }
         ca_expires_days: None,
         dns_governance: None,
         wal_path: "data/wal.log".to_string(),
+        wal_chain_health: gvm_proxy::wal_background_reverify::WalChainHealth::new(),
         active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
     };
 
@@ -2558,6 +2566,7 @@ decision = { type = "Allow" }
         ca_expires_days: None,
         dns_governance: None,
         wal_path: "data/wal.log".to_string(),
+        wal_chain_health: gvm_proxy::wal_background_reverify::WalChainHealth::new(),
         active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
     };
 
@@ -2654,6 +2663,7 @@ async fn ic3_self_approval_blocked_on_proxy_port() {
         ca_expires_days: None,
         dns_governance: None,
         wal_path: "data/wal.log".to_string(),
+        wal_chain_health: gvm_proxy::wal_background_reverify::WalChainHealth::new(),
         active_integrity_ref: std::sync::Arc::new(std::sync::RwLock::new(None)),
     };
 

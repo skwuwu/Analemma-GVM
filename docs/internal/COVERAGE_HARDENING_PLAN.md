@@ -31,7 +31,22 @@ Format per item:
 
 ---
 
-## △-1 — Timing side channel (security-model.md §1)
+## △-1 — Timing side channel (security-model.md §1) — **CLOSED 2026-05-10**
+
+**Status: ✓ CLOSED.** `tests/timing_invariance.rs` (2 tests) pins
+two regression invariants:
+- *Cross-rule median ratio* < 3.0× — across five distinct
+  decision-type scenarios (URL-Deny, default-caution, payload-match,
+  payload-skip, method-mismatch).
+- *Within-rule median ratio* < 1.6× — for two requests on
+  `POST /graphql` taking different sub-paths (payload-match vs
+  payload-skip). The within-rule invariant is the side-channel-
+  relevant one because the URL/method does not disclose the
+  sub-path; the cross-rule is a regression catch (the URL already
+  tells the attacker which rule shape applied). Bounds documented
+  in `docs/security-model.md §1`. Tightening the within-rule
+  bound to <1.1× requires constant-time policy evaluation —
+  tracked as an open follow-up below.
 
 **What's tested today**
 
@@ -73,7 +88,42 @@ and the `tests/timing_under_load.rs` line.
 
 ---
 
-## △-2 — Wasm runtime integrity (security-model.md §2)
+## △-2 — Wasm runtime integrity (security-model.md §2) — **DEFERRED 2026-05-10 (no production exposure)**
+
+**Status: deferred until Wasm activation.** Code review during the
+hardening pass surfaced that Wasm is wired through a Cargo
+feature flag and is **not in the default build**: `[features]
+default = []` ([Cargo.toml:76](../../Cargo.toml#L76)), `wasmtime`
+and `wasmtime-wasi` are `optional = true`, and every Wasm callsite
+in `src/main.rs` (lines 14, 381, 518) is `#[cfg(feature = "wasm")]`.
+A default `cargo build --release -p gvm-proxy` produces a binary
+that logs `Layer 1: Native policy engine (Wasm disabled)` at
+startup; the `wasmtime` crate is not even compiled in. The five
+documented `wasmtime` CVEs and the ~10 MB binary cost are both
+absent from v0.5.3.
+
+This collapses the threat model: an attacker who can swap the
+Wasm module file on disk has nothing to attack, because the
+proxy never loads any Wasm. Hash pinning still has to land
+**before** Wasm is ever flipped on for a production deployment,
+so the design + test plan stay in this file as a precondition,
+but the implementation is deferred to the same release that
+exposes the feature to operators.
+
+**Hard precondition (do not flip without)**: before
+`default = ["wasm"]`, ship:
+
+1. `[wasm] module_path` + `module_sha256` config schema in
+   `src/config.rs`.
+2. `WasmEngine::load_pinned(path, expected_sha256)` that
+   refuses to start on hash mismatch.
+3. `tests/wasm_module_substitution.rs` covering hash match /
+   mismatch / unpinned-with-warning / engine-panic-fail-closed.
+
+The remaining content of this section (full implementation
+plan) is preserved below for the eventual implementer.
+
+---
 
 **What's tested today**
 
@@ -118,7 +168,19 @@ Implemented (v0.6.0)".
 
 ---
 
-## △-6 — WAL periodic re-verification (security-model.md §6)
+## △-6 — WAL periodic re-verification (security-model.md §6) — **CLOSED 2026-05-10**
+
+**Status: ✓ CLOSED (opt-in).** New module
+`src/wal_background_reverify.rs` plus the
+`[wal] background_reverify_interval_secs` config field. Operator
+sets a positive interval; proxy spawns a tokio task that re-runs
+`merkle::verify_wal()` on a periodic schedule. Chain breaks flip a
+monotonic `WalChainHealth` flag, surfaced as
+`wal_chain_intact: false` in `/gvm/health` and as a
+`tracing::warn!` line. Default is `0` (disabled): operators who
+rely on `gvm audit verify` cron'd from outside don't pay the
+read overhead. Pinned by `tests/wal_background_reverify.rs`
+(8 tests).
 
 **What's tested today**
 
@@ -257,7 +319,21 @@ to a single sentence about the opt-in.
 
 ---
 
-## △-10 — GraphQL alias bypass (security-model.md §10)
+## △-10 — GraphQL alias bypass (security-model.md §10) — **CLOSED 2026-05-10 (Phase 1)**
+
+**Status: ✓ Phase 1 CLOSED.** New `payload_query_alias_match`
+field on `NetworkRuleConfig`. When set, SRR scans the request
+body's top-level `query` JSON field for any GraphQL invocation
+whose field name matches a configured list, regardless of
+`operationName` or alias prefix. The lexer
+(`scan_graphql_query_for_invocation` in `src/srr/mod.rs`) strips
+GraphQL comments (`# ... \n`) and string literals (`"..."` and
+`"""..."""`) before whole-word identifier match — false-positive
+free on identifier overlap (`transferFundsExtra` does not match
+`transferFunds`), false-positive free on smuggled comments /
+string contents. Pinned by `tests/graphql_alias_direct_match.rs`
+(11 tests). Phase 2 (full GraphQL parser, fragment expansion)
+remains deferred per the plan below.
 
 **What's tested today**
 
