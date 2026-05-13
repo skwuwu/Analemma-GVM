@@ -3,17 +3,39 @@
 > Multi-dimensional benchmark and analysis. Raw methodology + data live here;
 > a public summary (audience-facing) lives at [`docs/comparison-opa-envoy.md`](../comparison-opa-envoy.md).
 
-**Status**: Phase 1 (infrastructure committed). Results pending EC2 run.
+**Status**: methodology v2 committed (full-stack design). Results pending EC2 run.
+
+---
+
+## 0. Design Note — Scope Revision
+
+Phase 1 (committed 2026-05-13) measured **proxy-only** — `gvm-proxy` and
+`Envoy + OPA` were each invoked from a host-side `curl`, with no sandbox
+or container around the client. That measurement is internally consistent
+but represents neither stack as actually deployed. GVM is a vertically
+integrated product (sandbox + proxy + audit bundled); measuring its proxy
+in isolation strips out the integration that *is* the product. The same
+asymmetry holds for OPA+Envoy: the canonical deployment runs the agent
+inside an isolation boundary that the proxy intercepts.
+
+Methodology v2 (this document) re-scopes the comparison to **full stack
+on both sides**: agent runs inside an isolation boundary (`gvm run
+--sandbox` for Stack A, `docker run` for Stack B/C), policy enforces on
+egress, audit records the decision. This is what an operator actually
+deploys, and it is what should be compared. Proxy-only numbers are still
+collectible from the same scripts (commented out in `bench.sh`) for
+operators who want them.
 
 ---
 
 ## 1. Why This Comparison
 
 GVM's positioning is that it is a *lightweight alternative* to the OPA+Envoy
-stack for the specific use case of AI agent governance. That claim deserves
-data. If we are uniformly slower, larger, or more complex than OPA+Envoy,
-the positioning is hollow. If we are competitive on some dimensions and
-better on others by virtue of bundled scope, the positioning is defensible.
+stack for the specific use case of AI agent governance. That claim
+deserves data. If we are uniformly slower, larger, or more complex than
+OPA+Envoy, the positioning is hollow. If we are competitive on some
+dimensions and better on others by virtue of bundled scope, the
+positioning is defensible.
 
 The comparison also tests the deeper thesis question raised on 2026-05-13
 (see CHANGELOG `Removed from this roadmap on 2026-05-11` block): is GVM
@@ -25,185 +47,259 @@ form of the critique.
 
 ## 2. Stacks Under Test
 
-Three stacks, each providing comparable end-to-end functionality (HTTP
-intercept + policy decision + workload isolation + audit log):
+Three full-stack configurations providing comparable end-to-end functionality
+(workload isolation + HTTP intercept + policy decision + forward + audit log)
+on a single EC2 host:
 
 ### Stack A — GVM (this repository)
 
 ```
-┌────────────┐
-│ gvm-proxy  │  ── policy (SRR in-process) + audit (WAL+Merkle+Ed25519)
-└─────┬──────┘
-      │
-┌─────▼──────┐
-│ gvm        │  ── sandbox (namespace+veth+iptables+seccomp)
-│   sandbox  │
-└────────────┘
+┌────────────────────────────────────────┐
+│  gvm-proxy (host)                      │  policy (SRR in-process)
+│  + WAL (Merkle + Ed25519 anchors)      │  + audit (durable)
+└──────────────────▲─────────────────────┘
+                   │ iptables DNAT
+                   │ (transparent intercept)
+┌──────────────────┴─────────────────────┐
+│  gvm sandbox                           │
+│  ├ network namespace + veth            │  workload isolation
+│  ├ seccomp-BPF                         │
+│  ├ cgroup v2                           │
+│  └ agent process (curl loop)           │
+└────────────────────────────────────────┘
 ```
 
-Single binary, in-process SRR evaluation, integrated WAL.
+`gvm run --sandbox -- <agent>` is the production-recommended invocation.
+The agent inside the sandbox is unaware of the proxy — all egress is
+captured by kernel-level iptables DNAT and routed to `gvm-proxy` on the
+host. This is **structural enforcement**: the agent cannot opt out.
 
 ### Stack B — Envoy + OPA-Envoy plugin (ext_authz over gRPC)
 
 ```
-┌────────────┐    ┌────────────┐
-│   Envoy    │───▶│  OPA       │  ── policy (Rego over RPC)
-│ (sidecar)  │    │ (gRPC svc) │
-└─────┬──────┘    └────────────┘
-      │
-┌─────▼──────┐
-│   Docker   │  ── workload isolation
-│ (container)│
-└────────────┘
+┌────────────────┐   gRPC   ┌────────────────┐
+│   Envoy (host) │─────────▶│  OPA (host)    │  policy (Rego over RPC)
+└────────────▲───┘          └────────────────┘
+             │ HTTP_PROXY (cooperative)
+             │
+┌────────────┴───────────────────────────┐
+│   Docker container                     │
+│   ├ network namespace + bridge         │  workload isolation
+│   ├ cgroup v2                          │
+│   └ agent process (HTTP_PROXY=envoy)   │
+└────────────────────────────────────────┘
 ```
 
 Canonical OPA+Envoy deployment. Decision crosses process boundary for
-every request. Audit = Envoy access log (no tamper evidence by default).
+every request. The agent inside the container is **cooperative** — it
+honours `HTTP_PROXY` env var. An adversarial agent could bypass by
+ignoring the env var (no iptables redirect inside the container without
+extra setup). Audit = Envoy access log (no tamper evidence by default).
 
 ### Stack C — Envoy + OPA WASM filter (in-process)
 
 ```
-┌──────────────────┐
-│      Envoy       │
-│  ┌────────────┐  │
-│  │ OPA-WASM   │  │  ── policy (Rego compiled to WASM, in-process eval)
-│  └────────────┘  │
-└────────┬─────────┘
-         │
-┌────────▼─────────┐
-│      Docker      │  ── workload isolation
-└──────────────────┘
+┌──────────────────────────────┐
+│  Envoy (host)                │
+│  ┌──────────────────────┐    │  policy (Rego→WASM, in-process)
+│  │  OPA-WASM filter     │    │
+│  └──────────────────────┘    │
+└──────────────▲───────────────┘
+               │ HTTP_PROXY (cooperative)
+               │
+┌──────────────┴────────────────┐
+│  Docker container             │
+│  (same as Stack B)            │
+└───────────────────────────────┘
 ```
 
-Performance-optimised OPA+Envoy. In-process eval — the fairest 1:1 latency
-comparison vs GVM's in-process SRR. Less commonly deployed in production
-(WASM filter is newer + has feature limits), but it is the right
-architectural comparison point.
+Performance-optimised OPA+Envoy. Same workload isolation + cooperative
+interception as B; only the policy evaluator differs (WASM in-process
+instead of gRPC out-of-process). The architecturally fairest comparison
+vs GVM's in-process SRR.
+
+### Critical asymmetry: transparent vs cooperative interception
+
+Stack A intercepts at the kernel (iptables DNAT inside the sandbox
+netns). Every packet pays a netfilter hook cost. Agent cannot bypass.
+
+Stack B/C intercepts at the application layer (curl honours
+`HTTP_PROXY`). No kernel cost. An adversarial agent that ignores the
+env var bypasses entirely.
+
+**This is not the same security guarantee.** The benchmark compares
+"same deployment shape" (lightweight, single-host, no service mesh),
+not "same security level." This asymmetry is *the point*: it shows the
+cost of structural enforcement vs cooperative enforcement. Operators
+who need structural enforcement on the OPA+Envoy side need to add an
+istio-init-style iptables-redirect sidecar (out of scope here — that's
+no longer the lightweight deployment).
+
+Result reading: if Stack A is slower on D1, the delta is the cost of
+that stronger guarantee. If faster, it's despite paying that cost.
 
 ## 3. Equivalent Policy
 
 To compare apples-to-apples we need the same logical policy expressed
-in both SRR and Rego. The set is intentionally narrow — three rules — so
+in both SRR and Rego. The set is intentionally narrow — two rules — so
 we measure the engines under their canonical happy path, not the cost
-of complex evaluation. We also run a 10K-rule fallthrough scenario to
-test scale.
+of complex evaluation. We use **IP-based host matching** so neither
+stack depends on DNS hijacking or `/etc/hosts` manipulation; the SRR
+and Rego rules match on `"172.31.X.X:9999"` literally (the EC2 host's
+primary IP + the mock upstream port). The agent inside isolation
+makes HTTP calls to that IP:port; policy decides on host + method + path.
 
 | Logical rule | SRR (TOML) | Rego |
 |---|---|---|
-| Allow LLM API | `pattern = "api.anthropic.com/{any}"`, `method = "*"`, decision Allow | `input.host == "api.anthropic.com"` |
-| Deny payment endpoint | `pattern = "api.bank.com/transfer"`, `method = "POST"`, decision Deny | `input.host == "api.bank.com"; input.path == "/transfer"; input.method == "POST"` |
-| Default Audit-Allow | catch-all, decision AuditOnly | default allow |
+| Deny POST /transfer | `pattern = "${HOST_IP}:9999/transfer"`, `method = "POST"`, decision Deny | `host == HOST_IP_PORT; path == "/transfer"; method == "POST"` |
+| Allow everything else on bench host | catch-all `${HOST_IP}:9999/{any}`, decision Allow | default allow |
 
 The reference artefacts:
 - SRR: [`scripts/comparison/srr-bench.toml`](../../scripts/comparison/srr-bench.toml)
 - Rego: [`scripts/comparison/policy.rego`](../../scripts/comparison/policy.rego)
 
-Both engines run with **decision caching disabled** on both sides — Envoy
-local rate limit / decision cache off, GVM has no decision cache to begin
-with. Otherwise the comparison measures cache, not policy evaluation.
+The host IP literal is templated at bench-script start time (the
+generated SRR + Rego files are written to `scripts/comparison/build/`).
+Both engines run with **decision caching disabled** on both sides.
 
 ## 4. Dimensions Measured
 
 Five dimensions. Each gets a separate section in §6 (Results).
 
-### D1 — Per-request enforcement latency
+### D1 — Steady-state per-request latency (inside isolation)
 
-Hot-path measurement. p50/p95/p99 over `n=1000` curl requests through the
-proxy to a local mock upstream. Three scenarios:
-- **D1a — Allow path** (first rule match): measures fast path
-- **D1b — Deny path** (specific rule match): measures enforcement reaction
-- **D1c — 10K-rule fallthrough**: rule-scan cost at scale
+p50/p95/p99 over `n=1000` requests issued from an agent *inside* the
+isolation boundary (sandbox for A, container for B/C). The sandbox/
+container is started once; the loop runs 1000 curls inside. Cold start
+is excluded (measured separately in D2).
 
-Local mock upstream (Python `http.server` returning 200 immediately) so
-network jitter and upstream variance do not contaminate the measurement.
-Numbers reported as the *delta over a baseline direct-curl-to-upstream*.
+Two scenarios:
+- **D1a — Allow path**: GET `${HOST_IP}:9999/v1/messages` (matches catch-all allow rule)
+- **D1b — Deny path**: POST `${HOST_IP}:9999/transfer` (matches deny rule)
 
-### D2 — Cold start to first decision
+Mock upstream is a Python `http.server` on `0.0.0.0:9999` so it is
+reachable from sandbox + container + host. Times reported as the
+*delta over baseline direct-curl* (host-side curl directly to mock
+upstream, no proxy) so the loopback RTT does not contaminate the
+comparison.
 
-Wall-clock from `start command issued` to `first successful enforced
-request through the stack`. Measured by:
-1. Ensure stack is down (proxy stopped, OPA stopped, Envoy stopped, container removed).
-2. Start the stack (`gvm run --sandbox -- ...` or `docker compose up + wait`).
-3. Loop curl until success.
-4. Report time-to-first-200.
+> **D1 disclaimer (kept next to the result table in §6):** Stack A
+> includes the cost of kernel-level transparent interception (iptables
+> DNAT on every packet); Stack B/C uses application-layer cooperative
+> proxy (`HTTP_PROXY` env). Not the same security level — the same
+> deployment shape. If A is slower, that is the price of structural
+> enforcement.
 
-This is the operationally honest metric — what an operator waits for to
-run their first agent request.
+### D2 — Cold start, split into two sub-measurements
 
-### D3 — Memory footprint
+The original D2 conflated workload bring-up with control-plane bring-up.
+Splitting clarifies which audience each number serves:
 
-RSS (`ps -o rss=`) of each process, summed across the stack. Measured at:
-- **D3a — Idle**: 30 s after stack ready, no traffic
-- **D3b — Loaded**: at the end of the D1 benchmark sweep
+- **D2a — Workload cold start.** Time from `start-an-isolated-agent`
+  command to the agent's first successful HTTP request. Measured by:
+  1. Control plane already running (gvm-proxy up for A, Envoy+OPA up for B/C).
+  2. Issue `gvm run --sandbox -- curl ...` (A) or `docker run --rm ... curl ...` (B/C).
+  3. Record time from start to first 200/403 response.
+  - Stack A pays: sandbox namespace + veth + iptables rules + seccomp + cgroup + agent exec.
+  - Stack B/C pays: container netns + bridge + cgroup + agent exec.
+  - Stack A is doing more isolation work; expect a measurable delta.
+  
+- **D2b — Control-plane cold start.** Time from `start-the-proxy-stack`
+  command to the listener accepting connections. Measured by:
+  1. All processes stopped.
+  2. Start `gvm-proxy` (A) or `docker run envoy + docker run opa` (B/C).
+  3. Loop curl until first connect succeeds.
+  - Both pay daemon-init cost only; no sandbox/container yet.
+  - Useful for operators thinking about "restart the policy plane after a config push."
 
-Both reported. Idle measures resting cost; loaded measures pressure.
+### D3 — Memory footprint with sandbox/container scaling
+
+RSS (`ps -o rss=`) of every relevant process, summed across the stack,
+measured at three load points: **N = 1, 5, 20 idle agents**. Idle agents
+are `sleep infinity` inside the isolation boundary so memory cost reflects
+isolation overhead, not workload variance.
+
+This dimension is where the asymmetry between vertical-integrated GVM
+and composed OPA+Envoy shows most honestly:
+- **Stack A** scales: 1 × `gvm-proxy` (constant) + N × (sandbox child + per-sandbox kernel structures + per-sandbox MITM CA in process memory).
+- **Stack B/C** scales: 1 × Envoy + 1 × OPA (constant) + N × (container init + cgroup + per-container netns) — but the control-plane RSS does not grow per agent.
+
+If GVM scales worse per-agent, the data tells operators what to expect
+when running many agents. If comparable, the bundling has no penalty.
 
 ### D4 — Distribution size
 
-- Single binary / single image: `stat`/`du` of the production artefact
-- Total stack: GVM = single binary; OPA+Envoy = Envoy image + OPA image + dependencies
-
-Reported as "bytes operator must pull to run the stack."
+- GVM: `stat` the production binaries (`gvm` + `gvm-proxy`).
+- OPA+Envoy: Docker image sizes (`docker image inspect`).
+- Reported as "bytes operator must pull to run the stack."
 
 ### D5 — Audit visibility
 
 For one denied request, measure:
-- **D5a — Decision-to-log latency**: time from policy decision to a log entry being readable by an external auditor (file/socket).
-- **D5b — Tamper evidence**: is the log entry cryptographically tamper-evident out-of-the-box? (binary yes/no — not a number.)
+- **D5a — Decision-to-log latency**: time from policy decision to a log entry being readable by an external auditor.
+- **D5b — Tamper evidence**: is the log entry cryptographically tamper-evident out-of-the-box? (binary yes/no.)
 
 For GVM: WAL append + the seal of the batch containing the event.
-For OPA+Envoy: Envoy access log stdout/file or OPA decision log stdout/file.
+For OPA+Envoy: Envoy access log stdout/file or OPA decision log.
 
 This dimension is intentionally biased toward GVM because it measures
-something GVM ships by default and OPA+Envoy does not. The bias is
-*the point* — it surfaces a scope difference that would otherwise be
-invisible in latency numbers.
+something GVM ships by default and OPA+Envoy does not. The bias is *the
+point*: it surfaces a scope difference invisible in latency numbers.
 
 ## 5. Fairness Rules
 
-1. **Same hardware**: EC2 t3.medium (`Intel Xeon @ 2.5 GHz, 2 vCPU, 4 GB`), Ubuntu 22.04, kernel 6.17.
-2. **Same network setup**: local mock upstream (Python `http.server` on `127.0.0.1:9999`).
-3. **Same policy semantics**: the three logical rules above, no extras either side.
+1. **Same hardware**: EC2 t3.medium (`Intel Xeon @ 2.5 GHz, 2 vCPU, 4 GB`), Ubuntu 22.04+, kernel 6.17.
+2. **Same network**: mock upstream on `0.0.0.0:9999`, reachable from sandbox/container via the host's primary IP. No `/etc/hosts` hijacking, no synthetic DNS.
+3. **Same logical policy**: two rules (Deny POST /transfer, Allow everything else on bench host).
 4. **No decision cache** on either side.
-5. **No TLS in D1**: TLS adds variance, both sides handle it equivalently. The MITM/TLS overhead is measured separately in the existing GVM bench (`scripts/bench-overhead.sh`).
-6. **Both stacks built from upstream release artefacts**:
-   - GVM: `cargo build --release` from current `master`. Print `git rev` + binary mtime at bench start.
-   - Envoy: official Docker image `envoyproxy/envoy:v1.32-latest` (pinned at run time).
-   - OPA: official `openpolicyagent/opa:1.16.2-envoy` (pinned; OPA's `:N.N.N-envoy` image variant ships the gRPC ext_authz plugin pre-installed).
-7. **Warm-up**: 100 throw-away requests before each measurement window.
-8. **Single-host topology**: no multi-node, no service mesh, no orchestrator. Same constraint both sides.
-
-The constraints favour neither stack — they pin the comparison to what
-both can do alone, on one host, with declarative policy.
+5. **Same workload shape**: the same agent script runs inside isolation on both sides — a shell loop issuing `n` curls with `-w '%{time_total}'`.
+6. **Same isolation primitive class**: both sides use Linux namespaces + cgroups + their own per-instance network namespace. GVM adds seccomp + transparent iptables redirect; Docker does not (default config). This is a real asymmetry — see §2 "Critical asymmetry" — and is documented next to results, not hidden.
+7. **Pinned upstream artefact versions**:
+   - GVM: `cargo build --release` from current `master`. Bench prints `git rev` + binary mtime.
+   - Envoy: `envoyproxy/envoy:v1.32-latest`.
+   - OPA: `openpolicyagent/opa:1.16.2-envoy`.
+8. **Warm-up**: 100 throw-away requests before each measurement window.
+9. **Single-host topology**: no multi-node, no orchestrator. Same on both sides.
 
 ## 6. Results
 
-> Filled after EC2 run. Placeholders below — each subsection becomes a
-> table + a one-paragraph reading once data is in.
+> Filled after EC2 run.
 
-### D1 — Per-request latency
+### D1 — Steady-state per-request latency (inside isolation)
 
-| Stack | D1a Allow (p50/p95/p99) | D1b Deny (p50/p95/p99) | D1c 10K fallthrough (p50/p95/p99) |
-|---|---|---|---|
-| GVM (Stack A) | TBD | TBD | TBD |
-| Envoy + OPA ext_authz (Stack B) | TBD | TBD | TBD |
-| Envoy + OPA-WASM (Stack C) | TBD | TBD | TBD |
-
-### D2 — Cold start
-
-| Stack | Time to first 200 | Notes |
+| Stack | D1a Allow (p50/p95/p99 ms) | D1b Deny (p50/p95/p99 ms) |
 |---|---|---|
-| GVM | TBD | sandbox + proxy autostart |
-| OPA+Envoy ext_authz | TBD | `docker compose up` + readiness probe |
-| OPA+Envoy WASM | TBD | same |
+| GVM (Stack A) | TBD | TBD |
+| Envoy + OPA ext_authz (Stack B) | TBD | TBD |
+| Envoy + OPA-WASM (Stack C) | TBD | TBD |
 
-### D3 — Memory footprint
+*Reading note: Stack A includes kernel-level transparent interception
+cost; Stack B/C uses cooperative HTTP_PROXY. Different security
+guarantees, same deployment shape — see §2 "Critical asymmetry."*
 
-| Stack | Idle RSS (sum) | Loaded RSS (sum) |
-|---|---|---|
-| GVM | TBD | TBD |
-| OPA+Envoy ext_authz | TBD | TBD |
-| OPA+Envoy WASM | TBD | TBD |
+### D2a — Workload cold start (control plane already up)
+
+| Stack | Time to first response (ms) |
+|---|---|
+| GVM (`gvm run --sandbox -- curl`) | TBD |
+| Docker + OPA ext_authz (`docker run ... curl`) | TBD |
+| Docker + OPA WASM | TBD |
+
+### D2b — Control plane cold start
+
+| Stack | Time to listener ready (ms) |
+|---|---|
+| GVM (`gvm-proxy` daemon) | TBD |
+| Envoy + OPA ext_authz (`docker run envoy` + `docker run opa`) | TBD |
+| Envoy + OPA WASM | TBD |
+
+### D3 — Memory footprint scaling
+
+| Stack | N=1 (MB) | N=5 (MB) | N=20 (MB) | Per-agent ~ (MB) |
+|---|---|---|---|---|
+| GVM | TBD | TBD | TBD | TBD |
+| OPA + Envoy ext_authz | TBD | TBD | TBD | TBD |
+| OPA + Envoy WASM | TBD | TBD | TBD | TBD |
 
 ### D4 — Distribution size
 
@@ -214,47 +310,47 @@ both can do alone, on one host, with declarative policy.
 
 ### D5 — Audit visibility
 
-| Stack | D5a decision→log latency | D5b tamper evidence |
+| Stack | D5a decision→log (ms) | D5b tamper evidence |
 |---|---|---|
-| GVM | TBD (WAL append + seal) | ✓ Merkle + Ed25519 anchors |
-| OPA+Envoy ext_authz | TBD (Envoy access log + OPA decision log) | ✗ not by default |
-| OPA+Envoy WASM | TBD | ✗ not by default |
+| GVM | TBD | ✓ Merkle + Ed25519 anchors |
+| Envoy + OPA ext_authz | TBD | ✗ not default |
+| Envoy + OPA WASM | TBD | ✗ not default |
 
 ## 7. Analysis
 
 > Filled after results. Sections planned:
 >
-> - **Where GVM wins**: expected D3 (memory), D4 (size), D5 (audit), possibly D2 (cold start of proxy alone).
-> - **Where it's a wash**: expected D1a/D1b (both engines in-process ≈ ns-µs).
-> - **Where OPA+Envoy wins (if anywhere)**: possibly D1c (mature index structures vs GVM's linear scan), possibly D2 cold start if container layer caching is in play.
-> - **What this means for the thesis**: the orchestrator-friendly v0.7 surface converges on OPA+Envoy in *shape*; the data tests whether it converges in *cost*.
+> - **Where vertical integration wins**: expected D4 (size), D5 (audit), D2b (control plane cold start).
+> - **Where vertical integration costs**: expected D3 (per-agent memory grows), possibly D1 (kernel intercept cost).
+> - **Where it's a wash**: expected D1 between A and C (both in-process eval after the intercept hop).
+> - **What this means for the thesis**: the orchestrator-friendly v0.7 surface converges on OPA+Envoy in *shape*; the data tests whether it converges in *cost across the dimensions an operator actually cares about*.
 
 ## 8. Reproducibility
 
-- Bench scripts: [`scripts/comparison/`](../../scripts/comparison/)
-- Run instructions: [`scripts/comparison/README.md`](../../scripts/comparison/README.md)
-- Raw output: `results/comparison-<timestamp>/` (gitignored; archived under
-  [`docs/internal/raw/`](raw/) after each run)
-- All stacks pin upstream artefact versions (§5.6) so a future operator
+- Bench scripts: [`scripts/comparison/`](../../scripts/comparison/).
+- Run instructions: [`scripts/comparison/README.md`](../../scripts/comparison/README.md).
+- Raw output: `results/comparison-<timestamp>/` (gitignored; archived
+  under [`docs/internal/raw/`](raw/) after each run).
+- All stacks pin upstream artefact versions (§5.7) so a future operator
   on a different machine reproduces within hardware variance.
 
 ## 9. Known Limitations
 
-1. **OPA-WASM filter is less production-deployed** than ext_authz. Stack C
-   represents the *theoretical best-case* for OPA+Envoy latency; many
-   production deployments do not run it. Stack B (ext_authz) is the
-   honest representation of "what most operators have."
-2. **No multi-node measurement.** A real production OPA+Envoy deployment
-   often has OPA bundle distribution latency, cross-node policy
-   propagation delay, Envoy CDS push timing. Single-host comparison
-   misses these. They are not relevant to GVM's design space (single
-   host is the default), so the omission is intentional but worth noting.
-3. **No L7 features that Envoy has and GVM does not.** Envoy is a
-   general-purpose proxy — circuit breaking, retries, load balancing,
-   gRPC-Web transcoding, JWT validation, mTLS termination. We do not
-   benchmark these because GVM does not aim at them. Operators who need
-   them have OPA+Envoy as the better choice; this comparison is for
-   operators who need the GVM-shaped feature set.
-4. **One policy shape per dimension.** Real policy complexity varies.
-   We use a narrow shape that both engines handle well to keep the
-   comparison about engine cost, not policy complexity.
+1. **Asymmetric interception** — Stack A intercepts transparently
+   (kernel iptables), Stack B/C cooperatively (HTTP_PROXY env). Same
+   deployment shape, different security guarantees. Documented next
+   to every D1 result, not hidden.
+2. **OPA-WASM is less production-deployed** than ext_authz. Stack C
+   represents *theoretical best-case* OPA+Envoy latency; many real
+   deployments use ext_authz. Both are measured so readers can pick
+   the comparison point that matches their deployment.
+3. **No multi-host measurement.** Real OPA+Envoy production often has
+   OPA bundle distribution, Envoy CDS push, cross-node policy
+   propagation latency. Single-host comparison misses these and
+   intentionally so — single-host is GVM's design space.
+4. **No L7 features that Envoy has and GVM does not.** Circuit
+   breaking, retries, load balancing, gRPC-Web, mTLS termination. GVM
+   does not aim at these; operators who need them should use OPA+Envoy.
+5. **N=20 ceiling on D3.** EC2 t3.medium has 4 GB RAM; N=50 or N=100
+   would test resource exhaustion, not steady-state scaling. The N=1/5/20
+   sweep captures the per-agent overhead trend.

@@ -1,33 +1,28 @@
 # SRR ruleset for GVM-side of the OPA+Envoy comparison benchmark.
 #
-# Semantic equivalent of scripts/comparison/policy.rego — three logical
-# rules, narrow shape, comparable to what Envoy+OPA evaluates on each
-# request. The point is to measure engine cost on identical policy,
-# NOT to test SRR's full expressiveness.
+# Bench target is the synthetic hostname `bench.local`, mapped to the
+# EC2 host's primary IP via /etc/hosts (bench.sh sets + cleans up the
+# /etc/hosts entry around each run). The agent inside `gvm run
+# --sandbox` resolves bench.local via the host's /etc/hosts (visible to
+# the sandbox via overlayfs), connects to that IP:9999, gets intercepted
+# by GVM's iptables DNAT, and gvm-proxy applies these rules using
+# host=bench.local:9999 (preserved from the Host header).
+#
+# Allow / Deny discrimination is by path + method (host is constant
+# across scenarios). Matches the Rego policy in policy.rego.
 
-# ── Rule 1: Allow LLM API ─────────────────────────────────────────────
-[[rules]]
-method = "*"
-pattern = "api.anthropic.com/{any}"
-decision = { type = "Allow" }
-description = "Anthropic LLM API"
-label = "anthropic-allow"
-
-# ── Rule 2: Deny POST to payment endpoint ─────────────────────────────
+# ── Rule 1: Deny POST to /transfer ────────────────────────────────────
 [[rules]]
 method = "POST"
-pattern = "api.bank.com/transfer"
-decision = { type = "Deny", reason = "Payment endpoint requires explicit approval" }
-description = "Bank transfer endpoint"
-label = "bank-transfer-deny"
+pattern = "bench.local:9999/transfer"
+decision = { type = "Deny", reason = "Bench deny scenario" }
+description = "Bench deny endpoint"
+label = "bench-deny"
 
-# ── Rule 3: Default audit-only catch-all ──────────────────────────────
-# AuditOnly is GVM-specific (records the event but allows the request).
-# Rego cannot natively express this with a single decision — the closest
-# equivalent in the Rego side is `allow = true` + `audit = true` marker.
+# ── Rule 2: Allow everything else on the bench host ───────────────────
 [[rules]]
 method = "*"
-pattern = "{any}"
-decision = { type = "AuditOnly" }
-description = "Default audit-allow catch-all"
-label = "default-audit"
+pattern = "bench.local:9999/{any}"
+decision = { type = "Allow" }
+description = "Bench allow catch-all on the mock upstream"
+label = "bench-allow"

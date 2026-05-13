@@ -1,24 +1,32 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════
-# GVM vs OPA+Envoy+Docker — multi-dimensional comparison benchmark.
+# GVM vs OPA+Envoy+Docker — full-stack comparison benchmark (v2).
 #
-# Measures D1-D5 (see docs/internal/comparison-opa-envoy.md §4) across
-# three stacks:
-#   A — GVM       (gvm-proxy + sandbox + WAL)
-#   B — Envoy + OPA ext_authz (gRPC)
-#   C — Envoy + OPA WASM (in-process)
+# Measures the GVM stack as actually deployed (workload inside
+# `gvm run --sandbox`, transparent kernel-level intercept) against the
+# OPA+Envoy stack as actually deployed (workload inside `docker run`
+# with cooperative HTTP_PROXY → Envoy → OPA).
 #
-# Mock upstream on 127.0.0.1:9999 — local, so no network jitter.
+# See docs/internal/comparison-opa-envoy.md for full methodology,
+# fairness rules, and the transparent-vs-cooperative disclaimer.
+#
+# Dimensions:
+#   d1   per-request latency inside isolation (steady-state)
+#   d2a  workload cold start (control plane already up)
+#   d2b  control-plane cold start
+#   d3   memory @ N=1, 5, 10 idle agents
+#   d4   distribution size
+#   d5   decision-to-log latency + tamper evidence
 #
 # Requirements:
-#   - bash scripts/comparison/setup.sh has been run on this host
+#   - scripts/comparison/setup.sh has been run
 #   - GVM built in release mode: cargo build --release -p gvm-cli -p gvm-proxy
-#   - User in `docker` group (or run with sudo)
+#   - sudo (for gvm sandbox + docker without group membership)
 #
 # Usage:
-#   bash scripts/comparison/bench.sh           # full sweep
-#   bash scripts/comparison/bench.sh d1        # only D1 (latency)
-#   bash scripts/comparison/bench.sh d2 d3     # only D2 + D3
+#   sudo bash scripts/comparison/bench.sh           # full sweep
+#   sudo bash scripts/comparison/bench.sh d1        # only D1
+#   sudo bash scripts/comparison/bench.sh d2a d2b   # both cold starts
 # ═══════════════════════════════════════════════════════════════════
 
 set -o pipefail
@@ -34,7 +42,7 @@ GVM_BIN="$REPO_DIR/target/release/gvm"
 GVM_PROXY_BIN="$REPO_DIR/target/release/gvm-proxy"
 GIT_REV="$(cd "$REPO_DIR" && git rev-parse --short HEAD)"
 
-# Sanity: latest binary (anti-stale-binary check per CLAUDE.md)
+# ── Latest-binary check ─────────────────────────────────────────────
 if [ ! -x "$GVM_BIN" ] || [ ! -x "$GVM_PROXY_BIN" ]; then
     echo "ERROR: GVM binaries missing. Run: cargo build --release -p gvm-cli -p gvm-proxy"
     exit 1
@@ -42,93 +50,107 @@ fi
 GVM_MTIME="$(stat -c %Y "$GVM_BIN" 2>/dev/null || stat -f %m "$GVM_BIN")"
 PROXY_MTIME="$(stat -c %Y "$GVM_PROXY_BIN" 2>/dev/null || stat -f %m "$GVM_PROXY_BIN")"
 
-echo "═══════════════════════════════════════════════════════════════════"
-echo "GVM vs OPA+Envoy comparison — $STAMP"
-echo "  git rev:        $GIT_REV"
-echo "  gvm mtime:      $(date -d "@$GVM_MTIME" 2>/dev/null || date -r "$GVM_MTIME")"
-echo "  gvm-proxy mtime:$(date -d "@$PROXY_MTIME" 2>/dev/null || date -r "$PROXY_MTIME")"
-echo "  results in:     $RESULTS_DIR"
-echo "═══════════════════════════════════════════════════════════════════"
-echo ""
-
-# ── Stack ports ─────────────────────────────────────────────────────
-UPSTREAM_PORT=9999
-GVM_PROXY_PORT=8080
-ENVOY_EXTAUTHZ_PORT=10000
-ENVOY_WASM_PORT=10001
-OPA_GRPC_PORT=9191
-
 # ── Docker permission shim ──────────────────────────────────────────
-# If the operator is not in the `docker` group, fall back to `sudo docker`.
-# Cleaner than asking the operator to re-login mid-bench.
 if groups 2>/dev/null | grep -qw docker; then
     DOCKER="docker"
 else
     DOCKER="sudo docker"
 fi
 
+# ── Host primary IP (sandbox/container reach this for the mock) ─────
+HOST_IP="$(hostname -I | awk '{print $1}')"
+if [ -z "$HOST_IP" ]; then
+    echo "ERROR: could not determine host IP via hostname -I"
+    exit 1
+fi
+
+# ── /etc/hosts marker for bench.local → HOST_IP ─────────────────────
+ETC_HOSTS_MARKER="# gvm-bench bench.local"
+add_bench_hosts() {
+    if ! grep -q "$ETC_HOSTS_MARKER" /etc/hosts; then
+        echo "$HOST_IP bench.local  $ETC_HOSTS_MARKER" | sudo tee -a /etc/hosts >/dev/null
+    fi
+}
+remove_bench_hosts() {
+    sudo sed -i.bak "/$ETC_HOSTS_MARKER/d" /etc/hosts
+    sudo rm -f /etc/hosts.bak
+}
+
+# ── Ports ───────────────────────────────────────────────────────────
+UPSTREAM_PORT=9999
+GVM_PROXY_PORT=8080
+ENVOY_EXTAUTHZ_PORT=10000
+ENVOY_WASM_PORT=10001
+OPA_GRPC_PORT=9191
+
+echo "═══════════════════════════════════════════════════════════════════"
+echo "GVM vs OPA+Envoy comparison v2 (full-stack) — $STAMP"
+echo "  git rev:        $GIT_REV"
+echo "  gvm mtime:      $(date -d "@$GVM_MTIME" 2>/dev/null || date -r "$GVM_MTIME")"
+echo "  gvm-proxy mtime:$(date -d "@$PROXY_MTIME" 2>/dev/null || date -r "$PROXY_MTIME")"
+echo "  host IP:        $HOST_IP (used for bench.local mapping)"
+echo "  results in:     $RESULTS_DIR"
+echo "═══════════════════════════════════════════════════════════════════"
+echo ""
+
 # ── Process bookkeeping ─────────────────────────────────────────────
 PIDS_TO_KILL=()
 CONTAINERS_TO_STOP=()
+GVM_TMP_CONFIG=""
 
 cleanup() {
-    for pid in "${PIDS_TO_KILL[@]:-}"; do
-        kill "$pid" 2>/dev/null || true
-    done
-    for c in "${CONTAINERS_TO_STOP[@]:-}"; do
-        $DOCKER rm -f "$c" 2>/dev/null >/dev/null || true
-    done
+    for pid in "${PIDS_TO_KILL[@]:-}"; do kill "$pid" 2>/dev/null || true; done
+    for c in "${CONTAINERS_TO_STOP[@]:-}"; do $DOCKER rm -f "$c" 2>/dev/null >/dev/null || true; done
+    [ -n "$GVM_TMP_CONFIG" ] && rm -rf "$GVM_TMP_CONFIG" 2>/dev/null
+    GVM_TMP_CONFIG=""
+    PIDS_TO_KILL=()
+    CONTAINERS_TO_STOP=()
 }
-trap cleanup EXIT INT TERM
+final_cleanup() {
+    cleanup
+    remove_bench_hosts
+}
+trap final_cleanup EXIT INT TERM
 
-# ── Mock upstream — Python http.server on 9999 ──────────────────────
+# ── Mock upstream — Python http.server on 0.0.0.0:9999 ──────────────
 start_upstream() {
-    python3 -c "
-import http.server, socketserver, sys
+    sudo python3 -c "
+import http.server, socketserver
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self): self.send_response(200); self.send_header('Content-Length','2'); self.end_headers(); self.wfile.write(b'OK')
-    def do_POST(self): self.send_response(200); self.send_header('Content-Length','2'); self.end_headers(); self.wfile.write(b'OK')
+    def do_POST(self): self.do_GET()
     def log_message(*a, **k): pass
-with socketserver.TCPServer(('127.0.0.1', $UPSTREAM_PORT), H) as s: s.serve_forever()
+class T(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+with T(('0.0.0.0', $UPSTREAM_PORT), H) as s: s.serve_forever()
 " &
     PIDS_TO_KILL+=($!)
-    # readiness wait
-    for _ in $(seq 1 20); do
+    for _ in $(seq 1 30); do
         curl -sS -o /dev/null "http://127.0.0.1:$UPSTREAM_PORT/" 2>/dev/null && return 0
         sleep 0.1
     done
+    echo "ERROR: upstream mock did not become ready"
     return 1
 }
 
-# ── Stack A — GVM ─────────────────────────────────────────────────────
-# Use a per-run temp config directory so the operator's real
-# config/srr_network.toml is never touched.
-GVM_TMP_CONFIG=""
-
-start_stack_a() {
+# ── Stack A control plane: gvm-proxy daemon ─────────────────────────
+start_gvm_proxy() {
     GVM_TMP_CONFIG="$(mktemp -d -t gvm-bench-XXXXXX)"
-    # Mirror just what gvm-proxy needs from config/.
     cp "$REPO_DIR/config/proxy.toml" "$GVM_TMP_CONFIG/proxy.toml" 2>/dev/null || true
     cp "$REPO_DIR/config/gvm.toml" "$GVM_TMP_CONFIG/gvm.toml" 2>/dev/null || true
     cp "$SCRIPT_DIR/srr-bench.toml" "$GVM_TMP_CONFIG/srr_network.toml"
-    GVM_CONFIG="$GVM_TMP_CONFIG/proxy.toml" \
-    GVM_TOML="$GVM_TMP_CONFIG/gvm.toml" \
+    sudo RUST_LOG=warn GVM_CONFIG="$GVM_TMP_CONFIG/proxy.toml" GVM_TOML="$GVM_TMP_CONFIG/gvm.toml" \
         "$GVM_PROXY_BIN" >"$RESULTS_DIR/gvm-proxy.log" 2>&1 &
     PIDS_TO_KILL+=($!)
-    for _ in $(seq 1 50); do
+    for _ in $(seq 1 60); do
         curl -sS -o /dev/null "http://127.0.0.1:$GVM_PROXY_PORT/healthz" 2>/dev/null && return 0
         sleep 0.1
     done
     return 1
 }
 
-cleanup_stack_a() {
-    [ -n "$GVM_TMP_CONFIG" ] && rm -rf "$GVM_TMP_CONFIG" 2>/dev/null
-    GVM_TMP_CONFIG=""
-}
-
-# ── Stack B — Envoy + OPA ext_authz ─────────────────────────────────
-start_stack_b() {
+# ── Stack B control plane: Envoy + OPA ext_authz containers ─────────
+start_envoy_extauthz() {
     $DOCKER run -d --rm --name opa-ext --network host \
         -v "$SCRIPT_DIR/policy.rego:/policy.rego:ro" \
         openpolicyagent/opa:1.16.2-envoy \
@@ -145,14 +167,14 @@ start_stack_b() {
     CONTAINERS_TO_STOP+=(envoy-ext)
 
     for _ in $(seq 1 100); do
-        curl -sS -o /dev/null "http://127.0.0.1:$ENVOY_EXTAUTHZ_PORT/" 2>/dev/null && return 0
+        curl -sS -o /dev/null --max-time 1 "http://127.0.0.1:$ENVOY_EXTAUTHZ_PORT/" 2>/dev/null && return 0
         sleep 0.1
     done
     return 1
 }
 
-# ── Stack C — Envoy + OPA WASM ──────────────────────────────────────
-start_stack_c() {
+# ── Stack C control plane: Envoy + OPA WASM container ───────────────
+start_envoy_wasm() {
     $DOCKER run -d --rm --name envoy-wasm --network host \
         -v "$SCRIPT_DIR/envoy-wasm.yaml:/etc/envoy/envoy.yaml:ro" \
         -v "$SCRIPT_DIR/build/opa-bundle:/etc/opa-bundle:ro" \
@@ -160,122 +182,239 @@ start_stack_c() {
         -c /etc/envoy/envoy.yaml >/dev/null
     CONTAINERS_TO_STOP+=(envoy-wasm)
     for _ in $(seq 1 100); do
-        curl -sS -o /dev/null "http://127.0.0.1:$ENVOY_WASM_PORT/" 2>/dev/null && return 0
+        curl -sS -o /dev/null --max-time 1 "http://127.0.0.1:$ENVOY_WASM_PORT/" 2>/dev/null && return 0
         sleep 0.1
     done
     return 1
 }
 
-stop_all_stacks() { cleanup; cleanup_stack_a; sleep 1; }
+stop_all() { cleanup; sleep 1; }
 
-# ── D1 — Per-request latency ────────────────────────────────────────
+# ── In-isolation workload runner — Stack A (GVM sandbox) ────────────
+# Runs N curls for the given scenario inside `gvm run --sandbox`.
+# Emits one line per request: "T:<seconds>" — parseable by awk.
+run_in_sandbox_a() {
+    local n="$1" method="$2" url_path="$3"
+    sudo "$GVM_BIN" run --sandbox -- bash -c "
+        for i in \$(seq 1 $n); do
+            t=\$(curl -sS -o /dev/null -w '%{time_total}\\n' -X $method http://bench.local:9999$url_path 2>/dev/null || echo 0)
+            echo \"T:\$t\"
+        done
+    " 2>/dev/null | grep -oP '^T:\K[0-9.]+' || true
+}
+
+# ── In-isolation workload runner — Stack B/C (Docker container) ─────
+run_in_docker_bc() {
+    local n="$1" method="$2" url_path="$3" envoy_port="$4"
+    $DOCKER run --rm \
+        --add-host "bench.local:$HOST_IP" \
+        -e "HTTP_PROXY=http://$HOST_IP:$envoy_port" \
+        -e "http_proxy=http://$HOST_IP:$envoy_port" \
+        curlimages/curl:8.10.1 \
+        sh -c "
+            for i in \$(seq 1 $n); do
+                t=\$(curl -sS -o /dev/null -w '%{time_total}\\n' -X $method http://bench.local:9999$url_path 2>/dev/null || echo 0)
+                echo \"T:\$t\"
+            done
+        " 2>/dev/null | grep -oP '^T:\K[0-9.]+' || true
+}
+
+stats_csv() {
+    local times_file="$1" stack="$2" scenario="$3"
+    python3 -c "
+v=sorted(float(x) for x in open('$times_file') if x.strip())
+if not v:
+    print('$stack','$scenario','0','0','0','0',sep=',')
+else:
+    n=len(v); med=v[n//2]*1000; p95=v[int(n*0.95) if n>=20 else n-1]*1000; p99=v[int(n*0.99) if n>=100 else n-1]*1000
+    print('$stack','$scenario',f'{med:.3f}',f'{p95:.3f}',f'{p99:.3f}',n,sep=',')
+"
+}
+
+# ── D1 — steady-state latency inside isolation ──────────────────────
 run_d1() {
-    echo "── D1 — Per-request enforcement latency ──────────────────────"
+    echo "── D1 — Steady-state per-request latency (inside isolation) ──"
     : >"$RESULTS_DIR/d1.csv"
     echo "stack,scenario,p50_ms,p95_ms,p99_ms,n" >>"$RESULTS_DIR/d1.csv"
     local n=1000
+    add_bench_hosts
+    $DOCKER pull curlimages/curl:8.10.1 >/dev/null 2>&1 || true
 
-    for stack in A B C; do
-        case "$stack" in
-            A) start_upstream && start_stack_a; port=$GVM_PROXY_PORT ;;
-            B) start_upstream && start_stack_b; port=$ENVOY_EXTAUTHZ_PORT ;;
-            C) start_upstream && start_stack_c; port=$ENVOY_WASM_PORT ;;
-        esac
+    # Stack A
+    start_upstream || return 1
+    start_gvm_proxy || { echo "GVM proxy failed; tail:"; tail "$RESULTS_DIR/gvm-proxy.log"; return 1; }
+    echo "  Stack A: gvm-proxy ready. Running $n×2 curls inside sandbox..."
+    # Warmup
+    run_in_sandbox_a 50 GET /v1/messages >/dev/null
+    run_in_sandbox_a "$n" GET /v1/messages >"$RESULTS_DIR/d1-A-allow.times"
+    run_in_sandbox_a "$n" POST /transfer >"$RESULTS_DIR/d1-A-deny.times"
+    stop_all
+    stats_csv "$RESULTS_DIR/d1-A-allow.times" A allow >>"$RESULTS_DIR/d1.csv"
+    stats_csv "$RESULTS_DIR/d1-A-deny.times"  A deny  >>"$RESULTS_DIR/d1.csv"
 
-        # warm up
-        for _ in $(seq 1 100); do curl -sS -o /dev/null "http://127.0.0.1:$port/v1/messages" -H "Host: api.anthropic.com" 2>/dev/null || true; done
+    # Stack B
+    start_upstream && start_envoy_extauthz || { echo "Stack B startup failed"; return 1; }
+    echo "  Stack B: Envoy+OPA ext_authz ready. Running $n×2 curls inside docker..."
+    run_in_docker_bc 50 GET /v1/messages "$ENVOY_EXTAUTHZ_PORT" >/dev/null
+    run_in_docker_bc "$n" GET /v1/messages "$ENVOY_EXTAUTHZ_PORT" >"$RESULTS_DIR/d1-B-allow.times"
+    run_in_docker_bc "$n" POST /transfer "$ENVOY_EXTAUTHZ_PORT" >"$RESULTS_DIR/d1-B-deny.times"
+    stop_all
+    stats_csv "$RESULTS_DIR/d1-B-allow.times" B allow >>"$RESULTS_DIR/d1.csv"
+    stats_csv "$RESULTS_DIR/d1-B-deny.times"  B deny  >>"$RESULTS_DIR/d1.csv"
 
-        for scenario in allow deny; do
-            local host path
-            case "$scenario" in
-                allow) host=api.anthropic.com; path=/v1/messages; method=GET ;;
-                deny)  host=api.bank.com;      path=/transfer;     method=POST ;;
-            esac
-            local times="$RESULTS_DIR/d1-$stack-$scenario.times"
-            : >"$times"
-            for _ in $(seq 1 $n); do
-                t=$(curl -sS -o /dev/null -w '%{time_total}\n' \
-                    -X "$method" "http://127.0.0.1:$port$path" \
-                    -H "Host: $host" 2>/dev/null || echo 0)
-                echo "$t" >>"$times"
-            done
-            python3 -c "
-v=sorted(float(x)*1000 for x in open('$times') if x.strip())
-n=len(v)
-print('$stack','$scenario',f'{v[n//2]:.3f}',f'{v[int(n*0.95)]:.3f}',f'{v[int(n*0.99)]:.3f}',n,sep=',')" \
-                >>"$RESULTS_DIR/d1.csv"
-        done
-        stop_all_stacks
-    done
+    # Stack C
+    start_upstream && start_envoy_wasm || { echo "Stack C startup failed"; return 1; }
+    echo "  Stack C: Envoy+OPA WASM ready. Running $n×2 curls inside docker..."
+    run_in_docker_bc 50 GET /v1/messages "$ENVOY_WASM_PORT" >/dev/null
+    run_in_docker_bc "$n" GET /v1/messages "$ENVOY_WASM_PORT" >"$RESULTS_DIR/d1-C-allow.times"
+    run_in_docker_bc "$n" POST /transfer "$ENVOY_WASM_PORT" >"$RESULTS_DIR/d1-C-deny.times"
+    stop_all
+    stats_csv "$RESULTS_DIR/d1-C-allow.times" C allow >>"$RESULTS_DIR/d1.csv"
+    stats_csv "$RESULTS_DIR/d1-C-deny.times"  C deny  >>"$RESULTS_DIR/d1.csv"
 
     echo "  results: $RESULTS_DIR/d1.csv"
     cat "$RESULTS_DIR/d1.csv"
 }
 
-# ── D2 — Cold start ─────────────────────────────────────────────────
-run_d2() {
-    echo "── D2 — Cold start to first decision ─────────────────────────"
-    : >"$RESULTS_DIR/d2.csv"
-    echo "stack,iter,cold_start_ms" >>"$RESULTS_DIR/d2.csv"
+# ── D2a — workload cold start (control plane already up) ────────────
+run_d2a() {
+    echo "── D2a — Workload cold start ─────────────────────────────────"
+    : >"$RESULTS_DIR/d2a.csv"
+    echo "stack,iter,workload_cold_start_ms" >>"$RESULTS_DIR/d2a.csv"
     local iters=5
-    for stack in A B C; do
-        for i in $(seq 1 $iters); do
-            stop_all_stacks
-            start_upstream
-            local t0=$(date +%s%3N)
-            case "$stack" in
-                A) start_stack_a; port=$GVM_PROXY_PORT ;;
-                B) start_stack_b; port=$ENVOY_EXTAUTHZ_PORT ;;
-                C) start_stack_c; port=$ENVOY_WASM_PORT ;;
-            esac
-            curl -sS -o /dev/null "http://127.0.0.1:$port/v1/messages" -H "Host: api.anthropic.com" 2>/dev/null
-            local t1=$(date +%s%3N)
-            echo "$stack,$i,$((t1-t0))" >>"$RESULTS_DIR/d2.csv"
-        done
+    add_bench_hosts
+
+    start_upstream && start_gvm_proxy
+    for i in $(seq 1 $iters); do
+        local t0=$(date +%s%3N)
+        sudo "$GVM_BIN" run --sandbox -- bash -c "curl -sS -o /dev/null http://bench.local:9999/v1/messages" 2>/dev/null
+        local t1=$(date +%s%3N)
+        echo "A,$i,$((t1-t0))" >>"$RESULTS_DIR/d2a.csv"
     done
-    stop_all_stacks
-    echo "  results: $RESULTS_DIR/d2.csv"
-    cat "$RESULTS_DIR/d2.csv"
+    stop_all
+
+    for stack_tag in B:start_envoy_extauthz:$ENVOY_EXTAUTHZ_PORT C:start_envoy_wasm:$ENVOY_WASM_PORT; do
+        IFS=: read -r tag fn port <<<"$stack_tag"
+        start_upstream && $fn
+        for i in $(seq 1 $iters); do
+            local t0=$(date +%s%3N)
+            $DOCKER run --rm \
+                --add-host "bench.local:$HOST_IP" \
+                -e "HTTP_PROXY=http://$HOST_IP:$port" \
+                curlimages/curl:8.10.1 \
+                curl -sS -o /dev/null http://bench.local:9999/v1/messages 2>/dev/null
+            local t1=$(date +%s%3N)
+            echo "$tag,$i,$((t1-t0))" >>"$RESULTS_DIR/d2a.csv"
+        done
+        stop_all
+    done
+    echo "  results: $RESULTS_DIR/d2a.csv"
+    cat "$RESULTS_DIR/d2a.csv"
 }
 
-# ── D3 — Memory footprint ───────────────────────────────────────────
+# ── D2b — control-plane cold start ──────────────────────────────────
+run_d2b() {
+    echo "── D2b — Control-plane cold start ────────────────────────────"
+    : >"$RESULTS_DIR/d2b.csv"
+    echo "stack,iter,control_plane_cold_start_ms" >>"$RESULTS_DIR/d2b.csv"
+    local iters=5
+    for i in $(seq 1 $iters); do
+        stop_all
+        local t0=$(date +%s%3N)
+        start_gvm_proxy
+        local t1=$(date +%s%3N)
+        echo "A,$i,$((t1-t0))" >>"$RESULTS_DIR/d2b.csv"
+        stop_all
+    done
+
+    for stack_tag in B:start_envoy_extauthz C:start_envoy_wasm; do
+        IFS=: read -r tag fn <<<"$stack_tag"
+        for i in $(seq 1 $iters); do
+            stop_all
+            local t0=$(date +%s%3N)
+            $fn
+            local t1=$(date +%s%3N)
+            echo "$tag,$i,$((t1-t0))" >>"$RESULTS_DIR/d2b.csv"
+            stop_all
+        done
+    done
+    echo "  results: $RESULTS_DIR/d2b.csv"
+    cat "$RESULTS_DIR/d2b.csv"
+}
+
+# ── D3 — memory with sandbox/container scaling ──────────────────────
 run_d3() {
-    echo "── D3 — Memory footprint ─────────────────────────────────────"
+    echo "── D3 — Memory @ N=1, 5, 10 idle agents ──────────────────────"
     : >"$RESULTS_DIR/d3.csv"
-    echo "stack,state,process,rss_kb" >>"$RESULTS_DIR/d3.csv"
-    for stack in A B C; do
-        start_upstream
-        case "$stack" in A) start_stack_a; port=$GVM_PROXY_PORT;; B) start_stack_b; port=$ENVOY_EXTAUTHZ_PORT;; C) start_stack_c; port=$ENVOY_WASM_PORT;; esac
-        sleep 30  # idle settle
-        sample_d3 "$stack" idle "$port"
-        for _ in $(seq 1 500); do curl -sS -o /dev/null "http://127.0.0.1:$port/v1/messages" -H "Host: api.anthropic.com" 2>/dev/null || true; done
-        sample_d3 "$stack" loaded "$port"
-        stop_all_stacks
+    echo "stack,N,total_rss_kb" >>"$RESULTS_DIR/d3.csv"
+    add_bench_hosts
+
+    for N in 1 5 10; do
+        # Stack A: gvm-proxy + N × gvm sandbox children, each `sleep 60`.
+        start_upstream && start_gvm_proxy
+        local sandbox_pids=()
+        for _ in $(seq 1 "$N"); do
+            sudo "$GVM_BIN" run --sandbox -- sleep 60 >/dev/null 2>&1 &
+            sandbox_pids+=($!)
+        done
+        sleep 15  # let all sandboxes complete setup
+        local total_a=0
+        for p in $(pgrep -f 'gvm-proxy\|gvm.*run.*--sandbox\|sleep 60' 2>/dev/null); do
+            local rss=$(ps -p "$p" -o rss= 2>/dev/null | awk '{print $1+0}')
+            total_a=$((total_a + ${rss:-0}))
+        done
+        echo "A,$N,$total_a" >>"$RESULTS_DIR/d3.csv"
+        for p in "${sandbox_pids[@]}"; do sudo kill -TERM "$p" 2>/dev/null || true; done
+        sleep 2
+        stop_all
+
+        # Stack B: envoy + opa + N × alpine containers `sleep 60`.
+        start_upstream && start_envoy_extauthz
+        local container_names=()
+        for j in $(seq 1 "$N"); do
+            local cn="bench-idle-b-$j"
+            $DOCKER run -d --rm --name "$cn" alpine sleep 60 >/dev/null 2>&1
+            container_names+=("$cn")
+        done
+        sleep 5
+        local total_b=0
+        for c in envoy-ext opa-ext "${container_names[@]}"; do
+            local pid=$($DOCKER inspect -f '{{.State.Pid}}' "$c" 2>/dev/null)
+            [ -n "$pid" ] && [ "$pid" != "0" ] && {
+                local rss=$(ps -p "$pid" -o rss= 2>/dev/null | awk '{print $1+0}')
+                total_b=$((total_b + ${rss:-0}))
+            }
+        done
+        echo "B,$N,$total_b" >>"$RESULTS_DIR/d3.csv"
+        for c in "${container_names[@]}"; do $DOCKER rm -f "$c" >/dev/null 2>&1 || true; done
+        stop_all
+
+        # Stack C: same as B but with envoy-wasm.
+        start_upstream && start_envoy_wasm
+        container_names=()
+        for j in $(seq 1 "$N"); do
+            local cn="bench-idle-c-$j"
+            $DOCKER run -d --rm --name "$cn" alpine sleep 60 >/dev/null 2>&1
+            container_names+=("$cn")
+        done
+        sleep 5
+        local total_c=0
+        for c in envoy-wasm "${container_names[@]}"; do
+            local pid=$($DOCKER inspect -f '{{.State.Pid}}' "$c" 2>/dev/null)
+            [ -n "$pid" ] && [ "$pid" != "0" ] && {
+                local rss=$(ps -p "$pid" -o rss= 2>/dev/null | awk '{print $1+0}')
+                total_c=$((total_c + ${rss:-0}))
+            }
+        done
+        echo "C,$N,$total_c" >>"$RESULTS_DIR/d3.csv"
+        for c in "${container_names[@]}"; do $DOCKER rm -f "$c" >/dev/null 2>&1 || true; done
+        stop_all
     done
     echo "  results: $RESULTS_DIR/d3.csv"
     cat "$RESULTS_DIR/d3.csv"
 }
 
-sample_d3() {
-    local stack="$1" state="$2" port="$3"
-    case "$stack" in
-        A)
-            for proc in gvm-proxy; do
-                local rss=$(ps -C "$proc" -o rss= 2>/dev/null | awk '{s+=$1} END {print s+0}')
-                echo "$stack,$state,$proc,$rss" >>"$RESULTS_DIR/d3.csv"
-            done
-            ;;
-        B|C)
-            for c in $($DOCKER ps --format '{{.Names}}' | grep -E 'envoy|opa-ext|envoy-wasm'); do
-                local pid=$($DOCKER inspect -f '{{.State.Pid}}' "$c" 2>/dev/null)
-                local rss=$(ps -p "$pid" -o rss= 2>/dev/null | awk '{print $1+0}')
-                echo "$stack,$state,$c,$rss" >>"$RESULTS_DIR/d3.csv"
-            done
-            ;;
-    esac
-}
-
-# ── D4 — Distribution size ──────────────────────────────────────────
+# ── D4 — distribution size ──────────────────────────────────────────
 run_d4() {
     echo "── D4 — Distribution size ────────────────────────────────────"
     : >"$RESULTS_DIR/d4.csv"
@@ -290,42 +429,41 @@ run_d4() {
     cat "$RESULTS_DIR/d4.csv"
 }
 
-# ── D5 — Audit visibility ───────────────────────────────────────────
+# ── D5 — decision-to-log latency + tamper evidence ──────────────────
 run_d5() {
     echo "── D5 — Audit visibility ─────────────────────────────────────"
     : >"$RESULTS_DIR/d5.csv"
     echo "stack,decision_to_log_ms,tamper_evident" >>"$RESULTS_DIR/d5.csv"
-    # GVM: WAL is in REPO_DIR/data/wal/wal.log (per default proxy.toml).
-    start_upstream && start_stack_a
-    local wal_path="$REPO_DIR/data/wal/wal.log"
+    add_bench_hosts
+
+    start_upstream && start_gvm_proxy
+    local wal_path="$REPO_DIR/data/wal.log"
     local t0=$(date +%s%3N)
-    curl -sS -o /dev/null -X POST "http://127.0.0.1:$GVM_PROXY_PORT/transfer" -H "Host: api.bank.com" 2>/dev/null
-    # Wait for the deny event to appear in WAL.
+    sudo "$GVM_BIN" run --sandbox -- curl -sS -o /dev/null -X POST http://bench.local:9999/transfer 2>/dev/null
     for _ in $(seq 1 100); do
-        if grep -q "bank-transfer-deny\|api.bank.com" "$wal_path" 2>/dev/null; then
-            break
-        fi
+        grep -q "bench-deny\|bench.local" "$wal_path" 2>/dev/null && break
         sleep 0.05
     done
     local t1=$(date +%s%3N)
     echo "A,$((t1-t0)),yes" >>"$RESULTS_DIR/d5.csv"
-    stop_all_stacks
+    stop_all
 
-    for stack_label in B:start_stack_b:$ENVOY_EXTAUTHZ_PORT C:start_stack_c:$ENVOY_WASM_PORT; do
-        IFS=: read -r tag fn port <<<"$stack_label"
+    for stack_tag in B:start_envoy_extauthz:$ENVOY_EXTAUTHZ_PORT:envoy-ext C:start_envoy_wasm:$ENVOY_WASM_PORT:envoy-wasm; do
+        IFS=: read -r tag fn port cname <<<"$stack_tag"
         start_upstream && $fn
-        # Envoy access log path inside containers, mapped via stdout — tail through `docker logs`.
-        local cname
-        case "$tag" in B) cname=envoy-ext;; C) cname=envoy-wasm;; esac
         local t0=$(date +%s%3N)
-        curl -sS -o /dev/null -X POST "http://127.0.0.1:$port/transfer" -H "Host: api.bank.com" 2>/dev/null
+        $DOCKER run --rm \
+            --add-host "bench.local:$HOST_IP" \
+            -e "HTTP_PROXY=http://$HOST_IP:$port" \
+            curlimages/curl:8.10.1 \
+            curl -sS -o /dev/null -X POST http://bench.local:9999/transfer 2>/dev/null
         for _ in $(seq 1 100); do
-            $DOCKER logs "$cname" 2>&1 | grep -q "api.bank.com" && break
+            $DOCKER logs "$cname" 2>&1 | grep -q "/transfer" && break
             sleep 0.05
         done
         local t1=$(date +%s%3N)
         echo "$tag,$((t1-t0)),no" >>"$RESULTS_DIR/d5.csv"
-        stop_all_stacks
+        stop_all
     done
     echo "  results: $RESULTS_DIR/d5.csv"
     cat "$RESULTS_DIR/d5.csv"
@@ -333,11 +471,12 @@ run_d5() {
 
 # ── Run selected dimensions ─────────────────────────────────────────
 DIMS=("$@")
-if [ ${#DIMS[@]} -eq 0 ]; then DIMS=(d1 d2 d3 d4 d5); fi
+if [ ${#DIMS[@]} -eq 0 ]; then DIMS=(d1 d2a d2b d3 d4 d5); fi
 for d in "${DIMS[@]}"; do
     case "$d" in
         d1) run_d1 ;;
-        d2) run_d2 ;;
+        d2a) run_d2a ;;
+        d2b) run_d2b ;;
         d3) run_d3 ;;
         d4) run_d4 ;;
         d5) run_d5 ;;
@@ -348,11 +487,12 @@ done
 
 # ── Manifest ────────────────────────────────────────────────────────
 cat >"$RESULTS_DIR/manifest.txt" <<EOF
-GVM vs OPA+Envoy comparison
+GVM vs OPA+Envoy comparison v2 (full-stack)
 timestamp: $STAMP
 git rev:   $GIT_REV
 host:      $(uname -a)
 kernel:    $(uname -r)
+host IP:   $HOST_IP (bench.local mapping)
 gvm binary mtime:        $(date -d "@$GVM_MTIME" 2>/dev/null || date -r "$GVM_MTIME")
 gvm-proxy binary mtime:  $(date -d "@$PROXY_MTIME" 2>/dev/null || date -r "$PROXY_MTIME")
 envoy image:             envoyproxy/envoy:v1.32-latest

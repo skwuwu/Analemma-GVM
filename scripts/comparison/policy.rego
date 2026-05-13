@@ -1,52 +1,29 @@
-# Rego policy — semantic equivalent of scripts/comparison/srr-bench.toml.
+# Rego policy — semantic equivalent of srr-bench.toml.
 #
-# The package name `envoy.authz` matches what envoy-extauthz.yaml and
-# envoy-wasm.yaml expect. Decision is exposed via `allow` (default false)
-# and `result` (rich object for ext_authz).
+# Bench target is the synthetic hostname `bench.local`, mapped to the
+# EC2 host's primary IP at the system layer (host /etc/hosts on the GVM
+# side; `docker run --add-host` for the OPA+Envoy side). The agent
+# inside isolation uses HTTP_PROXY=envoy to forward requests through
+# Envoy; OPA receives the Host header as `bench.local:9999` and matches
+# on that string.
 #
-# Logical rules (same as SRR side):
-#   1. Allow  api.anthropic.com/*  any method
-#   2. Deny   POST api.bank.com/transfer
-#   3. Default: Allow with audit (Rego cannot natively express "audit
-#      only" the way SRR does — closest match is `allow = true` with
-#      an `audit: true` marker on the result object.)
-#
-# Input shape (Envoy ext_authz):
-#   input.attributes.request.http = { host, path, method, ... }
-# Input shape (OPA-WASM filter):
-#   same shape via Envoy's WASM context — the filter populates the
-#   identical envelope.
+# Allow / Deny discrimination is by path + method (host is constant
+# across scenarios). Matches the SRR rules in srr-bench.toml.
 
 package envoy.authz
 
 import future.keywords.if
-import future.keywords.in
 
 default allow := true
 
 default result := {
     "allowed": true,
-    "rule": "default-allow-audit",
-    "audit": true,
+    "rule": "bench-allow",
 }
 
-# Rule 1 — Allow LLM API (any method).
-result := r if {
-    input.attributes.request.http.host == "api.anthropic.com"
-    r := {
-        "allowed": true,
-        "rule": "anthropic-allow",
-        "audit": false,
-    }
-}
-
-allow if {
-    input.attributes.request.http.host == "api.anthropic.com"
-}
-
-# Rule 2 — Deny POST api.bank.com/transfer.
+# Deny POST /transfer on the bench host.
 deny if {
-    input.attributes.request.http.host == "api.bank.com"
+    input.attributes.request.http.host == "bench.local:9999"
     input.attributes.request.http.path == "/transfer"
     input.attributes.request.http.method == "POST"
 }
@@ -55,9 +32,8 @@ result := r if {
     deny
     r := {
         "allowed": false,
-        "rule": "bank-transfer-deny",
-        "audit": true,
-        "reason": "Payment endpoint requires explicit approval",
+        "rule": "bench-deny",
+        "reason": "Bench deny scenario",
     }
 }
 

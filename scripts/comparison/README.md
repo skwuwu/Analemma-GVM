@@ -1,8 +1,11 @@
 # GVM vs OPA+Envoy comparison — run instructions
 
 This directory holds the benchmark infrastructure that compares GVM to
-the canonical OPA+Envoy+Docker stack across five dimensions. Full
-methodology: [`../../docs/internal/comparison-opa-envoy.md`](../../docs/internal/comparison-opa-envoy.md).
+the canonical OPA+Envoy+Docker stack across five dimensions, with both
+stacks measured as **full deployments** — agent process running inside
+an isolation boundary, egress intercepted by the policy plane.
+
+Full methodology: [`../../docs/internal/comparison-opa-envoy.md`](../../docs/internal/comparison-opa-envoy.md).
 Public summary: [`../../docs/comparison-opa-envoy.md`](../../docs/comparison-opa-envoy.md).
 
 ## What's here
@@ -10,31 +13,41 @@ Public summary: [`../../docs/comparison-opa-envoy.md`](../../docs/comparison-opa
 | File | Purpose |
 |---|---|
 | `setup.sh` | Installs Docker, OPA CLI, hyperfine; pulls Envoy + OPA images; compiles `policy.rego` to WASM. Run once per host. |
-| `bench.sh` | Runs the benchmark sweep (D1-D5) against all three stacks. Writes CSV to `results/comparison-<timestamp>/`. |
+| `bench.sh` | Runs the benchmark sweep (D1, D2a, D2b, D3, D4, D5). Writes CSV to `results/comparison-<timestamp>/`. |
 | `policy.rego` | Rego policy — semantic equivalent of `srr-bench.toml`. |
 | `srr-bench.toml` | SRR rules — semantic equivalent of `policy.rego`. |
 | `envoy-extauthz.yaml` | Envoy config for Stack B (OPA over gRPC ext_authz). Listens on `:10000`. |
 | `envoy-wasm.yaml` | Envoy config for Stack C (OPA-WASM in-process). Listens on `:10001`. |
 | `build/` | Generated WASM bundle from `setup.sh` (gitignored). |
 
+## How the bench is shaped
+
+Each request goes through:
+
+```
+agent inside isolation ──> policy plane ──> mock upstream
+       (sandbox/         (gvm-proxy /        (Python http.server
+        container)        Envoy + OPA)         on 0.0.0.0:9999)
+```
+
+The mock upstream binds to `0.0.0.0:9999` so it is reachable from every
+network namespace (sandbox, container, host). The agent inside isolation
+addresses it as `bench.local:9999`; bench.sh maps `bench.local` to the
+host's primary IP via `/etc/hosts` (added at run start, removed at end).
+
 ## Run on EC2
 
 Target host: Ubuntu 22.04+ on EC2 t3.medium (same hardware as the
-existing GVM benchmarks for cross-comparable numbers).
+existing GVM benchmarks).
 
 ### 1. Sync the latest source
 
 ```bash
-# Locally:
-git push
-
-# On EC2:
+# Local:  git push
+# EC2:
 cd ~/Analemma-GVM
 git fetch && git reset --hard origin/master
 ```
-
-This step is non-negotiable. See `feedback_bench_origin_sync.md` —
-benching against a stale tree wastes the run.
 
 ### 2. Build the GVM binaries
 
@@ -42,102 +55,102 @@ benching against a stale tree wastes the run.
 cargo build --release -p gvm-cli -p gvm-proxy
 ```
 
-The bench script prints binary mtime + git rev at startup; a stale
-binary surfaces loudly there.
+The bench prints binary mtime + git rev at startup; stale binaries
+surface loudly.
 
-### 3. Set up the OPA+Envoy stack
+### 3. Set up the OPA+Envoy stack (first run only)
 
 ```bash
 bash scripts/comparison/setup.sh
 ```
 
-This will (a) install Docker if missing, (b) install `opa` and
-`hyperfine`, (c) pull `envoyproxy/envoy:v1.32-latest` and
-`openpolicyagent/opa:1.16.2-envoy`, (d) compile `policy.rego` to a
-WASM bundle for Stack C, (e) verify the Rego policy passes a smoke
-test on both allow and deny paths.
+Installs `opa` and `hyperfine`, pulls `envoyproxy/envoy:v1.32-latest`
+and `openpolicyagent/opa:1.16.2-envoy`, compiles `policy.rego` to a
+WASM bundle for Stack C, runs a Rego smoke test.
 
-If Docker was newly installed, run `newgrp docker` or re-login so the
-shell picks up the group membership.
+### 4. Run the comparison (use tmux)
 
-### 4. Run the comparison
-
-Long-running pipeline — **use tmux per CLAUDE.md** (never `nohup`):
+bench.sh needs **sudo** because `gvm run --sandbox` requires root and
+Docker without group membership also does. Long-running, so use tmux:
 
 ```bash
 tmux new -s gvm-compare
-bash scripts/comparison/bench.sh         # full D1-D5 sweep
-# detach with Ctrl-b d; reattach with `tmux attach -t gvm-compare`
+sudo bash scripts/comparison/bench.sh         # full sweep, ~30-45 min
+# detach: Ctrl-b d ; reattach: tmux attach -t gvm-compare
 ```
 
-Subset runs are fine:
+Subset runs:
 
 ```bash
-bash scripts/comparison/bench.sh d1      # only latency
-bash scripts/comparison/bench.sh d3 d4   # only memory + distribution size
+sudo bash scripts/comparison/bench.sh d1          # latency
+sudo bash scripts/comparison/bench.sh d2a d2b     # both cold starts
+sudo bash scripts/comparison/bench.sh d3          # memory scaling
 ```
 
-Results land in `results/comparison-<timestamp>/`:
+Results in `results/comparison-<timestamp>/`:
 
 ```
-d1.csv       per-request latency by stack × scenario
-d2.csv       cold start by stack × iteration
-d3.csv       memory RSS by stack × state × process
-d4.csv       distribution size by stack × artifact
-d5.csv       audit decision-to-log latency + tamper evidence flag
-manifest.txt run metadata (git rev, mtimes, kernel, image versions)
-gvm-proxy.log proxy log from Stack A runs
+d1.csv            steady-state latency by stack × scenario
+d2a.csv           workload cold start by stack × iteration
+d2b.csv           control-plane cold start by stack × iteration
+d3.csv            memory RSS by stack × N agents
+d4.csv            distribution size
+d5.csv            decision-to-log latency
+gvm-proxy.log     proxy log from Stack A runs
+manifest.txt      run metadata
 ```
 
-### 5. Archive results
-
-After a successful run, copy the timestamped result directory under
-`docs/internal/raw/` for future reference:
+### 5. Archive + write up results
 
 ```bash
 mkdir -p docs/internal/raw
 cp -r results/comparison-<timestamp> docs/internal/raw/
-git add docs/internal/raw/comparison-<timestamp>
 ```
 
-Then update the result tables in
-`docs/internal/comparison-opa-envoy.md` §6 with the new numbers and
-update the public summary table in `docs/comparison-opa-envoy.md`.
+Then fill `docs/internal/comparison-opa-envoy.md` §6 with numbers and
+update the public summary table.
+
+## What this bench does NOT measure
+
+- **TLS overhead** — D1 measures plain HTTP. MITM TLS overhead is
+  measured separately in `scripts/bench-overhead.sh`.
+- **Multi-host policy distribution** — single-host only on both sides.
+- **L7 features Envoy ships and GVM does not** — circuit breaking,
+  retries, load balancing, gRPC-Web transcoding, mTLS termination.
+
+The transparent vs cooperative interception asymmetry is documented
+explicitly in
+[`../../docs/internal/comparison-opa-envoy.md` §2](../../docs/internal/comparison-opa-envoy.md#2-stacks-under-test)
+and surfaced next to every D1 result.
 
 ## Troubleshooting
 
-**"Docker daemon not running"**: `sudo systemctl start docker`.
+**"sudo: gvm: command not found"**: sudo path doesn't include
+~/.cargo/bin. Use absolute path or run from repo: bench.sh uses
+`$REPO_DIR/target/release/gvm` already.
 
-**Envoy container exits immediately**: `docker logs envoy-ext` (or
-`envoy-wasm`). Most common cause: a typo in the YAML that the parser
-rejects at startup. Fix the YAML, re-run.
+**`gvm run --sandbox` fails at startup**: check kernel version
+(needs ≥ 6.5 for full sandbox functionality) and that
+`/proc/sys/kernel/unprivileged_userns_clone == 1`.
 
-**OPA container exits immediately**: `docker logs opa-ext`. Most common
-cause: Rego policy fails to compile. Re-run `opa eval` from `setup.sh`
-to surface the error.
+**Envoy container exits immediately**: `sudo docker logs envoy-ext`
+(or `envoy-wasm`). Most common: YAML typo. Fix, re-run.
 
-**Stack C (WASM) hangs or all-deny**: the WASM bundle path or entrypoint
-in `envoy-wasm.yaml` does not match what `setup.sh` produced. Verify
-`scripts/comparison/build/opa-bundle/policy.wasm` exists.
+**OPA container exits immediately**: `sudo docker logs opa-ext`.
+Most common: Rego compile error — re-run `setup.sh` to surface.
 
-**Port already in use**: another GVM run is on `:8080`, or a previous
-bench did not clean up. `bash scripts/comparison/bench.sh` traps EXIT
-and cleans up its own processes/containers, but a SIGKILL or crashed
-run leaves residue:
+**Stack C all-deny or all-allow**: WASM bundle path/entrypoint
+mismatch. Verify `scripts/comparison/build/opa-bundle/policy.wasm`
+exists and `envoy-wasm.yaml` references the right entry.
 
+**Port already in use**:
 ```bash
-docker rm -f envoy-ext envoy-wasm opa-ext 2>/dev/null
-pkill -f gvm-proxy 2>/dev/null
+sudo docker rm -f envoy-ext envoy-wasm opa-ext 2>/dev/null
+sudo pkill -f gvm-proxy 2>/dev/null
 ```
 
-## Known limitations
-
-The four `Known Limitations` items in
-[`../../docs/internal/comparison-opa-envoy.md` §9](../../docs/internal/comparison-opa-envoy.md#9-known-limitations)
-apply. Most important for running the bench:
-
-- Single-host topology only — no multi-node OPA bundle distribution.
-- TLS is not included in D1 (latency); MITM/TLS cost is measured
-  separately in `scripts/bench-overhead.sh`.
-- One policy shape (three logical rules) — does not exercise complex
-  Rego expressiveness or large rule sets except in D1c (10K fallthrough).
+**/etc/hosts has stale `bench.local` entry**: bench.sh removes on
+clean exit, but a SIGKILL leaves it. Remove with:
+```bash
+sudo sed -i '/# gvm-bench bench.local/d' /etc/hosts
+```
