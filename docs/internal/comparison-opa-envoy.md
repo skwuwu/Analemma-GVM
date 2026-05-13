@@ -169,7 +169,7 @@ invisible in latency numbers.
 6. **Both stacks built from upstream release artefacts**:
    - GVM: `cargo build --release` from current `master`. Print `git rev` + binary mtime at bench start.
    - Envoy: official Docker image `envoyproxy/envoy:v1.32-latest` (pinned at run time).
-   - OPA: official `openpolicyagent/opa:0.71.0` (pinned).
+   - OPA: official `openpolicyagent/opa:1.16.2-envoy` (pinned; OPA's `:N.N.N-envoy` image variant ships the gRPC ext_authz plugin pre-installed).
 7. **Warm-up**: 100 throw-away requests before each measurement window.
 8. **Single-host topology**: no multi-node, no service mesh, no orchestrator. Same constraint both sides.
 

@@ -12,7 +12,7 @@
 #
 # Pulls (lazy, at bench time):
 #   - envoyproxy/envoy:v1.32-latest
-#   - openpolicyagent/opa:0.71.0-envoy
+#   - openpolicyagent/opa:1.16.2-envoy
 #
 # Usage:
 #   bash scripts/comparison/setup.sh
@@ -23,7 +23,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-OPA_VERSION="0.71.0"
+OPA_VERSION="1.16.2"
 ENVOY_VERSION="v1.32-latest"
 
 echo "=== System packages ==="

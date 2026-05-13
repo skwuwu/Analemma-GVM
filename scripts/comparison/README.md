@@ -53,7 +53,7 @@ bash scripts/comparison/setup.sh
 
 This will (a) install Docker if missing, (b) install `opa` and
 `hyperfine`, (c) pull `envoyproxy/envoy:v1.32-latest` and
-`openpolicyagent/opa:0.71.0-envoy`, (d) compile `policy.rego` to a
+`openpolicyagent/opa:1.16.2-envoy`, (d) compile `policy.rego` to a
 WASM bundle for Stack C, (e) verify the Rego policy passes a smoke
 test on both allow and deny paths.
 

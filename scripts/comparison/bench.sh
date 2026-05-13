@@ -122,7 +122,7 @@ cleanup_stack_a() {
 start_stack_b() {
     docker run -d --rm --name opa-ext --network host \
         -v "$SCRIPT_DIR/policy.rego:/policy.rego:ro" \
-        openpolicyagent/opa:0.71.0-envoy \
+        openpolicyagent/opa:1.16.2-envoy \
         run --server --addr=:0 --diagnostic-addr=:0 \
         --set=plugins.envoy_ext_authz_grpc.addr=:$OPA_GRPC_PORT \
         --set=plugins.envoy_ext_authz_grpc.path=envoy/authz/allow \
@@ -273,7 +273,7 @@ run_d4() {
     echo "stack,artifact,bytes" >>"$RESULTS_DIR/d4.csv"
     echo "A,gvm,$(stat -c %s "$GVM_BIN" 2>/dev/null || stat -f %z "$GVM_BIN")" >>"$RESULTS_DIR/d4.csv"
     echo "A,gvm-proxy,$(stat -c %s "$GVM_PROXY_BIN" 2>/dev/null || stat -f %z "$GVM_PROXY_BIN")" >>"$RESULTS_DIR/d4.csv"
-    for img in envoyproxy/envoy:v1.32-latest openpolicyagent/opa:0.71.0-envoy; do
+    for img in envoyproxy/envoy:v1.32-latest openpolicyagent/opa:1.16.2-envoy; do
         local sz=$(docker image inspect "$img" --format '{{.Size}}' 2>/dev/null || echo 0)
         echo "BC,$img,$sz" >>"$RESULTS_DIR/d4.csv"
     done
@@ -347,7 +347,7 @@ kernel:    $(uname -r)
 gvm binary mtime:        $(date -d "@$GVM_MTIME" 2>/dev/null || date -r "$GVM_MTIME")
 gvm-proxy binary mtime:  $(date -d "@$PROXY_MTIME" 2>/dev/null || date -r "$PROXY_MTIME")
 envoy image:             envoyproxy/envoy:v1.32-latest
-opa image:               openpolicyagent/opa:0.71.0-envoy
+opa image:               openpolicyagent/opa:1.16.2-envoy
 dimensions run:          ${DIMS[*]}
 EOF
 
