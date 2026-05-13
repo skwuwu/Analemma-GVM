@@ -53,7 +53,8 @@ docker --version
 
 echo "=== opa CLI ==="
 if ! command -v opa &>/dev/null; then
-    curl -fsSL -o /tmp/opa "https://openpolicyagent.org/downloads/v${OPA_VERSION}/opa_linux_amd64_static"
+    # GitHub releases is the canonical distribution channel.
+    curl -fsSL -o /tmp/opa "https://github.com/open-policy-agent/opa/releases/download/v${OPA_VERSION}/opa_linux_amd64_static"
     sudo install -m 0755 /tmp/opa /usr/local/bin/opa
 fi
 echo "opa: $(opa version | head -1)"
