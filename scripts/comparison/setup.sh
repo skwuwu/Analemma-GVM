@@ -30,7 +30,7 @@ echo "=== System packages ==="
 sudo apt-get update -qq
 sudo apt-get install -y -qq \
     ca-certificates curl gnupg lsb-release \
-    jq python3 net-tools procps
+    jq python3 python3-cryptography net-tools procps openssl
 
 echo "=== Docker ==="
 if ! command -v docker &>/dev/null; then
@@ -100,6 +100,9 @@ opa eval -d "$REPO_DIR/scripts/comparison/policy.rego" \
     --input <(echo '{"attributes":{"request":{"http":{"host":"api.anthropic.com","path":"/v1/messages","method":"POST"}}}}') \
     'data.envoy.authz.allow' | jq -e '.result[0].expressions[0].value == true' >/dev/null && \
     echo "  Rego allow path verified."
+
+echo "=== Generate TLS certs for B+TLS scenario ==="
+bash "$REPO_DIR/scripts/comparison/gen-tls-certs.sh"
 
 echo ""
 echo "=== Setup complete. ==="

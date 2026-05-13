@@ -81,7 +81,12 @@ UPSTREAM_PORT=9999
 GVM_PROXY_PORT=8080
 ENVOY_EXTAUTHZ_PORT=10000
 ENVOY_WASM_PORT=10001
+ENVOY_TLS_PORT=10443
 OPA_GRPC_PORT=9191
+
+# Paths shared between Envoy + hash-chain sidecar (file mode access log).
+ENVOY_ACCESS_LOG=/tmp/envoy-bench.log
+SIGNED_LOG=/tmp/envoy-bench-signed.log
 
 # ── Pre-flight: kill stale bench artefacts (defensive cleanup) ──────
 # If a previous bench run was killed forcibly, gvm-proxy or mock
@@ -241,6 +246,57 @@ start_envoy_extauthz() {
     return 1
 }
 
+# ── Stack B+TLS: Envoy with TLS termination + OPA ext_authz ─────────
+# Listens HTTPS on :10443, terminates with bench CA-signed cert, OPA
+# evaluates policy.rego unchanged. Access log written to a host-
+# accessible file so the optional hash-chain sidecar can tail it.
+start_envoy_tls() {
+    # Pre-create access log on host so docker -v bind mount works.
+    : > "$ENVOY_ACCESS_LOG"
+    chmod 0644 "$ENVOY_ACCESS_LOG"
+
+    $DOCKER run -d --rm --name opa-tls --network host \
+        -v "$SCRIPT_DIR/policy.rego:/policy.rego:ro" \
+        openpolicyagent/opa:1.16.2-envoy \
+        run --server --addr=:0 --diagnostic-addr=:0 \
+        --set=plugins.envoy_ext_authz_grpc.addr=:$OPA_GRPC_PORT \
+        --set=plugins.envoy_ext_authz_grpc.path=envoy/authz/allow \
+        /policy.rego >/dev/null
+    CONTAINERS_TO_STOP+=(opa-tls)
+
+    $DOCKER run -d --rm --name envoy-tls --network host \
+        -v "$SCRIPT_DIR/envoy-tls.yaml:/etc/envoy/envoy.yaml:ro" \
+        -v "$SCRIPT_DIR/build/tls:/etc/envoy-tls:ro" \
+        -v "$ENVOY_ACCESS_LOG:/var/log/envoy-bench.log" \
+        envoyproxy/envoy:v1.32-latest \
+        -c /etc/envoy/envoy.yaml >/dev/null
+    CONTAINERS_TO_STOP+=(envoy-tls)
+
+    for _ in $(seq 1 100); do
+        curl -sS -o /dev/null --max-time 1 \
+            --cacert "$SCRIPT_DIR/build/tls/ca.crt" \
+            "https://bench.local:$ENVOY_TLS_PORT/" 2>/dev/null && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
+# ── Stack B+TLS+hash: TLS Envoy + hash-chain sidecar ────────────────
+# Same as start_envoy_tls but also spawns hash-chain-sidecar.py which
+# tails the Envoy access log, computes SHA-256 chain + Ed25519 signs
+# each entry, and writes a signed log file.
+start_envoy_tls_hash() {
+    start_envoy_tls || return 1
+    : > "$SIGNED_LOG"
+    chmod 0644 "$SIGNED_LOG"
+    python3 "$SCRIPT_DIR/hash-chain-sidecar.py" \
+        --input "$ENVOY_ACCESS_LOG" \
+        --output "$SIGNED_LOG" >/tmp/sidecar.log 2>&1 &
+    PIDS_TO_KILL+=($!)
+    sleep 0.5  # let sidecar attach to the access log
+    return 0
+}
+
 # ── Stack C control plane: Envoy + OPA WASM container ───────────────
 start_envoy_wasm() {
     $DOCKER run -d --rm --name envoy-wasm --network host \
@@ -286,6 +342,25 @@ run_in_docker_bc() {
         sh -c "
             for i in \$(seq 1 $n); do
                 t=\$(curl -sS -o /dev/null -w '%{time_total}\\n' -X $method http://bench.local:9999$url_path 2>/dev/null || echo 0)
+                echo \"T:\$t\"
+            done
+        " 2>/dev/null | grep -oP '^T:\K[0-9.]+' || true
+}
+
+# ── In-isolation workload runner — Stack B+TLS (Docker, HTTPS direct) ─
+# Talks HTTPS directly to Envoy's TLS listener on :10443 (no HTTP_PROXY).
+# Mounts the bench CA so curl trusts Envoy's server cert.
+run_in_docker_tls() {
+    local n="$1" method="$2" url_path="$3"
+    $DOCKER run --rm \
+        --add-host "bench.local:$HOST_IP" \
+        -v "$SCRIPT_DIR/build/tls/ca.crt:/etc/ssl/bench-ca.crt:ro" \
+        curlimages/curl:8.10.1 \
+        sh -c "
+            for i in \$(seq 1 $n); do
+                t=\$(curl -sS -o /dev/null -w '%{time_total}\\n' \
+                    --cacert /etc/ssl/bench-ca.crt \
+                    -X $method https://bench.local:$ENVOY_TLS_PORT$url_path 2>/dev/null || echo 0)
                 echo \"T:\$t\"
             done
         " 2>/dev/null | grep -oP '^T:\K[0-9.]+' || true
@@ -516,9 +591,83 @@ run_d5() {
     cat "$RESULTS_DIR/d5.csv"
 }
 
+# ── D6 — B vs B+TLS vs B+TLS+hash per-request latency ──────────────
+# Isolates the cost of (a) adding TLS termination and (b) adding a
+# hash-chain audit sidecar on top of Stack B. Stack A is unchanged
+# from D1 — its TLS via per-sandbox MITM CA + WAL audit are bundled by
+# design and measured there.
+run_d6() {
+    echo "── D6 — Adding TLS + hash-chain audit to Stack B ─────────────"
+    : >"$RESULTS_DIR/d6.csv"
+    echo "variant,scenario,p50_ms,p95_ms,p99_ms,n" >>"$RESULTS_DIR/d6.csv"
+    local n=1000
+    add_bench_hosts
+    $DOCKER pull curlimages/curl:8.10.1 >/dev/null 2>&1 || true
+
+    # Variant B-tls — Envoy with TLS termination, no sidecar.
+    start_upstream || return 1
+    start_envoy_tls || { echo "B+TLS startup failed"; return 1; }
+    echo "  B+TLS: ready. Running $n×2 curls inside docker (HTTPS)..."
+    run_in_docker_tls 50 GET /v1/messages >/dev/null
+    run_in_docker_tls "$n" GET /v1/messages >"$RESULTS_DIR/d6-B-tls-allow.times"
+    run_in_docker_tls "$n" POST /transfer >"$RESULTS_DIR/d6-B-tls-deny.times"
+    stop_all
+    stats_csv "$RESULTS_DIR/d6-B-tls-allow.times" B-tls allow >>"$RESULTS_DIR/d6.csv"
+    stats_csv "$RESULTS_DIR/d6-B-tls-deny.times"  B-tls deny  >>"$RESULTS_DIR/d6.csv"
+
+    # Variant B-tls-hash — TLS Envoy + hash-chain sidecar.
+    start_upstream && start_envoy_tls_hash || { echo "B+TLS+hash startup failed"; return 1; }
+    echo "  B+TLS+hash: ready. Running $n×2 curls inside docker..."
+    run_in_docker_tls 50 GET /v1/messages >/dev/null
+    run_in_docker_tls "$n" GET /v1/messages >"$RESULTS_DIR/d6-B-tls-hash-allow.times"
+    run_in_docker_tls "$n" POST /transfer >"$RESULTS_DIR/d6-B-tls-hash-deny.times"
+    stop_all
+    stats_csv "$RESULTS_DIR/d6-B-tls-hash-allow.times" B-tls-hash allow >>"$RESULTS_DIR/d6.csv"
+    stats_csv "$RESULTS_DIR/d6-B-tls-hash-deny.times"  B-tls-hash deny  >>"$RESULTS_DIR/d6.csv"
+
+    echo "  results: $RESULTS_DIR/d6.csv"
+    cat "$RESULTS_DIR/d6.csv"
+}
+
+# ── D7 — Decision-to-signed-anchor latency (audit-equivalence) ──────
+# How long from "agent issued a denied request" to "a hash-chained +
+# Ed25519-signed entry containing that request is on disk." For Stack A,
+# this is the bundled WAL+Merkle path (re-using D5's number). For
+# B+TLS+hash, this is Envoy access-log -> sidecar -> signed log file.
+run_d7() {
+    echo "── D7 — Decision-to-signed-anchor latency ────────────────────"
+    : >"$RESULTS_DIR/d7.csv"
+    echo "variant,decision_to_signed_anchor_ms" >>"$RESULTS_DIR/d7.csv"
+    add_bench_hosts
+
+    start_upstream && start_envoy_tls_hash || { echo "B+TLS+hash startup failed"; return 1; }
+    # Reset signed log so we time just THIS request's appearance.
+    : > "$SIGNED_LOG"
+    chmod 0644 "$SIGNED_LOG"
+    sleep 0.3
+
+    local t0=$(date +%s%3N)
+    $DOCKER run --rm \
+        --add-host "bench.local:$HOST_IP" \
+        -v "$SCRIPT_DIR/build/tls/ca.crt:/etc/ssl/bench-ca.crt:ro" \
+        curlimages/curl:8.10.1 \
+        curl -sS -o /dev/null --cacert /etc/ssl/bench-ca.crt \
+            -X POST "https://bench.local:$ENVOY_TLS_PORT/transfer" 2>/dev/null
+    for _ in $(seq 1 500); do
+        grep -q '"entry".*"/transfer"\|/transfer' "$SIGNED_LOG" 2>/dev/null && break
+        sleep 0.005
+    done
+    local t1=$(date +%s%3N)
+    echo "B-tls-hash,$((t1-t0))" >>"$RESULTS_DIR/d7.csv"
+    stop_all
+
+    echo "  results: $RESULTS_DIR/d7.csv"
+    cat "$RESULTS_DIR/d7.csv"
+}
+
 # ── Run selected dimensions ─────────────────────────────────────────
 DIMS=("$@")
-if [ ${#DIMS[@]} -eq 0 ]; then DIMS=(d1 d2a d2b d3 d4 d5); fi
+if [ ${#DIMS[@]} -eq 0 ]; then DIMS=(d1 d2a d2b d3 d4 d5 d6 d7); fi
 for d in "${DIMS[@]}"; do
     case "$d" in
         d1) run_d1 ;;
@@ -527,6 +676,8 @@ for d in "${DIMS[@]}"; do
         d3) run_d3 ;;
         d4) run_d4 ;;
         d5) run_d5 ;;
+        d6) run_d6 ;;
+        d7) run_d7 ;;
         *) echo "Unknown dimension: $d"; exit 1 ;;
     esac
     echo ""

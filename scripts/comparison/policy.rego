@@ -22,8 +22,10 @@ default result := {
 }
 
 # Deny POST /transfer on the bench host.
+# startswith so both plain-HTTP (host = bench.local:9999) and TLS
+# (host = bench.local:10443) scenarios match without two rules.
 deny if {
-    input.attributes.request.http.host == "bench.local:9999"
+    startswith(input.attributes.request.http.host, "bench.local")
     input.attributes.request.http.path == "/transfer"
     input.attributes.request.http.method == "POST"
 }
