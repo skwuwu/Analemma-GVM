@@ -1,0 +1,33 @@
+# SRR ruleset for GVM-side of the OPA+Envoy comparison benchmark.
+#
+# Semantic equivalent of scripts/comparison/policy.rego — three logical
+# rules, narrow shape, comparable to what Envoy+OPA evaluates on each
+# request. The point is to measure engine cost on identical policy,
+# NOT to test SRR's full expressiveness.
+
+# ── Rule 1: Allow LLM API ─────────────────────────────────────────────
+[[rules]]
+method = "*"
+pattern = "api.anthropic.com/{any}"
+decision = { type = "Allow" }
+description = "Anthropic LLM API"
+label = "anthropic-allow"
+
+# ── Rule 2: Deny POST to payment endpoint ─────────────────────────────
+[[rules]]
+method = "POST"
+pattern = "api.bank.com/transfer"
+decision = { type = "Deny", reason = "Payment endpoint requires explicit approval" }
+description = "Bank transfer endpoint"
+label = "bank-transfer-deny"
+
+# ── Rule 3: Default audit-only catch-all ──────────────────────────────
+# AuditOnly is GVM-specific (records the event but allows the request).
+# Rego cannot natively express this with a single decision — the closest
+# equivalent in the Rego side is `allow = true` + `audit = true` marker.
+[[rules]]
+method = "*"
+pattern = "{any}"
+decision = { type = "AuditOnly" }
+description = "Default audit-allow catch-all"
+label = "default-audit"
