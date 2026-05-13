@@ -151,16 +151,53 @@ with T(('0.0.0.0', $UPSTREAM_PORT), H) as s: s.serve_forever()
 }
 
 # ── Stack A control plane: gvm-proxy daemon ─────────────────────────
+# Use a fully isolated bench workspace so we don't (a) inherit the
+# repo's 80-rule default SRR config, (b) recover from a corrupt repo
+# WAL, or (c) pick up dev host-overrides. The minimal proxy.toml below
+# uses absolute paths so the proxy's relative-path resolution can't
+# escape the temp dir.
 start_gvm_proxy() {
     GVM_TMP_CONFIG="$(mktemp -d -t gvm-bench-XXXXXX)"
-    cp "$REPO_DIR/config/proxy.toml" "$GVM_TMP_CONFIG/proxy.toml" 2>/dev/null || true
-    cp "$REPO_DIR/config/gvm.toml" "$GVM_TMP_CONFIG/gvm.toml" 2>/dev/null || true
+    mkdir -p "$GVM_TMP_CONFIG/data"
     cp "$SCRIPT_DIR/srr-bench.toml" "$GVM_TMP_CONFIG/srr_network.toml"
+    # Empty semantic rules file — the bench does not exercise SRR-semantic.
+    printf '# bench: empty semantic rules\n' > "$GVM_TMP_CONFIG/srr_semantic.toml"
+    # Minimal proxy.toml, absolute paths, default=Allow so unmatched
+    # requests do NOT take a 300ms Delay (which would dominate timings).
+    cat > "$GVM_TMP_CONFIG/proxy.toml" <<EOF
+[server]
+listen = "0.0.0.0:$GVM_PROXY_PORT"
+
+[enforcement]
+default_decision = { type = "Allow" }
+
+[wal]
+path = "$GVM_TMP_CONFIG/data/wal.log"
+
+[srr]
+network_file = "$GVM_TMP_CONFIG/srr_network.toml"
+semantic_file = "$GVM_TMP_CONFIG/srr_semantic.toml"
+hot_reload = false
+EOF
+    # Minimal gvm.toml — needed if proxy reads it; otherwise harmless.
+    printf '# bench gvm.toml\n' > "$GVM_TMP_CONFIG/gvm.toml"
+
     sudo RUST_LOG=warn GVM_CONFIG="$GVM_TMP_CONFIG/proxy.toml" GVM_TOML="$GVM_TMP_CONFIG/gvm.toml" \
         "$GVM_PROXY_BIN" >"$RESULTS_DIR/gvm-proxy.log" 2>&1 &
     PIDS_TO_KILL+=($!)
+    # Readiness: instead of /healthz (which goes through SRR and may
+    # confuse a forward-proxy as a self-targeted request), probe the
+    # admin port if reachable or wait for the listener log line.
     for _ in $(seq 1 60); do
-        curl -sS -o /dev/null "http://127.0.0.1:$GVM_PROXY_PORT/healthz" 2>/dev/null && return 0
+        # Probe TCP listener directly with a short timeout.
+        if curl -sS -m 1 -o /dev/null "http://127.0.0.1:$GVM_PROXY_PORT/healthz" 2>/dev/null; then
+            return 0
+        fi
+        # If proxy printed its banner, treat that as ready too.
+        if grep -q 'Network SRR\|Governance Summary\|Rules loaded' "$RESULTS_DIR/gvm-proxy.log" 2>/dev/null; then
+            sleep 0.5
+            return 0
+        fi
         sleep 0.1
     done
     return 1
