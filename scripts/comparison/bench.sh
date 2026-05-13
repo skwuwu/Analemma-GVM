@@ -58,6 +58,15 @@ ENVOY_EXTAUTHZ_PORT=10000
 ENVOY_WASM_PORT=10001
 OPA_GRPC_PORT=9191
 
+# ── Docker permission shim ──────────────────────────────────────────
+# If the operator is not in the `docker` group, fall back to `sudo docker`.
+# Cleaner than asking the operator to re-login mid-bench.
+if groups 2>/dev/null | grep -qw docker; then
+    DOCKER="docker"
+else
+    DOCKER="sudo docker"
+fi
+
 # ── Process bookkeeping ─────────────────────────────────────────────
 PIDS_TO_KILL=()
 CONTAINERS_TO_STOP=()
@@ -67,7 +76,7 @@ cleanup() {
         kill "$pid" 2>/dev/null || true
     done
     for c in "${CONTAINERS_TO_STOP[@]:-}"; do
-        docker rm -f "$c" 2>/dev/null >/dev/null || true
+        $DOCKER rm -f "$c" 2>/dev/null >/dev/null || true
     done
 }
 trap cleanup EXIT INT TERM
@@ -120,7 +129,7 @@ cleanup_stack_a() {
 
 # ── Stack B — Envoy + OPA ext_authz ─────────────────────────────────
 start_stack_b() {
-    docker run -d --rm --name opa-ext --network host \
+    $DOCKER run -d --rm --name opa-ext --network host \
         -v "$SCRIPT_DIR/policy.rego:/policy.rego:ro" \
         openpolicyagent/opa:1.16.2-envoy \
         run --server --addr=:0 --diagnostic-addr=:0 \
@@ -129,7 +138,7 @@ start_stack_b() {
         /policy.rego >/dev/null
     CONTAINERS_TO_STOP+=(opa-ext)
 
-    docker run -d --rm --name envoy-ext --network host \
+    $DOCKER run -d --rm --name envoy-ext --network host \
         -v "$SCRIPT_DIR/envoy-extauthz.yaml:/etc/envoy/envoy.yaml:ro" \
         envoyproxy/envoy:v1.32-latest \
         -c /etc/envoy/envoy.yaml >/dev/null
@@ -144,7 +153,7 @@ start_stack_b() {
 
 # ── Stack C — Envoy + OPA WASM ──────────────────────────────────────
 start_stack_c() {
-    docker run -d --rm --name envoy-wasm --network host \
+    $DOCKER run -d --rm --name envoy-wasm --network host \
         -v "$SCRIPT_DIR/envoy-wasm.yaml:/etc/envoy/envoy.yaml:ro" \
         -v "$SCRIPT_DIR/build/opa-bundle:/etc/opa-bundle:ro" \
         envoyproxy/envoy:v1.32-latest \
@@ -257,8 +266,8 @@ sample_d3() {
             done
             ;;
         B|C)
-            for c in $(docker ps --format '{{.Names}}' | grep -E 'envoy|opa-ext|envoy-wasm'); do
-                local pid=$(docker inspect -f '{{.State.Pid}}' "$c" 2>/dev/null)
+            for c in $($DOCKER ps --format '{{.Names}}' | grep -E 'envoy|opa-ext|envoy-wasm'); do
+                local pid=$($DOCKER inspect -f '{{.State.Pid}}' "$c" 2>/dev/null)
                 local rss=$(ps -p "$pid" -o rss= 2>/dev/null | awk '{print $1+0}')
                 echo "$stack,$state,$c,$rss" >>"$RESULTS_DIR/d3.csv"
             done
@@ -274,7 +283,7 @@ run_d4() {
     echo "A,gvm,$(stat -c %s "$GVM_BIN" 2>/dev/null || stat -f %z "$GVM_BIN")" >>"$RESULTS_DIR/d4.csv"
     echo "A,gvm-proxy,$(stat -c %s "$GVM_PROXY_BIN" 2>/dev/null || stat -f %z "$GVM_PROXY_BIN")" >>"$RESULTS_DIR/d4.csv"
     for img in envoyproxy/envoy:v1.32-latest openpolicyagent/opa:1.16.2-envoy; do
-        local sz=$(docker image inspect "$img" --format '{{.Size}}' 2>/dev/null || echo 0)
+        local sz=$($DOCKER image inspect "$img" --format '{{.Size}}' 2>/dev/null || echo 0)
         echo "BC,$img,$sz" >>"$RESULTS_DIR/d4.csv"
     done
     echo "  results: $RESULTS_DIR/d4.csv"
@@ -311,7 +320,7 @@ run_d5() {
         local t0=$(date +%s%3N)
         curl -sS -o /dev/null -X POST "http://127.0.0.1:$port/transfer" -H "Host: api.bank.com" 2>/dev/null
         for _ in $(seq 1 100); do
-            docker logs "$cname" 2>&1 | grep -q "api.bank.com" && break
+            $DOCKER logs "$cname" 2>&1 | grep -q "api.bank.com" && break
             sleep 0.05
         done
         local t1=$(date +%s%3N)
