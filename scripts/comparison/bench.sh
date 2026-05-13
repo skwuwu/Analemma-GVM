@@ -252,8 +252,11 @@ start_envoy_extauthz() {
 # accessible file so the optional hash-chain sidecar can tail it.
 start_envoy_tls() {
     # Pre-create access log on host so docker -v bind mount works.
+    # 0666 because Envoy in container runs as non-root (UID 101) and
+    # the file's host owner is bench-runner (root via sudo); without
+    # world-write the container can't open it for append.
     : > "$ENVOY_ACCESS_LOG"
-    chmod 0644 "$ENVOY_ACCESS_LOG"
+    chmod 0666 "$ENVOY_ACCESS_LOG"
 
     $DOCKER run -d --rm --name opa-tls --network host \
         -v "$SCRIPT_DIR/policy.rego:/policy.rego:ro" \
@@ -288,7 +291,7 @@ start_envoy_tls() {
 start_envoy_tls_hash() {
     start_envoy_tls || return 1
     : > "$SIGNED_LOG"
-    chmod 0644 "$SIGNED_LOG"
+    chmod 0666 "$SIGNED_LOG"
     python3 "$SCRIPT_DIR/hash-chain-sidecar.py" \
         --input "$ENVOY_ACCESS_LOG" \
         --output "$SIGNED_LOG" >/tmp/sidecar.log 2>&1 &
@@ -643,7 +646,7 @@ run_d7() {
     start_upstream && start_envoy_tls_hash || { echo "B+TLS+hash startup failed"; return 1; }
     # Reset signed log so we time just THIS request's appearance.
     : > "$SIGNED_LOG"
-    chmod 0644 "$SIGNED_LOG"
+    chmod 0666 "$SIGNED_LOG"
     sleep 0.3
 
     local t0=$(date +%s%3N)
