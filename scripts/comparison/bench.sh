@@ -421,7 +421,16 @@ run_d3() {
         done
         sleep 15  # let all sandboxes complete setup
         local total_a=0
-        for p in $(pgrep -f 'gvm-proxy\|gvm.*run.*--sandbox\|sleep 60' 2>/dev/null); do
+        # Collect PIDs from three sources; dedupe via sort -u so a PID
+        # matching two patterns is counted once.
+        local d3_a_pids="$( \
+            pgrep -x gvm-proxy 2>/dev/null; \
+            pgrep -f 'gvm run --sandbox' 2>/dev/null; \
+            pgrep -fx 'sleep 60' 2>/dev/null \
+        )"
+        local d3_a_pids_unique
+        d3_a_pids_unique="$(echo "$d3_a_pids" | sort -un)"
+        for p in $d3_a_pids_unique; do
             local rss=$(ps -p "$p" -o rss= 2>/dev/null | awk '{print $1+0}')
             total_a=$((total_a + ${rss:-0}))
         done

@@ -27,7 +27,10 @@ static_resources:
                   - name: envoy.access_loggers.file
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
-                      path: /tmp/envoy-access.log
+                      # /dev/stdout so D5 measurement can read the access
+                      # log via `docker logs` from the host (no need to
+                      # exec into the container to tail a file).
+                      path: /dev/stdout
                 http_filters:
                   - name: envoy.filters.http.ext_authz
                     typed_config:
