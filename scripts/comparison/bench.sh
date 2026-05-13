@@ -164,12 +164,17 @@ start_gvm_proxy() {
     printf '# bench: empty semantic rules\n' > "$GVM_TMP_CONFIG/srr_semantic.toml"
     # Minimal proxy.toml, absolute paths, default=Allow so unmatched
     # requests do NOT take a 300ms Delay (which would dominate timings).
+    # Required fields per src/config.rs: server.listen,
+    # enforcement.{default_decision, ic1_async_ledger, ic1_loss_threshold},
+    # srr.{network_file, semantic_file, hot_reload}, secrets.{file, key_env}.
     cat > "$GVM_TMP_CONFIG/proxy.toml" <<EOF
 [server]
 listen = "0.0.0.0:$GVM_PROXY_PORT"
 
 [enforcement]
 default_decision = { type = "Allow" }
+ic1_async_ledger = true
+ic1_loss_threshold = 0.001
 
 [wal]
 path = "$GVM_TMP_CONFIG/data/wal.log"
@@ -178,7 +183,16 @@ path = "$GVM_TMP_CONFIG/data/wal.log"
 network_file = "$GVM_TMP_CONFIG/srr_network.toml"
 semantic_file = "$GVM_TMP_CONFIG/srr_semantic.toml"
 hot_reload = false
+
+[secrets]
+file = "$GVM_TMP_CONFIG/secrets.toml"
+key_env = "GVM_SECRETS_KEY"
+
+[dns]
+enabled = false
 EOF
+    # Empty secrets file (proxy tolerates missing rows in passthrough mode).
+    printf '# bench: no credentials\n' > "$GVM_TMP_CONFIG/secrets.toml"
     # Minimal gvm.toml — needed if proxy reads it; otherwise harmless.
     printf '# bench gvm.toml\n' > "$GVM_TMP_CONFIG/gvm.toml"
 
