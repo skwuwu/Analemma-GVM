@@ -83,6 +83,23 @@ ENVOY_EXTAUTHZ_PORT=10000
 ENVOY_WASM_PORT=10001
 OPA_GRPC_PORT=9191
 
+# ── Pre-flight: kill stale bench artefacts (defensive cleanup) ──────
+# If a previous bench run was killed forcibly, gvm-proxy or mock
+# upstream may still be listening on 8080/9999 — masking our own
+# start_gvm_proxy failure (the healthcheck would succeed against the
+# STALE proxy with its old config, while our new bind silently EADDRINUSE).
+sudo pkill -9 -f 'gvm-proxy' 2>/dev/null || true
+sudo pkill -9 -f 'http.server.*9999\|9999.*serve_forever' 2>/dev/null || true
+$DOCKER rm -f envoy-ext envoy-wasm opa-ext 2>/dev/null >/dev/null || true
+$DOCKER ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^bench-idle-' | xargs -r $DOCKER rm -f 2>/dev/null >/dev/null || true
+sleep 1
+if sudo ss -tlnp 2>/dev/null | grep -qE ':8080|:10000|:10001|:9999|:9191'; then
+    echo "ERROR: bench ports still occupied after cleanup:"
+    sudo ss -tlnp 2>/dev/null | grep -E ':8080|:10000|:10001|:9999|:9191'
+    echo "Resolve manually before re-running."
+    exit 1
+fi
+
 echo "═══════════════════════════════════════════════════════════════════"
 echo "GVM vs OPA+Envoy comparison v2 (full-stack) — $STAMP"
 echo "  git rev:        $GIT_REV"
@@ -192,10 +209,14 @@ stop_all() { cleanup; sleep 1; }
 
 # ── In-isolation workload runner — Stack A (GVM sandbox) ────────────
 # Runs N curls for the given scenario inside `gvm run --sandbox`.
-# Emits one line per request: "T:<seconds>" — parseable by awk.
+# Emits one line per request: "T:<seconds>" — parseable by grep.
+# GVM_CONFIG/GVM_TOML env vars pinned so `gvm run` uses the bench
+# config even if it autostarts a proxy (defensive — the pre-started
+# bench gvm-proxy should already own port 8080).
 run_in_sandbox_a() {
     local n="$1" method="$2" url_path="$3"
-    sudo "$GVM_BIN" run --sandbox -- bash -c "
+    sudo GVM_CONFIG="$GVM_TMP_CONFIG/proxy.toml" GVM_TOML="$GVM_TMP_CONFIG/gvm.toml" \
+        "$GVM_BIN" run --sandbox -- bash -c "
         for i in \$(seq 1 $n); do
             t=\$(curl -sS -o /dev/null -w '%{time_total}\\n' -X $method http://bench.local:9999$url_path 2>/dev/null || echo 0)
             echo \"T:\$t\"
