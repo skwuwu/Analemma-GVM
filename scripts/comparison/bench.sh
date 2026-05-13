@@ -92,15 +92,30 @@ with socketserver.TCPServer(('127.0.0.1', $UPSTREAM_PORT), H) as s: s.serve_fore
 }
 
 # ── Stack A — GVM ─────────────────────────────────────────────────────
+# Use a per-run temp config directory so the operator's real
+# config/srr_network.toml is never touched.
+GVM_TMP_CONFIG=""
+
 start_stack_a() {
-    cp "$SCRIPT_DIR/srr-bench.toml" "$REPO_DIR/config/srr_network.toml"
-    "$GVM_PROXY_BIN" --config "$REPO_DIR/config/proxy.toml" >"$RESULTS_DIR/gvm-proxy.log" 2>&1 &
+    GVM_TMP_CONFIG="$(mktemp -d -t gvm-bench-XXXXXX)"
+    # Mirror just what gvm-proxy needs from config/.
+    cp "$REPO_DIR/config/proxy.toml" "$GVM_TMP_CONFIG/proxy.toml" 2>/dev/null || true
+    cp "$REPO_DIR/config/gvm.toml" "$GVM_TMP_CONFIG/gvm.toml" 2>/dev/null || true
+    cp "$SCRIPT_DIR/srr-bench.toml" "$GVM_TMP_CONFIG/srr_network.toml"
+    GVM_CONFIG="$GVM_TMP_CONFIG/proxy.toml" \
+    GVM_TOML="$GVM_TMP_CONFIG/gvm.toml" \
+        "$GVM_PROXY_BIN" >"$RESULTS_DIR/gvm-proxy.log" 2>&1 &
     PIDS_TO_KILL+=($!)
     for _ in $(seq 1 50); do
         curl -sS -o /dev/null "http://127.0.0.1:$GVM_PROXY_PORT/healthz" 2>/dev/null && return 0
         sleep 0.1
     done
     return 1
+}
+
+cleanup_stack_a() {
+    [ -n "$GVM_TMP_CONFIG" ] && rm -rf "$GVM_TMP_CONFIG" 2>/dev/null
+    GVM_TMP_CONFIG=""
 }
 
 # ── Stack B — Envoy + OPA ext_authz ─────────────────────────────────
@@ -142,7 +157,7 @@ start_stack_c() {
     return 1
 }
 
-stop_all_stacks() { cleanup; sleep 1; }
+stop_all_stacks() { cleanup; cleanup_stack_a; sleep 1; }
 
 # ── D1 — Per-request latency ────────────────────────────────────────
 run_d1() {
