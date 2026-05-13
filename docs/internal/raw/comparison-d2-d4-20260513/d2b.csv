@@ -1,0 +1,11 @@
+stack,iter,control_plane_cold_start_ms
+A,1,1645
+A,2,1653
+A,3,1645
+A,4,1643
+A,5,1651
+B,1,692
+B,2,664
+B,3,645
+B,4,673
+B,5,682

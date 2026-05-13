@@ -1,0 +1,11 @@
+GVM vs OPA+Envoy comparison v2 (full-stack)
+timestamp: 20260513T103130
+git rev:   5b117de
+host:      Linux ip-172-31-10-156 6.17.0-1009-aws #9~24.04.2-Ubuntu SMP Fri Mar  6 23:50:29 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+kernel:    6.17.0-1009-aws
+host IP:   172.31.10.156 (bench.local mapping)
+gvm binary mtime:        Wed May 13 09:25:19 UTC 2026
+gvm-proxy binary mtime:  Wed May 13 09:25:41 UTC 2026
+envoy image:             envoyproxy/envoy:v1.32-latest
+opa image:               openpolicyagent/opa:1.16.2-envoy
+dimensions run:          d1

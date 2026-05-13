@@ -286,47 +286,175 @@ guarantees, same deployment shape — see §2 "Critical asymmetry."*
 
 ### D2a — Workload cold start (control plane already up)
 
-| Stack | Time to first response (ms) |
-|---|---|
-| GVM (`gvm run --sandbox -- curl`) | TBD |
-| Docker + OPA ext_authz (`docker run ... curl`) | TBD |
+Wall-clock from "start an isolated agent" to first 200 response (n=5
+iterations, median reported).
+
+| Stack | Median (ms) | Range | Notes |
+|---|---|---|---|
+| GVM (`gvm run --sandbox -- curl`) | **897** | 848–922 | namespace + veth + iptables + seccomp + cgroup + agent exec |
+| Docker + OPA ext_authz (`docker run ... curl`) | **448** | 431–479 | namespace + bridge + cgroup + agent exec |
+
+GVM's sandbox does ~2× the isolation work (seccomp filter load + iptables
+DNAT install + per-sandbox MITM CA generation + veth pair) on top of what
+Docker does. The ~450ms gap is the structural cost of stronger isolation.
 
 ### D2b — Control plane cold start
 
-| Stack | Time to listener ready (ms) |
-|---|---|
-| GVM (`gvm-proxy` daemon) | TBD |
-| Envoy + OPA ext_authz (`docker run envoy` + `docker run opa`) | TBD |
+Time from "start the policy plane" to listener accepting connections
+(n=5 iterations, median reported).
 
-### D3 — Memory footprint scaling
-
-| Stack | N=1 (kB) | N=5 (kB) | N=10 (kB) |
+| Stack | Median (ms) | Range | Notes |
 |---|---|---|---|
-| GVM | TBD | TBD | TBD |
-| OPA + Envoy ext_authz | TBD | TBD | TBD |
+| GVM (`gvm-proxy` daemon) | **1645** | 1643–1653 | WAL recovery + integrity chain check + vault init + Ed25519 key + SRR load + listener bind |
+| Envoy + OPA ext_authz | **673** | 645–692 | `docker run` × 2 (Envoy + OPA) + each daemon's own init |
+
+GVM is **2.4× slower** to bring up its control plane than Envoy+OPA.
+Counter-intuitive given GVM is one binary vs two containers — explained
+by the richness of GVM's audit init: WAL integrity chain verification,
+Ed25519 anchor key generation, Merkle batch builder setup. Strip those
+features for parity and GVM's startup would shrink, but those features
+*are* the product. This is a real cost of the bundled audit thesis.
+
+### D3 — Memory footprint scaling (idle agents)
+
+Sum of RSS across the stack with N agents sitting idle (`sleep 60`
+inside isolation), measured after 5-15s settle.
+
+| N | GVM (kB) | OPA+Envoy ext_authz (kB) | Per-agent delta GVM (kB) | Per-agent delta OPA+Envoy (kB) |
+|---|---|---|---|---|
+| 1 | 42,932 | 98,380 | (baseline) | (baseline) |
+| 5 | 137,048 | 102,556 | ~23,500 | ~1,000 |
+| 10 | 253,348 | 107,004 | ~23,400 | ~960 |
+
+**The vertical-integration trade-off is visible here:**
+
+- **Stack A scales roughly linearly at ~23 MB per agent.** Each gvm
+  sandbox child carries its own per-sandbox state (namespace + cgroup
+  + agent process + MITM CA + iptables rules). The control plane
+  (gvm-proxy ~17 MB) is constant.
+- **Stack B scales sub-linearly at ~1 MB per agent.** The container
+  process is ~1 MB; Envoy + OPA daemons (~100 MB combined) are
+  amortised across all containers.
+
+**Crossover point:** Stack A wins below N=3 (43 + 2 × 23 = 89 MB vs 100 MB
+for B); Stack B wins from N=4 onward. For deployments with many
+concurrent agents, the composed stack is more memory-efficient. For
+deployments with 1-3 long-lived agents, the bundled stack wins.
 
 ### D4 — Distribution size
 
-| Stack | Binaries / Images |
-|---|---|
-| GVM | TBD MB (gvm + gvm-proxy) |
-| Envoy + OPA | TBD MB (envoy image + opa image) |
+| Stack | Artifact | Bytes | MB |
+|---|---|---|---|
+| GVM | `gvm` (CLI) | 17,031,008 | 17.03 |
+| GVM | `gvm-proxy` (daemon) | 18,022,240 | 18.02 |
+| GVM | **total** |  | **35.05** |
+| OPA+Envoy | `envoyproxy/envoy:v1.32-latest` (image) | 60,048,021 | 60.05 |
+| OPA+Envoy | `openpolicyagent/opa:1.16.2-envoy` (image) | 39,632,170 | 39.63 |
+| OPA+Envoy | **total** |  | **99.68** |
+
+GVM is **2.85× smaller** to distribute (35 MB vs 100 MB), reflecting
+the bundled-single-binary build vs two separate container images.
+Operator pulls one tarball vs two Docker images.
 
 ### D5 — Audit visibility
 
+End-to-end from "agent issued a denied request" to "decision visible
+in the externally readable audit stream."
+
 | Stack | D5a decision→log (ms) | D5b tamper evidence |
 |---|---|---|
-| GVM | TBD | ✓ Merkle + Ed25519 anchors |
-| Envoy + OPA ext_authz | TBD | ✗ not default |
+| GVM (WAL append + Merkle batch seal) | **926** | ✓ Merkle + Ed25519 anchors |
+| Envoy + OPA ext_authz (Envoy access log → docker logs) | **9208** | ✗ not default |
+
+*D5a measurement notes:* Both numbers include the cold-start of the
+isolated agent (gvm run --sandbox or docker run --rm) issuing the
+denied request — that is the realistic end-to-end path. Subtracting
+D2a workload cold-start gives an estimate of the decision-recording
+overhead alone: ~30 ms for GVM (WAL append + flush), ~8.7 s for
+Stack B. The Stack B number is dominated by Docker log-driver
+buffering of Envoy's stdout access log + the bench's poll-with-sleep
+loop checking `docker logs envoy-ext`; a non-Docker deployment
+(Envoy writing access log to a file the auditor can tail directly)
+would surface the entry much sooner.
+
+*D5b is the more important comparison.* GVM ships tamper-evident audit
+by default: every WAL batch is hashed, Merkle-rolled, and the
+Merkle root is signed by an Ed25519 anchor key. A downstream auditor
+verifies offline with the public key alone. Envoy access logs are
+text; to make them tamper-evident an operator needs to add a
+hashing/signing layer (e.g., forwarding to an HSM-backed SIEM). That
+add-on is operationally non-trivial and changes the "lightweight
+deployment" calculus.
 
 ## 7. Analysis
 
-> Filled after results. Sections planned:
->
-> - **Where vertical integration wins**: expected D4 (size), D5 (audit), D2b (control plane cold start).
-> - **Where vertical integration costs**: expected D3 (per-agent memory grows), possibly D1 (kernel intercept cost).
-> - **Where it's a wash**: expected D1 between A and C (both in-process eval after the intercept hop).
-> - **What this means for the thesis**: the orchestrator-friendly v0.7 surface converges on OPA+Envoy in *shape*; the data tests whether it converges in *cost across the dimensions an operator actually cares about*.
+### Where vertical integration wins
+
+- **D4 (distribution size, −65%)**: 35 MB vs 100 MB. Single binary
+  pair vs two Docker images. One artefact to pull, one mtime to
+  verify, one rev to anchor on.
+- **D5b (tamper-evident audit by default)**: GVM ships Merkle + Ed25519
+  anchors; OPA+Envoy ships text access logs. To match GVM's audit
+  guarantee, an OPA+Envoy operator needs to bolt on a hashing/signing
+  forwarder — non-trivial new surface that the comparison's
+  lightweight-deployment constraint excludes.
+- **D3 at low N (memory crossover at N≈3)**: for 1-3 long-lived
+  agents, the bundled stack uses less memory than running a control
+  plane that amortises across many containers.
+
+### Where vertical integration costs
+
+- **D1 (~5 ms / 3-5× slower per request)**: kernel-level transparent
+  interception (iptables DNAT inside sandbox netns) pays a per-packet
+  netfilter cost the cooperative HTTP_PROXY path does not. This is
+  the cost of structural enforcement, not a policy-engine
+  inefficiency. An adversarial agent in Stack B that ignores
+  HTTP_PROXY bypasses entirely; in Stack A it cannot. Not the same
+  security level — see §2 "Critical asymmetry."
+- **D2a (~450 ms slower workload cold start)**: namespace + veth +
+  iptables + seccomp + per-sandbox MITM CA + cgroup vs Docker's
+  namespace + bridge + cgroup. The added work is what gives the
+  sandbox structural enforcement.
+- **D2b (2.4× slower control plane cold start)**: WAL recovery, Ed25519
+  init, Merkle builder setup, integrity-chain verification are GVM-
+  specific startup costs absent from Envoy+OPA. This is the price of
+  the bundled audit thesis.
+- **D3 at higher N (memory crossover at N≈4)**: each gvm sandbox child
+  carries ~23 MB; OPA+Envoy reuses one ~100 MB control plane across all
+  containers. Deployments of many concurrent agents pay more memory
+  with GVM. (Future v0.8 sandbox pool / pre-warming targets this.)
+
+### What this means for the thesis
+
+The data does NOT settle "GVM is OPA+sidecar with extra audit." It
+shows that GVM occupies a different point in the same design space
+with quantifiable trade-offs:
+
+- **Convergent in shape**: both stacks intercept HTTP, evaluate
+  declarative policy, log decisions. Same building blocks.
+- **Divergent in scope**: GVM bundles isolation primitives + tamper-
+  evident audit into a 35 MB single binary; OPA+Envoy composes two
+  ~50 MB images and assumes the operator brings their own isolation +
+  audit. Bundled vs composed at the *integration-unit* level.
+- **Divergent in enforcement**: GVM's transparent interception
+  structurally prevents agent bypass; OPA+Envoy's cooperative
+  interception is bypassable by an adversarial agent ignoring
+  HTTP_PROXY. Same building blocks, different security guarantee.
+
+For the AI agent governance use case — untrusted code, fast iteration,
+single-host laptop or VM deployment, audit chain required — GVM's
+shape is the right shape. For service-to-service authz on a K8s+Istio
+service mesh, OPA+Envoy's shape is the right shape. The benchmark
+quantifies that "right shape" claim per dimension; operators pick the
+tool that matches their workload.
+
+The orchestrator-friendly v0.7 surface (event stream + granular SRR +
+rule TTL) converges on OPA+Envoy in *shape* — but the underlying
+asymmetries (in-process eval, structural enforcement, bundled audit)
+remain. The 4-invariant guardrails proposed earlier
+(in-process policy / narrow SRR / standalone default / no required
+external service) keep the shape from drifting into "OPA+Envoy with
+extra audit" over the next release cycles.
 
 ## 8. Reproducibility
 

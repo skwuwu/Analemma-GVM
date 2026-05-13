@@ -71,37 +71,49 @@ Five dimensions, chosen to make trade-offs visible:
 |---|---|---|
 | D1 latency p50 Allow (ms) | **7.99** | **2.33** |
 | D1 latency p50 Deny (ms) | **7.17** | **1.47** |
-| D2a workload cold start | TBD | TBD |
-| D2b control plane cold start | TBD | TBD |
-| D3 memory @ N=10 | TBD | TBD |
-| D4 distribution size | TBD | TBD |
-| D5 tamper-evident audit | ✓ default | ✗ not default |
+| D2a workload cold start (ms, median) | **897** | **448** |
+| D2b control plane cold start (ms, median) | **1645** | **673** |
+| D3 memory @ N=1 (MB) | **42** | **98** |
+| D3 memory @ N=10 (MB) | **253** | **107** |
+| D3 per-agent delta (MB) | **~23** | **~1** |
+| D4 distribution size (MB total) | **35** | **100** |
+| D5 tamper-evident audit | ✓ default (Merkle + Ed25519) | ✗ not default |
 
 ## Reading Guide
 
-Read across each dimension rather than picking a winner overall. The
-expected pattern (to be confirmed by data):
+Read each dimension; pick the tool that matches your workload.
 
-- **D1**: Stack A may be slower because of kernel-level interception
-  cost. The delta is the price of structural enforcement, not the
-  price of the SRR engine — both engines are in-process.
-- **D2a (workload cold start)**: Stack A is doing more isolation work
-  (namespaces + veth + iptables + seccomp + cgroup) vs Docker
-  (namespaces + bridge + cgroup). Expect Stack A to pay a higher cold
-  start in exchange for stronger isolation.
-- **D2b (control plane cold start)**: a single GVM binary vs two
-  Docker images. Expect Stack A faster.
-- **D3 (memory scaling)**: the most honest dimension. Vertical
-  integration may scale per-agent worse than a shared sidecar. The
-  numbers tell operators what to expect at 20+ concurrent agents.
-- **D4 (distribution size)**: bundled single binary vs two images.
-  Expect Stack A smaller.
-- **D5 (audit)**: GVM ships tamper-evident audit by default; OPA+Envoy
-  ships text access logs. This is a feature gap, not a latency.
+- **D1 (per-request latency)** — GVM is ~5 ms slower per request. That
+  delta is the cost of kernel-level transparent interception
+  (iptables DNAT inside the sandbox), not a slow policy engine. An
+  adversarial agent in Stack B can bypass by ignoring `HTTP_PROXY`; an
+  agent in Stack A cannot. Not the same security guarantee.
+- **D2a (workload cold start)** — GVM 897 ms vs Docker 448 ms. The
+  difference is the sandbox's extra isolation work (seccomp, iptables,
+  per-sandbox MITM CA, veth pair).
+- **D2b (control plane cold start)** — GVM 1645 ms vs Envoy+OPA 673 ms.
+  Counter-intuitive (single binary vs two containers), explained by
+  GVM's audit-init richness (WAL recovery, integrity chain, Ed25519
+  key, Merkle setup). The price of bundled tamper-evident audit.
+- **D3 (memory scaling)** — the most honest dimension. GVM scales
+  linearly at ~23 MB / agent (each sandbox is its own world). OPA+Envoy
+  scales sub-linearly at ~1 MB / agent (control plane amortised). At
+  N≤3 the bundled stack wins on memory; from N≥4, the composed stack
+  wins. Tells operators what to expect at scale.
+- **D4 (distribution size)** — 35 MB vs 100 MB (~65% smaller). One
+  binary pair vs two Docker images.
+- **D5 (audit)** — GVM ships Merkle + Ed25519 tamper-evident audit by
+  default; OPA+Envoy ships text access logs. To match, an operator on
+  Stack B adds a hashing/signing forwarder — that bolt-on is what
+  takes the OPA+Envoy stack out of "lightweight deployment."
 
-The takeaway is not "GVM is faster." It is "GVM is differently shaped
-for the AI agent governance use case, and the trade-offs are quantified
-here so an operator can pick the right tool."
+The takeaway is not "GVM is faster" (it is not on per-request latency).
+It is **"GVM is differently shaped for the AI agent governance use
+case, and the trade-offs are quantified per-dimension."** For 1-3
+long-lived agents on a single host with tamper-evident audit required
+out of the box, GVM is the right tool. For many concurrent agents on
+a K8s service mesh where you already operate Envoy and OPA, that
+stack is the right tool.
 
 ## Methodology + Reproducibility
 

@@ -1,0 +1,5 @@
+stack,artifact,bytes
+A,gvm,17031008
+A,gvm-proxy,18022240
+BC,envoyproxy/envoy:v1.32-latest,60048021
+BC,openpolicyagent/opa:1.16.2-envoy,39632170
