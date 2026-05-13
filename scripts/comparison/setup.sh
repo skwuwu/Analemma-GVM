@@ -87,6 +87,8 @@ tar -xzf "$REPO_DIR/scripts/comparison/build/bundle.tar.gz" \
     tar -xzf "$REPO_DIR/scripts/comparison/build/bundle.tar.gz" \
     -C "$REPO_DIR/scripts/comparison/build/opa-bundle" \
     policy.wasm
+# Ensure Envoy (running as non-root in container) can read the bundle.
+chmod 0644 "$REPO_DIR/scripts/comparison/build/opa-bundle/policy.wasm" 2>/dev/null || true
 
 echo "=== Verify policy compiles + simulates ==="
 opa eval -d "$REPO_DIR/scripts/comparison/policy.rego" \
