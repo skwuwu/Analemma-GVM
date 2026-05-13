@@ -304,6 +304,13 @@ else:
 }
 
 # ── D1 — steady-state latency inside isolation ──────────────────────
+# Note: Stack C (OPA-WASM inside Envoy's WASM filter) was dropped after
+# verification on EC2 — `opa build -t wasm` produces OPA's own WASM ABI,
+# which is not the Proxy-Wasm ABI that Envoy's WASM filter expects.
+# Envoy crit-exits with "Missing or unknown Proxy-Wasm ABI version".
+# A wrapper would be needed (e.g., istio-cni's compiler) — out of scope
+# for "vanilla OPA + vanilla Envoy" canonical deployment. Stack B is
+# the real-world OPA+Envoy comparison point. See docs §2.
 run_d1() {
     echo "── D1 — Steady-state per-request latency (inside isolation) ──"
     : >"$RESULTS_DIR/d1.csv"
@@ -316,7 +323,6 @@ run_d1() {
     start_upstream || return 1
     start_gvm_proxy || { echo "GVM proxy failed; tail:"; tail "$RESULTS_DIR/gvm-proxy.log"; return 1; }
     echo "  Stack A: gvm-proxy ready. Running $n×2 curls inside sandbox..."
-    # Warmup
     run_in_sandbox_a 50 GET /v1/messages >/dev/null
     run_in_sandbox_a "$n" GET /v1/messages >"$RESULTS_DIR/d1-A-allow.times"
     run_in_sandbox_a "$n" POST /transfer >"$RESULTS_DIR/d1-A-deny.times"
@@ -333,16 +339,6 @@ run_d1() {
     stop_all
     stats_csv "$RESULTS_DIR/d1-B-allow.times" B allow >>"$RESULTS_DIR/d1.csv"
     stats_csv "$RESULTS_DIR/d1-B-deny.times"  B deny  >>"$RESULTS_DIR/d1.csv"
-
-    # Stack C
-    start_upstream && start_envoy_wasm || { echo "Stack C startup failed"; return 1; }
-    echo "  Stack C: Envoy+OPA WASM ready. Running $n×2 curls inside docker..."
-    run_in_docker_bc 50 GET /v1/messages "$ENVOY_WASM_PORT" >/dev/null
-    run_in_docker_bc "$n" GET /v1/messages "$ENVOY_WASM_PORT" >"$RESULTS_DIR/d1-C-allow.times"
-    run_in_docker_bc "$n" POST /transfer "$ENVOY_WASM_PORT" >"$RESULTS_DIR/d1-C-deny.times"
-    stop_all
-    stats_csv "$RESULTS_DIR/d1-C-allow.times" C allow >>"$RESULTS_DIR/d1.csv"
-    stats_csv "$RESULTS_DIR/d1-C-deny.times"  C deny  >>"$RESULTS_DIR/d1.csv"
 
     echo "  results: $RESULTS_DIR/d1.csv"
     cat "$RESULTS_DIR/d1.csv"
@@ -365,21 +361,18 @@ run_d2a() {
     done
     stop_all
 
-    for stack_tag in B:start_envoy_extauthz:$ENVOY_EXTAUTHZ_PORT C:start_envoy_wasm:$ENVOY_WASM_PORT; do
-        IFS=: read -r tag fn port <<<"$stack_tag"
-        start_upstream && $fn
-        for i in $(seq 1 $iters); do
-            local t0=$(date +%s%3N)
-            $DOCKER run --rm \
-                --add-host "bench.local:$HOST_IP" \
-                -e "HTTP_PROXY=http://$HOST_IP:$port" \
-                curlimages/curl:8.10.1 \
-                curl -sS -o /dev/null http://bench.local:9999/v1/messages 2>/dev/null
-            local t1=$(date +%s%3N)
-            echo "$tag,$i,$((t1-t0))" >>"$RESULTS_DIR/d2a.csv"
-        done
-        stop_all
+    start_upstream && start_envoy_extauthz
+    for i in $(seq 1 $iters); do
+        local t0=$(date +%s%3N)
+        $DOCKER run --rm \
+            --add-host "bench.local:$HOST_IP" \
+            -e "HTTP_PROXY=http://$HOST_IP:$ENVOY_EXTAUTHZ_PORT" \
+            curlimages/curl:8.10.1 \
+            curl -sS -o /dev/null http://bench.local:9999/v1/messages 2>/dev/null
+        local t1=$(date +%s%3N)
+        echo "B,$i,$((t1-t0))" >>"$RESULTS_DIR/d2a.csv"
     done
+    stop_all
     echo "  results: $RESULTS_DIR/d2a.csv"
     cat "$RESULTS_DIR/d2a.csv"
 }
@@ -399,16 +392,13 @@ run_d2b() {
         stop_all
     done
 
-    for stack_tag in B:start_envoy_extauthz C:start_envoy_wasm; do
-        IFS=: read -r tag fn <<<"$stack_tag"
-        for i in $(seq 1 $iters); do
-            stop_all
-            local t0=$(date +%s%3N)
-            $fn
-            local t1=$(date +%s%3N)
-            echo "$tag,$i,$((t1-t0))" >>"$RESULTS_DIR/d2b.csv"
-            stop_all
-        done
+    for i in $(seq 1 $iters); do
+        stop_all
+        local t0=$(date +%s%3N)
+        start_envoy_extauthz
+        local t1=$(date +%s%3N)
+        echo "B,$i,$((t1-t0))" >>"$RESULTS_DIR/d2b.csv"
+        stop_all
     done
     echo "  results: $RESULTS_DIR/d2b.csv"
     cat "$RESULTS_DIR/d2b.csv"
@@ -460,27 +450,6 @@ run_d3() {
         echo "B,$N,$total_b" >>"$RESULTS_DIR/d3.csv"
         for c in "${container_names[@]}"; do $DOCKER rm -f "$c" >/dev/null 2>&1 || true; done
         stop_all
-
-        # Stack C: same as B but with envoy-wasm.
-        start_upstream && start_envoy_wasm
-        container_names=()
-        for j in $(seq 1 "$N"); do
-            local cn="bench-idle-c-$j"
-            $DOCKER run -d --rm --name "$cn" alpine sleep 60 >/dev/null 2>&1
-            container_names+=("$cn")
-        done
-        sleep 5
-        local total_c=0
-        for c in envoy-wasm "${container_names[@]}"; do
-            local pid=$($DOCKER inspect -f '{{.State.Pid}}' "$c" 2>/dev/null)
-            [ -n "$pid" ] && [ "$pid" != "0" ] && {
-                local rss=$(ps -p "$pid" -o rss= 2>/dev/null | awk '{print $1+0}')
-                total_c=$((total_c + ${rss:-0}))
-            }
-        done
-        echo "C,$N,$total_c" >>"$RESULTS_DIR/d3.csv"
-        for c in "${container_names[@]}"; do $DOCKER rm -f "$c" >/dev/null 2>&1 || true; done
-        stop_all
     done
     echo "  results: $RESULTS_DIR/d3.csv"
     cat "$RESULTS_DIR/d3.csv"
@@ -520,23 +489,20 @@ run_d5() {
     echo "A,$((t1-t0)),yes" >>"$RESULTS_DIR/d5.csv"
     stop_all
 
-    for stack_tag in B:start_envoy_extauthz:$ENVOY_EXTAUTHZ_PORT:envoy-ext C:start_envoy_wasm:$ENVOY_WASM_PORT:envoy-wasm; do
-        IFS=: read -r tag fn port cname <<<"$stack_tag"
-        start_upstream && $fn
-        local t0=$(date +%s%3N)
-        $DOCKER run --rm \
-            --add-host "bench.local:$HOST_IP" \
-            -e "HTTP_PROXY=http://$HOST_IP:$port" \
-            curlimages/curl:8.10.1 \
-            curl -sS -o /dev/null -X POST http://bench.local:9999/transfer 2>/dev/null
-        for _ in $(seq 1 100); do
-            $DOCKER logs "$cname" 2>&1 | grep -q "/transfer" && break
-            sleep 0.05
-        done
-        local t1=$(date +%s%3N)
-        echo "$tag,$((t1-t0)),no" >>"$RESULTS_DIR/d5.csv"
-        stop_all
+    start_upstream && start_envoy_extauthz
+    local t0=$(date +%s%3N)
+    $DOCKER run --rm \
+        --add-host "bench.local:$HOST_IP" \
+        -e "HTTP_PROXY=http://$HOST_IP:$ENVOY_EXTAUTHZ_PORT" \
+        curlimages/curl:8.10.1 \
+        curl -sS -o /dev/null -X POST http://bench.local:9999/transfer 2>/dev/null
+    for _ in $(seq 1 100); do
+        $DOCKER logs envoy-ext 2>&1 | grep -q "/transfer" && break
+        sleep 0.05
     done
+    local t1=$(date +%s%3N)
+    echo "B,$((t1-t0)),no" >>"$RESULTS_DIR/d5.csv"
+    stop_all
     echo "  results: $RESULTS_DIR/d5.csv"
     cat "$RESULTS_DIR/d5.csv"
 }

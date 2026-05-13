@@ -8,7 +8,7 @@
 
 ## What This Compares
 
-Three end-to-end stacks, each measured as actually deployed — agent
+Two end-to-end stacks, each measured as actually deployed — agent
 process running *inside* an isolation boundary, egress intercepted by
 the policy plane, audit recorded.
 
@@ -18,9 +18,14 @@ the policy plane, audit recorded.
 - **Stack B — Envoy + OPA ext_authz**: agent in Docker container with
   `HTTP_PROXY=envoy`. Cooperative interception. Envoy consults OPA over
   gRPC per request. Envoy access log audit.
-- **Stack C — Envoy + OPA WASM**: same as B but Rego compiled to WASM,
-  evaluated inside Envoy's WASM filter. The architecturally fairest
-  policy-engine comparison vs GVM's in-process SRR.
+
+A third candidate — "Stack C: OPA-WASM inside Envoy's WASM filter" —
+was planned as the architecturally fairest 1:1 in-process eval
+comparison. Verification on EC2 (2026-05-13) revealed that
+`opa build -t wasm` produces a module using OPA's own WASM ABI, not
+the Proxy-Wasm ABI Envoy's filter expects (Envoy refuses to load with
+"Missing or unknown Proxy-Wasm ABI version"). The combination is not a
+canonical OPA+Envoy deployment; Stack B is the real production point.
 
 ## What This Doesn't Compare
 
@@ -62,14 +67,15 @@ Five dimensions, chosen to make trade-offs visible:
 > Filled after EC2 run. Each dimension becomes a one-line summary plus
 > a link to the internal raw table.
 
-| Dimension | GVM (Stack A) | Envoy+OPA ext_authz (B) | Envoy+OPA WASM (C) |
-|---|---|---|---|
-| D1 latency p50 (Allow) | TBD | TBD | TBD |
-| D2a workload cold start | TBD | TBD | TBD |
-| D2b control plane cold start | TBD | TBD | TBD |
-| D3 memory @ N=20 | TBD | TBD | TBD |
-| D4 distribution size | TBD | TBD | TBD |
-| D5 tamper-evident audit | ✓ default | ✗ not default | ✗ not default |
+| Dimension | GVM (Stack A) | Envoy+OPA ext_authz (B) |
+|---|---|---|
+| D1 latency p50 Allow (ms) | **7.99** | **2.33** |
+| D1 latency p50 Deny (ms) | **7.17** | **1.47** |
+| D2a workload cold start | TBD | TBD |
+| D2b control plane cold start | TBD | TBD |
+| D3 memory @ N=10 | TBD | TBD |
+| D4 distribution size | TBD | TBD |
+| D5 tamper-evident audit | ✓ default | ✗ not default |
 
 ## Reading Guide
 

@@ -96,27 +96,26 @@ honours `HTTP_PROXY` env var. An adversarial agent could bypass by
 ignoring the env var (no iptables redirect inside the container without
 extra setup). Audit = Envoy access log (no tamper evidence by default).
 
-### Stack C — Envoy + OPA WASM filter (in-process)
+### Stack C — Envoy + OPA WASM filter (NOT VIABLE — see methodology note)
 
-```
-┌──────────────────────────────┐
-│  Envoy (host)                │
-│  ┌──────────────────────┐    │  policy (Rego→WASM, in-process)
-│  │  OPA-WASM filter     │    │
-│  └──────────────────────┘    │
-└──────────────▲───────────────┘
-               │ HTTP_PROXY (cooperative)
-               │
-┌──────────────┴────────────────┐
-│  Docker container             │
-│  (same as Stack B)            │
-└───────────────────────────────┘
-```
+Originally planned: Rego compiled to WASM, loaded into Envoy's
+`envoy.filters.http.wasm` filter for in-process eval. This would have
+been the "fairest" 1:1 comparison vs GVM's in-process SRR.
 
-Performance-optimised OPA+Envoy. Same workload isolation + cooperative
-interception as B; only the policy evaluator differs (WASM in-process
-instead of gRPC out-of-process). The architecturally fairest comparison
-vs GVM's in-process SRR.
+**Discovered during EC2 verification (2026-05-13)**: `opa build -t wasm`
+produces a module that uses OPA's own WASM ABI (`eval`,
+`opa_eval_ctx_*`, etc.), NOT the Proxy-Wasm ABI that Envoy's WASM filter
+expects. Envoy crit-exits with `Missing or unknown Proxy-Wasm ABI
+version`. Loading OPA-WASM into vanilla Envoy is not a supported
+canonical deployment. Third-party wrappers exist (e.g., Istio's compiler
+emits Proxy-Wasm-compatible OPA modules) but require additional
+toolchain that operators of "vanilla OPA + vanilla Envoy" do not have.
+
+Honest implication: the canonical OPA+Envoy production deployment is
+Stack B (ext_authz over gRPC), with policy decisions crossing a process
+boundary per request. The "in-process OPA inside Envoy" framing in
+Phase 1 was based on an incorrect assumption about WASM ABI
+compatibility. Stack B is the real comparison point; Stack C is dropped.
 
 ### Critical asymmetry: transparent vs cooperative interception
 
@@ -267,11 +266,19 @@ point*: it surfaces a scope difference invisible in latency numbers.
 
 ### D1 — Steady-state per-request latency (inside isolation)
 
-| Stack | D1a Allow (p50/p95/p99 ms) | D1b Deny (p50/p95/p99 ms) |
-|---|---|---|
-| GVM (Stack A) | TBD | TBD |
-| Envoy + OPA ext_authz (Stack B) | TBD | TBD |
-| Envoy + OPA-WASM (Stack C) | TBD | TBD |
+| Stack | D1a Allow (p50/p95/p99 ms) | D1b Deny (p50/p95/p99 ms) | n |
+|---|---|---|---|
+| GVM (Stack A) | **7.986 / 8.378 / 8.956** | **7.168 / 7.928 / 13.345** | 1000 |
+| Envoy + OPA ext_authz (Stack B) | **2.330 / 2.450 / 3.657** | **1.465 / 1.558 / 2.244** | 1000 |
+| Envoy + OPA-WASM (Stack C) | — (not viable, see §2) | — | — |
+
+*Reading: Stack A is ~3-5× slower per request — the cost of
+kernel-level transparent interception (iptables DNAT inside sandbox
+netns) + in-process SRR + forward. Stack B has cooperative
+HTTP_PROXY interception + gRPC ext_authz hop to OPA. Different
+enforcement guarantees, same deployment shape — see §2 "Critical
+asymmetry." Deny is faster than Allow on both stacks because no
+upstream forward happens after a deny decision.*
 
 *Reading note: Stack A includes kernel-level transparent interception
 cost; Stack B/C uses cooperative HTTP_PROXY. Different security
@@ -283,7 +290,6 @@ guarantees, same deployment shape — see §2 "Critical asymmetry."*
 |---|---|
 | GVM (`gvm run --sandbox -- curl`) | TBD |
 | Docker + OPA ext_authz (`docker run ... curl`) | TBD |
-| Docker + OPA WASM | TBD |
 
 ### D2b — Control plane cold start
 
@@ -291,15 +297,13 @@ guarantees, same deployment shape — see §2 "Critical asymmetry."*
 |---|---|
 | GVM (`gvm-proxy` daemon) | TBD |
 | Envoy + OPA ext_authz (`docker run envoy` + `docker run opa`) | TBD |
-| Envoy + OPA WASM | TBD |
 
 ### D3 — Memory footprint scaling
 
-| Stack | N=1 (MB) | N=5 (MB) | N=20 (MB) | Per-agent ~ (MB) |
-|---|---|---|---|---|
-| GVM | TBD | TBD | TBD | TBD |
-| OPA + Envoy ext_authz | TBD | TBD | TBD | TBD |
-| OPA + Envoy WASM | TBD | TBD | TBD | TBD |
+| Stack | N=1 (kB) | N=5 (kB) | N=10 (kB) |
+|---|---|---|---|
+| GVM | TBD | TBD | TBD |
+| OPA + Envoy ext_authz | TBD | TBD | TBD |
 
 ### D4 — Distribution size
 
@@ -314,7 +318,6 @@ guarantees, same deployment shape — see §2 "Critical asymmetry."*
 |---|---|---|
 | GVM | TBD | ✓ Merkle + Ed25519 anchors |
 | Envoy + OPA ext_authz | TBD | ✗ not default |
-| Envoy + OPA WASM | TBD | ✗ not default |
 
 ## 7. Analysis
 
@@ -340,10 +343,15 @@ guarantees, same deployment shape — see §2 "Critical asymmetry."*
    (kernel iptables), Stack B/C cooperatively (HTTP_PROXY env). Same
    deployment shape, different security guarantees. Documented next
    to every D1 result, not hidden.
-2. **OPA-WASM is less production-deployed** than ext_authz. Stack C
-   represents *theoretical best-case* OPA+Envoy latency; many real
-   deployments use ext_authz. Both are measured so readers can pick
-   the comparison point that matches their deployment.
+2. **OPA-WASM-in-Envoy is not a viable canonical deployment.**
+   Originally planned as Stack C ("fairest 1:1 in-process eval
+   comparison"), but `opa build -t wasm` produces a module using OPA's
+   own WASM ABI, not the Proxy-Wasm ABI that Envoy's WASM filter
+   requires. Envoy fails to load with `Missing or unknown Proxy-Wasm
+   ABI version`. Third-party compilers (Istio's, etc.) exist but lie
+   outside "vanilla OPA + vanilla Envoy." Stack B (ext_authz over gRPC)
+   is the canonical production OPA+Envoy deployment and the real
+   comparison point.
 3. **No multi-host measurement.** Real OPA+Envoy production often has
    OPA bundle distribution, Envoy CDS push, cross-node policy
    propagation latency. Single-host comparison misses these and
