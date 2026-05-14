@@ -633,39 +633,90 @@ run_d6() {
 }
 
 # ── D7 — Decision-to-signed-anchor latency (audit-equivalence) ──────
-# How long from "agent issued a denied request" to "a hash-chained +
-# Ed25519-signed entry containing that request is on disk." For Stack A,
-# this is the bundled WAL+Merkle path (re-using D5's number). For
-# B+TLS+hash, this is Envoy access-log -> sidecar -> signed log file.
+# How long from "the deny decision is made" to "a hash-chained +
+# Ed25519-signed entry containing that request is on disk."
+#
+# Issued via host-side curl (NOT docker run) to remove the ~450ms
+# container cold-start from the measurement — D7 is about the audit
+# path's intrinsic latency, not the workload bring-up cost.
+# Stack A measured via direct forward-proxy curl to gvm-proxy + WAL
+# file growth. Stack B-tls-hash measured via direct HTTPS curl to
+# Envoy + signed-log file growth past a baseline-size watermark.
+# n=20 iterations, median + p95 reported.
 run_d7() {
     echo "── D7 — Decision-to-signed-anchor latency ────────────────────"
     : >"$RESULTS_DIR/d7.csv"
-    echo "variant,decision_to_signed_anchor_ms" >>"$RESULTS_DIR/d7.csv"
+    echo "variant,iter,decision_to_signed_anchor_ms" >>"$RESULTS_DIR/d7.csv"
     add_bench_hosts
 
-    start_upstream && start_envoy_tls_hash || { echo "B+TLS+hash startup failed"; return 1; }
-    # Reset signed log so we time just THIS request's appearance.
-    : > "$SIGNED_LOG"
-    chmod 0666 "$SIGNED_LOG"
-    sleep 0.3
+    # ── Stack A: gvm-proxy + WAL ─────────────────────────────────────
+    start_upstream && start_gvm_proxy || return 1
+    local wal_path="$GVM_TMP_CONFIG/data/wal.log"
+    # Pre-warm — generate one event so WAL exists.
+    curl -sS -m 2 -o /dev/null -x "http://127.0.0.1:$GVM_PROXY_PORT" \
+        "http://bench.local:9999/v1/messages" 2>/dev/null || true
+    sleep 0.2
 
-    local t0=$(date +%s%3N)
-    $DOCKER run --rm \
-        --add-host "bench.local:$HOST_IP" \
-        -v "$SCRIPT_DIR/build/tls/ca.crt:/etc/ssl/bench-ca.crt:ro" \
-        curlimages/curl:8.10.1 \
-        curl -sS -o /dev/null --cacert /etc/ssl/bench-ca.crt \
-            -X POST "https://bench.local:$ENVOY_TLS_PORT/transfer" 2>/dev/null
-    for _ in $(seq 1 500); do
-        grep -q '"entry".*"/transfer"\|/transfer' "$SIGNED_LOG" 2>/dev/null && break
-        sleep 0.005
+    for i in $(seq 1 20); do
+        local before_size=0
+        [ -f "$wal_path" ] && before_size=$(wc -c <"$wal_path")
+        local t0=$(date +%s%3N)
+        curl -sS -m 2 -o /dev/null -x "http://127.0.0.1:$GVM_PROXY_PORT" \
+            -X POST "http://bench.local:9999/transfer" 2>/dev/null
+        for _ in $(seq 1 500); do
+            local cur_size=0
+            [ -f "$wal_path" ] && cur_size=$(wc -c <"$wal_path")
+            if [ "$cur_size" -gt "$before_size" ]; then
+                tail -c +$((before_size + 1)) "$wal_path" 2>/dev/null | grep -q "/transfer\|bench-deny" && break
+            fi
+            sleep 0.002
+        done
+        local t1=$(date +%s%3N)
+        echo "A,$i,$((t1-t0))" >>"$RESULTS_DIR/d7.csv"
     done
-    local t1=$(date +%s%3N)
-    echo "B-tls-hash,$((t1-t0))" >>"$RESULTS_DIR/d7.csv"
+    stop_all
+
+    # ── B+TLS+hash: Envoy + sidecar ─────────────────────────────────
+    start_upstream && start_envoy_tls_hash || return 1
+    # Pre-warm so sidecar has steady state + Envoy worker threads warm.
+    for _ in 1 2 3; do
+        curl -sS -m 2 -o /dev/null --cacert "$SCRIPT_DIR/build/tls/ca.crt" \
+            "https://bench.local:$ENVOY_TLS_PORT/v1/messages" 2>/dev/null || true
+        sleep 0.1
+    done
+
+    for i in $(seq 1 20); do
+        local before_size=$(wc -c <"$SIGNED_LOG" 2>/dev/null || echo 0)
+        local t0=$(date +%s%3N)
+        curl -sS -m 2 -o /dev/null --cacert "$SCRIPT_DIR/build/tls/ca.crt" \
+            -X POST "https://bench.local:$ENVOY_TLS_PORT/transfer" 2>/dev/null
+        for _ in $(seq 1 500); do
+            local cur_size=$(wc -c <"$SIGNED_LOG" 2>/dev/null || echo 0)
+            if [ "$cur_size" -gt "$before_size" ]; then
+                tail -c +$((before_size + 1)) "$SIGNED_LOG" 2>/dev/null | grep -q "/transfer" && break
+            fi
+            sleep 0.002
+        done
+        local t1=$(date +%s%3N)
+        echo "B-tls-hash,$i,$((t1-t0))" >>"$RESULTS_DIR/d7.csv"
+    done
     stop_all
 
     echo "  results: $RESULTS_DIR/d7.csv"
-    cat "$RESULTS_DIR/d7.csv"
+    # Summary
+    python3 -c "
+import csv
+from collections import defaultdict
+d = defaultdict(list)
+with open('$RESULTS_DIR/d7.csv') as f:
+    r = csv.DictReader(f)
+    for row in r:
+        d[row['variant']].append(int(row['decision_to_signed_anchor_ms']))
+for v, vals in d.items():
+    vals.sort()
+    n = len(vals)
+    print(f'{v}: n={n} p50={vals[n//2]} p95={vals[int(n*0.95) if n>=20 else n-1]} max={vals[-1]}')
+"
 }
 
 # ── Run selected dimensions ─────────────────────────────────────────
