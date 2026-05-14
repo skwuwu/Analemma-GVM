@@ -1,0 +1,5 @@
+variant,scenario,p50_ms,p95_ms,p99_ms,n
+B-tls,allow,8.015,8.349,9.503,1000
+B-tls,deny,7.228,8.741,22.230,1000
+B-tls-hash,allow,8.192,8.606,10.722,1000
+B-tls-hash,deny,7.302,7.668,9.276,1000

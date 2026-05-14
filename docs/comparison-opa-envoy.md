@@ -79,6 +79,29 @@ Five dimensions, chosen to make trade-offs visible:
 | D4 distribution size (MB total) | **35** | **100** |
 | D5 tamper-evident audit | ✓ default (Merkle + Ed25519) | ✗ not default |
 
+### Same-work comparison — D6 + D7 (B brought to feature parity)
+
+What happens when Stack B is configured to do the *same work* GVM
+does by default (TLS termination + tamper-evident hash-chain audit
+via a bolt-on sidecar):
+
+| Variant | Per-request p50 Allow (ms) | Decision→signed-anchor p50 (ms) | LOC bolt-on |
+|---|---|---|---|
+| B baseline (HTTP, text log) | **2.33** | — (no signed audit) | 0 |
+| **B + TLS** (HTTPS at Envoy) | **8.02** | — (no signed audit) | +100 |
+| **B + TLS + hash-chain sidecar** | **8.19** | **3345** | ~180 |
+| **GVM (Stack A)** | **7.99** | **27** | 0 (bundled) |
+
+**Key reads:**
+- Once Stack B does the same TLS + hash-chain work, **per-request
+  latency lands at parity with GVM** (~8 ms each). The ~5 ms "gap"
+  in D1 is mostly TLS handshake, not structural-enforcement penalty.
+- **Audit recording latency stays ~124× different** — GVM signs
+  within ~27 ms (in-process WAL); the bolted-on Envoy file→tail→sign
+  path waits ~3.3 s for Envoy's default file-log flush window.
+- ~180 LOC of bolt-on (Envoy TLS YAML + openssl certs + Python
+  sidecar) is the operator cost of audit-equivalence on OPA+Envoy.
+
 ## Reading Guide
 
 Read each dimension; pick the tool that matches your workload.

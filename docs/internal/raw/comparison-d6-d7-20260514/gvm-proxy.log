@@ -1,0 +1,49 @@
+[2m2026-05-14T14:26:47.285930Z[0m [33m WARN[0m [2mgvm_proxy::config[0m[2m:[0m gvm.toml has insecure permissions — group/other can read API keys [3mpath[0m[2m=[0m/tmp/gvm-bench-1dF6VP/gvm.toml [3mmode[0m[2m=[0m"0644"
+[2m2026-05-14T14:26:47.286110Z[0m [33m WARN[0m [2mgvm_proxy::api_keys[0m[2m:[0m secrets.toml has insecure permissions — group/other can read API keys [3mpath[0m[2m=[0m/tmp/gvm-bench-1dF6VP/secrets.toml [3mmode[0m[2m=[0m"0644"
+[2m2026-05-14T14:26:47.286152Z[0m [33m WARN[0m [2mgvm_proxy[0m[2m:[0m No API keys configured. Running in passthrough mode. Layer 3 (API key isolation) is INACTIVE. Agents can bypass proxy by calling APIs directly. Run `gvm init` to configure API key isolation.
+[2m2026-05-14T14:26:47.294379Z[0m [33m WARN[0m [2mgvm_proxy::vault[0m[2m:[0m ⚠ GVM_VAULT_KEY not set — generating random ephemeral key. Data will NOT survive restart. NOT SAFE FOR PRODUCTION.
+
+  [1m[36m╔══════════════════════════════════════════╗[0m
+  [1m[36m║[0m   Analemma GVM — Governance Summary     [1m[36m║[0m
+  [1m[36m╚══════════════════════════════════════════╝[0m
+
+  [1mNetwork SRR[0m
+    Rules loaded:     8
+    [31mDeny:  1[0m   [33mDelay: 0[0m   [32mAllow: 7[0m
+    Default (no match): [33mDelay(300ms)[0m
+    Blocked endpoints:
+      [31m✗[0m POST bench.local:9999/transfer
+
+  [1mAPI Key Isolation[0m
+    [33m⚠ No API keys configured — passthrough mode[0m
+    [2mAgents can call APIs directly without credential isolation.[0m
+    [2mRun: gvm init --industry saas[0m
+
+  [2m┌─────────────────────────────────────────────┐[0m
+  [2m│  Request flow:                              │[0m
+  [2m│  Agent → [SRR check] → [API key inject]    │[0m
+  [2m│         → Upstream                          │[0m
+  [2m│  Unknown URLs → Delay(300ms) + audit trail  │[0m
+  [2m└─────────────────────────────────────────────┘[0m
+
+[2m2026-05-14T14:26:49.140320Z[0m [33m WARN[0m [2mgvm_proxy::proxy[0m[2m:[0m Request denied by policy [3mhost[0m[2m=[0mbench.local:9999 [3mpath[0m[2m=[0m/transfer [3mreason[0m[2m=[0mBench deny scenario
+[2m2026-05-14T14:26:49.171061Z[0m [33m WARN[0m [2mgvm_proxy::proxy[0m[2m:[0m Request denied by policy [3mhost[0m[2m=[0mbench.local:9999 [3mpath[0m[2m=[0m/transfer [3mreason[0m[2m=[0mBench deny scenario
+[2m2026-05-14T14:26:49.201477Z[0m [33m WARN[0m [2mgvm_proxy::proxy[0m[2m:[0m Request denied by policy [3mhost[0m[2m=[0mbench.local:9999 [3mpath[0m[2m=[0m/transfer [3mreason[0m[2m=[0mBench deny scenario
+[2m2026-05-14T14:26:49.229836Z[0m [33m WARN[0m [2mgvm_proxy::proxy[0m[2m:[0m Request denied by policy [3mhost[0m[2m=[0mbench.local:9999 [3mpath[0m[2m=[0m/transfer [3mreason[0m[2m=[0mBench deny scenario
+[2m2026-05-14T14:26:49.260005Z[0m [33m WARN[0m [2mgvm_proxy::proxy[0m[2m:[0m Request denied by policy [3mhost[0m[2m=[0mbench.local:9999 [3mpath[0m[2m=[0m/transfer [3mreason[0m[2m=[0mBench deny scenario
+[2m2026-05-14T14:26:49.292752Z[0m [33m WARN[0m [2mgvm_proxy::proxy[0m[2m:[0m Request denied by policy [3mhost[0m[2m=[0mbench.local:9999 [3mpath[0m[2m=[0m/transfer [3mreason[0m[2m=[0mBench deny scenario
+[2m2026-05-14T14:26:49.324563Z[0m [33m WARN[0m [2mgvm_proxy::proxy[0m[2m:[0m Request denied by policy [3mhost[0m[2m=[0mbench.local:9999 [3mpath[0m[2m=[0m/transfer [3mreason[0m[2m=[0mBench deny scenario
+[2m2026-05-14T14:26:49.355585Z[0m [33m WARN[0m [2mgvm_proxy::proxy[0m[2m:[0m Request denied by policy [3mhost[0m[2m=[0mbench.local:9999 [3mpath[0m[2m=[0m/transfer [3mreason[0m[2m=[0mBench deny scenario
+[2m2026-05-14T14:26:49.387517Z[0m [33m WARN[0m [2mgvm_proxy::proxy[0m[2m:[0m Request denied by policy [3mhost[0m[2m=[0mbench.local:9999 [3mpath[0m[2m=[0m/transfer [3mreason[0m[2m=[0mBench deny scenario
+[2m2026-05-14T14:26:49.418738Z[0m [33m WARN[0m [2mgvm_proxy::proxy[0m[2m:[0m Request denied by policy [3mhost[0m[2m=[0mbench.local:9999 [3mpath[0m[2m=[0m/transfer [3mreason[0m[2m=[0mBench deny scenario
+[2m2026-05-14T14:26:49.449391Z[0m [33m WARN[0m [2mgvm_proxy::proxy[0m[2m:[0m Request denied by policy [3mhost[0m[2m=[0mbench.local:9999 [3mpath[0m[2m=[0m/transfer [3mreason[0m[2m=[0mBench deny scenario
+[2m2026-05-14T14:26:49.480984Z[0m [33m WARN[0m [2mgvm_proxy::proxy[0m[2m:[0m Request denied by policy [3mhost[0m[2m=[0mbench.local:9999 [3mpath[0m[2m=[0m/transfer [3mreason[0m[2m=[0mBench deny scenario
+[2m2026-05-14T14:26:49.512006Z[0m [33m WARN[0m [2mgvm_proxy::proxy[0m[2m:[0m Request denied by policy [3mhost[0m[2m=[0mbench.local:9999 [3mpath[0m[2m=[0m/transfer [3mreason[0m[2m=[0mBench deny scenario
+[2m2026-05-14T14:26:49.543875Z[0m [33m WARN[0m [2mgvm_proxy::proxy[0m[2m:[0m Request denied by policy [3mhost[0m[2m=[0mbench.local:9999 [3mpath[0m[2m=[0m/transfer [3mreason[0m[2m=[0mBench deny scenario
+[2m2026-05-14T14:26:49.575911Z[0m [33m WARN[0m [2mgvm_proxy::proxy[0m[2m:[0m Request denied by policy [3mhost[0m[2m=[0mbench.local:9999 [3mpath[0m[2m=[0m/transfer [3mreason[0m[2m=[0mBench deny scenario
+[2m2026-05-14T14:26:49.608914Z[0m [33m WARN[0m [2mgvm_proxy::proxy[0m[2m:[0m Request denied by policy [3mhost[0m[2m=[0mbench.local:9999 [3mpath[0m[2m=[0m/transfer [3mreason[0m[2m=[0mBench deny scenario
+[2m2026-05-14T14:26:49.680386Z[0m [33m WARN[0m [2mgvm_proxy::proxy[0m[2m:[0m Request denied by policy [3mhost[0m[2m=[0mbench.local:9999 [3mpath[0m[2m=[0m/transfer [3mreason[0m[2m=[0mBench deny scenario
+[2m2026-05-14T14:26:49.712303Z[0m [33m WARN[0m [2mgvm_proxy::proxy[0m[2m:[0m Request denied by policy [3mhost[0m[2m=[0mbench.local:9999 [3mpath[0m[2m=[0m/transfer [3mreason[0m[2m=[0mBench deny scenario
+[2m2026-05-14T14:26:49.743636Z[0m [33m WARN[0m [2mgvm_proxy::proxy[0m[2m:[0m Request denied by policy [3mhost[0m[2m=[0mbench.local:9999 [3mpath[0m[2m=[0m/transfer [3mreason[0m[2m=[0mBench deny scenario
+[2m2026-05-14T14:26:49.775308Z[0m [33m WARN[0m [2mgvm_proxy::proxy[0m[2m:[0m Request denied by policy [3mhost[0m[2m=[0mbench.local:9999 [3mpath[0m[2m=[0m/transfer [3mreason[0m[2m=[0mBench deny scenario
+[2m2026-05-14T14:26:49.790399Z[0m [33m WARN[0m [2mgvm_proxy[0m[2m:[0m WAL shutdown: 33 references still held — batch task will flush on final drop [3mstrong_refs[0m[2m=[0m33

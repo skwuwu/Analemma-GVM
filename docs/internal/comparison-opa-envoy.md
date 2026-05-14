@@ -356,6 +356,93 @@ GVM is **2.85× smaller** to distribute (35 MB vs 100 MB), reflecting
 the bundled-single-binary build vs two separate container images.
 Operator pulls one tarball vs two Docker images.
 
+### D6 — Cost of adding TLS + hash-chain audit to Stack B
+
+Isolates the per-request latency cost of (a) adding TLS termination
+at Envoy and (b) adding a minimum-viable hash-chain audit sidecar
+that tails Envoy's access log. All scenarios run 1000 curls from
+inside a Docker container, same shape as D1.
+
+| Variant | Allow p50 / p95 / p99 (ms) | Deny p50 / p95 / p99 (ms) |
+|---|---|---|
+| B baseline (D1 reference) | 2.33 / 2.45 / 3.66 | 1.47 / 1.56 / 2.24 |
+| **B + TLS** | **8.02 / 8.35 / 9.50** | **7.23 / 8.74 / 22.23** |
+| **B + TLS + hash-chain** | **8.19 / 8.61 / 10.72** | **7.30 / 7.67 / 9.28** |
+
+**Cost breakdown:**
+- **TLS adds ~5.7 ms p50** (2.33 → 8.02 ms allow) — the cost of TLS
+  handshake + Envoy's downstream TLS termination per request.
+- **Hash-chain sidecar adds ~0.17 ms p50** on top of TLS — the
+  sidecar tails asynchronously off the request path; SHA-256 +
+  Ed25519 per entry happen in a separate process.
+- **Stack A (D1: 7.99 ms allow) is comparable to B+TLS+hash (8.19 ms).**
+  *Once Stack B is brought to feature-parity (TLS termination +
+  tamper-evident audit), the per-request latency gap largely closes.*
+  The ~5 ms "structural enforcement tax" attributed to Stack A in §7's
+  earlier reading is mostly TLS-handshake cost that Stack B was
+  bypassing under its cooperative HTTP_PROXY setup.
+
+### D7 — Decision-to-signed-anchor latency (audit-equivalence)
+
+End-to-end from "the deny decision is made" to "a hash-chained +
+Ed25519-signed entry containing that request is readable on disk."
+Issued via host-side curl (no docker cold-start contamination),
+n=20 iterations per variant, pre-warmed.
+
+| Variant | p50 (ms) | p95 (ms) | max (ms) |
+|---|---|---|---|
+| **Stack A (GVM, WAL + Merkle + Ed25519)** | **27** | **28** | **28** |
+| **B + TLS + hash-chain (Envoy file → tail → sign)** | **3345** | **4226** | **5198** |
+
+GVM's bundled pipeline records + signs within ~27 ms (proxy-side SRR
+decision + WAL durable append with group-commit fsync + Merkle batch
+seal with Ed25519 anchor). Tight distribution (p50 ≈ p95).
+
+B+TLS+hash is **~124× slower** at 3345 ms p50. Root cause: Envoy's
+`FileAccessLog` does not flush per request — default behaviour
+buffers and flushes on a ~10-second interval. The sidecar polling
+the access log file therefore sees entries in ~10-second batches;
+the bench's measurement lands uniformly within that window,
+producing the observed ~3.3 s p50.
+
+Verified by inspecting per-entry timestamps in the signed log: all
+entries within a 10-second window were sidecar-processed within
+microseconds of each other, then no new entries for 10 seconds, then
+another batch — upstream buffering, not sidecar delay. Setting
+`access_log_options.flush_access_log_on_new_request: true` in the
+HCM did not change the behaviour (that option applies to streaming
+access loggers, not the file logger).
+
+**Operator paths to lower audit latency on Stack B:**
+
+1. **gRPC streaming access log** (`envoy.access_loggers.open_telemetry`
+   or `envoy.access_loggers.http_grpc`) → sign-and-record service.
+   Sub-second audit feasible. Adds a gRPC server to the stack
+   (~200 LOC + protobuf).
+2. **UDP / syslog access log** + UDP-receiving signer.
+   Sub-100 ms feasible. Adds a UDP daemon.
+3. **Bootstrap-level `access_log_options.access_log_flush_interval`**
+   set short. Untested here — may not honour for file loggers.
+
+The 3.3 s in D7 is the **honest vanilla-FileAccessLog cost** for the
+bolt-on approach. Improvable, but each improvement adds operational
+surface the vanilla-deployment constraint of this comparison excluded.
+
+### D6 + D7 LOC cost — operator bolt-on size
+
+What an operator writes to bring Stack B to feature parity with
+Stack A's bundled TLS + tamper-evident audit:
+
+| Artifact | LOC | Purpose |
+|---|---|---|
+| `envoy-tls.yaml` | +72 (vs `envoy-extauthz.yaml`) | TLS listener + cert mount |
+| `gen-tls-certs.sh` | 30 | openssl CA + server cert with SANs |
+| `hash-chain-sidecar.py` | 81 | Tail access log, SHA-256 chain, Ed25519 sign |
+| **Total bolt-on** | **~180 LOC** | Plus operational complexity: supervise sidecar, manage key rotation |
+
+Stack A bundles all of this. The bolt-on size + maintenance is the
+real cost of audit-equivalence on OPA+Envoy.
+
 ### D5 — Audit visibility
 
 End-to-end from "agent issued a denied request" to "decision visible
@@ -404,13 +491,16 @@ deployment" calculus.
 
 ### Where vertical integration costs
 
-- **D1 (~5 ms / 3-5× slower per request)**: kernel-level transparent
-  interception (iptables DNAT inside sandbox netns) pays a per-packet
-  netfilter cost the cooperative HTTP_PROXY path does not. This is
-  the cost of structural enforcement, not a policy-engine
-  inefficiency. An adversarial agent in Stack B that ignores
-  HTTP_PROXY bypasses entirely; in Stack A it cannot. Not the same
-  security level — see §2 "Critical asymmetry."
+- **D1 reads ~5 ms slower for A, but D6 shows the gap is mostly TLS,
+  not structural enforcement.** When Stack B is brought to feature
+  parity (B+TLS = 8.02 ms, B+TLS+hash = 8.19 ms vs A = 7.99 ms), the
+  per-request gap closes. The "~5 ms structural enforcement tax"
+  initially attributed to A in §7's first reading is largely the cost
+  of TLS handshake that A bundles by default and B's vanilla
+  HTTP_PROXY setup omits. The cooperative-vs-transparent security
+  difference remains real — see §2 "Critical asymmetry" — but the
+  per-request *cost* of that difference is small once both stacks do
+  the same work.
 - **D2a (~450 ms slower workload cold start)**: namespace + veth +
   iptables + seccomp + per-sandbox MITM CA + cgroup vs Docker's
   namespace + bridge + cgroup. The added work is what gives the
@@ -432,17 +522,26 @@ with quantifiable trade-offs:
 
 - **Convergent in shape**: both stacks intercept HTTP, evaluate
   declarative policy, log decisions. Same building blocks.
-- **Divergent in scope**: GVM bundles isolation primitives + tamper-
-  evident audit into a 35 MB single binary; OPA+Envoy composes two
-  ~50 MB images and assumes the operator brings their own isolation +
-  audit. Bundled vs composed at the *integration-unit* level.
+- **Divergent in scope**: GVM bundles isolation primitives + TLS +
+  tamper-evident audit into a 35 MB single binary; OPA+Envoy composes
+  two ~50 MB images plus a ~180-LOC bolt-on (TLS config + cert
+  generation + audit sidecar) to reach feature parity. Bundled vs
+  composed at the *integration-unit* level.
 - **Divergent in enforcement**: GVM's transparent interception
   structurally prevents agent bypass; OPA+Envoy's cooperative
-  interception is bypassable by an adversarial agent ignoring
-  HTTP_PROXY. Same building blocks, different security guarantee.
+  HTTP_PROXY interception is bypassable. Same building blocks,
+  different security guarantee.
+- **Divergent in audit recording latency (D7)**: even with the
+  hash-chain sidecar bolted on, OPA+Envoy's file-based access log
+  exit path is ~124× slower than GVM's in-process WAL+Merkle (3345
+  ms vs 27 ms). Operators wanting sub-second tamper-evident audit on
+  OPA+Envoy need to upgrade further to gRPC streaming access log
+  (more LOC, more daemons, more failure surface). GVM's audit
+  latency is structural — the WAL is in-process — and no operator
+  config or bolt-on can match it without a similar architecture.
 
 For the AI agent governance use case — untrusted code, fast iteration,
-single-host laptop or VM deployment, audit chain required — GVM's
+single-host laptop or VM deployment, low-latency audit chain — GVM's
 shape is the right shape. For service-to-service authz on a K8s+Istio
 service mesh, OPA+Envoy's shape is the right shape. The benchmark
 quantifies that "right shape" claim per dimension; operators pick the
@@ -450,8 +549,8 @@ tool that matches their workload.
 
 The orchestrator-friendly v0.7 surface (event stream + granular SRR +
 rule TTL) converges on OPA+Envoy in *shape* — but the underlying
-asymmetries (in-process eval, structural enforcement, bundled audit)
-remain. The 4-invariant guardrails proposed earlier
+asymmetries (in-process eval, structural enforcement, sub-second
+audit) remain. The 4-invariant guardrails proposed earlier
 (in-process policy / narrow SRR / standalone default / no required
 external service) keep the shape from drifting into "OPA+Envoy with
 extra audit" over the next release cycles.
