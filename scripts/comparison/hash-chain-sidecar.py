@@ -87,8 +87,13 @@ def main() -> int:
     fout = open(args.output, "a")
     try:
         while True:
+            # Snapshot position so we can rewind on partial-line / EOF reads.
+            # Python text-mode file's internal buffer can otherwise mask
+            # new bytes written after a readline() returned '' at EOF.
+            where = fin.tell()
             line = fin.readline()
-            if not line:
+            if not line or not line.endswith("\n"):
+                fin.seek(where)
                 time.sleep(poll_s)
                 continue
             entry = line.rstrip("\n").encode("utf-8")
