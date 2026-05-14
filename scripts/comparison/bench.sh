@@ -252,9 +252,11 @@ start_envoy_extauthz() {
 # accessible file so the optional hash-chain sidecar can tail it.
 start_envoy_tls() {
     # Pre-create access log on host so docker -v bind mount works.
-    # 0666 because Envoy in container runs as non-root (UID 101) and
-    # the file's host owner is bench-runner (root via sudo); without
-    # world-write the container can't open it for append.
+    # `rm -f` first because a leftover file from a prior docker bind
+    # mount can stick in an open-but-unwritable state even for root
+    # — observed empirically on Ubuntu 24 + Docker 29. Recreate fresh.
+    # 0666 because Envoy in container runs as non-root (UID 101).
+    sudo rm -f "$ENVOY_ACCESS_LOG"
     : > "$ENVOY_ACCESS_LOG"
     chmod 0666 "$ENVOY_ACCESS_LOG"
 
@@ -290,6 +292,7 @@ start_envoy_tls() {
 # each entry, and writes a signed log file.
 start_envoy_tls_hash() {
     start_envoy_tls || return 1
+    sudo rm -f "$SIGNED_LOG" /tmp/sidecar.log
     : > "$SIGNED_LOG"
     chmod 0666 "$SIGNED_LOG"
     python3 "$SCRIPT_DIR/hash-chain-sidecar.py" \
