@@ -32,6 +32,13 @@ static_resources:
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: ingress_tls
+                # Force per-request flush so the audit sidecar sees each
+                # access-log entry within ms instead of waiting for the
+                # default ~10s flush interval of FileAccessLog. This is
+                # what a real-world operator would set when bolting on
+                # tamper-evident audit on top of Envoy.
+                access_log_options:
+                  flush_access_log_on_new_request: true
                 access_log:
                   - name: envoy.access_loggers.file
                     typed_config:
