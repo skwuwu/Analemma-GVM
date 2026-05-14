@@ -167,8 +167,17 @@ pub const PREFIX_OPDETAIL_V1: &[u8] = b"gvm-opdetail-v1:";
 pub const PREFIX_EVENT_V1: &[u8] = b"gvm-event-v1:";
 
 /// Domain-separation prefix for `compute_event_hash_v2`.
-/// Used when the event has `operation_descriptor: Some(...)`.
+/// Used when the event has `operation_descriptor: Some(...)` but no
+/// `token_id` (legacy v2 records written before JWT-binding landed).
 pub const PREFIX_EVENT_V2: &[u8] = b"gvm-event-v2:";
+
+/// Domain-separation prefix for `compute_event_hash_v3`.
+/// Used when the event has `operation_descriptor: Some(...)` AND
+/// `token_id: Some(...)` — binds the authentication token id (JWT
+/// `jti` or synthetic `sandbox-peer:<id>`) into the audit chain so an
+/// auditor can prove which token instance authorised the action,
+/// not just which `agent_id`.
+pub const PREFIX_EVENT_V3: &[u8] = b"gvm-event-v3:";
 
 /// Operation descriptor — split-form replacement for the legacy
 /// `operation: String` field. Production callers populate this when
@@ -285,6 +294,15 @@ pub struct GVMEvent {
     pub agent_id: String,
     pub tenant_id: Option<String>,
     pub session_id: String,
+    /// Authentication-token identity for this event:
+    /// - `Some("<uuid>")` for JWT-authenticated requests (`jti` claim)
+    /// - `Some("sandbox-peer:<sandbox_id>")` for namespace-bound identity
+    /// - `None` for legacy / pre-JWT WAL entries (read by v1/v2 hash)
+    /// Present in WAL entries from spec_version 3+ and bound into
+    /// `compute_event_hash_v3` so an auditor can attribute by token
+    /// instance, not just by agent_id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_id: Option<String>,
     pub timestamp: chrono::DateTime<chrono::Utc>,
 
     // ── Operation (semantic) ──

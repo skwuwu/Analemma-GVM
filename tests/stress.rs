@@ -28,6 +28,7 @@ fn make_test_event(id: &str) -> GVMEvent {
         trace_id: "trace-stress".to_string(),
         parent_event_id: None,
         agent_id: "stress-agent".to_string(),
+        token_id: None,
         tenant_id: None,
         session_id: "session".to_string(),
         timestamp: chrono::Utc::now(),

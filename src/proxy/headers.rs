@@ -86,6 +86,7 @@ pub(super) fn build_event(
     classification: &Classification,
     gvm_headers: &Option<GVMHeaders>,
     target: &Target,
+    token_id: Option<String>,
 ) -> GVMEvent {
     let (agent_id, trace_id, event_id, parent_event_id, operation, session_id, tenant_id) =
         match gvm_headers {
@@ -118,6 +119,7 @@ pub(super) fn build_event(
         agent_id,
         tenant_id,
         session_id,
+        token_id,
         timestamp: chrono::Utc::now(),
         operation,
         resource: classification

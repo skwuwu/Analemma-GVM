@@ -29,6 +29,7 @@
 use crate::{
     BatchSealRecord, EventStatus, GVMEvent, GvmIntegrityContext, GvmStateAnchor, LLMTrace,
     MerkleBatchRecord, OperationDescriptor, PayloadDescriptor, PREFIX_EVENT_V1, PREFIX_EVENT_V2,
+    PREFIX_EVENT_V3,
     PREFIX_OPDETAIL_V1,
 };
 use serde::{Deserialize, Serialize};
@@ -88,10 +89,16 @@ pub enum GVMEventOrRedacted {
 /// v2 hash dispatcher can still produce the same output.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RedactedEvent {
-    pub spec_version: u8, // Always 1 for now; future schema-bumps land here.
+    pub spec_version: u8, // 1 for v1/v2 hash path; 3 when token_id is bound.
     pub event_id: String,
     pub trace_id: String,
     pub agent_id: String,
+    /// Authentication-token identity for v3 hash binding. Preserved
+    /// across redaction levels because it is not PII (random UUID
+    /// or `sandbox-peer:<id>`) and must round-trip for the auditor
+    /// to recompute the v3 event_hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_id: Option<String>,
     pub timestamp: chrono::DateTime<chrono::Utc>,
 
     /// Legacy operation string. Only meaningful when
@@ -150,10 +157,11 @@ pub fn redact_event(event: &GVMEvent, level: RedactionLevel) -> GVMEventOrRedact
                 };
 
             GVMEventOrRedacted::Redacted(RedactedEvent {
-                spec_version: 1,
+                spec_version: if event.token_id.is_some() { 3 } else { 1 },
                 event_id: event.event_id.clone(),
                 trace_id: event.trace_id.clone(),
                 agent_id: event.agent_id.clone(),
+                token_id: event.token_id.clone(),
                 timestamp: event.timestamp,
                 operation,
                 operation_descriptor: stripped_descriptor,
@@ -369,8 +377,22 @@ pub fn verify_proof(
 /// `compute_event_hash` dispatcher in gvm-proxy::merkle, kept here so
 /// the verifier can run without that crate.
 pub fn recompute_event_hash(event: &GVMEvent) -> String {
-    match &event.operation_descriptor {
-        Some(desc) => recompute_event_hash_v2(
+    match (&event.operation_descriptor, &event.token_id) {
+        (Some(desc), Some(token_id)) => recompute_event_hash_v3(
+            &event.event_id,
+            &event.trace_id,
+            &event.agent_id,
+            token_id,
+            &desc.category,
+            &desc.detail_digest,
+            &event.decision,
+            &event.decision_source,
+            &format!("{:?}", event.status),
+            &event.enforcement_point,
+            &event.timestamp.to_rfc3339(),
+            &event.payload.content_hash,
+        ),
+        (Some(desc), None) => recompute_event_hash_v2(
             &event.event_id,
             &event.trace_id,
             &event.agent_id,
@@ -383,7 +405,7 @@ pub fn recompute_event_hash(event: &GVMEvent) -> String {
             &event.timestamp.to_rfc3339(),
             &event.payload.content_hash,
         ),
-        None => recompute_event_hash_v1(
+        (None, _) => recompute_event_hash_v1(
             &event.event_id,
             &event.trace_id,
             &event.agent_id,
@@ -404,8 +426,22 @@ pub fn recompute_event_hash(event: &GVMEvent) -> String {
 pub fn recompute_event_hash_either(e: &GVMEventOrRedacted) -> String {
     match e {
         GVMEventOrRedacted::Full(ev) => recompute_event_hash(ev),
-        GVMEventOrRedacted::Redacted(r) => match &r.operation_descriptor {
-            Some(desc) => recompute_event_hash_v2(
+        GVMEventOrRedacted::Redacted(r) => match (&r.operation_descriptor, &r.token_id) {
+            (Some(desc), Some(token_id)) => recompute_event_hash_v3(
+                &r.event_id,
+                &r.trace_id,
+                &r.agent_id,
+                token_id,
+                &desc.category,
+                &desc.detail_digest,
+                &r.decision,
+                &r.decision_source,
+                &format!("{:?}", r.status),
+                &r.enforcement_point,
+                &r.timestamp.to_rfc3339(),
+                &r.payload_content_hash,
+            ),
+            (Some(desc), None) => recompute_event_hash_v2(
                 &r.event_id,
                 &r.trace_id,
                 &r.agent_id,
@@ -418,7 +454,7 @@ pub fn recompute_event_hash_either(e: &GVMEventOrRedacted) -> String {
                 &r.timestamp.to_rfc3339(),
                 &r.payload_content_hash,
             ),
-            None => recompute_event_hash_v1(
+            (None, _) => recompute_event_hash_v1(
                 &r.event_id,
                 &r.trace_id,
                 &r.agent_id,
@@ -487,6 +523,43 @@ fn recompute_event_hash_v2(
         event_id,
         trace_id,
         agent_id,
+        category,
+        detail_digest,
+        decision,
+        decision_source,
+        status,
+        enforcement_point,
+        timestamp_rfc3339,
+        payload_content_hash,
+    ] {
+        h.update((f.len() as u32).to_le_bytes());
+        h.update(f.as_bytes());
+    }
+    hex::encode(h.finalize())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recompute_event_hash_v3(
+    event_id: &str,
+    trace_id: &str,
+    agent_id: &str,
+    token_id: &str,
+    category: &str,
+    detail_digest: &str,
+    decision: &str,
+    decision_source: &str,
+    status: &str,
+    enforcement_point: &str,
+    timestamp_rfc3339: &str,
+    payload_content_hash: &str,
+) -> String {
+    let mut h = Sha256::new();
+    h.update(PREFIX_EVENT_V3);
+    for f in &[
+        event_id,
+        trace_id,
+        agent_id,
+        token_id,
         category,
         detail_digest,
         decision,

@@ -571,6 +571,7 @@ pub async fn append_enforcement_event(
         trace_id: uuid::Uuid::new_v4().to_string(),
         parent_event_id,
         agent_id: classify_output.agent_id.clone(),
+        token_id: None,
         tenant_id: None,
         session_id: host.to_string(),
         timestamp: chrono::Utc::now(),

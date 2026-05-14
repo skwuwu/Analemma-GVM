@@ -52,6 +52,7 @@ pub(super) fn append_proxy_wal_event(
         trace_id: uuid::Uuid::new_v4().to_string(),
         parent_event_id: None,
         agent_id: agent_id.to_string(),
+        token_id: None,
         tenant_id: None,
         session_id: host.to_string(),
         timestamp: chrono::Utc::now(),

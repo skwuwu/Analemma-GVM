@@ -45,6 +45,12 @@ impl JwtSecret {
 pub struct JwtConfig {
     pub secret: JwtSecret,
     pub token_ttl_secs: u64,
+    /// Strict mode — reject requests without a valid Bearer token.
+    /// See `JwtAuthConfig.strict` in src/config.rs for rationale.
+    pub strict: bool,
+    /// Path to a revocation list file (one jti per line). `None`
+    /// disables revocation enforcement.
+    pub revocation_file: Option<std::path::PathBuf>,
 }
 
 impl JwtConfig {
@@ -69,8 +75,42 @@ impl JwtConfig {
         Ok(Some(Self {
             secret: JwtSecret { key },
             token_ttl_secs,
+            strict: false,
+            revocation_file: None,
         }))
     }
+
+    /// Set strict-mode flag (chainable).
+    pub fn with_strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
+    }
+
+    /// Set revocation-list path (chainable).
+    pub fn with_revocation_file(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.revocation_file = path;
+        self
+    }
+}
+
+/// Check whether `jti` appears in the revocation file. Re-reads the
+/// file on every call so operators can append entries and have them
+/// honoured on the next verify (no restart required). Returns false
+/// (treat as not revoked) if the file is missing or unreadable — this
+/// is fail-OPEN for the revocation list specifically; the rationale is
+/// that an admin error (typo'd path, file moved) should not lock all
+/// agents out. Operators paranoid about file availability should
+/// monitor the proxy's startup log line which prints the resolved
+/// revocation_file path.
+pub fn is_jti_revoked(revocation_file: &std::path::Path, jti: &str) -> bool {
+    let content = match std::fs::read_to_string(revocation_file) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    content
+        .lines()
+        .map(|line| line.trim())
+        .any(|line| !line.is_empty() && !line.starts_with('#') && line == jti)
 }
 
 // ─── JWT Claims ───
@@ -190,6 +230,13 @@ pub fn verify_token(config: &JwtConfig, token: &str) -> Result<VerifiedIdentity>
         return Err(anyhow!("Invalid token issuer"));
     }
 
+    // Revocation check (no-op when revocation_file is None).
+    if let Some(ref rev_path) = config.revocation_file {
+        if is_jti_revoked(rev_path, &claims.jti) {
+            return Err(anyhow!("Token revoked"));
+        }
+    }
+
     Ok(VerifiedIdentity {
         agent_id: claims.sub,
         tenant_id: claims.tid,
@@ -303,6 +350,8 @@ mod tests {
                 key: vec![0xAB; 32],
             },
             token_ttl_secs: ttl,
+            strict: false,
+            revocation_file: None,
         }
     }
 
@@ -380,6 +429,8 @@ mod tests {
                 key: vec![0xCD; 32],
             },
             token_ttl_secs: 3600,
+            strict: false,
+            revocation_file: None,
         };
 
         let token = issue_token(&config_a, "agent-001", None, "proxy").expect("issue must succeed");
@@ -666,5 +717,71 @@ mod tests {
             result.is_ok(),
             "Slight clock skew within leeway must be accepted"
         );
+    }
+
+    // ── Revocation list ──────────────────────────────────────────
+
+    #[test]
+    fn revoked_jti_rejected() {
+        let tmpdir = tempfile::TempDir::new().expect("tempdir");
+        let rev_path = tmpdir.path().join("revoked.txt");
+        // Issue a token under a plain config so we can read its jti.
+        let cfg = test_config(3600);
+        let token = issue_token(&cfg, "agent-rev", None, "proxy").expect("issue");
+        let claims = decode_jwt(&cfg.secret, &token).expect("decode");
+
+        // Build a config with revocation enabled pointing at the file.
+        let cfg_rev = JwtConfig {
+            secret: JwtSecret { key: vec![0xAB; 32] },
+            token_ttl_secs: 3600,
+            strict: false,
+            revocation_file: Some(rev_path.clone()),
+        };
+
+        // Before revocation: valid.
+        assert!(verify_token(&cfg_rev, &token).is_ok(), "unrevoked must pass");
+
+        // Append jti and re-verify: must fail.
+        std::fs::write(&rev_path, format!("{}\n", claims.jti)).expect("write rev");
+        let err = verify_token(&cfg_rev, &token).expect_err("must reject");
+        assert!(
+            err.to_string().contains("revoked"),
+            "error must mention revocation, got: {err}"
+        );
+    }
+
+    #[test]
+    fn revocation_file_missing_does_not_block() {
+        // Operator typo: revocation_file path doesn't exist. Verification
+        // must NOT lock everyone out — it should fail-OPEN on the
+        // revocation check (consistent with is_jti_revoked's contract).
+        let cfg = JwtConfig {
+            secret: JwtSecret { key: vec![0xAB; 32] },
+            token_ttl_secs: 3600,
+            strict: false,
+            revocation_file: Some(std::path::PathBuf::from(
+                "/nonexistent/path/that/should/not/exist",
+            )),
+        };
+        let token = issue_token(&cfg, "agent-x", None, "proxy").expect("issue");
+        assert!(
+            verify_token(&cfg, &token).is_ok(),
+            "missing revocation file must not block"
+        );
+    }
+
+    #[test]
+    fn revocation_file_comments_and_blanks_ignored() {
+        let tmpdir = tempfile::TempDir::new().expect("tempdir");
+        let rev_path = tmpdir.path().join("revoked.txt");
+        std::fs::write(
+            &rev_path,
+            "# header comment\n\n  \n# another comment\nactual-jti-here\n",
+        )
+        .expect("write");
+        assert!(is_jti_revoked(&rev_path, "actual-jti-here"));
+        assert!(!is_jti_revoked(&rev_path, "# header comment"));
+        assert!(!is_jti_revoked(&rev_path, ""));
+        assert!(!is_jti_revoked(&rev_path, "unrelated"));
     }
 }

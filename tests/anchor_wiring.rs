@@ -29,6 +29,7 @@ fn evt(label: &str) -> GVMEvent {
         trace_id: format!("trace-{}", label),
         parent_event_id: None,
         agent_id: "test-agent".to_string(),
+        token_id: None,
         tenant_id: None,
         session_id: "anchor-wiring".to_string(),
         timestamp: Utc::now(),

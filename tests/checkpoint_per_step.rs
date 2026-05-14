@@ -235,6 +235,7 @@ fn make_event(event_id: &str) -> gvm_types::GVMEvent {
         trace_id: "trace".to_string(),
         parent_event_id: None,
         agent_id: "agent-A".to_string(),
+        token_id: None,
         tenant_id: None,
         session_id: "ckpt-per-step-test".to_string(),
         timestamp: chrono::Utc::now(),

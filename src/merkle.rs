@@ -46,9 +46,13 @@ use sha2::{Digest, Sha256};
 /// `status` field prevents undetected Pending→Confirmed tampering;
 /// `decision_source` / `enforcement_point` prevent attribution falsification.
 pub fn compute_event_hash(event: &GVMEvent) -> String {
-    match &event.operation_descriptor {
-        Some(desc) => compute_event_hash_v2(event, desc),
-        None => compute_event_hash_v1(event),
+    match (&event.operation_descriptor, &event.token_id) {
+        // v3: descriptor + token-id binding (JWT jti or sandbox-peer).
+        (Some(desc), Some(token_id)) => compute_event_hash_v3(event, desc, token_id),
+        // v2: descriptor, but no token_id (legacy WAL or unauthenticated event).
+        (Some(desc), None) => compute_event_hash_v2(event, desc),
+        // v1: pre-descriptor legacy record.
+        (None, _) => compute_event_hash_v1(event),
     }
 }
 
@@ -90,6 +94,43 @@ pub fn compute_event_hash_v2(event: &GVMEvent, desc: &gvm_types::OperationDescri
         event.event_id.as_str(),
         event.trace_id.as_str(),
         event.agent_id.as_str(),
+        desc.category.as_str(),
+        desc.detail_digest.as_str(),
+        event.decision.as_str(),
+        event.decision_source.as_str(),
+        &format!("{:?}", event.status),
+        event.enforcement_point.as_str(),
+        &event.timestamp.to_rfc3339(),
+        event.payload.content_hash.as_str(),
+    ] {
+        hasher.update((field.len() as u32).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// v3 event hash. Same shape as v2 plus an explicit `token_id` field
+/// (JWT `jti` for token-authenticated events, or `sandbox-peer:<id>`
+/// for namespace-bound identity). Binds the authentication-token
+/// instance into the audit chain so an auditor can attribute by
+/// token instance, not just by `agent_id`.
+///
+/// Privacy property: `token_id` is a random UUID (or sandbox marker),
+/// not PII; redacted proofs preserve it like other audit-critical
+/// fields. A verifier holding a redacted proof recomputes v3 the
+/// same as the producer.
+pub fn compute_event_hash_v3(
+    event: &GVMEvent,
+    desc: &gvm_types::OperationDescriptor,
+    token_id: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(gvm_types::PREFIX_EVENT_V3);
+    for field in &[
+        event.event_id.as_str(),
+        event.trace_id.as_str(),
+        event.agent_id.as_str(),
+        token_id,
         desc.category.as_str(),
         desc.detail_digest.as_str(),
         event.decision.as_str(),
@@ -605,6 +646,7 @@ mod tests {
             trace_id: "cafebabe".to_string(),
             parent_event_id: None,
             agent_id: "agent-x".to_string(),
+            token_id: None,
             tenant_id: None,
             session_id: "sess".to_string(),
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
@@ -672,6 +714,7 @@ mod tests {
             trace_id: "trace-001".to_string(),
             parent_event_id: None,
             agent_id: "agent-1".to_string(),
+            token_id: None,
             tenant_id: None,
             session_id: "sess".to_string(),
             timestamp: chrono::DateTime::parse_from_rfc3339("2026-05-02T12:00:00Z")
@@ -809,5 +852,66 @@ mod tests {
             "v2 hash must be independent of legacy operation field — \
              event.operation should NOT be in canonical input"
         );
+    }
+
+    // ─── Phase 4 (jti binding) — event_hash v3 dispatch + properties ─
+
+    fn make_v2_event_with_descriptor() -> GVMEvent {
+        let mut e = make_test_event("ignored");
+        e.operation_descriptor = Some(gvm_types::OperationDescriptor {
+            category: "http.POST".to_string(),
+            detail: Some("/v1/messages".to_string()),
+            detail_salt: vec![0xAB; 16],
+            detail_digest: "deadbeef".to_string(),
+        });
+        e
+    }
+
+    #[test]
+    fn dispatcher_uses_v3_when_token_id_set() {
+        let mut e = make_v2_event_with_descriptor();
+        e.token_id = Some("jti-abcdef-0123".to_string());
+        let h_dispatch = compute_event_hash(&e);
+        let h_v3 = compute_event_hash_v3(
+            &e,
+            e.operation_descriptor.as_ref().unwrap(),
+            e.token_id.as_deref().unwrap(),
+        );
+        assert_eq!(h_dispatch, h_v3, "dispatcher must take v3 path with token_id");
+    }
+
+    #[test]
+    fn v3_hash_differs_from_v2_for_same_event() {
+        let mut e = make_v2_event_with_descriptor();
+        let h_v2 = compute_event_hash(&e);
+        e.token_id = Some("jti-xyz".to_string());
+        let h_v3 = compute_event_hash(&e);
+        assert_ne!(
+            h_v2, h_v3,
+            "v3 must include token_id + use distinct domain prefix"
+        );
+    }
+
+    #[test]
+    fn v3_hash_changes_on_token_id_change() {
+        let mut e = make_v2_event_with_descriptor();
+        e.token_id = Some("jti-A".to_string());
+        let h_a = compute_event_hash(&e);
+        e.token_id = Some("jti-B".to_string());
+        let h_b = compute_event_hash(&e);
+        assert_ne!(h_a, h_b, "different token_id → different hash");
+    }
+
+    #[test]
+    fn v3_hash_changes_on_sandbox_peer_marker() {
+        // sandbox-peer:<id> form must produce its own hash, distinct
+        // from a UUID jti — auditor can distinguish the two trust paths
+        // by reading token_id from the event after recomputing.
+        let mut e = make_v2_event_with_descriptor();
+        e.token_id = Some("jti-uuid".to_string());
+        let h_jwt = compute_event_hash(&e);
+        e.token_id = Some("sandbox-peer:sb-12345".to_string());
+        let h_peer = compute_event_hash(&e);
+        assert_ne!(h_jwt, h_peer);
     }
 }

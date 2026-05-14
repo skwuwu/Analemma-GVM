@@ -723,6 +723,15 @@ pub async fn proxy_handler(
                     Some(identity)
                 }
                 None => {
+                    if jwt.strict {
+                        tracing::warn!(
+                            "Strict-mode reject: no JWT token, no sandbox-peer mapping"
+                        );
+                        return error_response(
+                            StatusCode::UNAUTHORIZED,
+                            "Authentication required: present a Bearer JWT or run inside a GVM sandbox",
+                        );
+                    }
                     tracing::warn!(
                         "No JWT token provided and peer is not a known sandbox — \
                          falling back to unverified X-GVM-Agent-Id header"
@@ -971,7 +980,12 @@ pub async fn proxy_handler(
     }
 
     // ── Step 4: Enforcement with EventStatus lifecycle ──
-    let mut event = build_event(&classification, &gvm_headers, &target);
+    let mut event = build_event(
+        &classification,
+        &gvm_headers,
+        &target,
+        verified_identity.as_ref().map(|id| id.token_id.clone()),
+    );
     event.default_caution = is_default_caution;
     // Bind this event to the config version that was active when the
     // decision was made. Later auditors can resolve this ref back to the
@@ -1448,6 +1462,7 @@ mod tests {
             trace_id: "trace-test-1".to_string(),
             parent_event_id: None,
             agent_id: "agent-test".to_string(),
+            token_id: None,
             tenant_id: None,
             session_id: "session-test".to_string(),
             timestamp: chrono::Utc::now(),

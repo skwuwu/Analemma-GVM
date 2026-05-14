@@ -137,6 +137,7 @@ fn mk_evt() -> gvm_types::GVMEvent {
         trace_id: uuid::Uuid::new_v4().to_string(),
         parent_event_id: None,
         agent_id: "rot-test".to_string(),
+        token_id: None,
         tenant_id: None,
         session_id: "rot".to_string(),
         timestamp: chrono::Utc::now(),

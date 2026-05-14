@@ -414,6 +414,7 @@ async fn handle_request(
         // identity without joining external state.
         parent_event_id: sandbox_anchor.as_ref().map(|(_, parent)| parent.clone()),
         agent_id: classify_output.agent_id.clone(),
+        token_id: None,
         tenant_id: None,
         session_id: host.clone(),
         timestamp: chrono::Utc::now(),

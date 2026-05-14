@@ -1595,6 +1595,7 @@ fn make_test_event(event_id: &str, operation: &str) -> GVMEvent {
         trace_id: format!("trace-{}", event_id),
         parent_event_id: None,
         agent_id: "test-agent".to_string(),
+            token_id: None,
         tenant_id: None,
         session_id: "session-001".to_string(),
         timestamp: chrono::Utc::now(),

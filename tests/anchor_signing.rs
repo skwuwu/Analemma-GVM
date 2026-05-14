@@ -32,6 +32,7 @@ fn evt(id: &str) -> GVMEvent {
         trace_id: "trace".to_string(),
         parent_event_id: None,
         agent_id: "agent".to_string(),
+        token_id: None,
         tenant_id: None,
         session_id: "signing-test".to_string(),
         timestamp: chrono::Utc::now(),

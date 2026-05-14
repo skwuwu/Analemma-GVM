@@ -133,6 +133,89 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-05-15: JWT issuance model hardening (#1, #2, #5, #6)
+
+Closes the four most impactful gaps in the v1 JWT model identified
+during the issuance-model audit. #3 (X-Admin-Key for non-loopback
+admin) and #4 (asymmetric Ed25519/RS256) deferred — see notes below.
+
+**1. Mint endpoint moved from public proxy port to admin port.**
+`POST /gvm/auth/token` no longer lives on the agent listener
+(`0.0.0.0:8080` by default — reachable by anyone who can hit the
+proxy); it lives on the admin listener (`127.0.0.1:9090`, loopback-
+only unless `[server] allow_non_loopback_admin = true`). Before this
+change, any caller that could reach the public proxy could mint a
+token for any `agent_id`. After: token issuance is gated by operator
+shell access (or by whatever auth layer fronts the admin port).
+`crates/gvm-cli/src/run.rs::issue_jwt_token` updated to use
+`derive_admin_url(agent_url)` so the local CLI continues to work
+transparently.
+
+**2. JWT strict mode (`[jwt] strict = true`).** Default `false`
+(backward-compat). When true, requests without a valid Bearer token
+*and* without a resolvable sandbox-peer mapping are rejected with
+HTTP 401 instead of falling through to header-declared
+`X-GVM-Agent-Id`. The MITM TLS path was already strict by default
+(see `src/tls_proxy_hyper.rs:189`); this closes the equivalent gap on
+the plain-HTTP forward path. `src/proxy/mod.rs:725-744`.
+
+**3. Revocation list (`[jwt] revocation_file = "<path>"`).** Flat
+file, one `jti` per line, `#` and blank lines ignored. Re-read on
+every verify call so operators rotate by appending — no proxy
+restart. `POST /gvm/auth/revoke` (admin port) accepts
+`{ "jti": "...", "reason": "..." }`, appends a timestamp + reason
+comment, returns 200. Missing/unreadable file is fail-open (the
+revocation check no-ops) — a typo'd path must not lock all agents
+out. `src/auth.rs::is_jti_revoked`, `src/api.rs::auth_revoke_token`.
+
+**4. `token_id` (JWT `jti`) bound into Merkle audit chain.** New
+schema version `gvm-event-v3:` + new field `GVMEvent.token_id:
+Option<String>`. The hash dispatcher chooses by field presence:
+  - v3: operation_descriptor present + token_id present
+  - v2: operation_descriptor present, token_id absent (legacy WAL)
+  - v1: no operation_descriptor (pre-Phase-1 WAL)
+v3 leaves include `jti` (or `sandbox-peer:<sandbox_id>` for namespace-
+bound identity) so an auditor can now prove not just *which agent*
+performed an action but *which token instance* authorised it.
+Cryptographic detection of token replay is now possible across the
+chain. Backward-compatible: existing v1/v2 WAL entries verify
+unchanged; new entries land as v3 once `verified_identity.token_id`
+flows through `build_event`. Mirrored in `crates/gvm-types/src/proof.rs`
+(`recompute_event_hash_v3`) so external auditors replay the same.
+
+**Tests added (+7 new, all green):**
+- `src/auth.rs::tests::revoked_jti_rejected`
+- `src/auth.rs::tests::revocation_file_missing_does_not_block`
+- `src/auth.rs::tests::revocation_file_comments_and_blanks_ignored`
+- `src/merkle.rs::tests::dispatcher_uses_v3_when_token_id_set`
+- `src/merkle.rs::tests::v3_hash_differs_from_v2_for_same_event`
+- `src/merkle.rs::tests::v3_hash_changes_on_token_id_change`
+- `src/merkle.rs::tests::v3_hash_changes_on_sandbox_peer_marker`
+
+Workspace test count: 896 passing (was 808), 0 failed.
+
+**Affected files**: `src/auth.rs`, `src/config.rs`, `src/api.rs`,
+`src/main.rs`, `src/merkle.rs`, `src/proxy/mod.rs`,
+`src/proxy/headers.rs`, `crates/gvm-types/src/lib.rs`,
+`crates/gvm-types/src/proof.rs`, `crates/gvm-cli/src/run.rs`, plus
+~20 test files updated for the new `token_id` field and new
+`JwtConfig` fields.
+
+**Deferred (follow-up)**:
+- #3 X-Admin-Key for non-loopback admin port — mostly orthogonal to
+  JWT and addressed by `allow_non_loopback_admin` policy gate.
+- #4 Asymmetric signing (Ed25519 / RS256) — larger scope (new
+  algorithm dispatcher, key generation/loading, JWS header `alg`
+  validation). Tracked as follow-up. The anchor-signing key
+  infrastructure (`src/sign.rs::AnchorSigner`) is the natural reuse
+  target.
+
+**Risk**: Medium-low. The mint-endpoint move is a behavioural change
+(CLI tools/scripts pointing at the public port will start getting
+404). Backward-compat reasons documented in `security-model.md §8`;
+the CLI itself was updated to use the admin URL. Operators with
+custom token-fetching scripts must update to call the admin port.
+
 ### 2026-05-08: Proxy config-path discovery — deterministic across CWDs
 
 **Symptom.** Running `sudo gvm run --sandbox -- ...` from a directory

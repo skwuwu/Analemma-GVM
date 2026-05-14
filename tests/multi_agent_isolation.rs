@@ -198,6 +198,7 @@ fn evt(id: &str, agent_id: &str, decision: &str) -> GVMEvent {
         trace_id: "trace".to_string(),
         parent_event_id: None,
         agent_id: agent_id.to_string(),
+        token_id: None,
         tenant_id: None,
         session_id: "multi-agent".to_string(),
         timestamp: chrono::Utc::now(),
@@ -419,6 +420,8 @@ fn shared_jwt_config() -> JwtConfig {
     JwtConfig {
         secret: JwtSecret::from_bytes(vec![0xAB; 32]),
         token_ttl_secs: 3600,
+        strict: false,
+        revocation_file: None,
     }
 }
 

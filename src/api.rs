@@ -847,6 +847,98 @@ pub async fn auth_token(
     }
 }
 
+#[derive(Deserialize)]
+pub struct RevokeRequest {
+    /// JWT ID (jti claim) to revoke. Caller must already know the
+    /// jti — typically pulled from a prior WAL audit event (where
+    /// agent_id maps to recent jtis used) or from the operator's
+    /// own token-issuance log.
+    pub jti: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// POST /gvm/auth/revoke — append `jti` to the revocation file so
+/// subsequent verifications reject the token.
+///
+/// Requires `[jwt] revocation_file = "..."` to be set in proxy.toml
+/// (otherwise revocation enforcement is disabled and this endpoint
+/// returns 503 to make the misconfiguration loud rather than silently
+/// no-op-ing). Admin port only — see main.rs.
+pub async fn auth_revoke_token(
+    State(state): State<AppState>,
+    Json(body): Json<RevokeRequest>,
+) -> Response<Body> {
+    let jwt_config = match &state.jwt_config {
+        Some(c) => c,
+        None => {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &serde_json::json!({
+                    "error": "JWT authentication not configured",
+                }),
+            );
+        }
+    };
+    let rev_path = match &jwt_config.revocation_file {
+        Some(p) => p.clone(),
+        None => {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &serde_json::json!({
+                    "error": "Revocation file not configured",
+                    "hint": "Set [jwt] revocation_file = \"<path>\" in proxy.toml"
+                }),
+            );
+        }
+    };
+
+    // Basic jti validation — UUID-shaped, no path / newline injection.
+    if body.jti.is_empty()
+        || body.jti.len() > 128
+        || body.jti.chars().any(|c| !c.is_ascii_graphic())
+    {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({"error": "Invalid jti"}),
+        );
+    }
+
+    let entry = match &body.reason {
+        Some(r) if !r.is_empty() => {
+            let safe_reason: String = r.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').collect();
+            format!("{}  # revoked-at={} reason={}", body.jti, chrono::Utc::now().to_rfc3339(), safe_reason)
+        }
+        _ => format!("{}  # revoked-at={}", body.jti, chrono::Utc::now().to_rfc3339()),
+    };
+
+    // Append (create if missing).
+    let result = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&rev_path)
+        .and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, "{}", entry)
+        });
+    match result {
+        Ok(_) => {
+            tracing::info!(jti = %body.jti, "JWT revoked");
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({"revoked": true, "jti": body.jti}),
+            )
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to append to revocation file");
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({"error": "Failed to persist revocation"}),
+            )
+        }
+    }
+}
+
 // ─── Shadow Mode: Intent Registration ───
 
 /// POST /gvm/intent — Register an intent for shadow verification.

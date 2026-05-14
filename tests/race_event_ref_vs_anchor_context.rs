@@ -46,6 +46,7 @@ fn make_event_with_ref(id: &str, ref_hash: &str) -> GVMEvent {
         trace_id: "trace".to_string(),
         parent_event_id: None,
         agent_id: "agent".to_string(),
+        token_id: None,
         tenant_id: None,
         session_id: "race-test".to_string(),
         timestamp: chrono::Utc::now(),

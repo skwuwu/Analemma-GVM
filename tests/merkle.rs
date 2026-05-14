@@ -24,6 +24,7 @@ fn make_test_event(agent_id: &str) -> GVMEvent {
         trace_id: uuid::Uuid::new_v4().to_string(),
         parent_event_id: None,
         agent_id: agent_id.to_string(),
+        token_id: None,
         tenant_id: None,
         session_id: "test-session".to_string(),
         timestamp: chrono::Utc::now(),

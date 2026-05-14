@@ -499,6 +499,32 @@ pub struct JwtAuthConfig {
     /// Token time-to-live in seconds (default: 3600 = 1 hour).
     #[serde(default = "default_jwt_ttl")]
     pub token_ttl_secs: u64,
+    /// Strict mode — when true and JWT is configured, requests
+    /// without a valid `Authorization: Bearer <jwt>` header are
+    /// rejected with 401 (no fallback to header-declared agent_id or
+    /// to sandbox-peer identity for non-sandboxed traffic).
+    ///
+    /// Default `false` for backward compatibility: existing
+    /// deployments that mix JWT and header-based identity continue
+    /// to work. Operators with a strict identity policy flip this
+    /// to true and accept that any caller not presenting a valid
+    /// token is rejected at the proxy boundary.
+    ///
+    /// Note: sandbox-peer identity (the namespace-bound fallback for
+    /// `gvm run --sandbox` workloads) is NOT a fallback in this sense
+    /// — it's a separate cryptographically-equivalent path (the
+    /// peer IP itself is the identity proof). Strict mode rejects
+    /// only requests that have *neither* a valid JWT *nor* a
+    /// resolvable sandbox-peer mapping.
+    #[serde(default)]
+    pub strict: bool,
+    /// Path to a file listing revoked JWT IDs (jti claims), one per
+    /// line. Lines starting with `#` and blank lines are ignored.
+    /// `None` means no revocation enforcement (default). The file is
+    /// re-read on every verify; operators rotate by appending and
+    /// the next verify picks up new revocations without restart.
+    #[serde(default)]
+    pub revocation_file: Option<String>,
 }
 
 fn default_jwt_secret_env() -> String {

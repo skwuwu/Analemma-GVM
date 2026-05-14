@@ -300,6 +300,7 @@ async fn edge_concurrent_status_update_no_crash() {
                 agent_id: format!("agent-{}", i),
                 tenant_id: None,
                 session_id: "session".to_string(),
+                token_id: None,
                 timestamp: chrono::Utc::now(),
                 operation: "gvm.storage.read".to_string(),
                 resource: ResourceDescriptor::default(),

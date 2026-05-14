@@ -431,10 +431,22 @@ async fn main() {
         .map(|j| j.token_ttl_secs)
         .unwrap_or(3600);
 
+    let jwt_strict = config.jwt.as_ref().map(|j| j.strict).unwrap_or(false);
+    let jwt_revocation = config
+        .jwt
+        .as_ref()
+        .and_then(|j| j.revocation_file.as_ref())
+        .map(std::path::PathBuf::from);
+
     let jwt_config = match auth::JwtConfig::from_env(jwt_secret_env, jwt_ttl) {
         Ok(Some(c)) => {
+            let c = c
+                .with_strict(jwt_strict)
+                .with_revocation_file(jwt_revocation.clone());
             tracing::info!(
                 ttl_secs = c.token_ttl_secs,
+                strict = jwt_strict,
+                revocation_file = ?jwt_revocation,
                 "JWT authentication ACTIVE — agent identity will be cryptographically verified"
             );
             Some(Arc::new(c))
@@ -690,7 +702,6 @@ async fn main() {
         .route("/gvm/check", axum::routing::post(api::check))
         .route("/gvm/intent", axum::routing::post(api::register_intent))
         .route("/gvm/ca.pem", axum::routing::get(serve_mitm_ca))
-        .route("/gvm/auth/token", axum::routing::post(api::auth_token))
         .route(
             "/gvm/vault/:key",
             axum::routing::put(api::vault_write)
@@ -748,6 +759,17 @@ async fn main() {
         .route(
             "/gvm/sandbox/:sandbox_id",
             axum::routing::delete(api::sandbox_revoke),
+        )
+        // JWT issuance — moved here from the public agent port so an
+        // unauthenticated request reaching the proxy listener cannot
+        // mint tokens for arbitrary agent_ids. The admin port is
+        // loopback-only by default (see ServerConfig.admin_listen),
+        // so token issuance is gated by operator-controlled access
+        // to the host shell.
+        .route("/gvm/auth/token", axum::routing::post(api::auth_token))
+        .route(
+            "/gvm/auth/revoke",
+            axum::routing::post(api::auth_revoke_token),
         )
         .with_state(state)
         .layer(

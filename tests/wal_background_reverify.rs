@@ -120,6 +120,7 @@ async fn reverify_pass_on_corrupted_chain_flips_flag() {
                 trace_id: format!("trace-{i}"),
                 parent_event_id: None,
                 agent_id: "reverify-test".to_string(),
+        token_id: None,
                 tenant_id: None,
                 session_id: "session-1".to_string(),
                 timestamp: chrono::Utc::now(),

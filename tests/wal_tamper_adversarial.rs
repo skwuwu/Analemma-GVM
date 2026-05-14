@@ -48,6 +48,7 @@ fn evt(seq: u64) -> GVMEvent {
         trace_id: format!("trace-{}", seq),
         parent_event_id: None,
         agent_id: "tamper-test".to_string(),
+        token_id: None,
         tenant_id: None,
         session_id: "tamper-session".to_string(),
         timestamp: chrono::Utc::now(),

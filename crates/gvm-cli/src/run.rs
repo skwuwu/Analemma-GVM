@@ -310,7 +310,12 @@ pub(crate) async fn provision_sandbox(admin_url: &str, agent_id: &str) -> Result
 /// must do it manually (or use a wrapper — see
 /// `docs/user-guide.md` "Running multiple agents").
 pub(crate) async fn issue_jwt_token(agent_url: &str, agent_id: &str) -> Result<Option<String>> {
-    let url = format!("{}/gvm/auth/token", agent_url.trim_end_matches('/'));
+    // Token issuance moved to the admin port (loopback-only by
+    // default) to remove the unauthenticated mint hole on the public
+    // agent port. The CLI runs on the same host as the proxy, so
+    // hitting the admin URL is the natural path.
+    let admin_url = crate::run::derive_admin_url(agent_url);
+    let url = format!("{}/gvm/auth/token", admin_url.trim_end_matches('/'));
     let body = serde_json::json!({
         "agent_id": agent_id,
         // tenant_id intentionally omitted — single-org deployment.

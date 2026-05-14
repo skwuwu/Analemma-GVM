@@ -149,6 +149,7 @@ pub fn build_sandbox_launch_event(
         trace_id: uuid::Uuid::new_v4().to_string(),
         parent_event_id: None, // chain root for this sandbox
         agent_id: agent_id.to_string(),
+        token_id: None,
         tenant_id: None,
         session_id: sandbox_id.to_string(),
         timestamp: chrono::Utc::now(),
