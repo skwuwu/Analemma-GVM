@@ -144,6 +144,29 @@ pub(crate) fn derive_admin_url(proxy: &str) -> String {
     }
 }
 
+/// Read `GVM_ADMIN_TOKEN` env var. When set, the CLI attaches it as
+/// a Bearer header on every admin-port request. Required when the
+/// proxy is configured with a non-loopback admin listener (the
+/// require_admin_jwt middleware rejects unauthenticated calls).
+///
+/// Returns `None` when the env var is unset; callers MAY then call
+/// admin endpoints without a token (works against a loopback admin
+/// port, which has no middleware).
+pub(crate) fn admin_bearer_token() -> Option<String> {
+    std::env::var("GVM_ADMIN_TOKEN")
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
+/// Apply the GVM_ADMIN_TOKEN as a Bearer header on a reqwest
+/// request builder, if the env var is set. No-op when unset.
+pub(crate) fn with_admin_bearer(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match admin_bearer_token() {
+        Some(t) => rb.bearer_auth(t),
+        None => rb,
+    }
+}
+
 /// Download the legacy shared MITM CA certificate from the proxy's
 /// agent-port endpoint (`GET /gvm/ca.pem`).
 ///
@@ -323,8 +346,7 @@ pub(crate) async fn issue_jwt_token(agent_url: &str, agent_id: &str) -> Result<O
         // that's not on the v0.5 roadmap.
     });
 
-    let resp = reqwest::Client::new()
-        .post(&url)
+    let resp = crate::run::with_admin_bearer(reqwest::Client::new().post(&url))
         .json(&body)
         .send()
         .await

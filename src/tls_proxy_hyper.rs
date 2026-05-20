@@ -178,6 +178,7 @@ async fn handle_request(
                         agent_id: agent_id.clone(),
                         tenant_id: None,
                         token_id: format!("sandbox-peer:{}", launch_event_id),
+                        gvm_role: None,
                     };
                     tracing::debug!(
                         agent = %identity.agent_id,
@@ -210,6 +211,7 @@ async fn handle_request(
                 agent_id: agent_id.clone(),
                 tenant_id: None,
                 token_id: format!("sandbox-peer:{}", launch_event_id),
+                gvm_role: None,
             },
         )
     };

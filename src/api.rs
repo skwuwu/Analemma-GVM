@@ -784,6 +784,14 @@ pub struct TokenRequest {
     pub tenant_id: Option<String>,
     #[serde(default = "default_scope")]
     pub scope: String,
+    /// When `Some("admin")`, the issued token carries `gvm_role: admin`
+    /// and is accepted by the admin-port middleware. Reserved for the
+    /// operator's own tooling — agent tokens never need this and
+    /// should leave it unset. The mint endpoint itself does not gate
+    /// on this field; the admin-port middleware (when enforced) makes
+    /// sure the caller already has admin role before producing more.
+    #[serde(default)]
+    pub gvm_role: Option<String>,
 }
 
 fn default_scope() -> String {
@@ -830,12 +838,39 @@ pub async fn auth_token(
         );
     }
 
-    match crate::auth::issue_token_response(
-        jwt_config,
-        &body.agent_id,
-        body.tenant_id.as_deref(),
-        &body.scope,
-    ) {
+    // Branch on requested role. admin-role tokens take the dedicated
+    // helper (synthetic `sub = "admin:<label>"`, scope=admin,
+    // gvm_role=admin). Plain agent tokens take the normal path.
+    let issued = match body.gvm_role.as_deref() {
+        Some("admin") => {
+            // Reuse `agent_id` as the admin label so the operator can
+            // tag tokens (`gvm-cli-laptop`, `ci-runner`, etc.).
+            match crate::auth::issue_admin_token(jwt_config, &body.agent_id, None) {
+                Ok(token) => Ok(crate::auth::TokenResponse {
+                    token,
+                    expires_in: jwt_config.token_ttl_secs,
+                    token_type: "Bearer".to_string(),
+                }),
+                Err(e) => Err(e),
+            }
+        }
+        Some(other) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({
+                    "error": format!("Unsupported gvm_role '{}': only 'admin' is recognised", other)
+                }),
+            );
+        }
+        None => crate::auth::issue_token_response(
+            jwt_config,
+            &body.agent_id,
+            body.tenant_id.as_deref(),
+            &body.scope,
+        ),
+    };
+
+    match issued {
         Ok(resp) => json_response(StatusCode::OK, &serde_json::json!(resp)),
         Err(e) => {
             tracing::error!(error = %e, "Token issuance failed");

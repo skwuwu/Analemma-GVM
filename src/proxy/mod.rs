@@ -644,6 +644,7 @@ impl AppState {
                 agent_id: metadata.agent_id.clone(),
                 tenant_id: None,
                 token_id: format!("sandbox-peer:{}", sandbox_id),
+                gvm_role: None,
             })
         }
         #[cfg(not(target_os = "linux"))]

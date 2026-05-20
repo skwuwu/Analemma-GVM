@@ -244,6 +244,15 @@ pub struct Claims {
     pub tid: Option<String>,
     /// Scope (e.g., "proxy")
     pub scope: String,
+    /// Role marker for privilege-separated tokens. `None` (default)
+    /// for normal agent tokens; `Some("admin")` for tokens minted to
+    /// drive the admin port. Validated by the admin-port middleware
+    /// when admin_listen is non-loopback. Kept narrow on purpose —
+    /// SRR rule matching does NOT consult this field (that would
+    /// resurrect the cross-agent privilege boundary that v0.7 was
+    /// reframed to avoid).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gvm_role: Option<String>,
     /// Issued-at (Unix timestamp)
     pub iat: u64,
     /// Expiration (Unix timestamp)
@@ -262,6 +271,18 @@ pub struct VerifiedIdentity {
     pub agent_id: String,
     pub tenant_id: Option<String>,
     pub token_id: String,
+    /// `gvm_role` claim from the token. `None` for normal agent
+    /// tokens; `Some("admin")` for tokens minted via
+    /// `issue_admin_token` and meant for the admin port.
+    pub gvm_role: Option<String>,
+}
+
+impl VerifiedIdentity {
+    /// Whether this identity has the `admin` role claim. Used by
+    /// the admin-port middleware to gate access.
+    pub fn is_admin(&self) -> bool {
+        self.gvm_role.as_deref() == Some("admin")
+    }
 }
 
 // ─── Token Issuance ───
@@ -292,12 +313,56 @@ pub fn issue_token(
         sub: agent_id.to_string(),
         tid: tenant_id.map(String::from),
         scope: scope.to_string(),
+        gvm_role: None,
         iat: now,
         exp: now + config.token_ttl_secs,
         jti: uuid::Uuid::new_v4().to_string(),
         iss: "gvm-proxy".to_string(),
     };
 
+    encode_jwt(config, &claims)
+}
+
+/// Issue a JWT carrying the `admin` role claim. Used at proxy
+/// bootstrap to produce a one-shot operator token when the admin
+/// port is bound to a non-loopback address; also reachable via the
+/// admin endpoint `POST /gvm/auth/token` when called by an already-
+/// authenticated admin caller.
+///
+/// The `sub` claim is set to a synthetic marker (`admin:<label>`) so
+/// audit events tied to this token are distinguishable from agent
+/// traffic in the WAL.
+pub fn issue_admin_token(
+    config: &JwtConfig,
+    label: &str,
+    ttl_secs_override: Option<u64>,
+) -> Result<String> {
+    if label.is_empty() {
+        return Err(anyhow!("admin token label must not be empty"));
+    }
+    if label.len() > 64 {
+        return Err(anyhow!("admin token label too long (max 64)"));
+    }
+    if !label
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(anyhow!(
+            "admin token label may only contain [A-Za-z0-9-_.]"
+        ));
+    }
+    let now = now_unix();
+    let ttl = ttl_secs_override.unwrap_or(config.token_ttl_secs);
+    let claims = Claims {
+        sub: format!("admin:{}", label),
+        tid: None,
+        scope: "admin".to_string(),
+        gvm_role: Some("admin".to_string()),
+        iat: now,
+        exp: now + ttl,
+        jti: uuid::Uuid::new_v4().to_string(),
+        iss: "gvm-proxy".to_string(),
+    };
     encode_jwt(config, &claims)
 }
 
@@ -361,6 +426,7 @@ pub fn verify_token(config: &JwtConfig, token: &str) -> Result<VerifiedIdentity>
         agent_id: claims.sub,
         tenant_id: claims.tid,
         token_id: claims.jti,
+        gvm_role: claims.gvm_role,
     })
 }
 
@@ -509,6 +575,59 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+// ─── Admin port middleware ───
+
+/// Axum middleware that enforces an admin-role JWT on every request.
+/// Wired by main.rs onto the admin router when the admin listener is
+/// bound to a non-loopback address (defense-in-depth — even if the
+/// `allow_non_loopback_admin` policy gate is misconfigured or bypassed
+/// by an L4/L7 forwarder, the runtime refuses unauthenticated callers).
+///
+/// For loopback admin (default), this middleware is NOT installed —
+/// the trust path is "anyone with shell access on the host is already
+/// the operator," matching the assumption baked into ServerConfig.
+///
+/// Returns 401 Unauthorized on:
+///   - No `Authorization: Bearer <token>` header
+///   - JWT verification failure (bad signature, expired, revoked, ...)
+///   - Valid JWT but `gvm_role != "admin"`
+pub async fn require_admin_jwt(
+    axum::extract::State(jwt_config): axum::extract::State<std::sync::Arc<JwtConfig>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> std::result::Result<axum::response::Response, axum::http::StatusCode> {
+    let token = match extract_bearer_token(req.headers()) {
+        Some(t) => t,
+        None => {
+            tracing::warn!(
+                path = %req.uri().path(),
+                "Admin port: rejecting request without Bearer token (non-loopback bind enforces JWT)"
+            );
+            return Err(axum::http::StatusCode::UNAUTHORIZED);
+        }
+    };
+    let identity = match verify_token(&jwt_config, token) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(
+                path = %req.uri().path(),
+                error = %e,
+                "Admin port: rejecting token (verification failed)"
+            );
+            return Err(axum::http::StatusCode::UNAUTHORIZED);
+        }
+    };
+    if !identity.is_admin() {
+        tracing::warn!(
+            path = %req.uri().path(),
+            sub = %identity.agent_id,
+            "Admin port: rejecting token (gvm_role != admin)"
+        );
+        return Err(axum::http::StatusCode::UNAUTHORIZED);
+    }
+    Ok(next.run(req).await)
 }
 
 // ─── Tests ───
@@ -841,6 +960,7 @@ mod tests {
             sub: "agent-001".to_string(),
             tid: None,
             scope: "proxy".to_string(),
+            gvm_role: None,
             iat: now,
             exp: now + 3600,
             jti: uuid::Uuid::new_v4().to_string(),
@@ -869,6 +989,7 @@ mod tests {
             sub: "agent-001".to_string(),
             tid: None,
             scope: "proxy".to_string(),
+            gvm_role: None,
             iat: future_time,
             exp: future_time + 3600,
             jti: uuid::Uuid::new_v4().to_string(),
@@ -895,6 +1016,7 @@ mod tests {
             sub: "agent-001".to_string(),
             tid: None,
             scope: "proxy".to_string(),
+            gvm_role: None,
             iat: now + EXPIRY_LEEWAY_SECS - 1, // Within leeway
             exp: now + 3600,
             jti: uuid::Uuid::new_v4().to_string(),
@@ -1125,6 +1247,7 @@ mod tests {
             sub: "agent-evil".to_string(),
             tid: None,
             scope: "proxy".to_string(),
+            gvm_role: None,
             iat: now_unix(),
             exp: now_unix() + 3600,
             jti: uuid::Uuid::new_v4().to_string(),
@@ -1176,6 +1299,43 @@ mod tests {
         assert_eq!(cfg.algorithm, JwtAlgorithm::Ed25519);
         assert!(cfg.public_key_hex().is_some());
         std::env::remove_var("GVM_TEST_JWT_ED25519_SEED");
+    }
+
+    #[test]
+    fn admin_token_carries_admin_role() {
+        let cfg = test_config(3600);
+        let token = issue_admin_token(&cfg, "bootstrap", None).expect("admin issue");
+        let identity = verify_token(&cfg, &token).expect("verify");
+        assert!(identity.is_admin(), "admin token must report is_admin");
+        assert_eq!(identity.gvm_role.as_deref(), Some("admin"));
+        assert_eq!(identity.agent_id, "admin:bootstrap");
+    }
+
+    #[test]
+    fn admin_token_label_validated() {
+        let cfg = test_config(3600);
+        assert!(issue_admin_token(&cfg, "", None).is_err());
+        assert!(issue_admin_token(&cfg, &"x".repeat(65), None).is_err());
+        assert!(issue_admin_token(&cfg, "bad label", None).is_err()); // space
+        assert!(issue_admin_token(&cfg, "evil\"escape", None).is_err());
+        assert!(issue_admin_token(&cfg, "gvm-cli-laptop_2026.q2", None).is_ok());
+    }
+
+    #[test]
+    fn agent_token_does_not_have_admin_role() {
+        let cfg = test_config(3600);
+        let token = issue_token(&cfg, "agent-001", None, "proxy").expect("issue");
+        let identity = verify_token(&cfg, &token).expect("verify");
+        assert!(!identity.is_admin(), "agent token must NOT report is_admin");
+        assert_eq!(identity.gvm_role, None);
+    }
+
+    #[test]
+    fn ed25519_admin_token_works() {
+        let cfg = test_config_ed25519(3600, "k1");
+        let token = issue_admin_token(&cfg, "ci-runner", None).expect("issue");
+        let identity = verify_token(&cfg, &token).expect("verify");
+        assert!(identity.is_admin());
     }
 
     #[test]

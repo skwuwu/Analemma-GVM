@@ -575,7 +575,7 @@ async fn main() {
         http_client,
         upstream_pool: gvm_proxy::upstream_pool::UpstreamPool::new(),
         host_overrides,
-        jwt_config,
+        jwt_config: jwt_config.clone(),
         intent_store: Arc::new(gvm_proxy::intent_store::IntentStore::new(
             config.shadow.intent_ttl_secs,
         )),
@@ -857,18 +857,44 @@ async fn main() {
     // carries IC-3 approval / SRR reload / sandbox launch — silently
     // exposing it to a routable interface is the kind of misconfig
     // that turns into a CVE.
-    match config.server.admin_bind_acceptable() {
-        Ok(gvm_proxy::config::AdminBindCheck::Loopback) => {
-            // Default, expected, no log line.
-        }
+    // Determine whether the admin port runs on a non-loopback address.
+    // When yes AND JWT is configured, wire the admin-port JWT middleware
+    // (defense-in-depth: even if the bind-policy gate is bypassed by a
+    // misconfigured L4/L7 forwarder, the runtime refuses callers without
+    // a valid `gvm_role=admin` token). When the policy gate rejects the
+    // non-loopback bind without JWT enabled, refuse to start at all —
+    // the operator must EITHER bind to loopback OR enable JWT.
+    let admin_non_loopback = match config.server.admin_bind_acceptable() {
+        Ok(gvm_proxy::config::AdminBindCheck::Loopback) => false,
         Ok(gvm_proxy::config::AdminBindCheck::NonLoopbackAllowed { ref addr }) => {
+            if jwt_config.is_none() {
+                eprintln!();
+                eprintln!(
+                    "  ERROR: admin_listen = {addr} is non-loopback AND JWT is disabled.",
+                );
+                eprintln!(
+                    "  Defense-in-depth refuses to start: either bind to 127.0.0.1 or"
+                );
+                eprintln!(
+                    "  configure JWT ([jwt] section + GVM_JWT_SECRET or GVM_JWT_ED25519_SEED)"
+                );
+                eprintln!(
+                    "  so the admin-port middleware can gate access by token."
+                );
+                eprintln!();
+                tracing::error!(
+                    address = %addr,
+                    "Non-loopback admin port requires JWT — refusing to start"
+                );
+                std::process::exit(1);
+            }
             tracing::warn!(
                 address = %addr,
-                "GVM Admin API bound to a non-loopback address — \
-                 allow_non_loopback_admin = true is set. The operator is \
-                 responsible for the trust boundary above this port \
-                 (mTLS terminator, VPN, IAP, etc.)."
+                "GVM Admin API bound to a non-loopback address — JWT middleware \
+                 ENFORCED. The bootstrap admin token printed below is the only \
+                 token until the operator mints replacements via POST /gvm/auth/token."
             );
+            true
         }
         Err(msg) => {
             eprintln!();
@@ -877,7 +903,47 @@ async fn main() {
             tracing::error!(error = %msg, "Refusing to start: admin port bind policy violation");
             std::process::exit(1);
         }
-    }
+    };
+
+    // If non-loopback admin + JWT, wrap the admin router with the
+    // require_admin_jwt middleware AND print a one-shot bootstrap
+    // token (kubeadm pattern: operator captures from stderr at first
+    // launch; subsequent tokens minted via the API).
+    let admin_app = if admin_non_loopback {
+        if let Some(ref jc) = jwt_config {
+            // Bootstrap token has the standard configured TTL.
+            match gvm_proxy::auth::issue_admin_token(jc, "bootstrap", None) {
+                Ok(token) => {
+                    eprintln!();
+                    eprintln!("  ═══════════════════════════════════════════════════════════════");
+                    eprintln!("  GVM ADMIN BOOTSTRAP TOKEN (capture now — printed once)");
+                    eprintln!("  Use as: Authorization: Bearer <this token>");
+                    eprintln!("  TTL: {} seconds", jc.token_ttl_secs);
+                    eprintln!("  {}", token);
+                    eprintln!("  ═══════════════════════════════════════════════════════════════");
+                    eprintln!();
+                    tracing::info!(
+                        "Admin bootstrap token emitted to stderr (jti recorded in next anchor batch)"
+                    );
+                }
+                Err(e) => {
+                    eprintln!("  ERROR: failed to mint admin bootstrap token: {e}");
+                    std::process::exit(1);
+                }
+            }
+            let mw_jc = jc.clone();
+            admin_app.layer(axum::middleware::from_fn_with_state(
+                mw_jc,
+                gvm_proxy::auth::require_admin_jwt,
+            ))
+        } else {
+            // Unreachable — admin_non_loopback=true implies jwt_config=Some.
+            admin_app
+        }
+    } else {
+        admin_app
+    };
+
     let admin_addr = config.server.admin_listen.clone();
     tokio::spawn(async move {
         match tokio::net::TcpListener::bind(&admin_addr).await {
