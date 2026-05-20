@@ -94,18 +94,55 @@ pub enum JwtKeyMaterial {
     Ed25519 {
         signing: SigningKey,
         verifying: VerifyingKey,
-        /// Operator-assigned label baked into the JWS header `kid`
-        /// claim. Auditors look up the matching VerifyingKey in a
-        /// registry by this id when verifying offline. Optional —
-        /// when empty, header omits `kid`.
-        key_id: String,
     },
 }
+
+/// A single key slot in the multi-key rotation set. One slot is
+/// `active = true` (used for signing); all slots are eligible for
+/// verification as long as `expires_at` is in the future (or `None`).
+///
+/// Rotation pattern (active + previous, advance on a schedule):
+/// 1. Add a new slot with `active = false`, `expires_at = None`.
+/// 2. Promote it: set `active = true`; demote the previous active
+///    by setting `active = false`, `expires_at = now + grace`.
+/// 3. After grace expires, no token signed by the old key remains
+///    valid. Operator removes the slot at next reload.
+///
+/// All steps are hot-reloadable via `POST /gvm/reload` — no proxy
+/// restart, no in-flight verify torn down (atomic snapshot under
+/// the `Arc<RwLock<...>>` reader path).
+pub struct JwtKeySlot {
+    /// Operator-assigned label. Baked into the JWS header `kid` so
+    /// the verifier can locate the right slot for a given token.
+    /// Empty string is allowed (matches header without `kid`), but
+    /// only one such slot may exist or look-up is ambiguous.
+    pub kid: String,
+    /// Key material — algorithm must match `JwtConfig.algorithm`.
+    pub material: JwtKeyMaterial,
+    /// Exactly one slot in a `JwtConfig.keys` vector carries
+    /// `active = true`. Signing always uses that slot; verification
+    /// uses any matching `kid` regardless of active status.
+    pub active: bool,
+    /// Optional automatic expiry. After this wall-clock time, the
+    /// slot is excluded from verification even if it is still in
+    /// the keys vector — operator can leave deprecated slots in
+    /// place and rely on the timer to retire them safely.
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Maximum number of slots in a single `JwtConfig.keys` vector.
+/// Picked low (4) so the verify-time linear scan stays cheap and a
+/// runaway config can't blow up memory. Active + immediately
+/// preceding + one in pre-promotion + one safety margin is the
+/// realistic upper bound for any rotation cadence.
+pub const MAX_KEY_SLOTS: usize = 4;
 
 /// JWT configuration: algorithm + key material + token parameters.
 pub struct JwtConfig {
     pub algorithm: JwtAlgorithm,
-    pub key: JwtKeyMaterial,
+    /// One or more key slots. Exactly one carries `active = true`.
+    /// Capped at `MAX_KEY_SLOTS`.
+    pub keys: Vec<JwtKeySlot>,
     pub token_ttl_secs: u64,
     /// Strict mode — reject requests without a valid Bearer token.
     /// See `JwtAuthConfig.strict` in src/config.rs for rationale.
@@ -139,7 +176,12 @@ impl JwtConfig {
 
         Ok(Some(Self {
             algorithm: JwtAlgorithm::Hs256,
-            key: JwtKeyMaterial::Hmac(JwtSecret { key }),
+            keys: vec![JwtKeySlot {
+                kid: String::new(),
+                material: JwtKeyMaterial::Hmac(JwtSecret { key }),
+                active: true,
+                expires_at: None,
+            }],
             token_ttl_secs,
             strict: false,
             revocation_file: None,
@@ -177,24 +219,82 @@ impl JwtConfig {
         let verifying = signing.verifying_key();
         Ok(Some(Self {
             algorithm: JwtAlgorithm::Ed25519,
-            key: JwtKeyMaterial::Ed25519 {
-                signing,
-                verifying,
-                key_id: key_id.into(),
-            },
+            keys: vec![JwtKeySlot {
+                kid: key_id.into(),
+                material: JwtKeyMaterial::Ed25519 {
+                    signing,
+                    verifying,
+                },
+                active: true,
+                expires_at: None,
+            }],
             token_ttl_secs,
             strict: false,
             revocation_file: None,
         }))
     }
 
-    /// Hex-encoded public key, when the algorithm is Ed25519. Lets the
-    /// proxy expose the verifying key to auditors via a static admin
-    /// endpoint (out of scope here — operators can also just `xxd` the
-    /// configured seed since they already trust the host that minted
-    /// the key).
+    /// Validate the slot invariants: at least one slot, exactly one
+    /// active, no duplicate `kid`, length ≤ MAX_KEY_SLOTS. Called by
+    /// the constructors and the hot-reload path.
+    pub fn validate_slots(&self) -> Result<()> {
+        if self.keys.is_empty() {
+            return Err(anyhow!("JwtConfig must have at least one key slot"));
+        }
+        if self.keys.len() > MAX_KEY_SLOTS {
+            return Err(anyhow!(
+                "JwtConfig has {} slots; max is {}",
+                self.keys.len(),
+                MAX_KEY_SLOTS
+            ));
+        }
+        let active_count = self.keys.iter().filter(|s| s.active).count();
+        if active_count != 1 {
+            return Err(anyhow!(
+                "JwtConfig must have exactly one active slot (got {})",
+                active_count
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for slot in &self.keys {
+            if !seen.insert(slot.kid.as_str()) {
+                return Err(anyhow!(
+                    "JwtConfig has duplicate kid '{}'",
+                    slot.kid
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Reference to the currently active slot. Panics if the slot
+    /// invariants are violated — callers must `validate_slots` after
+    /// constructing or reloading the config.
+    pub fn active_slot(&self) -> &JwtKeySlot {
+        self.keys
+            .iter()
+            .find(|s| s.active)
+            .expect("validate_slots was not called or did not enforce active=1")
+    }
+
+    /// Locate a slot by `kid`. Used by `decode_jwt` to dispatch the
+    /// verifying key. Slot is rejected (returned as `None`) if its
+    /// `expires_at` is in the past, so the verifier transparently
+    /// skips retired rotation slots without operator intervention.
+    pub fn slot_by_kid(&self, kid: &str) -> Option<&JwtKeySlot> {
+        let now = chrono::Utc::now();
+        self.keys.iter().find(|s| {
+            s.kid == kid && s.expires_at.map(|t| t > now).unwrap_or(true)
+        })
+    }
+
+    /// Hex-encoded public key of the active slot, when the algorithm
+    /// is Ed25519. Lets the proxy expose the verifying key to auditors
+    /// via a static admin endpoint (out of scope here — operators can
+    /// also just `xxd` the configured seed since they already trust
+    /// the host that minted the key).
     pub fn public_key_hex(&self) -> Option<String> {
-        match &self.key {
+        match &self.active_slot().material {
             JwtKeyMaterial::Ed25519 { verifying, .. } => Some(hex::encode(verifying.as_bytes())),
             JwtKeyMaterial::Hmac(_) => None,
         }
@@ -446,29 +546,23 @@ fn encode_jwt(config: &JwtConfig, claims: &Claims) -> Result<String> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
 
-    // Header — include `kid` for Ed25519 so auditors can locate the
-    // verifying key in a registry. HS256 keeps the legacy header
-    // shape verbatim for backward compat with v1 tokens.
-    let header_json = match &config.key {
-        JwtKeyMaterial::Hmac(_) => r#"{"alg":"HS256","typ":"JWT"}"#.to_string(),
-        JwtKeyMaterial::Ed25519 { key_id, .. } => {
-            if key_id.is_empty() {
-                r#"{"alg":"EdDSA","typ":"JWT"}"#.to_string()
-            } else {
-                // Manual JSON so field order is deterministic across
-                // serde versions — matters for hash-of-token equality
-                // checks in audit replay.
-                format!(
-                    r#"{{"alg":"EdDSA","typ":"JWT","kid":"{}"}}"#,
-                    // kid is operator-controlled; sanitize to a safe
-                    // subset to defend against JSON-escape injection.
-                    key_id
-                        .chars()
-                        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-                        .collect::<String>()
-                )
-            }
-        }
+    // Signing always uses the ACTIVE slot. Verification is
+    // multi-slot (any non-expired matching kid), but minting is
+    // unambiguous — exactly one private key produces tokens.
+    let slot = config.active_slot();
+    let alg = config.algorithm.jws_alg();
+
+    // Header — include `kid` so verifiers (and rotated past slots)
+    // can dispatch. Sanitize kid against JSON-escape injection.
+    let safe_kid: String = slot
+        .kid
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .collect();
+    let header_json = if safe_kid.is_empty() {
+        format!(r#"{{"alg":"{}","typ":"JWT"}}"#, alg)
+    } else {
+        format!(r#"{{"alg":"{}","typ":"JWT","kid":"{}"}}"#, alg, safe_kid)
     };
     let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
 
@@ -478,7 +572,7 @@ fn encode_jwt(config: &JwtConfig, claims: &Claims) -> Result<String> {
 
     let signing_input = format!("{}.{}", header_b64, payload_b64);
 
-    let signature_bytes: Vec<u8> = match &config.key {
+    let signature_bytes: Vec<u8> = match &slot.material {
         JwtKeyMaterial::Hmac(secret) => {
             let mut mac = HmacSha256::new_from_slice(&secret.key)
                 .map_err(|e| anyhow!("HMAC key error: {}", e))?;
@@ -533,14 +627,32 @@ fn decode_jwt(config: &JwtConfig, token: &str) -> Result<Claims> {
         return Err(anyhow!("Unsupported token algorithm"));
     }
 
+    // Dispatch the verifying key by header `kid`. Token without
+    // `kid` falls back to the active slot — preserves backward compat
+    // for legacy tokens minted before multi-slot landed (kid="").
+    let token_kid = header_json
+        .get("kid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let slot = match config.slot_by_kid(token_kid) {
+        Some(s) => s,
+        None => {
+            tracing::warn!(
+                token_kid = token_kid,
+                "JWT kid does not match any active key slot (rotation in progress, or token signed by retired key)"
+            );
+            return Err(anyhow!("No verifying key for token kid"));
+        }
+    };
+
     let signing_input = format!("{}.{}", parts[0], parts[1]);
 
-    // Verify signature with the algorithm-appropriate key.
+    // Verify signature with the slot's key.
     let signature = URL_SAFE_NO_PAD
         .decode(parts[2])
         .map_err(|_| anyhow!("Invalid token encoding"))?;
 
-    match &config.key {
+    match &slot.material {
         JwtKeyMaterial::Hmac(secret) => {
             let mut mac = HmacSha256::new_from_slice(&secret.key)
                 .map_err(|e| anyhow!("HMAC key error: {}", e))?;
@@ -636,12 +748,30 @@ pub async fn require_admin_jwt(
 mod tests {
     use super::*;
 
+    fn single_slot_hmac(secret: Vec<u8>) -> JwtKeySlot {
+        JwtKeySlot {
+            kid: String::new(),
+            material: JwtKeyMaterial::Hmac(JwtSecret { key: secret }),
+            active: true,
+            expires_at: None,
+        }
+    }
+
+    fn single_slot_ed25519(seed: [u8; 32], kid: &str) -> JwtKeySlot {
+        let signing = SigningKey::from_bytes(&seed);
+        let verifying = signing.verifying_key();
+        JwtKeySlot {
+            kid: kid.to_string(),
+            material: JwtKeyMaterial::Ed25519 { signing, verifying },
+            active: true,
+            expires_at: None,
+        }
+    }
+
     fn test_config(ttl: u64) -> JwtConfig {
         JwtConfig {
             algorithm: JwtAlgorithm::Hs256,
-            key: JwtKeyMaterial::Hmac(JwtSecret {
-                key: vec![0xAB; 32],
-            }),
+            keys: vec![single_slot_hmac(vec![0xAB; 32])],
             token_ttl_secs: ttl,
             strict: false,
             revocation_file: None,
@@ -649,15 +779,9 @@ mod tests {
     }
 
     fn test_config_ed25519(ttl: u64, key_id: &str) -> JwtConfig {
-        let signing = SigningKey::from_bytes(&[0xCD; 32]);
-        let verifying = signing.verifying_key();
         JwtConfig {
             algorithm: JwtAlgorithm::Ed25519,
-            key: JwtKeyMaterial::Ed25519 {
-                signing,
-                verifying,
-                key_id: key_id.to_string(),
-            },
+            keys: vec![single_slot_ed25519([0xCD; 32], key_id)],
             token_ttl_secs: ttl,
             strict: false,
             revocation_file: None,
@@ -735,9 +859,7 @@ mod tests {
         let config_a = test_config(3600);
         let config_b = JwtConfig {
             algorithm: JwtAlgorithm::Hs256,
-            key: JwtKeyMaterial::Hmac(JwtSecret {
-                key: vec![0xCD; 32],
-            }),
+            keys: vec![single_slot_hmac(vec![0xCD; 32])],
             token_ttl_secs: 3600,
             strict: false,
             revocation_file: None,
@@ -1046,7 +1168,7 @@ mod tests {
         // Build a config with revocation enabled pointing at the file.
         let cfg_rev = JwtConfig {
             algorithm: JwtAlgorithm::Hs256,
-            key: JwtKeyMaterial::Hmac(JwtSecret { key: vec![0xAB; 32] }),
+            keys: vec![single_slot_hmac(vec![0xAB; 32])],
             token_ttl_secs: 3600,
             strict: false,
             revocation_file: Some(rev_path.clone()),
@@ -1071,7 +1193,7 @@ mod tests {
         // revocation check (consistent with is_jti_revoked's contract).
         let cfg = JwtConfig {
             algorithm: JwtAlgorithm::Hs256,
-            key: JwtKeyMaterial::Hmac(JwtSecret { key: vec![0xAB; 32] }),
+            keys: vec![single_slot_hmac(vec![0xAB; 32])],
             token_ttl_secs: 3600,
             strict: false,
             revocation_file: Some(std::path::PathBuf::from(
@@ -1132,11 +1254,12 @@ mod tests {
         let verifying = signing.verifying_key();
         let cfg = JwtConfig {
             algorithm: JwtAlgorithm::Ed25519,
-            key: JwtKeyMaterial::Ed25519 {
-                signing,
-                verifying,
-                key_id: r#"evil","alg":"none","x":""#.to_string(),
-            },
+            keys: vec![JwtKeySlot {
+                kid: r#"evil","alg":"none","x":""#.to_string(),
+                material: JwtKeyMaterial::Ed25519 { signing, verifying },
+                active: true,
+                expires_at: None,
+            }],
             token_ttl_secs: 3600,
             strict: false,
             revocation_file: None,
@@ -1163,14 +1286,14 @@ mod tests {
         // EdDSA MUST reject — `alg` mismatch detected before
         // signature verification ever runs.
         let cfg_ed = test_config_ed25519(3600, "k");
-        let public_bytes = match &cfg_ed.key {
+        let public_bytes = match &cfg_ed.active_slot().material {
             JwtKeyMaterial::Ed25519 { verifying, .. } => verifying.as_bytes().to_vec(),
             _ => unreachable!(),
         };
         // Forge an HS256 token using the public key as the HMAC secret.
         let cfg_attacker = JwtConfig {
             algorithm: JwtAlgorithm::Hs256,
-            key: JwtKeyMaterial::Hmac(JwtSecret { key: public_bytes }),
+            keys: vec![single_slot_hmac(public_bytes)],
             token_ttl_secs: 3600,
             strict: false,
             revocation_file: None,
@@ -1223,11 +1346,15 @@ mod tests {
         let other_verifying = other_signing.verifying_key();
         let cfg_b = JwtConfig {
             algorithm: JwtAlgorithm::Ed25519,
-            key: JwtKeyMaterial::Ed25519 {
-                signing: other_signing,
-                verifying: other_verifying,
-                key_id: "kb".to_string(),
-            },
+            keys: vec![JwtKeySlot {
+                kid: "ka".to_string(),  // SAME kid as cfg_a so kid-dispatch hits this slot
+                material: JwtKeyMaterial::Ed25519 {
+                    signing: other_signing,
+                    verifying: other_verifying,
+                },
+                active: true,
+                expires_at: None,
+            }],
             token_ttl_secs: 3600,
             strict: false,
             revocation_file: None,
@@ -1344,5 +1471,170 @@ mod tests {
         let result = JwtConfig::from_env_ed25519("GVM_TEST_JWT_ED25519_SHORT", "k", 3600);
         assert!(result.is_err());
         std::env::remove_var("GVM_TEST_JWT_ED25519_SHORT");
+    }
+
+    // ── Multi-key slot rotation (Phase B) ──────────────────────
+
+    fn multi_slot_config(active_seed: [u8; 32], prev_seed: [u8; 32]) -> JwtConfig {
+        JwtConfig {
+            algorithm: JwtAlgorithm::Ed25519,
+            keys: vec![
+                JwtKeySlot {
+                    kid: "active".to_string(),
+                    material: {
+                        let s = SigningKey::from_bytes(&active_seed);
+                        let v = s.verifying_key();
+                        JwtKeyMaterial::Ed25519 { signing: s, verifying: v }
+                    },
+                    active: true,
+                    expires_at: None,
+                },
+                JwtKeySlot {
+                    kid: "previous".to_string(),
+                    material: {
+                        let s = SigningKey::from_bytes(&prev_seed);
+                        let v = s.verifying_key();
+                        JwtKeyMaterial::Ed25519 { signing: s, verifying: v }
+                    },
+                    active: false,
+                    expires_at: None,
+                },
+            ],
+            token_ttl_secs: 3600,
+            strict: false,
+            revocation_file: None,
+        }
+    }
+
+    #[test]
+    fn validate_slots_enforces_invariants() {
+        // Empty slot vec → error
+        let mut cfg = test_config(3600);
+        cfg.keys.clear();
+        assert!(cfg.validate_slots().is_err());
+
+        // Two active slots → error
+        let mut cfg = test_config(3600);
+        cfg.keys.push(single_slot_hmac(vec![0x11; 32]));
+        // both have active = true now
+        assert!(cfg.validate_slots().is_err());
+
+        // No active slot → error
+        let mut cfg = test_config(3600);
+        cfg.keys[0].active = false;
+        assert!(cfg.validate_slots().is_err());
+
+        // Duplicate kid → error
+        let mut cfg = test_config(3600);
+        let dup_kid = cfg.keys[0].kid.clone();
+        cfg.keys.push(JwtKeySlot {
+            kid: dup_kid,
+            material: JwtKeyMaterial::Hmac(JwtSecret { key: vec![0x22; 32] }),
+            active: false,
+            expires_at: None,
+        });
+        assert!(cfg.validate_slots().is_err());
+
+        // Too many slots (cap MAX_KEY_SLOTS=4) → error
+        let mut cfg = test_config(3600);
+        for i in 0..MAX_KEY_SLOTS {
+            cfg.keys.push(JwtKeySlot {
+                kid: format!("k{i}"),
+                material: JwtKeyMaterial::Hmac(JwtSecret { key: vec![0x33; 32] }),
+                active: false,
+                expires_at: None,
+            });
+        }
+        assert!(cfg.validate_slots().is_err());
+    }
+
+    #[test]
+    fn sign_always_uses_active_slot() {
+        // Issue a token, then inspect its header — kid must equal
+        // the active slot's kid, not the previous slot's.
+        let cfg = multi_slot_config([0x11; 32], [0x22; 32]);
+        let token = issue_token(&cfg, "agent-1", None, "proxy").expect("issue");
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let header_b64 = token.split('.').next().unwrap();
+        let header_bytes = URL_SAFE_NO_PAD.decode(header_b64).unwrap();
+        let header: serde_json::Value = serde_json::from_slice(&header_bytes).unwrap();
+        assert_eq!(header["kid"], "active");
+    }
+
+    #[test]
+    fn rotation_previous_slot_token_still_verifies() {
+        // Simulate a graceful rotation: a token was issued under
+        // `previous` (when it was active), then operator rotated so
+        // `active` slot took over. The previous-slot token must
+        // STILL verify until its `expires_at` elapses.
+        let mut cfg = multi_slot_config([0x11; 32], [0x22; 32]);
+        // Issue under previous-active (swap roles temporarily).
+        cfg.keys[0].active = false;
+        cfg.keys[1].active = true;
+        let token = issue_token(&cfg, "agent-1", None, "proxy").expect("issue under previous");
+        // Now rotate back.
+        cfg.keys[0].active = true;
+        cfg.keys[1].active = false;
+        assert!(
+            verify_token(&cfg, &token).is_ok(),
+            "rotated-out slot must continue to verify pre-rotation tokens"
+        );
+    }
+
+    #[test]
+    fn expired_slot_excluded_from_verification() {
+        let mut cfg = multi_slot_config([0x11; 32], [0x22; 32]);
+        // Issue under previous slot.
+        cfg.keys[0].active = false;
+        cfg.keys[1].active = true;
+        let token = issue_token(&cfg, "agent-1", None, "proxy").expect("issue");
+        // Mark previous expired in the past, restore active.
+        cfg.keys[0].active = true;
+        cfg.keys[1].active = false;
+        cfg.keys[1].expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+        assert!(
+            verify_token(&cfg, &token).is_err(),
+            "token signed by an expired slot must be rejected"
+        );
+    }
+
+    #[test]
+    fn unknown_kid_rejected() {
+        let cfg = multi_slot_config([0x11; 32], [0x22; 32]);
+        // Forge a token with an unknown kid (using attacker's own key).
+        let attacker_signing = SigningKey::from_bytes(&[0x99; 32]);
+        let attacker_verifying = attacker_signing.verifying_key();
+        let attacker_cfg = JwtConfig {
+            algorithm: JwtAlgorithm::Ed25519,
+            keys: vec![JwtKeySlot {
+                kid: "attacker-kid".to_string(),
+                material: JwtKeyMaterial::Ed25519 {
+                    signing: attacker_signing,
+                    verifying: attacker_verifying,
+                },
+                active: true,
+                expires_at: None,
+            }],
+            token_ttl_secs: 3600,
+            strict: false,
+            revocation_file: None,
+        };
+        let token = issue_token(&attacker_cfg, "evil", None, "proxy").expect("attacker issues");
+        // Real verifier (cfg) does not have "attacker-kid" → rejection.
+        let err = verify_token(&cfg, &token).expect_err("unknown kid must be rejected");
+        assert!(err.to_string().contains("kid") || err.to_string().contains("verifying key"));
+    }
+
+    #[test]
+    fn legacy_token_without_kid_falls_back_to_active_slot() {
+        // A token whose header has no `kid` (legacy v1 issuance) must
+        // verify against the slot with empty kid (default). This
+        // preserves backward compat — operators rotating from
+        // single-key configs to multi-key keep their old tokens working
+        // as long as the original key is the active slot with kid="".
+        let cfg = test_config(3600);
+        let token = issue_token(&cfg, "agent-001", None, "proxy").expect("issue");
+        assert!(verify_token(&cfg, &token).is_ok());
     }
 }

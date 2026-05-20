@@ -419,7 +419,14 @@ async fn multi_agent_atomicity_preserved_under_burst() {
 fn shared_jwt_config() -> JwtConfig {
     JwtConfig {
         algorithm: gvm_proxy::auth::JwtAlgorithm::Hs256,
-        key: gvm_proxy::auth::JwtKeyMaterial::Hmac(JwtSecret::from_bytes(vec![0xAB; 32])),
+        keys: vec![gvm_proxy::auth::JwtKeySlot {
+            kid: String::new(),
+            material: gvm_proxy::auth::JwtKeyMaterial::Hmac(
+                JwtSecret::from_bytes(vec![0xAB; 32]),
+            ),
+            active: true,
+            expires_at: None,
+        }],
         token_ttl_secs: 3600,
         strict: false,
         revocation_file: None,

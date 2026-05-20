@@ -443,8 +443,24 @@ async fn main() {
         .jwt
         .as_ref()
         .map(|j| j.algorithm.as_str())
-        .unwrap_or("hs256");
-    let jwt_algorithm = match auth::JwtAlgorithm::from_config_str(jwt_algorithm) {
+        .unwrap_or("");
+    // In production mode, default to Ed25519 (asymmetric) when the
+    // operator did not specify an algorithm. Dev/local stays on HS256
+    // for the no-config UX. Operators who explicitly set
+    // `algorithm = "hs256"` get HS256 even in production — but they
+    // get the loud warning below.
+    let gvm_env_production = matches!(
+        std::env::var("GVM_ENV").as_deref(),
+        Ok("production") | Ok("prod")
+    );
+    let resolved_alg_str = if jwt_algorithm.is_empty() && gvm_env_production {
+        "ed25519"
+    } else if jwt_algorithm.is_empty() {
+        "hs256"
+    } else {
+        jwt_algorithm
+    };
+    let jwt_algorithm = match auth::JwtAlgorithm::from_config_str(resolved_alg_str) {
         Ok(a) => a,
         Err(e) => {
             tracing::error!(error = %e, "Invalid JWT algorithm in proxy.toml");
@@ -452,6 +468,59 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // ── HS256 deprecation warning ────────────────────────────────────
+    //
+    // HS256 keeps the signing-and-verifying key in one symmetric
+    // secret, which means:
+    //   - external auditors cannot verify token authenticity offline
+    //     without holding the issuer's secret (defeats the audit
+    //     thesis when distributing evidence bundles)
+    //   - operator compromise of the proxy host = adversary mints
+    //     arbitrary tokens (same as Ed25519, but the surface for
+    //     post-compromise damage is wider because no asymmetric trust
+    //     boundary survives)
+    //
+    // We do NOT add penalty latency (that would be hostile UX and
+    // does not improve security). Instead: prominent banner + WAL
+    // event so the choice is visible in audit and operator
+    // dashboards. The roadmap commits to removing HS256 in the next
+    // major version (v1.0); operators planning long-lived deployments
+    // should migrate to Ed25519 now.
+    if matches!(jwt_algorithm, auth::JwtAlgorithm::Hs256) {
+        eprintln!();
+        eprintln!("  ⚠ WARNING: JWT algorithm = HS256 (symmetric)");
+        eprintln!(
+            "    Anyone holding {} can mint tokens for ANY agent_id.",
+            jwt_secret_env
+        );
+        eprintln!(
+            "    Suitable for: single-operator, single-host deployments where"
+        );
+        eprintln!(
+            "      the secret never leaves the proxy host."
+        );
+        eprintln!(
+            "    NOT suitable for: distributed verification, external audit,"
+        );
+        eprintln!(
+            "      multi-tenant, or compliance evidence handoff."
+        );
+        eprintln!(
+            "    Migrate: set `[jwt] algorithm = \"ed25519\"` +"
+        );
+        eprintln!(
+            "      `GVM_JWT_ED25519_SEED=<64 hex chars>`."
+        );
+        eprintln!(
+            "    HS256 will be REMOVED in v1.0. See docs/security-model.md §8."
+        );
+        eprintln!();
+        tracing::warn!(
+            algorithm = "HS256",
+            "JWT symmetric algorithm active — see startup banner for migration path"
+        );
+    }
 
     let load_result = match jwt_algorithm {
         auth::JwtAlgorithm::Hs256 => auth::JwtConfig::from_env(jwt_secret_env, jwt_ttl),

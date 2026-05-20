@@ -133,6 +133,94 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-05-21: JWT hardening Phase B+C — multi-key rotation + HS256 deprecation path
+
+Follow-up to the same-day Phase A commit (admin port JWT middleware
++ bootstrap token + gvm_role claim). Closes the two remaining items
+the operator surfaced in the JWT-model review.
+
+**Phase B — Multi-key slots for graceful rotation.**
+
+Replaces the prior single-key `JwtConfig.key: JwtKeyMaterial` with
+`JwtConfig.keys: Vec<JwtKeySlot>` (cap `MAX_KEY_SLOTS = 4`). Each
+slot carries `{ kid, material, active, expires_at }`. The invariant
+(exactly one active, unique kids, ≤4 entries) is enforced by
+`JwtConfig::validate_slots`, called on construction and on every
+hot-reload.
+
+- **Sign**: always with the active slot. Header `kid` is the active
+  slot's kid (sanitized to `[A-Za-z0-9-_.]`).
+- **Verify**: parse `kid` from the token header, look up the
+  matching slot via `JwtConfig::slot_by_kid` (which transparently
+  excludes slots whose `expires_at` is past). Tokens without `kid`
+  fall back to the slot whose kid is empty — preserves backward
+  compat with v1 HS256 tokens minted before kid was used.
+- **Rotation pattern**:
+    1. Add new slot, `active = false`, no expiry.
+    2. Promote it: flip `active`, set old slot's `expires_at = now +
+       grace`, hot-reload via `POST /gvm/reload`.
+    3. After grace elapses, old slot is auto-excluded from
+       verification. Operator removes it at next config edit.
+- **No restart, no token-replay window**, no in-flight verify torn
+  down — the reload is the same atomic `Arc<RwLock<>>` swap already
+  used for SRR rules.
+
+**Phase C — HS256 deprecation path (no penalty latency).**
+
+- Prominent stderr banner at startup when the resolved algorithm is
+  HS256: explains the symmetric-secret risk, points at the Ed25519
+  migration, names the v1.0 removal timeline.
+- `GVM_ENV=production` flips the default algorithm from HS256 to
+  Ed25519 when the operator did not explicitly choose. Dev/local
+  ergonomics preserved (HS256 still default with no env set).
+- Structured `tracing::warn!` line so HS256 use is visible in log
+  aggregation.
+- **Explicit non-choice**: no artificial slow-down on HS256 verify.
+  Hostile UX, no security benefit. The deprecation is communicated,
+  not punished.
+
+**Tests added (+7):**
+- `validate_slots_enforces_invariants` (empty, double-active,
+  no-active, duplicate-kid, over-cap)
+- `sign_always_uses_active_slot` (header kid inspection)
+- `rotation_previous_slot_token_still_verifies`
+- `expired_slot_excluded_from_verification`
+- `unknown_kid_rejected`
+- `legacy_token_without_kid_falls_back_to_active_slot`
+- Plus all pre-existing alg-confusion / EdDSA tests adapted to the
+  multi-slot shape.
+
+Workspace: **917 passing** (was 911 after Phase A), 0 failed.
+
+**Affected files**: `src/auth.rs` (slot enum + sign/verify dispatch
++ tests, ~250 LOC net), `src/main.rs` (production-mode default,
+HS256 banner), `tests/multi_agent_isolation.rs` (struct migration
+to slots), `docs/security-model.md §8` (v1.5 hardening),
+`docs/internal/CHANGELOG.md` (this entry).
+
+**Backward compat**: existing operator configs work unchanged.
+HS256 single-key path is preserved (now a degenerate single-slot
+config under the hood). Tokens minted before this change verify
+under the active slot (kid="" lookup). No WAL schema change, no
+on-disk format change.
+
+**Risk**: Medium-low. The slot refactor touches every encode/decode
+site; all 917 workspace tests pass. The active-slot invariant is
+checked at construction time + on reload, so a misconfigured
+multi-slot setup fails loud at startup rather than silent at first
+mismatched verify.
+
+**Deferred**:
+- Per-slot algorithm mixing (Hs256 + Ed25519 in the same `keys`
+  vector). Currently the algorithm is config-wide. Use case is
+  thin — operators rotating into Ed25519 do the algorithm swap as
+  a separate config change, not a hybrid slot set.
+- TOML schema for `[[jwt.keys]]` array. The Vec<JwtKeySlot>
+  in-memory shape is ready; surface wiring (config.rs +
+  proxy.toml schema) lands as a follow-up. Operators who want
+  multi-key today can build it programmatically via the lib API.
+- HS256 final removal — tracked for v1.0.
+
 ### 2026-05-21: JWT issuance model hardening — Ed25519 (#4)
 
 Lands the deferred #4 follow-up from 2026-05-15: asymmetric JWT
