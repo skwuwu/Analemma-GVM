@@ -133,6 +133,97 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-05-21: JWT issuance model hardening — Ed25519 (#4)
+
+Lands the deferred #4 follow-up from 2026-05-15: asymmetric JWT
+signing via Ed25519 (EdDSA per RFC 8037). HS256 stays the default;
+operators flip `[jwt] algorithm = "ed25519"` to opt in.
+
+**Why asymmetric matters.** HS256 uses a shared secret for both
+sign and verify; anyone holding the secret can mint tokens. An
+external auditor (compliance reviewer, downstream service, separate
+team) cannot verify token authenticity without being trusted with
+the signing key. Ed25519 splits that — the proxy holds the private
+signing key; auditors verify offline with only the public key.
+
+**Implementation:**
+- New `JwtAlgorithm { Hs256, Ed25519 }` enum + `JwtKeyMaterial`
+  variant carrying either an `HmacSha256` secret or an Ed25519
+  `SigningKey`/`VerifyingKey` pair with `kid`. Encode + decode
+  dispatch on the algorithm; both produce/verify standard JWS.
+- New env var `GVM_JWT_ED25519_SEED` (default; rename via `[jwt]
+  ed25519_seed_env`): 32-byte hex seed. New `[jwt] ed25519_key_id`
+  config field is baked into the JWS header `kid` so auditors
+  pick the right verifying key from a registry.
+- `JwtConfig::public_key_hex()` exposes the public key for printing
+  / serving via admin endpoint (operator decides distribution path).
+- Reuses the same `ed25519_dalek::SigningKey`/`VerifyingKey`
+  infrastructure as `src/sign.rs::SelfSignedSigner` — no new
+  cryptographic surface added.
+
+**Alg-confusion defense (CVE-2018-1000531 class):** the verifier
+refuses any token whose header `alg` does not equal the operator-
+configured algorithm. So if an attacker takes the EdDSA public key,
+treats it as HMAC secret, and signs an HS256 token, the EdDSA-
+configured verifier rejects on header mismatch BEFORE attempting
+signature verification. Symmetric direction covered too. Test:
+`ed25519_config_rejects_hs256_signed_token`.
+
+**`kid` injection defense:** operator-supplied `ed25519_key_id` is
+filtered to `[A-Za-z0-9-_.]` at issuance — prevents an operator
+typo (or a malicious operator) from breaking out of the JSON header
+with embedded quotes and rewriting `alg` mid-string. Test:
+`ed25519_kid_sanitized_against_json_escape_injection`.
+
+**Tests added (+11):**
+- `ed25519_round_trip` — full sign/verify path with claims preserved
+- `ed25519_header_contains_kid_and_eddsa_alg`
+- `ed25519_kid_sanitized_against_json_escape_injection`
+- `ed25519_config_rejects_hs256_signed_token` — alg-confusion
+- `hs256_config_rejects_eddsa_signed_token` — symmetric alg-confusion
+- `ed25519_tampered_signature_rejected`
+- `ed25519_wrong_seed_rejected`
+- `algorithm_none_attack_rejected_for_eddsa` — CVE-2015-9235 alg:none
+- `algorithm_from_config_str_parses_known_aliases`
+- `ed25519_from_env_seed_loads_keypair`
+- `ed25519_from_env_rejects_wrong_seed_length`
+
+Workspace test count: 907 passing (was 896), 0 failed.
+
+**Backward compat:** existing operator configs without `[jwt]
+algorithm` field default to `hs256` (matching prior behaviour);
+existing HS256 tokens issued before this commit continue to verify
+under the same env var + secret. Operators upgrade by adding three
+lines to `proxy.toml`:
+
+```toml
+[jwt]
+algorithm = "ed25519"
+ed25519_seed_env = "GVM_JWT_ED25519_SEED"  # default
+ed25519_key_id = "gvm-2026-q2"             # optional label
+```
+
+then setting `GVM_JWT_ED25519_SEED=<64 hex chars>` and restarting.
+
+**Affected files**: `src/auth.rs` (algorithm dispatch, key material
+union, sanitized `kid`, +11 tests), `src/config.rs` (3 new
+`JwtAuthConfig` fields), `src/main.rs` (algorithm-aware loader,
+public key hex in startup log), `tests/multi_agent_isolation.rs`
+(struct migration). Crypto layer reuses `ed25519_dalek` already
+present for anchor signing.
+
+**Risk**: Low. HS256 path unchanged. Ed25519 path is gated by a new
+config field that defaults to "hs256". No on-disk format changes,
+no WAL schema bump. The `kid` sanitization is the only place where
+operator input is rewritten — alternative would be to refuse
+startup on invalid `kid`, which is also acceptable but reduces
+operator flexibility for legitimate ASCII labels.
+
+**Deferred from #4**: RS256 (RSA). Not included — Ed25519 covers
+the same use case at smaller key/signature size, faster verify,
+without RSA's parameter pitfalls (key sizes, PKCS#1 v1.5 vs PSS).
+Re-add if specific operator demand for RS256 surfaces.
+
 ### 2026-05-15: JWT issuance model hardening (#1, #2, #5, #6)
 
 Closes the four most impactful gaps in the v1 JWT model identified

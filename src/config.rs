@@ -493,9 +493,27 @@ impl AnchorKeyFile {
 /// ```
 #[derive(Deserialize, Clone, Debug)]
 pub struct JwtAuthConfig {
-    /// Environment variable name holding the hex-encoded HMAC secret (min 32 bytes).
+    /// Signing algorithm. `"hs256"` (default) uses HMAC-SHA256 with a
+    /// shared secret. `"ed25519"` uses EdDSA over Curve25519 — an
+    /// external auditor verifies with only the public key, no shared
+    /// secret. Operator picks ONE; alg-confusion attacks are blocked
+    /// at the verifier (the token's JWS header `alg` must match this).
+    #[serde(default = "default_jwt_algorithm")]
+    pub algorithm: String,
+    /// Environment variable name holding the hex-encoded HMAC secret
+    /// (min 32 bytes). Only used when `algorithm = "hs256"`.
     #[serde(default = "default_jwt_secret_env")]
     pub secret_env: String,
+    /// Environment variable name holding the hex-encoded 32-byte
+    /// Ed25519 seed. Only used when `algorithm = "ed25519"`.
+    #[serde(default = "default_jwt_ed25519_seed_env")]
+    pub ed25519_seed_env: String,
+    /// Operator-assigned label baked into the JWS header `kid` claim
+    /// so auditors can locate the matching verifying key in a
+    /// registry. Empty string → no `kid` in the header (single-key
+    /// deployments don't need it).
+    #[serde(default)]
+    pub ed25519_key_id: String,
     /// Token time-to-live in seconds (default: 3600 = 1 hour).
     #[serde(default = "default_jwt_ttl")]
     pub token_ttl_secs: u64,
@@ -527,8 +545,18 @@ pub struct JwtAuthConfig {
     pub revocation_file: Option<String>,
 }
 
+fn default_jwt_algorithm() -> String {
+    // HS256 stays the default so existing operator configs without
+    // the new `algorithm` field continue to use HMAC.
+    "hs256".to_string()
+}
+
 fn default_jwt_secret_env() -> String {
     "GVM_JWT_SECRET".to_string()
+}
+
+fn default_jwt_ed25519_seed_env() -> String {
+    "GVM_JWT_ED25519_SEED".to_string()
 }
 
 fn default_jwt_ttl() -> u64 {

@@ -438,34 +438,75 @@ async fn main() {
         .and_then(|j| j.revocation_file.as_ref())
         .map(std::path::PathBuf::from);
 
-    let jwt_config = match auth::JwtConfig::from_env(jwt_secret_env, jwt_ttl) {
+    // Algorithm selection: default HS256 for backward compat.
+    let jwt_algorithm = config
+        .jwt
+        .as_ref()
+        .map(|j| j.algorithm.as_str())
+        .unwrap_or("hs256");
+    let jwt_algorithm = match auth::JwtAlgorithm::from_config_str(jwt_algorithm) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!(error = %e, "Invalid JWT algorithm in proxy.toml");
+            eprintln!("  ERROR: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let load_result = match jwt_algorithm {
+        auth::JwtAlgorithm::Hs256 => auth::JwtConfig::from_env(jwt_secret_env, jwt_ttl),
+        auth::JwtAlgorithm::Ed25519 => {
+            let seed_env = config
+                .jwt
+                .as_ref()
+                .map(|j| j.ed25519_seed_env.as_str())
+                .unwrap_or("GVM_JWT_ED25519_SEED");
+            let key_id = config
+                .jwt
+                .as_ref()
+                .map(|j| j.ed25519_key_id.as_str())
+                .unwrap_or("");
+            auth::JwtConfig::from_env_ed25519(seed_env, key_id, jwt_ttl)
+        }
+    };
+
+    let jwt_config = match load_result {
         Ok(Some(c)) => {
             let c = c
                 .with_strict(jwt_strict)
                 .with_revocation_file(jwt_revocation.clone());
             tracing::info!(
+                algorithm = ?c.algorithm,
                 ttl_secs = c.token_ttl_secs,
                 strict = jwt_strict,
                 revocation_file = ?jwt_revocation,
+                public_key_hex = ?c.public_key_hex(),
                 "JWT authentication ACTIVE — agent identity will be cryptographically verified"
             );
             Some(Arc::new(c))
         }
         Ok(None) => {
             tracing::info!(
-                "JWT authentication DISABLED (no {} env var). \
-                 Agent identity uses self-declared X-GVM-Agent-Id headers.",
-                jwt_secret_env
+                algorithm = ?jwt_algorithm,
+                "JWT authentication DISABLED (key env var unset). \
+                 Agent identity uses self-declared X-GVM-Agent-Id headers."
             );
             None
         }
         Err(e) => {
-            tracing::error!(error = %e, "Invalid JWT secret — cannot start");
+            tracing::error!(error = %e, "Invalid JWT key material — cannot start");
             eprintln!();
-            eprintln!("  ERROR: JWT secret is configured but invalid.");
+            eprintln!("  ERROR: JWT key is configured but invalid.");
             eprintln!("  {}", e);
             eprintln!();
-            eprintln!("  Fix: export {}=<64+ hex chars>", jwt_secret_env);
+            match jwt_algorithm {
+                auth::JwtAlgorithm::Hs256 => {
+                    eprintln!("  Fix: export {}=<64+ hex chars>", jwt_secret_env);
+                }
+                auth::JwtAlgorithm::Ed25519 => {
+                    eprintln!("  Fix: export GVM_JWT_ED25519_SEED=<64 hex chars / 32 bytes>");
+                }
+            }
             eprintln!("  Or remove [jwt] section from proxy.toml to disable JWT.");
             eprintln!();
             std::process::exit(1);
