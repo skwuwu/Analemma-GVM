@@ -133,6 +133,134 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-05-21: JWT hardening Phase D+E — TOML multi-slot schema + HS256 final removal (breaking)
+
+Completes the deferred items from the 2026-05-21 Phase B+C commit
+the same day. Two changes, one breaking.
+
+**Phase D — `[[jwt.keys]]` TOML schema.**
+
+The in-memory `Vec<JwtKeySlot>` shape landed in Phase B; this wires
+operator-facing config:
+
+```toml
+[jwt]
+algorithm = "ed25519"
+
+[[jwt.keys]]
+kid = "gvm-2026-q2"
+seed_env = "GVM_JWT_ED25519_SEED_ACTIVE"
+active = true
+
+[[jwt.keys]]
+kid = "gvm-2026-q1"
+seed_env = "GVM_JWT_ED25519_SEED_PREVIOUS"
+expires_at = "2026-08-01T00:00:00Z"
+```
+
+`JwtConfig::from_slot_configs(algorithm, slots, ttl)` reads each
+`seed_env`, parses hex, builds the slot vector, runs `validate_slots`.
+`main.rs` prefers `[[jwt.keys]]` when non-empty; falls back to the
+single-key `ed25519_seed_env`/`secret_env` path otherwise (backward
+compat). Tests +5.
+
+**Phase E — HS256 removal (BREAKING).**
+
+The deprecation banner shipped in the same-day Phase C commit; this
+removes the code. Rationale captured in the deprecation banner is
+still valid (symmetric-secret risk, no offline auditor verification,
+no compelling use case GVM doesn't cover better with Ed25519).
+Operators with explicit `algorithm = "hs256"` now see startup error
+with migration message.
+
+Code removed:
+- `JwtAlgorithm::Hs256` variant
+- `JwtKeyMaterial::Hmac` variant
+- `JwtSecret` struct + ZeroizeOnDrop wrapper
+- `JwtConfig::from_env` (HS256 single-key loader)
+- HS256 branches in `encode_jwt`, `decode_jwt`, `from_slot_configs`
+- HS256 startup banner + production-mode default-flip logic in
+  `main.rs` (no longer applicable — Ed25519 is the only algorithm,
+  so no "flip" is needed)
+- `hmac` / `Sha256` direct imports from `auth.rs` (still used
+  elsewhere via `sha2::Sha256` for Merkle hashing — kept indirectly)
+
+Tests removed/migrated:
+- `secret_zeroized_on_drop` — DELETED (`JwtSecret` no longer exists;
+  Ed25519 zeroization is `ed25519-dalek`'s responsibility)
+- `from_env_missing_returns_none` → `from_env_ed25519_missing_returns_none`
+- `algorithm_from_config_str_parses_known_aliases` →
+  `algorithm_from_config_str_post_hs256_removal` (asserts HS256
+  rejection with migration message)
+- `ed25519_config_rejects_hs256_signed_token` — rewritten to forge
+  the HS256-claimed token MANUALLY (since the HS256 issue path is
+  gone); the alg-confusion defense is what's being tested and
+  remains identically effective
+- `hs256_config_rejects_eddsa_signed_token` — DELETED (symmetric
+  test on a non-existent direction)
+- `wrong_secret_rejected` — kept, now uses two different Ed25519
+  seeds (functionally identical assertion: distinct private key →
+  signature rejected)
+- `multi_agent_isolation.rs::shared_jwt_config` — migrated to Ed25519
+- `fuzz_jwt_auth.rs` corpus driver — migrated to Ed25519
+
+`JwtAlgorithm::from_config_str` semantics:
+- `""` → `Ed25519` (no-config UX preserved; was HS256 default
+  pre-removal)
+- `"ed25519"` / `"eddsa"` (case-insensitive) → `Ed25519`
+- `"hs256"` / `"hmac"` → ERROR with migration message
+- Anything else → ERROR with "Supported: ed25519"
+
+**Workspace: 920 passing** (release mode), 0 failed, 7 ignored.
+Down from 922 due to the two intentionally-deleted tests above.
+
+**Affected files**: `src/auth.rs` (HS256 deletion, test migration,
+~250 LOC net delta), `src/config.rs` (TOML schema for `[[jwt.keys]]`,
+unchanged for HS256 path), `src/main.rs` (HS256 banner removed,
+algorithm load simplified), `tests/multi_agent_isolation.rs`
+(Ed25519 migration), `fuzz/fuzz_targets/fuzz_jwt_auth.rs` (Ed25519
+migration), `docs/security-model.md` (§8 v1.6 hardening row),
+`docs/internal/CHANGELOG.md` (this entry).
+
+**Operator-facing breakage:**
+
+1. `[jwt] algorithm = "hs256"` → startup ERROR + migration message.
+2. `GVM_JWT_SECRET` env var no longer read by JWT loader (its name
+   remains as the `secret_env` field default for forward compat in
+   case HMAC returns later under a different scheme, but nothing
+   consumes it).
+3. Tokens previously issued under HS256 — invalid; auditor /
+   long-lived agent token sessions need fresh issuance under
+   Ed25519. Operators with active HS256 deployments should issue
+   replacement Ed25519 tokens BEFORE upgrading the proxy.
+
+**Migration recipe:**
+
+```bash
+# 1. Generate an Ed25519 seed (operator's choice of method).
+openssl rand -hex 32 > /etc/gvm/jwt_ed25519_seed
+export GVM_JWT_ED25519_SEED=$(cat /etc/gvm/jwt_ed25519_seed)
+
+# 2. Update proxy.toml.
+[jwt]
+algorithm = "ed25519"
+# secret_env = "GVM_JWT_SECRET"        # delete this line
+ed25519_seed_env = "GVM_JWT_ED25519_SEED"
+ed25519_key_id = "gvm-2026"            # optional kid label
+
+# 3. Restart the proxy. The bootstrap admin token is printed if
+#    admin_listen is non-loopback (kubeadm pattern from v1.5).
+
+# 4. Re-issue agent tokens. Existing HS256 tokens become invalid.
+```
+
+**Risk**: High by surface area, low by failure mode. The change is
+breaking but fails LOUD at startup (config-error exit) rather than
+silently dropping HS256 traffic. An operator who upgrades without
+reading the CHANGELOG sees an immediate error and can either
+downgrade or follow the migration recipe. No data corruption
+possible — WAL schema unchanged, audit chain unaffected.
+
 ### 2026-05-21: JWT hardening Phase B+C — multi-key rotation + HS256 deprecation path
 
 Follow-up to the same-day Phase A commit (admin port JWT middleware

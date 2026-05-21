@@ -12,11 +12,25 @@ use std::sync::OnceLock;
 static CONFIG: OnceLock<gvm_proxy::auth::JwtConfig> = OnceLock::new();
 
 fn get_config() -> &'static gvm_proxy::auth::JwtConfig {
-    CONFIG.get_or_init(|| gvm_proxy::auth::JwtConfig {
-        secret: gvm_proxy::auth::JwtSecret::from_bytes(
-            b"fuzz-secret-key-32bytes-exactly!".to_vec(),
-        ),
-        token_ttl_secs: 3600,
+    CONFIG.get_or_init(|| {
+        use ed25519_dalek::SigningKey;
+        let signing = SigningKey::from_bytes(&[0x42; 32]);
+        let verifying = signing.verifying_key();
+        gvm_proxy::auth::JwtConfig {
+            algorithm: gvm_proxy::auth::JwtAlgorithm::Ed25519,
+            keys: vec![gvm_proxy::auth::JwtKeySlot {
+                kid: "fuzz".to_string(),
+                material: gvm_proxy::auth::JwtKeyMaterial::Ed25519 {
+                    signing,
+                    verifying,
+                },
+                active: true,
+                expires_at: None,
+            }],
+            token_ttl_secs: 3600,
+            strict: false,
+            revocation_file: None,
+        }
     })
 }
 

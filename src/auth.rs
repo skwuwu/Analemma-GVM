@@ -1,22 +1,24 @@
 //! JWT-based agent identity verification.
 //!
 //! Replaces self-declared `X-GVM-Agent-Id` headers with cryptographically
-//! verified identity tokens. HMAC-SHA256 signing/verification.
+//! verified identity tokens. **Ed25519 (EdDSA, RFC 8037) is the only
+//! supported algorithm as of 2026-05-21** — HS256 was removed in this
+//! release after the deprecation banner shipped in v0.5.x. Asymmetric
+//! signing means external auditors can verify token authenticity
+//! offline with only the public key, never holding the private signing
+//! key. The symmetric-secret risk of HS256 (any party with the secret
+//! can mint tokens) is gone.
 //!
-//! When `GVM_JWT_SECRET` is configured:
-//! - POST /gvm/auth/token issues JWTs with agent_id, tenant_id claims
-//! - proxy_handler verifies Bearer tokens and overrides header identity
-//! - Unverified requests emit warnings but still proceed (backward-compat)
+//! When `GVM_JWT_ED25519_SEED` (or per-slot `seed_env`) is configured:
+//! - POST /gvm/auth/token issues JWTs with agent_id, tenant_id, gvm_role
+//! - proxy verifies Bearer tokens and overrides header identity
+//! - Multi-key slot rotation via `[[jwt.keys]]` TOML table
 //!
-//! When not configured: JWT is disabled, header-based identity continues.
+//! When not configured: JWT is disabled, identity falls back to
+//! sandbox-peer (namespace-bound) or self-declared headers.
 
 use anyhow::{anyhow, Result};
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use zeroize::{Zeroize, ZeroizeOnDrop};
-
-type HmacSha256 = Hmac<Sha256>;
 
 /// Maximum token size to prevent DoS via oversized tokens.
 const MAX_TOKEN_BYTES: usize = 4096;
@@ -29,21 +31,16 @@ const EXPIRY_LEEWAY_SECS: u64 = 5;
 
 // ─── Algorithm dispatch ───
 
-/// JWT signing algorithm. Operator picks ONE per deployment; the proxy
-/// rejects tokens whose header `alg` does not match (alg-confusion
-/// defense, CVE-2015-9235).
-///
-/// - `Hs256` — HMAC-SHA256, symmetric. Same secret signs and verifies;
-///   simplest config; cannot be verified by parties who do not hold the
-///   secret. The original v1 default.
-/// - `Ed25519` — EdDSA over Curve25519 per RFC 8037. Asymmetric: the
-///   proxy holds the private signing key, external auditors verify with
-///   only the public key. Useful when token authenticity must be
-///   verifiable downstream (compliance evidence, third-party auditor)
-///   without sharing the signing key. ~50 µs sign, ~150 µs verify.
+/// JWT signing algorithm. Currently only `Ed25519` is supported.
+/// The enum is preserved (rather than collapsing to a constant) so
+/// the same alg-confusion defense in `decode_jwt` still applies and
+/// so future algorithms (e.g. RS256, if operator demand surfaces)
+/// slot in without API churn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JwtAlgorithm {
-    Hs256,
+    /// EdDSA over Curve25519 per RFC 8037. Asymmetric: the proxy
+    /// holds the private signing key, external auditors verify with
+    /// only the public key. ~50 µs sign, ~150 µs verify.
     Ed25519,
 }
 
@@ -51,46 +48,36 @@ impl JwtAlgorithm {
     /// The JWS header `alg` string for this algorithm.
     pub fn jws_alg(&self) -> &'static str {
         match self {
-            JwtAlgorithm::Hs256 => "HS256",
             JwtAlgorithm::Ed25519 => "EdDSA",
         }
     }
 
     /// Parse from the value an operator wrote in `[jwt] algorithm = "..."`.
+    /// HS256/HMAC are explicitly rejected with a migration message;
+    /// empty string (no operator choice) defaults to Ed25519.
     pub fn from_config_str(s: &str) -> Result<Self> {
         match s.to_ascii_lowercase().as_str() {
-            "hs256" | "hmac" | "" => Ok(JwtAlgorithm::Hs256),
-            "ed25519" | "eddsa" => Ok(JwtAlgorithm::Ed25519),
+            "ed25519" | "eddsa" | "" => Ok(JwtAlgorithm::Ed25519),
+            "hs256" | "hmac" => Err(anyhow!(
+                "HS256/HMAC JWT signing was removed in this release. \
+                 Migrate to Ed25519: set `[jwt] algorithm = \"ed25519\"` \
+                 + export GVM_JWT_ED25519_SEED=<64 hex chars>. \
+                 See docs/security-model.md §8."
+            )),
             other => Err(anyhow!(
-                "Unsupported JWT algorithm: '{}'. Supported: hs256, ed25519",
+                "Unsupported JWT algorithm: '{}'. Supported: ed25519",
                 other
             )),
         }
     }
 }
 
-// ─── Secret Management ───
+// ─── Key Material ───
 
-/// HMAC signing key with secure zeroing on drop. Retained as a
-/// distinct type so the HS256 path keeps its existing zeroization
-/// guarantee; the Ed25519 path uses `SigningKey` whose key material
-/// is already zeroized by `ed25519-dalek` on drop.
-#[derive(Zeroize, ZeroizeOnDrop)]
-pub struct JwtSecret {
-    key: Vec<u8>,
-}
-
-impl JwtSecret {
-    /// Create a JwtSecret from raw bytes. Used by tests and fuzz targets.
-    pub fn from_bytes(key: Vec<u8>) -> Self {
-        Self { key }
-    }
-}
-
-/// Key material — variant tied to `JwtAlgorithm` choice. Operator
-/// supplies one or the other depending on the configured algorithm.
+/// Key material for a JWT signing slot. Ed25519 only since the
+/// 2026-05-21 HS256 removal. `ed25519-dalek`'s `SigningKey` already
+/// zeroizes the private key on drop, so no extra wrapper is needed.
 pub enum JwtKeyMaterial {
-    Hmac(JwtSecret),
     Ed25519 {
         signing: SigningKey,
         verifying: VerifyingKey,
@@ -153,41 +140,6 @@ pub struct JwtConfig {
 }
 
 impl JwtConfig {
-    /// Load JWT secret from the named environment variable (hex-encoded).
-    /// Returns None if the env var is unset (JWT disabled).
-    /// Errors if the value is invalid hex or too short (< 32 bytes).
-    ///
-    /// Produces an HS256 config; the Ed25519 variant is loaded via
-    /// `from_env_ed25519`.
-    pub fn from_env(env_var: &str, token_ttl_secs: u64) -> Result<Option<Self>> {
-        let hex_secret = match std::env::var(env_var) {
-            Ok(v) if !v.is_empty() => v,
-            _ => return Ok(None),
-        };
-
-        let key = hex::decode(&hex_secret).map_err(|_| anyhow!("JWT secret must be valid hex"))?;
-
-        if key.len() < 32 {
-            return Err(anyhow!(
-                "JWT secret too short ({} bytes, minimum 32)",
-                key.len()
-            ));
-        }
-
-        Ok(Some(Self {
-            algorithm: JwtAlgorithm::Hs256,
-            keys: vec![JwtKeySlot {
-                kid: String::new(),
-                material: JwtKeyMaterial::Hmac(JwtSecret { key }),
-                active: true,
-                expires_at: None,
-            }],
-            token_ttl_secs,
-            strict: false,
-            revocation_file: None,
-        }))
-    }
-
     /// Load an Ed25519 signing key from a 32-byte seed (hex-encoded)
     /// in the named environment variable, plus a `key_id` operators
     /// embed in the JWS header `kid` claim so auditors can pick the
@@ -285,16 +237,6 @@ impl JwtConfig {
                     let verifying = signing.verifying_key();
                     JwtKeyMaterial::Ed25519 { signing, verifying }
                 }
-                JwtAlgorithm::Hs256 => {
-                    if bytes.len() < 32 {
-                        return Err(anyhow!(
-                            "JWT slot '{}' (HS256) secret too short ({} bytes, minimum 32)",
-                            sc.kid,
-                            bytes.len()
-                        ));
-                    }
-                    JwtKeyMaterial::Hmac(JwtSecret { key: bytes })
-                }
             };
             built.push(JwtKeySlot {
                 kid: sc.kid.clone(),
@@ -368,15 +310,14 @@ impl JwtConfig {
         })
     }
 
-    /// Hex-encoded public key of the active slot, when the algorithm
-    /// is Ed25519. Lets the proxy expose the verifying key to auditors
-    /// via a static admin endpoint (out of scope here — operators can
-    /// also just `xxd` the configured seed since they already trust
-    /// the host that minted the key).
+    /// Hex-encoded public key of the active slot. Lets the proxy
+    /// expose the verifying key to auditors via a static admin
+    /// endpoint (out of scope here — operators can also just `xxd`
+    /// the configured seed since they already trust the host that
+    /// minted the key).
     pub fn public_key_hex(&self) -> Option<String> {
         match &self.active_slot().material {
             JwtKeyMaterial::Ed25519 { verifying, .. } => Some(hex::encode(verifying.as_bytes())),
-            JwtKeyMaterial::Hmac(_) => None,
         }
     }
 
@@ -653,12 +594,6 @@ fn encode_jwt(config: &JwtConfig, claims: &Claims) -> Result<String> {
     let signing_input = format!("{}.{}", header_b64, payload_b64);
 
     let signature_bytes: Vec<u8> = match &slot.material {
-        JwtKeyMaterial::Hmac(secret) => {
-            let mut mac = HmacSha256::new_from_slice(&secret.key)
-                .map_err(|e| anyhow!("HMAC key error: {}", e))?;
-            mac.update(signing_input.as_bytes());
-            mac.finalize().into_bytes().to_vec()
-        }
         JwtKeyMaterial::Ed25519 { signing, .. } => {
             let sig = signing.sign(signing_input.as_bytes());
             sig.to_bytes().to_vec()
@@ -733,13 +668,6 @@ fn decode_jwt(config: &JwtConfig, token: &str) -> Result<Claims> {
         .map_err(|_| anyhow!("Invalid token encoding"))?;
 
     match &slot.material {
-        JwtKeyMaterial::Hmac(secret) => {
-            let mut mac = HmacSha256::new_from_slice(&secret.key)
-                .map_err(|e| anyhow!("HMAC key error: {}", e))?;
-            mac.update(signing_input.as_bytes());
-            mac.verify_slice(&signature)
-                .map_err(|_| anyhow!("Invalid token signature"))?;
-        }
         JwtKeyMaterial::Ed25519 { verifying, .. } => {
             let sig_bytes: &[u8; 64] = signature.as_slice().try_into().map_err(|_| {
                 anyhow!("EdDSA signature must be exactly 64 bytes")
@@ -828,15 +756,6 @@ pub async fn require_admin_jwt(
 mod tests {
     use super::*;
 
-    fn single_slot_hmac(secret: Vec<u8>) -> JwtKeySlot {
-        JwtKeySlot {
-            kid: String::new(),
-            material: JwtKeyMaterial::Hmac(JwtSecret { key: secret }),
-            active: true,
-            expires_at: None,
-        }
-    }
-
     fn single_slot_ed25519(seed: [u8; 32], kid: &str) -> JwtKeySlot {
         let signing = SigningKey::from_bytes(&seed);
         let verifying = signing.verifying_key();
@@ -848,10 +767,12 @@ mod tests {
         }
     }
 
+    /// Generic test config (Ed25519 default since HS256 removal).
+    /// Kept as `test_config` to minimise churn across the test suite.
     fn test_config(ttl: u64) -> JwtConfig {
         JwtConfig {
-            algorithm: JwtAlgorithm::Hs256,
-            keys: vec![single_slot_hmac(vec![0xAB; 32])],
+            algorithm: JwtAlgorithm::Ed25519,
+            keys: vec![single_slot_ed25519([0xAB; 32], "")],
             token_ttl_secs: ttl,
             strict: false,
             revocation_file: None,
@@ -936,10 +857,13 @@ mod tests {
 
     #[test]
     fn wrong_secret_rejected() {
+        // Post-HS256 removal: this verifies that a different Ed25519
+        // seed produces a key that rejects tokens signed by the
+        // original. Functionally equivalent to the old HMAC version.
         let config_a = test_config(3600);
         let config_b = JwtConfig {
-            algorithm: JwtAlgorithm::Hs256,
-            keys: vec![single_slot_hmac(vec![0xCD; 32])],
+            algorithm: JwtAlgorithm::Ed25519,
+            keys: vec![single_slot_ed25519([0xCD; 32], "")],
             token_ttl_secs: 3600,
             strict: false,
             revocation_file: None,
@@ -1039,56 +963,21 @@ mod tests {
         assert!(!resp.token.is_empty());
     }
 
-    #[test]
-    fn secret_zeroized_on_drop() {
-        // Verify zeroize contract: JwtSecret derives ZeroizeOnDrop, which
-        // calls Vec::zeroize() before the heap buffer is deallocated.
-        // We capture the buffer pointer pre-drop and read the same bytes
-        // post-drop with read_volatile — if the sentinel pattern still
-        // appears, Drop did not zero.
-        //
-        // SAFETY caveat: the allocator may reuse the slot before we read.
-        // We use a 32-byte distinctive sentinel (0xA5) so an allocator-
-        // recycled slot is unlikely to match. The test fails if and only
-        // if the original sentinel survives — which proves "no zeroing".
-
-        let sentinel: u8 = 0xA5;
-        let secret = JwtSecret {
-            key: vec![sentinel; 32],
-        };
-        assert_eq!(secret.key.len(), 32);
-
-        // Capture the pointer to the Vec's heap buffer.
-        let buf_ptr: *const u8 = secret.key.as_ptr();
-
-        drop(secret);
-
-        // Read 32 bytes through the captured pointer post-drop.
-        // SAFETY: pointer is dangling after drop; we use read_volatile to
-        // defeat the optimizer. If the allocator has reused the slot for
-        // something else, we'll read non-sentinel bytes — still passing
-        // the contract. Only "still all 0xA5" indicates zeroize ran NOT.
-        let observed: [u8; 32] = unsafe {
-            let mut buf = [0u8; 32];
-            for (i, slot) in buf.iter_mut().enumerate() {
-                *slot = std::ptr::read_volatile(buf_ptr.add(i));
-            }
-            buf
-        };
-
-        assert_ne!(
-            observed, [sentinel; 32],
-            "JwtSecret heap buffer still holds the original sentinel after \
-             drop — ZeroizeOnDrop did not zero. observed={:02x?}",
-            observed,
-        );
-    }
+    // Note: `secret_zeroized_on_drop` (HS256 JwtSecret zeroize) was
+    // removed in the HS256 deletion. Ed25519's SigningKey is zeroized
+    // by `ed25519-dalek` directly. Equivalent coverage for the
+    // Ed25519 path would have to inspect dalek's internals; not
+    // worth the unsafe gymnastics here.
 
     #[test]
-    fn from_env_missing_returns_none() {
-        // Use a unique env var name that is guaranteed not to be set
-        let result = JwtConfig::from_env("GVM_TEST_JWT_SECRET_NONEXISTENT_12345", 3600)
-            .expect("missing env var must return Ok(None)");
+    fn from_env_ed25519_missing_returns_none() {
+        // Use a unique env var name that is guaranteed not to be set.
+        let result = JwtConfig::from_env_ed25519(
+            "GVM_TEST_JWT_ED25519_SEED_NONEXISTENT_12345",
+            "test-kid",
+            3600,
+        )
+        .expect("missing env var must return Ok(None)");
         assert!(result.is_none());
     }
 
@@ -1247,8 +1136,8 @@ mod tests {
 
         // Build a config with revocation enabled pointing at the file.
         let cfg_rev = JwtConfig {
-            algorithm: JwtAlgorithm::Hs256,
-            keys: vec![single_slot_hmac(vec![0xAB; 32])],
+            algorithm: JwtAlgorithm::Ed25519,
+            keys: vec![single_slot_ed25519([0xAB; 32], "")],
             token_ttl_secs: 3600,
             strict: false,
             revocation_file: Some(rev_path.clone()),
@@ -1272,8 +1161,8 @@ mod tests {
         // must NOT lock everyone out — it should fail-OPEN on the
         // revocation check (consistent with is_jti_revoked's contract).
         let cfg = JwtConfig {
-            algorithm: JwtAlgorithm::Hs256,
-            keys: vec![single_slot_hmac(vec![0xAB; 32])],
+            algorithm: JwtAlgorithm::Ed25519,
+            keys: vec![single_slot_ed25519([0xAB; 32], "")],
             token_ttl_secs: 3600,
             strict: false,
             revocation_file: Some(std::path::PathBuf::from(
@@ -1365,41 +1254,39 @@ mod tests {
         // secret, and signs an HS256 token. Verifier configured for
         // EdDSA MUST reject — `alg` mismatch detected before
         // signature verification ever runs.
+        // Manually forge a token whose JWS header claims alg=HS256
+        // (post-removal we cannot use any in-tree HS256 path, but
+        // the alg-confusion defense is about REJECTING such forged
+        // headers — so we construct one by hand using a forged
+        // signature). The verifier must reject on header `alg`
+        // mismatch (EdDSA-configured) BEFORE attempting any
+        // signature verification.
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
         let cfg_ed = test_config_ed25519(3600, "k");
-        let public_bytes = match &cfg_ed.active_slot().material {
-            JwtKeyMaterial::Ed25519 { verifying, .. } => verifying.as_bytes().to_vec(),
-            _ => unreachable!(),
+        let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let claims = Claims {
+            sub: "agent-evil".to_string(),
+            tid: None,
+            scope: "proxy".to_string(),
+            gvm_role: None,
+            iat: now_unix(),
+            exp: now_unix() + 3600,
+            jti: uuid::Uuid::new_v4().to_string(),
+            iss: "gvm-proxy".to_string(),
         };
-        // Forge an HS256 token using the public key as the HMAC secret.
-        let cfg_attacker = JwtConfig {
-            algorithm: JwtAlgorithm::Hs256,
-            keys: vec![single_slot_hmac(public_bytes)],
-            token_ttl_secs: 3600,
-            strict: false,
-            revocation_file: None,
-        };
-        let token = issue_token(&cfg_attacker, "agent-evil", None, "proxy")
-            .expect("attacker forges HS256 token");
-        // Real verifier (EdDSA-configured) must reject.
+        let payload_b64 =
+            URL_SAFE_NO_PAD.encode(serde_json::to_string(&claims).unwrap().as_bytes());
+        // Attach a junk signature — content does not matter because
+        // verification must fail on the algorithm mismatch first.
+        let sig_b64 = URL_SAFE_NO_PAD.encode(&[0u8; 32]);
+        let token = format!("{}.{}.{}", header_b64, payload_b64, sig_b64);
         let result = verify_token(&cfg_ed, &token);
-        assert!(result.is_err(), "Ed25519 verifier must refuse HS256 token");
+        assert!(result.is_err(), "Ed25519 verifier must refuse HS256-claimed token");
         assert!(
             result.unwrap_err().to_string().contains("algorithm"),
             "error must indicate algorithm mismatch"
         );
-    }
-
-    #[test]
-    fn hs256_config_rejects_eddsa_signed_token() {
-        // Symmetric case: an HS256-configured verifier must refuse a
-        // legitimately signed EdDSA token (even though the EdDSA
-        // signature would verify against the public key, the verifier
-        // is locked to HMAC by config and treats the token as wrong-alg).
-        let cfg_ed = test_config_ed25519(3600, "k");
-        let token = issue_token(&cfg_ed, "agent-001", None, "proxy").expect("EdDSA issue");
-        let cfg_hs = test_config(3600);
-        let result = verify_token(&cfg_hs, &token);
-        assert!(result.is_err(), "HS256 verifier must refuse EdDSA token");
     }
 
     #[test]
@@ -1467,15 +1354,8 @@ mod tests {
     }
 
     #[test]
-    fn algorithm_from_config_str_parses_known_aliases() {
-        assert_eq!(
-            JwtAlgorithm::from_config_str("hs256").unwrap(),
-            JwtAlgorithm::Hs256
-        );
-        assert_eq!(
-            JwtAlgorithm::from_config_str("HMAC").unwrap(),
-            JwtAlgorithm::Hs256
-        );
+    fn algorithm_from_config_str_post_hs256_removal() {
+        // Ed25519 and EdDSA aliases (case-insensitive) accepted.
         assert_eq!(
             JwtAlgorithm::from_config_str("ed25519").unwrap(),
             JwtAlgorithm::Ed25519
@@ -1484,11 +1364,19 @@ mod tests {
             JwtAlgorithm::from_config_str("EdDSA").unwrap(),
             JwtAlgorithm::Ed25519
         );
+        // Empty string defaults to Ed25519 (no-config UX).
         assert_eq!(
             JwtAlgorithm::from_config_str("").unwrap(),
-            JwtAlgorithm::Hs256,
-            "empty string must default to HS256 for backward-compat"
+            JwtAlgorithm::Ed25519,
         );
+        // HS256/HMAC explicitly rejected with migration message.
+        let err = JwtAlgorithm::from_config_str("hs256").unwrap_err().to_string();
+        assert!(
+            err.contains("HS256") && err.contains("ed25519"),
+            "HS256 rejection must carry migration hint: {err}"
+        );
+        assert!(JwtAlgorithm::from_config_str("hmac").is_err());
+        // Other unknowns also rejected.
         assert!(JwtAlgorithm::from_config_str("rs256").is_err());
         assert!(JwtAlgorithm::from_config_str("none").is_err());
     }
@@ -1595,7 +1483,7 @@ mod tests {
 
         // Two active slots → error
         let mut cfg = test_config(3600);
-        cfg.keys.push(single_slot_hmac(vec![0x11; 32]));
+        cfg.keys.push(single_slot_ed25519([0x11; 32], "k2"));
         // both have active = true now
         assert!(cfg.validate_slots().is_err());
 
@@ -1609,7 +1497,7 @@ mod tests {
         let dup_kid = cfg.keys[0].kid.clone();
         cfg.keys.push(JwtKeySlot {
             kid: dup_kid,
-            material: JwtKeyMaterial::Hmac(JwtSecret { key: vec![0x22; 32] }),
+            material: single_slot_ed25519([0x22; 32], "").material,
             active: false,
             expires_at: None,
         });
@@ -1620,7 +1508,7 @@ mod tests {
         for i in 0..MAX_KEY_SLOTS {
             cfg.keys.push(JwtKeySlot {
                 kid: format!("k{i}"),
-                material: JwtKeyMaterial::Hmac(JwtSecret { key: vec![0x33; 32] }),
+                material: single_slot_ed25519([0x33; 32], "").material,
                 active: false,
                 expires_at: None,
             });

@@ -23,7 +23,7 @@
 //! The MITM JWT enforcement test in tls_proxy_hyper requires a full
 //! TLS fixture and lives in `tests/mitm_streaming.rs` patterns.
 
-use gvm_proxy::auth::{issue_token, verify_token, JwtConfig, JwtSecret};
+use gvm_proxy::auth::{issue_token, verify_token, JwtConfig};
 use gvm_proxy::ledger::{GroupCommitConfig, Ledger};
 use gvm_proxy::token_budget::{BudgetClock, PerAgentBudgets, MAX_PER_AGENT_BUDGETS};
 use gvm_types::{
@@ -417,13 +417,14 @@ async fn multi_agent_atomicity_preserved_under_burst() {
 // ════════════════════════════════════════════════════════════════════
 
 fn shared_jwt_config() -> JwtConfig {
+    use ed25519_dalek::SigningKey;
+    let signing = SigningKey::from_bytes(&[0xAB; 32]);
+    let verifying = signing.verifying_key();
     JwtConfig {
-        algorithm: gvm_proxy::auth::JwtAlgorithm::Hs256,
+        algorithm: gvm_proxy::auth::JwtAlgorithm::Ed25519,
         keys: vec![gvm_proxy::auth::JwtKeySlot {
             kid: String::new(),
-            material: gvm_proxy::auth::JwtKeyMaterial::Hmac(
-                JwtSecret::from_bytes(vec![0xAB; 32]),
-            ),
+            material: gvm_proxy::auth::JwtKeyMaterial::Ed25519 { signing, verifying },
             active: true,
             expires_at: None,
         }],
