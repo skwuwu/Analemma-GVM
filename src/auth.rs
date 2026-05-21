@@ -234,6 +234,86 @@ impl JwtConfig {
         }))
     }
 
+    /// Build a multi-slot JwtConfig from operator-facing TOML
+    /// `[[jwt.keys]]` entries. Each entry's `seed_env` is read at
+    /// load time. Ed25519 expects 32-byte hex seeds; HMAC expects
+    /// ≥32-byte hex secrets. The resulting config is validated via
+    /// `validate_slots` before return.
+    ///
+    /// Returns `Ok(None)` when no slot's `seed_env` is set in the
+    /// environment (JWT effectively disabled — matches the
+    /// single-key from_env semantics).
+    pub fn from_slot_configs(
+        algorithm: JwtAlgorithm,
+        slots: &[crate::config::JwtKeySlotConfig],
+        token_ttl_secs: u64,
+    ) -> Result<Option<Self>> {
+        if slots.is_empty() {
+            return Ok(None);
+        }
+        let mut built: Vec<JwtKeySlot> = Vec::with_capacity(slots.len());
+        for sc in slots {
+            let hex_key = match std::env::var(&sc.seed_env) {
+                Ok(v) if !v.is_empty() => v,
+                _ => {
+                    return Err(anyhow!(
+                        "JWT slot '{}' references env var '{}' which is unset",
+                        sc.kid,
+                        sc.seed_env
+                    ));
+                }
+            };
+            let bytes = hex::decode(&hex_key).map_err(|_| {
+                anyhow!(
+                    "JWT slot '{}': {} must be valid hex",
+                    sc.kid,
+                    sc.seed_env
+                )
+            })?;
+            let material = match algorithm {
+                JwtAlgorithm::Ed25519 => {
+                    if bytes.len() != 32 {
+                        return Err(anyhow!(
+                            "JWT slot '{}' (Ed25519) seed must be 32 bytes, got {}",
+                            sc.kid,
+                            bytes.len()
+                        ));
+                    }
+                    let mut seed = [0u8; 32];
+                    seed.copy_from_slice(&bytes);
+                    let signing = SigningKey::from_bytes(&seed);
+                    let verifying = signing.verifying_key();
+                    JwtKeyMaterial::Ed25519 { signing, verifying }
+                }
+                JwtAlgorithm::Hs256 => {
+                    if bytes.len() < 32 {
+                        return Err(anyhow!(
+                            "JWT slot '{}' (HS256) secret too short ({} bytes, minimum 32)",
+                            sc.kid,
+                            bytes.len()
+                        ));
+                    }
+                    JwtKeyMaterial::Hmac(JwtSecret { key: bytes })
+                }
+            };
+            built.push(JwtKeySlot {
+                kid: sc.kid.clone(),
+                material,
+                active: sc.active,
+                expires_at: sc.expires_at,
+            });
+        }
+        let cfg = Self {
+            algorithm,
+            keys: built,
+            token_ttl_secs,
+            strict: false,
+            revocation_file: None,
+        };
+        cfg.validate_slots()?;
+        Ok(Some(cfg))
+    }
+
     /// Validate the slot invariants: at least one slot, exactly one
     /// active, no duplicate `kid`, length ≤ MAX_KEY_SLOTS. Called by
     /// the constructors and the hot-reload path.
@@ -1624,6 +1704,120 @@ mod tests {
         // Real verifier (cfg) does not have "attacker-kid" → rejection.
         let err = verify_token(&cfg, &token).expect_err("unknown kid must be rejected");
         assert!(err.to_string().contains("kid") || err.to_string().contains("verifying key"));
+    }
+
+    // ── Multi-slot TOML loading (Phase D) ──────────────────────
+
+    #[test]
+    fn from_slot_configs_ed25519_round_trip() {
+        std::env::set_var(
+            "GVM_TEST_SLOT_A",
+            "0202020202020202020202020202020202020202020202020202020202020202",
+        );
+        std::env::set_var(
+            "GVM_TEST_SLOT_B",
+            "0303030303030303030303030303030303030303030303030303030303030303",
+        );
+        let slots = vec![
+            crate::config::JwtKeySlotConfig {
+                kid: "active-q2".to_string(),
+                seed_env: "GVM_TEST_SLOT_A".to_string(),
+                active: true,
+                expires_at: None,
+            },
+            crate::config::JwtKeySlotConfig {
+                kid: "previous-q1".to_string(),
+                seed_env: "GVM_TEST_SLOT_B".to_string(),
+                active: false,
+                expires_at: None,
+            },
+        ];
+        let cfg = JwtConfig::from_slot_configs(JwtAlgorithm::Ed25519, &slots, 3600)
+            .expect("load")
+            .expect("non-empty slots returns Some");
+        assert_eq!(cfg.keys.len(), 2);
+        assert_eq!(cfg.active_slot().kid, "active-q2");
+
+        let token = issue_token(&cfg, "agent-001", None, "proxy").expect("issue");
+        assert!(verify_token(&cfg, &token).is_ok());
+
+        std::env::remove_var("GVM_TEST_SLOT_A");
+        std::env::remove_var("GVM_TEST_SLOT_B");
+    }
+
+    #[test]
+    fn from_slot_configs_missing_env_fails_loud() {
+        let slots = vec![crate::config::JwtKeySlotConfig {
+            kid: "active".to_string(),
+            seed_env: "GVM_TEST_SLOT_UNSET_DEFINITELY_NOT_SET".to_string(),
+            active: true,
+            expires_at: None,
+        }];
+        let result = JwtConfig::from_slot_configs(JwtAlgorithm::Ed25519, &slots, 3600);
+        match result {
+            Err(e) => assert!(
+                e.to_string().contains("unset"),
+                "missing env must produce a clear error, got: {}",
+                e
+            ),
+            Ok(_) => panic!("missing env must error"),
+        }
+    }
+
+    #[test]
+    fn from_slot_configs_validates_invariants() {
+        // Two active slots fails fast at construction (before
+        // any token is even issued).
+        std::env::set_var(
+            "GVM_TEST_SLOT_DUP_A",
+            "0404040404040404040404040404040404040404040404040404040404040404",
+        );
+        std::env::set_var(
+            "GVM_TEST_SLOT_DUP_B",
+            "0505050505050505050505050505050505050505050505050505050505050505",
+        );
+        let slots = vec![
+            crate::config::JwtKeySlotConfig {
+                kid: "k1".to_string(),
+                seed_env: "GVM_TEST_SLOT_DUP_A".to_string(),
+                active: true,
+                expires_at: None,
+            },
+            crate::config::JwtKeySlotConfig {
+                kid: "k2".to_string(),
+                seed_env: "GVM_TEST_SLOT_DUP_B".to_string(),
+                active: true,
+                expires_at: None,
+            },
+        ];
+        let result = JwtConfig::from_slot_configs(JwtAlgorithm::Ed25519, &slots, 3600);
+        assert!(result.is_err());
+        std::env::remove_var("GVM_TEST_SLOT_DUP_A");
+        std::env::remove_var("GVM_TEST_SLOT_DUP_B");
+    }
+
+    #[test]
+    fn from_slot_configs_rejects_short_seed() {
+        std::env::set_var("GVM_TEST_SLOT_SHORT", "deadbeef");
+        let slots = vec![crate::config::JwtKeySlotConfig {
+            kid: "k1".to_string(),
+            seed_env: "GVM_TEST_SLOT_SHORT".to_string(),
+            active: true,
+            expires_at: None,
+        }];
+        let result = JwtConfig::from_slot_configs(JwtAlgorithm::Ed25519, &slots, 3600);
+        assert!(result.is_err());
+        std::env::remove_var("GVM_TEST_SLOT_SHORT");
+    }
+
+    #[test]
+    fn from_slot_configs_empty_returns_none() {
+        // Backward-compat sentinel: empty slots vector means "no
+        // multi-slot config" — the caller should fall back to the
+        // single-key path.
+        let result =
+            JwtConfig::from_slot_configs(JwtAlgorithm::Ed25519, &[], 3600).expect("load");
+        assert!(result.is_none());
     }
 
     #[test]

@@ -522,20 +522,38 @@ async fn main() {
         );
     }
 
-    let load_result = match jwt_algorithm {
-        auth::JwtAlgorithm::Hs256 => auth::JwtConfig::from_env(jwt_secret_env, jwt_ttl),
-        auth::JwtAlgorithm::Ed25519 => {
-            let seed_env = config
-                .jwt
-                .as_ref()
-                .map(|j| j.ed25519_seed_env.as_str())
-                .unwrap_or("GVM_JWT_ED25519_SEED");
-            let key_id = config
-                .jwt
-                .as_ref()
-                .map(|j| j.ed25519_key_id.as_str())
-                .unwrap_or("");
-            auth::JwtConfig::from_env_ed25519(seed_env, key_id, jwt_ttl)
+    // Prefer multi-slot table `[[jwt.keys]]` when present; otherwise
+    // fall back to the single-key path. This preserves backward
+    // compat for existing operator configs that don't know about
+    // the multi-slot schema.
+    let configured_slots = config
+        .jwt
+        .as_ref()
+        .map(|j| j.keys.as_slice())
+        .unwrap_or(&[]);
+
+    let load_result = if !configured_slots.is_empty() {
+        tracing::info!(
+            n_slots = configured_slots.len(),
+            "Loading JWT config from multi-slot `[[jwt.keys]]` table"
+        );
+        auth::JwtConfig::from_slot_configs(jwt_algorithm, configured_slots, jwt_ttl)
+    } else {
+        match jwt_algorithm {
+            auth::JwtAlgorithm::Hs256 => auth::JwtConfig::from_env(jwt_secret_env, jwt_ttl),
+            auth::JwtAlgorithm::Ed25519 => {
+                let seed_env = config
+                    .jwt
+                    .as_ref()
+                    .map(|j| j.ed25519_seed_env.as_str())
+                    .unwrap_or("GVM_JWT_ED25519_SEED");
+                let key_id = config
+                    .jwt
+                    .as_ref()
+                    .map(|j| j.ed25519_key_id.as_str())
+                    .unwrap_or("");
+                auth::JwtConfig::from_env_ed25519(seed_env, key_id, jwt_ttl)
+            }
         }
     };
 

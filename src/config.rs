@@ -514,6 +514,30 @@ pub struct JwtAuthConfig {
     /// deployments don't need it).
     #[serde(default)]
     pub ed25519_key_id: String,
+    /// Multi-key slot table for graceful rotation. When non-empty,
+    /// overrides the single-key `ed25519_seed_env` / `secret_env`
+    /// path — the proxy builds its slot vector directly from this
+    /// list. Exactly one slot must carry `active = true`; expired
+    /// slots are auto-excluded from verification. See the
+    /// `JwtKeySlotConfig` doc and `docs/security-model.md §8`
+    /// "v1.5 hardening" for the rotation pattern.
+    ///
+    /// ```toml
+    /// [jwt]
+    /// algorithm = "ed25519"
+    ///
+    /// [[jwt.keys]]
+    /// kid = "gvm-2026-q2"
+    /// seed_env = "GVM_JWT_ED25519_SEED_ACTIVE"
+    /// active = true
+    ///
+    /// [[jwt.keys]]
+    /// kid = "gvm-2026-q1"
+    /// seed_env = "GVM_JWT_ED25519_SEED_PREVIOUS"
+    /// expires_at = "2026-08-01T00:00:00Z"
+    /// ```
+    #[serde(default)]
+    pub keys: Vec<JwtKeySlotConfig>,
     /// Token time-to-live in seconds (default: 3600 = 1 hour).
     #[serde(default = "default_jwt_ttl")]
     pub token_ttl_secs: u64,
@@ -543,6 +567,36 @@ pub struct JwtAuthConfig {
     /// the next verify picks up new revocations without restart.
     #[serde(default)]
     pub revocation_file: Option<String>,
+}
+
+/// One key slot in the multi-key rotation table. All slots in a
+/// `JwtAuthConfig.keys` vector share the algorithm picked at the
+/// `JwtAuthConfig.algorithm` level (no per-slot algorithm mixing).
+///
+/// Required: `kid`, `seed_env`.
+/// Optional: `active` (default false; exactly one slot in the vector
+/// must be true), `expires_at` (default None = never expires).
+#[derive(Deserialize, Clone, Debug)]
+pub struct JwtKeySlotConfig {
+    /// Operator label, baked into the JWS header `kid`. Auditors
+    /// look up the matching verifying key in a registry by this id.
+    /// Must be unique across the slot vector.
+    pub kid: String,
+    /// Environment variable holding the hex-encoded key material.
+    /// For Ed25519: 32-byte (64 hex chars) seed.
+    /// For HS256: ≥32-byte (≥64 hex chars) HMAC secret.
+    pub seed_env: String,
+    /// Exactly one slot in the keys[] vector must be `active = true`.
+    /// Signing uses the active slot; verification accepts any
+    /// non-expired matching kid.
+    #[serde(default)]
+    pub active: bool,
+    /// Wall-clock at which this slot stops accepting tokens for
+    /// verification. `None` = never expires. Operators set this on
+    /// the previous slot during a rotation, advance the active flag
+    /// to the new slot, and let the timer retire the old one.
+    #[serde(default)]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn default_jwt_algorithm() -> String {
