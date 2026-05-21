@@ -656,6 +656,17 @@ pub struct ServerConfig {
     /// the trust boundary above this line.
     #[serde(default)]
     pub allow_non_loopback_admin: bool,
+    /// Bootstrap admin-token TTL when the non-loopback admin path is
+    /// active. The proxy mints this token once at startup and prints
+    /// it to stderr; the operator captures it from logs and uses it
+    /// to call `POST /gvm/auth/token` for longer-lived replacements.
+    /// Default: 86400 (24h) — long enough for provisioning across
+    /// timezones / CI delays without forcing a restart just to
+    /// re-mint a bootstrap token. Operators with stricter posture
+    /// shorten this. Has no effect on the loopback default (no
+    /// bootstrap token is printed in that mode).
+    #[serde(default = "default_bootstrap_token_ttl_secs")]
+    pub bootstrap_token_ttl_secs: u64,
     /// Graceful shutdown drain timeout in seconds (default: 5).
     /// After receiving SIGTERM/SIGINT, the proxy stops accepting new connections
     /// and waits up to this many seconds for in-flight requests to complete.
@@ -745,6 +756,12 @@ fn default_admin_listen() -> String {
 
 fn default_drain_timeout_secs() -> u64 {
     5
+}
+
+fn default_bootstrap_token_ttl_secs() -> u64 {
+    86400 // 24 hours — long enough for cross-timezone / CI-delayed
+          // provisioning without forcing a restart just to re-mint a
+          // bootstrap token. See ServerConfig.bootstrap_token_ttl_secs.
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -1005,6 +1022,7 @@ impl Default for ProxyConfig {
                 listen: "0.0.0.0:8080".to_string(),
                 admin_listen: default_admin_listen(),
                 allow_non_loopback_admin: false,
+                bootstrap_token_ttl_secs: default_bootstrap_token_ttl_secs(),
                 drain_timeout_secs: 5,
             },
             enforcement: EnforcementConfig {

@@ -81,7 +81,9 @@ fn parse_list_response(body: &serde_json::Value) -> Result<Vec<SandboxRow>> {
 async fn fetch_list(proxy: &str) -> Result<(serde_json::Value, Vec<SandboxRow>)> {
     let admin_url = crate::run::derive_admin_url(proxy);
     let url = format!("{}/gvm/sandbox", admin_url.trim_end_matches('/'));
-    let resp = reqwest::get(&url)
+    let client = reqwest::Client::new();
+    let resp = crate::run::with_admin_bearer(client.get(&url))
+        .send()
         .await
         .with_context(|| format!("GET {} failed (is the proxy running?)", url))?;
 

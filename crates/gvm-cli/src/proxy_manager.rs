@@ -126,13 +126,15 @@ fn config_changed_since_proxy_start(workspace: &Path) -> bool {
 /// `/gvm/reload` endpoint. This avoids killing and restarting the daemon when
 /// the user has only edited config files (e.g. via `gvm suggest`).
 async fn reload_running_proxy(proxy: &str) -> Result<()> {
-    let url = format!("{}/gvm/reload", proxy.trim_end_matches('/'));
+    // /gvm/reload lives on the admin port; derive the admin URL and
+    // attach the GVM_ADMIN_TOKEN bearer (no-op on loopback admin).
+    let admin_url = crate::run::derive_admin_url(proxy);
+    let url = format!("{}/gvm/reload", admin_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .context("Failed to build reload HTTP client")?;
-    let resp = client
-        .post(&url)
+    let resp = crate::run::with_admin_bearer(client.post(&url))
         .send()
         .await
         .with_context(|| format!("POST {} failed", url))?;

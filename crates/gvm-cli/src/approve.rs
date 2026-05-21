@@ -80,8 +80,7 @@ pub async fn run_approve(proxy: &str, poll_interval: u64, auto_deny: bool) -> Re
 
 /// Fetch pending approvals from the proxy.
 async fn fetch_pending(client: &reqwest::Client, url: &str) -> Result<Vec<PendingEntry>> {
-    let resp = client
-        .get(url)
+    let resp = crate::run::with_admin_bearer(client.get(url))
         .send()
         .await
         .context("Failed to reach proxy")?;
@@ -121,8 +120,7 @@ async fn send_decision(
     event_id: &str,
     approved: bool,
 ) -> DecisionOutcome {
-    let resp = match client
-        .post(url)
+    let resp = match crate::run::with_admin_bearer(client.post(url))
         .json(&serde_json::json!({
             "event_id": event_id,
             "approved": approved,

@@ -129,10 +129,49 @@ pub(crate) fn looks_like_script(arg: &str) -> bool {
     )
 }
 
-/// Derive admin API URL from the proxy URL.
-/// Convention: admin port = proxy port + 1010 (e.g. 8080 → 9090).
-/// The admin API runs on a separate port, unreachable by the agent.
+/// Derive admin API URL.
+///
+/// Resolution order (highest priority first):
+///   1. `GVM_ADMIN_URL` env var — explicit operator override
+///   2. `[server] admin_listen` parsed from a discoverable proxy.toml
+///   3. Convention: admin port = proxy port + 1010 (e.g. 8080 → 9090)
+///
+/// (1) and (2) close the production-deployment gap where the operator
+/// has bound the admin port to a non-conventional address (e.g.
+/// `127.0.0.1:9999` to avoid a port collision) — the +1010 heuristic
+/// alone would fail there. (2) reuses the same proxy.toml discovery
+/// that `proxy_manager` already runs at startup.
+///
+/// The admin API runs on a separate port, unreachable by the agent
+/// when bound to a loopback address (and gated by JWT middleware when
+/// bound to a non-loopback address — see ServerConfig).
 pub(crate) fn derive_admin_url(proxy: &str) -> String {
+    // 1. Env-var override
+    if let Ok(v) = std::env::var("GVM_ADMIN_URL") {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    // 2. Parse proxy.toml [server] admin_listen — best-effort. We do
+    //    not bail on parse error; fall through to the heuristic. The
+    //    full proxy.toml schema lives in gvm-proxy/src/config.rs; CLI
+    //    needs only the one field, so we pull it with a tolerant grep.
+    if let Some(listen) = read_admin_listen_from_proxy_toml() {
+        let host_str = url::Url::parse(proxy)
+            .ok()
+            .and_then(|u| u.host_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        // admin_listen is like "127.0.0.1:9090" or "0.0.0.0:9999".
+        // Strip the bind address: a CLI on the host always connects
+        // via the operator-facing host (127.0.0.1 / configured proxy
+        // host), not via 0.0.0.0.
+        if let Some(port) = listen.rsplit(':').next() {
+            if port.parse::<u16>().is_ok() {
+                return format!("http://{}:{}", host_str, port);
+            }
+        }
+    }
+    // 3. Heuristic fallback (existing behaviour)
     match url::Url::parse(proxy) {
         Ok(url) => {
             let host = url.host_str().unwrap_or("127.0.0.1");
@@ -142,6 +181,67 @@ pub(crate) fn derive_admin_url(proxy: &str) -> String {
         }
         Err(_) => "http://127.0.0.1:9090".to_string(),
     }
+}
+
+/// Best-effort `admin_listen` field reader from a discoverable
+/// proxy.toml. Walks the same discovery order as the proxy itself:
+///   - `$GVM_CONFIG` env var (operator override)
+///   - `./config/proxy.toml`, `./proxy.toml`
+///   - `$XDG_CONFIG_HOME/gvm/proxy.toml`, `$HOME/.config/gvm/proxy.toml`
+///   - `/etc/gvm/proxy.toml`
+///
+/// Returns the raw `"host:port"` string when found, `None` otherwise.
+/// Uses a tolerant line-based grep rather than a TOML parser so the
+/// CLI doesn't pick up a heavy `toml` dependency just for one field.
+fn read_admin_listen_from_proxy_toml() -> Option<String> {
+    let candidates = proxy_toml_candidates();
+    for path in candidates {
+        let content = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // Look for `admin_listen = "..."` in the [server] section.
+        let mut in_server = false;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                in_server = trimmed == "[server]";
+                continue;
+            }
+            if !in_server {
+                continue;
+            }
+            if let Some(rest) = trimmed.strip_prefix("admin_listen") {
+                if let Some(eq) = rest.find('=') {
+                    let value = rest[eq + 1..].trim();
+                    let cleaned = value.trim_matches('"').trim_matches('\'').to_string();
+                    if !cleaned.is_empty() {
+                        return Some(cleaned);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn proxy_toml_candidates() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(p) = std::env::var("GVM_CONFIG") {
+        if !p.is_empty() {
+            out.push(std::path::PathBuf::from(p));
+        }
+    }
+    out.push(std::path::PathBuf::from("config/proxy.toml"));
+    out.push(std::path::PathBuf::from("proxy.toml"));
+    if let Ok(home) = std::env::var("XDG_CONFIG_HOME") {
+        out.push(std::path::PathBuf::from(home).join("gvm/proxy.toml"));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        out.push(std::path::PathBuf::from(home).join(".config/gvm/proxy.toml"));
+    }
+    out.push(std::path::PathBuf::from("/etc/gvm/proxy.toml"));
+    out
 }
 
 /// Read `GVM_ADMIN_TOKEN` env var. When set, the CLI attaches it as
@@ -289,8 +389,7 @@ pub(crate) async fn provision_sandbox(admin_url: &str, agent_id: &str) -> Result
         "agent_id": agent_id,
     });
 
-    let resp = reqwest::Client::new()
-        .post(&url)
+    let resp = crate::run::with_admin_bearer(reqwest::Client::new().post(&url))
         .json(&body)
         .send()
         .await

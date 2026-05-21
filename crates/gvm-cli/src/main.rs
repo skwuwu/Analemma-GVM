@@ -1428,7 +1428,7 @@ async fn revoke_sandboxes_on_proxy(sandbox_ids: &[String]) -> usize {
     let mut succeeded = 0usize;
     for sid in sandbox_ids {
         let url = format!("{}/gvm/sandbox/{}", admin_url.trim_end_matches('/'), sid);
-        match client.delete(&url).send().await {
+        match run::with_admin_bearer(client.delete(&url)).send().await {
             Ok(resp) if resp.status().is_success() => {
                 succeeded += 1;
             }

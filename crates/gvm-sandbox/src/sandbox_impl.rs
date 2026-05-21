@@ -812,6 +812,45 @@ fn child_entry(
     // System binaries (in /usr, /bin, /sbin) keep their original paths.
     let bin_path = remap_path_for_sandbox(interpreter_path, &config.interpreter);
 
+    // ── Strip operator-level secrets from the agent's env ──────
+    //
+    // The sandbox inherits the parent process env via clone(); the
+    // parent process is `gvm run` which is the operator's shell —
+    // so it can carry GVM_ADMIN_TOKEN (admin port auth), JWT
+    // signing seeds, and other plane-level secrets that an agent
+    // must NOT see. Defense-in-depth: even if the agent gets
+    // namespace-bypass, it cannot mint admin tokens / forge JWT
+    // signatures with material it never had access to.
+    //
+    // We strip a specific allow-list rather than wildcard-stripping
+    // GVM_* because a few GVM_* vars (GVM_AGENT_ID, GVM_PROXY_URL,
+    // GVM_DEBUG_SKIP_DYNLOAD) ARE meant to reach the agent. The
+    // strip list below is the set of secrets that must NOT.
+    for sensitive in &[
+        "GVM_ADMIN_TOKEN",
+        "GVM_JWT_SECRET",
+        "GVM_JWT_ED25519_SEED",
+        "GVM_VAULT_KEY",
+        "GVM_SECRETS_KEY",
+    ] {
+        std::env::remove_var(sensitive);
+    }
+    // Also strip the per-slot env var names if the operator declared
+    // any `GVM_JWT_*_SEED_*` style names — best-effort wildcard.
+    // Collect first (snapshot of current env), then remove, to avoid
+    // mutating the iterator we are walking.
+    let to_strip: Vec<String> = std::env::vars()
+        .filter(|(k, _)| {
+            (k.starts_with("GVM_JWT_") && k.ends_with("_SEED"))
+                || k.starts_with("GVM_JWT_HMAC_")
+                || k.starts_with("GVM_JWT_ED25519_SEED_")
+        })
+        .map(|(k, _)| k)
+        .collect();
+    for k in to_strip {
+        std::env::remove_var(&k);
+    }
+
     // Set environment and exec
     std::env::set_var("HTTP_PROXY", &proxy_url);
     std::env::set_var("http_proxy", &proxy_url);

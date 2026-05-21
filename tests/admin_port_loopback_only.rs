@@ -20,6 +20,7 @@ fn cfg(addr: &str, allow_non_loopback: bool) -> ServerConfig {
         listen: "0.0.0.0:8080".to_string(),
         admin_listen: addr.to_string(),
         allow_non_loopback_admin: allow_non_loopback,
+        bootstrap_token_ttl_secs: 86400,
         drain_timeout_secs: 5,
     }
 }

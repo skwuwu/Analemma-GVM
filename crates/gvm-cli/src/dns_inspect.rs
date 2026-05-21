@@ -14,7 +14,9 @@ use crate::ui::{BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW};
 pub(crate) async fn run_status(proxy: &str, emit_json: bool) -> Result<()> {
     let admin_url = crate::run::derive_admin_url(proxy);
     let url = format!("{}/gvm/dns/state", admin_url.trim_end_matches('/'));
-    let resp = reqwest::get(&url)
+    let client = reqwest::Client::new();
+    let resp = crate::run::with_admin_bearer(client.get(&url))
+        .send()
         .await
         .with_context(|| format!("GET {} failed (proxy not running?)", url))?;
 

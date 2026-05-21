@@ -133,6 +133,117 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-05-22: JWT hardening Phase F — CLI plumbing + derive_admin_url discovery + bootstrap TTL + sandbox env sanitization
+
+Closes the three architecture-review items from the operator's
+critique of the 2026-05-21 admin-port middleware work, plus the
+deferred CLI plumbing.
+
+**1. CLI admin call sites wired with `with_admin_bearer`.**
+
+Every admin-port HTTP call now passes through `crate::run::
+with_admin_bearer(rb)`, which attaches `Authorization: Bearer
+$GVM_ADMIN_TOKEN` when the env var is set (no-op when unset, so
+loopback-default operators see zero behaviour change).
+
+Wired sites:
+- `approve.rs::fetch_pending` (GET /gvm/pending)
+- `approve.rs::send_decision` (POST /gvm/approve)
+- `proxy_manager.rs::reload_running_proxy` (POST /gvm/reload) —
+  also fixed to use `derive_admin_url` (was hitting the proxy
+  port directly, an existing latent bug)
+- `reload.rs::run_reload` (POST /gvm/reload) — same fix
+- `dns_inspect.rs::run_status` (GET /gvm/dns/state)
+- `sandbox_inspect.rs::fetch_list` (GET /gvm/sandbox)
+- `main.rs::cleanup_sandbox` DELETE handler (DELETE /gvm/sandbox/<id>)
+- `run.rs::provision_sandbox` (POST /gvm/sandbox/launch)
+
+Not wired (intentionally): `Commands::Dashboard` only opens the
+browser at the admin URL — the browser would need to inject the
+Bearer header itself (e.g. via DevTools), which is an operator
+workflow concern. Documented limitation.
+
+**2. Critique #1 fix — `derive_admin_url` discovery order.**
+
+The `+1010` heuristic breaks when an operator binds admin to a
+non-conventional port (e.g. `127.0.0.1:9999` to dodge a port
+collision). New priority order:
+1. `GVM_ADMIN_URL` env var (explicit operator override).
+2. `[server] admin_listen` parsed from a discoverable proxy.toml.
+   Reuses the same discovery order the proxy itself uses
+   (`$GVM_CONFIG`, `./config/proxy.toml`, `./proxy.toml`,
+   `$XDG_CONFIG_HOME/gvm/proxy.toml`, `~/.config/gvm/proxy.toml`,
+   `/etc/gvm/proxy.toml`). Tolerant line-based grep — no `toml`
+   dep added to the CLI just for one field.
+3. `proxy_port + 1010` heuristic (existing fallback).
+
+**3. Critique #2 fix — bootstrap token TTL.**
+
+`[server] bootstrap_token_ttl_secs` config field, **default 86400
+(24h)**, replaces the previous behaviour of using
+`token_ttl_secs` (typically 1h) for the bootstrap token. The
+1-hour bootstrap was hostile UX for cross-timezone / CI-delayed
+provisioning where the bootstrap token expired before the operator
+could mint a long-lived replacement, forcing a proxy restart just
+to re-mint. Operators with stricter posture can shorten the field.
+Bootstrap token's `jti` lands in the WAL like any other token, so
+revocation is available if the longer TTL is undesirable for a
+specific run.
+
+**4. Critique #3 (admin role granularity) — DEFERRED, not closed.**
+
+`gvm_role` is still binary (`None` / `Some("admin")`). Schema
+remains forward-compatible — a future `Some("auditor")` would
+slot in with one new middleware variant. Deferring because the
+current admin-port endpoint surface is small enough that the
+admin/auditor split is not yet load-bearing; left as a clean
+extension point in the Claims schema.
+
+**5. Sandbox env sanitization.**
+
+`gvm-sandbox/src/sandbox_impl.rs` now strips the following env vars
+from the agent process immediately before exec:
+- `GVM_ADMIN_TOKEN` (admin-port Bearer)
+- `GVM_JWT_SECRET` (legacy HS256 secret, removed but still defensive)
+- `GVM_JWT_ED25519_SEED` (Ed25519 signing seed)
+- `GVM_VAULT_KEY`, `GVM_SECRETS_KEY` (vault encryption keys)
+- Plus wildcard: any env var matching `GVM_JWT_*_SEED` or
+  `GVM_JWT_ED25519_SEED_*` (multi-slot per-slot seed names)
+
+Defense-in-depth: even if an agent escapes its sandbox namespace,
+it never had access to the operator's plane-level secrets. The
+strip happens AFTER all GVM-injected env vars (HTTP_PROXY,
+GVM_AGENT_ID, etc.) so the agent still gets what it needs.
+Operator-supplied placeholder credentials via `--env` are unaffected
+(they go through the `config.extra_env` path which runs after).
+
+**Tests**: 920 passing (release mode), 0 failed. No new test files
+added — the changes are surface-level wiring without new behaviour
+to verify (the existing `admin_port_loopback_only.rs` tests cover
+the bind policy gate, and the JWT middleware tests in `auth.rs`
+cover the actual auth path).
+
+**Affected files**:
+- `crates/gvm-cli/src/{approve,proxy_manager,reload,dns_inspect,sandbox_inspect}.rs`
+- `crates/gvm-cli/src/run.rs` (derive_admin_url discovery,
+  provision_sandbox bearer)
+- `crates/gvm-cli/src/main.rs` (cleanup_sandbox bearer)
+- `src/config.rs` (bootstrap_token_ttl_secs field + default)
+- `src/main.rs` (bootstrap token uses config TTL + updated banner)
+- `crates/gvm-sandbox/src/sandbox_impl.rs` (env strip block)
+- `tests/admin_port_loopback_only.rs` (struct migration)
+- `docs/internal/CHANGELOG.md` (this entry)
+
+**Risk**: Low. CLI changes are surface-level — operator workflow on
+loopback-default unchanged (env var unset = no-op). Non-loopback
+admin operators now have a clean migration path: `export
+GVM_ADMIN_TOKEN=...` and the CLI just works. The bootstrap-TTL
+default change extends a token's validity window from 1h to 24h —
+a deliberate trade-off documented inline. Sandbox env sanitization
+is purely additive removal (no env var added to the strip list
+was ever needed by an agent — agents talk via the proxy, not
+directly to admin port or signing keys).
+
 ### 2026-05-21: JWT hardening Phase D+E — TOML multi-slot schema + HS256 final removal (breaking)
 
 Completes the deferred items from the 2026-05-21 Phase B+C commit

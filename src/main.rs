@@ -927,14 +927,17 @@ async fn main() {
     let admin_app = if admin_non_loopback {
         if let Some(ref jc) = jwt_config {
             // Bootstrap token has the standard configured TTL.
-            match gvm_proxy::auth::issue_admin_token(jc, "bootstrap", None) {
+            let bootstrap_ttl = config.server.bootstrap_token_ttl_secs;
+            match gvm_proxy::auth::issue_admin_token(jc, "bootstrap", Some(bootstrap_ttl)) {
                 Ok(token) => {
                     eprintln!();
                     eprintln!("  ═══════════════════════════════════════════════════════════════");
                     eprintln!("  GVM ADMIN BOOTSTRAP TOKEN (capture now — printed once)");
                     eprintln!("  Use as: Authorization: Bearer <this token>");
-                    eprintln!("  TTL: {} seconds", jc.token_ttl_secs);
+                    eprintln!("  TTL: {} seconds (override via [server] bootstrap_token_ttl_secs)", bootstrap_ttl);
                     eprintln!("  {}", token);
+                    eprintln!("  Mint additional admin tokens before this expires via");
+                    eprintln!("    POST {{admin_url}}/gvm/auth/token (gvm_role=admin in body).");
                     eprintln!("  ═══════════════════════════════════════════════════════════════");
                     eprintln!();
                     tracing::info!(
