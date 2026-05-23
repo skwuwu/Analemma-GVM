@@ -390,8 +390,9 @@ per_agent_max_cost_per_hour   = 10.0
 this order of preference (first match wins):
 
 1. **`Authorization: Bearer <jwt>`** — cryptographically verified.
-   Enable by setting `GVM_JWT_SECRET` env var on the proxy and adding
-   a `[jwt]` section to `proxy.toml`. The agent must include the
+   Enable by setting `GVM_JWT_ED25519_SEED` env var on the proxy
+   (HS256/HMAC was removed in v1.6 — Ed25519 only) and adding a
+   `[jwt]` section to `proxy.toml`. The agent must include the
    header explicitly; clients that don't construct the header pass
    to the next step.
 
@@ -413,13 +414,23 @@ this order of preference (first match wins):
 ```toml
 # proxy.toml — JWT is the recommended identity for cooperative-mode
 # (non-sandboxed) clients. Sandboxed agents are covered automatically.
+# Ed25519 is the only supported algorithm (HS256 removed in v1.6);
+# external auditors verify offline with just the public key.
 [jwt]
-secret_env     = "GVM_JWT_SECRET"   # 32+ byte hex secret
-token_ttl_secs = 3600
+algorithm        = "ed25519"
+ed25519_seed_env = "GVM_JWT_ED25519_SEED"  # `openssl rand -hex 32`
+ed25519_key_id   = "gvm-2026"              # optional, baked into JWS kid
+token_ttl_secs   = 3600
+# Optional hardening:
+# strict          = true                    # 401 if neither JWT nor sandbox-peer
+# revocation_file = "/etc/gvm/jwt-revoked.txt"  # jti blocklist, re-read every verify
+# See docs/reference.md "[[jwt.keys]]" for multi-slot rotation.
 ```
 
-When JWT is enabled, `gvm run` calls `POST /gvm/auth/token` and
-exposes the result as `GVM_JWT_TOKEN` in the agent's environment.
+When JWT is enabled, `gvm run` calls `POST /gvm/auth/token` on the
+**admin port** (default `127.0.0.1:9090`, loopback-only; the mint
+endpoint was moved off the public agent port in v1.5) and exposes
+the result as `GVM_JWT_TOKEN` in the agent's environment.
 Agents that already set `Authorization: Bearer …` themselves use
 that token (sample for plain `urllib` / `fetch`):
 
@@ -718,7 +729,7 @@ segfault, etc.), `gvm status` will tell you loudly:
 
 - [ ] Remove `[dev] host_overrides` from proxy.toml
 - [ ] Set `GVM_SECRETS_KEY` and `GVM_VAULT_KEY`
-- [ ] Set `GVM_JWT_SECRET` (`openssl rand -hex 32`) and add `[jwt]` section
+- [ ] Set `GVM_JWT_ED25519_SEED` (`openssl rand -hex 32`) and add `[jwt] algorithm = "ed25519"` section (HS256 removed in v1.6)
 - [ ] Run `gvm anchor keygen --out /etc/gvm/anchor.key --key-id <stable-label>`, then `[anchor] enabled = true` in proxy.toml. Distribute the matching `.pub` file to your auditor.
 - [ ] Set `[wal] max_wal_segments` to fit your retention policy. The local WAL is the single source of truth — for off-host replication, tail `data/wal.log` with rsync / fluentd / vector / S3 backup. GVM does not connect to external streaming systems on the operator's behalf.
 - [ ] Set credential policy to `Deny` (not Passthrough)

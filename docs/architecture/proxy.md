@@ -301,8 +301,9 @@ The Tower middleware stack provides three layers of runtime protection:
 **Fail-Close**: Steps 1–5, 7, and 12 are fatal. Steps 4 and 8 are
 fatal *only when their config asks for the feature* — `[anchor]
 enabled = true` with a missing/malformed key file refuses startup,
-as does `[jwt]` with `GVM_JWT_SECRET` set to invalid hex. The proxy
-never silently downgrades a feature the operator turned on.
+as does `[jwt]` with `GVM_JWT_ED25519_SEED` (or any per-slot
+`*_SEED`) set to invalid hex / wrong length. The proxy never
+silently downgrades a feature the operator turned on.
 
 ---
 

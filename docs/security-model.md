@@ -253,11 +253,14 @@ Patterns are pre-compiled at config load time (fail-fast on invalid patterns) an
 
 **v1 (default)**: Self-declared `X-GVM-Agent-Id` header. Spoofable on shared networks.
 
-**v1.1 (opt-in)**: JWT-based identity verification via `POST /gvm/auth/token`. When `GVM_JWT_SECRET` env var is set (hex-encoded, min 32 bytes HMAC-SHA256 key):
-- Proxy issues JWTs with `agent_id`, `tenant_id`, `scope` claims
-- `Authorization: Bearer <token>` is verified; claims override self-declared headers
-- Rate limiter uses verified `agent_id` (spoofing prevented)
-- Backward-compatible: without JWT configured, header-based identity continues
+**v1.1 — JWT-based identity verification (HISTORICAL; superseded by v1.5/v1.6 entries below).**
+
+The original v1.1 introduced JWT identity via `POST /gvm/auth/token` with HMAC-SHA256 secret in `GVM_JWT_SECRET`, carrying `agent_id`, `tenant_id`, and a `scope` claim. **All three details are obsolete in the current code:**
+- HMAC-SHA256 / HS256 was removed in v1.6 — only Ed25519 (RFC 8037 EdDSA) is supported now. `[jwt] algorithm = "hs256"` causes a startup error.
+- `GVM_JWT_SECRET` is no longer consumed. Operators set `GVM_JWT_ED25519_SEED` (or per-slot envs declared via `[[jwt.keys]]`).
+- The `scope` claim is recorded as audit metadata only; the v0.7 reframe deliberately removed cross-agent scope enforcement from SRR rules. Privilege gating in current code uses `gvm_role` (binary: agent vs admin), narrowly scoped to the admin port.
+
+See the v1.6 entry below for current state.
 
 **v1.2 (sandbox-peer fallback)**: For agents running inside `gvm run --sandbox`, identity is also derivable from the veth source IP. The proxy minted that IP itself when it allocated the sandbox network namespace, so the lookup `peer_ip → sandbox_id → agent_id` is no weaker than the namespace-isolation guarantee that already separates sandboxes. This means a plain `urllib` / `requests` / `node-fetch` call inside a sandbox is correctly attributed in the audit chain with **zero code changes** — no client library, no header to inject, no JWT for the agent author to wire up. The synthesized identity sets `token_id = "sandbox-peer:<sandbox_id>"` so the audit chain records which trust path was taken — JWT-bearer events show a UUID `jti`, IP-derived events show the sandbox tag.
 
@@ -277,15 +280,15 @@ Patterns are pre-compiled at config load time (fail-fast on invalid patterns) an
 - **Multi-key slots for rotation**: `JwtConfig.keys: Vec<JwtKeySlot>` (cap 4). Exactly one slot is `active = true` (used for signing); all non-expired slots are eligible for verification. Per-slot `expires_at: Option<DateTime>` retires deprecated keys without operator intervention. Token's JWS header `kid` dispatches to the correct slot. Operators rotate by adding a new active slot, demoting the old one with a grace `expires_at`, and reloading via the existing atomic config swap — no restart, no token-replay window, no in-flight verify torn down.
 - **HS256 deprecation banner + `GVM_ENV=production` default = Ed25519** (subsequently superseded by v1.6 final removal): when HS256 was the resolved algorithm, the proxy printed a prominent stderr banner + structured warning log explaining the symmetric-secret risk. **No penalty latency** was added: artificial slowdowns are hostile UX and do not improve security.
 
-**v1.4 hardening**:
-- **Asymmetric Ed25519 signing (RFC 8037 EdDSA)**: set `[jwt] algorithm = "ed25519"` plus `GVM_JWT_ED25519_SEED` (32-byte hex seed) and the proxy signs tokens with a private key it alone holds; external auditors verify offline with only the public key (`config.public_key_hex()` exposes it). HS256 remains the default for backward compatibility — operators upgrade by setting the new `algorithm` field, no schema migration needed.
-- **Algorithm-confusion defense (CVE-2018-1000531 class)**: the proxy rejects any token whose JWS header `alg` does not match the operator-configured algorithm. An attacker who takes the EdDSA public key and forges an HS256 token (treating the pubkey as HMAC secret) cannot get it accepted — the header-vs-config mismatch is detected before signature verification ever runs. Symmetric case covered too: an HS256-configured verifier refuses EdDSA tokens.
+**v1.4 hardening** (initial Ed25519 introduction; superseded by v1.6 HS256-removal):
+- **Asymmetric Ed25519 signing (RFC 8037 EdDSA)** was added alongside HS256. Set `[jwt] algorithm = "ed25519"` plus `GVM_JWT_ED25519_SEED` (32-byte hex seed) and the proxy signs tokens with a private key it alone holds; external auditors verify offline with only the public key (`config.public_key_hex()` exposes it). At v1.4 HS256 was still the default; v1.6 removed it.
+- **Algorithm-confusion defense (CVE-2018-1000531 class)**: the proxy rejects any token whose JWS header `alg` does not match the operator-configured algorithm. Defense still active in v1.6+ (Ed25519-configured verifier rejects any non-EdDSA header).
 - **JWS header `kid` carry-through (Ed25519)**: `[jwt] ed25519_key_id = "..."` is baked into every token's header so an offline verifier can pick the right `VerifyingKey` from a key registry. Operator-supplied `kid` is sanitized at issuance to defend against JSON-escape injection (only `[A-Za-z0-9-_.]` survive).
 
 **Remaining limitations**:
-- **HS256 still tolerated**: not removed yet, deprecation banner + production-mode default flip discourage use. Final removal scheduled for v1.0.
-- **Bootstrap admin token visibility**: the first admin token is printed to stderr — operators must capture it from logs and treat it like any other secret. Subsequent tokens are minted via `POST /gvm/auth/token` on the (now-authenticated) admin port.
+- **Bootstrap admin token visibility**: the first admin token is printed to stderr — operators must capture it from logs and treat it like any other secret. Subsequent tokens are minted via `POST /gvm/auth/token` on the (now-authenticated) admin port. v1.6 raised the default bootstrap TTL to 24h (`[server] bootstrap_token_ttl_secs`) so cross-timezone / CI-delayed provisioning doesn't force a restart.
 - **`gvm_role` claim is binary**: only `admin` is recognised. No finer-grained admin sub-roles (read-only-admin, approval-only, etc.). If demand surfaces, the field is already in the schema and can grow without WAL migration.
+- **Dashboard browser auth**: the `gvm dashboard` CLI command opens the admin URL in a browser. When admin is non-loopback, the browser must inject the Bearer header itself (DevTools or a fronting mTLS layer); the CLI cannot do it on the browser's behalf.
 
 ### 9. IPv4-Mapped IPv6 Bypass (Fixed)
 

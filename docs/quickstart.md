@@ -226,13 +226,22 @@ or anything else that opens an HTTP socket is automatically attributed
 to the right `agent_id` in the audit chain. **No SDK, no header, no
 JWT for the agent author to wire up.**
 
-If you also enable JWT-based identity (`GVM_JWT_SECRET` env var,
-`[jwt]` config section), the proxy's order of precedence is:
+If you also enable JWT-based identity (`GVM_JWT_ED25519_SEED` env var
++ `[jwt] algorithm = "ed25519"` config — HS256/HMAC was removed in
+v1.6), the proxy's order of precedence is:
 
 1. Valid `Authorization: Bearer <jwt>` → identity from claims
 2. Sandboxed peer (recognized veth IP) → identity from sandbox metadata
 3. Self-declared `X-GVM-Agent-Id` header → unverified, dev only
 4. None of the above → request flagged as `agent=unknown` in WAL
+
+Token issuance (`POST /gvm/auth/token`) lives on the **admin port**
+(`127.0.0.1:9090` by default, loopback-only). The CLI uses it
+automatically; if you script against it, ensure your bootstrap can
+reach the admin port. When `admin_listen` is non-loopback, the
+proxy auto-enables the JWT middleware and prints a one-shot
+bootstrap admin token to stderr — capture it on first launch and
+`export GVM_ADMIN_TOKEN=<token>` for subsequent CLI calls.
 
 Production deployments should configure JWT for cooperative-mode
 clients and rely on the sandbox-peer fallback for `--sandbox`

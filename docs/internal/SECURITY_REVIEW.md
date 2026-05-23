@@ -65,7 +65,10 @@ The primary adversary is **a compromised or malicious AI agent running
 inside a GVM sandbox**, with the ability to:
 
 - Make arbitrary HTTP/HTTPS requests via any client library
-- Read its own environment (env vars, including `GVM_JWT_TOKEN`)
+- Read its own environment (env vars; note that as of v1.5
+  `GVM_ADMIN_TOKEN`, `GVM_JWT_*_SEED`, and `GVM_VAULT_KEY` are
+  stripped before exec, so the agent's view never includes proxy
+  signing material — only its own short-lived JWT, if any)
 - Modify its own filesystem (within the sandbox overlay)
 - Spawn subprocesses (within seccomp policy)
 - Read/write its agent-id-scoped vault entries
@@ -75,10 +78,18 @@ The adversary CANNOT (by sandbox guarantee):
 - Break out of the network namespace (would require kernel exploit)
 - Read another agent's vault entries
 - Write to the proxy's WAL directly
-- Forge an HMAC-signed JWT without `GVM_JWT_SECRET`
+- Forge an Ed25519-signed agent JWT without the proxy's
+  `GVM_JWT_ED25519_SEED` (or any per-slot `*_SEED`); HS256 has
+  been removed in v1.6 so there is no symmetric signing path to
+  attack
 - Spoof its source IP at the veth level
 - Forge an Ed25519 anchor signature without the operator's
   `[anchor] key_path` secret
+- Reach the admin port (`/gvm/auth/token`, `/gvm/reload`,
+  `/gvm/dns/state`, `/gvm/sandbox/...`) — bound to 127.0.0.1 by
+  default, and when bound to a non-loopback address the
+  `require_admin_jwt` middleware demands a `gvm_role=admin` JWT
+  the agent has no way to obtain
 
 ### Trust boundaries
 
@@ -123,7 +134,7 @@ In rough order of impact-if-exploited:
 
 | Use | Algorithm | Library | Reviewed |
 |-----|-----------|---------|----------|
-| JWT signing | HMAC-SHA256 | `hmac`, `sha2` | ✅ alg:none, RS256 confusion, future iat all rejected with tests |
+| JWT signing | Ed25519 (EdDSA, RFC 8037) — HS256 removed in v1.6 | `ed25519-dalek`, `jsonwebtoken` | ✅ alg:none, alg-confusion (HS256-claimed token over Ed25519-configured verifier), wrong-key, future-iat, missing-kid, multi-slot rotation, revocation list, jti binding into event_hash all covered by tests in `src/auth.rs` |
 | Vault sealing | AES-256-GCM (12-byte random nonce) | `aes-gcm` | ✅ tampered/truncated ciphertext, nonce uniqueness tested |
 | Audit-chain hashing | SHA-256 with domain-separation prefix | `sha2` | ✅ prefix per leaf type prevents collision across leaf classes |
 | Anchor signing | Ed25519 (optional via `[anchor] enabled = true`) | `ed25519-dalek` | ✅ wired into `Ledger::with_config_and_signer`; fail-close on missing/malformed key file; `tests/anchor_signing.rs` covers signer round-trip; verified end-to-end on EC2 (every WAL anchor SelfSigned with operator key_id); not yet load-tested at scale |
@@ -132,8 +143,15 @@ In rough order of impact-if-exploited:
 
 Key handling:
 - All long-lived keys are wiped via `zeroize::ZeroizeOnDrop` on drop.
-- `GVM_SECRETS_KEY` is read once at startup, held in `JwtSecret`
-  with `zeroize` impl, never logged, never serialized.
+- `GVM_JWT_ED25519_SEED` (and any per-slot `GVM_JWT_ED25519_SEED_*`)
+  is read once at startup, expanded into an `ed25519_dalek::SigningKey`
+  inside `JwtKeyMaterial::Ed25519`, and the original seed bytes are
+  zeroized; the signing key itself is held behind `Arc<JwtKeySlot>`,
+  never logged, never serialized. The matching public key is exposed
+  via the `kid` field so external verifiers can validate offline
+  without holding any secret. `GVM_VAULT_KEY` (vault sealing) and
+  `GVM_SECRETS_KEY` (secrets store) are read once at startup and held
+  with `zeroize` impls, never logged, never serialized.
 - Anchor signing key, when `[anchor] enabled = true`, lives at the
   operator-chosen `key_path` (production template recommends
   `/etc/gvm/anchor.key`, mode 0600, owned by the proxy uid). The

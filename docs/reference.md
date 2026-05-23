@@ -29,8 +29,10 @@ Optional `proxy.toml` is loaded from `config/proxy.toml` or `~/.config/gvm/proxy
 | `GVM_VAULT_KEY` | AES-256 key for Vault encryption (64 hex chars) | Random ephemeral key |
 | `GVM_SECRETS_KEY` | Encryption key for credential block in `gvm.toml` | None (plaintext + `0600`) |
 | `GVM_PROXY_URL` | Proxy URL hint published by `gvm run` to the agent's environment (e.g. `HTTP_PROXY=$GVM_PROXY_URL`) | `http://127.0.0.1:8080` |
-| `GVM_JWT_SECRET` | HMAC-SHA256 secret (hex, ≥ 32 bytes) — enables JWT identity verification | None (JWT disabled) |
+| `GVM_JWT_ED25519_SEED` | Ed25519 signing seed (32-byte hex) — enables JWT identity verification (HS256 was removed in v1.6) | None (JWT disabled) |
 | `GVM_JWT_TOKEN` | JWT issued by `gvm run` and exposed inside the agent's environment | None |
+| `GVM_ADMIN_TOKEN` | Bearer token for the admin port; CLI auto-attaches when set. Required only when `admin_listen` is non-loopback (see `[server] allow_non_loopback_admin`); ignored on loopback default. | None |
+| `GVM_ADMIN_URL` | Explicit admin URL override (e.g. `http://127.0.0.1:9999`). When unset, the CLI reads `[server] admin_listen` from a discoverable `proxy.toml`; final fallback is `proxy_port + 1010`. | None (auto-derived) |
 | `GVM_SHADOW_MODE` | Shadow Mode: `strict`, `cautious`, `permissive`, `disabled` | `disabled` |
 | `RUST_LOG` | Proxy log level | `info` |
 
@@ -99,10 +101,40 @@ enabled = true
 listen_port = 5353
 
 # JWT identity (recommended for production cooperative-mode clients;
-# sandboxed agents are covered automatically by source-IP attribution)
+# sandboxed agents are covered automatically by source-IP attribution).
+# Ed25519 (EdDSA) is the only supported algorithm — HS256/HMAC removed
+# in v1.6. Generate seed with `openssl rand -hex 32`.
 [jwt]
-secret_env     = "GVM_JWT_SECRET"
-token_ttl_secs = 3600
+algorithm        = "ed25519"
+ed25519_seed_env = "GVM_JWT_ED25519_SEED"
+ed25519_key_id   = "gvm-2026"        # optional label; baked into JWS `kid`
+token_ttl_secs   = 3600
+strict           = false              # true → 401 when neither JWT nor
+                                      #   sandbox-peer mapping resolves
+revocation_file  = "/etc/gvm/jwt-revoked.txt"  # optional jti blocklist
+
+# Multi-key rotation (optional). When [[jwt.keys]] is non-empty, the
+# single-key `ed25519_seed_env` field above is ignored and slots take
+# over. Exactly one slot must carry `active = true`; expired slots are
+# auto-excluded from verification.
+#
+# [[jwt.keys]]
+# kid        = "gvm-2026-q2"
+# seed_env   = "GVM_JWT_ED25519_SEED_ACTIVE"
+# active     = true
+#
+# [[jwt.keys]]
+# kid        = "gvm-2026-q1"
+# seed_env   = "GVM_JWT_ED25519_SEED_PREVIOUS"
+# expires_at = "2026-08-01T00:00:00Z"
+
+# Admin port. Loopback (default) needs no JWT — trust = host shell.
+# Non-loopback enables require_admin_jwt middleware automatically;
+# bootstrap admin token is printed once to stderr at startup.
+# [server]
+# admin_listen                = "127.0.0.1:9090"
+# allow_non_loopback_admin    = false
+# bootstrap_token_ttl_secs    = 86400   # 24h, only used in non-loopback mode
 
 # Ed25519 anchor signing (every WAL anchor record is signed; auditors
 # verify offline with the matching .pub file). Generate the key with
