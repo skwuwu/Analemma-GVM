@@ -36,7 +36,6 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 - Overlayfs periodic scan (long-running agents): tokio timer → `scan_upper_layer()` at interval. The function exists in `crates/gvm-sandbox/src/filesystem.rs:68` but is only called once at sandbox exit; v0.6 wires a periodic invocation for agents that run for hours/days.
 - Overlayfs inotify-based real-time scan (event-driven alternative to the periodic scan)
 - **Audit Phase 5b — cross-rotation anchor recovery**: extend `scan_wal_for_recovery` to fall back to the highest-numbered `wal.log.<N>` segment when the active `wal.log` carries no anchor (rotation-then-shutdown corner case). Today recovery falls back to genesis in that window — true positive on the rule, false positive on the operator's situation.
-- **Audit Phase 4 — leaves-only checkpoint persistence**: snapshot the `CheckpointAggregator` `BTreeMap` to disk at shutdown (and periodically on a tokio timer), reload at `Ledger::with_config_and_signer` so `checkpoint_root` survives restart. Today the in-memory aggregator resets to empty on startup, leaving anchors with `checkpoint_root: None` until checkpoints re-register. Snapshot must itself hash into the next anchor (so a tampered snapshot file is detected at first batch).
 
 **v0.7 — Orchestrator integration & time-bounded permission grants**
 
@@ -132,6 +131,116 @@ Audit + crypto:
 ---
 
 ## Implementation Log
+
+### 2026-05-24: Audit Phase 4 — leaves-only checkpoint snapshot persistence
+
+Closes the only remaining gap from the v3 audit-architecture plan in
+`~/.claude/plans/lazy-zooming-naur.md` (Phase C deferred follow-up).
+The per-step `AgentCheckpointTree` was in-memory only since the Phase
+3 full landing (`6c06dd4`); proxy restart reset every per-agent tree
+to step 0, breaking cross-restart inclusion proofs and leaving
+post-restart anchors with `checkpoint_root: None` until checkpoints
+re-registered.
+
+**What changed.**
+
+- `CheckpointSnapshot { spec_version, expected_checkpoint_root,
+  written_at, agents: BTreeMap<String, BTreeMap<u32, hex_hash>> }`
+  is the on-disk format. JSON for human inspection; the
+  `expected_checkpoint_root` is the recomputed global aggregator
+  root over `agents` at write time and acts as a self-consistency
+  check on load.
+- `CheckpointAggregator::with_snapshot(ledger, snapshot_path)`
+  loads from disk at startup. Never fails — on parse error /
+  spec-version mismatch / self-hash mismatch the aggregator starts
+  empty and a `SnapshotLoadReport::Rejected { reason }` is
+  returned so the caller can surface a warning. On successful
+  load the reconstructed root is published into the ledger's
+  triple state immediately so the next sealed batch's anchor
+  binds it via the existing `BatchSealRecord::checkpoint_root`
+  field — no schema change to the anchor.
+- `save_snapshot()` is an atomic write (`.tmp` + fsync + rename).
+  Skipped (`Ok(false)`) when no snapshot path is configured or
+  when nothing changed since the last successful save (a
+  `write_counter` / `saved_at_counter` pair tracks dirty state,
+  TOCTOU-safe under concurrent saves).
+- `spawn_periodic_save(interval)` returns a `JoinHandle` for a
+  tokio task that calls `save_snapshot` on each tick. Caller
+  aborts the handle at shutdown and is expected to do one final
+  manual `save_snapshot()` to flush state written between the
+  last tick and shutdown.
+
+**Why this design.**
+
+- *No anchor schema change.* The existing
+  `BatchSealRecord::checkpoint_root` field already hashes into
+  every anchor via `GvmStateAnchor::compute_hash`, so the
+  reconstructed root rides the existing chain — the snapshot
+  "hashes into the next anchor" transitively, without bumping
+  `spec_version` or adding new fields.
+- *Self-consistency only at load time.* Catches transit
+  corruption deterministically. Stronger guarantees (cross-check
+  against the most recent WAL anchor's `checkpoint_root`,
+  Ed25519-signed snapshot files) deferred — operators get
+  post-hoc detection through the chain, which the roadmap
+  explicitly accepted ("tampered snapshot file is detected at
+  first batch"). Documented as a known limitation in the module
+  doc; v0.7 / v1.1 can layer signed snapshots on top without
+  changing the existing API.
+- *Backward compatibility.* `CheckpointAggregator::new(ledger)`
+  signature unchanged — every existing test and (future)
+  production caller that doesn't need persistence keeps working
+  with `snapshot_path: None`. Persistence is fully opt-in via
+  the new `with_snapshot` constructor.
+- *No production wiring yet.* The aggregator is still
+  test-instantiated only (no `src/` callsite calls `register`).
+  Phase 4 ships the persistence primitive so future production
+  wiring (enforcement-path checkpoint emission) gets restart
+  durability for free. The roadmap's "snapshot at shutdown +
+  periodic timer + reload at `Ledger::with_config_and_signer`"
+  shape is preserved; the production wiring happens when the
+  enforcement path that calls `register` is added.
+
+**Tests.** `tests/checkpoint_persistence.rs` (+9 tests):
+- `snapshot_round_trip_restores_state_and_root` — register → save
+  → drop → reload reproduces per-agent / per-step state, ledger's
+  `checkpoint_root` matches, `proof()` works on the reloaded tree
+- `missing_snapshot_file_yields_clean_start` — fresh install /
+  first boot case, NoFile status, no error
+- `corrupt_snapshot_file_is_rejected_and_aggregator_starts_empty`
+  — invalid JSON → Rejected with parse reason, fallback to empty
+- `tampered_leaf_hash_breaks_self_hash_and_is_rejected` — single
+  leaf hex mutated without root recompute → self-hash mismatch
+  detected at load
+- `wrong_spec_version_is_rejected` — future-version snapshot
+  refused (forward-compatibility wedge)
+- `save_with_no_changes_is_a_noop` — dirty flag prevents
+  redundant fsync work in the periodic saver
+- `in_memory_only_aggregator_save_is_noop` — backward-compat
+  `new()` constructor never writes
+- `periodic_save_writes_dirty_state_to_disk` — `spawn_periodic_save`
+  end-to-end with 50ms interval
+- `reloaded_state_publishes_to_next_anchor_checkpoint_root` —
+  the chain-binding invariant: after restart, the ledger's
+  `triple.checkpoint_root` equals the snapshot's reconstructed root
+
+All 25 prior checkpoint tests still pass (no breaking changes to
+`CheckpointAggregator::new` / `register` / `register_agent_root`
+/ `proof`).
+
+**Affected files**: `src/checkpoint.rs` (rewrite to add Phase 4
+on top of Phase 3), `tests/checkpoint_persistence.rs` (NEW),
+`docs/internal/CHANGELOG.md` (this entry, plus removal of the
+"Audit Phase 4 — leaves-only checkpoint persistence" line from
+the v0.6 Planned section).
+
+**Risk**: Low. New code is opt-in (`with_snapshot` vs `new`);
+existing callers see no behaviour change. The reload path
+fail-closes to empty on any parse / validation error, so a
+corrupted snapshot file degrades to today's "start empty"
+behaviour rather than crashing the proxy. The chain-binding is
+through an existing anchor field, not a new one — no on-disk
+WAL schema change.
 
 ### 2026-05-22: JWT hardening Phase F — CLI plumbing + derive_admin_url discovery + bootstrap TTL + sandbox env sanitization
 
