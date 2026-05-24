@@ -877,7 +877,10 @@ mod tests {
             e.operation_descriptor.as_ref().unwrap(),
             e.token_id.as_deref().unwrap(),
         );
-        assert_eq!(h_dispatch, h_v3, "dispatcher must take v3 path with token_id");
+        assert_eq!(
+            h_dispatch, h_v3,
+            "dispatcher must take v3 path with token_id"
+        );
     }
 
     #[test]

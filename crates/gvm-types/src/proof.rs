@@ -29,8 +29,7 @@
 use crate::{
     BatchSealRecord, EventStatus, GVMEvent, GvmIntegrityContext, GvmStateAnchor, LLMTrace,
     MerkleBatchRecord, OperationDescriptor, PayloadDescriptor, PREFIX_EVENT_V1, PREFIX_EVENT_V2,
-    PREFIX_EVENT_V3,
-    PREFIX_OPDETAIL_V1,
+    PREFIX_EVENT_V3, PREFIX_OPDETAIL_V1,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

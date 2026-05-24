@@ -725,9 +725,7 @@ pub async fn proxy_handler(
                 }
                 None => {
                     if jwt.strict {
-                        tracing::warn!(
-                            "Strict-mode reject: no JWT token, no sandbox-peer mapping"
-                        );
+                        tracing::warn!("Strict-mode reject: no JWT token, no sandbox-peer mapping");
                         return error_response(
                             StatusCode::UNAUTHORIZED,
                             "Authentication required: present a Bearer JWT or run inside a GVM sandbox",

@@ -941,10 +941,22 @@ pub async fn auth_revoke_token(
 
     let entry = match &body.reason {
         Some(r) if !r.is_empty() => {
-            let safe_reason: String = r.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').collect();
-            format!("{}  # revoked-at={} reason={}", body.jti, chrono::Utc::now().to_rfc3339(), safe_reason)
+            let safe_reason: String = r
+                .chars()
+                .filter(|c| c.is_ascii_graphic() || *c == ' ')
+                .collect();
+            format!(
+                "{}  # revoked-at={} reason={}",
+                body.jti,
+                chrono::Utc::now().to_rfc3339(),
+                safe_reason
+            )
         }
-        _ => format!("{}  # revoked-at={}", body.jti, chrono::Utc::now().to_rfc3339()),
+        _ => format!(
+            "{}  # revoked-at={}",
+            body.jti,
+            chrono::Utc::now().to_rfc3339()
+        ),
     };
 
     // Append (create if missing).

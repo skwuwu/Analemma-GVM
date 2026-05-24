@@ -884,18 +884,12 @@ async fn main() {
         Ok(gvm_proxy::config::AdminBindCheck::NonLoopbackAllowed { ref addr }) => {
             if jwt_config.is_none() {
                 eprintln!();
-                eprintln!(
-                    "  ERROR: admin_listen = {addr} is non-loopback AND JWT is disabled.",
-                );
-                eprintln!(
-                    "  Defense-in-depth refuses to start: either bind to 127.0.0.1 or"
-                );
+                eprintln!("  ERROR: admin_listen = {addr} is non-loopback AND JWT is disabled.",);
+                eprintln!("  Defense-in-depth refuses to start: either bind to 127.0.0.1 or");
                 eprintln!(
                     "  configure JWT ([jwt] section + GVM_JWT_SECRET or GVM_JWT_ED25519_SEED)"
                 );
-                eprintln!(
-                    "  so the admin-port middleware can gate access by token."
-                );
+                eprintln!("  so the admin-port middleware can gate access by token.");
                 eprintln!();
                 tracing::error!(
                     address = %addr,
@@ -934,7 +928,10 @@ async fn main() {
                     eprintln!("  ═══════════════════════════════════════════════════════════════");
                     eprintln!("  GVM ADMIN BOOTSTRAP TOKEN (capture now — printed once)");
                     eprintln!("  Use as: Authorization: Bearer <this token>");
-                    eprintln!("  TTL: {} seconds (override via [server] bootstrap_token_ttl_secs)", bootstrap_ttl);
+                    eprintln!(
+                        "  TTL: {} seconds (override via [server] bootstrap_token_ttl_secs)",
+                        bootstrap_ttl
+                    );
                     eprintln!("  {}", token);
                     eprintln!("  Mint additional admin tokens before this expires via");
                     eprintln!("    POST {{admin_url}}/gvm/auth/token (gvm_role=admin in body).");

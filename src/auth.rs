@@ -156,9 +156,8 @@ impl JwtConfig {
             Ok(v) if !v.is_empty() => v,
             _ => return Ok(None),
         };
-        let bytes = hex::decode(&hex_seed).map_err(|_| {
-            anyhow!("JWT Ed25519 seed must be valid hex (64 hex chars = 32 bytes)")
-        })?;
+        let bytes = hex::decode(&hex_seed)
+            .map_err(|_| anyhow!("JWT Ed25519 seed must be valid hex (64 hex chars = 32 bytes)"))?;
         if bytes.len() != 32 {
             return Err(anyhow!(
                 "JWT Ed25519 seed must be exactly 32 bytes (got {})",
@@ -173,10 +172,7 @@ impl JwtConfig {
             algorithm: JwtAlgorithm::Ed25519,
             keys: vec![JwtKeySlot {
                 kid: key_id.into(),
-                material: JwtKeyMaterial::Ed25519 {
-                    signing,
-                    verifying,
-                },
+                material: JwtKeyMaterial::Ed25519 { signing, verifying },
                 active: true,
                 expires_at: None,
             }],
@@ -215,13 +211,8 @@ impl JwtConfig {
                     ));
                 }
             };
-            let bytes = hex::decode(&hex_key).map_err(|_| {
-                anyhow!(
-                    "JWT slot '{}': {} must be valid hex",
-                    sc.kid,
-                    sc.seed_env
-                )
-            })?;
+            let bytes = hex::decode(&hex_key)
+                .map_err(|_| anyhow!("JWT slot '{}': {} must be valid hex", sc.kid, sc.seed_env))?;
             let material = match algorithm {
                 JwtAlgorithm::Ed25519 => {
                     if bytes.len() != 32 {
@@ -280,10 +271,7 @@ impl JwtConfig {
         let mut seen = std::collections::HashSet::new();
         for slot in &self.keys {
             if !seen.insert(slot.kid.as_str()) {
-                return Err(anyhow!(
-                    "JwtConfig has duplicate kid '{}'",
-                    slot.kid
-                ));
+                return Err(anyhow!("JwtConfig has duplicate kid '{}'", slot.kid));
             }
         }
         Ok(())
@@ -305,9 +293,9 @@ impl JwtConfig {
     /// skips retired rotation slots without operator intervention.
     pub fn slot_by_kid(&self, kid: &str) -> Option<&JwtKeySlot> {
         let now = chrono::Utc::now();
-        self.keys.iter().find(|s| {
-            s.kid == kid && s.expires_at.map(|t| t > now).unwrap_or(true)
-        })
+        self.keys
+            .iter()
+            .find(|s| s.kid == kid && s.expires_at.map(|t| t > now).unwrap_or(true))
     }
 
     /// Hex-encoded public key of the active slot. Lets the proxy
@@ -468,9 +456,7 @@ pub fn issue_admin_token(
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     {
-        return Err(anyhow!(
-            "admin token label may only contain [A-Za-z0-9-_.]"
-        ));
+        return Err(anyhow!("admin token label may only contain [A-Za-z0-9-_.]"));
     }
     let now = now_unix();
     let ttl = ttl_secs_override.unwrap_or(config.token_ttl_secs);
@@ -669,9 +655,10 @@ fn decode_jwt(config: &JwtConfig, token: &str) -> Result<Claims> {
 
     match &slot.material {
         JwtKeyMaterial::Ed25519 { verifying, .. } => {
-            let sig_bytes: &[u8; 64] = signature.as_slice().try_into().map_err(|_| {
-                anyhow!("EdDSA signature must be exactly 64 bytes")
-            })?;
+            let sig_bytes: &[u8; 64] = signature
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow!("EdDSA signature must be exactly 64 bytes"))?;
             let sig = ed25519_dalek::Signature::from_bytes(sig_bytes);
             verifying
                 .verify(signing_input.as_bytes(), &sig)
@@ -1144,7 +1131,10 @@ mod tests {
         };
 
         // Before revocation: valid.
-        assert!(verify_token(&cfg_rev, &token).is_ok(), "unrevoked must pass");
+        assert!(
+            verify_token(&cfg_rev, &token).is_ok(),
+            "unrevoked must pass"
+        );
 
         // Append jti and re-verify: must fail.
         std::fs::write(&rev_path, format!("{}\n", claims.jti)).expect("write rev");
@@ -1211,8 +1201,14 @@ mod tests {
         let token = issue_token(&cfg, "agent-001", None, "proxy").expect("issue");
         let header_b64 = token.split('.').next().unwrap();
         let header = String::from_utf8(URL_SAFE_NO_PAD.decode(header_b64).unwrap()).unwrap();
-        assert!(header.contains(r#""alg":"EdDSA""#), "header must declare EdDSA: {header}");
-        assert!(header.contains(r#""kid":"audit-key-2026""#), "header must carry kid: {header}");
+        assert!(
+            header.contains(r#""alg":"EdDSA""#),
+            "header must declare EdDSA: {header}"
+        );
+        assert!(
+            header.contains(r#""kid":"audit-key-2026""#),
+            "header must carry kid: {header}"
+        );
     }
 
     #[test]
@@ -1240,9 +1236,11 @@ mod tests {
         use base64::Engine;
         let header_b64 = token.split('.').next().unwrap();
         let header_bytes = URL_SAFE_NO_PAD.decode(header_b64).expect("base64 decode");
-        let header: serde_json::Value =
-            serde_json::from_slice(&header_bytes).expect("JSON parse");
-        assert_eq!(header["alg"], "EdDSA", "alg must remain EdDSA after sanitization");
+        let header: serde_json::Value = serde_json::from_slice(&header_bytes).expect("JSON parse");
+        assert_eq!(
+            header["alg"], "EdDSA",
+            "alg must remain EdDSA after sanitization"
+        );
         assert!(!header["kid"].as_str().unwrap().contains('"'));
     }
 
@@ -1282,7 +1280,10 @@ mod tests {
         let sig_b64 = URL_SAFE_NO_PAD.encode(&[0u8; 32]);
         let token = format!("{}.{}.{}", header_b64, payload_b64, sig_b64);
         let result = verify_token(&cfg_ed, &token);
-        assert!(result.is_err(), "Ed25519 verifier must refuse HS256-claimed token");
+        assert!(
+            result.is_err(),
+            "Ed25519 verifier must refuse HS256-claimed token"
+        );
         assert!(
             result.unwrap_err().to_string().contains("algorithm"),
             "error must indicate algorithm mismatch"
@@ -1314,7 +1315,7 @@ mod tests {
         let cfg_b = JwtConfig {
             algorithm: JwtAlgorithm::Ed25519,
             keys: vec![JwtKeySlot {
-                kid: "ka".to_string(),  // SAME kid as cfg_a so kid-dispatch hits this slot
+                kid: "ka".to_string(), // SAME kid as cfg_a so kid-dispatch hits this slot
                 material: JwtKeyMaterial::Ed25519 {
                     signing: other_signing,
                     verifying: other_verifying,
@@ -1347,8 +1348,7 @@ mod tests {
             jti: uuid::Uuid::new_v4().to_string(),
             iss: "gvm-proxy".to_string(),
         };
-        let payload =
-            URL_SAFE_NO_PAD.encode(serde_json::to_string(&claims).unwrap().as_bytes());
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_string(&claims).unwrap().as_bytes());
         let token = format!("{}.{}.", evil_header, payload);
         assert!(verify_token(&cfg, &token).is_err());
     }
@@ -1370,7 +1370,9 @@ mod tests {
             JwtAlgorithm::Ed25519,
         );
         // HS256/HMAC explicitly rejected with migration message.
-        let err = JwtAlgorithm::from_config_str("hs256").unwrap_err().to_string();
+        let err = JwtAlgorithm::from_config_str("hs256")
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("HS256") && err.contains("ed25519"),
             "HS256 rejection must carry migration hint: {err}"
@@ -1452,7 +1454,10 @@ mod tests {
                     material: {
                         let s = SigningKey::from_bytes(&active_seed);
                         let v = s.verifying_key();
-                        JwtKeyMaterial::Ed25519 { signing: s, verifying: v }
+                        JwtKeyMaterial::Ed25519 {
+                            signing: s,
+                            verifying: v,
+                        }
                     },
                     active: true,
                     expires_at: None,
@@ -1462,7 +1467,10 @@ mod tests {
                     material: {
                         let s = SigningKey::from_bytes(&prev_seed);
                         let v = s.verifying_key();
-                        JwtKeyMaterial::Ed25519 { signing: s, verifying: v }
+                        JwtKeyMaterial::Ed25519 {
+                            signing: s,
+                            verifying: v,
+                        }
                     },
                     active: false,
                     expires_at: None,
@@ -1703,8 +1711,7 @@ mod tests {
         // Backward-compat sentinel: empty slots vector means "no
         // multi-slot config" — the caller should fall back to the
         // single-key path.
-        let result =
-            JwtConfig::from_slot_configs(JwtAlgorithm::Ed25519, &[], 3600).expect("load");
+        let result = JwtConfig::from_slot_configs(JwtAlgorithm::Ed25519, &[], 3600).expect("load");
         assert!(result.is_none());
     }
 
