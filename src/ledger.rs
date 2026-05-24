@@ -480,6 +480,34 @@ pub(crate) struct WalRecoveryState {
     pub last_context_hash: Option<String>,
 }
 
+/// Phase 5b: find the highest-numbered rotated segment alongside
+/// `active_path`. Rotation produces files named `<stem>.<N>` where
+/// `<stem>` is the active file name (typically `wal.log`) and `<N>`
+/// is monotonically increasing. Returns `None` if no rotated
+/// segments exist.
+async fn find_highest_rotated_segment(active_path: &Path) -> Option<PathBuf> {
+    let parent = active_path.parent()?;
+    let stem = active_path.file_name()?.to_str()?;
+    let prefix = format!("{}.", stem);
+
+    let mut max_segment: u64 = 0;
+    let mut entries = tokio::fs::read_dir(parent).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if let Some(suffix) = name_str.strip_prefix(&prefix) {
+            if let Ok(n) = suffix.parse::<u64>() {
+                max_segment = max_segment.max(n);
+            }
+        }
+    }
+
+    if max_segment == 0 {
+        return None;
+    }
+    Some(parent.join(format!("{}.{}", stem, max_segment)))
+}
+
 /// Walk the WAL forward, retaining the LAST occurrence of each
 /// recovery field. Forward iteration is intentional: the tail of an
 /// append-only WAL is exactly the latest value, and forward scanning
@@ -490,6 +518,58 @@ pub(crate) struct WalRecoveryState {
 /// gathered so far — a partially recovered chain is strictly better
 /// than a forced genesis after every restart.
 async fn scan_wal_for_recovery(path: &Path) -> WalRecoveryState {
+    let mut state = scan_single_segment(path).await;
+
+    // Phase 5b: cross-rotation anchor recovery. If the active segment
+    // has no anchor (rotation happened then proxy shut down before any
+    // new batch sealed), look back at the most recently rotated
+    // segment. Without this, the active-only scan correctly reports
+    // "no anchor" and the next batch falls back to genesis — a true
+    // positive on the chain-break rule, but a false positive on the
+    // operator's situation (the chain is intact, the anchor just
+    // lives in `wal.log.<N>`).
+    //
+    // Merge rule: active values take precedence (they are strictly
+    // more recent); rotated fills only the gaps. For a freshly
+    // rotated empty active file this means every field comes from
+    // the rotated segment.
+    if state.last_anchor_hash.is_none() {
+        if let Some(rotated) = find_highest_rotated_segment(path).await {
+            let rotated_state = scan_single_segment(&rotated).await;
+            if rotated_state.last_anchor_hash.is_some() {
+                if state.last_anchor_hash.is_none() {
+                    state.last_anchor_hash = rotated_state.last_anchor_hash.clone();
+                }
+                if state.last_batch_id.is_none() {
+                    state.last_batch_id = rotated_state.last_batch_id;
+                }
+                if state.last_batch_root.is_none() {
+                    state.last_batch_root = rotated_state.last_batch_root.clone();
+                }
+                if state.last_context_hash.is_none() {
+                    state.last_context_hash = rotated_state.last_context_hash.clone();
+                }
+                tracing::info!(
+                    rotated = %rotated.display(),
+                    anchor_short = state
+                        .last_anchor_hash
+                        .as_ref()
+                        .map(|h| &h[..h.len().min(12)])
+                        .unwrap_or(""),
+                    "Phase 5b: active WAL had no anchor — recovered chain head from rotated segment"
+                );
+            }
+        }
+    }
+
+    state
+}
+
+/// Read a single WAL segment forward, retaining the LAST occurrence
+/// of each recovery field. Extracted from `scan_wal_for_recovery` so
+/// Phase 5b can reuse it on both the active file and a rotated
+/// segment without duplicating the line-parsing loop.
+async fn scan_single_segment(path: &Path) -> WalRecoveryState {
     let bytes = match tokio::fs::read(path).await {
         Ok(b) => b,
         Err(_) => return WalRecoveryState::default(),

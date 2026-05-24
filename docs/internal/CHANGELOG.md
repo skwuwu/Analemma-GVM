@@ -35,7 +35,6 @@ HTTP enforcement proxy (Rust/axum/tower) with SRR network governance + API key i
 - WebSocket proxy support — `gvm.operation::ws_upgrade` descriptor exists for audit logging, but the MITM relay does not yet handle the HTTP `Upgrade: websocket` handshake. v0.6 adds a real WS relay so SRR rules can govern WS connections and individual frames.
 - Overlayfs periodic scan (long-running agents): tokio timer → `scan_upper_layer()` at interval. The function exists in `crates/gvm-sandbox/src/filesystem.rs:68` but is only called once at sandbox exit; v0.6 wires a periodic invocation for agents that run for hours/days.
 - Overlayfs inotify-based real-time scan (event-driven alternative to the periodic scan)
-- **Audit Phase 5b — cross-rotation anchor recovery**: extend `scan_wal_for_recovery` to fall back to the highest-numbered `wal.log.<N>` segment when the active `wal.log` carries no anchor (rotation-then-shutdown corner case). Today recovery falls back to genesis in that window — true positive on the rule, false positive on the operator's situation.
 
 **v0.7 — Orchestrator integration & time-bounded permission grants**
 
@@ -131,6 +130,95 @@ Audit + crypto:
 ---
 
 ## Implementation Log
+
+### 2026-05-24: Audit Phase 5b — cross-rotation anchor recovery
+
+Fixes the rotation-then-shutdown false-positive in startup recovery.
+Before this commit, `scan_wal_for_recovery` only read the active
+`wal.log`; if WAL rotation completed (the active file got renamed
+to `wal.log.<N>`, a fresh empty active file was created) and the
+proxy shut down before any new batch sealed, the next start saw an
+empty active file, recovered no anchor, and fell back to genesis.
+The next anchor's `prev_anchor: None` then looked like a chain
+break to `verify_anchor_chain` — a true positive on the rule but a
+false positive on the operator's situation (the previous anchor is
+still on disk in `wal.log.<N>`).
+
+**What changed.**
+
+- New helper `find_highest_rotated_segment(active_path)` enumerates
+  sibling files of the form `<stem>.<N>` (decimal N) and returns
+  the highest-numbered path, mirroring the segment-naming convention
+  already used by `rotate_wal`.
+- The existing line-parsing loop in `scan_wal_for_recovery` was
+  factored out into `scan_single_segment(path)` so the new code can
+  invoke it on both files without duplicating the JSON-line matching.
+- `scan_wal_for_recovery` now scans the active file first; if and
+  only if the result has `last_anchor_hash: None`, it scans the
+  highest-numbered rotated segment and fills only the recovery
+  fields the active scan left empty (active values strictly win).
+  Emits a `tracing::info!` under target `gvm.audit.recovery` with
+  the rotated segment path and recovered anchor's hex prefix so
+  the recovery path is visible in logs without operator action.
+
+**Why the merge rule is "active wins, rotated fills gaps".**
+
+Active values are strictly more recent (rotation happened before
+they were written). If the active file did manage to write a
+`MerkleBatchRecord` for batch N+1 but no anchor, the chain is
+already broken at that batch — Phase 5b cannot fix that; it only
+recovers the last *complete* chain head, which always lives in the
+rotated segment in that scenario. Using rotated's `last_batch_id`
+in that case would re-issue an already-used batch id and trip
+the duplicate-batch_id rule on the next anchor, so the merge
+keeps active's batch info and only borrows rotated's anchor + (if
+absent) context_hash.
+
+**What stays out of scope.**
+
+- Walking back past the highest-numbered rotated segment. Multi-
+  rotation-then-shutdown is operationally rare (rotation requires
+  `max_wal_bytes` of throughput; two rotations between shutdowns
+  is a stretch), and a corrupted highest segment will already
+  surface in the logs. If concrete operator pain materializes,
+  the helper can iterate descending segment numbers without an
+  API change.
+- Watermark-file integration. `wal.log.<N>.watermark` is owned by
+  the background re-verification path and isn't part of the
+  startup chain-head recovery contract.
+
+**Tests.** `tests/cross_rotation_recovery.rs` (+7 tests):
+- `empty_active_with_rotated_segment_recovers_anchor` — the core
+  scenario; anchor in `wal.log.1`, empty `wal.log` → recovered
+- `active_anchor_takes_precedence_over_rotated` — when both
+  segments have anchors, active wins (the merge invariant)
+- `highest_numbered_rotated_segment_is_selected` — four rotated
+  segments, only the highest gets scanned
+- `no_rotated_segments_falls_back_to_genesis` — preserves the
+  existing fresh-install behaviour
+- `corrupt_rotated_segment_does_not_recover` — garbage in the
+  rotated segment must not produce a false-positive recovery
+- `non_numeric_suffix_files_are_ignored` — `wal.log.bak` or
+  similar operator-staged files are not treated as segments
+- `rotated_segment_context_hash_seeds_triple` — config_load's
+  `config_integrity_ref` from the rotated segment seeds
+  `triple.context_hash` so events between restart and the first
+  new config_load carry the right ref
+
+All Phase 3 / Phase 4 / anchor-signing / ledger-shutdown tests
+continue to pass.
+
+**Affected files**: `src/ledger.rs` (added
+`find_highest_rotated_segment`, split out `scan_single_segment`,
+extended `scan_wal_for_recovery`), `tests/cross_rotation_recovery.rs`
+(NEW), `docs/internal/CHANGELOG.md` (this entry, plus removal of
+the "Audit Phase 5b" line from the v0.6 Planned section).
+
+**Risk**: Very low. Pure read-path change. The fallback is gated
+on `last_anchor_hash.is_none()` after the active scan, so existing
+deployments that already have an anchor in the active file see
+zero behaviour change. No on-disk schema change, no public API
+change.
 
 ### 2026-05-24: Audit Phase 4 — leaves-only checkpoint snapshot persistence
 
