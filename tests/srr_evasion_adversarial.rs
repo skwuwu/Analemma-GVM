@@ -351,3 +351,106 @@ decision = { type = "Deny", reason = "Exfiltration blocked" }
         "base64-wrapped field value",
     );
 }
+
+// ─── Documented structural gaps (asserted, but #[ignore]'d) ────────────────
+//
+// The two tests below assert that a STRUCTURAL bypass currently SUCCEEDS.
+// They're marked `#[ignore]` so CI doesn't fail on them, but they're
+// runnable on demand with `cargo test --test srr_evasion_adversarial --
+// --ignored`. If the engine ever adds case-insensitive JSON key lookup or
+// recursive payload-field search, these tests will start failing — that's
+// the signal to flip them into positive-defense tests.
+//
+// **Exploitability caveat.** Both bypasses require the upstream API to
+// also accept the non-canonical envelope. A real GraphQL server rejects
+// `{"OperationName":...}` (case-sensitive per spec) and `{"data":{...}}`
+// wrappers (schema mismatch), so the bypass only matters for permissive
+// internal APIs. Operators relying on SRR as defense-in-depth on such
+// APIs should know about this.
+
+/// PROBE: SRR payload_field is case-sensitive. `OperationName` evades a
+/// rule written for `operationName`. The engine falls through to
+/// Default-to-Caution (Delay 300ms) instead of Deny.
+#[test]
+#[ignore = "documents structural bypass — payload_field key match is case-sensitive"]
+fn structural_bypass_case_variant_envelope_key_evades_payload_rule() {
+    let toml = r#"
+[[rules]]
+method = "POST"
+pattern = "api.bank.com/graphql"
+payload_field = "operationName"
+payload_match = ["TransferFunds"]
+decision = { type = "Deny", reason = "Transfer denied" }
+"#;
+    let srr = srr_from_toml(toml);
+
+    // Sanity: canonical key DOES trigger Deny.
+    let canon = srr.check(
+        "POST",
+        "api.bank.com",
+        "/graphql",
+        Some(br#"{"operationName":"TransferFunds"}"#),
+    );
+    assert!(
+        matches!(canon.decision, EnforcementDecision::Deny { .. }),
+        "Canonical envelope key must Deny (sanity); got {:?}",
+        canon.decision
+    );
+
+    // Bypass: capitalise the key.
+    let result = srr.check(
+        "POST",
+        "api.bank.com",
+        "/graphql",
+        Some(br#"{"OperationName":"TransferFunds"}"#),
+    );
+    assert!(
+        !matches!(result.decision, EnforcementDecision::Deny { .. }),
+        "structural bypass should currently succeed (engine has no case-folding \
+         on JSON keys); if this test starts failing, the engine has been \
+         hardened — flip the assertion to assert Deny."
+    );
+}
+
+/// PROBE: SRR payload_field only looks at top-level JSON keys. Burying the
+/// matched field one level deep in a wrapper object evades the rule.
+#[test]
+#[ignore = "documents structural bypass — payload_field lookup is top-level only"]
+fn structural_bypass_nested_payload_field_evades_payload_rule() {
+    let toml = r#"
+[[rules]]
+method = "POST"
+pattern = "api.bank.com/cmd"
+payload_field = "op"
+payload_match = ["drop_table"]
+decision = { type = "Deny", reason = "Drop denied" }
+"#;
+    let srr = srr_from_toml(toml);
+
+    // Sanity: top-level field DOES trigger Deny.
+    let canon = srr.check(
+        "POST",
+        "api.bank.com",
+        "/cmd",
+        Some(br#"{"op":"drop_table"}"#),
+    );
+    assert!(
+        matches!(canon.decision, EnforcementDecision::Deny { .. }),
+        "Top-level field must Deny (sanity); got {:?}",
+        canon.decision
+    );
+
+    // Bypass: wrap the field inside a parent object.
+    let result = srr.check(
+        "POST",
+        "api.bank.com",
+        "/cmd",
+        Some(br#"{"data":{"op":"drop_table"}}"#),
+    );
+    assert!(
+        !matches!(result.decision, EnforcementDecision::Deny { .. }),
+        "structural bypass should currently succeed (engine doesn't recurse \
+         into nested objects); if this test starts failing, the engine has \
+         been hardened — flip the assertion to assert Deny."
+    );
+}

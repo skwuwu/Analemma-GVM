@@ -205,11 +205,42 @@ cross-platform under `cargo test`; the bash script needs only a
 built release binary and `curl`, runs without root (no sandbox
 involved).
 
+**Verified structural bypasses (Phase 3 supplement).**
+
+A direct challenge during review (was a case-sensitivity / nested-field
+bypass *actually* possible, or was the backlog speculation?) prompted
+two runnable probes:
+
+- `structural_bypass_case_variant_envelope_key_evades_payload_rule`
+- `structural_bypass_nested_payload_field_evades_payload_rule`
+
+Both are marked `#[ignore]` so they don't fail CI, but running
+`cargo test --test srr_evasion_adversarial -- --ignored` confirms
+the engine falls through to Default-to-Caution (Delay 300ms) for:
+
+- `{"OperationName":"TransferFunds"}` against a rule keyed on
+  `payload_field = "operationName"` — `serde_json::Value::get` is
+  case-sensitive; the engine has no case-folding on JSON keys.
+- `{"data":{"op":"drop_table"}}` against a rule keyed on
+  `payload_field = "op"` — `json.get(field)` only looks at the
+  top level; the engine has no recursive search.
+
+The bypass is **structural** (engine layer) but exploitability
+depends on the upstream API also accepting the non-canonical
+envelope. A spec-compliant GraphQL server rejects mixed-case
+envelope keys; a strict JSON-schema API rejects nested wrappers.
+The bypass therefore only matters for permissive internal APIs
+relying on SRR as defense-in-depth. Operators should know about
+this when sizing their threat model.
+
+The probes assert the bypass *succeeds*; if a future change adds
+case-folding or recursive payload lookup, the probes start
+failing — that's the signal to flip them into positive-defense
+tests.
+
 **Follow-ups (Phase 4).**
 
-MITM TLS downgrade + IC-3 bypass. Phase 3.5 backlog records two
-known SRR limits (JSON field key case sensitivity, nested payload
-field) explicitly NOT pinned by tests — those would lock in the gap.
+MITM TLS downgrade + IC-3 bypass.
 
 ### 2026-05-26: Pentest Phase 2 — DNS governance bypass regression suite
 
