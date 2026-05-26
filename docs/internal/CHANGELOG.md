@@ -131,6 +131,86 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-05-26: Pentest Phase 2 — DNS governance bypass regression suite
+
+Adversarial coverage for the DNS governance engine and the sandbox-side
+DNAT integration. The pure-Rust engine surface gets six adversarial
+tests plus one positive control; the live DNAT path gets two bash
+scenarios run against a real sandboxed shell.
+
+**What changed.**
+
+- New `tests/dns_governance_adversarial.rs` — six adversarial cases
+  plus a positive control:
+  - `tier4_flood_global_threshold_triggers_after_burst`: a burst of
+    distinct base domains past `snapshot_state().tier4_threshold`
+    must produce at least one `DnsTier::Flood` classification.
+  - `tier3_anomalous_via_subdomain_burst`: subdomain enumeration on
+    a single base past `tier3_threshold` must escalate to
+    `DnsTier::Anomalous` (or stricter `Flood`).
+  - `parser_rejects_malformed_packets`: empty, header-only, qdcount=0,
+    truncated-label, overlong-label, and invalid-UTF8 packets all
+    return `None` from `parse_dns_question`. Each `Some(_)` would be
+    an arbitrary-classification bypass (attacker fakes a domain
+    string the engine then trusts).
+  - `parser_rejects_pointer_compression_in_question`: a 0xC0.. byte
+    at the question section is rejected (RFC 1035 §4.1.4).
+  - `case_variants_share_tier_window_slot`: mixed-case subdomains
+    collapse to one window slot, so an attacker cannot dilute Tier 3
+    counters by varying capitalization. `classify_inner` already
+    lowercases at entry — the test pins that behavior.
+  - `idn_homograph_treated_as_distinct_domain`: Latin `anthropic.com`
+    and Cyrillic `\u{0430}nthropic.com` classify as different base
+    domains. Documents the current behavior so a future "normalize
+    IDN" change shows up here as a deliberate decision.
+  - `parser_accepts_well_formed_query`: positive control guarding
+    against the malformed-only tests passing vacuously.
+- New `scripts/dns-bypass-pentest.sh` — two scenarios against a live
+  sandbox:
+  - B1: rewrite `/etc/resolv.conf` to `nameserver 8.8.8.8` and issue
+    queries. Either the queries reach the local DNS proxy (DNAT
+    works regardless of resolv.conf) or iptables OUTPUT drops the
+    egress entirely — both are containment passes. Failing here
+    means the sandbox's configured resolver shaped policy.
+  - B2: in-sandbox subdomain burst (10 queries) plus cross-domain
+    burst (25 queries) must produce both Tier 3 and Tier 4
+    `gvm.dns.query` events in WAL or proxy.log. End-to-end smoke
+    that the engine is wired and classifying real sandbox traffic.
+- `docs/internal/PENTEST_REGRESSION_MAP.md` — Phase 2 sections added,
+  backlog table updated (DNS engine + DNAT entries marked shipped,
+  decay-gaming deferred to Phase 2.5 because the engine's clock
+  injector is `#[cfg(test)] pub(super)` and not reachable from an
+  external integration test).
+
+**Why.**
+
+The engine has 23 internal `#[cfg(test)] mod tests` cases at the unit
+level, but the integration-level surface (what an external attacker
+can reach through `gvm_proxy::dns_governance::*`) was uncovered.
+Memory recorded that the DNAT integration had been verified once
+44 days ago (Test 83 9/9 PASS on EC2), but there was no automated
+regression — a silent break in DNS classification would only surface
+on the next manual EC2 walkthrough. This commit closes that gap.
+
+**Affected files.**
+
+- `tests/dns_governance_adversarial.rs` (new)
+- `scripts/dns-bypass-pentest.sh` (new)
+- `docs/internal/PENTEST_REGRESSION_MAP.md` (Phase 2 sections)
+- `docs/internal/CHANGELOG.md` (this entry)
+
+**Risk.**
+
+Low. No production code changed. Engine tests are pure-Rust and run
+on every platform; the bash script is Linux + root + sandbox and
+mirrors the Phase 1 invocation pattern.
+
+**Follow-ups (Phase 3-4).**
+
+SRR/classifier evasion (Phase 3), MITM TLS downgrade + IC-3 bypass
+(Phase 4). Backlog tracked in
+`docs/internal/PENTEST_REGRESSION_MAP.md § Known Gaps`.
+
 ### 2026-05-26: Pentest Phase 1 — sandbox escape 15-vector regression suite
 
 Promotes the 2026-04-05 manual EC2 pentest result table ("15/15 attacks
