@@ -131,6 +131,100 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-05-26: Pentest Phase 4 — MITM TLS + IC-3 approval bypass regression suite
+
+Final Phase of the pentest roadmap. Eleven Rust integration tests
+cover the TLS proxy's policy + resource-bound invariants and the IC-3
+approval handler's state-machine corners (replay, race, malformed
+input, type confusion). One bash script verifies the live trust-anchor
+bypass surface that the engine-level suite cannot.
+
+**What changed.**
+
+- New `tests/mitm_tls_adversarial.rs` — five `#[tokio::test]` cases:
+  - `server_config_forces_alpn_http_1_1_only` — ALPN list pinned to
+    `http/1.1` only; prevents h2 framing-bypass.
+  - `leaf_cert_cache_bounded_under_unique_sni_flood` — 200 unique
+    SNIs produce a cache whose size scales with input, not above
+    (MAX_CERT_CACHE_SIZE=10_000 is enforced by moka at the documented
+    ceiling).
+  - `leaf_cert_cache_hits_on_repeat_domain` — 50 repeat
+    ensure_cached calls grow the cache by at most 1 entry; cache is
+    not silently disabled.
+  - `cert_resolver_handles_hostile_sni_inputs_without_panic` —
+    empty / NUL / CRLF-smuggled / IPv6-literal / IDN / 1 KB
+    hostnames don't panic the resolver or hang background tasks.
+  - `per_sandbox_resolvers_produce_distinct_leaf_chains` — two
+    resolvers built from distinct per-sandbox CAs mint distinct
+    leaves for the same domain; pins the cross-sandbox impersonation
+    defense.
+- New `tests/ic3_bypass_adversarial.rs` — six `#[tokio::test]` cases:
+  - `malformed_event_id_with_control_chars_does_not_panic` — NUL,
+    CRLF, embedded quotes in event_id yield 404 or 400, never 200/500.
+  - `very_long_event_id_handled_gracefully` — 10 KB event_id yields
+    404/400/413; no memory blowup.
+  - `non_boolean_approved_value_falls_back_to_deny` — `"yes"` (string)
+    either gets 400 or falls back to Deny per the `unwrap_or(false)`
+    contract; never fail-open to Allow.
+  - `approve_with_extra_unknown_fields_still_succeeds` — handler is
+    forward-compatible with orchestrator metadata.
+  - `replay_approve_same_event_id_returns_404_second_time` — second
+    approve of a consumed event_id is rejected; no double-deliver.
+  - `concurrent_approve_and_deny_same_event_id_exactly_one_delivers`
+    — concurrent approve+deny on the same id: exactly one wins (200),
+    one is 404; receiver gets exactly one clean bool.
+- New `scripts/mitm-pentest.sh` — two scenarios:
+  - B1: override `SSL_CERT_FILE` to an empty file inside the sandbox
+    and try `curl https://api.anthropic.com/`. Must fail cert
+    verification — the agent cannot strip the trust anchor.
+  - B2: drop a hostile self-signed root CA into `/etc/ssl/certs/` and
+    retry. Either the sandbox blocks the trust-store write (best
+    case) or the per-sandbox MITM CA remains the sole accepted issuer
+    for inspected traffic.
+- `docs/internal/PENTEST_REGRESSION_MAP.md` — Phase 4 sections added;
+  backlog updated. Two items moved to Phase 5 backlog (wire-level
+  TLS-version pinning, cipher-suite weakening probes) — both require
+  a custom rustls-incompatible client harness or provider injection
+  that's not pure-Rust testable.
+
+**Why.**
+
+Existing MITM coverage in `tests/mitm_streaming.rs` exercised the
+streaming relay end-to-end but didn't pin the ALPN/cache/SNI invariants
+that a single refactor could silently break. IC-3 coverage in
+`tests/api_handlers.rs` + `tests/ic3_concurrency.rs` exercised happy
+paths and concurrency but didn't probe replay, race, or hostile JSON
+input. The Phase 4 suite closes both gaps.
+
+**Affected files.**
+
+- `tests/mitm_tls_adversarial.rs` (new, 5 cases)
+- `tests/ic3_bypass_adversarial.rs` (new, 6 cases)
+- `scripts/mitm-pentest.sh` (new, 2 scenarios)
+- `docs/internal/PENTEST_REGRESSION_MAP.md` (Phase 4 sections + table)
+- `docs/internal/CHANGELOG.md` (this entry)
+
+**Risk.**
+
+Low. No production code changed. Engine tests run cross-platform under
+`cargo test`; the bash script needs sandbox + root and follows the
+Phase 1 invocation pattern.
+
+**Roadmap completion.**
+
+Phases 1-4 of the pentest plan are now shipped. Inventory growth from
+pre-Phase-1 baseline:
+
+- Rust adversarial tests:    88 → 131  (+43)
+- Bash pentest scripts:        3 →   7  (+4)
+- Pentest documentation:       4 →   5  (regression map keeps growing)
+- Verified engine artifacts:   0 →   2  (SRR JSON evasion probes)
+
+Phase 5 backlog: wire-level TLS-version pinning, cipher-suite weakening
+probes, SRR warning-level WAL log when a case-variant of payload_field
+or a nested match appears (mitigation for the documented Known
+Limitations, deferred from Phase 3.5).
+
 ### 2026-05-26: Pentest Phase 3 — SRR / classifier evasion regression suite
 
 Adversarial coverage for the SRR engine's normalization pipeline and
