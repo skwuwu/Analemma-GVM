@@ -131,6 +131,74 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-05-26: Pentest Phase 1 — sandbox escape 15-vector regression suite
+
+Promotes the 2026-04-05 manual EC2 pentest result table ("15/15 attacks
+blocked", in `docs/security-model.md`) from a frozen marketing artifact
+to a build-time-verified guarantee. Adds 15 integration tests, one per
+documented attack vector, plus an extended bash pentest covering
+capability set, device nodes, interface visibility, cgroup escape, and
+user-namespace privilege escalation — areas the existing
+`ghost-stress-test.sh` does not assert on.
+
+**What changed.**
+
+- New `tests/sandbox_escape_15_vectors.rs` — 15 `#[cfg(target_os =
+  "linux")] #[test]` functions named `escape_v<NN>_<slug>`, each
+  invoking `gvm run --sandbox -- <probe>` via the CLI (per the
+  CLAUDE.md "CLI-only testing" rule) and asserting on exit code,
+  stdout, and stderr. Probes are written in shell and Python ctypes
+  so we exercise the actual syscalls (AF_PACKET, mount, unshare,
+  ptrace, kill, direct UDP/53) and not a wrapper that might silently
+  shape the result.
+- New `tests/sandbox_escape_common/mod.rs` — shared helpers:
+  `gvm_binary_path()`, `is_root()`, `require_sandbox_env(name)` for
+  the SKIP-when-not-Linux-or-not-root preflight, `run_sandboxed_probe`
+  with a 60s wall-clock timeout, and `assert_blocked_with` /
+  `assert_stdout_eq` for the two common assertion shapes.
+- New `scripts/sandbox-escape-extended.sh` — five scenarios (capability
+  set audit, sensitive device nodes, host interface visibility, cgroup
+  escape, `unshare(CLONE_NEWUSER)` privilege-escalation proxy). Each
+  scenario writes per-probe stdout/stderr/exit files to
+  `results/extended-<UTC-timestamp>/` so failures are diagnosable
+  offline.
+- New `docs/internal/PENTEST_REGRESSION_MAP.md` — explicit mapping
+  between every row of the security-model attack table and the
+  test function that enforces it. Future additions get a single
+  procedural checklist: doc row → test function → regression-map
+  row.
+
+**Why.**
+
+The 2026-04-05 pentest was a one-time manual walkthrough. Nothing
+prevents a future seccomp whitelist widening or capability-set
+loosening from silently breaking the documented guarantees — there
+were no automated assertions backing the table. Memory pointed at
+`project_sandbox_telegram_test.md` (51 days old) for the "15/15"
+claim, but that memory cited a different test run, not an automated
+regression suite. This commit closes that gap.
+
+**Affected files.**
+
+- `tests/sandbox_escape_15_vectors.rs` (new)
+- `tests/sandbox_escape_common/mod.rs` (new)
+- `scripts/sandbox-escape-extended.sh` (new)
+- `docs/internal/PENTEST_REGRESSION_MAP.md` (new)
+- `docs/internal/CHANGELOG.md` (this entry)
+
+**Risk.**
+
+Low. Tests are gated on `target_os = "linux"` and on root privilege;
+non-Linux and unprivileged invocations SKIP loudly rather than
+fail. No production code changed — only test files, scripts, and
+docs. The release binary is unaffected.
+
+**Follow-ups (Phase 2-4).**
+
+DNS governance bypass (Phase 2), SRR/classifier evasion (Phase 3),
+MITM TLS downgrade + IC-3 bypass (Phase 4). Backlog tracked in
+`docs/internal/PENTEST_REGRESSION_MAP.md § Known Gaps`.
+
 ### 2026-05-24: Audit Phase 5b — cross-rotation anchor recovery
 
 Fixes the rotation-then-shutdown false-positive in startup recovery.
