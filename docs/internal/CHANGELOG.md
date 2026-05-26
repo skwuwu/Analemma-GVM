@@ -131,6 +131,86 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-05-26: Pentest Phase 3 — SRR / classifier evasion regression suite
+
+Adversarial coverage for the SRR engine's normalization pipeline and
+payload-inspection stack. Ten Rust integration tests load inline SRR
+configs and assert that adversarial surface forms (encoded traversal,
+double encoding, null-byte injection, method case, slash variants,
+trailing dot segments, body-size boundaries, base64 wrappers) still
+land in the configured Deny after canonicalization. One bash script
+drives the same set of evasions through a live `gvm-proxy` and
+verifies the audit chain records every Deny.
+
+**What changed.**
+
+- New `tests/srr_evasion_adversarial.rs` — ten tests against
+  `NetworkSRR::check`:
+  - `url_encoded_path_traversal_still_denied` — `%2e%2e/`, `%2E%2E/`,
+    `..%2f..%2f` all reduce to the protected path.
+  - `double_encoded_path_traversal_still_denied` — the 3-pass
+    percent decoder collapses `%252e%252e/` before dot-segment
+    resolution.
+  - `null_byte_in_path_does_not_truncate_match` — `%00` and raw
+    `\0` are stripped; no truncation bypass.
+  - `lowercase_method_matches_uppercase_rule` — `post`/`Post`/`pOsT`
+    all match a `POST` rule (uppercased at check entry).
+  - `consecutive_slashes_in_path_collapsed_to_single` — `//admin`,
+    `///admin`, `/admin//` all collapse.
+  - `trailing_dot_segment_resolved_before_match` — RFC 3986 §5.2.4
+    dot-segment handling.
+  - `body_at_exact_max_size_inspected` — body length equal to
+    `max_body_bytes` is still inspected (strict `>` at src/srr/mod.rs:804).
+  - `body_one_byte_over_max_size_skipped` — body length above the
+    limit skips payload inspection for that rule; documents the
+    size-bypass surface so an operator who relies on payload
+    inspection can size their `max_body_bytes` deliberately.
+  - `base64_encoded_body_still_inspected` — the engine's
+    plain-JSON-then-base64-JSON fallback catches base64-wrapped
+    envelopes.
+  - `base64_encoded_field_value_still_inspected` — the second
+    base64 defense layer (src/srr/mod.rs:856) decodes the matched
+    field value and re-checks for `payload_match` inside.
+- New `scripts/srr-evasion-pentest.sh` — spawns a `gvm-proxy` with
+  an isolated SRR config (single Deny on `evasion-target.test/admin*`),
+  issues 11 evasion variants through `curl -x http://127.0.0.1:18080`,
+  and asserts every variant lands in the WAL as a Deny.
+- `docs/internal/PENTEST_REGRESSION_MAP.md` — Phase 3 section added
+  with per-test threat / proof rows and per-variant defense table;
+  backlog updated with the JSON-key-case and nested-field gaps
+  documented but deliberately NOT pinned (avoid locking in the gap).
+
+**Why.**
+
+Existing SRR coverage lived in
+`tests/hostile.rs` (case smuggling, null byte, unicode), the GraphQL
+alias suite (`tests/graphql_alias_*.rs`), and `tests/srr_time_window.rs`.
+None of those exercise percent encoding, double encoding, base64
+envelopes, slash variants, or body-size boundaries. The Phase 3 suite
+fills those gaps so a future change in `src/srr/normalize.rs` or
+`src/srr/mod.rs:727` (`check_at`) trips a named test rather than
+silently weakening a Deny rule.
+
+**Affected files.**
+
+- `tests/srr_evasion_adversarial.rs` (new)
+- `scripts/srr-evasion-pentest.sh` (new)
+- `docs/internal/PENTEST_REGRESSION_MAP.md` (Phase 3 sections)
+- `docs/internal/CHANGELOG.md` (this entry)
+
+**Risk.**
+
+Low. No production code changed. Engine tests are pure-Rust and run
+cross-platform under `cargo test`; the bash script needs only a
+built release binary and `curl`, runs without root (no sandbox
+involved).
+
+**Follow-ups (Phase 4).**
+
+MITM TLS downgrade + IC-3 bypass. Phase 3.5 backlog records two
+known SRR limits (JSON field key case sensitivity, nested payload
+field) explicitly NOT pinned by tests — those would lock in the gap.
+
 ### 2026-05-26: Pentest Phase 2 — DNS governance bypass regression suite
 
 Adversarial coverage for the DNS governance engine and the sandbox-side
