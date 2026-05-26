@@ -205,7 +205,7 @@ cross-platform under `cargo test`; the bash script needs only a
 built release binary and `curl`, runs without root (no sandbox
 involved).
 
-**Verified structural bypasses (Phase 3 supplement).**
+**Verified engine-layer artifacts (Phase 3 supplement).**
 
 A direct challenge during review (was a case-sensitivity / nested-field
 bypass *actually* possible, or was the backlog speculation?) prompted
@@ -225,18 +225,31 @@ the engine falls through to Default-to-Caution (Delay 300ms) for:
   `payload_field = "op"` — `json.get(field)` only looks at the
   top level; the engine has no recursive search.
 
-The bypass is **structural** (engine layer) but exploitability
-depends on the upstream API also accepting the non-canonical
-envelope. A spec-compliant GraphQL server rejects mixed-case
-envelope keys; a strict JSON-schema API rejects nested wrappers.
-The bypass therefore only matters for permissive internal APIs
-relying on SRR as defense-in-depth. Operators should know about
-this when sizing their threat model.
+**Practical exploitability: low.** Follow-up review pointed out that
+mainstream JSON parsers (Python pydantic, Java Jackson default,
+JavaScript class-validator, Rust serde, spec-compliant GraphQL
+servers) reject non-canonical key case at the upstream, so the
+bypass leaves the attacker no closer to the protected action — the
+malformed envelope dies at the API itself. The main residual risk
+is **Go's `encoding/json`**, which does case-insensitive struct-field
+matching by default; that's the population where the engine-layer
+artifact has real teeth. Nested-field evasion is even weaker because
+most production APIs reject unknown wrapper objects at schema
+validation.
 
-The probes assert the bypass *succeeds*; if a future change adds
-case-folding or recursive payload lookup, the probes start
-failing — that's the signal to flip them into positive-defense
-tests.
+Documented as a Known Limitation in
+`docs/security-model.md § SRR Payload Inspection` together with the
+planned mitigation: a **warning-level WAL log** when a case-variant
+of the configured `payload_field` appears in the body, or when a
+recursive lookup finds a match below the top level. The warning
+surfaces suspicious envelopes without changing enforcement — useful
+for both detection and for nudging operators to tighten their rules
+when their downstream is Go-based.
+
+The probes are kept `#[ignore]`'d to track the engine behavior over
+time: if a future change adds case-folding or recursive payload
+lookup, the probes start failing and must be flipped into
+positive-defense tests.
 
 **Follow-ups (Phase 4).**
 

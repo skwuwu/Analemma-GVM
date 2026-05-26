@@ -819,6 +819,19 @@ Use `--no-mitm` to disable MITM and fall back to CONNECT relay (domain-level onl
 | **WAL coverage gaps (P2 remaining)** | Pre-classification failures (JWT 401, missing host 400) do not record to WAL — these occur before governance classification and have no decision to audit. Circuit breaker (503) is intentionally unrecorded (WAL already failing). All P1 gaps fixed: SRR lock poison, token budget exceeded, shadow STRICT, Deny, RequireApproval, classification error — all record to WAL on both MITM and proxy paths. |
 | **Intermittent CONNECT TLS handshake eof** | Node.js undici HTTP client occasionally resets the 2nd CONNECT before sending ClientHello. Self-recovers on 3rd attempt (~2s delay). No data loss — WAL records all successful requests. | Under investigation. Likely client-side connection pool race condition after CONNECT tunnel close. `Connection: close` header added to CONNECT response to prevent upgrade reuse. Does not affect stress test pass rate (289 API calls, 0 TLS errors in steady state). |
 
+## SRR Payload Inspection — Known Limitations
+
+The SRR payload matcher (`payload_field` + `payload_match`) walks JSON
+bodies with `serde_json::Value::get`. This lookup is **case-sensitive on
+keys** and **top-level only**. Adversarial probes confirming the engine
+behavior live in [tests/srr_evasion_adversarial.rs](../tests/srr_evasion_adversarial.rs)
+under `#[ignore]` (`cargo test ... -- --ignored`).
+
+| Limitation | Impact | Mitigation |
+|-----------|--------|------------|
+| **JSON envelope key is case-sensitive** | A rule with `payload_field = "operationName"` does not match a body whose key is `"OperationName"`. The engine falls through to Default-to-Caution (Delay 300ms) instead of Deny. | The vast majority of production APIs (Python pydantic, Java Jackson default, JavaScript class-validator, Rust serde, spec-compliant GraphQL servers) themselves reject non-canonical key case, so the bypass leaves the attacker no closer to the action — the upstream rejects the malformed envelope. The notable exception is **Go's `encoding/json`**, which does case-insensitive struct-field matching by default; agents calling Go-based APIs should not rely on SRR `payload_field` alone. Planned mitigation: warning-level WAL log when `payload_field` is configured and the inspected body contains a key whose lowercased form matches `payload_field` but the literal form does not — surfaces the suspicious case-variant request without changing enforcement. |
+| **Payload field lookup is top-level only** | A rule with `payload_field = "op"` does not recurse into nested objects, so `{"data":{"op":"X"}}` is not inspected for the `op` value. Same Delay-not-Deny fall-through. | Most production APIs have strict schemas that reject nested wrappers around a top-level field, so the bypass typically dies at upstream validation. For envelope-pattern APIs that legitimately accept wrapped payloads (some legacy JSON:API implementations), prefer GraphQL alias scanning (`payload_query_alias_match`) which scans the body's `query` text rather than a specific JSON key. Planned mitigation: same warning-level WAL log when a recursive search finds a matching field one or more levels deep. |
+
 ## Overlayfs Trust-on-Pattern — Known Limitations
 
 | Limitation | Impact | Mitigation |
