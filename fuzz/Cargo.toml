@@ -41,6 +41,13 @@ gvm-types = { path = "../crates/gvm-types" }
 serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "io-util", "time", "macros"] }
+# fuzz_jwt_auth constructs an Ed25519 SigningKey directly to populate the
+# JwtKeySlot fixture. The host crate `gvm-proxy` re-exports the type
+# through its public API, but `use ed25519_dalek::SigningKey;` resolves
+# against this fuzz crate's namespace, so the dependency must be listed
+# explicitly. Without this line, `cargo +nightly fuzz build` fails the
+# fuzz target with E0432 (unresolved import).
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 # SRR rule matching fuzzer: exercises regex compilation + pattern matching
 [[bin]]

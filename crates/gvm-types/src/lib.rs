@@ -298,6 +298,7 @@ pub struct GVMEvent {
     /// - `Some("<uuid>")` for JWT-authenticated requests (`jti` claim)
     /// - `Some("sandbox-peer:<sandbox_id>")` for namespace-bound identity
     /// - `None` for legacy / pre-JWT WAL entries (read by v1/v2 hash)
+    ///
     /// Present in WAL entries from spec_version 3+ and bound into
     /// `compute_event_hash_v3` so an auditor can attribute by token
     /// instance, not just by agent_id.
