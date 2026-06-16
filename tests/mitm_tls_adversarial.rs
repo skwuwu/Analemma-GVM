@@ -22,25 +22,19 @@
 //!   5. Two per-sandbox CAs yield distinct leaf chains — pins the DN
 //!      contract that the per-sandbox MITM trust model depends on.
 
+mod common;
+
+use common::install_rustls_provider;
 use gvm_proxy::tls_proxy::{build_server_config, GvmCertResolver};
 use gvm_sandbox::ca::CARegistry;
 use std::sync::Arc;
-
-/// Install the rustls crypto provider once per test process. Without this,
-/// `build_server_config` panics on the first call. Idempotent.
-fn init_rustls() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
-}
 
 /// Provision a real per-sandbox CA and wrap it into a GvmCertResolver.
 /// Mirrors what the proxy does at sandbox launch — using `SandboxCA`
 /// rather than a hand-rolled in-test CA keeps the test on the same code
 /// path production exercises (RFC 5280 DN, ECDSA P-256, etc.).
 fn resolver_from_fresh_ca(sandbox_id: &str) -> Arc<GvmCertResolver> {
-    init_rustls();
+    install_rustls_provider();
     let registry = CARegistry::new();
     let ca = registry
         .provision(sandbox_id)
@@ -88,12 +82,32 @@ async fn leaf_cert_cache_bounded_under_unique_sni_flood() {
     // MAX_CERT_CACHE_SIZE = 10_000 to keep the test under a few seconds;
     // BURST = 200 is enough to populate well past the warm-up curve and
     // still let us prove the cache size scales with — not above —
-    // unique inputs.
+    // unique inputs. Issued via `join_all` so the spawn_blocking ECDSA
+    // keygens overlap on the tokio blocking pool instead of serialising.
     const BURST: usize = 200;
-    for i in 0..BURST {
-        let domain = format!("flood-{i}.evasion-target.test");
-        let _ = resolver.ensure_cached(domain).await;
-    }
+    let probe_futures: Vec<_> = (0..BURST)
+        .map(|i| {
+            let resolver = Arc::clone(&resolver);
+            async move {
+                let domain = format!("flood-{i}.evasion-target.test");
+                resolver.ensure_cached(domain).await
+            }
+        })
+        .collect();
+    let results = futures_util::future::join_all(probe_futures).await;
+
+    // Floor: at least one ensure_cached call must have produced a real
+    // CertifiedKey. Without this floor an environment where every
+    // keygen silently returned None (broken provider, OOM in
+    // spawn_blocking, etc.) would still satisfy the upper-bound
+    // assertion below and the test would pass vacuously.
+    let minted = results.iter().filter(|r| r.is_some()).count();
+    assert!(
+        minted >= 1,
+        "cache flood produced zero leaf certs (all ensure_cached calls \
+         returned None) — keygen path is broken, the upper-bound \
+         assertion below would pass vacuously"
+    );
 
     let count = resolver.sync_and_count();
     assert!(

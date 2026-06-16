@@ -80,14 +80,7 @@ impl AsRef<Path> for TestWal {
 /// Callers that don't read the WAL can bind it to `_wal` — the guard
 /// still runs.
 pub async fn test_state() -> (AppState, TestWal) {
-    // Install rustls CryptoProvider once per test process. The proxy's
-    // `tls_proxy::build_server_config` panics without it; production
-    // installs in main.rs. Idempotent: `install_default` returns Err
-    // on re-install which we deliberately ignore.
-    static RUSTLS_INIT: std::sync::Once = std::sync::Once::new();
-    RUSTLS_INIT.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
+    install_rustls_provider();
 
     // Single temp dir owns both the WAL file and the throwaway SRR
     // bootstrap file. When the returned TestWal drops, the dir's
@@ -176,4 +169,78 @@ pub async fn test_state_with_srr(srr: NetworkSRR) -> (AppState, TestWal) {
     let (mut state, wal) = test_state().await;
     state.srr = Arc::new(std::sync::RwLock::new(srr));
     (state, wal)
+}
+
+/// Install the rustls CryptoProvider once per test process. The proxy's
+/// `tls_proxy::build_server_config` panics without it; production
+/// installs in main.rs. Idempotent: `install_default` returns Err on
+/// re-install which we deliberately ignore.
+///
+/// Pulled out of `test_state` so test files that build their own
+/// `GvmCertResolver` directly (e.g. `tests/mitm_tls_adversarial.rs`)
+/// can call this without going through the full AppState setup.
+pub fn install_rustls_provider() {
+    static RUSTLS_INIT: std::sync::Once = std::sync::Once::new();
+    RUSTLS_INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+/// Build an in-memory `NetworkSRR` from inline TOML. Mirrors the
+/// pattern that has been copy-pasted across `tests/hostile.rs`,
+/// `tests/srr_evasion_adversarial.rs`, and several others.
+///
+/// Panics if the TOML does not parse — that's a test-setup bug, not a
+/// runtime condition. Use this only with hand-written test fixtures.
+pub fn srr_from_toml(toml_str: &str) -> NetworkSRR {
+    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
+    let path = dir.path().join("srr.toml");
+    std::fs::write(&path, toml_str).expect("writing SRR config to temp file must succeed");
+    NetworkSRR::load(&path).expect("inline SRR TOML must parse")
+}
+
+/// Build a `PendingApproval` plus its receiver, with realistic-looking
+/// transaction metadata so the test framework prints meaningful
+/// diagnostics on failure. Duplicated from the original in
+/// `tests/ic3_concurrency.rs` so future IC-3 tests don't keep copying.
+pub fn pending_approval(
+    event_id: &str,
+    agent_id: &str,
+) -> (
+    gvm_proxy::proxy::PendingApproval,
+    tokio::sync::oneshot::Receiver<bool>,
+) {
+    let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+    (
+        gvm_proxy::proxy::PendingApproval {
+            sender: tx,
+            event_id: event_id.to_string(),
+            operation: "gvm.payment.charge".to_string(),
+            host: "api.stripe.com".to_string(),
+            path: "/v1/charges".to_string(),
+            method: "POST".to_string(),
+            agent_id: agent_id.to_string(),
+            timestamp: chrono::Utc::now(),
+        },
+        rx,
+    )
+}
+
+/// Drain an axum response body and parse it as JSON.
+///
+/// Uses `.expect` (not `.unwrap_or(Null)`): tests for the approve/deny
+/// API ALWAYS get a JSON envelope back; a non-JSON body means the
+/// handler regressed, and silently falling back to `Value::Null` would
+/// mask that — downstream `json["decision"]` lookups silently produce
+/// `Value::Null` which then masquerades as a missing field rather than
+/// the real failure.
+pub async fn body_json(resp: axum::http::Response<axum::body::Body>) -> serde_json::Value {
+    use http_body_util::BodyExt;
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .expect("response body must drain")
+        .to_bytes();
+    serde_json::from_slice(&bytes).expect("response body must be JSON")
 }

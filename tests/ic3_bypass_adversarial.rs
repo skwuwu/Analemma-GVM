@@ -23,37 +23,10 @@
 
 mod common;
 
-use axum::body::Body;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
-use gvm_proxy::proxy::PendingApproval;
-use http_body_util::BodyExt;
-
-fn pending(
-    event_id: &str,
-    agent_id: &str,
-) -> (PendingApproval, tokio::sync::oneshot::Receiver<bool>) {
-    let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-    (
-        PendingApproval {
-            sender: tx,
-            event_id: event_id.to_string(),
-            operation: "gvm.payment.charge".to_string(),
-            host: "api.stripe.com".to_string(),
-            path: "/v1/charges".to_string(),
-            method: "POST".to_string(),
-            agent_id: agent_id.to_string(),
-            timestamp: chrono::Utc::now(),
-        },
-        rx,
-    )
-}
-
-async fn body_json(resp: axum::http::Response<Body>) -> serde_json::Value {
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
-}
+use common::{body_json, pending_approval as pending};
 
 // ─── Case 1: control / null bytes in event_id ──────────────────────────────
 
@@ -293,16 +266,12 @@ async fn concurrent_approve_and_deny_same_event_id_exactly_one_delivers() {
     );
 
     // Receiver must have received the decision of the winner exactly once.
-    let decision = tokio::time::timeout(std::time::Duration::from_millis(200), &mut rx)
+    // The decision itself (true vs false) is scheduling-dependent — both
+    // are valid; the load-bearing assertions are above (exactly one 200,
+    // exactly one 404, and the `expect` here that the channel delivered
+    // a value at all without being dropped or timing out).
+    let _decision = tokio::time::timeout(std::time::Duration::from_millis(200), &mut rx)
         .await
         .expect("rx must receive exactly one decision")
         .expect("rx must not be dropped");
-
-    // The winner's decision (true if approve won, false if deny won) is
-    // determined by scheduling — both outcomes are valid; we only assert
-    // it was ONE consistent decision (not corrupted).
-    assert!(
-        decision == true || decision == false,
-        "decision must be a clean bool, not corrupted"
-    );
 }

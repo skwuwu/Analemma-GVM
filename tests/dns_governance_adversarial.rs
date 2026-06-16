@@ -76,15 +76,12 @@ fn tier4_flood_global_threshold_triggers_after_burst() {
     let mut floods_seen = 0;
     let burst_size = threshold + 5;
     for i in 0..burst_size {
-        let domain = format!("flood-host-{i}.attacker.com");
-        // Use a distinct base per iteration to fill the global window.
         let base = format!("attacker-flood-{i}.test");
         let result = gov.classify(&base);
         if result.tier == DnsTier::Flood {
             floods_seen += 1;
         }
         last_tier = result.tier;
-        let _ = domain;
     }
 
     assert!(

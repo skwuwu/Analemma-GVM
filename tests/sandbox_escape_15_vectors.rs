@@ -388,17 +388,23 @@ except OSError as e:
     sys.exit(e.errno if e.errno else 99)
 '"#;
     let r = run_sandboxed_probe("v12", probe, PROBE_TIMEOUT);
-    // 0 = SIGKILL delivered to sandbox-PID-1 (which kills the sandbox; the
-    //     test harness on the host is unaffected). The sandbox dies but
-    //     the host is not compromised, which is the intended outcome.
-    // Non-zero exit = call rejected outright (preferred).
-    // The "BREACH" case would be: exit=0 AND the host gvm process died,
-    // which can't happen because PID 1 in the sandbox != PID 1 on host.
-    // So we just record the result for the regression-map doc; both
-    // outcomes are acceptable here.
-    eprintln!(
-        "v12 kill(1, 9) result: exit={}, output={}",
-        r.exit_code,
+    // Two secure outcomes:
+    //   - The Python script exited with an errno (1=EPERM from seccomp,
+    //     3=ESRCH if PID 1 lookup was contained, other errnos = also
+    //     refused).
+    //   - The kill succeeded against the sandbox's own PID 1 (its init),
+    //     which terminated the sandbox itself — gvm reports a non-zero
+    //     exit code (often 137 from SIGKILL). The host harness reaching
+    //     this assertion proves the host PID 1 is unaffected.
+    //
+    // BREACH = exit == 0, which means the Python `sys.exit(0)` line ran:
+    // the kill call returned success WITHOUT terminating the namespace
+    // init. That would imply the seccomp/PID-ns combo let an arbitrary
+    // process kill an unrelated PID, which is the real security failure.
+    assert!(
+        r.exit_code != 0,
+        "v12 kill(1, 9) reached sys.exit(0): the kill returned success \
+         without killing the sandbox init. Output:\n{}",
         r.combined()
     );
 }
@@ -439,23 +445,33 @@ fn escape_v14_proc1_root_denied() {
     }
     let r = run_sandboxed_probe("v14", "ls /proc/1/root/ 2>&1; echo EXIT=$?", PROBE_TIMEOUT);
     let out = r.combined();
-    // EXIT=0 is acceptable if PID 1 in the sandbox namespace is the sandbox
-    // init itself (you can list your own /proc/1/root, which == /). What
-    // must NOT happen: seeing the host's /proc/1/root contents (which would
-    // include /home/<host-user>, /etc/sudoers, etc.). We approximate by
-    // requiring that the listing does not contain host-only directories.
+
+    // Host-content leak is the hard failure: even an EXIT=0 listing must
+    // not contain anything from the host's root (e.g. /etc/sudoers,
+    // /home/ec2-user/, shadow file path) — those are host-only paths the
+    // sandbox should never see through any /proc lookup.
     let host_leak_indicators = ["sudoers", "shadow", "/root", "ec2-user"];
     let leaked = host_leak_indicators.iter().any(|s| out.contains(s));
     assert!(
         !leaked,
         "v14 /proc/1/root leaked host content. Output:\n{out}"
     );
-    // Document outcome for the regression map.
-    eprintln!(
-        "v14 /proc/1/root result: exit={}, output_chars={}",
-        r.exit_code,
-        out.len()
-    );
+
+    // If the call SUCCEEDED, we must have landed inside the sandbox
+    // rootfs — verify by checking for at least one sandbox-typical
+    // directory entry. An empty-but-EXIT=0 listing would be an
+    // ambiguous state we don't want to call "pass". If the call FAILED
+    // (EXIT!=0), that's also fine — hidepid=2 or PID namespace blocked
+    // the lookup, which is the documented defense.
+    if out.contains("EXIT=0") {
+        let sandbox_indicators = ["bin", "etc", "usr", "tmp", "workspace"];
+        let saw_sandbox_root = sandbox_indicators.iter().any(|s| out.contains(s));
+        assert!(
+            saw_sandbox_root,
+            "v14 /proc/1/root succeeded (EXIT=0) with no recognisable \
+             sandbox-rootfs entries. Output:\n{out}"
+        );
+    }
 }
 
 // ─── Vector 15: DNS exfiltration blocked ───────────────────────────────────

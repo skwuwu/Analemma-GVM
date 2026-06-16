@@ -13,18 +13,11 @@
 //!
 //! All tests are pure-Rust and run on every platform under `cargo test`.
 
+mod common;
+
+use common::srr_from_toml;
 use gvm_proxy::srr::NetworkSRR;
 use gvm_proxy::types::EnforcementDecision;
-
-/// Build an in-memory SRR from inline TOML. Mirrors the helper pattern used
-/// across `tests/hostile.rs` and `tests/srr_time_window.rs` (TOML → temp
-/// file → `NetworkSRR::load`).
-fn srr_from_toml(toml_str: &str) -> NetworkSRR {
-    let dir = tempfile::tempdir().expect("temp dir creation must succeed");
-    let path = dir.path().join("srr.toml");
-    std::fs::write(&path, toml_str).expect("writing SRR config to temp file must succeed");
-    NetworkSRR::load(&path).expect("inline SRR TOML must parse")
-}
 
 /// Assert the check decision is a Deny. Includes the matched rule (if any)
 /// in the failure message so a regression points back at the rule that
