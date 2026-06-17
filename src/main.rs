@@ -298,13 +298,22 @@ async fn main() {
         }
     };
 
+    // Tier-3 P3-b: in-process event fan-out channel. Capacity 1024 ≈
+    // one bursty second of decision events; a subscriber that lags
+    // beyond that gets a `lagged` SSE event and is closed. The
+    // sender is held by BOTH the Ledger (fires on every successful
+    // WAL append) and AppState (so the SSE handler can subscribe).
+    let (event_broadcast, _initial_rx) =
+        tokio::sync::broadcast::channel::<gvm_types::GVMEvent>(1024);
+
     let ledger = Ledger::with_config_and_signer(
         Path::new(&std::env::var("GVM_WAL_PATH").unwrap_or_else(|_| config.wal.path.clone())),
         wal_config,
         anchor_signer,
     )
     .await
-    .expect("Failed to initialize ledger");
+    .expect("Failed to initialize ledger")
+    .with_event_broadcast(event_broadcast.clone());
     let ledger = Arc::new(ledger);
     let ledger_for_shutdown = ledger.clone();
 
@@ -627,6 +636,7 @@ async fn main() {
         wal_path: std::env::var("GVM_WAL_PATH").unwrap_or_else(|_| config.wal.path.clone()),
         wal_chain_health: gvm_proxy::wal_background_reverify::WalChainHealth::new(),
         active_integrity_ref: active_integrity_ref.clone(),
+        event_broadcast: event_broadcast.clone(),
     };
 
     // 11.5. Background WAL re-verification (△-6, opt-in).
@@ -786,6 +796,11 @@ async fn main() {
         .route("/gvm/pending", axum::routing::get(api::pending_approvals))
         .route("/gvm/approve", axum::routing::post(api::approve_request))
         .route("/gvm/reload", axum::routing::post(api::reload_srr))
+        // WAL event SSE stream (Tier-3 P3-b). Push-based subscription
+        // so orchestrators don't poll /gvm/pending. Admin-port only
+        // because the stream surfaces every audit event including
+        // decisions for other agents.
+        .route("/gvm/events", axum::routing::get(api::events_stream))
         // Single-rule SRR mutation (Tier-3 P3-a). Orchestrator-only;
         // admin-port only because injecting an Allow rule from inside
         // a sandbox is a self-grant attack.

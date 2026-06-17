@@ -489,6 +489,71 @@ Regression coverage:
   (9 HTTP-layer cases: 201 / 400 / 409 / 404 / 200 round-trip;
   list endpoint; insert → check fires → remove → check doesn't)
 
+### Event Stream — `GET /gvm/events` (SSE)
+
+The push-based companion to single-rule mutation. Orchestrators
+subscribe once and receive every decision event as it's appended
+to the WAL — no need to poll `GET /gvm/pending` or the audit CLI.
+
+```bash
+curl -N http://127.0.0.1:9090/gvm/events
+# event: keep-alive
+# data: keep-alive
+#
+# data: { "event_id": "...", "agent_id": "release-bot",
+#         "decision": "RequireApproval", ... }
+#
+# data: { "event_id": "...", "agent_id": "claims-reviewer-1842",
+#         "decision": "Allow", ... }
+```
+
+Combined with `POST /gvm/srr/rule` (P3-a), the orchestrator
+implements the time-bounded grant pattern in one round-trip:
+
+1. Subscribe to `/gvm/events` once at startup.
+2. See a `RequireApproval` event for `agent:release-bot` on
+   `github.pr.merge`.
+3. Decide → `POST /gvm/approve` to release this call AND
+   `POST /gvm/srr/rule` to insert a 5-minute `Allow` rule.
+4. Subsequent merges from this bot in that window pass without
+   re-prompting; the lease rule auto-expires.
+
+**Filtering.** Two optional query params, ANDed:
+
+| Param | Behaviour |
+|-------|-----------|
+| `agent_id=<id>` | Exact-match the event's `agent_id` field |
+| `decision=<class>` | Prefix-match the discriminant (`Allow`, `Deny`, `Delay`, `RequireApproval`, `AuditOnly`) — case-sensitive so `delay` does not silently match `Delay(300ms)` |
+
+```bash
+# All Deny events for one specific agent
+curl -N 'http://127.0.0.1:9090/gvm/events?agent_id=release-bot&decision=Deny'
+```
+
+**Backpressure.** Capacity 1024 events per subscriber. A slow
+subscriber that falls behind gets a single `event: lagged` SSE
+event carrying the skip count, then the connection closes. The
+orchestrator's reconnect logic is responsible for reconciling
+state (`GET /gvm/pending`, `GET /gvm/srr/rule`) before resubscribing.
+The WAL writer is **never** blocked by a stuck HTTP consumer.
+
+**No replay.** First cut streams only events that arrive after
+the subscriber connects. The `since=<id>` parameter is a v0.7
+enhancement — it requires an in-memory ring buffer of recent
+events that adds memory pressure for a feature that matters
+less once orchestrators stay connected (which they should).
+
+**Admin-port only.** The stream surfaces every audit event,
+including decisions for other agents, so it lives behind the
+same boundary as `/gvm/approve` and `/gvm/srr/rule`. The
+sandbox network namespace has no route to the admin port.
+
+Regression coverage:
+[tests/events_stream.rs](../tests/events_stream.rs)
+(9 cases: filter combinations, broadcast fan-out to one and many
+subscribers, no-subscribers no-panic, slow-subscriber lag without
+blocking the writer).
+
 ### Base64 Payload Decoding
 
 SRR automatically decodes Base64-encoded content before pattern matching. This prevents bypass via encoding obfuscation. Two decoding strategies are applied in order:

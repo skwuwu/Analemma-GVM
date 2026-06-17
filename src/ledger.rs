@@ -1110,6 +1110,18 @@ pub struct Ledger {
     /// from a known point. Initialized from WAL event count during
     /// recovery to avoid duplicate sequences across restarts.
     wal_sequence: AtomicU64,
+    /// Tier-3 P3-b: in-process event fan-out for orchestrator
+    /// subscribers (`GET /gvm/events`). When `Some`, every event that
+    /// successfully reaches the WAL (primary or emergency) is
+    /// broadcast to all live receivers. When `None`, no fan-out —
+    /// the ledger behaves exactly as before.
+    ///
+    /// The send is non-blocking (`tokio::sync::broadcast::Sender::send`
+    /// puts the event in each receiver's buffer); a slow subscriber
+    /// gets `RecvError::Lagged` on next `recv()` but does NOT block
+    /// the WAL writer. The audit path is never held up by a stuck
+    /// HTTP consumer.
+    event_broadcast: Option<tokio::sync::broadcast::Sender<GVMEvent>>,
 }
 
 impl Ledger {
@@ -1182,7 +1194,17 @@ impl Ledger {
             primary_failures: AtomicU64::new(0),
             emergency_writes: AtomicU64::new(0),
             wal_sequence: AtomicU64::new(0),
+            event_broadcast: None,
         })
+    }
+
+    /// Builder-style setter for the in-process event fan-out channel
+    /// used by `GET /gvm/events`. Call from `main.rs` startup right
+    /// after `Ledger::new`. Idempotent; replacing an existing sender
+    /// is allowed (test paths exercise this).
+    pub fn with_event_broadcast(mut self, tx: tokio::sync::broadcast::Sender<GVMEvent>) -> Self {
+        self.event_broadcast = Some(tx);
+        self
     }
 
     /// IC-2/3 durable write: WAL append (group-commit fsync + Merkle).
@@ -1242,6 +1264,14 @@ impl Ledger {
                     }
                 }
             }
+        }
+
+        // 3. Fan out to in-process subscribers (orchestrator stream
+        //    via GET /gvm/events). Send is non-blocking; an error
+        //    means there are zero live receivers, which is the
+        //    common case — silently ignore.
+        if let Some(tx) = &self.event_broadcast {
+            let _ = tx.send(event.clone());
         }
 
         Ok(())

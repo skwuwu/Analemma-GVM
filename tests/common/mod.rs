@@ -100,10 +100,16 @@ pub async fn test_state() -> (AppState, TestWal) {
         NetworkSRR::load(&empty_srr_path).expect("empty SRR must parse"),
     ));
     let api_keys = Arc::new(APIKeyStore::from_map(std::collections::HashMap::new()));
+    // Tier-3 P3-b: event broadcast channel. Same Sender goes to the
+    // Ledger (which broadcasts on every successful append) and into
+    // AppState (so the SSE handler can subscribe). Capacity 64 is
+    // plenty for any test — slow subscribers in tests are bugs.
+    let (event_tx, _) = tokio::sync::broadcast::channel::<gvm_types::GVMEvent>(64);
     let ledger = Arc::new(
         Ledger::new(&wal_path)
             .await
-            .expect("test ledger must initialize"),
+            .expect("test ledger must initialize")
+            .with_event_broadcast(event_tx.clone()),
     );
     let vault = Arc::new(Vault::new(ledger.clone()).expect("test vault"));
     let token_budget = Arc::new(TokenBudget::new(0, 0.0, 500));
@@ -151,6 +157,7 @@ pub async fn test_state() -> (AppState, TestWal) {
         wal_path: wal_path.to_string_lossy().into_owned(),
         wal_chain_health: gvm_proxy::wal_background_reverify::WalChainHealth::new(),
         active_integrity_ref: Arc::new(std::sync::RwLock::new(None)),
+        event_broadcast: event_tx,
     };
 
     (

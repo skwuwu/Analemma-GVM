@@ -1239,6 +1239,122 @@ pub async fn health(State(state): State<AppState>) -> Response<Body> {
     )
 }
 
+// ─── WAL event stream (orchestrator control plane) ───
+
+/// Query parameters for `GET /gvm/events`.
+#[derive(Debug, Deserialize)]
+pub struct EventsQuery {
+    /// Optional agent-id filter. Only events whose `agent_id` equals
+    /// this string are sent. Multiple agent IDs are not supported in
+    /// first cut — issue multiple subscriptions if you need that.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+
+    /// Optional decision-class filter. Accepted values match the
+    /// `EnforcementDecision` discriminant: `Allow`, `Deny`, `Delay`,
+    /// `RequireApproval`, `AuditOnly`. Case-sensitive.
+    #[serde(default)]
+    pub decision: Option<String>,
+}
+
+/// `GET /gvm/events` — Server-Sent Events stream of WAL events.
+///
+/// Tier-3 P3-b. Push-based delivery so an orchestrator does not have
+/// to poll `GET /gvm/pending` (and friends). Every event that
+/// successfully reaches the WAL is broadcast to all subscribers. The
+/// stream lives until the client disconnects or the proxy shuts down.
+///
+/// **Filtering.** Two optional query params, ANDed:
+///   - `agent_id=<id>` — exact-match the event's `agent_id` field
+///   - `decision=<class>` — exact-match the decision discriminant
+///     (Allow / Deny / Delay / RequireApproval / AuditOnly)
+///
+/// **Backpressure.** Capacity 1024 events per receiver. A slow
+/// subscriber that falls behind by more than that gets a single
+/// `lagged` SSE event and the connection is closed; the orchestrator
+/// reconciles current state via `GET /gvm/pending` (and
+/// `GET /gvm/srr/rule`) and re-subscribes.
+///
+/// **No replay.** First cut streams only events that arrive after the
+/// subscriber connects. The `since=<id>` parameter is documented as a
+/// v0.7 enhancement — it requires a ring buffer of recent events that
+/// would add memory pressure for a feature few orchestrators need
+/// once they're connected.
+///
+/// **Admin-port only.** Same boundary as the other control-plane
+/// endpoints (`/gvm/srr/rule`, `/gvm/approve`): the sandbox network
+/// namespace has no route to the admin port.
+pub async fn events_stream(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<EventsQuery>,
+) -> axum::response::Sse<
+    impl futures_util::stream::Stream<
+        Item = Result<axum::response::sse::Event, std::convert::Infallible>,
+    >,
+> {
+    use axum::response::sse;
+    use tokio::sync::broadcast::error::RecvError;
+
+    let mut rx = state.event_broadcast.subscribe();
+
+    let stream = async_stream::stream! {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if !event_matches_filter(&event, &params) {
+                        continue;
+                    }
+                    match sse::Event::default().json_data(&event) {
+                        Ok(sse_event) => yield Ok(sse_event),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to serialize event for SSE");
+                            continue;
+                        }
+                    }
+                }
+                Err(RecvError::Lagged(skipped)) => {
+                    // Tell the subscriber what they missed, then close.
+                    let lagged = sse::Event::default()
+                        .event("lagged")
+                        .data(skipped.to_string());
+                    yield Ok(lagged);
+                    return;
+                }
+                Err(RecvError::Closed) => {
+                    // Broadcaster dropped — proxy is shutting down.
+                    return;
+                }
+            }
+        }
+    };
+
+    sse::Sse::new(stream).keep_alive(
+        sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("keep-alive"),
+    )
+}
+
+/// Test-visible filter check. Pulled out so the regression suite can
+/// exercise the filter logic without spinning up an SSE stream.
+pub fn event_matches_filter(event: &gvm_types::GVMEvent, params: &EventsQuery) -> bool {
+    if let Some(required) = &params.agent_id {
+        if event.agent_id != *required {
+            return false;
+        }
+    }
+    if let Some(required) = &params.decision {
+        // `event.decision` is the discriminant name as a string
+        // ("Allow" / "Deny" / "Delay" / "RequireApproval" /
+        // "AuditOnly"). Case-sensitive prefix-match so orchestrators
+        // can use `decision=Delay` to catch any Delay variant.
+        if !event.decision.starts_with(required.as_str()) {
+            return false;
+        }
+    }
+    true
+}
+
 // ─── Single-rule SRR mutation (orchestrator control plane) ───
 
 /// POST /gvm/srr/rule — Inject one SRR rule atomically.

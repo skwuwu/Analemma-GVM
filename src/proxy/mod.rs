@@ -485,6 +485,18 @@ pub struct AppState {
     /// is rejected here because its ~10x overhead over `std::sync` at
     /// ~tens of thousands of RPS is measurable.
     pub active_integrity_ref: Arc<std::sync::RwLock<Option<String>>>,
+    /// Tier-3 P3-b: in-process event fan-out for the
+    /// `GET /gvm/events` SSE endpoint. The Ledger holds the same
+    /// `Sender` (it broadcasts on every successful WAL append) and
+    /// the SSE handler calls `event_broadcast.subscribe()` to get
+    /// a fresh `Receiver` per connected orchestrator.
+    ///
+    /// Capacity is 1024 — a slow subscriber gets `RecvError::Lagged`
+    /// after that much backlog, the SSE stream sends a `lagged`
+    /// event, and the connection is closed so the orchestrator
+    /// reconciles via `GET /gvm/pending` (and `GET /gvm/srr/rule`).
+    /// The WAL writer is NEVER blocked by a stuck subscriber.
+    pub event_broadcast: tokio::sync::broadcast::Sender<gvm_types::GVMEvent>,
 }
 
 impl AppState {

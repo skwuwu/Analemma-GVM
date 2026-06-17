@@ -131,6 +131,162 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-06-18: WAL event stream — `GET /gvm/events` SSE (Tier-3 P3-b)
+
+Second Tier-3 control-plane primitive from the strategic-audit
+roadmap. Orchestrators now receive every WAL event via a
+push-based SSE stream instead of polling `GET /gvm/pending`.
+Combined with `POST /gvm/srr/rule` (P3-a), the orchestrator
+implements the time-bounded grant pattern in one round-trip:
+subscribe to the stream → see a RequireApproval event → decide
+via `/gvm/approve` AND insert an Allow lease via `/gvm/srr/rule`
+→ subsequent calls pass without re-prompting; the lease
+auto-expires.
+
+```bash
+curl -N 'http://127.0.0.1:9090/gvm/events?agent_id=release-bot&decision=Deny'
+```
+
+**What changed.**
+
+- `Ledger` gains an `Option<tokio::sync::broadcast::Sender<GVMEvent>>`
+  field plus a builder-style `with_event_broadcast(tx)` setter.
+- `Ledger::append_durable` broadcasts the event after a successful
+  WAL append (primary OR emergency path). The send is non-blocking;
+  `broadcast::Sender::send` returns Err with zero receivers, which
+  is the common case — silently ignored.
+- `AppState` gains an `event_broadcast: broadcast::Sender<GVMEvent>`
+  field. `main.rs` creates one `(tx, _rx)` channel with capacity
+  1024, hands the same `tx` to both the Ledger and AppState. SSE
+  handlers call `state.event_broadcast.subscribe()` to get a fresh
+  `Receiver` per connected orchestrator.
+- New `api::events_stream` handler returns `axum::response::Sse<…>`
+  with `keep_alive(15s)`. The inner stream is built with
+  `async_stream::stream!`:
+  - On `Ok(event)` → check filter, json-serialize, yield as SSE
+  - On `RecvError::Lagged(n)` → yield `event: lagged data: n`,
+    then return (close the connection)
+  - On `RecvError::Closed` → return (proxy shutting down)
+- New `api::event_matches_filter` pure function. Two ANDed checks:
+  exact-match on `agent_id`, prefix-match on `decision`. Pulled out
+  of the streaming machinery so the regression suite exercises it
+  directly without an HTTP layer.
+- New `EventsQuery` struct (`agent_id: Option<String>`,
+  `decision: Option<String>`) deserialised from query params.
+- Route wired on the admin router only:
+  `GET /gvm/events` → `api::events_stream`.
+
+**Capacity / lag policy.**
+
+- Channel capacity: 1024 events per receiver. ~1 second of bursty
+  decision traffic on a busy proxy.
+- A subscriber that lags beyond that gets `RecvError::Lagged(n)`
+  on the next `recv()`. The handler emits a single `event: lagged
+  data: <n>` SSE event so the orchestrator knows what it missed,
+  then closes the connection. The orchestrator reconnects, runs a
+  reconcile pass on `/gvm/pending` + `/gvm/srr/rule`, and resumes.
+- The WAL writer is NEVER blocked by a stuck subscriber.
+  `broadcast::Sender::send` is non-blocking — it puts the event in
+  each receiver's buffer and returns immediately.
+
+**No replay (yet).**
+
+First cut streams only events that arrive after the subscriber
+connects. The `since=<id>` parameter mentioned in the strategic
+audit's v0.7 control-plane sketch is scoped as a separate
+follow-up. Adding it well requires:
+- an in-memory ring buffer of recent events (~last 1000 by
+  default, capacity-bounded)
+- a cursor scheme so an orchestrator that disconnects briefly can
+  resume from a known event ID
+- a 410 GONE response when the requested cursor has fallen out of
+  the buffer
+
+The conservative position for first cut is "no replay; orchestrator
+reconciles on reconnect." That keeps the new surface small and
+honest. If real demand surfaces, the ring buffer drops in behind
+the same endpoint.
+
+**Why admin-port only.**
+
+The stream surfaces every audit event — including decisions for
+agents other than the one that's listening. Same scope concern as
+`/gvm/approve` and `/gvm/srr/rule`. The sandbox network namespace
+has no route to the admin port.
+
+**Why broadcast not file-tail.**
+
+A file-tail design would read `wal.log` from a position cursor and
+poll for new content. We avoided it because:
+1. It races with WAL rotation (the file the tailer is reading
+   might get renamed mid-stream)
+2. It can't easily filter by `agent_id` without reading every
+   line
+3. It introduces a second source of truth for "what events
+   exist" — the in-process broadcast trivially matches the WAL by
+   construction (broadcast fires after successful append)
+
+Broadcast keeps everything single-source-of-truth.
+
+**Affected files.**
+
+- `src/ledger.rs` — `event_broadcast` field, `with_event_broadcast`
+  setter, broadcast fire at the end of `append_durable`
+- `src/proxy/mod.rs` — `event_broadcast` field on AppState
+- `src/main.rs` — channel construction (capacity 1024), wired to
+  both Ledger and AppState
+- `src/api.rs` — `EventsQuery`, `events_stream` handler,
+  `event_matches_filter` pure function
+- `src/main.rs` — admin route added
+- `tests/common/mod.rs` — `test_state` builds the channel (capacity
+  64) so the helper is usable for every event-related test
+- `tests/integration.rs` — 10 `AppState` construction sites get
+  `event_broadcast` field (mechanical)
+- `docs/srr.md` — new "Event Stream" subsection with the filter
+  table, lease orchestration example, lag policy, no-replay note
+- `docs/internal/CHANGELOG.md` (this entry)
+- `tests/events_stream.rs` (new, 9 cases):
+  - filter logic: no params, agent_id only, decision-prefix only,
+    AND composition, strict case sensitivity
+  - broadcast: one subscriber gets the event verbatim
+  - broadcast: zero subscribers does not fail the append
+  - broadcast: multiple subscribers each see each event
+  - broadcast: slow subscriber lagged-without-blocking-writer
+    (200-event burst → all writes succeed, slow recv reports
+    Lagged with skip count)
+
+**Verification.**
+
+- `cargo test --test events_stream` — 9/9 pass.
+- All previous SRR / IC-3 / integration tests pass unchanged
+  (75 cases plus the 10 integration-test sites get the new field
+  threaded through mechanically).
+- `cargo check --workspace --tests` clean.
+
+**Risk.**
+
+Medium-low. Two structural changes:
+- `Ledger.append_durable` does one extra `Option::is_some` +
+  optional non-blocking send on the success path. Cost: ~0
+  measurable (broadcast::Sender::send is a single mutex + Vec
+  push internally; in the no-subscribers case it short-circuits
+  before the push).
+- AppState gains a new required field. 13 construction sites had
+  to be updated (1 prod + 2 in tests/common + 10 in
+  tests/integration). All mechanical.
+
+The Ledger sender is `Option<>` so even if `with_event_broadcast`
+is not called, the no-broadcast path stays unchanged.
+
+**Follow-up.**
+
+- P3-c: `POST /gvm/payload-context` cooperative body-context
+  endpoint — SDK / sidecar / MCP adapter delivers structured
+  payload context without MITM (lowers the MITM dependency for
+  HTTPS-pinned and gRPC traffic).
+- v0.7 replay surface: `since=<id>` query param with the ring
+  buffer described above.
+
 ### 2026-06-18: SRR — single-rule mutation endpoints (Tier-3 P3-a)
 
 First Tier-3 item from the strategic-audit roadmap. The
