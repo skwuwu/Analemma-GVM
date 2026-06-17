@@ -296,17 +296,15 @@ See the v1.6 entry below for current state.
 
 **Status**: Fixed in v0.2. `normalize_host()` canonicalizes IPv6 loopback, IPv4-mapped, and cloud metadata addresses before SRR matching.
 
-### 10. GraphQL Alias Bypass
+### 10. GraphQL Alias Bypass (Mitigated)
 
-**Attack**: Current SRR payload inspection matches the `operationName` field only. An attacker can omit `operationName` or use GraphQL aliases in the query body to bypass detection. For example, a mutation named `TransferFunds` could be aliased as `t: transferFunds(...)` in the `query` field without setting `operationName`.
+**Attack**: An attacker could previously omit `operationName` or use GraphQL aliases in the query body to dodge a payload rule. A mutation named `TransferFunds` aliased as `t: transferFunds(...)` in the `query` field with `operationName` omitted would evade a rule keyed on `payload_field = "operationName"` and fall through to a less restrictive URL-only rule.
 
-**Preconditions**: Agent sends requests to a GraphQL endpoint that has payload-based SRR rules.
+**Status**: **Mitigated in v0.5.x via `payload_query_alias_match`.** A SRR rule with `payload_query_alias_match = ["transferFunds", "deleteAccount", ...]` scans the body's `query` field for invocations of those field names regardless of `operationName` or alias prefix. The scanner is a narrow lexer that strips comments and string literals before matching (see [src/srr/mod.rs:1103](../src/srr/mod.rs#L1103) `scan_graphql_query_for_invocation` and the 15+ tests in `tests/graphql_alias_*.rs`). Closed 2026-05-10 per [docs/internal/COVERAGE_HARDENING_PLAN.md](internal/COVERAGE_HARDENING_PLAN.md) (△-10).
 
-**Impact**: High-risk GraphQL operations (e.g., `TransferFunds`, `DeleteAccount`) could bypass the Deny rule and fall through to a less restrictive URL-only rule.
+**Residual limitation — JSON envelope key case sensitivity**: `serde_json::Value::get` is case-sensitive, so a rule keyed on `payload_field = "operationName"` does not match a body whose envelope key is `"OperationName"`. The engine falls through to Default-to-Caution (Delay 300ms) instead of Deny. Exploitability is low because the majority of commercial JSON parsers reject non-canonical key case at the upstream themselves; the notable exception is Go's `encoding/json` which does case-insensitive struct-field matching by default. See [SRR Payload Inspection — Known Limitations](#srr-payload-inspection--known-limitations) below for the planned warning-level WAL log mitigation. The `payload_query_alias_match` defense (above) does not have this limit — it scans the raw `query` text and catches the invocation regardless of envelope casing, provided the rule includes the alias-match list.
 
-**Planned mitigation (v2)**: GraphQL query parser that inspects the `query` field for mutation names, field names, and aliases. Until then, GraphQL endpoints should be treated as elevated risk — consider Deny-by-default for GraphQL endpoints with allowlisted `operationName` values only.
-
-**Why acceptable now**: Current deployments are expected to pair payload rules with URL-based Deny rules for high-risk GraphQL endpoints. An alias bypass evades the `operationName` match but cannot evade a URL-level Deny on the mutation endpoint itself.
+**Recommended configuration**: For each high-risk GraphQL endpoint, define an SRR rule with BOTH `payload_field = "operationName"` (legacy envelope match) AND `payload_query_alias_match = [...]` (raw-text match). The two layers compose; either matching short-circuits to the configured decision. Pair with a URL-level Deny on the mutation endpoint as a defense-in-depth backstop.
 
 ---
 

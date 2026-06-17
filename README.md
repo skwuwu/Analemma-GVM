@@ -153,7 +153,7 @@ Use cooperative mode for agents you trust or wrote yourself (Python `requests`, 
 - 10-parallel concurrent `httpbin.org`: 1104 ms direct vs 1269 ms via proxy = **+165 ms median**.
 - Policy evaluation < 1μs (SRR, Criterion benchmark)
 - WAL with Merkle chain + optional Ed25519 anchor signing (run `gvm anchor keygen` to generate the operator-managed keypair, set `[anchor] enabled = true`). Size-based rotation (100MB x 10 segments by default). Local storage — for off-host audit replication, tail the WAL with rsync / fluentd / vector / S3 backup.
-- **808 Windows tests / 852 Linux tests** across 49 binaries, fmt + clippy `-D warnings` clean. 30-min chaos stress test (proxy kill, network partition, disk pressure) — [PASS](docs/test-report.md#hermes-agent-validation-2026-04-15-ec2-t3medium)
+- Cross-platform CI (Linux + Windows + macOS), `cargo fmt` + `cargo clippy --workspace -- -D warnings` clean on every push. 30-min chaos stress test (proxy kill, network partition, disk pressure) — [PASS](docs/test-report.md#hermes-agent-validation-2026-04-15-ec2-t3medium)
 - Tested with [OpenClaw](https://github.com/openclaw/openclaw) and [hermes-agent](https://github.com/NousResearch/hermes-agent) — GVM is framework-independent; any agent that makes HTTP calls is governed
 - seccomp-BPF with ~130 whitelisted syscalls, ENOSYS default for unknown
 - All data stays local. No telemetry, no phone-home.
@@ -207,4 +207,4 @@ gvm run my_agent.py
 ---
 - Feedback on technical and structural issues or bug reports is always welcome!
 
-v0.4 pre-release. Apache 2.0. [Issues →](https://github.com/skwuwu/Analemma-GVM/issues)
+v0.5.3. Apache 2.0. [Issues →](https://github.com/skwuwu/Analemma-GVM/issues)
