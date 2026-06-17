@@ -418,6 +418,77 @@ Regression coverage:
   right `description`; bare-host server URL; `--out` flag writes
   to a file path; missing `servers` fails loudly)
 
+### Single-Rule Mutation — `POST /gvm/srr/rule` and friends
+
+The orchestrator control-plane endpoint for issuing a single rule
+without rewriting the SRR file. Used to land a per-task lease
+(principal_filter + expires_at) in front of the file's defaults.
+
+```bash
+# Inject a 5-minute Allow rule for one bot, one PR
+curl -X POST http://127.0.0.1:9090/gvm/srr/rule \
+  -H 'Authorization: Bearer <admin-jwt>' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "method": "PUT",
+    "pattern": "api.github.com/{any}",
+    "path_regex": "^/repos/my-org/my-repo/pulls/1842/merge$",
+    "principal_filter": "agent:release-bot",
+    "expires_at": "2026-07-01T15:00:00Z",
+    "decision": { "type": "Allow" },
+    "description": "github.pr.merge.lease.claim-1842"
+  }'
+
+# 201 Created
+# { "id": "github.pr.merge.lease.claim-1842",
+#   "applied": true,
+#   "injected_count": 1 }
+```
+
+Companions:
+
+```bash
+# List the IDs of currently injected rules
+curl -s http://127.0.0.1:9090/gvm/srr/rule
+# 200 { "ids": ["github.pr.merge.lease.claim-1842"], "count": 1 }
+
+# Remove a rule before its expires_at — orchestrator's emergency
+# brake
+curl -X DELETE http://127.0.0.1:9090/gvm/srr/rule/github.pr.merge.lease.claim-1842
+# 200 { "id": "...", "removed": true, "injected_count": 0 }
+```
+
+**Endpoint contract** (admin port only — not exposed on the
+agent-facing proxy port; the sandbox cannot self-grant):
+
+| Endpoint | Status codes |
+|----------|--------------|
+| `POST /gvm/srr/rule` | 201 OK, 400 bad body / missing description / bad regex, 409 duplicate id, 429 cap reached (1 000 rules) |
+| `DELETE /gvm/srr/rule/:id` | 200 removed, 404 not found |
+| `GET /gvm/srr/rule` | 200 + `{ "ids": [...], "count": N }` |
+
+**Lifecycle.** Injected rules iterate **before** file-loaded rules
+in the engine (first-match-wins is preserved within and across
+slots). The slot survives `gvm reload` (file reload only touches
+the file slot). The slot does **not** survive proxy restart — for
+first cut, the orchestrator owns lease lifecycle and re-issues on
+restart. Persistence is a v0.7+ follow-up if real demand surfaces.
+
+**Cap.** 1 000 injected rules (`MAX_INJECTED_RULES`). Mirrors the
+IC-3 pending cap; designed to absorb burst lease issuance from a
+broken orchestrator without OOMing the proxy. Hit the cap → 429.
+
+Regression coverage:
+- [tests/srr_rule_mutation.rs](../tests/srr_rule_mutation.rs)
+  (10 library-layer cases: shadow file rule, restore after remove,
+  empty-description error, duplicate-id error, unknown remove
+  returns false, cap, bad regex compile error, lease composition
+  with principal_filter + expires_at, inspection IDs, rule_count
+  vs injected_rule_count)
+- [tests/srr_rule_api.rs](../tests/srr_rule_api.rs)
+  (9 HTTP-layer cases: 201 / 400 / 409 / 404 / 200 round-trip;
+  list endpoint; insert → check fires → remove → check doesn't)
+
 ### Base64 Payload Decoding
 
 SRR automatically decodes Base64-encoded content before pattern matching. This prevents bypass via encoding obfuscation. Two decoding strategies are applied in order:

@@ -1239,6 +1239,180 @@ pub async fn health(State(state): State<AppState>) -> Response<Body> {
     )
 }
 
+// ─── Single-rule SRR mutation (orchestrator control plane) ───
+
+/// POST /gvm/srr/rule — Inject one SRR rule atomically.
+///
+/// Tier-3 P3-a from the strategic-audit roadmap. The orchestrator
+/// posts a `NetworkRuleConfig` JSON body; the engine compiles it
+/// (via the same path that file-loaded rules use) and prepends it
+/// to the in-memory rule set so subsequent requests see it
+/// immediately. The rule survives `gvm reload` (file reload only
+/// touches the file slot) but does NOT survive proxy restart —
+/// lifecycle is orchestrator-owned.
+///
+/// Body shape:
+/// ```json
+/// {
+///   "method": "PUT",
+///   "pattern": "api.github.com/{any}",
+///   "path_regex": "^/repos/my-org/my-repo/pulls/1842/merge$",
+///   "principal_filter": "agent:release-bot",
+///   "expires_at": "2026-07-01T15:00:00Z",
+///   "decision": { "type": "Allow" },
+///   "description": "github.pr.merge.lease.claim-1842"
+/// }
+/// ```
+///
+/// Responses:
+///   201 — `{ "id": "...", "applied": true, "injected_count": N }`
+///   400 — bad body shape / missing description / bad regex
+///   409 — duplicate id (an injected rule with that description
+///         already exists)
+///   429 — injected-rule cap reached
+///
+/// The rule's `description` becomes the ID used by
+/// `DELETE /gvm/srr/rule/:id`.
+pub async fn insert_srr_rule(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response<Body> {
+    let cfg: crate::srr::NetworkRuleConfig = match serde_json::from_value(body) {
+        Ok(c) => c,
+        Err(e) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({
+                    "error": format!("invalid SRR rule body: {e}"),
+                }),
+            );
+        }
+    };
+
+    let mut srr_guard = match state.srr.write() {
+        Ok(g) => g,
+        Err(_) => {
+            tracing::error!("SRR write lock poisoned during rule insert");
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({"error": "SRR lock poisoned"}),
+            );
+        }
+    };
+
+    match srr_guard.insert_rule(cfg) {
+        Ok(id) => {
+            let count = srr_guard.injected_rule_count();
+            // Drop the guard before formatting the success body to keep
+            // the write lock as brief as possible. The id was cloned
+            // into us by insert_rule.
+            drop(srr_guard);
+            tracing::info!(rule_id = %id, injected_total = count, "SRR rule injected");
+            json_response(
+                StatusCode::CREATED,
+                &serde_json::json!({
+                    "id": id,
+                    "applied": true,
+                    "injected_count": count,
+                }),
+            )
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            // Map known error strings to specific status codes so an
+            // orchestrator can branch on the response without parsing
+            // free-form text.
+            let status = if msg.contains("already exists") {
+                StatusCode::CONFLICT
+            } else if msg.contains("cap") {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            tracing::warn!(error = %msg, "SRR rule injection refused");
+            json_response(
+                status,
+                &serde_json::json!({
+                    "error": msg,
+                }),
+            )
+        }
+    }
+}
+
+/// DELETE /gvm/srr/rule/:id — Remove an injected SRR rule by ID.
+///
+/// The `:id` path parameter is the rule's `description` field as
+/// supplied to `POST /gvm/srr/rule`. Removes every injected rule
+/// whose description equals `id` (so a method=`*` insert removes
+/// all the expanded verbs in one call).
+///
+/// Responses:
+///   200 — `{ "id": "...", "removed": true, "injected_count": N }`
+///   404 — no injected rule with that id
+pub async fn remove_srr_rule(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response<Body> {
+    let mut srr_guard = match state.srr.write() {
+        Ok(g) => g,
+        Err(_) => {
+            tracing::error!("SRR write lock poisoned during rule remove");
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({"error": "SRR lock poisoned"}),
+            );
+        }
+    };
+
+    let removed = srr_guard.remove_rule(&id);
+    let count = srr_guard.injected_rule_count();
+    drop(srr_guard);
+
+    if removed {
+        tracing::info!(rule_id = %id, injected_total = count, "SRR rule removed");
+        json_response(
+            StatusCode::OK,
+            &serde_json::json!({
+                "id": id,
+                "removed": true,
+                "injected_count": count,
+            }),
+        )
+    } else {
+        json_response(
+            StatusCode::NOT_FOUND,
+            &serde_json::json!({
+                "error": format!("no injected rule with id '{id}'"),
+            }),
+        )
+    }
+}
+
+/// GET /gvm/srr/rule — List the IDs of currently-injected rules.
+///
+/// Lightweight inspection endpoint so an orchestrator can reconcile
+/// its view of the active leases against what the proxy actually
+/// has, and detect drift after a restart (which clears the slot).
+pub async fn list_injected_srr_rules(State(state): State<AppState>) -> Response<Body> {
+    let ids = match state.srr.read() {
+        Ok(g) => g.injected_rule_ids(),
+        Err(_) => {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({"error": "SRR lock poisoned"}),
+            );
+        }
+    };
+    json_response(
+        StatusCode::OK,
+        &serde_json::json!({
+            "ids": ids,
+            "count": ids.len(),
+        }),
+    )
+}
+
 // ─── IC-3 Approval Endpoints ───
 
 /// GET /gvm/pending — List pending IC-3 approval requests.

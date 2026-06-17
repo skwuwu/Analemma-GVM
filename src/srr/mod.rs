@@ -363,8 +363,28 @@ pub enum HostPattern {
 /// by (method, host) for sub-linear lookup.
 pub struct NetworkSRR {
     rules: Vec<NetworkRule>,
+    /// API-injected rules — added via `POST /gvm/srr/rule`,
+    /// removed via `DELETE /gvm/srr/rule/<id>`. Iterated BEFORE
+    /// file-loaded `rules` in [`check_at_with_principal`] so an
+    /// orchestrator-issued lease shadows the file's defaults
+    /// without rewriting the file.
+    ///
+    /// Identified by the rule's `description` field (which becomes the
+    /// HTTP API's `id` on POST and the `:id` path parameter on DELETE).
+    /// Descriptions in this slot must be unique; insertion of a
+    /// duplicate returns 409 from the HTTP layer.
+    ///
+    /// Survives `gvm reload` (file reload only touches `rules`).
+    /// Does NOT survive proxy restart — for first cut, lease lifecycle
+    /// is orchestrator-owned and re-injected on restart. Persistence
+    /// is a v0.7 follow-up if real demand surfaces.
+    injected_rules: Vec<NetworkRule>,
     default_decision: EnforcementDecision,
 }
+
+/// Cap on the number of API-injected rules. Mirrors the IC-3 pending
+/// cap (1000) to prevent an orchestrator bug from filling memory.
+pub const MAX_INJECTED_RULES: usize = 1000;
 
 /// Summary of loaded SRR rules for startup banner display.
 pub struct SrrSummary {
@@ -576,6 +596,7 @@ impl NetworkSRR {
 
         Ok(Self {
             rules,
+            injected_rules: Vec::new(),
             default_decision: EnforcementDecision::Delay { milliseconds: 300 },
         })
     }
@@ -655,6 +676,7 @@ impl NetworkSRR {
 
         Ok(Self {
             rules,
+            injected_rules: Vec::new(),
             default_decision: EnforcementDecision::Delay { milliseconds: 300 },
         })
     }
@@ -722,9 +744,76 @@ impl NetworkSRR {
     /// Paths are canonicalized (percent-decoded, dot-segment resolved, double
     /// slashes collapsed) to prevent bypass via path manipulation.
     ///
-    /// Number of loaded rules (for info/reload reporting).
+    /// Number of file-loaded rules (for info/reload reporting).
+    /// Does not include API-injected rules; use [`injected_rule_count`]
+    /// for that.
     pub fn rule_count(&self) -> usize {
         self.rules.len()
+    }
+
+    /// Number of currently injected (API-issued) rules.
+    pub fn injected_rule_count(&self) -> usize {
+        self.injected_rules.len()
+    }
+
+    /// Snapshot the descriptions of currently injected rules. Used by
+    /// the admin API for listing and by tests for assertion.
+    pub fn injected_rule_ids(&self) -> Vec<String> {
+        self.injected_rules
+            .iter()
+            .map(|r| r.description.clone())
+            .collect()
+    }
+
+    /// Insert a single rule into the injected slot, atomically.
+    ///
+    /// The rule is compiled via the same path as file-loaded rules, so
+    /// a bad regex / unknown decision type / malformed expires_at
+    /// fails here with the same error message format. The rule's
+    /// `description` becomes its ID — it must be non-empty and not
+    /// collide with an existing injected rule.
+    ///
+    /// On success returns the assigned ID (the description). Errors:
+    ///   - missing or empty description
+    ///   - duplicate description in the injected slot
+    ///   - `injected_rules.len() >= MAX_INJECTED_RULES`
+    ///   - any compile-time error from `from_rule_configs` (bad regex,
+    ///     unknown decision type, malformed expires_at, etc.)
+    pub fn insert_rule(&mut self, cfg: NetworkRuleConfig) -> Result<String> {
+        let id = cfg.description.clone().unwrap_or_default();
+        if id.trim().is_empty() {
+            anyhow::bail!("injected rule requires a non-empty `description` (used as the rule ID)");
+        }
+        if self.injected_rules.iter().any(|r| r.description == id) {
+            anyhow::bail!(
+                "an injected rule with id '{id}' already exists; DELETE it first or pick a different description"
+            );
+        }
+        if self.injected_rules.len() >= MAX_INJECTED_RULES {
+            anyhow::bail!(
+                "injected rule cap reached ({MAX_INJECTED_RULES}); remove unused rules before adding more"
+            );
+        }
+        // Compile through the regular path so we share validation
+        // exactly with file-loaded rules. `from_rule_configs` returns
+        // a fresh NetworkSRR; we steal its compiled rule and drop the
+        // rest of the throwaway shell.
+        let compiled = NetworkSRR::from_rule_configs(vec![cfg])?;
+        // `*` method-expansion may produce N rules from 1 config (one
+        // per HTTP verb). Push all of them under the same ID so the
+        // operator can remove the whole set in one call.
+        for rule in compiled.rules {
+            self.injected_rules.push(rule);
+        }
+        Ok(id)
+    }
+
+    /// Remove every injected rule whose `description` equals `id`.
+    /// Returns true if at least one rule was removed.
+    pub fn remove_rule(&mut self, id: &str) -> bool {
+        let before = self.injected_rules.len();
+        self.injected_rules.retain(|r| r.description != id);
+        self.injected_rules.len() < before
     }
 
     /// Extract all exact-match host domains from loaded rules.
@@ -881,7 +970,11 @@ impl NetworkSRR {
         let canonical = normalize_path(path);
         let effective_path = canonical.as_deref().unwrap_or(path);
 
-        for rule in &self.rules {
+        // Iterate API-injected rules BEFORE file rules so a per-task
+        // lease (POST /gvm/srr/rule) shadows the file's defaults
+        // without rewriting the file. First-match-wins is preserved
+        // within each slot and across slots.
+        for rule in self.injected_rules.iter().chain(self.rules.iter()) {
             // Method match (both sides uppercase — case-insensitive comparison)
             if rule.method != effective_method {
                 continue;

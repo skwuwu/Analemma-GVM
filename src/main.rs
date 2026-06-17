@@ -786,6 +786,18 @@ async fn main() {
         .route("/gvm/pending", axum::routing::get(api::pending_approvals))
         .route("/gvm/approve", axum::routing::post(api::approve_request))
         .route("/gvm/reload", axum::routing::post(api::reload_srr))
+        // Single-rule SRR mutation (Tier-3 P3-a). Orchestrator-only;
+        // admin-port only because injecting an Allow rule from inside
+        // a sandbox is a self-grant attack.
+        .route("/gvm/srr/rule", axum::routing::post(api::insert_srr_rule))
+        .route(
+            "/gvm/srr/rule",
+            axum::routing::get(api::list_injected_srr_rules),
+        )
+        .route(
+            "/gvm/srr/rule/:id",
+            axum::routing::delete(api::remove_srr_rule),
+        )
         .route("/gvm/dashboard", axum::routing::get(api::dashboard))
         .route(
             "/gvm/dashboard/events",

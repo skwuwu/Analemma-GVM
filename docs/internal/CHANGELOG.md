@@ -131,6 +131,156 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-06-18: SRR — single-rule mutation endpoints (Tier-3 P3-a)
+
+First Tier-3 item from the strategic-audit roadmap. The
+orchestrator can now inject one SRR rule atomically via
+`POST /gvm/srr/rule` and remove it via
+`DELETE /gvm/srr/rule/:id` — without rewriting the SRR file or
+incurring the latency of a `gvm reload` full-file swap. This is
+the control-plane primitive that makes the v0.5.3 lease shape
+(principal_filter + expires_at) practical at scale.
+
+```bash
+curl -X POST http://127.0.0.1:9090/gvm/srr/rule \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "method": "PUT",
+    "pattern": "api.github.com/{any}",
+    "path_regex": "^/repos/my-org/my-repo/pulls/1842/merge$",
+    "principal_filter": "agent:release-bot",
+    "expires_at": "2026-07-01T15:00:00Z",
+    "decision": { "type": "Allow" },
+    "description": "github.pr.merge.lease.claim-1842"
+  }'
+```
+
+**What changed.**
+
+- `NetworkSRR` gains a parallel `injected_rules: Vec<NetworkRule>`
+  slot and the public methods `insert_rule`, `remove_rule`,
+  `injected_rule_count`, `injected_rule_ids`. Plus the constant
+  `MAX_INJECTED_RULES = 1000` (mirrors the IC-3 pending cap).
+- `check_at_with_principal` iterates
+  `injected_rules.iter().chain(self.rules.iter())` so injected
+  rules win first-match. The two slots together preserve
+  first-match-wins semantics within and across slots.
+- `insert_rule` compiles the supplied `NetworkRuleConfig` through
+  the same `from_rule_configs` path that file-loaded rules use, so
+  validation parity is exact: bad regex, malformed
+  `expires_at`, unknown decision type all surface as
+  `anyhow::Error` from this method. Error messages bubble through
+  to HTTP 400 / 409 / 429 mapping in the handler.
+- Three admin-port HTTP handlers in `src/api.rs`:
+  - `insert_srr_rule`: `POST /gvm/srr/rule` → 201 / 400 / 409 / 429
+  - `remove_srr_rule`: `DELETE /gvm/srr/rule/:id` → 200 / 404
+  - `list_injected_srr_rules`: `GET /gvm/srr/rule` → 200
+    `{ ids, count }`
+- Routes wired only on the admin router (`src/main.rs`). The
+  agent-facing port does NOT expose these — injecting an Allow
+  rule from inside a sandbox would be a self-grant attack.
+
+**Why admin-only.**
+
+The sandbox network namespace can only reach the agent-facing
+proxy port. The admin port lives on a separate listener
+(loopback-only by default, or behind admin JWT + IP allow-list in
+production). This boundary preserves the principle that the
+sandbox cannot grant itself capabilities — only the orchestrator
+operating on the admin port can.
+
+**Lifecycle decisions (and why).**
+
+- *Survives `gvm reload`.* File reload only rebuilds `rules`. The
+  orchestrator does not have to re-issue every lease on every file
+  edit. (The alternative — wipe injected on reload — would be a
+  silent footgun.)
+- *Does NOT survive proxy restart.* The slot is in-memory only.
+  The orchestrator owns lease lifecycle and is expected to
+  re-issue on restart. Persistence is a v0.7+ follow-up if real
+  demand surfaces; the simpler model wins for first cut.
+- *Cap at 1 000 injected rules.* Mirrors the IC-3 pending cap.
+  Protects the proxy against runaway lease issuance from a broken
+  orchestrator. Hit the cap → 429 (the operator's signal to
+  reconcile state).
+
+**Status-code semantics** so an orchestrator can branch on
+response without parsing free-form text:
+
+| Outcome | Mapped from | Status |
+|---------|-------------|--------|
+| success | Ok(id) | 201 |
+| missing description | error contains "description" | 400 |
+| duplicate description | error contains "already exists" | 409 |
+| cap reached | error contains "cap" | 429 |
+| bad regex / other compile error | anything else | 400 |
+
+**Affected files.**
+
+- `src/srr/mod.rs` — `injected_rules` slot, `MAX_INJECTED_RULES`,
+  `insert_rule`, `remove_rule`, `injected_rule_count`,
+  `injected_rule_ids`, `check_at_with_principal` iteration
+  chained.
+- `src/api.rs` — three new handlers, with status-code mapping
+  documented inline.
+- `src/main.rs` — three new admin-router routes.
+- `docs/srr.md` — new "Single-Rule Mutation" subsection with the
+  endpoint contract table and lease example.
+- `docs/internal/CHANGELOG.md` (this entry).
+- `tests/srr_rule_mutation.rs` (new, 10 cases — library layer):
+  - injected rule shadows file rule
+  - removing the injected rule restores the file rule
+  - insert with empty description errors loudly
+  - insert with duplicate description errors and rolls back
+  - remove on unknown id returns false
+  - cap at MAX_INJECTED_RULES; one-more insert errors with "cap"
+  - bad regex returns a compile error and adds nothing
+  - lease composition (principal_filter + expires_at via
+    injection) — three sub-assertions
+  - `injected_rule_ids` returns inserted IDs only
+  - `rule_count` returns only file-loaded (legacy contract)
+- `tests/srr_rule_api.rs` (new, 9 cases — HTTP layer):
+  - 201 + JSON body on success
+  - 400 on missing description
+  - 409 on duplicate
+  - 400 on bad regex (no partial insert)
+  - 400 on malformed JSON shape
+  - 200 on existing-rule removal
+  - 404 on unknown-rule removal
+  - 200 on list with the expected IDs array
+  - full insert → check fires → remove → check doesn't lifecycle
+
+**Verification.**
+
+- `cargo test --test srr_rule_mutation` — 10/10 pass.
+- `cargo test --test srr_rule_api` — 9/9 pass.
+- All previous SRR / GraphQL / timing / IC-3 / api_handlers tests
+  pass unchanged (112+ cases).
+- `cargo check --workspace --tests` clean.
+
+**Risk.**
+
+Low-to-medium. The hot-path change (iteration chain) is a single
+extra `chain()` call; branch prediction handles the "no injected
+rules" case at zero overhead. The write-lock path for insert /
+remove is brief (compile → acquire → push → drop), and an injected
+rule cannot crash the engine — any malformed input is rejected at
+compile, returning 400 with the error string. The new endpoints
+are admin-port-only, so a compromised agent cannot reach them.
+
+**Follow-up.**
+
+- P3-b: `GET /gvm/events?since=<id>&filter=...` long-poll WAL
+  event stream so an orchestrator consumes IC-3 transitions and
+  decision events without polling /gvm/pending. Composes with
+  P3-a: orchestrator subscribes to the stream, sees a Pending
+  event, decides via /gvm/approve AND inserts an Allow lease
+  via /gvm/srr/rule in one round-trip.
+- P3-c: `POST /gvm/payload-context` cooperative body-context
+  endpoint — SDK / sidecar / MCP adapter delivers structured
+  payload context without MITM (lowers the MITM dependency for
+  HTTPS-pinned and gRPC traffic).
+
 ### 2026-06-18: CLI — `gvm import openapi` (Tier-2 P2-b, Tier-2 complete)
 
 Second Tier-2 item from the strategic-audit roadmap. A new CLI
