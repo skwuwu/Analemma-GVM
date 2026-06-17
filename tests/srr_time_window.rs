@@ -46,6 +46,7 @@ fn allow_rule(host: &str, condition: Option<RuleConditionConfig>) -> NetworkRule
         label: None,
         condition,
         expires_at: None,
+        principal_filter: None,
     }
 }
 

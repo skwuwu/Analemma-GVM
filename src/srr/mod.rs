@@ -76,6 +76,35 @@ pub struct NetworkRuleConfig {
     /// condition matches against the request's evaluation timestamp.
     /// Today only `time_window` is defined; future variants land here.
     pub condition: Option<RuleConditionConfig>,
+    /// Optional principal restriction. When set, the rule only fires
+    /// for requests whose verified `agent_id` exactly equals this
+    /// string (case-sensitive). When unset (default), the rule matches
+    /// every principal — the legacy behaviour where `agent_id` was an
+    /// audit label only.
+    ///
+    /// TOML:
+    /// ```toml
+    /// principal_filter = "agent:claims-reviewer-1842"
+    /// ```
+    ///
+    /// Match contract: a rule with `principal_filter = Some(p)` matches
+    /// only when the caller supplies `agent_id == Some(p)`. A rule
+    /// keyed on a principal is skipped for unauthenticated traffic
+    /// (`agent_id == None`) and for any other principal. This is the
+    /// fail-close direction — a rule "for one agent" never accidentally
+    /// fires for an unrelated agent or for traffic that hasn't
+    /// established an identity yet.
+    ///
+    /// First cut is exact-match only. Glob / wildcard
+    /// (`agent:claims-reviewer-*`) is scoped for a follow-up; exact
+    /// match gives the strongest semantics and avoids smuggling via
+    /// similar-named principals on day one.
+    ///
+    /// This promotes `agent_id` from an audit label to an SRR matching
+    /// input — the missing piece for the lease primitive ([CHANGELOG.md]
+    /// v0.7 roadmap). Combined with `expires_at`, a lease is "this
+    /// principal may do these things until this instant."
+    pub principal_filter: Option<String>,
     /// Optional absolute expiration. When set, the rule is skipped on
     /// any request whose evaluation timestamp is at or after `expires_at`.
     ///
@@ -167,6 +196,9 @@ pub struct NetworkRule {
     /// Optional absolute expiration. See [`NetworkRuleConfig::expires_at`].
     /// At or after this instant the rule does not match.
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Optional principal restriction. See
+    /// [`NetworkRuleConfig::principal_filter`].
+    pub principal_filter: Option<String>,
 }
 
 /// Compiled gating condition. Pure function of (rule, evaluation timestamp).
@@ -475,6 +507,7 @@ impl NetworkSRR {
                     is_catch_all,
                     condition: condition.clone(),
                     expires_at: rule_cfg.expires_at,
+                    principal_filter: rule_cfg.principal_filter.clone(),
                 });
             }
         }
@@ -610,6 +643,7 @@ impl NetworkSRR {
                     is_catch_all,
                     condition: condition.clone(),
                     expires_at: rule_cfg.expires_at,
+                    principal_filter: rule_cfg.principal_filter.clone(),
                 });
             }
         }
@@ -775,7 +809,28 @@ impl NetworkSRR {
         path: &str,
         body: Option<&[u8]>,
     ) -> SrrCheckResult {
-        self.check_at(method, host, path, body, Utc::now())
+        self.check_at_with_principal(method, host, path, body, None, Utc::now())
+    }
+
+    /// Check a request with an explicit verified principal (`agent_id`).
+    ///
+    /// Use this from request handlers that resolve the caller's identity
+    /// from JWT or the sandbox veth peer-IP → agent_id table before
+    /// running enforcement. Rules carrying `principal_filter` only match
+    /// when this argument is `Some(matching_id)`.
+    ///
+    /// Passing `None` is the same as calling [`check`] — rules with
+    /// `principal_filter` are skipped (fail-closed for principal-bound
+    /// rules under anonymous traffic).
+    pub fn check_with_principal(
+        &self,
+        method: &str,
+        host: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        agent_id: Option<&str>,
+    ) -> SrrCheckResult {
+        self.check_at_with_principal(method, host, path, body, agent_id, Utc::now())
     }
 
     /// Check a request at an explicit evaluation timestamp.
@@ -790,6 +845,21 @@ impl NetworkSRR {
         host: &str,
         path: &str,
         body: Option<&[u8]>,
+        now: DateTime<Utc>,
+    ) -> SrrCheckResult {
+        self.check_at_with_principal(method, host, path, body, None, now)
+    }
+
+    /// Full check entry point — explicit principal + explicit timestamp.
+    /// All other entry points (`check`, `check_with_principal`, `check_at`)
+    /// funnel through this method.
+    pub fn check_at_with_principal(
+        &self,
+        method: &str,
+        host: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        agent_id: Option<&str>,
         now: DateTime<Utc>,
     ) -> SrrCheckResult {
         // Normalize method: uppercase once here to match rule storage format.
@@ -820,6 +890,20 @@ impl NetworkSRR {
             // Host match
             if !match_host(&rule.host_pattern, &effective_host) {
                 continue;
+            }
+
+            // Principal filter: if the rule is keyed on a specific agent
+            // identity, only that agent's traffic should fire it. A rule
+            // with `principal_filter = Some(p)` is skipped for any caller
+            // whose `agent_id` is `None` (no verified identity) or any
+            // other principal. Rules without `principal_filter` match
+            // every caller (legacy behaviour preserved). One string
+            // comparison; no allocation.
+            if let Some(required) = &rule.principal_filter {
+                match agent_id {
+                    Some(supplied) if supplied == required.as_str() => { /* match */ }
+                    _ => continue,
+                }
             }
 
             // Expiration: a rule whose `expires_at` is at or before the

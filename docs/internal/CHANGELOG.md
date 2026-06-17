@@ -131,6 +131,138 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-06-18: SRR — `principal_filter` rule field (Tier-1 P1-c, Tier-1 complete)
+
+Third and final Tier-1 item from the strategic-audit roadmap.
+Promotes `agent_id` from an audit-only label to an SRR matching
+input — a rule can now require an exact agent identity, and the
+engine enforces it deterministically before any of the more
+expensive matching steps. Combined with `expires_at` (P1-b), this
+is the v0.5.3 spelling of a time-bounded permission grant.
+
+```toml
+[[rules]]
+method = "POST"
+pattern = "workflow.internal/claims/1842"
+principal_filter = "agent:claims-reviewer-1842"
+expires_at = "2026-07-01T12:05:00Z"
+decision = { type = "Allow" }
+```
+
+**What changed.**
+
+- `NetworkRuleConfig` gains `principal_filter: Option<String>`. Same
+  field on the compiled `NetworkRule`.
+- A new public entry point `check_with_principal(method, host, path,
+  body, agent_id: Option<&str>)` and the underlying
+  `check_at_with_principal(..., agent_id, now)`. The legacy `check`
+  and `check_at` now delegate to `check_at_with_principal` with
+  `agent_id = None`. The 170 existing callers (production + tests)
+  did not need to change; only the proxy hot path was updated to
+  pass the resolved principal.
+- `src/proxy/mod.rs` resolves the principal in the documented order
+  (JWT-verified `agent_id` → sandbox peer-IP → `X-GVM-Agent-Id`
+  header) and passes it to `check_with_principal`. JWT identity is
+  preferred over the header because the header is operator-supplied
+  while the JWT is cryptographic.
+- Match logic placed RIGHT AFTER the host filter, before
+  `expires_at` and `condition`. One string comparison; no
+  allocation; branch is a no-op when `principal_filter == None`
+  (which is the case for every legacy rule). The two-line block:
+
+  ```rust
+  if let Some(required) = &rule.principal_filter {
+      match agent_id {
+          Some(supplied) if supplied == required.as_str() => { /* match */ }
+          _ => continue,
+      }
+  }
+  ```
+
+**Match contract.**
+
+- Rule has no filter → matches every principal (legacy).
+- Rule has `Some(p)`, caller supplies `Some(p)` (exact) → match.
+- Rule has `Some(p)`, caller supplies `Some(q)` (different) → skip.
+- Rule has `Some(p)`, caller supplies `None` → skip (fail-closed).
+
+The fail-closed direction is deliberate: code paths that call
+`srr.check(...)` without a principal pass `None`, so
+principal-filtered rules are invisible to them. That preserves the
+strictest possible default for non-audited callers.
+
+**Exact match, case-sensitive.** First cut deliberately does not
+support glob/wildcard. Exact equality rules out smuggling via
+similar-named principals. Wildcard support is a follow-up.
+
+**Lease primitive shape.** With this commit, an orchestrator can
+issue a lease as a single SRR rule that the engine enforces in
+both dimensions (identity + time) without any caller-side cleanup:
+
+```toml
+principal_filter = "agent:claims-reviewer-1842"
+expires_at = "2026-07-01T12:05:00Z"
+decision = { type = "Allow" }
+```
+
+The full lease primitive (P4 in the audit roadmap) wraps this with
+a signed JWT envelope and a `gvm lease issue` CLI; the underlying
+SRR semantics are now there.
+
+**Backwards compatibility.**
+
+- `Option<String>` defaults to `None`. Existing SRR configs unchanged.
+- Existing test fixtures (5 files, 6 sites) get `principal_filter: None`
+  added — mechanical.
+- The 170 existing callers of `srr.check(...)` are unchanged. Only
+  the proxy hot path was updated to use `check_with_principal`.
+  Legacy `check` continues to work and matches every principal.
+
+**Affected files.**
+
+- `src/srr/mod.rs` — field on both `NetworkRuleConfig` and `NetworkRule`,
+  threaded through both compile paths, new entry points
+  `check_with_principal` and `check_at_with_principal`, legacy
+  entries refactored to delegate.
+- `src/proxy/mod.rs` — proxy resolves principal and uses
+  `check_with_principal`.
+- `docs/srr.md` — new "Principal-Bound Rules" subsection with the
+  match contract table, identity-source ordering, and the lease
+  composition example.
+- `docs/internal/CHANGELOG.md` (this entry).
+- `tests/srr_principal_filter.rs` (new, 7 cases):
+  - matching principal fires rule
+  - non-matching principal skips rule
+  - absent principal skips principal-filtered rule (fail-closed)
+  - legacy `check()` entry never fires principal-filtered rule
+  - rules without `principal_filter` match every caller (back-compat)
+  - `principal_filter` composes with `expires_at` (lease shape)
+  - exact-match, case-sensitive
+- 5 test fixture files — `principal_filter: None` added at 6 sites.
+
+**Verification.**
+
+- `cargo test --test srr_principal_filter` — 7/7 pass.
+- All existing tests pass unchanged (P1-a 9 + P1-b 6 + hostile 25 +
+  srr_evasion 10+2 + srr_time_window 11 + graphql_alias 25 +
+  timing 2 + enforcement 11 = 95+ cases in the SRR /
+  payload-evasion / timing / enforcement block).
+- `cargo check --workspace --tests` clean.
+
+**Risk.**
+
+Low. The two-line match block is branch-predicted as a no-op for
+every legacy rule. The proxy now reads `verified_identity` /
+`gvm_headers` to extract `agent_id` — both fields were already
+populated for the audit path; we are reusing them.
+
+**Tier-1 complete.** The three rule fields land the audit's
+"closest small wins": fail-close on unverifiable body
+(unsafe_body_action), rule expiration (expires_at), and identity
+binding (principal_filter). Tier-2 (industry-template provider
+action pack + OpenAPI importer) and Tier-3 (control-plane endpoints
+for orchestrators) are scoped separately.
+
 ### 2026-06-18: SRR — `expires_at` rule field (Tier-1 P1-b)
 
 Second Tier-1 item from the strategic-audit roadmap. First

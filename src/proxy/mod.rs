@@ -819,11 +819,22 @@ pub async fn proxy_handler(
                 );
             }
         };
-        let srr_result = srr.check(
+        // Resolve the principal once for SRR matching. Prefer the
+        // JWT-verified identity (cryptographic) over the parsed header
+        // agent_id (operator-supplied label). Either reaches the
+        // matcher as &str; SRR rules carrying `principal_filter` only
+        // fire when this matches.
+        let principal: Option<&str> = verified_identity
+            .as_ref()
+            .map(|v| v.agent_id.as_str())
+            .or_else(|| gvm_headers.as_ref().map(|h| h.agent_id.as_str()));
+
+        let srr_result = srr.check_with_principal(
             request.method().as_str(),
             &target.host,
             &target.path,
             body_for_srr,
+            principal,
         );
         // srr guard dropped at end of block — ensures future is Send
 

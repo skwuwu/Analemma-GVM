@@ -62,6 +62,7 @@ fn alias_match_rule(names: &[&str]) -> NetworkRuleConfig {
         label: None,
         condition: None,
         expires_at: None,
+        principal_filter: None,
     }
 }
 

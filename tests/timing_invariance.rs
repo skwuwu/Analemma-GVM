@@ -133,6 +133,7 @@ fn rule(
         label: None,
         condition: None,
         expires_at: None,
+        principal_filter: None,
     }
 }
 

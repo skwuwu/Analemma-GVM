@@ -57,6 +57,7 @@ fn alias_match_rule(names: &[&str]) -> NetworkRuleConfig {
         label: Some("graphql_alias".to_string()),
         condition: None,
         expires_at: None,
+        principal_filter: None,
     }
 }
 

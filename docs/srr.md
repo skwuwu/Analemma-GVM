@@ -210,6 +210,79 @@ Regression coverage: [tests/srr_expires_at.rs](../tests/srr_expires_at.rs)
 (6 cases — strictly-before / at-instant / strictly-after / legacy
 no-deadline / malformed-string-fails-load / replay-determinism).
 
+### Principal-Bound Rules — `principal_filter`
+
+A rule can require an exact agent identity. The rule only fires when
+the caller's verified `agent_id` matches the configured string exactly
+(case-sensitive). This promotes `agent_id` from an audit-only label to
+an SRR matching input.
+
+```toml
+[[rules]]
+method = "POST"
+pattern = "workflow.internal/claims/1842"
+principal_filter = "agent:claims-reviewer-1842"
+decision = { type = "Allow" }
+```
+
+**Identity source.** The proxy resolves the principal in this order:
+
+1. JWT-verified `agent_id` (cryptographic — Bearer token signed with
+   the configured Ed25519 key).
+2. Sandbox peer-IP → agent_id mapping (topological — the proxy minted
+   the veth pair so peer-IP equates to the sandbox's identity).
+3. `X-GVM-Agent-Id` header (operator-supplied label, lowest trust).
+
+The first one that resolves wins. Whatever string it produces is
+passed to the matcher.
+
+**Match contract**:
+
+| Rule | Caller supplies `agent_id` | Result |
+|------|----------------------------|--------|
+| `principal_filter = None` (legacy) | anything | match (back-compat) |
+| `principal_filter = Some(p)` | `Some(p)` (exact match) | match |
+| `principal_filter = Some(p)` | `Some(q)` (different string) | skip |
+| `principal_filter = Some(p)` | `None` (unauthenticated) | skip (fail-closed) |
+
+**Fail-close direction**: a rule "for one agent" never accidentally
+fires for an unrelated agent or for traffic that hasn't established an
+identity. Code paths that call the legacy entry point (`srr.check(...)`
+without a principal) implicitly pass `None`, so principal-filtered
+rules are invisible to them. This is the intended safety boundary for
+non-audited callers.
+
+**Exact match, case-sensitive**. The first cut deliberately does not
+support glob / wildcard matching (`agent:claims-reviewer-*`). Exact
+equality gives the strongest semantics and rules out smuggling via
+similar-named principals. Wildcard support is a follow-up; it would
+need the same compile-time validation that the existing host-pattern
+glob receives.
+
+**Lease primitive composition**: combined with `expires_at`,
+`principal_filter` is the v0.5.3 spelling of a time-bounded permission
+grant — "this principal may do these things until this instant":
+
+```toml
+[[rules]]
+method = "POST"
+pattern = "workflow.internal/claims/1842"
+principal_filter = "agent:claims-reviewer-1842"
+expires_at = "2026-07-01T12:05:00Z"
+decision = { type = "Allow" }
+```
+
+After the deadline the rule expires; before the deadline it only fires
+for the named agent. An orchestrator emits this rule after approving
+an IC-3 request and forgets about cleanup — both the principal scope
+and the time scope are enforced by the engine, not by the caller.
+
+Regression coverage:
+[tests/srr_principal_filter.rs](../tests/srr_principal_filter.rs)
+(7 cases — match path, non-matching principal, absent principal,
+legacy `check` entry, back-compat, lease composition with
+`expires_at`, case-sensitivity).
+
 ### Base64 Payload Decoding
 
 SRR automatically decodes Base64-encoded content before pattern matching. This prevents bypass via encoding obfuscation. Two decoding strategies are applied in order:

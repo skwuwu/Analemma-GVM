@@ -49,6 +49,7 @@ fn payload_rule_then_url_deny() -> Vec<NetworkRuleConfig> {
         label: Some("graphql_dangerous".to_string()),
         condition: None,
         expires_at: None,
+        principal_filter: None,
     };
 
     // Rule 2: URL-level Deny on the same endpoint. The audit's
@@ -69,6 +70,7 @@ fn payload_rule_then_url_deny() -> Vec<NetworkRuleConfig> {
         label: Some("graphql_url".to_string()),
         condition: None,
         expires_at: None,
+        principal_filter: None,
     };
 
     vec![payload, url_deny]
