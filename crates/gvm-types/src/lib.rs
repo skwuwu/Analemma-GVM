@@ -1823,11 +1823,60 @@ pub struct TransportInfo {
     pub status_code: Option<u16>,
 }
 
-/// Classification source — which enforcement layer produced the final decision
+/// Classification source — which enforcement layer produced the final decision.
+///
+/// The legacy `SRR` variant covers the standard network-observed path
+/// (URL / host / method match, optionally with payload inspection at the
+/// MITM relay). The five `Cooperative*` variants are introduced by Tier-3
+/// P3-c Phase 2 to surface evidence-tier information for decisions that
+/// involved a cooperative intent lease (`X-GVM-Context-Token`). The
+/// mapping to the dotted string written into the WAL's `decision_source`
+/// field lives in `proxy/headers.rs`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ClassificationSource {
-    /// Network SRR (host/path/method matching)
+    /// Network SRR (host/path/method matching).
     SRR,
+    /// Token-claimed lease whose declared body was used for SRR (no MITM
+    /// observation available). Lowest evidence; depends on agent honesty
+    /// + sandbox isolation.
+    CooperativeDeclaredOnly,
+    /// Token-claimed lease AND observed body — both run through SRR, the
+    /// observed body decided. Equivalent evidence to network-observed.
+    CooperativeCrossChecked,
+    /// Declared body did not match observed body. Always Deny.
+    CooperativeMismatch,
+    /// Token claimed after lease TTL elapsed, OR `policy_epoch` mismatch
+    /// without `allow_pinned_lease`. Always Deny.
+    CooperativeExpired,
+    /// Token presented but no matching active lease exists. Re-use,
+    /// forgery, or replay. Always Deny.
+    CooperativeUnbound,
+}
+
+impl ClassificationSource {
+    /// String form used in WAL events, `X-GVM-Decision-Source`
+    /// response header, and the `decision_source` field of
+    /// `GovernanceBlockResponse`. The `SRR` variant retains its
+    /// historical `"SRR"` form for wire compatibility — the new
+    /// `DecisionSource::SrrNetworkObserved => "srr.network_observed"`
+    /// canonical form is exposed only through `DecisionSource`, which
+    /// callers migrating to the new enum should use.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ClassificationSource::SRR => "SRR",
+            ClassificationSource::CooperativeDeclaredOnly => "cooperative.declared_only",
+            ClassificationSource::CooperativeCrossChecked => "cooperative.cross_checked",
+            ClassificationSource::CooperativeMismatch => "cooperative.mismatch",
+            ClassificationSource::CooperativeExpired => "cooperative.expired",
+            ClassificationSource::CooperativeUnbound => "cooperative.unbound",
+        }
+    }
+}
+
+impl From<ClassificationSource> for String {
+    fn from(src: ClassificationSource) -> Self {
+        src.as_str().to_string()
+    }
 }
 
 /// Internal classification result
@@ -2183,4 +2232,14 @@ pub struct GovernanceBlockResponse {
 
     /// Impact Classification level (1-3, higher = more restrictive)
     pub ic_level: u8,
+
+    /// Evidence tier that produced this decision. Mirrors the
+    /// `X-GVM-Decision-Source` response header on Allow / Delay paths
+    /// so introspecting a Deny doesn't require parsing the JSON body
+    /// to learn whether the call hit `srr.network_observed`,
+    /// `cooperative.mismatch`, or one of the other tiers. Defaults to
+    /// `None` for callers that have not been updated yet; the
+    /// response header is omitted in that case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_source: Option<String>,
 }

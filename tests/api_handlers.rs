@@ -471,6 +471,7 @@ async fn governance_block_response_emits_matched_rule_header() {
         matched_rule_id: Some("finance-002".to_string()),
         policy_link: Some("https://gvm-console/rules/finance-002".to_string()),
         ic_level: 4,
+        decision_source: None,
     };
     // Round-trip via the JSON body — confirms Serialize emits both
     // new fields and the older shape stays compatible.

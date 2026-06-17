@@ -240,7 +240,7 @@ async fn malformed_payload_hash_returns_400() {
 #[tokio::test]
 async fn preflight_deny_returns_no_token() {
     // Set up an SRR that denies transfers under "ban.com".
-    let mut srr_guard = state_with_deny_rule().await;
+    let srr_guard = state_with_deny_rule().await;
     // The deny rule was injected; now run a lease against the same
     // URL and verify the response has no token.
     let (state, _wal) = srr_guard.take();

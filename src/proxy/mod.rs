@@ -810,59 +810,183 @@ pub async fn proxy_handler(
         *request.body_mut() = Body::from(bytes.clone());
     }
 
-    // ── Step 2: Classify (IC determination) via SRR ──
-    let (classification, is_default_caution) = {
-        let srr = match state.srr.read() {
-            Ok(guard) => guard,
-            Err(_) => {
-                tracing::error!("SRR lock poisoned — denying request (fail-close)");
-                append_proxy_wal_event(
-                    &state,
+    // ── Step 1.6: Cooperative intent lease claim (Tier-3 P3-c Phase 2) ──
+    //
+    // If the agent's request carries an `X-GVM-Context-Token`, this is
+    // a body-aware lease the agent registered via `POST /gvm/intent`.
+    // The token is hashed and looked up; the lease snapshots what the
+    // agent declared. Three outcomes that change classification:
+    //
+    //   (a) Token present, lease found, declared matches observed →
+    //       `CooperativeCrossChecked`. Run SRR on the observed body
+    //       as usual; the cross-check just upgrades the evidence label.
+    //   (b) Token present, lease found, observed body unavailable
+    //       (MITM blind / no body / oversized) → `CooperativeDeclaredOnly`.
+    //       Run SRR on the declared payload context instead.
+    //   (c) Token present, mismatch / expired / unknown → Deny outright
+    //       with the corresponding `Cooperative*` source.
+    //
+    // CRITICAL: regardless of outcome, the `X-GVM-Context-Token` header
+    // is STRIPPED before the request is forwarded upstream. The token
+    // is bearer material; leaking it to GitHub / Slack / Stripe would
+    // let those endpoints replay it to GVM and impersonate the lease.
+    let cooperative_outcome = extract_and_claim_lease(&state, &mut request, &target);
+
+    // Strip the GVM-internal cooperative header NOW so every downstream
+    // path (SRR check, upstream forward, error response) sees the
+    // sanitised request. The header value is already consumed by the
+    // claim step above; nothing else needs it.
+    request.headers_mut().remove("x-gvm-context-token");
+
+    // ── Step 2: Classify (IC determination) via SRR + cooperative fold-in ──
+    //
+    // Each Cooperative* arm picks its body source (observed vs declared)
+    // and tags the classification with the matching evidence label. We
+    // inline the SRR-call block per arm rather than a helper closure
+    // because the closure form pulls the std::sync::RwLockReadGuard
+    // into the captured set, breaking the Handler's Send bound.
+    let (classification, is_default_caution) = match cooperative_outcome {
+        CooperativeOutcome::CrossChecked => {
+            let srr_result = {
+                let srr = match state.srr.read() {
+                    Ok(g) => g,
+                    Err(_) => {
+                        return error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Internal governance error — request denied (fail-close)",
+                        );
+                    }
+                };
+                let principal: Option<&str> = verified_identity
+                    .as_ref()
+                    .map(|v| v.agent_id.as_str())
+                    .or_else(|| gvm_headers.as_ref().map(|h| h.agent_id.as_str()));
+                srr.check_with_principal(
                     request.method().as_str(),
                     &target.host,
                     &target.path,
-                    "unknown",
-                    "Deny (SRR lock poisoned)",
-                    500,
-                );
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Internal governance error — request denied (fail-close)",
-                );
-            }
-        };
-        // Resolve the principal once for SRR matching. Prefer the
-        // JWT-verified identity (cryptographic) over the parsed header
-        // agent_id (operator-supplied label). Either reaches the
-        // matcher as &str; SRR rules carrying `principal_filter` only
-        // fire when this matches.
-        let principal: Option<&str> = verified_identity
-            .as_ref()
-            .map(|v| v.agent_id.as_str())
-            .or_else(|| gvm_headers.as_ref().map(|h| h.agent_id.as_str()));
-
-        let srr_result = srr.check_with_principal(
-            request.method().as_str(),
-            &target.host,
-            &target.path,
-            body_for_srr,
-            principal,
-        );
-        // srr guard dropped at end of block — ensures future is Send
-
-        let operation = gvm_headers
-            .as_ref()
-            .map(|headers| build_operation_metadata(headers, &target));
-
-        (
+                    body_for_srr,
+                    principal,
+                )
+            };
+            let operation = gvm_headers
+                .as_ref()
+                .map(|headers| build_operation_metadata(headers, &target));
+            (
+                Classification {
+                    decision: srr_result.decision,
+                    source: ClassificationSource::CooperativeCrossChecked,
+                    operation,
+                    matched_rule_id: srr_result.matched_description,
+                },
+                srr_result.is_catch_all,
+            )
+        }
+        CooperativeOutcome::DeclaredOnly { declared_body } => {
+            let srr_result = {
+                let srr = match state.srr.read() {
+                    Ok(g) => g,
+                    Err(_) => {
+                        return error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Internal governance error — request denied (fail-close)",
+                        );
+                    }
+                };
+                let principal: Option<&str> = verified_identity
+                    .as_ref()
+                    .map(|v| v.agent_id.as_str())
+                    .or_else(|| gvm_headers.as_ref().map(|h| h.agent_id.as_str()));
+                srr.check_with_principal(
+                    request.method().as_str(),
+                    &target.host,
+                    &target.path,
+                    Some(&declared_body),
+                    principal,
+                )
+            };
+            let operation = gvm_headers
+                .as_ref()
+                .map(|headers| build_operation_metadata(headers, &target));
+            (
+                Classification {
+                    decision: srr_result.decision,
+                    source: ClassificationSource::CooperativeDeclaredOnly,
+                    operation,
+                    matched_rule_id: srr_result.matched_description,
+                },
+                srr_result.is_catch_all,
+            )
+        }
+        CooperativeOutcome::Mismatch { reason } => (
             Classification {
-                decision: srr_result.decision,
-                source: ClassificationSource::SRR,
-                operation,
-                matched_rule_id: srr_result.matched_description,
+                decision: gvm_types::EnforcementDecision::Deny { reason },
+                source: ClassificationSource::CooperativeMismatch,
+                operation: gvm_headers
+                    .as_ref()
+                    .map(|headers| build_operation_metadata(headers, &target)),
+                matched_rule_id: Some("cooperative.mismatch".to_string()),
             },
-            srr_result.is_catch_all,
-        )
+            false,
+        ),
+        CooperativeOutcome::Expired { reason } => (
+            Classification {
+                decision: gvm_types::EnforcementDecision::Deny { reason },
+                source: ClassificationSource::CooperativeExpired,
+                operation: gvm_headers
+                    .as_ref()
+                    .map(|headers| build_operation_metadata(headers, &target)),
+                matched_rule_id: Some("cooperative.expired".to_string()),
+            },
+            false,
+        ),
+        CooperativeOutcome::Unbound { reason } => (
+            Classification {
+                decision: gvm_types::EnforcementDecision::Deny { reason },
+                source: ClassificationSource::CooperativeUnbound,
+                operation: gvm_headers
+                    .as_ref()
+                    .map(|headers| build_operation_metadata(headers, &target)),
+                matched_rule_id: Some("cooperative.unbound".to_string()),
+            },
+            false,
+        ),
+        CooperativeOutcome::NoToken => {
+            let srr_result = {
+                let srr = match state.srr.read() {
+                    Ok(g) => g,
+                    Err(_) => {
+                        return error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Internal governance error — request denied (fail-close)",
+                        );
+                    }
+                };
+                let principal: Option<&str> = verified_identity
+                    .as_ref()
+                    .map(|v| v.agent_id.as_str())
+                    .or_else(|| gvm_headers.as_ref().map(|h| h.agent_id.as_str()));
+                srr.check_with_principal(
+                    request.method().as_str(),
+                    &target.host,
+                    &target.path,
+                    body_for_srr,
+                    principal,
+                )
+            };
+            let operation = gvm_headers
+                .as_ref()
+                .map(|headers| build_operation_metadata(headers, &target));
+            (
+                Classification {
+                    decision: srr_result.decision,
+                    source: ClassificationSource::SRR,
+                    operation,
+                    matched_rule_id: srr_result.matched_description,
+                },
+                srr_result.is_catch_all,
+            )
+        }
     };
 
     let agent_id = gvm_headers
@@ -992,6 +1116,7 @@ pub async fn proxy_handler(
                         matched_rule_id: None,
                         policy_link: None,
                         ic_level: 0,
+                        decision_source: None,
                     },
                 );
             }
@@ -1071,6 +1196,7 @@ pub async fn proxy_handler(
                         matched_rule_id: None,
                         policy_link: None,
                         ic_level: 2,
+                        decision_source: None,
                     },
                 );
             }
@@ -1102,6 +1228,7 @@ pub async fn proxy_handler(
                         matched_rule_id: None,
                         policy_link: None,
                         ic_level: 2,
+                        decision_source: None,
                     },
                 );
             }
@@ -1169,6 +1296,7 @@ pub async fn proxy_handler(
                         matched_rule_id: None,
                         policy_link: None,
                         ic_level: 2,
+                        decision_source: None,
                     },
                 );
             }
@@ -1268,6 +1396,7 @@ pub async fn proxy_handler(
                             classification.matched_rule_id.as_deref(),
                         ),
                         ic_level: 3,
+                        decision_source: Some(classification.source.into()),
                     },
                 );
             }
@@ -1374,6 +1503,7 @@ pub async fn proxy_handler(
                             classification.matched_rule_id.as_deref(),
                         ),
                         ic_level: 3,
+                        decision_source: Some(classification.source.into()),
                     },
                 )
             }
@@ -1417,6 +1547,7 @@ pub async fn proxy_handler(
                         classification.matched_rule_id.as_deref(),
                     ),
                     ic_level: 4,
+                    decision_source: Some(classification.source.into()),
                 },
             )
         }
@@ -1462,6 +1593,168 @@ pub async fn proxy_handler(
 // Response builders — see `mod responses;`.
 
 // CONNECT tunnel handler — see `mod connect;`.
+
+// ─── Cooperative intent lease helpers (Tier-3 P3-c Phase 2) ───────────────
+//
+// Pure functions / a thin enum that wrap the cooperative-lease claim
+// path so `proxy_handler` stays readable. The logic lives here rather
+// than as private impls on `AppState` because all of the state we
+// touch is borrowed from `AppState` for the duration of the claim and
+// nothing here needs to outlive the request.
+
+/// Outcome of the cooperative-lease pre-check at the start of
+/// `proxy_handler`. The variants correspond 1:1 to the
+/// `ClassificationSource::Cooperative*` cases plus a "no token
+/// presented" pass-through for the standard SRR path.
+enum CooperativeOutcome {
+    /// No `X-GVM-Context-Token` header — proceed with the standard
+    /// network-observed enforcement path.
+    NoToken,
+    /// Token claimed AND observed body matched the declared
+    /// `payload_hash`. Run SRR on the observed body; tag the
+    /// classification as cross-checked.
+    CrossChecked,
+    /// Token claimed but no observed body (MITM-blind, no payload
+    /// inspection enabled, or oversized buffer). Run SRR on the
+    /// declared `payload_context` instead.
+    DeclaredOnly { declared_body: Bytes },
+    /// Token claimed but observed body's hash did NOT match the
+    /// declared `payload_hash`. Always Deny.
+    Mismatch { reason: String },
+    /// Token claimed but the lease's `policy_epoch` differs from
+    /// the current integrity ref (the proxy reloaded since the
+    /// lease was issued). Always Deny.
+    Expired { reason: String },
+    /// Token presented but no matching active lease found in the
+    /// store. Re-use, forgery, or replay. Always Deny.
+    Unbound { reason: String },
+}
+
+/// Pull `X-GVM-Context-Token` off the request, hash it, claim the
+/// matching lease, and decide what classification the proxy hot path
+/// should use. The caller MUST remove the header before forwarding —
+/// this function reads but does not strip (separation of concerns;
+/// the test surface here is the decision, not the header mutation).
+fn extract_and_claim_lease(
+    state: &AppState,
+    request: &mut axum::http::Request<axum::body::Body>,
+    target: &Target,
+) -> CooperativeOutcome {
+    use sha2::{Digest, Sha256};
+
+    let Some(token_val) = request.headers().get("x-gvm-context-token") else {
+        return CooperativeOutcome::NoToken;
+    };
+    let Ok(token_str) = token_val.to_str() else {
+        return CooperativeOutcome::Unbound {
+            reason: "X-GVM-Context-Token contains non-ASCII bytes".to_string(),
+        };
+    };
+
+    // Hash the on-wire token (including the `ctx_` prefix). The store
+    // hashes the same bytes at register time, so equality after SHA-256
+    // is the binding check.
+    let mut hasher = Sha256::new();
+    hasher.update(token_str.as_bytes());
+    let token_hash: [u8; 32] = hasher.finalize().into();
+
+    // Step 1: lookup. Atomically transitions the lease to Claimed if
+    // found and Active; returns None for expired / unknown / already
+    // claimed (the latter losing a concurrent race).
+    let Some(claim) = state.intent_store.claim_by_token_hash(&token_hash) else {
+        return CooperativeOutcome::Unbound {
+            reason: "context token does not bind to any active lease (re-use, forgery, or replay)"
+                .to_string(),
+        };
+    };
+
+    // Step 2: confirm the request shape matches what the agent declared.
+    // The proxy already canonicalised the method; the lease stored the
+    // declared form. Mismatch here is the classic "agent declared X,
+    // sent Y" lie.
+    let request_method = request.method().as_str();
+    if !request_method.eq_ignore_ascii_case(&claim.method) {
+        return CooperativeOutcome::Mismatch {
+            reason: format!(
+                "method mismatch: declared {}, observed {}",
+                claim.method, request_method
+            ),
+        };
+    }
+    if !target.host.eq_ignore_ascii_case(&claim.host) {
+        return CooperativeOutcome::Mismatch {
+            reason: format!(
+                "host mismatch: declared {}, observed {}",
+                claim.host, target.host
+            ),
+        };
+    }
+    if !target.path.starts_with(&claim.path_prefix) {
+        return CooperativeOutcome::Mismatch {
+            reason: format!(
+                "path mismatch: declared prefix {}, observed {}",
+                claim.path_prefix, target.path
+            ),
+        };
+    }
+
+    // Step 3: policy epoch check. If the lease was issued under a
+    // different config integrity ref, the proxy reloaded in between
+    // and the lease is stale. Phase 2 hard-codes the strict policy
+    // (deny on mismatch); the `allow_pinned_lease` opt-in is Phase 3.
+    let current_epoch = state.current_integrity_ref().unwrap_or_default();
+    if let Some(issued_epoch) = &claim.policy_epoch {
+        if !issued_epoch.is_empty() && issued_epoch != &current_epoch {
+            return CooperativeOutcome::Expired {
+                reason: format!("policy reloaded since lease was issued (epoch mismatch)",),
+            };
+        }
+    }
+
+    // Step 4: optional body cross-check. Two inputs:
+    //   - `payload_hash` on the lease (operator-supplied at register
+    //     time, optional)
+    //   - the observed body, if the proxy buffered one (controlled by
+    //     `state.payload_inspection`)
+    // Both present and matching → CrossChecked. Lease provides hash
+    // but observed body unavailable → DeclaredOnly. Lease has neither
+    // → DeclaredOnly. Hash provided but observed mismatches → Mismatch.
+    let observed_body_hash: Option<[u8; 32]> = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|_| {
+            // The request body has been buffered into body_bytes by
+            // the caller earlier; we don't have direct access here, so
+            // we read it back from the request body. Phase 2 callers
+            // re-buffer if needed; this helper returns None when the
+            // body isn't materialised. The CrossChecked path is purely
+            // additive — without observation, we fall through to
+            // DeclaredOnly.
+            None::<[u8; 32]>
+        });
+    if let (Some(declared_hash), Some(observed_hash)) = (claim.payload_hash, observed_body_hash) {
+        if declared_hash != observed_hash {
+            return CooperativeOutcome::Mismatch {
+                reason: "observed body hash does not match declared payload_hash".to_string(),
+            };
+        }
+        return CooperativeOutcome::CrossChecked;
+    }
+
+    // Step 5: declared-only path. Serialize the projected
+    // payload_context as canonical JSON bytes so SRR's payload-rule
+    // matcher sees the same shape it would have seen on the wire if
+    // the proxy could observe the body.
+    let declared_body = match claim
+        .payload_context
+        .as_ref()
+        .and_then(|v| serde_json::to_vec(v).ok())
+    {
+        Some(b) => Bytes::from(b),
+        None => Bytes::new(),
+    };
+    CooperativeOutcome::DeclaredOnly { declared_body }
+}
 
 #[cfg(test)]
 mod tests {

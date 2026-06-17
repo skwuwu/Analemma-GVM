@@ -131,6 +131,131 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-06-18: Cooperative intent lease — Phase 2 claim path (Tier-3 P3-c)
+
+Wires the issuance side from Phase 1 to the proxy hot path. A
+visible HTTP request carrying `X-GVM-Context-Token` now binds the
+request to the declared lease at classification time, and the
+classification result records which evidence tier produced the
+decision. The blind paths (MITM-defeated TLS, cert pinning, mTLS,
+gRPC over h2) — Phase 3 — still need a delivery channel for the
+token; everything else needed for the visible-HTTP case is now
+shipped.
+
+**What changed.**
+
+- `src/proxy/mod.rs` — new `extract_and_claim_lease()` reads the
+  `X-GVM-Context-Token` header, hashes it (SHA-256 over the
+  on-wire form including the `ctx_` prefix), calls
+  `IntentStore::claim_by_token_hash` for the atomic
+  Active → Claimed transition, and returns a `CooperativeOutcome`
+  enum with six variants (`NoToken`, `CrossChecked`,
+  `DeclaredOnly`, `Mismatch { reason }`, `Expired { reason }`,
+  `Unbound { reason }`).
+- `src/proxy/mod.rs::proxy_handler` — runs
+  `extract_and_claim_lease` before the SRR check. **Strips
+  `X-GVM-Context-Token` immediately after**, before any
+  downstream path (SRR, forward, error response) touches the
+  request. This is the load-bearing security invariant of Phase
+  2 — token leakage to upstream would let GitHub / Slack /
+  Stripe replay it to GVM and impersonate the lease. Each
+  `CooperativeOutcome` arm inlines the SRR-call block (rather
+  than going through a closure) so the `std::sync::RwLockReadGuard`
+  on `state.srr` does not pull into a captured set and break the
+  Handler's Send bound.
+- `src/proxy/mod.rs` — match arms map to classifications:
+  - `CrossChecked` → SRR on observed body, source
+    `CooperativeCrossChecked`. (Observed-body hash extraction
+    pending Phase 3's streamed-body refactor; currently falls
+    through to `DeclaredOnly`.)
+  - `DeclaredOnly` → SRR on canonical-JSON of declared
+    `payload_context`, source `CooperativeDeclaredOnly`.
+  - `Mismatch` / `Expired` / `Unbound` → Deny with the matching
+    `cooperative.*` source.
+  - `NoToken` → existing `srr.network_observed` path. Unchanged.
+- `crates/gvm-types/src/lib.rs` — `GovernanceBlockResponse` gains
+  `decision_source: Option<String>` with `skip_serializing_if`
+  (back-compat for older callers). `ClassificationSource` gains
+  `as_str()` and `From<ClassificationSource> for String`. The
+  `SRR` variant retains its historical `"SRR"` wire form; the new
+  `DecisionSource::SrrNetworkObserved => "srr.network_observed"`
+  canonical form is exposed only through `DecisionSource` to keep
+  the response header stable for existing consumers.
+- `src/proxy/responses.rs::governance_block_response` — emits
+  `X-GVM-Decision-Source` on the response when
+  `block.decision_source.is_some()`. Agents reading a 403 can
+  now tell `cooperative.mismatch` from
+  `cooperative.unbound` from the header without parsing the JSON
+  body.
+- `src/proxy/mod.rs` — Deny / RequireApproval-timeout / IC-3
+  queue-overflow paths populate `decision_source` from
+  `classification.source`. WAL-infra-failure / budget-exceeded
+  paths leave it `None` (those Denies don't come from the
+  classification engine).
+
+**Tests** (10, all passing — `tests/cooperative_intent_lease_phase2.rs`).
+
+The new test file uses the existing `common::test_state()` plus
+the recording-upstream pattern from `tests/integration.rs`:
+
+- `unknown_token_returns_deny_with_unbound_source` — fabricated
+  `ctx_…` value not in the store; 403 +
+  `X-GVM-Decision-Source: cooperative.unbound`.
+- `non_ascii_token_returns_unbound` — header with raw `0xff
+  0xfe 0xfd` bytes; smuggled in via `HeaderValue::from_bytes`
+  (axum accepts it; `to_str()` in the extractor rejects).
+- `method_mismatch_returns_deny_with_mismatch_source` — lease
+  for POST, request as PUT.
+- `path_mismatch_returns_deny_with_mismatch_source` — lease for
+  `/transfer`, request to `/admin`.
+- `host_mismatch_returns_deny_with_mismatch_source` — lease for
+  `api.bank.com`, X-GVM-Target-Host `api.evil.com`.
+- `valid_lease_allows_with_declared_only_source` — happy path;
+  200 OK + `X-GVM-Decision-Source: cooperative.declared_only`;
+  upstream observed exactly one request.
+- `valid_lease_path_prefix_match_allows` — lease for
+  `/transfer`, request to `/transfer/123` (prefix match).
+- `context_token_never_leaks_to_upstream_on_allow` — **the
+  load-bearing security invariant**. Mock upstream captures
+  every forwarded header; assertion: no `x-gvm-context-token`
+  in the captured headers, and (defence in depth) no
+  `x-gvm-*` header survives at all.
+- `token_reuse_second_request_returns_unbound` — first request
+  succeeds; second with the same token gets
+  `cooperative.unbound` (the state machine already moved past
+  Active).
+- `epoch_change_between_issue_and_claim_returns_expired` —
+  flips `state.active_integrity_ref` between
+  `register_intent` and `proxy_handler`; expects
+  `cooperative.expired`.
+
+**Cleanup.** Removed the unused `run_srr_check` helper (the
+inline-per-arm form replaced it). Dropped the unused
+`claim_id: u64` fields on `CooperativeOutcome::CrossChecked` and
+`DeclaredOnly` — they were placeholders for a
+`gvm.intent.lease_claimed` WAL event that was deferred. The
+normal `proxy_handler` audit path already captures the decision
+under `cooperative.*` source.
+
+**Deferred to Phase 3.**
+
+- Observed-body hash extraction so `CrossChecked` produces the
+  highest-tier `cooperative.cross_checked` evidence. Today the
+  body cross-check exists in `extract_and_claim_lease` but
+  returns `None` for the observed hash, routing to
+  `DeclaredOnly`.
+- `allow_pinned_lease` opt-in for stale-epoch acceptance.
+- Blind-path token delivery (CONNECT-visible token, sidecar /
+  veth binding).
+
+**Risk.** Header strip is the only path-affecting change to
+existing traffic, and the test for it pins the exact upstream
+observation. The cooperative arms only fire when
+`X-GVM-Context-Token` is present, which no production agent sets
+today. The default decision_source `None` keeps the existing
+Deny wire shape for callers that didn't update — the
+`X-GVM-Decision-Source` header is additive.
+
 ### 2026-06-18: Cooperative intent lease — Phase 1 issuance (Tier-3 P3-c)
 
 Body-aware policy enforcement when MITM is blind (cert pinning,

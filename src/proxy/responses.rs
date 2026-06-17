@@ -175,6 +175,11 @@ pub(super) fn governance_block_response(
             },
         );
 
+    if let Some(ref source) = block.decision_source {
+        if let Ok(v) = axum::http::HeaderValue::from_str(source) {
+            builder = builder.header("X-GVM-Decision-Source", v);
+        }
+    }
     if !block.event_id.is_empty() {
         builder = builder.header("X-GVM-Event-Id", &block.event_id);
     }

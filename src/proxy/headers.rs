@@ -28,6 +28,11 @@ pub(super) fn inject_gvm_response_headers(
     let decision_str = format!("{:?}", classification.decision);
     let source_str = match classification.source {
         ClassificationSource::SRR => "SRR",
+        ClassificationSource::CooperativeDeclaredOnly => "cooperative.declared_only",
+        ClassificationSource::CooperativeCrossChecked => "cooperative.cross_checked",
+        ClassificationSource::CooperativeMismatch => "cooperative.mismatch",
+        ClassificationSource::CooperativeExpired => "cooperative.expired",
+        ClassificationSource::CooperativeUnbound => "cooperative.unbound",
     };
 
     // Always inject these headers
@@ -139,10 +144,26 @@ pub(super) fn build_event(
             status_code: None,
         }),
         decision: format!("{:?}", classification.decision),
-        decision_source: format!("{:?}", classification.source),
+        decision_source: match classification.source {
+            ClassificationSource::SRR => "SRR".to_string(),
+            ClassificationSource::CooperativeDeclaredOnly => {
+                "cooperative.declared_only".to_string()
+            }
+            ClassificationSource::CooperativeCrossChecked => {
+                "cooperative.cross_checked".to_string()
+            }
+            ClassificationSource::CooperativeMismatch => "cooperative.mismatch".to_string(),
+            ClassificationSource::CooperativeExpired => "cooperative.expired".to_string(),
+            ClassificationSource::CooperativeUnbound => "cooperative.unbound".to_string(),
+        },
         matched_rule_id: classification.matched_rule_id.clone(),
         enforcement_point: match classification.source {
             ClassificationSource::SRR => "proxy".to_string(),
+            ClassificationSource::CooperativeDeclaredOnly
+            | ClassificationSource::CooperativeCrossChecked
+            | ClassificationSource::CooperativeMismatch
+            | ClassificationSource::CooperativeExpired
+            | ClassificationSource::CooperativeUnbound => "proxy-cooperative".to_string(),
         },
         status: EventStatus::Pending,
         payload: PayloadDescriptor::default(),

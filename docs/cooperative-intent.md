@@ -289,35 +289,81 @@ lease for Phase 2 to compare against.
 9. Legacy URL-only intent unchanged
 10. `DecisionSource` enum round-trips through its dotted-string form
 
-### Phase 2 — Claim path (next)
+### Phase 2 — Claim path (shipped)
 
 - Proxy hot path extracts `X-GVM-Context-Token` from visible HTTP
-  requests.
-- `IntentStore::claim_by_token_hash(sha256(token))` looks up the
-  lease.
-- Cross-check logic:
-  - Observed body + declared body → SRR runs on observed; declared
-    is hashed and compared; mismatch → `cooperative.mismatch` Deny.
-  - Observed body only → existing `srr/mitm.network_observed` path.
-  - Declared only (MITM-blind) → SRR runs on declared body;
+  requests via `extract_and_claim_lease()` in `src/proxy/mod.rs`.
+- `IntentStore::claim_by_token_hash(sha256(token))` does the
+  atomic Active → Claimed transition; two simultaneous claims on
+  the same token resolve to exactly one `Some(LeaseClaim)` and one
+  `None` (the latter denies as `cooperative.unbound`).
+- Cross-check logic (the `CooperativeOutcome` enum):
+  - **`NoToken`** — request has no token. Falls through to the
+    existing `srr.network_observed` SRR path. Unchanged behaviour.
+  - **`CrossChecked`** — token claimed AND observed body hash
+    matches declared `payload_hash`. SRR runs on the observed body;
+    classification tagged `cooperative.cross_checked`. (Phase 2
+    wires the type; the observed-body hash extraction is stubbed
+    pending the streamed-body refactor in Phase 3.)
+  - **`DeclaredOnly`** — token claimed but no observed body
+    available (MITM-blind, body inspection disabled, or oversize).
+    SRR runs on the canonical-JSON form of the declared
+    `payload_context`; classification tagged
     `cooperative.declared_only`.
-- Policy epoch comparison with `allow_pinned_lease` opt-in.
-- Token consumed on successful claim (one-time use).
-- `X-GVM-Context-Token` stripped before upstream forward
-  (CRITICAL — must not leak to GitHub, Slack, Stripe, etc.).
+  - **`Mismatch`** — method / host / path observed differs from
+    what the lease declared. Always Deny, tagged
+    `cooperative.mismatch`.
+  - **`Expired`** — lease's `policy_epoch` does not match the
+    proxy's current `active_integrity_ref`. Always Deny, tagged
+    `cooperative.expired`. The `allow_pinned_lease` opt-in is
+    deferred to Phase 3.
+  - **`Unbound`** — header present but no matching active lease
+    (re-use, forgery, replay, non-ASCII token bytes). Always Deny,
+    tagged `cooperative.unbound`.
+- **CRITICAL — token strip.** `X-GVM-Context-Token` is removed
+  from the request headers BEFORE the request is forwarded
+  upstream, regardless of outcome. The token is bearer material;
+  leaking it to GitHub / Slack / Stripe would let those endpoints
+  replay it to GVM and impersonate the lease. The strip is in
+  `proxy_handler` (the same call site that runs
+  `extract_and_claim_lease`) so every downstream path —
+  forward, error response, audit recording — sees the sanitised
+  request. The test
+  `context_token_never_leaks_to_upstream_on_allow` pins this
+  invariant against a mock upstream that records every forwarded
+  header.
+- **Block-response surface.** `GovernanceBlockResponse` gained a
+  `decision_source: Option<String>` field; the Deny / IC-3
+  capacity / RequireApproval timeout paths populate it from
+  `classification.source`. `governance_block_response` emits this
+  on the `X-GVM-Decision-Source` response header so an agent
+  inspecting a 403 can tell `srr.network_observed` from
+  `cooperative.mismatch` without parsing the JSON body.
 
-**Tests planned** (8):
+**Tests** (10, all passing — `tests/cooperative_intent_lease_phase2.rs`):
 
-- Claim with valid token → existing enforcement flow
-- Claim with expired lease → `cooperative.expired` Deny
-- Claim with re-used token → `cooperative.unbound` Deny
-- Claim with mismatching observed body → `cooperative.mismatch`
-  Deny; WAL captures both bodies (hashed)
-- Header stripped before upstream
-- Policy epoch mismatch → Deny by default, allowed under
-  `allow_pinned_lease`
-- Concurrent claim attempts on the same token — exactly one wins
-- TOCTOU race: lease expires between header parse and claim
+- `unknown_token_returns_deny_with_unbound_source`
+- `non_ascii_token_returns_unbound`
+- `method_mismatch_returns_deny_with_mismatch_source`
+- `path_mismatch_returns_deny_with_mismatch_source`
+- `host_mismatch_returns_deny_with_mismatch_source`
+- `valid_lease_allows_with_declared_only_source`
+- `valid_lease_path_prefix_match_allows`
+- `context_token_never_leaks_to_upstream_on_allow` — **the
+  load-bearing security invariant of Phase 2**
+- `token_reuse_second_request_returns_unbound`
+- `epoch_change_between_issue_and_claim_returns_expired`
+
+**Deferred to Phase 3** (intentionally out of scope):
+
+- Observed-body hash extraction for full `CrossChecked` evidence.
+  The current implementation routes through `DeclaredOnly` when
+  no body hash is available; the wiring is in place, the
+  hash-of-streamed-body source is the remaining piece.
+- `allow_pinned_lease` opt-in for stale-epoch acceptance.
+- `gvm.intent.lease_claimed` WAL event — Phase 2 records the
+  decision via the normal `proxy_handler` audit path; a separate
+  lease-lifecycle event would be additive, not load-bearing.
 
 ### Phase 3 — Blind-path token delivery (later)
 

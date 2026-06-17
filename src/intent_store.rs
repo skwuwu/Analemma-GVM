@@ -190,6 +190,27 @@ pub struct VerifyResult {
     pub agent_id: Option<String>,
 }
 
+/// Snapshot returned by [`IntentStore::claim_by_token_hash`].
+///
+/// Contains everything the proxy hot path needs to run cross-check
+/// without re-acquiring the store lock. Fields mirror the lease as
+/// stored (raw `payload_context` is included so the hot path can
+/// feed it to SRR when MITM body is unavailable).
+#[derive(Debug, Clone)]
+pub struct LeaseClaim {
+    pub claim_id: u64,
+    pub intent_id: u64,
+    pub method: String,
+    pub host: String,
+    pub path_prefix: String,
+    pub agent_id: String,
+    pub operation: String,
+    pub payload_context: Option<serde_json::Value>,
+    pub payload_context_hash: Option<[u8; 32]>,
+    pub payload_hash: Option<[u8; 32]>,
+    pub policy_epoch: Option<String>,
+}
+
 /// Request body for POST /gvm/intent.
 ///
 /// Tier-3 P3-c Phase 1 added three optional fields for the
@@ -556,6 +577,85 @@ impl IntentStore {
                 }
             }
         }
+    }
+
+    /// Tier-3 P3-c Phase 2: claim a cooperative lease by its bearer
+    /// token hash.
+    ///
+    /// The caller (proxy hot path) has already extracted the
+    /// `X-GVM-Context-Token` header, hashed it with the same
+    /// SHA-256 the issuance side used, and passes the resulting 32
+    /// bytes here. We look up the matching active lease, mark it
+    /// `Claimed` (Phase 1 lifecycle still applies — confirm /
+    /// release work the same way for cooperative leases as for
+    /// legacy intents), and return the lease's decision-relevant
+    /// snapshot so the hot path can:
+    ///
+    ///   1. Verify `method` / `host` / `path` match what the agent
+    ///      declared (mismatch → `cooperative.mismatch` Deny).
+    ///   2. Cross-check the observed body hash against
+    ///      `payload_hash` if both are present.
+    ///   3. Compare the lease's `policy_epoch` against the current
+    ///      integrity ref (mismatch → `cooperative.expired` Deny
+    ///      unless `allow_pinned_lease` is set).
+    ///
+    /// Outcome variants:
+    ///   - `Some(LeaseClaim { .. })` — lease found and marked Claimed.
+    ///   - `None` — lease not found, expired, or not in Active
+    ///     state. The hot path treats this as
+    ///     `CooperativeUnbound` and denies the request.
+    ///
+    /// Concurrency: two simultaneous claims on the same token
+    /// resolve to exactly one `Some(_)` and one `None` — the second
+    /// arrival sees the state already `Claimed` and falls into the
+    /// `None` branch.
+    pub fn claim_by_token_hash(&self, token_hash: &[u8; 32]) -> Option<LeaseClaim> {
+        let mut store = self.inner.lock().ok()?;
+
+        self.cleanup_inner(&mut store);
+
+        // Find the lease whose token_hash matches AND is still
+        // Active. A Claimed lease yields None (the concurrent
+        // path lost the race).
+        let intent_id = store
+            .intents
+            .values()
+            .find(|i| {
+                matches!(i.state, IntentState::Active)
+                    && !i.is_expired()
+                    && i.context_token_hash.as_ref() == Some(token_hash)
+            })
+            .map(|i| i.intent_id)?;
+
+        let claim_id = self.next_claim_id.fetch_add(1, Ordering::Relaxed);
+        let intent = store.intents.get_mut(&intent_id)?;
+
+        let claim = LeaseClaim {
+            claim_id,
+            intent_id,
+            method: intent.method.clone(),
+            host: intent.host.clone(),
+            path_prefix: intent.path_prefix.clone(),
+            agent_id: intent.agent_id.clone(),
+            operation: intent.operation.clone(),
+            payload_context: intent.payload_context.clone(),
+            payload_context_hash: intent.payload_context_hash,
+            payload_hash: intent.payload_hash,
+            policy_epoch: intent.policy_epoch.clone(),
+        };
+
+        intent.state = IntentState::Claimed {
+            claim_id,
+            at: Instant::now(),
+        };
+
+        tracing::debug!(
+            intent_id,
+            claim_id,
+            "Cooperative lease claimed by token (pending WAL)"
+        );
+
+        Some(claim)
     }
 
     /// Phase 2a: WAL write succeeded → delete the intent.
