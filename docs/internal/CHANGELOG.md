@@ -131,6 +131,89 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-06-18: SRR — provider action packs: GitHub + Slack (Tier-2 P2-a)
+
+First Tier-2 item from the strategic-audit roadmap. Ships two
+curated SRR rule files whose `description` fields carry canonical
+semantic action names (`github.pr.merge`, `slack.message.send`,
+...). The internal compile target is unchanged — each rule is
+still `method + host + path_regex` — but the operator writes and
+the auditor reads the agent-IAM vocabulary, not the URL.
+
+**What changed.**
+
+- New `config/templates/_action_packs/` directory containing:
+  - `github.toml` — 9 rules covering GitHub REST API v3:
+    repo.read, issue.read, pr.read (Allow), issue.comment.create,
+    pr.create (Delay), pr.merge, workflow.dispatch (RequireApproval),
+    repo.delete (Deny), and the api.unspecified catch-all (Delay).
+  - `slack.toml` — 10 rules covering the Slack Web API:
+    user.lookup, conversations.list (Allow), message.send,
+    message.update, file.upload (Delay), channel.create,
+    workflow.trigger (RequireApproval), message.delete (Deny),
+    and the api.unspecified catch-all (Delay).
+  - `README.md` — explains the action-pack concept, the
+    default-effect-by-risk-class convention, and the lease
+    composition pattern. Includes a checklist for adding a new
+    pack so contributions stay shape-consistent.
+- `docs/srr.md` — new "Provider Action Packs" subsection with the
+  default-effect table, the lease composition example, and links
+  to the shipped packs.
+- `tests/srr_action_packs.rs` (new, 5 tests):
+  - GitHub pack loads via `NetworkSRR::load`; 10 canonical URLs
+    map to their declared action names and risk classes
+    (Allow / Delay / RequireApproval / Deny).
+  - Slack pack same shape: 10 canonical URLs covered.
+  - Each pack's catch-all rule handles unmapped endpoints
+    (audit, not block).
+  - The documented lease shape (`principal_filter` + `expires_at`
+    in a rule BEFORE the pack's RequireApproval rule) correctly
+    shadows the pack default for the named principal in the named
+    window. Three sub-assertions: in-lease principal Allowed,
+    wrong principal falls to pack's RequireApproval, expired
+    lease falls to pack's RequireApproval.
+
+**Why.**
+
+The strategic audit (2026-06-17) flagged that without a provider
+vocabulary GVM reads as a "weird egress firewall" rather than as an
+agent-permission runtime. Action packs were the audit's
+recommended cheapest fix: no new engine machinery, no protocol
+changes; just operator configuration that lets the audit CLI
+print "agent invoked github.pr.merge" instead of an opaque URL.
+The two packs cover the most common agent surfaces (issue
+management + PR review on GitHub, channel + DM messaging on
+Slack) that show up in regulated-workflow agents.
+
+**Affected files.**
+
+- `config/templates/_action_packs/github.toml` (new)
+- `config/templates/_action_packs/slack.toml` (new)
+- `config/templates/_action_packs/README.md` (new)
+- `docs/srr.md` — "Provider Action Packs" subsection added
+- `docs/internal/CHANGELOG.md` (this entry)
+- `tests/srr_action_packs.rs` (new, 5 tests)
+
+**Verification.**
+
+- `cargo test --test srr_action_packs` — 5/5 pass.
+- All existing tests pass unchanged.
+- `cargo check --workspace --tests` clean.
+
+**Risk.**
+
+None. New files only; no Rust code, no production behaviour
+changed. The packs sit in `config/templates/` and are only loaded
+when an operator explicitly appends them.
+
+**Follow-up.**
+
+P2-b: `gvm import openapi <spec.yaml>` CLI — convert an OpenAPI
+spec into a deny-by-default SRR rule set with `description` fields
+populated from `operationId`. Same audit vocabulary; lets an
+operator spin up a baseline policy for any in-house or third-party
+API without hand-writing 50 path_regex blocks.
+
 ### 2026-06-18: SRR — `principal_filter` rule field (Tier-1 P1-c, Tier-1 complete)
 
 Third and final Tier-1 item from the strategic-audit roadmap.

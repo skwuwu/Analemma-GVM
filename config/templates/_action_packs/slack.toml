@@ -1,0 +1,107 @@
+# Provider action pack — Slack Web API
+#
+# Same shape as github.toml: each rule's `description` carries the
+# canonical semantic action name. The audit trail records
+# "slack.message.send" instead of "POST /api/chat.postMessage".
+#
+# Append to your SRR config:
+#   cat config/templates/_action_packs/slack.toml >> config/srr_network.toml
+#   gvm reload
+#
+# Slack Web API base: https://slack.com/api/<method>. Methods are
+# named with dots (chat.postMessage, conversations.create); we
+# match them via path_regex with escaped dots.
+#
+# Compose with lease primitive (principal_filter + expires_at) when
+# the orchestrator issues a per-task grant.
+
+# ─── Reads (Allow with audit) ──────────────────────────────────────────
+
+[[rules]]
+# slack.user.lookup — POST /api/users.lookupByEmail or users.info
+method = "POST"
+pattern = "slack.com/{any}"
+path_regex = "^/api/users\\.(lookupByEmail|info)$"
+decision = { type = "Allow" }
+description = "slack.user.lookup"
+label = "slack_user_lookup"
+
+[[rules]]
+# slack.conversations.list — POST /api/conversations.list
+method = "POST"
+pattern = "slack.com/{any}"
+path_regex = "^/api/conversations\\.list$"
+decision = { type = "Allow" }
+description = "slack.conversations.list"
+label = "slack_conversations_list"
+
+# ─── Writes (Delay = audit before forward) ─────────────────────────────
+
+[[rules]]
+# slack.message.send — POST /api/chat.postMessage
+method = "POST"
+pattern = "slack.com/{any}"
+path_regex = "^/api/chat\\.postMessage$"
+decision = { type = "Delay", milliseconds = 300 }
+description = "slack.message.send"
+label = "slack_message_send"
+
+[[rules]]
+# slack.message.update — POST /api/chat.update
+method = "POST"
+pattern = "slack.com/{any}"
+path_regex = "^/api/chat\\.update$"
+decision = { type = "Delay", milliseconds = 300 }
+description = "slack.message.update"
+label = "slack_message_update"
+
+[[rules]]
+# slack.file.upload — POST /api/files.upload[V2]
+method = "POST"
+pattern = "slack.com/{any}"
+path_regex = "^/api/files\\.upload(V2)?$"
+decision = { type = "Delay", milliseconds = 300 }
+description = "slack.file.upload"
+label = "slack_file_upload"
+
+# ─── High-risk (RequireApproval — orchestrator promotes via lease) ─────
+
+[[rules]]
+# slack.channel.create ⚠ — POST /api/conversations.create
+method = "POST"
+pattern = "slack.com/{any}"
+path_regex = "^/api/conversations\\.create$"
+decision = { type = "RequireApproval" }
+description = "slack.channel.create"
+label = "slack_channel_create"
+
+[[rules]]
+# slack.workflow.trigger ⚠ — POST /api/workflows.triggers.run
+method = "POST"
+pattern = "slack.com/{any}"
+path_regex = "^/api/workflows\\.triggers\\.run$"
+decision = { type = "RequireApproval" }
+description = "slack.workflow.trigger"
+label = "slack_workflow_trigger"
+
+# ─── Destructive (Deny by default) ─────────────────────────────────────
+
+[[rules]]
+# slack.message.delete ⚠ — POST /api/chat.delete
+method = "POST"
+pattern = "slack.com/{any}"
+path_regex = "^/api/chat\\.delete$"
+decision = { type = "Deny", reason = "agent cannot delete Slack messages" }
+description = "slack.message.delete"
+label = "slack_message_delete"
+
+# ─── Catch-all ─────────────────────────────────────────────────────────
+
+[[rules]]
+# slack.api.unspecified — any other Slack Web API method
+method = "*"
+pattern = "slack.com/{any}"
+path_regex = "^/api/[a-zA-Z0-9._]+$"
+decision = { type = "Delay", milliseconds = 300 }
+description = "slack.api.unspecified"
+label = "slack_unspecified"

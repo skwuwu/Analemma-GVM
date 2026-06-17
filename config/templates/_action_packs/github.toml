@@ -1,0 +1,117 @@
+# Provider action pack — GitHub REST API v3
+#
+# Maps GitHub agent actions to semantic action names that surface in
+# WAL events as `matched_rule_id` and in the audit CLI output. The
+# operator writes — and the auditor reads — "github.pr.merge" instead
+# of "PUT /repos/foo/bar/pulls/1234/merge".
+#
+# The internal compile target stays method + host + path_regex, same
+# as any other SRR rule. The action pack is just a curated set of
+# rules whose `description` field carries the canonical action name.
+#
+# Append to your SRR config (or pipe into `gvm reload` after a hot edit):
+#   cat config/templates/_action_packs/github.toml >> config/srr_network.toml
+#   gvm reload
+#
+# Recommended composition with the v0.5.3 lease shape:
+#   - principal_filter = "agent:..."   bind one action to one agent
+#   - expires_at = "..."               time-bound the grant
+#   - unsafe_body_action = { ... }     fail-close on unverifiable body
+#
+# Effects below are conservative defaults: Allow on reads, Delay on
+# writes (audit-only with 300 ms delay so an operator can see them
+# stream past), RequireApproval on actions a CI / human review process
+# usually gates, Deny outright on destructive actions. Override the
+# decision when an orchestrator issues a per-task lease — e.g. promote
+# github.pr.merge from RequireApproval to Allow for the agent that
+# owns this specific PR for the next 5 minutes.
+
+# ─── Reads (typically safe; Allow with audit) ──────────────────────────
+
+[[rules]]
+# github.repo.read — GET /repos/{owner}/{repo}
+method = "GET"
+pattern = "api.github.com/{any}"
+path_regex = "^/repos/[^/]+/[^/]+$"
+decision = { type = "Allow" }
+description = "github.repo.read"
+label = "github_repo_read"
+
+[[rules]]
+# github.issue.read — GET /repos/{owner}/{repo}/issues[/{n}]
+method = "GET"
+pattern = "api.github.com/{any}"
+path_regex = "^/repos/[^/]+/[^/]+/issues(/[0-9]+)?$"
+decision = { type = "Allow" }
+description = "github.issue.read"
+label = "github_issue_read"
+
+[[rules]]
+# github.pr.read — GET /repos/{owner}/{repo}/pulls[/{n}]
+method = "GET"
+pattern = "api.github.com/{any}"
+path_regex = "^/repos/[^/]+/[^/]+/pulls(/[0-9]+)?$"
+decision = { type = "Allow" }
+description = "github.pr.read"
+label = "github_pr_read"
+
+# ─── Writes (Delay = audit before forward; operator can promote) ───────
+
+[[rules]]
+# github.issue.comment.create — POST /repos/{owner}/{repo}/issues/{n}/comments
+method = "POST"
+pattern = "api.github.com/{any}"
+path_regex = "^/repos/[^/]+/[^/]+/issues/[0-9]+/comments$"
+decision = { type = "Delay", milliseconds = 300 }
+description = "github.issue.comment.create"
+label = "github_issue_comment_create"
+
+[[rules]]
+# github.pr.create — POST /repos/{owner}/{repo}/pulls
+method = "POST"
+pattern = "api.github.com/{any}"
+path_regex = "^/repos/[^/]+/[^/]+/pulls$"
+decision = { type = "Delay", milliseconds = 300 }
+description = "github.pr.create"
+label = "github_pr_create"
+
+# ─── High-risk (RequireApproval — orchestrator promotes via lease) ─────
+
+[[rules]]
+# github.pr.merge ⚠ — PUT /repos/{owner}/{repo}/pulls/{n}/merge
+method = "PUT"
+pattern = "api.github.com/{any}"
+path_regex = "^/repos/[^/]+/[^/]+/pulls/[0-9]+/merge$"
+decision = { type = "RequireApproval" }
+description = "github.pr.merge"
+label = "github_pr_merge"
+
+[[rules]]
+# github.workflow.dispatch ⚠ — POST /repos/.../actions/workflows/.../dispatches
+method = "POST"
+pattern = "api.github.com/{any}"
+path_regex = "^/repos/[^/]+/[^/]+/actions/workflows/[^/]+/dispatches$"
+decision = { type = "RequireApproval" }
+description = "github.workflow.dispatch"
+label = "github_workflow_dispatch"
+
+# ─── Destructive (Deny by default; operator opts in per agent) ─────────
+
+[[rules]]
+# github.repo.delete ⚠ — DELETE /repos/{owner}/{repo}
+method = "DELETE"
+pattern = "api.github.com/{any}"
+path_regex = "^/repos/[^/]+/[^/]+$"
+decision = { type = "Deny", reason = "agent cannot delete repositories" }
+description = "github.repo.delete"
+label = "github_repo_delete"
+
+# ─── Catch-all (audit any GitHub call not named above) ─────────────────
+
+[[rules]]
+# github.api.unspecified — any GitHub endpoint not covered above
+method = "*"
+pattern = "api.github.com/{any}"
+decision = { type = "Delay", milliseconds = 300 }
+description = "github.api.unspecified"
+label = "github_unspecified"

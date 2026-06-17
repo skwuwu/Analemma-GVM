@@ -283,6 +283,70 @@ Regression coverage:
 legacy `check` entry, back-compat, lease composition with
 `expires_at`, case-sensitivity).
 
+### Provider Action Packs
+
+A curated set of SRR rule files that map common SaaS API endpoints to
+**semantic action names**. Each rule's `description` field carries the
+canonical action name (`github.pr.merge`, `slack.message.send`, ...);
+the WAL records that name as `matched_rule_id`; the audit CLI surfaces
+it as the operator-readable label for what the agent did.
+
+The internal compile target is unchanged — `method + host +
+path_regex` — but the operator writes (and the auditor reads) the
+agent-IAM vocabulary, not the URL.
+
+```bash
+# Append the relevant pack to your SRR config and hot-reload
+cat config/templates/_action_packs/github.toml >> config/srr_network.toml
+cat config/templates/_action_packs/slack.toml  >> config/srr_network.toml
+gvm reload
+```
+
+**Default effects** (operator overrides per agent + per task via a
+lease):
+
+| Action class | Default effect | Reason |
+|--------------|----------------|--------|
+| Reads | `Allow` | Side-effect-free; audit suffices |
+| Writes | `Delay 300ms` | Visible in the watch stream; operator can promote |
+| High-risk writes | `RequireApproval` | Holds for human or orchestrator review |
+| Destructive | `Deny` | Operator must explicitly opt in per agent |
+| Catch-all | `Delay 300ms` | Unrecognised endpoint on a known provider — audit |
+
+**Lease composition** — append the lease rule **before** the pack so it
+fires first (SRR is first-match-wins):
+
+```toml
+# Promote github.pr.merge from RequireApproval to Allow for one bot,
+# one PR, one 5-minute window. Append BEFORE github.toml's pack rules.
+[[rules]]
+method = "PUT"
+pattern = "api.github.com/{any}"
+path_regex = "^/repos/my-org/my-repo/pulls/1842/merge$"
+principal_filter = "agent:release-bot"
+expires_at = "2026-07-01T15:00:00Z"
+decision = { type = "Allow" }
+description = "github.pr.merge"
+```
+
+**Ships in v0.5.3**:
+- [config/templates/_action_packs/github.toml](../config/templates/_action_packs/github.toml)
+  — repo.read, issue.read, pr.read, issue.comment.create, pr.create,
+  pr.merge, workflow.dispatch, repo.delete + catch-all
+- [config/templates/_action_packs/slack.toml](../config/templates/_action_packs/slack.toml)
+  — user.lookup, conversations.list, message.send, message.update,
+  file.upload, channel.create, workflow.trigger, message.delete +
+  catch-all
+- [config/templates/_action_packs/README.md](../config/templates/_action_packs/README.md)
+  — checklist for adding a new pack
+
+Regression coverage:
+[tests/srr_action_packs.rs](../tests/srr_action_packs.rs)
+(5 tests — each pack loads via production `NetworkSRR::load`, each
+canonical URL maps to its declared action name and risk class, the
+lease shape correctly shadows pack defaults for the named principal
+in the named window).
+
 ### Base64 Payload Decoding
 
 SRR automatically decodes Base64-encoded content before pattern matching. This prevents bypass via encoding obfuscation. Two decoding strategies are applied in order:
