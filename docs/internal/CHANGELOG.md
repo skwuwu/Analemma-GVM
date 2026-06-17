@@ -131,6 +131,103 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-06-18: Docs — reposition from sandbox-first to permission-grant + evidence-forward
+
+Follow-up to the strategic audit. The pentest suite (Phases 1–4),
+the timing fix, the CI repair, and the SRR limitation docs all
+landed without a positioning update; README.md and docs/overview.md
+still led with "sandbox" as the headline noun. The strategic review
+flagged this as a product-positioning gap: the user thinks in
+"give this agent a container," not "give this agent a grant," so
+GVM reads as a "weird egress firewall" rather than as a
+permission-grant runtime.
+
+**What changed.**
+
+- `README.md` — new tagline + opening: "Permission-Grant Runtime
+  for AI Agents — Bound the actions. Sign the evidence. Stay
+  framework-independent." Four-pillar value section (bound
+  actions, signed evidence, framework-independent, zero-code-change).
+  New "Evidence boundary" section right after the existing
+  "Execution boundary" section, surfacing `gvm proof event` /
+  `gvm proof batch` / `gvm proof verify` with the offline-against-
+  public-anchor-key guarantee. New "For orchestrators" section
+  showing the per-task workflow today (v0.5.3) plus the v0.7
+  control-plane roadmap (WAL event stream, single-rule mutations,
+  `expires_at`). "What it doesn't do" softened: "Complementary
+  to OPA, not a replacement."
+- `docs/overview.md` — Abstract rewritten to lead with the
+  operational primitive ("give the agent a grant for this task
+  with these capabilities for this duration"). Three-mode summary
+  now puts `--contained` in the "experimental, opt-in" column
+  consistently. New "Evidence Boundary" section with the WAL
+  field-by-field breakdown, the proof bundle contents table, the
+  three CLI verbs, and the maturity ladder (current default →
+  v0.7+ external timestamp / WORM / HSM scoped).
+- `docs/quickstart.md` — Section 8 renamed "Tamper-Evident Audit"
+  (was "Tamper-Proof Audit", inconsistent with the rest of the
+  codebase). New subsection "Exporting an evidence bundle" with
+  `gvm proof event/batch/verify` examples. New section 8b
+  "Orchestrator Integration Pattern" with a full per-task
+  workflow that uses real commands (`gvm reload`, `gvm approve`,
+  `gvm events list --agent ... --last 1h`, `gvm proof batch`)
+  plus a v0.7-roadmap-coming note.
+- `src/wasm_engine.rs` doc-comment — one-line inconsistency from
+  the earlier strategic audit ("tamper-proof" — the rest of the
+  codebase says "tamper-evident") replaced with the correct
+  framing plus a cross-link to `docs/internal/GVM_CODE_STANDARDS.md
+  §11 ("tamper-evident, not tamper-proof")`.
+
+**Why.**
+
+The strategic audit ([reviewed 2026-06-17]) verified that the
+implementation already has the evidence stack (Merkle WAL,
+Ed25519 anchor, `gvm proof` CLI, offline verify), the five-effect
+decision model, and the framework-independent posture the
+positioning needed — but the docs were burying these under
+sandbox-mode prose. This commit surfaces what already ships,
+without overclaiming what's still on the roadmap (IAM
+principal binding, lease primitive, provider action packs,
+`expires_at` on rules, RFC 3161 / HSM / KMS hooks — all kept
+explicitly labelled "v0.7+").
+
+**Affected files.**
+
+- `README.md` (lead paragraphs + new orchestrator section +
+  evidence-boundary section + softened "what it doesn't do")
+- `docs/overview.md` (Abstract + new Evidence Boundary section)
+- `docs/quickstart.md` (section 8 rename + new 8b orchestrator
+  pattern + new "Exporting an evidence bundle" sub-section)
+- `src/wasm_engine.rs` (doc-comment, one paragraph)
+- `docs/internal/CHANGELOG.md` (this entry)
+
+**Risk.**
+
+None. No code logic changed (the wasm_engine.rs edit is purely
+inside `//!` doc-comment, verified by `cargo check --workspace`).
+No public API surface changed.
+
+**Follow-ups (audit P0–P4).**
+
+The strategic audit produced a prioritised work plan that this
+commit does NOT execute — only the P0 string fix (`tamper-proof`
+→ `tamper-evident`) lands here. The remaining items are scoped
+separately:
+
+- P1: `unsafe_body_action: Option<EffectKind>` rule field —
+  fail-close on body-inspection failure.
+- P1: `expires_at: Option<DateTime<Utc>>` rule field — first
+  step toward the lease primitive.
+- P2: `principal_filter: Option<String>` rule field — agent_id
+  becomes an SRR matching input, not just an audit label.
+- P2: Industry-template seed for 1–2 provider action packs
+  (`github.pr.merge`, `slack.message.send` → method/path mapping).
+- P3: `gvm import openapi` — OpenAPI → SRR rule importer.
+- P3: Cooperative body-context endpoint
+  (`POST /gvm/payload-context`) — SDK / sidecar / MCP adapter
+  delivers structured payload context without MITM.
+- P4: Full `gvm lease issue` / `gvm run --lease` lease primitive.
+
 ### 2026-05-26: Pentest Phase 4 — MITM TLS + IC-3 approval bypass regression suite
 
 Final Phase of the pentest roadmap. Eleven Rust integration tests

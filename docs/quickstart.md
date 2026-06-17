@@ -263,11 +263,15 @@ emails (Deny) — and prints a full governance audit. Other scenarios:
 
 ---
 
-## 8. Tamper-Proof Audit (Optional, Recommended for Production)
+## 8. Tamper-Evident Audit (Recommended for Production)
 
 Every WAL anchor record can be Ed25519-signed by an operator-managed
 key. External auditors verify the chain offline using only the matching
-public key — no need to trust the runtime.
+public key — they do not need access to the host, the WAL, or the
+operator's signing material. The result is **tamper-evident** (any
+mutation breaks the chain on the next verify), not tamper-*proof* (a
+host-root attacker can still delete files locally, but the break
+shows up to the auditor).
 
 ```bash
 # One-time keygen on the operator host
@@ -291,15 +295,95 @@ The proxy refuses to start if `enabled = true` but the key file is
 missing or malformed (fail-close — operators who turned signing on
 cannot accidentally end up with unsigned anchors).
 
-Auditors verify with the public key only:
+### Exporting an evidence bundle
+
+After a task finishes, package the decisions an auditor needs into a
+self-contained JSON document:
 
 ```bash
-gvm audit verify --wal /path/to/wal.log
+# Whole-WAL verification (operator-side sanity check)
+gvm audit verify --wal /var/lib/gvm/wal.log
+
+# Single decision — for "exactly what did the agent do at 14:32:07?"
+gvm proof event   evt-abc123              --wal /var/lib/gvm/wal.log > evt.json
+
+# All decisions in a sealed batch — for "everything for run claims-1842"
+gvm proof batch   batch-2026-06-17-09     --wal /var/lib/gvm/wal.log > batch.json
+
+# Offline verification — auditor runs this without touching the host
+gvm proof verify  evt.json   --anchor /path/to/anchor.key.pub
+gvm proof verify  batch.json --anchor /path/to/anchor.key.pub
 ```
+
+The exported bundle contains the event(s), the Merkle inclusion path
+to the batch root, the signed BatchSealRecord, the policy + config
+integrity context active at decision time, and the anchor signature
+chain. `gvm proof verify` returns 0 on success and a structured error
+naming the broken link (event hash, Merkle node, anchor signature, or
+config chain) on failure.
 
 For the full operator checklist (file mode, encryption-at-rest,
 backup hygiene, rotation runbook), see
 [`config/proxy.production.toml.example`](../config/proxy.production.toml.example).
+
+---
+
+## 8b. Orchestrator Integration Pattern
+
+GVM is meant to sit *underneath* an external orchestrator (your own
+scheduler, a workflow engine, an MCP server, an internal portal) that
+decides *which agent gets which capability for how long*. The
+orchestrator owns the policy decision; GVM owns the enforcement and
+the evidence.
+
+The pattern that works today (v0.5.3), and the primitives v0.7 adds to
+make it tighter:
+
+```bash
+# ── Per-task workflow (today, v0.5.3) ──
+
+# 1. Orchestrator writes a task-scoped SRR ruleset for this agent.
+#    Per-agent ruleset under config/<agent-id>/srr_network.toml; hot-reloaded.
+#    The orchestrator is the source of truth for which permissions are issued.
+cat > config/claims-reviewer-1842/srr_network.toml <<'TOML'
+[[rules]]
+method  = "GET"
+pattern = "case.internal.corp/claims/1842/{any}"
+decision = { type = "Allow" }
+
+[[rules]]
+method  = "POST"
+pattern = "workflow.internal.corp/claims/1842"
+payload_field = "status"
+payload_match = ["draft", "needs_review"]
+decision = { type = "Allow" }
+
+[[rules]]
+method  = "POST"
+pattern = "workflow.internal.corp/claims/1842/finalize"
+decision = { type = "RequireApproval" }
+
+[[rules]]
+method  = "*"
+pattern = "{any}"
+decision = { type = "Deny", reason = "outside-grant" }
+TOML
+
+# 2. Atomic hot-reload — all in-flight requests use new rules from this commit.
+gvm reload
+
+# 3. Launch under the scoped permissions
+sudo gvm run --sandbox --agent-id claims-reviewer-1842 ./agent
+
+# 4. Operator monitors via the admin port (separate from agent-facing proxy)
+gvm approve                        # polls pending RequireApproval events
+gvm events list --agent claims-reviewer-1842 --last 1h
+
+# 5. Package the evidence
+gvm proof batch <batch_id> --wal /var/lib/gvm/wal.log > claims-1842-evidence.json
+```
+
+**Coming in v0.7** — a `GET /gvm/events` push-based WAL stream subscription, granular `POST /gvm/srr/rule` / `DELETE /gvm/srr/rule/<id>` single-rule mutations, and `expires_at` on individual rules. The three compose into the **time-bounded permission grant**: orchestrator approves an IC-3 request *and* inserts a 5-minute `Allow` rule with `expires_at = now + 5m`, agent's subsequent calls in that window pass without re-prompting, the rule auto-expires on the next match attempt. The full design lives in [CHANGELOG.md](internal/CHANGELOG.md) under the v0.7 roadmap.
 
 ---
 

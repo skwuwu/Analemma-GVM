@@ -1,8 +1,12 @@
 //! Layer 1: Wasm Governance Engine — immutable policy evaluation sandbox.
 //!
 //! Loads the governance engine as a Wasm module via Wasmtime, ensuring the
-//! policy evaluation logic is memory-isolated and tamper-proof. Even if the
-//! host proxy process is compromised, the governance logic cannot be modified.
+//! policy evaluation logic is memory-isolated. The Wasm boundary makes
+//! in-process modification of the policy code tamper-evident: a host-side
+//! compromise cannot silently replace the policy module without changing
+//! the module hash recorded in the integrity context, and the change shows
+//! up on the next audit verify. See docs/internal/GVM_CODE_STANDARDS.md
+//! §11 ("tamper-evident, not tamper-proof") for the broader policy.
 //!
 //! Falls back to native evaluation (direct Rust call) when no Wasm module
 //! is available — useful for development and testing.

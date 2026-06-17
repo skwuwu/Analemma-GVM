@@ -1,16 +1,26 @@
 # Analemma-GVM Technical Whitepaper
 
-**AI Agent Governance Virtual Machine — Security Kernel Architecture**
+**Permission-grant runtime for AI agents — bounded actions, signed evidence, framework-independent**
 
-Version: 0.1.0 | Date: 2026-03-14
+Version: 0.5.3 | Whitepaper revision: 2026-06
 
 ---
 
 ## Abstract
 
-Analemma-GVM is a transparent enforcement proxy for AI agent I/O operations. It enforces security policies at the infrastructure level, ensuring that no agent — regardless of framework, language, or behavior — can bypass governance controls. The system operates as a "security kernel" sitting between AI agents and external APIs.
+Analemma-GVM (Governance Virtual Machine) is a **permission-grant runtime for autonomous AI agents**. It binds an agent's execution to a task-scoped set of HTTP, filesystem, and syscall permissions, enforces those permissions at the proxy and kernel layer, and produces a Merkle-chained, Ed25519-signed evidence trail that an external auditor can verify offline using only the public anchor key.
 
-**Core thesis**: Security must be structural, not behavioral. Agent code is unchanged. GVM ships three enforcement modes: **cooperative** (HTTP_PROXY env-var injection — runs everywhere), **`--sandbox`** (Linux kernel namespaces + seccomp-BPF + iptables DNAT + MITM — production default; structurally guaranteed), and **`--contained`** (Docker isolation — *experimental, opt-in via `cargo build --release --features contained`*; the production binary does not advertise this flag). In `--sandbox` mode enforcement is structurally guaranteed by kernel-level redirection; in cooperative mode it depends on the agent honouring `HTTP_PROXY`.
+**Operational primitive.** The unit a user thinks in is not "give the agent a container" but "give the agent a *grant* for this task with these capabilities for this duration." That places GVM in the same product category as `docker run` (which gave operators "give the process a container") and IAM roles (which gave operators "give the workload a credential scope") — but for the agent-action layer, where the question is which network egress, which file write, and which API body shape an autonomous LLM-driven workflow is allowed to produce.
+
+**Core thesis.** GVM does not make the model trustworthy. It makes the model's actions **bounded, auditable, and revocable**. The mechanism is structural rather than behavioral: agent code is unchanged, and a bypass requires either (a) compromising the host kernel (sandbox mode) or (b) breaking the cooperative `HTTP_PROXY` contract (cooperative mode, lower assurance, no sudo). The evidence chain rides on top of both modes and is the load-bearing piece for regulated workflows — claim review, internal coding agents, on-prem document review, sovereign AI deployments, CI/CD agent containment — where "the agent did X" must be *defensible to an auditor*, not just believed by an operator.
+
+**Three enforcement modes** (same rules, three trust strengths):
+
+- **Cooperative** — `HTTP_PROXY` env injection, runs on any OS, no root. Lowest assurance: depends on the agent's HTTP client honouring the env var.
+- **`--sandbox`** — Linux kernel namespaces + seccomp-BPF (~130 syscalls) + iptables DNAT + per-sandbox MITM CA + overlayfs filesystem. Production default; bypass requires kernel-level escape.
+- **`--contained`** — Docker isolation. **Experimental**, opt-in via `cargo build --release --features contained`. Host-side iptables egress lock works; in-container DNAT + CA injection NOT yet wired. Default release binary does not advertise this flag.
+
+The **evidence boundary** (Merkle WAL + Ed25519 anchor + `gvm proof` CLI) ships in every mode and is described in §"Evidence Boundary" below.
 
 ---
 
@@ -61,6 +71,54 @@ Strictness order (total): `Allow (0) < AuditOnly (1) < Delay (2) < RequireApprov
 ### Fail-Close Philosophy
 
 When in doubt, block. The system defaults to **Delay 300ms** (Default-to-Caution) for any unrecognized request. If the WAL is unavailable, requests are rejected outright.
+
+---
+
+## Evidence Boundary
+
+The Merkle WAL and the `gvm proof` CLI form the second half of GVM's value proposition. Where the **enforcement boundary** (above) decides whether an action happens, the **evidence boundary** answers the regulator's question: *"what exactly happened, who did it, under what policy, and prove it."*
+
+### What Lands in the WAL
+
+Every governance decision appends a structured JSON event with:
+
+- **Subject** — `agent_id`, `tenant_id`, `session_id`, `token_id` (the `jti` from the JWT or `sandbox-peer:<id>` for namespace-bound identity, `None` for legacy entries)
+- **Operation** — semantic operation name (`gvm.payment.charge`, `gvm.dns.query`, `http.POST`, etc.)
+- **Resource descriptor** — `service`, `tier` (internal / external / customer-facing), `sensitivity` (low / medium / high / critical)
+- **Decision** — one of Allow / AuditOnly / Delay / RequireApproval / Deny
+- **Matched rule** — the SRR rule id and description that fired (None for Default-to-Caution)
+- **Integrity context** — hash chain of the policy snapshot + config that was active at decision time
+- **Event hash** — SHA-256 with domain-separation prefix, v1/v2/v3 dispatcher per `spec_version`
+
+Batches of events are sealed at group-commit. The seal is a Merkle tree over the batch's event hashes; the root is signed with the operator-managed Ed25519 anchor key; the anchor signature is chained to the previous batch's anchor so a cross-rotation tamper is detectable.
+
+### What `gvm proof` Exports
+
+The proof bundle is a self-contained JSON document an auditor can verify offline using only the public anchor key. Contents:
+
+| Field | Source | Purpose |
+|-------|--------|---------|
+| `event` (full or redacted) | WAL line | The decision record |
+| `merkle_inclusion` | Merkle path | Proves the event is in the batch the seal covers |
+| `batch_seal` | `BatchSealRecord` | The signed batch root + anchor signature |
+| `config_chain` | `GvmIntegrityContext` | Short hash chain of policy + config active at decision time |
+| `anchor_chain` | Cross-batch anchor history | Detects cross-rotation tamper |
+
+Three CLI verbs:
+
+```bash
+gvm proof event   <event_id>   --wal data/wal.log   > evt.json     # single event
+gvm proof batch   <batch_id>   --wal data/wal.log   > batch.json   # whole batch
+gvm proof verify  evt.json     --anchor anchor.pub               # offline verify
+```
+
+`gvm proof verify` runs against just the public anchor key — the auditor does not need the host, the WAL, or the operator's signing material.
+
+### What This Buys (and What It Does Not)
+
+**Buys.** *Tamper-evident* audit: any local mutation of the WAL — by a compromised proxy, by an operator with shell access, by an attacker who has root — breaks the Merkle chain at the next verify. The chain is verifiable by anyone who has the anchor public key. Off-host replication via rsync / fluentd / vector / S3 is straightforward and turns the local tamper-evident chain into an externally-stored audit-grade record.
+
+**Does not buy.** *Tamper-proof* logs. A host-root attacker can still delete or modify files; what they cannot do is change the WAL **without leaving a verifiable break in the chain**. The maturity ladder (see `docs/security-model.md`) extends through customer-managed signing keys, RFC 3161 external timestamping, WORM / S3 Object Lock storage, and HSM/KMS-backed signing — all hooks scoped for v0.7+. The current default ships customer-verifiable evidence inside a customer-managed-key model, which is the level most regulated workflows ask for first.
 
 ---
 

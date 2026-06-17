@@ -1,12 +1,19 @@
-# Analemma-GVM: Lightweight AI Agent Governance Runtime
+# Analemma-GVM: Permission-Grant Runtime for AI Agents
 
-**A lightweight secure runtime for autonomous AI agents.** Governs every outbound HTTP call, isolates the filesystem, and locks down syscalls — using a Rust proxy and Linux kernel primitives.
+**Bound the actions. Sign the evidence. Stay framework-independent.**
 
-I wanted to run multiple autonomous AI agents (such as OpenClaw) for my personal affairs. But every time I let agents do everything they want, there was always a little anxiety. What if it does something it shouldn't? What if it leaks personal information or deletes important data?
+GVM gives an AI agent a **time-bounded set of permissions** for a specific task, enforces those permissions at the HTTP / filesystem / syscall boundary, and produces a Merkle-chained, Ed25519-signed evidence trail an external auditor can verify offline. Two small Rust binaries (CLI + proxy, ~35 MB on Linux). No Kubernetes, no service mesh, no GPU, no SDK to import.
 
-Existing answers (such as NemoClaw, OPA+Envoy) required Docker, an embedded Kubernetes cluster, NVIDIA GPUs, or Envoy sidecars. I wanted a lightweight alternative that doesn't need infrastructure setup and strictly enforces what agents do.
+GVM does **not** make the model trustworthy. It makes the model's actions **bounded, auditable, and revocable** — the framing regulated environments (claim review, internal coding agents, on-prem document workflows, sovereign AI deployments) need before turning autonomy on. Think of it less as a sandbox and more as **`docker run` for agent permissions, with a court-grade audit trail attached.**
 
-So I built GVM (Governance Virtual Machine) — a lightweight security runtime for AI agents. Two small Rust binaries (CLI + proxy, ~35MB total on Linux), no Kubernetes, no service mesh, no GPU. It sits between your agent and its actions, and assumes the agent can't be fully trusted.
+Four things you get out of the box:
+
+1. **Bound actions** — every outbound HTTP call, filesystem write, and DNS query is gated by a policy. Default-to-Caution on anything unrecognised; Deny / RequireApproval / Delay / Allow / AuditOnly as the five effects.
+2. **Signed evidence** — every decision lands in a Merkle-chained WAL with an Ed25519 anchor signature. `gvm proof event` / `gvm proof batch` exports a self-contained JSON bundle; `gvm proof verify` runs offline against just the public anchor key.
+3. **Framework-independent** — your agent isn't modified. Plain `requests`, `urllib`, `node-fetch`, `curl`, LangChain, hermes-agent, OpenClaw all work unchanged — governance sits at the proxy and kernel layer, not in your code.
+4. **Zero-code-change cooperative path on any OS** + **kernel-enforced sandbox path on Linux** — same rules, two enforcement strengths, pick per environment.
+
+What it is **not**: a prompt filter (use Lakera or provider safety for that), an LLM safety solution (it doesn't change what the model says — it bounds what the model can *do*), or a replacement for OPA (OPA governs service-to-service; GVM governs agent-to-world).
 
 ## Demo — Watch, Suggest, Enforce in 3 commands
 
@@ -54,9 +61,9 @@ log on the first request.
 
 ---
 
-## What happens when you run `gvm run --sandbox agent.py`
+## The enforcement boundary — what `gvm run --sandbox` actually contains
 
-One command activates four security layers. This is the production mode — Linux only (requires namespaces, iptables, seccomp-BPF).
+`--sandbox` is the **execution boundary** — one command activates four enforcement layers below. Linux-only (needs namespaces, iptables, seccomp-BPF). The complementary **evidence boundary** (signed WAL + `gvm proof verify`) is described in the next section and ships in all modes including the cooperative no-sudo path.
 
 **DNS governance (Layer 0)** — Every DNS query passes through a built-in governance proxy before any HTTP call happens. Known domains (learned via `gvm suggest`) resolve instantly. Unknown domains are delayed 200ms. Repeated anomalous patterns (e.g. subdomain burst — a DNS tunneling signature) escalate to 3–10 second delays with alerts. No DNS query is ever denied — worst case is a delay, never an outage. Disable with `--no-dns-governance` if you already use dedicated DNS security tools.
 
@@ -65,6 +72,7 @@ One command activates four security layers. This is the production mode — Linu
 | Decision | What happens | Example |
 |----------|-------------|---------|
 | **Allow** | Pass through, async audit | `GET api.github.com/repos` |
+| **AuditOnly** | Allow + synchronous WAL write before forwarding | High-value read on a sensitive endpoint |
 | **Delay** | Audit first, then forward | Unknown host, first time seen |
 | **RequireApproval** | Hold until human approves | `POST api.stripe.com/charges` |
 | **Deny** | Block immediately | `DELETE production-db/users` |
@@ -76,6 +84,26 @@ One command activates four security layers. This is the production mode — Linu
 **Syscall filtering** — seccomp-BPF restricts the agent to ~130 whitelisted syscalls. This prevents the agent from modifying iptables rules (no `AF_NETLINK`) or opening raw sockets (no `AF_PACKET`), ensuring the network layer above can't be tampered with.
 
 These aren't separate features you configure individually. They're layers of a single sandbox runtime, all activated by `--sandbox`.
+
+---
+
+## The evidence boundary — what `gvm proof` produces
+
+The Merkle-chained WAL and the `gvm proof` CLI are the audit-grade evidence side of GVM and ship in **every mode** (cooperative, sandbox, contained). The audit trail is what makes "the agent ran" defensible to a regulator or an internal compliance team — not just a log file you have to trust.
+
+**What's in the WAL.** Every governance decision is appended as a JSON event with: agent identity, token id, operation, resource descriptor, decision, matched rule id, request/response classification, integrity context (policy + config hash chain), and a SHA-256 event hash. Batches of events are sealed into a Merkle tree; the batch root is signed with an Ed25519 key whose public half is published as the anchor. WAL segments rotate at 100 MB × 10 by default.
+
+**What `gvm proof` exports.** A self-contained JSON bundle with the event (full or redacted), its Merkle inclusion path to the batch root, the BatchSealRecord, the config integrity context, and the Ed25519 anchor signature.
+
+```bash
+gvm proof event   <event_id>   --wal data/wal.log   > evt.json
+gvm proof batch   <batch_id>   --wal data/wal.log   > batch.json
+gvm proof verify  evt.json     --anchor anchor.pub             # offline
+```
+
+Verify runs **offline against just the anchor public key** — the auditor doesn't need access to the host, the WAL, or the operator's signing material. A tamper-evident chain (not tamper-*proof*: a host-root attacker can still mutate local files, but any mutation breaks the chain at the next verify) covers events, batches, and the cross-rotation anchor history.
+
+**Where the signing key lives.** The Ed25519 anchor key is generated by `gvm anchor keygen` and is **operator-managed by default**. Hooks for KMS / HSM backed signing and external timestamp authorities (RFC 3161) are scoped for v0.7+; the current default delivers customer-verifiable evidence inside a customer-managed-key model.
 
 ---
 
@@ -117,10 +145,39 @@ Use cooperative mode for agents you trust or wrote yourself (Python `requests`, 
 
 ---
 
+## For orchestrators — issue a grant, watch decisions, mutate policy
+
+GVM is designed to sit underneath an external orchestrator (your own scheduler, a workflow engine, an MCP server, an internal portal) that decides *which agent gets which capability for how long*. The orchestrator owns the policy decision; GVM owns the enforcement and the evidence.
+
+A typical orchestrated workflow today (v0.5.3):
+
+```bash
+# 1. Operator (or orchestrator) writes a task-scoped SRR ruleset
+#    Per-agent ruleset under config/<agent-id>/srr_network.toml; hot-reloaded.
+gvm reload                                # atomic ruleset swap, all in-flight requests use new rules
+
+# 2. Launch the agent under the scoped permissions
+sudo gvm run --sandbox --agent-id claims-reviewer-1842 ./agent
+
+# 3. Operator monitors via the admin port (separate from the agent-facing proxy)
+gvm approve                               # polls pending RequireApproval events, prompts to decide
+gvm events list --agent claims-reviewer-1842 --last 1h
+
+# 4. After the run, package the evidence
+gvm proof batch <batch_id> --wal data/wal.log > claims-1842-evidence.json
+```
+
+**On the v0.7 roadmap** (see [CHANGELOG.md](docs/internal/CHANGELOG.md) for status): a push-based `GET /gvm/events` WAL stream subscription, granular `POST /gvm/srr/rule` / `DELETE /gvm/srr/rule/<id>` single-rule mutations, and `expires_at` on rules. The three compose into the **time-bounded permission grant pattern** — orchestrator inserts an `Allow` rule with a 5-minute TTL after approving an IC-3 request, agent's next N calls in that window pass without re-prompting, the rule auto-expires.
+
+This is the position GVM aims for: not a sandbox you wrap an agent in, but a **runtime an orchestrator can drive** — the way Docker is a runtime Kubernetes drives. The operational primitive is the **task-scoped grant**, not the container.
+
+---
+
 ## What it doesn't do
 
 - **Not a prompt filter.** Use Lakera or provider safety for that. GVM governs actions, not words.
-- **Not a replacement for OPA.** OPA governs service-to-service. GVM governs agent-to-world.
+- **Not a substitute for the model's own safety.** GVM does not stop the model from being wrong; it limits the blast radius when the model is wrong.
+- **Complementary to OPA, not a replacement.** OPA governs service-to-service. GVM governs agent-to-world. They compose: deploy OPA at your API edge AND GVM around your agent.
 
 | | LLM Provider Safety | Prompt Guards (Lakera) | **GVM** |
 |---|---|---|---|
