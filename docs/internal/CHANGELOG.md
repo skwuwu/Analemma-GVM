@@ -131,6 +131,141 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-06-18: CLI — `gvm import openapi` (Tier-2 P2-b, Tier-2 complete)
+
+Second Tier-2 item from the strategic-audit roadmap. A new CLI
+subcommand generates a deny-by-default SRR baseline from any
+OpenAPI 3.x spec. Combined with the provider action packs (P2-a)
+this means an operator can spin up a baseline policy for any
+internal or third-party API without hand-writing 50 `path_regex`
+blocks. The audit vocabulary stays the same — `operationId`
+becomes the rule's `description`, which surfaces in the WAL as
+`matched_rule_id`.
+
+```bash
+gvm import openapi spec.yaml > srr_network.toml
+gvm import openapi spec.json --out config/srr_network.toml
+```
+
+**What changed.**
+
+- New `crates/gvm-cli/src/import.rs` module with:
+  - `import_openapi(path) -> Vec<String>` (per-rule blocks)
+  - `import_openapi_to_toml(path) -> String` (full file body)
+  - `path_template_to_regex` — turns `/users/{id}/posts/{post_id}`
+    into `^/users/[^/]+/posts/[^/]+$`, escaping regex
+    metacharacters in literal segments
+  - `extract_host_and_base_path` — pulls host and base path from
+    `servers[0].url` (scheme-stripped, trailing-slash-normalised)
+  - `to_snake_case` — `listUsers` → `list_users`,
+    `users.list` → `users_list` (used for `label`)
+  - 7 internal unit tests for the helpers above
+- New `Commands::Import { action: ImportAction }` clap subcommand
+  with `ImportAction::Openapi { spec, out }`. `--out` writes to a
+  file path; absent flag prints to stdout. Errors return non-zero
+  with a stderr explanation.
+- New `serde_yaml = "0.9"` dependency on gvm-cli. YAML parser
+  accepts JSON as a subset, so the same importer handles both
+  formats.
+
+**Generated rule shape** — for each `paths.<template>.<method>`:
+
+```toml
+[[rules]]
+method = "POST"
+pattern = "api.example.com/{any}"
+path_regex = "^/v1/users/[^/]+/comments$"
+decision = { type = "Deny", reason = "outside imported baseline" }
+description = "createUserComment"
+label = "create_user_comment"
+```
+
+**Why deny-by-default, not method-class-by-default.**
+
+The OpenAPI spec doesn't reliably tell us "this is destructive" vs
+"this is a read." `DELETE` isn't always destructive; `POST` isn't
+always a write. A wrong guess that produced an `Allow` rule is the
+worst possible outcome (silent bypass), while a wrong-direction
+`Deny` is loud and self-correcting (operator notices the agent
+can't do its job, reviews, promotes). So every operation imports
+as `Deny`; the operator reviews and promotes individual rules by
+hand or via lease (`principal_filter` + `expires_at` overlay in
+front of the imported baseline).
+
+**Failure modes (all loud).**
+
+- Spec file missing or unreadable → non-zero exit, stderr message
+  including the path.
+- YAML/JSON parse error → non-zero exit, stderr includes the
+  parser error.
+- `servers` missing or empty → non-zero exit, stderr explains
+  that the host cannot be inferred (no silent fallback).
+
+Pinned by `gvm_import_openapi_fails_loudly_on_missing_servers`.
+
+**Affected files.**
+
+- `crates/gvm-cli/Cargo.toml` — `serde_yaml` added
+- `crates/gvm-cli/src/main.rs` — module declared, `Commands::Import`
+  enum variant, `ImportAction::Openapi` subcommand, dispatch arm
+- `crates/gvm-cli/src/import.rs` (new, ~280 LOC + 7 unit tests)
+- `crates/gvm-cli/tests/import_openapi.rs` (new, 4 integration
+  tests — round-trip YAML → CLI → SRR loader, bare-host URL,
+  `--out` flag writes to file, missing-servers loud fail)
+- `docs/srr.md` — new "Importing a Baseline from OpenAPI" subsection
+- `docs/internal/CHANGELOG.md` (this entry)
+
+**Verification.**
+
+- 7 internal unit tests pass (`cargo test -p gvm-cli --bin gvm
+  import::`).
+- 4 integration tests pass (`cargo test --test import_openapi -p
+  gvm-cli`). Each integration test:
+  1. writes a YAML spec to a temp file
+  2. runs the actual `gvm` binary via `CARGO_BIN_EXE_gvm`
+  3. captures stdout, writes it back to a temp `srr_network.toml`
+  4. loads via the production `NetworkSRR::load` path (catches
+     malformed TOML, bad regex, etc.)
+  5. drives canonical requests through `srr.check` and asserts
+     the right `matched_description` (operation id) surfaces
+- All existing tests pass unchanged.
+
+**Risk.**
+
+Low. Net-new CLI surface; no existing behaviour changes. The
+`serde_yaml` crate adds ~50 KB to the gvm-cli binary and pulls
+`unsafe-libyaml` transitively (a small C-FFI shim that
+serde_yaml wraps). Both are widely used and well-maintained.
+
+**Tier-2 complete.** The audit's "give it a product shape" items
+land. Operators can:
+
+1. Mount a curated action pack (`github.pr.merge`,
+   `slack.message.send`) for the SaaS APIs their agents touch
+   (P2-a).
+2. Generate a deny-by-default baseline for any in-house or
+   third-party API from its OpenAPI spec, with operationIds
+   becoming the audit vocabulary (P2-b).
+3. Overlay per-task leases (`principal_filter` + `expires_at`,
+   Tier-1) on either layer to issue time-bounded grants for
+   specific agents.
+
+The composition produces the agent-IAM shape the strategic audit
+called out as the path off "weird egress firewall".
+
+**Follow-ups (Tier-3, control plane).**
+
+- `POST /gvm/srr/rule` + `DELETE /gvm/srr/rule/<id>` — granular
+  single-rule mutation (orchestrator injects/removes one rule
+  atomically; current `gvm reload` is full-file swap).
+- `GET /gvm/events?since=<id>&filter=...` — long-poll WAL event
+  stream so orchestrators consume IC-3 transitions without
+  polling.
+- `POST /gvm/payload-context` — cooperative body-context endpoint
+  where an SDK / sidecar / MCP adapter delivers structured
+  payload context without MITM (lowers the MITM dependency for
+  HTTPS-pinned and gRPC traffic).
+
 ### 2026-06-18: SRR — provider action packs: GitHub + Slack (Tier-2 P2-a)
 
 First Tier-2 item from the strategic-audit roadmap. Ships two

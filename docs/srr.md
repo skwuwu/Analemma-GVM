@@ -347,6 +347,77 @@ canonical URL maps to its declared action name and risk class, the
 lease shape correctly shadows pack defaults for the named principal
 in the named window).
 
+### Importing a Baseline from OpenAPI — `gvm import openapi`
+
+For an internal or third-party API the operator already has an
+OpenAPI 3.x spec for, `gvm import openapi` generates a
+deny-by-default SRR file in one shot. The vocabulary is the same:
+`operationId` becomes the rule's `description`, so the audit log
+records the semantic action name instead of the URL.
+
+```bash
+# YAML or JSON, both accepted
+gvm import openapi spec.yaml > srr_network.toml
+gvm import openapi spec.json --out config/srr_network.toml
+```
+
+For each `paths.<template>.<method>` in the spec, the importer emits
+a `[[rules]]` block with:
+
+- `method` from the HTTP verb
+- `pattern = "<host>/{any}"` from `servers[0].url`
+- `path_regex` from the path template — `{name}` becomes `[^/]+`,
+  regex metacharacters in literal segments are escaped
+- `description = operationId` (or a `method_path` placeholder when
+  the spec omits it)
+- `label = to_snake_case(operationId)`
+- `decision = { type = "Deny", reason = "outside imported baseline" }`
+
+The operator reviews each rule and promotes individual actions to
+`Allow` / `Delay` / `RequireApproval` by hand, or appends a lease
+rule (with `principal_filter` + `expires_at`) **before** the
+imported baseline so the lease's match shadows the deny.
+
+```toml
+# Per-agent lease — fires first, overrides the imported Deny for
+# this principal, this URL, and this window only.
+[[rules]]
+method = "POST"
+pattern = "api.internal.corp/{any}"
+path_regex = "^/v1/workflows/release/runs$"
+principal_filter = "agent:release-bot"
+expires_at = "2026-07-01T15:00:00Z"
+decision = { type = "Allow" }
+description = "triggerWorkflow"
+
+# === BEGIN imported baseline (gvm import openapi spec.yaml) ===
+# ... generated rules ...
+```
+
+The importer deliberately does NOT guess risk class by HTTP verb
+(POST = Delay, DELETE = Deny, etc.). The OpenAPI spec doesn't
+reliably carry that information, and a wrong guess that produces
+an Allow rule is the worst possible outcome. Deny-by-default plus
+explicit operator review is the safe default.
+
+**Errors are loud.** The importer exits non-zero with a stderr
+message when:
+- the spec file does not exist or cannot be read
+- the spec parses neither as YAML nor as JSON
+- `servers` is missing or empty (host cannot be inferred)
+
+Regression coverage:
+- [crates/gvm-cli/src/import.rs](../crates/gvm-cli/src/import.rs)
+  `mod tests` (7 unit tests — path-template-to-regex with params,
+  multiple params, metacharacter escaping, host extraction with
+  and without base path, snake_case for camelCase and dotted
+  identifiers)
+- [crates/gvm-cli/tests/import_openapi.rs](../crates/gvm-cli/tests/import_openapi.rs)
+  (4 integration tests — end-to-end YAML → generated TOML →
+  `NetworkSRR::load` → request match for canonical URLs with the
+  right `description`; bare-host server URL; `--out` flag writes
+  to a file path; missing `servers` fails loudly)
+
 ### Base64 Payload Decoding
 
 SRR automatically decodes Base64-encoded content before pattern matching. This prevents bypass via encoding obfuscation. Two decoding strategies are applied in order:

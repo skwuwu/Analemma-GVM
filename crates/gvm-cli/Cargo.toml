@@ -68,6 +68,10 @@ crossterm = "0.29"
 # anchor verification path), so this doesn't grow the dep tree.
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
+# OpenAPI spec import (`gvm import openapi <spec.yaml>`).
+# serde_yaml's parser accepts JSON as a subset of YAML, so the same
+# importer handles both file formats.
+serde_yaml = "0.9"
 
 [dev-dependencies]
 # `tempfile` is only used by `replay::tests::srr_from_inline` — keeping

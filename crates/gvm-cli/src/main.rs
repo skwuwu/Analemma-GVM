@@ -8,6 +8,7 @@ mod demo;
 mod dns_inspect;
 mod events;
 mod fs_approve;
+mod import;
 mod init;
 mod pipeline;
 mod preflight;
@@ -405,6 +406,20 @@ enum Commands {
         proxy: String,
     },
 
+    /// Generate a deny-by-default SRR baseline from an external spec.
+    ///
+    /// Combined with the provider action packs in
+    /// `config/templates/_action_packs/`, this lets an operator spin
+    /// up a baseline policy for any internal or third-party API
+    /// without hand-writing one [[rules]] block per endpoint.
+    ///
+    ///   gvm import openapi spec.yaml > srr_network.toml
+    ///   gvm import openapi spec.json --out config/srr_network.toml
+    Import {
+        #[command(subcommand)]
+        action: ImportAction,
+    },
+
     /// Dry-run an SRR ruleset against historical WAL events (#3
     /// visibility item). Re-classifies every event in the WAL using
     /// the proposed rule file, reports the verdict delta.
@@ -768,6 +783,26 @@ enum ProofAction {
     Verify {
         /// Path to proof JSON file.
         proof: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImportAction {
+    /// Generate SRR rules from an OpenAPI 3.x spec (YAML or JSON).
+    ///
+    /// Every path × method becomes a `decision = { type = "Deny" }`
+    /// rule keyed on the spec's `operationId` (used as the canonical
+    /// action name). Operators review the generated file and promote
+    /// individual rules to Allow / Delay / RequireApproval by hand,
+    /// or by appending a lease rule (principal_filter + expires_at)
+    /// before the generated baseline.
+    Openapi {
+        /// Path to the OpenAPI spec file (`.yaml`, `.yml`, or `.json`).
+        spec: String,
+
+        /// Output file path. Default: stdout.
+        #[arg(long)]
+        out: Option<String>,
     },
 }
 
@@ -1176,6 +1211,19 @@ async fn main() -> anyhow::Result<()> {
         Commands::Reload { proxy } => {
             reload::run_reload(&proxy).await?;
         }
+
+        Commands::Import { action } => match action {
+            ImportAction::Openapi { spec, out } => {
+                let body = import::import_openapi_to_toml(std::path::Path::new(&spec))?;
+                match out {
+                    Some(path) => {
+                        std::fs::write(&path, body)?;
+                        eprintln!("Wrote SRR baseline to {path}");
+                    }
+                    None => print!("{body}"),
+                }
+            }
+        },
 
         Commands::Replay {
             wal,
