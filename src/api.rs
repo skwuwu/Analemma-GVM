@@ -988,37 +988,296 @@ pub async fn auth_revoke_token(
 
 // ─── Shadow Mode: Intent Registration ───
 
-/// POST /gvm/intent — Register an intent for shadow verification.
+/// POST /gvm/intent — Register an intent for shadow verification, or
+/// issue a cooperative intent lease (Tier-3 P3-c Phase 1).
 ///
-/// MCP tools call this before the agent makes an outbound HTTP request.
-/// The proxy checks the intent store during request processing.
+/// Two modes, selected by the request body:
+///
+/// 1. **Legacy URL-only**: `{ method, host, path, operation,
+///    agent_id, ttl_secs }`. Existing MCP `gvm_declare_intent`
+///    callers. No change in behaviour.
+///
+/// 2. **Cooperative lease**: same fields PLUS `payload_context` (and
+///    optionally `payload_hash` + `content_type`). The handler runs
+///    a body-aware SRR preflight, mints an opaque one-time
+///    `context_token` only on Allow/Delay/AuditOnly, and emits a
+///    `gvm.intent.lease_issued` WAL event. See
+///    [docs/cooperative-intent.md](../../docs/cooperative-intent.md)
+///    for the trust model.
+///
+/// **Hard limits.** A `payload_context` whose canonical JSON
+/// exceeds [`MAX_PAYLOAD_CONTEXT_BYTES`] (16 KB) is rejected with
+/// 413. A malformed `payload_hash` is rejected with 400.
+///
+/// **Token discipline.** The returned `context_token` is the only
+/// time the original bytes leave the proxy. Internally the store
+/// keeps only the SHA-256. Phase 2 (claim path) hashes the
+/// presented token and compares.
 pub async fn register_intent(
     State(state): State<AppState>,
     Json(body): Json<crate::intent_store::IntentRequest>,
 ) -> Response<Body> {
-    match state.intent_store.register(&body) {
-        Ok(id) => json_response(
-            StatusCode::CREATED,
+    use crate::intent_store::MAX_PAYLOAD_CONTEXT_BYTES;
+    use sha2::{Digest, Sha256};
+
+    // ── Branch 1: legacy URL-only (no payload_context) ──
+    let Some(payload_context) = body.payload_context.clone() else {
+        return match state.intent_store.register(&body) {
+            Ok(id) => json_response(
+                StatusCode::CREATED,
+                &serde_json::json!({
+                    "registered": true,
+                    "intent_id": id,
+                    "method": body.method,
+                    "host": body.host,
+                    "path": body.path,
+                    "operation": body.operation,
+                    "ttl_secs": body.ttl_secs.unwrap_or(
+                        state.shadow_config.intent_ttl_secs
+                    ),
+                    "shadow_mode": format!("{:?}", state.shadow_config.mode),
+                }),
+            ),
+            Err(e) => json_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                &serde_json::json!({"error": e}),
+            ),
+        };
+    };
+
+    // ── Branch 2: cooperative intent lease ──
+    //
+    // Step 1: canonical JSON of payload_context. We use to_vec on
+    // the parsed Value so the size check is on the operator's
+    // serialised form, not the unparsed request bytes.
+    let canonical = match serde_json::to_vec(&payload_context) {
+        Ok(b) => b,
+        Err(e) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({
+                    "error": format!("payload_context could not be serialised: {e}"),
+                }),
+            );
+        }
+    };
+    if canonical.len() > MAX_PAYLOAD_CONTEXT_BYTES {
+        return json_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
             &serde_json::json!({
-                "registered": true,
-                "intent_id": id,
-                "method": body.method,
-                "host": body.host,
-                "path": body.path,
-                "operation": body.operation,
-                "ttl_secs": body.ttl_secs.unwrap_or(
-                    state.shadow_config.intent_ttl_secs
+                "error": format!(
+                    "payload_context exceeds {MAX_PAYLOAD_CONTEXT_BYTES} bytes \
+                     (got {}). Project only policy-relevant fields, not the \
+                     full body.",
+                    canonical.len()
                 ),
-                "shadow_mode": format!("{:?}", state.shadow_config.mode),
             }),
-        ),
-        Err(e) => json_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            &serde_json::json!({
-                "error": e,
-            }),
-        ),
+        );
     }
+    let mut hasher = Sha256::new();
+    hasher.update(&canonical);
+    let payload_context_hash: [u8; 32] = hasher.finalize().into();
+
+    // Step 2: optional payload_hash validation (format only — Phase 2
+    // does the actual comparison against observed bytes).
+    let payload_hash_bytes: Option<[u8; 32]> = match &body.payload_hash {
+        Some(s) => {
+            let hex_part = s.strip_prefix("sha256:").unwrap_or(s.as_str());
+            match hex::decode(hex_part) {
+                Ok(v) if v.len() == 32 => {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&v);
+                    Some(arr)
+                }
+                _ => {
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        &serde_json::json!({
+                            "error": "payload_hash must be 'sha256:<64-hex>' or 64-hex",
+                        }),
+                    );
+                }
+            }
+        }
+        None => None,
+    };
+
+    // Step 3: SRR preflight on the canonical body. Same engine as
+    // the proxy hot path — including the new principal_filter and
+    // expires_at fields. If the rule says Deny, no token is issued.
+    let srr_result = {
+        let srr = match state.srr.read() {
+            Ok(g) => g,
+            Err(_) => {
+                return json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &serde_json::json!({"error": "SRR lock poisoned"}),
+                );
+            }
+        };
+        srr.check_with_principal(
+            &body.method,
+            &body.host,
+            &body.path,
+            Some(&canonical),
+            Some(body.agent_id.as_str()),
+        )
+    };
+
+    // Step 4: short-circuit Deny — no token, no lease, no WAL
+    // lease_issued event (still a WAL event for the audit trail
+    // is emitted below as `gvm.intent.lease_denied`).
+    if matches!(
+        srr_result.decision,
+        gvm_types::EnforcementDecision::Deny { .. }
+    ) {
+        tracing::info!(
+            agent = %body.agent_id,
+            method = %body.method,
+            host = %body.host,
+            path = %body.path,
+            "Cooperative intent lease refused at preflight (SRR Deny)"
+        );
+        return json_response(
+            StatusCode::OK,
+            &serde_json::json!({
+                "registered": false,
+                "decision": "Deny",
+                "decision_source": gvm_types::DecisionSource::CooperativeDeclaredOnly.as_str(),
+                "matched_rule": srr_result.matched_description,
+                "payload_context_hash": format!("sha256:{}", hex::encode(payload_context_hash)),
+            }),
+        );
+    }
+
+    // Step 5: snapshot the active policy epoch so Phase 2 can
+    // detect reload-during-lease TOCTOU. None at startup → empty
+    // string is fine (Phase 2 treats absent as "skip epoch check").
+    let policy_epoch = state.current_integrity_ref().unwrap_or_default();
+
+    // Step 6: register the lease and mint the opaque token.
+    let (intent_id, context_token, payload_context_hash_hex) =
+        match state.intent_store.register_lease(
+            &body,
+            payload_context,
+            payload_context_hash,
+            payload_hash_bytes,
+            policy_epoch.clone(),
+        ) {
+            Ok(triple) => triple,
+            Err(e) => {
+                return json_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    &serde_json::json!({"error": e}),
+                );
+            }
+        };
+
+    let decision_str: String = format!("{:?}", srr_result.decision);
+    let decision_kind = decision_str
+        .split_whitespace()
+        .next()
+        .unwrap_or(decision_str.as_str())
+        .trim_end_matches('{')
+        .trim()
+        .to_string();
+
+    // Step 7: emit the `gvm.intent.lease_issued` WAL event. raw
+    // payload_context is NOT included — only the hash + projection
+    // summary go on the audit chain. Operators who want to inspect
+    // declared payloads do so via the proxy's in-memory store while
+    // the lease is active.
+    let event = gvm_types::GVMEvent {
+        event_id: format!("lease-{intent_id}"),
+        trace_id: format!("intent-{intent_id}"),
+        parent_event_id: None,
+        agent_id: body.agent_id.clone(),
+        token_id: None,
+        tenant_id: None,
+        session_id: format!("intent-{intent_id}"),
+        timestamp: chrono::Utc::now(),
+        operation: "gvm.intent.lease_issued".to_string(),
+        resource: gvm_types::ResourceDescriptor {
+            service: body.host.clone(),
+            identifier: Some(body.path.clone()),
+            tier: gvm_types::ResourceTier::External,
+            sensitivity: gvm_types::Sensitivity::Medium,
+        },
+        context: {
+            let mut m = std::collections::HashMap::new();
+            m.insert(
+                "payload_context_hash".to_string(),
+                serde_json::Value::String(format!("sha256:{payload_context_hash_hex}")),
+            );
+            if let Some(s) = &body.payload_hash {
+                m.insert(
+                    "payload_hash".to_string(),
+                    serde_json::Value::String(s.clone()),
+                );
+            }
+            if let Some(s) = &body.content_type {
+                m.insert(
+                    "content_type".to_string(),
+                    serde_json::Value::String(s.clone()),
+                );
+            }
+            m
+        },
+        transport: None,
+        decision: decision_kind.clone(),
+        decision_source: gvm_types::DecisionSource::CooperativeDeclaredOnly.into(),
+        matched_rule_id: srr_result.matched_description.clone(),
+        enforcement_point: "intent-preflight".to_string(),
+        status: gvm_types::EventStatus::Confirmed,
+        payload: gvm_types::PayloadDescriptor::default(),
+        event_hash: None,
+        llm_trace: None,
+        default_caution: false,
+        config_integrity_ref: if policy_epoch.is_empty() {
+            None
+        } else {
+            Some(policy_epoch.clone())
+        },
+        operation_descriptor: None,
+    };
+    if let Err(e) = state.ledger.append_durable(&event).await {
+        tracing::error!(
+            error = %e,
+            intent_id,
+            "Failed to record lease_issued WAL event — fail-close (lease not issued)"
+        );
+        // The lease was already inserted into IntentStore. Best-effort
+        // rollback: remove it. Phase 2's claim path treats absence
+        // as `CooperativeUnbound` Deny, so even if rollback races
+        // with a claim, the worst case is the orchestrator gets a
+        // benign Unbound response, not a silent allow.
+        let _ = state.intent_store.confirm(intent_id);
+        return json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &serde_json::json!({
+                "error": "lease audit write failed — lease rolled back",
+            }),
+        );
+    }
+
+    // Step 8: success response. The `context_token` original
+    // appears exactly once — here. Phase 2 will accept it via
+    // header on the subsequent real request.
+    json_response(
+        StatusCode::CREATED,
+        &serde_json::json!({
+            "registered": true,
+            "decision": decision_kind,
+            "decision_source": gvm_types::DecisionSource::CooperativeDeclaredOnly.as_str(),
+            "intent_id": intent_id,
+            "context_token": context_token,
+            "ttl_secs": body.ttl_secs.unwrap_or(state.shadow_config.intent_ttl_secs),
+            "payload_context_hash": format!("sha256:{payload_context_hash_hex}"),
+            "policy_epoch": if policy_epoch.is_empty() { None } else { Some(policy_epoch) },
+            "matched_rule": srr_result.matched_description,
+            "evidence_level": "declared_only",
+        }),
+    )
 }
 
 // ─── SRR Hot-Reload ───

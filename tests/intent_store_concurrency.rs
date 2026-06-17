@@ -34,6 +34,9 @@ fn intent(method: &str, host: &str, path: &str, agent: &str) -> IntentRequest {
         operation: format!("test.{}.{}", method, host),
         agent_id: agent.to_string(),
         ttl_secs: Some(60),
+        payload_context: None,
+        payload_hash: None,
+        content_type: None,
     }
 }
 

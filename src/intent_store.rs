@@ -108,6 +108,36 @@ struct Intent {
     created_at: Instant,
     ttl: Duration,
     state: IntentState,
+
+    // ── Cooperative lease fields (Tier-3 P3-c Phase 1) ──
+    //
+    // None for legacy URL-only declarations (no token issued).
+    // Some for body-aware declarations: the lease carries the
+    // hashed context token, the projected payload context, and
+    // the policy epoch active at issuance. Phase 2 (claim path)
+    // uses these for cross-check; Phase 1 only writes them.
+    /// SHA-256 of the raw bearer token bytes. The token original
+    /// is returned to the caller exactly once and never stored or
+    /// logged. Compare against this on claim by hashing the
+    /// presented token. None = legacy intent without a token.
+    context_token_hash: Option<[u8; 32]>,
+    /// Projected payload context (operator-supplied, NOT raw body).
+    /// Phase 2 uses this for cross-check against the observed body.
+    payload_context: Option<serde_json::Value>,
+    /// SHA-256 of the canonical JSON of `payload_context`. Always
+    /// present when `payload_context` is — pre-computed at
+    /// register time so Phase 2 doesn't re-serialize on hot path.
+    payload_context_hash: Option<[u8; 32]>,
+    /// Optional SHA-256 of the actual body the agent declared it
+    /// will send (forward-compat for Phase 2 strict cross-check).
+    /// Format on the wire: `"sha256:<hex>"`. Stored as bytes here.
+    payload_hash: Option<[u8; 32]>,
+    /// Policy epoch (config integrity context hash) at issuance.
+    /// Phase 2 compares with the current epoch on claim; mismatch
+    /// → `CooperativeExpired` Deny unless `allow_pinned_lease`
+    /// is set. Encoded as the same hex string the WAL already
+    /// uses for `config_integrity_ref`.
+    policy_epoch: Option<String>,
 }
 
 impl Intent {
@@ -161,6 +191,14 @@ pub struct VerifyResult {
 }
 
 /// Request body for POST /gvm/intent.
+///
+/// Tier-3 P3-c Phase 1 added three optional fields for the
+/// "cooperative intent lease" extension: `payload_context`,
+/// `payload_hash`, `content_type`. They turn the legacy URL-only
+/// preflight into a body-aware preflight without changing the
+/// endpoint's URL or breaking existing callers. See
+/// [docs/cooperative-intent.md](../../docs/cooperative-intent.md)
+/// for the full trust model and the Phase 2 / Phase 3 followups.
 #[derive(Debug, Deserialize)]
 pub struct IntentRequest {
     pub method: String,
@@ -170,11 +208,49 @@ pub struct IntentRequest {
     #[serde(default = "default_agent")]
     pub agent_id: String,
     pub ttl_secs: Option<u64>,
+
+    /// Projected, policy-relevant fields of the body the agent
+    /// intends to send. NOT the full body — operators are expected
+    /// to project only what `payload_field` rules read (e.g.
+    /// `{"channel": "C_INTERNAL", "case_id": "1842"}`), not the
+    /// full Slack message. See cooperative-intent.md §"Payload
+    /// privacy" for the rationale.
+    ///
+    /// Hard cap: `MAX_PAYLOAD_CONTEXT_BYTES` (16 KB) on the
+    /// serialized canonical form. Larger contexts return 413 from
+    /// the HTTP handler.
+    #[serde(default)]
+    pub payload_context: Option<serde_json::Value>,
+
+    /// Optional SHA-256 hash of the actual body the agent will
+    /// send. Used at Phase 2 claim time to cross-check the
+    /// observed body when GVM CAN see it. Format:
+    /// `"sha256:<lowercase-hex-64>"`. Validated at register time.
+    #[serde(default)]
+    pub payload_hash: Option<String>,
+
+    /// Optional MIME type the agent declares for the body
+    /// (`application/json`, `application/grpc+proto`, etc.).
+    /// Used to pick the right canonical form during cross-check.
+    #[serde(default)]
+    pub content_type: Option<String>,
 }
 
 fn default_agent() -> String {
     "mcp-agent".to_string()
 }
+
+/// Hard cap on serialized canonical `payload_context` bytes.
+/// 16 KB is small enough that an attacker can't OOM the proxy
+/// with declarations but large enough to fit realistic projected
+/// field bundles (channel + topic + 5 KB text excerpt + metadata).
+pub const MAX_PAYLOAD_CONTEXT_BYTES: usize = 16 * 1024;
+
+/// Length in bytes of the opaque context token's secret part
+/// (32 bytes = 256-bit). Encoded URL-safe-base64 produces 43
+/// characters. With the `ctx_` prefix the on-wire form is 47
+/// characters — fits comfortably in any HTTP header.
+pub const CONTEXT_TOKEN_SECRET_BYTES: usize = 32;
 
 // ── Intent Store ─────────────────────────────────────────────────────────────
 
@@ -238,6 +314,12 @@ impl IntentStore {
             created_at: Instant::now(),
             ttl,
             state: IntentState::Active,
+            // Legacy URL-only register: no cooperative lease.
+            context_token_hash: None,
+            payload_context: None,
+            payload_context_hash: None,
+            payload_hash: None,
+            policy_epoch: None,
         };
 
         store.index.entry(key).or_default().push(intent_id);
@@ -255,6 +337,124 @@ impl IntentStore {
         );
 
         Ok(intent_id)
+    }
+
+    /// Tier-3 P3-c Phase 1: register a cooperative intent lease.
+    ///
+    /// Same intent shape as [`register`] PLUS the caller supplies
+    /// the projected `payload_context`, its canonical hash, the
+    /// optional `payload_hash` (actual body forward-commit), and
+    /// the current `policy_epoch`. In return the store mints a
+    /// fresh opaque bearer token. The token original is returned
+    /// EXACTLY ONCE in this function's return value and never
+    /// stored — internally only the SHA-256 of the token bytes is
+    /// kept. Phase 2 verifies a presented token by hashing it and
+    /// comparing.
+    ///
+    /// The on-wire token form is `ctx_<base64url-no-pad>` where
+    /// the inner secret is `CONTEXT_TOKEN_SECRET_BYTES` (32) of
+    /// cryptographically random bytes from the OS RNG. Token IDs
+    /// are DELIBERATELY NOT derived from `intent_id` or
+    /// `claim_id` — those are sequential and would be guessable.
+    ///
+    /// Returns `(intent_id, context_token, payload_context_hash_hex)`
+    /// on success. The HTTP handler is responsible for emitting
+    /// the `gvm.intent.lease_issued` WAL event with the chosen
+    /// `DecisionSource::CooperativeDeclaredOnly` source (Phase 1
+    /// is declared-only by definition; cross-check happens on
+    /// claim in Phase 2).
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_lease(
+        &self,
+        req: &IntentRequest,
+        payload_context: serde_json::Value,
+        payload_context_hash: [u8; 32],
+        payload_hash: Option<[u8; 32]>,
+        policy_epoch: String,
+    ) -> Result<(u64, String, String), String> {
+        use base64::Engine;
+        use rand::RngCore;
+        use sha2::{Digest, Sha256};
+
+        let mut store = self
+            .inner
+            .lock()
+            .map_err(|_| "Intent store lock poisoned — fail-closed".to_string())?;
+
+        self.cleanup_inner(&mut store);
+
+        if store.intents.len() >= MAX_INTENTS {
+            return Err(format!(
+                "Intent store full ({} intents). Wait for TTL expiration.",
+                MAX_INTENTS
+            ));
+        }
+
+        // Mint the opaque token: 32 bytes from the OS RNG,
+        // base64url-no-pad encoded, prefixed with `ctx_` for
+        // grep-ability in operator logs. We never serialise the
+        // raw bytes anywhere else.
+        let mut secret = [0u8; CONTEXT_TOKEN_SECRET_BYTES];
+        rand::rngs::OsRng.fill_bytes(&mut secret);
+        let token_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret);
+        let context_token = format!("ctx_{token_b64}");
+
+        // Hash the on-wire token (with prefix) so a future claim
+        // path hashes the same bytes the caller sees.
+        let mut hasher = Sha256::new();
+        hasher.update(context_token.as_bytes());
+        let token_hash: [u8; 32] = hasher.finalize().into();
+
+        let ttl = req
+            .ttl_secs
+            .map(|s| Duration::from_secs(s.min(300)))
+            .unwrap_or(self.default_ttl);
+
+        let intent_id = self.next_intent_id.fetch_add(1, Ordering::Relaxed);
+        let key = make_key(&req.method, &req.host, &req.path);
+
+        let intent = Intent {
+            intent_id,
+            method: req.method.to_uppercase(),
+            host: req.host.to_lowercase(),
+            path_prefix: req.path.clone(),
+            operation: req.operation.clone(),
+            agent_id: req.agent_id.clone(),
+            created_at: Instant::now(),
+            ttl,
+            state: IntentState::Active,
+            context_token_hash: Some(token_hash),
+            payload_context: Some(payload_context),
+            payload_context_hash: Some(payload_context_hash),
+            payload_hash,
+            policy_epoch: Some(policy_epoch),
+        };
+
+        store.index.entry(key).or_default().push(intent_id);
+        store.intents.insert(intent_id, intent);
+
+        // Zeroize the local copy of the secret bytes before
+        // returning — the only surviving copies are the hashed
+        // store entry and the string we hand back to the HTTP
+        // handler (which writes it once into the response body and
+        // drops it).
+        secret.iter_mut().for_each(|b| *b = 0);
+
+        let payload_context_hash_hex = hex::encode(payload_context_hash);
+
+        tracing::info!(
+            intent_id,
+            method = %req.method,
+            host = %req.host,
+            path = %req.path,
+            operation = %req.operation,
+            agent = %req.agent_id,
+            ttl_secs = ttl.as_secs(),
+            payload_context_hash = %payload_context_hash_hex,
+            "Cooperative intent lease registered"
+        );
+
+        Ok((intent_id, context_token, payload_context_hash_hex))
     }
 
     /// Phase 1: Claim an intent (mark as Claimed, do NOT delete).
@@ -496,6 +696,9 @@ mod tests {
             operation: op.into(),
             agent_id: agent.into(),
             ttl_secs: None,
+            payload_context: None,
+            payload_hash: None,
+            content_type: None,
         }
     }
 
@@ -687,6 +890,9 @@ mod tests {
             operation: "test.poison".to_string(),
             agent_id: "agent-1".to_string(),
             ttl_secs: Some(30),
+            payload_context: None,
+            payload_hash: None,
+            content_type: None,
         };
         let _ = store
             .register(&req)
@@ -726,6 +932,9 @@ mod tests {
             operation: "test.after_poison".to_string(),
             agent_id: "agent-2".to_string(),
             ttl_secs: Some(30),
+            payload_context: None,
+            payload_hash: None,
+            content_type: None,
         };
         match store.register(&req2) {
             Ok(_) => {

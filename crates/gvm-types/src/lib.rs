@@ -281,6 +281,84 @@ pub fn compute_detail_digest(salt: &[u8], detail: Option<&str>) -> String {
     hex::encode(h.finalize())
 }
 
+// ─── Decision provenance (PART 5.5) ───
+
+/// Evidence level for a governance decision.
+///
+/// Recorded as `GVMEvent.decision_source` so the auditor can
+/// distinguish *what the engine saw* from *what the agent declared*.
+/// In regulated workflows, the same `decision = "Allow"` can be
+/// either "GVM observed the request body and matched a rule"
+/// (highest evidence) or "agent declared intent and GVM has no
+/// network-side observation" (lowest evidence). Both are valid
+/// operating modes; the audit must reflect the difference.
+///
+/// Serialised as a dotted string (see `From<DecisionSource>`) for
+/// back-compat with the existing `decision_source: String` WAL
+/// field. The producer side picks the right variant at decision
+/// time; consumers read the string verbatim (no enum on the
+/// deserialise path, so adding variants in v0.x is non-breaking).
+///
+/// Variants (highest → lowest evidence):
+///
+/// - `MitmNetworkObserved` — body inspection at the MITM relay.
+///   GVM decrypted, parsed, and matched against the real body.
+/// - `SrrNetworkObserved` — URL/method/host match at the network
+///   layer (no body inspection required, or body was inspected
+///   without a `payload_field` rule firing).
+/// - `CooperativeCrossChecked` — the agent declared a context AND
+///   GVM observed the actual request; the declaration was confirmed
+///   to match. Equivalent evidence to network-observed.
+/// - `CooperativeDeclaredOnly` — the agent declared a context but
+///   GVM could not observe the real request (pinned TLS, mTLS,
+///   gRPC over h2, or CONNECT-blind path). Decision was made on the
+///   declaration alone. Lower evidence — depends on agent honesty,
+///   typically combined with sandbox isolation for trust.
+/// - `CooperativeMismatch` — agent declared X but the observed
+///   request was Y. Always Deny. WAL captures both for forensics.
+/// - `CooperativeExpired` — a context token was presented after the
+///   lease TTL elapsed. Always Deny.
+/// - `CooperativeUnbound` — a context token was presented that does
+///   not bind to any active lease (re-use, forgery, or replay).
+///   Always Deny.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionSource {
+    SrrNetworkObserved,
+    MitmNetworkObserved,
+    CooperativeDeclaredOnly,
+    CooperativeCrossChecked,
+    CooperativeMismatch,
+    CooperativeExpired,
+    CooperativeUnbound,
+}
+
+impl DecisionSource {
+    /// Canonical dotted string form recorded in the WAL.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DecisionSource::SrrNetworkObserved => "srr.network_observed",
+            DecisionSource::MitmNetworkObserved => "mitm.network_observed",
+            DecisionSource::CooperativeDeclaredOnly => "cooperative.declared_only",
+            DecisionSource::CooperativeCrossChecked => "cooperative.cross_checked",
+            DecisionSource::CooperativeMismatch => "cooperative.mismatch",
+            DecisionSource::CooperativeExpired => "cooperative.expired",
+            DecisionSource::CooperativeUnbound => "cooperative.unbound",
+        }
+    }
+}
+
+impl From<DecisionSource> for String {
+    fn from(d: DecisionSource) -> String {
+        d.as_str().to_string()
+    }
+}
+
+impl std::fmt::Display for DecisionSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 // ─── Event Schema (PART 6) ───
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

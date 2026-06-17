@@ -131,6 +131,167 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-06-18: Cooperative intent lease — Phase 1 issuance (Tier-3 P3-c)
+
+Body-aware policy enforcement when MITM is blind (cert pinning,
+mTLS, gRPC over h2, raw CONNECT relay). The agent (or its
+SDK / sidecar / MCP adapter) declares the body context it intends
+to send; GVM runs SRR preflight against the declaration, mints an
+opaque one-time `context_token` on Allow / Delay / AuditOnly, and
+records the decision with explicit evidence level so the audit
+chain reflects what the engine had access to. **Does not replace
+MITM** — additive coverage of the paths MITM cannot reach. See
+[docs/cooperative-intent.md](../cooperative-intent.md) for the
+full design and Phase 2 / Phase 3 followups.
+
+**Trust boundary statement (canonical).**
+
+> Cooperative declaration extends enforcement only when GVM can
+> bind the declaration to a visible transport event — an HTTP
+> request, a CONNECT request, a sidecar-mediated egress, or a
+> sandbox-scoped network event. Without one of those bindings,
+> the declaration is recorded but is not load-bearing for
+> enforcement.
+
+**Phase 1 scope.** Issuance side only:
+- Extend `IntentRequest`, mint token, store hash, record evidence.
+- Phase 2 (next commit): proxy hot-path claim, observed-vs-declared
+  cross-check, header stripping.
+- Phase 3 (later): CONNECT-visible token, sidecar binding.
+
+**What changed.**
+
+- `crates/gvm-types/src/lib.rs` — new `DecisionSource` enum with
+  seven variants (`SrrNetworkObserved`, `MitmNetworkObserved`,
+  `CooperativeDeclaredOnly`, `CooperativeCrossChecked`,
+  `CooperativeMismatch`, `CooperativeExpired`, `CooperativeUnbound`).
+  `From<DecisionSource> for String` produces the canonical dotted
+  form (`cooperative.declared_only`, etc.) so the existing
+  `decision_source: String` WAL field accepts it without a schema
+  change.
+- `src/intent_store.rs` — `IntentRequest` gains three Option fields
+  (`payload_context: Option<serde_json::Value>`, `payload_hash`,
+  `content_type`). New `MAX_PAYLOAD_CONTEXT_BYTES = 16 KB` and
+  `CONTEXT_TOKEN_SECRET_BYTES = 32` constants.
+- `src/intent_store.rs` — internal `Intent` struct gains
+  cooperative-lease fields (`context_token_hash: [u8; 32]`,
+  `payload_context`, `payload_context_hash`, `payload_hash`,
+  `policy_epoch`). All optional; legacy `register` initializes
+  them to None.
+- `src/intent_store.rs` — new `register_lease(req,
+  payload_context, payload_context_hash, payload_hash,
+  policy_epoch) -> (intent_id, context_token,
+  payload_context_hash_hex)`. Mints 32 random bytes from
+  `OsRng`, base64url-no-pad encodes with `ctx_` prefix, hashes
+  the on-wire form, stores ONLY the hash. The secret buffer is
+  zeroed before return. Token discipline: original leaves the
+  proxy exactly once in this function's return value.
+- `src/api.rs::register_intent` — branches on `payload_context`
+  presence. Legacy URL-only path unchanged (back-compat). New
+  cooperative-lease path:
+  1. Canonical-serialise `payload_context`; reject 413 if > 16 KB
+  2. Validate `payload_hash` format if supplied; reject 400 on
+     malformed
+  3. Run SRR `check_with_principal` against canonical bytes; reject
+     200 with `decision: Deny` and no token / no intent_id /
+     no WAL event on preflight Deny
+  4. Snapshot `current_integrity_ref()` as the `policy_epoch`
+  5. Call `register_lease` to mint and store
+  6. Emit `gvm.intent.lease_issued` WAL event with
+     `decision_source = cooperative.declared_only`. Raw
+     `payload_context` is NOT in the event — only
+     `payload_context_hash` + optional `payload_hash` +
+     `content_type` go to the audit chain.
+  7. Return 201 with `context_token` (original — only emission),
+     `decision_source`, `evidence_level`, `policy_epoch`,
+     `payload_context_hash`. If WAL append fails, roll back the
+     lease and return 500 (fail-close).
+
+**Hard limits (all loud).**
+
+| Limit | Value | Response on violation |
+|---|---|---|
+| `payload_context` canonical JSON | 16 KB | 413 with cap explanation |
+| `payload_hash` format | `sha256:<64-hex>` or 64-hex | 400 |
+| Active intents (legacy + leases) | 10 000 | 429 |
+| `ttl_secs` ceiling | 300 (5 min) | Silent clamp |
+
+**Token security.**
+
+- 32 bytes from `OsRng` → base64url-no-pad → `ctx_<43-char>` (47
+  total) — fits any HTTP header.
+- Store keeps only SHA-256 of the on-wire bytes.
+- `intent_id` and `claim_id` are sequential u64 — NEVER used as
+  the public token. Test enforces this via entropy check (a
+  sequential token would have 1-2 distinct bytes; 32 random
+  bytes have ~28).
+- Original is zeroed in `register_lease` after the response
+  string is constructed.
+
+**Payload privacy.**
+
+- Raw `payload_context` does NOT go to the WAL.
+- WAL event records only `payload_context_hash`, optional
+  `payload_hash`, optional `content_type`.
+- Store holds raw `payload_context` in memory for Phase 2 cross-
+  check; dropped on consume / expire.
+
+**Affected files.**
+
+- `crates/gvm-types/src/lib.rs` — `DecisionSource` enum
+- `src/intent_store.rs` — `IntentRequest` extension,
+  `MAX_PAYLOAD_CONTEXT_BYTES`, `CONTEXT_TOKEN_SECRET_BYTES`,
+  internal `Intent` struct extension, `register_lease` method
+- `src/api.rs::register_intent` — branched handler
+- `tests/intent_store_concurrency.rs` — fixture updated for new
+  Option fields (mechanical)
+- `tests/cooperative_intent_lease.rs` (new, 10 cases)
+- `docs/cooperative-intent.md` (new) — full design doc, trust
+  model, Phase 2 / Phase 3 plan
+- `docs/internal/CHANGELOG.md` (this entry)
+
+**Verification.**
+
+- `cargo test --test cooperative_intent_lease` — 10/10 pass:
+  - lease_issuance_returns_opaque_context_token
+  - token_is_not_intent_id_or_claim_id (entropy-based)
+  - two_leases_produce_unrelated_tokens
+  - response_records_payload_context_hash_not_raw_payload
+  - response_decision_source_is_cooperative_declared_only
+  - oversize_payload_context_returns_413
+  - malformed_payload_hash_returns_400
+  - preflight_deny_returns_no_token
+  - legacy_url_only_intent_does_not_issue_context_token (back-compat)
+  - decision_source_round_trip_through_string (all 7 variants)
+- All existing IC-3 / intent_store / SRR / events tests pass
+  unchanged (108+ cases).
+
+**Risk.**
+
+Low-to-medium. New code paths are gated on `payload_context.is_some()`;
+the legacy path is bit-for-bit unchanged for existing MCP callers.
+The new WAL event type and `DecisionSource` strings are additive —
+old audit readers continue to deserialise into `decision_source:
+String`. Fail-close on WAL append failure (lease rolled back, 500
+returned).
+
+**Deferred to Phase 2.**
+
+- `X-GVM-Context-Token` header parsing in proxy hot path
+- `claim_by_token_hash` lookup
+- Observed-vs-declared cross-check (mismatch → Deny + dual-body
+  WAL evidence)
+- Policy epoch comparison + `allow_pinned_lease` opt-in
+- Header stripping before upstream forward (CRITICAL — must not
+  leak to external APIs)
+
+**Deferred to Phase 3.**
+
+- CONNECT-visible token delivery for blind paths
+- Sidecar / out-of-band binding to sandbox-scoped network events
+- `gvm.intent.lease_denied` audit-only event (low priority — SRR
+  event stream already captures every Deny)
+
 ### 2026-06-18: WAL event stream — `GET /gvm/events` SSE (Tier-3 P3-b)
 
 Second Tier-3 control-plane primitive from the strategic-audit
