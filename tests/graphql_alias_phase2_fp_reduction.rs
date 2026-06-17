@@ -57,6 +57,7 @@ fn alias_match_rule(names: &[&str]) -> NetworkRuleConfig {
         payload_match: None,
         payload_query_alias_match: Some(names.iter().map(|s| s.to_string()).collect()),
         max_body_bytes: Some(65536),
+        unsafe_body_action: None,
         description: Some("phase 2 alias-match".to_string()),
         label: None,
         condition: None,

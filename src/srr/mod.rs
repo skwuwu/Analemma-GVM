@@ -51,6 +51,24 @@ pub struct NetworkRuleConfig {
     pub payload_query_alias_match: Option<Vec<String>>,
     /// Max body bytes to inspect (default 64KB)
     pub max_body_bytes: Option<usize>,
+    /// Fail-close action for rules whose body-inspection branch
+    /// cannot be evaluated. Fires when the body is present but the
+    /// engine can't determine whether the rule applies — either the
+    /// body exceeds `max_body_bytes` (inspection skipped) or neither
+    /// the plain-JSON nor the base64-JSON parse succeeded
+    /// (inspection performed and failed).
+    ///
+    /// `None` (default) preserves the legacy permissive behaviour:
+    /// when inspection cannot run, the engine `continue`s to the
+    /// next rule. `Some(action)` applies `action` immediately —
+    /// typical use is `{ type = "Deny", reason = "..." }` or
+    /// `{ type = "RequireApproval" }` for high-risk endpoints.
+    ///
+    /// Does NOT fire when the body is absent — a missing body is
+    /// not an inspection failure; the rule's payload predicate
+    /// trivially does not apply, so the engine falls through to
+    /// URL-only rules for the same endpoint.
+    pub unsafe_body_action: Option<NetworkDecisionConfig>,
     pub description: Option<String>,
     /// Human-readable label (used in warnings and logs)
     pub label: Option<String>,
@@ -117,6 +135,9 @@ pub struct NetworkRule {
     /// [`NetworkRuleConfig::payload_query_alias_match`].
     pub payload_query_alias_match: Option<Vec<String>>,
     pub max_body_bytes: usize,
+    /// Fail-close action when body inspection cannot be evaluated.
+    /// See [`NetworkRuleConfig::unsafe_body_action`].
+    pub unsafe_body_action: Option<EnforcementDecision>,
     /// True if this rule is a catch-all (method="*" + pattern="{any}").
     /// Catch-all matches are flagged as default-to-caution for the CLI.
     pub is_catch_all: bool,
@@ -372,6 +393,14 @@ impl NetworkSRR {
             let decision = parse_decision(&rule_cfg.decision)?;
             let (host_pattern, path_pattern) = parse_pattern(&rule_cfg.pattern);
 
+            // Compile the optional fail-close action at load time so any
+            // typo in `type = "..."` surfaces at proxy startup, not at the
+            // first request that hits the rule.
+            let unsafe_body_action = match &rule_cfg.unsafe_body_action {
+                Some(cfg) => Some(parse_decision(cfg)?),
+                None => None,
+            };
+
             // Pre-compile gating condition at load time (fail-fast on bad windows / tz)
             let condition = match &rule_cfg.condition {
                 Some(c) => Some(compile_condition(c)?),
@@ -420,6 +449,7 @@ impl NetworkSRR {
                     payload_match: rule_cfg.payload_match.clone(),
                     payload_query_alias_match: rule_cfg.payload_query_alias_match.clone(),
                     max_body_bytes: rule_cfg.max_body_bytes.unwrap_or(65536),
+                    unsafe_body_action: unsafe_body_action.clone(),
                     is_catch_all,
                     condition: condition.clone(),
                 });
@@ -503,6 +533,11 @@ impl NetworkSRR {
             let decision = parse_decision(&rule_cfg.decision)?;
             let (host_pattern, path_pattern) = parse_pattern(&rule_cfg.pattern);
 
+            let unsafe_body_action = match &rule_cfg.unsafe_body_action {
+                Some(cfg) => Some(parse_decision(cfg)?),
+                None => None,
+            };
+
             let condition = match &rule_cfg.condition {
                 Some(c) => Some(compile_condition(c)?),
                 None => None,
@@ -548,6 +583,7 @@ impl NetworkSRR {
                     payload_match: rule_cfg.payload_match.clone(),
                     payload_query_alias_match: rule_cfg.payload_query_alias_match.clone(),
                     max_body_bytes: rule_cfg.max_body_bytes.unwrap_or(65536),
+                    unsafe_body_action: unsafe_body_action.clone(),
                     is_catch_all,
                     condition: condition.clone(),
                 });
@@ -803,13 +839,30 @@ impl NetworkSRR {
                 };
                 if body_bytes.len() > rule.max_body_bytes {
                     // Body too large for this rule's payload inspection.
-                    // Continue to next rule so URL-only rules for the same
-                    // endpoint can still match. Returning here would skip
-                    // all subsequent rules for this URL.
+                    // Two paths:
+                    //   - `unsafe_body_action` set on the rule: this is the
+                    //     fail-close hook. The operator has declared "I'd
+                    //     rather block / approval-gate this endpoint than
+                    //     let an oversized body slip past inspection."
+                    //   - Otherwise: legacy permissive behaviour — continue
+                    //     to next rule so URL-only rules for the same
+                    //     endpoint can still match.
                     tracing::warn!(
-                        "Body exceeds max_body_bytes ({}), skipping payload inspection for this rule",
-                        rule.max_body_bytes
+                        body_len = body_bytes.len(),
+                        max_body_bytes = rule.max_body_bytes,
+                        rule = %rule.description,
+                        "Body exceeds max_body_bytes; payload inspection skipped"
                     );
+                    if let Some(action) = &rule.unsafe_body_action {
+                        return SrrCheckResult {
+                            decision: action.clone(),
+                            matched_description: Some(format!(
+                                "{} (unsafe_body_action — body exceeds max_body_bytes)",
+                                rule.description
+                            )),
+                            is_catch_all: rule.is_catch_all,
+                        };
+                    }
                     continue;
                 }
 
@@ -889,6 +942,18 @@ impl NetworkSRR {
                             }
                         }
                     }
+                } else if let Some(action) = &rule.unsafe_body_action {
+                    // Body present but neither plain-JSON nor base64-JSON
+                    // parse succeeded. Inspection performed and failed —
+                    // apply fail-close action.
+                    return SrrCheckResult {
+                        decision: action.clone(),
+                        matched_description: Some(format!(
+                            "{} (unsafe_body_action — body unparseable as JSON)",
+                            rule.description
+                        )),
+                        is_catch_all: rule.is_catch_all,
+                    };
                 }
                 // Payload didn't match this rule — continue to next
                 continue;

@@ -120,6 +120,55 @@ When a payload rule is skipped (body too large, JSON parse failure, field missin
 
 **OOM Protection**: Bodies exceeding `max_body_bytes` (default 65536) are **never parsed**. The rule is skipped and evaluation continues to subsequent rules. This prevents adversarial payloads from causing memory exhaustion.
 
+#### Fail-Close on Unverifiable Body — `unsafe_body_action`
+
+The "skip and continue" behaviour described above is the legacy permissive
+default. It's the right choice when payload rules are advisory and a URL-only
+rule for the same endpoint provides the real boundary. For endpoints where
+"we couldn't verify the body" is itself a security signal, set
+`unsafe_body_action` on the rule:
+
+```toml
+[[rules]]
+method = "POST"
+pattern = "api.bank.com/transfer"
+payload_field = "amount"
+payload_match = ["LARGE_TRANSFER"]
+max_body_bytes = 65536
+# Fail-close: if the body exceeds 64 KB, or cannot be parsed as either
+# plain JSON or base64-of-JSON, return Deny instead of falling through
+# to the next rule.
+unsafe_body_action = { type = "Deny", reason = "body inspection failed; cannot verify safety" }
+decision = { type = "Allow" }
+```
+
+**When `unsafe_body_action` fires**:
+
+| Body state | unsafe_body_action set | Result |
+|------------|------------------------|--------|
+| Absent (no body) | — | Rule trivially does not apply; continue to next rule |
+| Present, parses, matches `payload_match` | — | Apply the rule's `decision` |
+| Present, parses, does not match | — | Continue to next rule (rule legitimately not applicable) |
+| Present, exceeds `max_body_bytes` | unset | Continue to next rule (legacy) |
+| Present, exceeds `max_body_bytes` | set | **Apply `unsafe_body_action`** |
+| Present, neither plain-JSON nor base64-JSON parses | unset | Continue to next rule (legacy) |
+| Present, neither plain-JSON nor base64-JSON parses | set | **Apply `unsafe_body_action`** |
+
+**Key invariant**: `unsafe_body_action` does NOT fire on absent body. A GET
+request (no body) or a body-less POST hitting a rule that requires payload
+inspection is "rule does not apply", not "inspection failed". This matters
+because operators want URL-only fallback rules to keep working — silently
+denying every body-less request would be a footgun.
+
+**Accepted effect types**: any value that `decision` accepts —
+`{ type = "Deny", reason = "..." }`, `{ type = "RequireApproval" }`,
+`{ type = "Delay", milliseconds = 5000 }`, etc. The compile path validates
+the value at proxy startup; a typo in `type = "..."` fails `gvm reload`
+loudly rather than at the first matching request.
+
+Regression coverage: [tests/srr_unsafe_body_action.rs](../tests/srr_unsafe_body_action.rs)
+(9 cases — fail-close paths + legacy permissive paths + alternate effect types).
+
 ### Base64 Payload Decoding
 
 SRR automatically decodes Base64-encoded content before pattern matching. This prevents bypass via encoding obfuscation. Two decoding strategies are applied in order:

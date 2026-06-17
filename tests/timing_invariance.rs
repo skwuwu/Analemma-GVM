@@ -128,6 +128,7 @@ fn rule(
         payload_match: payload_match.map(|v| v.into_iter().map(String::from).collect()),
         payload_query_alias_match: None,
         max_body_bytes: Some(65536),
+        unsafe_body_action: None,
         description: Some(format!("{method} {pattern}")),
         label: None,
         condition: None,

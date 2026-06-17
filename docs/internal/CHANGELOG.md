@@ -131,6 +131,87 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-06-18: SRR — `unsafe_body_action` rule field (Tier-1 P1-a)
+
+First Tier-1 item from the strategic-audit roadmap. Closes the
+fail-close-on-unverifiable-body gap surfaced by the 2026-06-17
+audit: previously, when a payload rule could not inspect the body
+(too large for `max_body_bytes`, or unparseable as plain JSON /
+base64-JSON), the engine fell through to the next rule — leaving
+the endpoint covered only by URL-only fallback rules. That's the
+right legacy default but the wrong default for high-value
+endpoints where "we couldn't verify the body" is itself a signal.
+
+**What changed.**
+
+- `NetworkRuleConfig` gains `unsafe_body_action: Option<NetworkDecisionConfig>`
+  (src/srr/mod.rs:53). When set, the compile path (`from_rule_configs` +
+  `load`) parses it through the existing `parse_decision()` so the same
+  decision-type surface (`Allow`, `AuditOnly`, `Delay`, `RequireApproval`,
+  `Deny`) is available with no new vocabulary.
+- `NetworkRule` (the compiled form) carries the parsed
+  `unsafe_body_action: Option<EnforcementDecision>`.
+- `check_at` body-inspection branch (src/srr/mod.rs:835-955) now applies
+  the action at two failure points:
+  - `body_bytes.len() > max_body_bytes`: skip inspection → if
+    `unsafe_body_action` is set, return that decision with a description
+    of the form `"<rule> (unsafe_body_action — body exceeds max_body_bytes)"`.
+    Otherwise continue (legacy).
+  - body present but `json_val` is None (plain-JSON parse failed AND
+    base64-JSON fallback failed): inspection ran and failed → if
+    `unsafe_body_action` is set, return that decision with description
+    `"<rule> (unsafe_body_action — body unparseable as JSON)"`. Otherwise
+    continue (legacy).
+- **Does NOT fire on absent body** — a body-less request hitting a rule
+  with `payload_field` set is "rule does not apply", not "inspection
+  failed". Legacy `continue` preserved at the body-None branch. This
+  matters because operators want URL-only fallback rules to keep working.
+
+**Backwards compatibility.**
+
+`Option<NetworkDecisionConfig>` defaults to `None` via serde, so existing
+SRR configs do not need any change. All existing test fixtures (5 files,
+6 construction sites) were updated to spell `unsafe_body_action: None`
+explicitly — this is a struct-initialiser requirement, not a behaviour
+change.
+
+**Affected files.**
+
+- `src/srr/mod.rs` — field added, compile path threaded, check_at
+  branches updated.
+- `docs/srr.md` — new "Fail-Close on Unverifiable Body" subsection with
+  the trigger matrix and an example TOML block.
+- `docs/internal/CHANGELOG.md` (this entry).
+- `tests/srr_unsafe_body_action.rs` (new, 9 cases) — covers fail-close
+  paths (body too large / unparseable), legacy permissive paths (no
+  field set), the absent-body invariant, the matching-body / non-
+  matching-body distinction, and the alternate effect types
+  (`RequireApproval`, `Delay { milliseconds }`).
+- 5 test fixture files (graphql_alias_*, srr_time_window,
+  timing_invariance) — `unsafe_body_action: None` added to direct
+  `NetworkRuleConfig` constructions.
+
+**Verification.**
+
+- `cargo test --test srr_unsafe_body_action` — 9/9 pass.
+- `cargo test --test hostile --test srr_evasion_adversarial --test
+  srr_time_window --test graphql_alias_* --test timing_invariance` —
+  all existing tests pass unchanged (69 total).
+- `cargo check --workspace --tests` clean.
+
+**Risk.**
+
+Low. No change in behaviour for any rule that does not set the new
+field. The check_at hot path adds one `Option<EnforcementDecision>`
+clone on the rule's fail-close branches only — no impact on the
+match-success or no-body paths.
+
+**Follow-ups.**
+
+P1-b (`expires_at: Option<DateTime<Utc>>` rule field — first step toward
+the lease primitive) and P1-c (`principal_filter: Option<String>` — agent
+identity as an SRR matching input) are scheduled as separate commits.
+
 ### 2026-06-18: Docs — reposition from sandbox-first to permission-grant + evidence-forward
 
 Follow-up to the strategic audit. The pentest suite (Phases 1–4),
