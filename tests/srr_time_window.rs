@@ -45,6 +45,7 @@ fn allow_rule(host: &str, condition: Option<RuleConditionConfig>) -> NetworkRule
         description: Some("test rule".to_string()),
         label: None,
         condition,
+        expires_at: None,
     }
 }
 

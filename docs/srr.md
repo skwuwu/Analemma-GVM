@@ -169,6 +169,47 @@ loudly rather than at the first matching request.
 Regression coverage: [tests/srr_unsafe_body_action.rs](../tests/srr_unsafe_body_action.rs)
 (9 cases — fail-close paths + legacy permissive paths + alternate effect types).
 
+### Rule Expiration — `expires_at`
+
+A rule can carry an absolute deadline. After the deadline, the rule
+silently stops matching — the next request that would have hit it
+falls through to the next rule (or to Default-to-Caution if nothing
+else matches).
+
+```toml
+[[rules]]
+method = "POST"
+pattern = "api.payments.com/transfer"
+expires_at = "2026-07-01T15:00:00Z"
+decision = { type = "Allow" }
+```
+
+**TOML format**: RFC 3339 (ISO 8601 with timezone). `chrono`'s
+`DateTime<Utc>` deserializer is strict — a date-only or
+timezone-less string is rejected at proxy startup (`gvm reload`),
+not at the first matching request.
+
+**Validity semantics**: half-open `[start_of_time, expires_at)` —
+the rule fires while `now < expires_at`, dies at `now == expires_at`.
+This mirrors the `time_window` exclusive-end convention.
+
+**Determinism**: the comparison uses the same `now` `check_at` already
+takes. An auditor replaying the WAL with the event's recorded
+timestamp reproduces the producer's decision exactly. No `Utc::now()`
+in the match path.
+
+**Use case — time-bounded permission grant**: an external orchestrator
+approves an IC-3 request, then inserts a 5-minute `Allow` rule with
+`expires_at = now + 5m`. Subsequent agent calls in that window pass
+without re-prompting. The rule auto-expires on the next match attempt
+after the deadline — no separate teardown call needed. This is the
+first building block of the lease primitive ([CHANGELOG.md v0.7
+roadmap](internal/CHANGELOG.md)).
+
+Regression coverage: [tests/srr_expires_at.rs](../tests/srr_expires_at.rs)
+(6 cases — strictly-before / at-instant / strictly-after / legacy
+no-deadline / malformed-string-fails-load / replay-determinism).
+
 ### Base64 Payload Decoding
 
 SRR automatically decodes Base64-encoded content before pattern matching. This prevents bypass via encoding obfuscation. Two decoding strategies are applied in order:

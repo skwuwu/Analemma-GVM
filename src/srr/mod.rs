@@ -76,6 +76,25 @@ pub struct NetworkRuleConfig {
     /// condition matches against the request's evaluation timestamp.
     /// Today only `time_window` is defined; future variants land here.
     pub condition: Option<RuleConditionConfig>,
+    /// Optional absolute expiration. When set, the rule is skipped on
+    /// any request whose evaluation timestamp is at or after `expires_at`.
+    ///
+    /// TOML accepts RFC 3339: `expires_at = "2026-07-01T15:00:00Z"`. The
+    /// comparison uses the same `now` `check_at` already takes — so an
+    /// auditor replaying the WAL against the same ruleset with the
+    /// event's recorded timestamp reproduces the producer's decision
+    /// exactly. No system-clock dependence at evaluation time.
+    ///
+    /// Semantics: half-open `[start_of_time, expires_at)` — at the moment
+    /// `now == expires_at` the rule is considered expired (mirrors the
+    /// time_window exclusive-end convention).
+    ///
+    /// Use case: orchestrator issues a 5-minute Allow rule after a human
+    /// approves an IC-3 request, then forgets about cleanup — the rule
+    /// silently disappears from matching once the clock crosses
+    /// `expires_at`, no separate teardown call needed. This is the first
+    /// building block of the lease primitive ([CHANGELOG.md] v0.7 roadmap).
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// TOML-side condition config. Tagged enum; future variants (e.g.,
@@ -145,6 +164,9 @@ pub struct NetworkRule {
     /// behaviour). Some(_) = rule fires only when the condition matches
     /// against the evaluation timestamp.
     pub condition: Option<Condition>,
+    /// Optional absolute expiration. See [`NetworkRuleConfig::expires_at`].
+    /// At or after this instant the rule does not match.
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Compiled gating condition. Pure function of (rule, evaluation timestamp).
@@ -452,6 +474,7 @@ impl NetworkSRR {
                     unsafe_body_action: unsafe_body_action.clone(),
                     is_catch_all,
                     condition: condition.clone(),
+                    expires_at: rule_cfg.expires_at,
                 });
             }
         }
@@ -586,6 +609,7 @@ impl NetworkSRR {
                     unsafe_body_action: unsafe_body_action.clone(),
                     is_catch_all,
                     condition: condition.clone(),
+                    expires_at: rule_cfg.expires_at,
                 });
             }
         }
@@ -796,6 +820,17 @@ impl NetworkSRR {
             // Host match
             if !match_host(&rule.host_pattern, &effective_host) {
                 continue;
+            }
+
+            // Expiration: a rule whose `expires_at` is at or before the
+            // evaluation timestamp is dead. Cheaper than the gating
+            // condition below — a single DateTime comparison — so it
+            // goes here, right after the method/host filter. Half-open
+            // semantics: rule is valid for `now < expires_at`.
+            if let Some(deadline) = rule.expires_at {
+                if now >= deadline {
+                    continue;
+                }
             }
 
             // Gating condition: a time-window rule that doesn't match the

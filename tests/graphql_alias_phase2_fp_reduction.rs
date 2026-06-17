@@ -61,6 +61,7 @@ fn alias_match_rule(names: &[&str]) -> NetworkRuleConfig {
         description: Some("phase 2 alias-match".to_string()),
         label: None,
         condition: None,
+        expires_at: None,
     }
 }
 

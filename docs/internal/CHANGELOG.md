@@ -131,6 +131,103 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-06-18: SRR — `expires_at` rule field (Tier-1 P1-b)
+
+Second Tier-1 item from the strategic-audit roadmap. First
+building block of the lease primitive: a rule can carry an
+absolute RFC 3339 deadline, and the engine silently stops
+matching against the rule once the evaluation timestamp
+crosses that deadline.
+
+```toml
+[[rules]]
+method = "POST"
+pattern = "api.payments.com/transfer"
+expires_at = "2026-07-01T15:00:00Z"
+decision = { type = "Allow" }
+```
+
+**What changed.**
+
+- `NetworkRuleConfig` gains
+  `expires_at: Option<chrono::DateTime<chrono::Utc>>` (src/srr/mod.rs).
+  TOML accepts RFC 3339; chrono's strict deserializer rejects
+  date-only or timezone-less strings at proxy startup
+  (`gvm reload`), not at the first matching request.
+- `NetworkRule` (compiled form) carries the same field.
+- `check_at` adds a single `if let Some(deadline) = rule.expires_at`
+  comparison right after the host filter — before the gating
+  condition (which is more expensive) and before path / payload
+  inspection. Half-open semantics: rule fires while
+  `now < expires_at`, dies at `now == expires_at`. Mirrors the
+  `time_window` exclusive-end convention.
+
+**Determinism / replay safety.**
+
+The match path takes the timestamp from `check_at`'s `now`
+parameter; no internal `Utc::now()`. An auditor replaying the WAL
+with the event's recorded timestamp reproduces the producer's
+decision exactly, even across the deadline boundary. This is the
+same audit guarantee that `time_window` carries; the field adds
+no new trust assumption because the timestamp is already
+anchor-signed.
+
+**Backwards compatibility.**
+
+`Option<DateTime<Utc>>` defaults to `None` via serde. Existing
+SRR configs need no change. Existing test fixtures (5 files, 6
+sites) get `expires_at: None` added — mechanical, no behaviour
+change.
+
+**Use case.**
+
+Time-bounded permission grant pattern. An external orchestrator
+approves an IC-3 request, then inserts a 5-minute `Allow` rule
+with `expires_at = now + 5m`. Subsequent agent calls in that
+window pass without re-prompting. The rule auto-expires on the
+next match attempt after the deadline — no separate teardown
+call needed. The full lease primitive (P4 in the audit roadmap)
+combines this with `principal_filter` (P1-c, next), single-rule
+mutations (Tier-3), and the signed lease envelope.
+
+**Affected files.**
+
+- `src/srr/mod.rs` — field added to both `NetworkRuleConfig` and
+  `NetworkRule`, threaded through both compile paths (`load` and
+  `from_rule_configs`), check at line 825-833.
+- `docs/srr.md` — new "Rule Expiration" subsection with the TOML
+  format, validity semantics, determinism note, and use-case
+  example.
+- `docs/internal/CHANGELOG.md` (this entry).
+- `tests/srr_expires_at.rs` (new, 6 cases):
+  - strictly-before-deadline (rule fires)
+  - at-exact-deadline-instant (rule dead — half-open)
+  - strictly-after-deadline (rule dead)
+  - rules-without-expires-at-never-expire (backwards compat)
+  - malformed-string-fails-load (parse-path validation)
+  - replay-reproduces-decision (determinism / no-Utc::now check)
+- 5 test fixture files — `expires_at: None` added at 6 direct
+  `NetworkRuleConfig` construction sites.
+
+**Verification.**
+
+- `cargo test --test srr_expires_at` — 6/6 pass.
+- All existing SRR / GraphQL / timing tests pass unchanged
+  (75 total + 6 new + 9 from P1-a = 90 cases in the SRR /
+  payload-evasion / timing block).
+- `cargo check --workspace --tests` clean.
+
+**Risk.**
+
+Low. The new comparison is a single `DateTime` ordering, branched
+on `Option::is_some`. No impact on rules without the field set
+(branch prediction collapses to a no-op).
+
+**Follow-up.**
+
+P1-c (`principal_filter: Option<String>` — agent_id as an SRR
+matching input) is the third and final Tier-1 item.
+
 ### 2026-06-18: SRR — `unsafe_body_action` rule field (Tier-1 P1-a)
 
 First Tier-1 item from the strategic-audit roadmap. Closes the

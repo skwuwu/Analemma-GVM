@@ -132,6 +132,7 @@ fn rule(
         description: Some(format!("{method} {pattern}")),
         label: None,
         condition: None,
+        expires_at: None,
     }
 }
 
