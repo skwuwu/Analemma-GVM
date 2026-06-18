@@ -479,18 +479,99 @@ The integration tests exercise `claim_connect_lease` directly:
 - `connect_epoch_mismatch_with_opt_in_returns_valid_pinned` —
   `allow_pinned_lease` tolerance
 
-### Phase 3c — Sidecar / veth binding (later)
+### Phase 3c — Sandbox-IP binding (shipped)
 
-- Token correlated to a sandbox-scoped network event
-  (e.g. veth source-IP + dest-host + time window), removing
-  the requirement that the agent set a header at all. The
-  proxy already resolves the connecting peer's IP to a
-  sandbox anchor (see `resolve_sandbox_anchor` and
-  `lookup_sandbox_id_by_ip`); Phase 3c indexes the active
-  leases by the same key so a CONNECT or HTTP request from
-  a known sandbox IP binds to the lease without the agent
-  having to plumb the token through TLS-pinned clients.
-- Documentation of the trust model for each delivery channel.
+The cooperative lease now binds **implicitly** when the request
+originates from a GVM-allocated sandbox veth IP. The agent
+registers a lease through GVM's controlled API
+(`POST /gvm/intent`) and gets back the usual `ctx_…` token; the
+proxy still uses the token when the agent's client presents it
+(unchanged Phase 2 / 3a / 3b behaviour). But when the client
+**cannot** plumb the header — cert-pinned HTTPS, mTLS, anything
+that wraps the request before GVM gets a chance to add headers
+— the proxy now binds the lease via the source IP instead.
+
+**Binding flow:**
+
+1. Request arrives at `proxy_handler` or `handle_connect_inner`.
+   `extract_and_claim_lease` (HTTP) or `claim_connect_lease`
+   (CONNECT) runs first and may produce one of the existing
+   outcomes if `X-GVM-Context-Token` is present.
+2. If the result is `NoToken` and the request carries a peer
+   IP that `state.resolve_sandbox_anchor` resolves to a
+   sandbox-allocated identity:
+   - HTTP path: `try_sandbox_binding` calls
+     `IntentStore::claim_by_sandbox_binding(agent_id, method,
+     host, path)`. Matches an Active cooperative lease for
+     the same (agent_id, method, host) where path starts with
+     the lease's path_prefix. When multiple match, the most
+     recently registered wins.
+   - CONNECT path: the inline fallback in
+     `handle_connect_inner` calls
+     `IntentStore::claim_by_sandbox_binding_host(agent_id,
+     host)` — the host-only variant because CONNECT never
+     sees the inner method or path.
+3. The `LeaseClaim` flows into the same classification arms as
+   the token path. Allow → `cooperative.declared_only` (or
+   `cooperative.cross_checked` if body inspection is enabled
+   and the lease declared a `payload_hash`). Epoch mismatch
+   without opt-in → `cooperative.expired`. Body divergence →
+   `cooperative.mismatch`.
+
+**Trust model.** The veth IP carrying the request was allocated
+by GVM itself: the proxy minted it, recorded it in
+`/run/gvm/gvm-sandbox-{pid}.state`, and forwarded the sandbox
+child into a network namespace where that IP is the only
+non-loopback source. For an agent process to forge a different
+sandbox's IP would require breaking out of its network
+namespace — the same threat boundary that already protects
+credential separation between sandboxes. So binding via
+`peer_ip → sandbox_id → agent_id` carries the same trust tier
+as the rest of the sandbox model. The audit chain records
+`cooperative.declared_only` (or `cross_checked`), exactly the
+same evidence tier as a token-bound claim — the binding
+channel changes, the trust tier does not.
+
+**What is NOT eligible.** Only **cooperative** leases (those
+registered via `register_lease`, with `context_token_hash =
+Some(_)`) can bind via the sandbox path. Legacy URL-only
+intents (`register`) are deliberately excluded — those have
+their own Shadow-Mode claim path (`claim()`), and treating
+them as cooperative would mis-tag normal Shadow-Mode requests
+as `cooperative.declared_only` evidence.
+
+**Tests** (15, all passing — `tests/cooperative_intent_lease_phase3c.rs`).
+The store-layer tests pin the matching and atomic state-transition
+logic, which is where Phase 3c's correctness lives:
+
+- `sandbox_binding_matches_cooperative_lease`
+- `sandbox_binding_accepts_child_path_via_prefix`
+- `sandbox_binding_host_compare_is_case_insensitive`
+- `sandbox_binding_rejects_different_agent` — guards against
+  a sibling sandbox's agent consuming another agent's lease
+- `sandbox_binding_rejects_different_host`
+- `sandbox_binding_rejects_different_method` — guards against
+  a sandbox executing a GET against a lease that authorised a
+  POST
+- `sandbox_binding_rejects_path_outside_prefix`
+- `sandbox_binding_skips_legacy_url_only_intents` — the
+  back-compat boundary; URL-only intents stay on the Shadow
+  Mode path
+- `sandbox_binding_is_single_use`
+- `sandbox_binding_and_token_binding_share_the_state_machine`
+  — first claim wins regardless of channel
+- `sandbox_binding_picks_most_recent_when_multiple_match` —
+  fresh-over-stale tiebreak
+- `sandbox_binding_host_variant_matches_any_method_path_for_agent_host`
+  — the CONNECT-shape variant
+- `sandbox_binding_host_variant_rejects_different_host`
+- `sandbox_binding_host_variant_rejects_different_agent`
+- `sandbox_binding_host_variant_skips_legacy_intents`
+
+Proxy hot-path integration (HTTP and CONNECT) is wired but its
+end-to-end Linux coverage belongs in the sandbox-observability
+stress test, where real veth + state files exist. The store-layer
+tests are cross-platform and pin the decision logic.
 
 ---
 

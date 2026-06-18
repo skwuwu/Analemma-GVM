@@ -189,7 +189,54 @@ async fn handle_connect_inner(
     //     agent_id / operation (these are higher-fidelity than the
     //     veth-resolved anchor).
     //   - NoToken → proceed as before.
-    let connect_lease = claim_connect_lease(&state, request.headers(), host);
+    let mut connect_lease = claim_connect_lease(&state, request.headers(), host);
+
+    // ── Phase 3c fallback: sandbox-IP binding on CONNECT ──
+    //
+    // If no `X-GVM-Context-Token` header was presented but the peer
+    // IP resolves to a sandbox-allocated identity AND the agent has
+    // already registered a cooperative lease for this host, claim
+    // it implicitly. Same trust model as the HTTP path: the veth IP
+    // is allocated by GVM itself, so spoofing it would require
+    // breaking the same isolation that already protects credential
+    // separation.
+    if matches!(connect_lease, ConnectLeaseOutcome::NoToken) {
+        let peer_ip = request.extensions().get::<std::net::IpAddr>().copied();
+        if let Some((agent_id, _)) = state.resolve_sandbox_anchor(peer_ip) {
+            if let Some(claim) = state
+                .intent_store
+                .claim_by_sandbox_binding_host(&agent_id, host)
+            {
+                let current_epoch = state.current_integrity_ref().unwrap_or_default();
+                let pinned = match &claim.policy_epoch {
+                    Some(issued) if !issued.is_empty() && issued != &current_epoch => {
+                        if claim.allow_pinned_lease {
+                            true
+                        } else {
+                            connect_lease = ConnectLeaseOutcome::Expired {
+                                reason: format!(
+                                    "policy reloaded since sandbox-bound CONNECT lease was \
+                                     issued (epoch mismatch); set allow_pinned_lease=true at \
+                                     issuance to tolerate"
+                                ),
+                            };
+                            // skip the Valid path below
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+                if matches!(connect_lease, ConnectLeaseOutcome::NoToken) {
+                    connect_lease = ConnectLeaseOutcome::Valid {
+                        agent_id: claim.agent_id,
+                        operation: claim.operation,
+                        pinned,
+                    };
+                }
+            }
+        }
+    }
+
     let (lease_agent_id, lease_operation, lease_pinned, lease_active) = match &connect_lease {
         ConnectLeaseOutcome::NoToken => (None, None, false, false),
         ConnectLeaseOutcome::Valid {

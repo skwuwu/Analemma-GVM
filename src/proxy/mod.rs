@@ -847,6 +847,22 @@ pub async fn proxy_handler(
     // claim step above; nothing else needs it.
     request.headers_mut().remove("x-gvm-context-token");
 
+    // ── Step 1.7: Phase 3c sandbox-IP fallback ──
+    //
+    // No `X-GVM-Context-Token` was presented, but the peer might be
+    // a GVM-allocated sandbox whose agent already registered a
+    // matching lease via `POST /gvm/intent`. Resolve the peer IP →
+    // agent_id; if there's a fresh cooperative lease for this
+    // (agent_id, method, host, path), claim it implicitly. This is
+    // the binding channel for cert-pinned clients that cannot set
+    // custom HTTP headers — the lease registration happens through
+    // GVM's controlled API, then subsequent requests bind via the
+    // sandbox's network namespace.
+    let cooperative_outcome = match cooperative_outcome {
+        CooperativeOutcome::NoToken => try_sandbox_binding(&state, &request, &target, body_for_srr),
+        other => other,
+    };
+
     // ── Step 2: Classify (IC determination) via SRR + cooperative fold-in ──
     //
     // Each Cooperative* arm picks its body source (observed vs declared)
@@ -1788,6 +1804,108 @@ fn extract_and_claim_lease(
     // payload_context as canonical JSON bytes so SRR's payload-rule
     // matcher sees the same shape it would have seen on the wire if
     // the proxy could observe the body.
+    let declared_body = match claim
+        .payload_context
+        .as_ref()
+        .and_then(|v| serde_json::to_vec(v).ok())
+    {
+        Some(b) => Bytes::from(b),
+        None => Bytes::new(),
+    };
+    CooperativeOutcome::DeclaredOnly {
+        declared_body,
+        pinned,
+    }
+}
+
+/// Tier-3 P3-c Phase 3c: attempt to bind the request to a
+/// cooperative lease by sandbox-IP identity. Called when the
+/// HTTP path's `extract_and_claim_lease` returned `NoToken`
+/// (no `X-GVM-Context-Token` header). Resolves the peer IP to a
+/// sandbox-allocated `agent_id` via `state.resolve_sandbox_anchor`,
+/// then looks for an Active cooperative lease matching the
+/// request's method / host / path.
+///
+/// Returns the same `CooperativeOutcome` shape as the token path
+/// so downstream classification arms do not branch on the binding
+/// channel — only on the evidence tier. Returns
+/// `CooperativeOutcome::NoToken` when there is nothing to bind
+/// (no peer IP, loopback, no matching lease).
+///
+/// On Allow paths this is purely additive: a request that would
+/// have classified as plain `srr.network_observed` now classifies
+/// as `cooperative.cross_checked` or `cooperative.declared_only`,
+/// depending on whether body inspection is enabled and a
+/// `payload_hash` was declared. On Deny paths nothing changes —
+/// the lease evidence cannot override an SRR Deny.
+fn try_sandbox_binding(
+    state: &AppState,
+    request: &axum::http::Request<axum::body::Body>,
+    target: &Target,
+    observed_body: Option<&[u8]>,
+) -> CooperativeOutcome {
+    use sha2::{Digest, Sha256};
+
+    let peer_ip = request.extensions().get::<std::net::IpAddr>().copied();
+    let Some((agent_id, _launch_id)) = state.resolve_sandbox_anchor(peer_ip) else {
+        return CooperativeOutcome::NoToken;
+    };
+
+    let Some(claim) = state.intent_store.claim_by_sandbox_binding(
+        &agent_id,
+        request.method().as_str(),
+        &target.host,
+        &target.path,
+    ) else {
+        return CooperativeOutcome::NoToken;
+    };
+
+    // Policy epoch check — same rule as the token path. Epoch
+    // mismatch without `allow_pinned_lease` → Expired Deny; with
+    // opt-in → pinned acceptance.
+    let current_epoch = state.current_integrity_ref().unwrap_or_default();
+    let pinned = if let Some(issued_epoch) = &claim.policy_epoch {
+        if !issued_epoch.is_empty() && issued_epoch != &current_epoch {
+            if claim.allow_pinned_lease {
+                tracing::info!(
+                    intent_id = claim.intent_id,
+                    issued_epoch = %issued_epoch,
+                    current_epoch = %current_epoch,
+                    "Sandbox-bound lease pinned across policy reload (allow_pinned_lease)"
+                );
+                true
+            } else {
+                return CooperativeOutcome::Expired {
+                    reason: format!(
+                        "policy reloaded since sandbox-bound lease was issued (epoch mismatch); \
+                         set allow_pinned_lease=true at issuance to tolerate"
+                    ),
+                };
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    // Body cross-check, identical to the token path.
+    let observed_body_hash: Option<[u8; 32]> = observed_body.map(|bytes| {
+        let mut h = Sha256::new();
+        h.update(bytes);
+        h.finalize().into()
+    });
+    if let (Some(declared_hash), Some(observed_hash)) = (claim.payload_hash, observed_body_hash) {
+        if declared_hash != observed_hash {
+            return CooperativeOutcome::Mismatch {
+                reason: "observed body hash does not match declared payload_hash \
+                         (sandbox-bound lease)"
+                    .to_string(),
+            };
+        }
+        return CooperativeOutcome::CrossChecked { pinned };
+    }
+
     let declared_body = match claim
         .payload_context
         .as_ref()

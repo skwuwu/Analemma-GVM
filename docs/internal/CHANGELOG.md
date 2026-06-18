@@ -131,6 +131,103 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-06-18: Cooperative intent lease — Phase 3c sandbox-IP binding (Tier-3 P3-c)
+
+Closes the final Phase 3 deferral. Cooperative leases now bind
+implicitly when the request originates from a GVM-allocated
+sandbox veth IP — no `X-GVM-Context-Token` header required. This
+is the delivery channel for cert-pinned HTTPS / mTLS / anything
+else that wraps the request before GVM gets a chance to add a
+custom header.
+
+**Trust model.** The veth IP carrying the request was allocated
+by GVM itself: the proxy minted it, recorded it in
+`/run/gvm/gvm-sandbox-{pid}.state`, and forwarded the sandbox
+child into a network namespace where that IP is the only
+non-loopback source. For an agent process to forge a different
+sandbox's IP would require breaking out of its network
+namespace — the same threat boundary that already protects
+credential separation between sandboxes. So binding via
+`peer_ip → sandbox_id → agent_id` carries the same trust tier
+as the rest of the sandbox model. Audit chain still records
+`cooperative.declared_only` (or `cross_checked` with body
+inspection) — same evidence tier as a token-bound claim.
+
+**What changed.**
+
+- `src/intent_store.rs` — two new claim methods, both
+  mirroring `claim_by_token_hash` for atomic
+  Active → Claimed transition + LeaseClaim snapshot:
+  - `claim_by_sandbox_binding(agent_id, method, host, path)`
+    — the HTTP-shape claim. Matches an Active **cooperative**
+    lease (its `context_token_hash` is `Some(_)`) by
+    `(agent_id, method, host)` with `path.starts_with(path_prefix)`.
+    Legacy URL-only intents are deliberately ineligible.
+    When multiple match, the most recently registered wins
+    (`max_by_key(|i| (created_at, intent_id))`), guarding
+    against a stale lease consuming the binding before a
+    fresher one the agent actually intended.
+  - `claim_by_sandbox_binding_host(agent_id, host)` — the
+    CONNECT-shape variant. CONNECT cannot see the inner
+    method / path (encrypted in the TLS that follows the
+    200), so the binding matches by (agent, host) alone.
+- `src/proxy/mod.rs` — new `try_sandbox_binding(state,
+  request, target, observed_body)` helper. Called only when
+  `extract_and_claim_lease` returned `NoToken`. Resolves the
+  peer IP via `state.resolve_sandbox_anchor` and, if a
+  matching cooperative lease exists, returns the same
+  `CooperativeOutcome` shape as the token path. Same
+  policy-epoch + `allow_pinned_lease` + body cross-check
+  rules — the binding channel changes, the decision logic
+  does not.
+- `src/proxy/mod.rs::proxy_handler` — added a one-line
+  fallback after the strip-token step:
+  `match cooperative_outcome { NoToken => try_sandbox_binding(...), other => other }`.
+  Production agents that already use the token path see no
+  behavioural change.
+- `src/proxy/connect.rs::handle_connect_inner` — inline
+  fallback after `claim_connect_lease` returns `NoToken`.
+  Calls `claim_by_sandbox_binding_host` and honors the same
+  epoch / `allow_pinned_lease` rules as the token-bound
+  CONNECT path, then re-routes through the existing
+  `Valid` arm so the Allow event records
+  `cooperative.declared_only` with the lease's declared
+  `agent_id` / `operation`.
+
+**Tests** (15, all passing — `tests/cooperative_intent_lease_phase3c.rs`).
+
+Store-layer tests cover the decision logic cross-platform.
+End-to-end Linux integration belongs in the
+sandbox-observability stress test where real veth + state
+files exist. The Phase 3c tests pin:
+
+- Happy path (`POST /transfer` matches), child path via
+  prefix, case-insensitive host comparison.
+- Reject paths: different agent / host / method, path
+  outside the prefix, legacy URL-only intent ineligibility.
+- Single-use semantics: second sandbox-binding attempt
+  finds the lease already Claimed.
+- Cross-channel single-use: token claim on a lease
+  sandbox-bound by another caller fails — both channels
+  share the same `Active → Claimed` state machine.
+- Recency: when two leases for the same
+  `(agent, method, host, path)` are Active, the most
+  recently registered wins.
+- CONNECT-shape variant: host-only match works regardless
+  of declared method / path, same rejects, same legacy
+  exclusion.
+
+**Risk.** Additive on production agents that don't run inside a
+GVM-allocated sandbox — `resolve_sandbox_anchor` returns `None`
+for loopback / non-Linux / unregistered peers, in which case
+the helper returns `NoToken` and the existing SRR path runs
+unchanged. The legacy-intent exclusion is the load-bearing
+guard against silent evidence-tier upgrade for non-cooperative
+flows. Token-bound and sandbox-bound paths share the same
+Active → Claimed state machine, so neither can "double-spend"
+a lease — verified by
+`sandbox_binding_and_token_binding_share_the_state_machine`.
+
 ### 2026-06-18: Cooperative intent lease — Phase 3b CONNECT-visible token (Tier-3 P3-c)
 
 Extends cooperative lease binding to the **CONNECT** boundary:

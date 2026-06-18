@@ -684,6 +684,166 @@ impl IntentStore {
         Some(claim)
     }
 
+    /// Tier-3 P3-c Phase 3c: claim a cooperative lease by network
+    /// identity rather than by bearer token. Used when the proxy
+    /// resolves the peer IP to a sandbox-allocated identity (via
+    /// `resolve_sandbox_anchor`) and no `X-GVM-Context-Token`
+    /// header is present — typically because the agent's client is
+    /// cert-pinned or otherwise unable to set custom headers.
+    ///
+    /// **Trust model.** The veth IP carrying the request is
+    /// allocated by GVM itself; spoofing it would require breaking
+    /// the same network-namespace isolation that protects credential
+    /// separation between sandboxes. So binding the lease via
+    /// `agent_id` resolved from the source IP is no weaker than the
+    /// rest of the sandbox model. The audit chain still records
+    /// `cooperative.declared_only` (or `cooperative.cross_checked`
+    /// when body inspection is enabled), exactly the same evidence
+    /// tier as a token-bound claim — the binding channel changes,
+    /// the trust tier does not.
+    ///
+    /// Match rule: the lease must be **cooperative** (its
+    /// `context_token_hash` is `Some`), still `Active`, not
+    /// expired, with `agent_id` and declared `method` / `host`
+    /// matching exactly (the latter case-insensitively for hosts
+    /// per DNS semantics), and `path` must start with the lease's
+    /// `path_prefix`. Legacy URL-only intents (Shadow-Mode-only)
+    /// are deliberately NOT eligible — those have their own
+    /// claim path via [`claim`](IntentStore::claim).
+    ///
+    /// When multiple leases match, the most recently registered
+    /// wins. This guards against a stale lease consuming the
+    /// binding before a fresher one the agent actually intended
+    /// (rare, but possible if an earlier lease's TTL has not
+    /// elapsed). Ties on `created_at` resolve by highest
+    /// `intent_id` (also recency-ordered).
+    pub fn claim_by_sandbox_binding(
+        &self,
+        agent_id: &str,
+        method: &str,
+        host: &str,
+        path: &str,
+    ) -> Option<LeaseClaim> {
+        let mut store = self.inner.lock().ok()?;
+
+        self.cleanup_inner(&mut store);
+
+        let intent_id = store
+            .intents
+            .values()
+            .filter(|i| {
+                matches!(i.state, IntentState::Active)
+                    && !i.is_expired()
+                    && i.context_token_hash.is_some() // cooperative only
+                    && i.agent_id == agent_id
+                    && i.method.eq_ignore_ascii_case(method)
+                    && i.host.eq_ignore_ascii_case(host)
+                    && path.starts_with(&i.path_prefix)
+            })
+            // Pick most recently registered to avoid stale stealing
+            // the binding from a fresher lease the agent just minted.
+            .max_by_key(|i| (i.created_at, i.intent_id))
+            .map(|i| i.intent_id)?;
+
+        let claim_id = self.next_claim_id.fetch_add(1, Ordering::Relaxed);
+        let intent = store.intents.get_mut(&intent_id)?;
+
+        let claim = LeaseClaim {
+            claim_id,
+            intent_id,
+            method: intent.method.clone(),
+            host: intent.host.clone(),
+            path_prefix: intent.path_prefix.clone(),
+            agent_id: intent.agent_id.clone(),
+            operation: intent.operation.clone(),
+            payload_context: intent.payload_context.clone(),
+            payload_context_hash: intent.payload_context_hash,
+            payload_hash: intent.payload_hash,
+            policy_epoch: intent.policy_epoch.clone(),
+            allow_pinned_lease: intent.allow_pinned_lease,
+        };
+
+        intent.state = IntentState::Claimed {
+            claim_id,
+            at: Instant::now(),
+        };
+
+        tracing::debug!(
+            intent_id,
+            claim_id,
+            agent_id,
+            host,
+            path,
+            "Cooperative lease claimed by sandbox binding (pending WAL)"
+        );
+
+        Some(claim)
+    }
+
+    /// Phase 3c CONNECT-side variant of
+    /// [`claim_by_sandbox_binding`]: bind by `(agent_id, host)`
+    /// only, skipping method and path checks.
+    ///
+    /// CONNECT has no inner method or path visible to the proxy
+    /// (those are encrypted inside the TLS tunnel that follows the
+    /// 200), so the lease's declared method / path cannot be
+    /// validated at CONNECT time. The token-based CONNECT path
+    /// (`super::proxy::connect::claim_connect_lease`) has the same
+    /// limitation. Like the HTTP variant this matches only
+    /// cooperative leases (`context_token_hash.is_some()`); legacy
+    /// URL-only intents are deliberately ineligible.
+    pub fn claim_by_sandbox_binding_host(&self, agent_id: &str, host: &str) -> Option<LeaseClaim> {
+        let mut store = self.inner.lock().ok()?;
+
+        self.cleanup_inner(&mut store);
+
+        let intent_id = store
+            .intents
+            .values()
+            .filter(|i| {
+                matches!(i.state, IntentState::Active)
+                    && !i.is_expired()
+                    && i.context_token_hash.is_some()
+                    && i.agent_id == agent_id
+                    && i.host.eq_ignore_ascii_case(host)
+            })
+            .max_by_key(|i| (i.created_at, i.intent_id))
+            .map(|i| i.intent_id)?;
+
+        let claim_id = self.next_claim_id.fetch_add(1, Ordering::Relaxed);
+        let intent = store.intents.get_mut(&intent_id)?;
+
+        let claim = LeaseClaim {
+            claim_id,
+            intent_id,
+            method: intent.method.clone(),
+            host: intent.host.clone(),
+            path_prefix: intent.path_prefix.clone(),
+            agent_id: intent.agent_id.clone(),
+            operation: intent.operation.clone(),
+            payload_context: intent.payload_context.clone(),
+            payload_context_hash: intent.payload_context_hash,
+            payload_hash: intent.payload_hash,
+            policy_epoch: intent.policy_epoch.clone(),
+            allow_pinned_lease: intent.allow_pinned_lease,
+        };
+
+        intent.state = IntentState::Claimed {
+            claim_id,
+            at: Instant::now(),
+        };
+
+        tracing::debug!(
+            intent_id,
+            claim_id,
+            agent_id,
+            host,
+            "Cooperative lease claimed by sandbox CONNECT binding (pending WAL)"
+        );
+
+        Some(claim)
+    }
+
     /// Phase 2a: WAL write succeeded → delete the intent.
     /// This is the ONLY path that deletes an intent.
     pub fn confirm(&self, claim_id: u64) {
