@@ -59,7 +59,12 @@ async fn lease_issuance_returns_opaque_context_token() {
         "claims-reviewer-1842",
         serde_json::json!({"amount": 100, "currency": "USD"}),
     );
-    let resp = gvm_proxy::api::register_intent(State(state.clone()), Json(body)).await;
+    let resp = gvm_proxy::api::register_intent(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        Json(body),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::CREATED);
     let body = body_json(resp).await;
     assert_eq!(body["registered"], true);
@@ -87,6 +92,7 @@ async fn token_is_not_intent_id_or_claim_id() {
     let (state, _wal) = common::test_state().await;
     let resp = gvm_proxy::api::register_intent(
         State(state.clone()),
+        axum::http::HeaderMap::new(),
         Json(lease_body("a", serde_json::json!({"op": "x"}))),
     )
     .await;
@@ -132,6 +138,7 @@ async fn two_leases_produce_unrelated_tokens() {
 
     let resp_a = gvm_proxy::api::register_intent(
         State(state.clone()),
+        axum::http::HeaderMap::new(),
         Json(lease_body("a", serde_json::json!({"op": "x"}))),
     )
     .await;
@@ -142,6 +149,7 @@ async fn two_leases_produce_unrelated_tokens() {
 
     let resp_b = gvm_proxy::api::register_intent(
         State(state.clone()),
+        axum::http::HeaderMap::new(),
         Json(lease_body("b", serde_json::json!({"op": "y"}))),
     )
     .await;
@@ -162,6 +170,7 @@ async fn response_records_payload_context_hash_not_raw_payload() {
     let payload = serde_json::json!({"amount": 100, "channel": "C_INTERNAL"});
     let resp = gvm_proxy::api::register_intent(
         State(state.clone()),
+        axum::http::HeaderMap::new(),
         Json(lease_body("a", payload.clone())),
     )
     .await;
@@ -192,6 +201,7 @@ async fn response_decision_source_is_cooperative_declared_only() {
     let (state, _wal) = common::test_state().await;
     let resp = gvm_proxy::api::register_intent(
         State(state.clone()),
+        axum::http::HeaderMap::new(),
         Json(lease_body("a", serde_json::json!({"op": "x"}))),
     )
     .await;
@@ -208,7 +218,12 @@ async fn oversize_payload_context_returns_413() {
     // ~20 KB of a single string field — over the 16 KB cap.
     let huge = "x".repeat(20 * 1024);
     let body = lease_body("a", serde_json::json!({"blob": huge}));
-    let resp = gvm_proxy::api::register_intent(State(state.clone()), Json(body)).await;
+    let resp = gvm_proxy::api::register_intent(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        Json(body),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     let json = body_json(resp).await;
     assert!(
@@ -233,7 +248,12 @@ async fn malformed_payload_hash_returns_400() {
         content_type: None,
         allow_pinned_lease: false,
     };
-    let resp = gvm_proxy::api::register_intent(State(state.clone()), Json(body)).await;
+    let resp = gvm_proxy::api::register_intent(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        Json(body),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -248,7 +268,12 @@ async fn preflight_deny_returns_no_token() {
     let (state, _wal) = srr_guard.take();
 
     let body = lease_body("a", serde_json::json!({"amount": 100}));
-    let resp = gvm_proxy::api::register_intent(State(state.clone()), Json(body)).await;
+    let resp = gvm_proxy::api::register_intent(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        Json(body),
+    )
+    .await;
     // 200 OK with decision=Deny — NOT a server error.
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
@@ -319,7 +344,12 @@ async fn legacy_url_only_intent_does_not_issue_context_token() {
         content_type: None,
         allow_pinned_lease: false,
     };
-    let resp = gvm_proxy::api::register_intent(State(state.clone()), Json(body)).await;
+    let resp = gvm_proxy::api::register_intent(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        Json(body),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::CREATED);
     let json = body_json(resp).await;
     assert_eq!(json["registered"], true);

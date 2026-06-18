@@ -867,6 +867,47 @@ impl IntentStore {
         Some(claim)
     }
 
+    /// Hard-remove an intent by its `intent_id`, regardless of
+    /// `Active` / `Claimed` state. Used by issuance-rollback paths
+    /// (e.g. `POST /gvm/intent` when the `gvm.intent.lease_issued`
+    /// WAL append fails after `register_lease` already wrote the
+    /// intent into the store).
+    ///
+    /// Why a separate method from [`confirm`]: `confirm(claim_id)`
+    /// removes ONLY entries whose state is `Claimed { claim_id }`.
+    /// A freshly-registered lease is in `Active` and has no claim_id
+    /// yet, so `confirm(intent_id)` would silently do nothing,
+    /// leaving the lease in the store. Sandbox-IP binding (Phase 3c)
+    /// can then claim that ghost lease without the token ever
+    /// reaching the agent — a `lease_issued` audit event was never
+    /// durably recorded, but the lease is consumable. This method
+    /// closes that hole.
+    ///
+    /// Returns `true` when an intent was actually removed, `false`
+    /// when no intent with that `intent_id` was present (already
+    /// confirmed / never inserted / lock poisoned).
+    pub fn cancel_intent(&self, intent_id: u64) -> bool {
+        let mut store = match self.inner.lock() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let Some(intent) = store.intents.remove(&intent_id) else {
+            return false;
+        };
+        let key = make_key(&intent.method, &intent.host, &intent.path_prefix);
+        if let Some(ids) = store.index.get_mut(&key) {
+            ids.retain(|&i| i != intent_id);
+            if ids.is_empty() {
+                store.index.remove(&key);
+            }
+        }
+        tracing::warn!(
+            intent_id,
+            "Intent cancelled (issuance rollback — no durable lease_issued audit record)"
+        );
+        true
+    }
+
     /// Phase 2a: WAL write succeeded → delete the intent.
     /// This is the ONLY path that deletes an intent.
     pub fn confirm(&self, claim_id: u64) {

@@ -314,6 +314,111 @@ fn sandbox_binding_host_variant_rejects_different_agent() {
         .is_none());
 }
 
+// ─── 6. WAL-rollback ghost-lease regression ───────────────────────────────
+//
+// /gvm/intent registers the lease BEFORE writing the
+// `gvm.intent.lease_issued` WAL event. If the WAL append fails
+// the API handler must hard-remove the lease via `cancel_intent`
+// — NOT `confirm`, which only touches `Claimed` entries and
+// silently leaves the freshly-registered `Active` lease alive.
+// Without that fix, a "ghost lease" sits in the store with no
+// durable audit record; the agent never gets the token, but
+// Phase 3c sandbox-IP binding can still claim it implicitly via
+// the agent_id + host match, producing an un-audited Allow.
+
+#[test]
+fn cancel_intent_removes_active_cooperative_lease() {
+    // Direct store-level regression: the exact failure mode the
+    // Blocker 2 critique pointed at. `register_lease` writes the
+    // intent in Active state; `confirm(intent_id)` would no-op
+    // because the state is Active, not Claimed; `cancel_intent`
+    // is the correct rollback primitive.
+    let store = IntentStore::new(30);
+    let (_id, _token, _hex) = store
+        .register_lease(
+            &coop("agent-rollback", "POST", "api.bank.com", "/transfer"),
+            serde_json::json!({"k": "v"}),
+            [0u8; 32],
+            None,
+            String::new(),
+        )
+        .expect("register_lease must succeed");
+    // Pull out the intent_id from the registered store by looking
+    // for the agent_id+method+host+path combination.
+    let claim_for_lookup = store
+        .claim_by_sandbox_binding("agent-rollback", "POST", "api.bank.com", "/transfer")
+        .expect("freshly registered lease must be claimable");
+    let intent_id = claim_for_lookup.intent_id;
+    // Restore it to Active so we can rollback from a real Active state.
+    store.release(claim_for_lookup.claim_id);
+
+    assert!(
+        store.cancel_intent(intent_id),
+        "cancel_intent must remove an Active lease"
+    );
+    // Now sandbox-binding must NOT find it — the ghost-lease hole
+    // is closed.
+    assert!(
+        store
+            .claim_by_sandbox_binding("agent-rollback", "POST", "api.bank.com", "/transfer")
+            .is_none(),
+        "after cancel_intent, the lease must be gone — sandbox-binding cannot resurrect it"
+    );
+}
+
+#[test]
+fn confirm_intent_does_not_remove_active_lease_proving_old_bug() {
+    // Negative-control test: documents WHY we added `cancel_intent`
+    // instead of just calling `confirm(intent_id)`. The legacy
+    // call site at api.rs:1254 used `confirm(intent_id)` for
+    // rollback — this test pins the broken behavior so a future
+    // refactor that "simplifies" by replacing cancel_intent with
+    // confirm gets caught.
+    let store = IntentStore::new(30);
+    let (intent_id, _token, _hex) = store
+        .register_lease(
+            &coop("agent-X", "POST", "api.bank.com", "/transfer"),
+            serde_json::json!({"k": "v"}),
+            [0u8; 32],
+            None,
+            String::new(),
+        )
+        .expect("register_lease must succeed");
+    // confirm() expects a claim_id; passing an intent_id of an
+    // Active lease must be a no-op because the lease's state is
+    // not `Claimed { claim_id: intent_id }`.
+    store.confirm(intent_id);
+    // Lease must still be there — proving the old rollback path
+    // was broken and `cancel_intent` was necessary.
+    assert!(
+        store
+            .claim_by_sandbox_binding("agent-X", "POST", "api.bank.com", "/transfer")
+            .is_some(),
+        "confirm(intent_id) on an Active lease must be a no-op — \
+         this is why api.rs rollback now uses cancel_intent"
+    );
+}
+
+#[test]
+fn cancel_intent_idempotent_returns_false_when_already_gone() {
+    let store = IntentStore::new(30);
+    let (intent_id, _token, _hex) = store
+        .register_lease(
+            &coop("agent-Y", "POST", "api.bank.com", "/transfer"),
+            serde_json::json!({"k": "v"}),
+            [0u8; 32],
+            None,
+            String::new(),
+        )
+        .expect("register_lease must succeed");
+
+    assert!(store.cancel_intent(intent_id));
+    assert!(
+        !store.cancel_intent(intent_id),
+        "second cancel must return false — idempotent, not panic"
+    );
+}
+
 #[test]
 fn sandbox_binding_host_variant_skips_legacy_intents() {
     // Same guard as the HTTP-shape variant — legacy URL-only

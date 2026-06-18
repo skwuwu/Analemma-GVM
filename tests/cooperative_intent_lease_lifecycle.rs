@@ -62,7 +62,12 @@ async fn spawn_recording_upstream() -> std::net::SocketAddr {
 async fn issue_lease(state: &gvm_proxy::proxy::AppState, req: IntentRequest) -> String {
     use axum::extract::State;
     use axum::Json;
-    let resp = gvm_proxy::api::register_intent(State(state.clone()), Json(req)).await;
+    let resp = gvm_proxy::api::register_intent(
+        State(state.clone()),
+        axum::http::HeaderMap::new(),
+        Json(req),
+    )
+    .await;
     assert_eq!(
         resp.status(),
         StatusCode::CREATED,
