@@ -1,19 +1,21 @@
-# Analemma-GVM: Permission-Grant Runtime for AI Agents
+# Analemma-GVM
 
-**Bound the actions. Sign the evidence. Stay framework-independent.**
+**A model-neutral Agent IAM runtime for regulated AI workflows.**
 
-GVM gives an AI agent a **time-bounded set of permissions** for a specific task, enforces those permissions at the HTTP / filesystem / syscall boundary, and produces a Merkle-chained, Ed25519-signed evidence trail an external auditor can verify offline. Two small Rust binaries (CLI + proxy, ~35 MB on Linux). No Kubernetes, no service mesh, no GPU, no SDK to import.
+Analemma-GVM grants each agent invocation a **short-lived, auditable capability lease** and enforces it across network egress, API payloads, filesystem access, credentials, approvals, and tamper-evident audit logs — **without requiring changes to the model or agent framework**.
 
-GVM does **not** make the model trustworthy. It makes the model's actions **bounded, auditable, and revocable** — the framing regulated environments (claim review, internal coding agents, on-prem document workflows, sovereign AI deployments) need before turning autonomy on. Think of it less as a sandbox and more as **`docker run` for agent permissions, with a court-grade audit trail attached.**
+Analemma-GVM is **not** a prompt filter, model safety layer, or VM replacement. It is an **invocation-level permission and evidence runtime for AI agents**: it does not make the model trustworthy — it makes the model's actions **bounded, auditable, and revocable**.
+
+Two small Rust binaries (CLI + proxy, ~35 MB on Linux). No Kubernetes, no service mesh, no GPU, no SDK to import. Designed to sit underneath an external orchestrator (your scheduler, workflow engine, MCP server, internal portal) that decides *which agent gets which capability for how long* — GVM owns the enforcement and the evidence.
 
 Four things you get out of the box:
 
-1. **Bound actions** — every outbound HTTP call, filesystem write, and DNS query is gated by a policy. Default-to-Caution on anything unrecognised; Deny / RequireApproval / Delay / Allow / AuditOnly as the five effects.
-2. **Signed evidence** — every decision lands in a Merkle-chained WAL with an Ed25519 anchor signature. `gvm proof event` / `gvm proof batch` exports a self-contained JSON bundle; `gvm proof verify` runs offline against just the public anchor key.
-3. **Framework-independent** — your agent isn't modified. Plain `requests`, `urllib`, `node-fetch`, `curl`, LangChain, hermes-agent, OpenClaw all work unchanged — governance sits at the proxy and kernel layer, not in your code.
-4. **Zero-code-change cooperative path on any OS** + **kernel-enforced sandbox path on Linux** — same rules, two enforcement strengths, pick per environment.
+1. **Bound actions** — every outbound HTTP call, filesystem write, DNS query, and credential injection is gated by policy. Five effects: Allow / AuditOnly / Delay / RequireApproval / Deny. Default-to-Caution on anything unrecognised.
+2. **Short-lived capability leases** — `POST /gvm/intent` mints an opaque `ctx_…` one-time token bound to a specific (method, host, path, payload) shape. Claim-time cross-check against the observed request; mismatch / replay / forgery → Deny with `cooperative.*` evidence tier on the audit chain. Single-use across `CLAIM_TIMEOUT` — verified by regression test.
+3. **Signed evidence** — every decision lands in a Merkle-chained WAL with an Ed25519 anchor signature. `gvm proof event` / `gvm proof batch` exports a self-contained JSON bundle; `gvm proof verify` and `gvm anchor verify` run **offline against just the public anchor key** — the auditor doesn't need access to the host or the operator's signing material. EvidenceFirst audit mode (opt-in) writes a Pending row durably BEFORE forwarding upstream; WAL failure → 500, nothing reaches the wire.
+4. **Framework-independent** — your agent isn't modified. Plain `requests`, `urllib`, `node-fetch`, `curl`, LangChain, hermes-agent, OpenClaw all work unchanged — governance sits at the proxy and kernel layer, not in your code. Zero-code-change cooperative path on any OS + kernel-enforced sandbox path on Linux — same rules, two enforcement strengths, pick per environment.
 
-What it is **not**: a prompt filter (use Lakera or provider safety for that), an LLM safety solution (it doesn't change what the model says — it bounds what the model can *do*), or a replacement for OPA (OPA governs service-to-service; GVM governs agent-to-world).
+The framing regulated environments need before turning autonomy on (claim review, internal coding agents, on-prem document workflows, sovereign AI deployments). Think of it less as a sandbox and more as **`docker run` for agent permissions, with a court-grade audit trail attached.**
 
 ## Demo — Watch, Suggest, Enforce in 3 commands
 
@@ -175,8 +177,11 @@ This is the position GVM aims for: not a sandbox you wrap an agent in, but a **r
 
 ## What it doesn't do
 
-- **Not a prompt filter.** Use Lakera or provider safety for that. GVM governs actions, not words.
-- **Not a substitute for the model's own safety.** GVM does not stop the model from being wrong; it limits the blast radius when the model is wrong.
+GVM is an **invocation-level permission and evidence runtime**, not a model-safety layer. Specifically:
+
+- **Not a prompt filter or model safety layer.** GVM does not change what the model says or how it reasons. Use Lakera, Anthropic safety, or provider guardrails for prompt/output filtering. GVM governs what the model can *do* — every HTTP call, file write, credential use, and approval gate.
+- **Not a VM or container replacement.** A VM gives you process isolation. GVM gives you *invocation-scoped capability leases* on top of whatever isolation you already use. `--sandbox` adds Linux namespace + seccomp + iptables enforcement; cooperative mode runs anywhere. Neither replaces the operating boundary your infra team already trusts.
+- **Not a substitute for the model's own safety.** GVM does not stop the model from being wrong; it limits the blast radius when the model is wrong, and produces a tamper-evident record of what it tried.
 - **Complementary to OPA, not a replacement.** OPA governs service-to-service. GVM governs agent-to-world. They compose: deploy OPA at your API edge AND GVM around your agent.
 
 | | LLM Provider Safety | Prompt Guards (Lakera) | **GVM** |
@@ -264,4 +269,4 @@ gvm run my_agent.py
 ---
 - Feedback on technical and structural issues or bug reports is always welcome!
 
-v0.5.3. Apache 2.0. [Issues →](https://github.com/skwuwu/Analemma-GVM/issues)
+v0.6.3. Apache 2.0. [Issues →](https://github.com/skwuwu/Analemma-GVM/issues)
