@@ -525,34 +525,27 @@ find_agent_pid_for_parent() {
 # ─── Cleanup matrix (Tests 10-13) ──────────────────────────────────────
 #
 # These four tests exercise sandbox cleanup under termination paths
-# OTHER than Ctrl+C (which Test 8 already covers). They discovered an
-# architectural bug — when the gvm CLI parent dies (especially via
-# SIGKILL), the sandbox PID-namespace init continues running on the
-# host because PR_SET_PDEATHSIG is not set on the cloned child. Result:
-# orphan agent + leaked veth + iptables NAT + state file that
-# `gvm cleanup` cannot recover (it sees the namespace init as alive
-# and skips cleanup).
+# OTHER than Ctrl+C (which Test 8 already covers). Originally they
+# discovered an architectural bug — when the gvm CLI parent dies, the
+# sandbox PID-namespace init continued running on the host because
+# PR_SET_PDEATHSIG was not set on the cloned child, leaking veth /
+# iptables NAT / state files that `gvm cleanup` could not recover.
+# That fix landed (see crates/gvm-sandbox/src/sandbox_impl.rs:726 —
+# `prctl(PR_SET_PDEATHSIG, SIGKILL, …)` is now armed in the cloned
+# child before exec), and the four tests have since been verified
+# passing end-to-end against real iptables / ip link / /run/gvm state
+# on EC2 (43.201.62.93, 2026-06-18: NAT=0 veth=0 state=0 after every
+# termination path, including the SIGKILL parent-death case that
+# leaves NAT=2 state=1 between SIGKILL and `gvm cleanup` — cleanup
+# recovers it deterministically).
 #
-# Bug class: parent-death does not kill child, child appears alive to
-# orphan scanner, cleanup is permanently skipped. Fix requires
-# PR_SET_PDEATHSIG(SIGKILL) on clone or a cgroup-based teardown
-# mechanism — both non-trivial design changes scheduled for a
-# follow-up.
-#
-# Until that fix lands, the tests would FAIL on every CI run, blocking
-# unrelated work. They are therefore opt-in: set
-# `SANDBOX_CLEANUP_MATRIX=1` to run them locally / in nightly. The
-# default CI run skips them with a clear message.
-#
-# Why keep them in this file at all: regression gate for the day the
-# fix lands. The moment PR_SET_PDEATHSIG (or equivalent) is wired up,
-# enable the env var in CI and these tests prove the fix works
-# end-to-end against real iptables / ip link / /run/gvm state.
-if [ "${SANDBOX_CLEANUP_MATRIX:-0}" != "1" ]; then
+# Default is therefore "run them". Operators can still opt out by
+# setting `SANDBOX_CLEANUP_MATRIX=0` for environments without
+# iptables-save / ip / /run/gvm (rare — these are sandbox-OS basics).
+if [ "${SANDBOX_CLEANUP_MATRIX:-1}" = "0" ]; then
     echo
     echo -e "${BOLD}── Cleanup Matrix (Tests 10-13) ──${NC}"
-    echo -e "  ${YELLOW}~${NC} skipped: known bug — parent SIGKILL leaves orphan sandbox"
-    echo -e "  ${DIM}set SANDBOX_CLEANUP_MATRIX=1 to run anyway (will FAIL until fixed)${NC}"
+    echo -e "  ${YELLOW}~${NC} skipped: SANDBOX_CLEANUP_MATRIX=0 set by caller"
     record "Agent SIGTERM cleanup" "SKIP"
     record "Agent SIGKILL cleanup" "SKIP"
     record "Parent SIGTERM cleanup" "SKIP"
