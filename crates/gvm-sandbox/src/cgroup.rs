@@ -71,6 +71,21 @@ impl CgroupGuard {
                 tracing::info!(limit_mb = bytes / (1024 * 1024), "cgroup: memory.max set");
             }
 
+            // Disable swap for this cgroup. Without this, a host with a
+            // swapfile lets the kernel reclaim cgroup pages to swap
+            // instead of firing the OOM killer — the agent allocates
+            // 200MB under `--memory 32m`, the pages spill to swap, and
+            // it finishes successfully. The whole point of the limit
+            // (kill the runaway agent before it consumes the host) is
+            // defeated. `memory.swap.max=0` makes the limit hard.
+            let swap_max = cgroup_path.join("memory.swap.max");
+            if let Err(e) = fs::write(&swap_max, "0") {
+                tracing::debug!(
+                    error = %e,
+                    "Failed to set memory.swap.max=0 — swap-spilling may defeat memory.max"
+                );
+            }
+
             // Enable OOM group kill: when OOM triggers, kill ALL processes in
             // the cgroup atomically. Without this, OOM killer picks individual
             // processes and forked children may survive — escaping governance.
