@@ -146,6 +146,34 @@ pub(super) fn build_event(
                     serde_json::Value::Bool(true),
                 );
             }
+            // H6: propagate lease audit metadata into the WAL event
+            // context so the auditor can correlate this decision
+            // back to the earlier `gvm.intent.lease_issued` event
+            // by `intent_id`, and see what hash the agent declared
+            // versus what (if anything) the proxy actually observed.
+            // Only hashes — never raw payload bytes.
+            if let Some(meta) = classification.cooperative.as_ref() {
+                attrs.insert(
+                    "cooperative.intent_id".to_string(),
+                    serde_json::Value::Number(meta.intent_id.into()),
+                );
+                attrs.insert(
+                    "cooperative.claim_id".to_string(),
+                    serde_json::Value::Number(meta.claim_id.into()),
+                );
+                if let Some(h) = meta.payload_context_hash {
+                    attrs.insert(
+                        "cooperative.payload_context_hash".to_string(),
+                        serde_json::Value::String(format!("sha256:{}", hex::encode(h))),
+                    );
+                }
+                if let Some(h) = meta.observed_payload_hash {
+                    attrs.insert(
+                        "cooperative.observed_payload_hash".to_string(),
+                        serde_json::Value::String(format!("sha256:{}", hex::encode(h))),
+                    );
+                }
+            }
             attrs
         },
         transport: Some(TransportInfo {

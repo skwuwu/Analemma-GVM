@@ -60,6 +60,7 @@ fn lease_body(allow_pinned: bool) -> IntentRequest {
         payload_hash: None,
         content_type: None,
         allow_pinned_lease: allow_pinned,
+        requires_observed_body: false,
     }
 }
 

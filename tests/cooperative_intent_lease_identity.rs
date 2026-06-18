@@ -50,6 +50,7 @@ fn lease_body(agent_id: &str) -> IntentRequest {
         payload_hash: None,
         content_type: None,
         allow_pinned_lease: false,
+        requires_observed_body: false,
     }
 }
 

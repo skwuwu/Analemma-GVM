@@ -113,6 +113,7 @@ fn lease_with_hash(payload_hash: Option<String>, allow_pinned: bool) -> IntentRe
         payload_hash,
         content_type: None,
         allow_pinned_lease: allow_pinned,
+        requires_observed_body: false,
     }
 }
 

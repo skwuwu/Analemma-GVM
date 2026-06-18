@@ -1236,10 +1236,7 @@ pub async fn register_intent(
     // Step 4: short-circuit Deny — no token, no lease, no WAL
     // lease_issued event (still a WAL event for the audit trail
     // is emitted below as `gvm.intent.lease_denied`).
-    if matches!(
-        srr_result.decision,
-        gvm_types::EnforcementDecision::Deny { .. }
-    ) {
+    if let gvm_types::EnforcementDecision::Deny { ref reason } = srr_result.decision {
         tracing::info!(
             agent = %body.agent_id,
             method = %body.method,
@@ -1247,6 +1244,71 @@ pub async fn register_intent(
             path = %body.path,
             "Cooperative intent lease refused at preflight (SRR Deny)"
         );
+        // H7: emit a `gvm.intent.lease_denied` WAL event. The
+        // refused issuance must leave a durable audit record so
+        // attempted privilege-escalation patterns (agent declares
+        // a bank-transfer for `/admin` on a deny-listed rule) are
+        // visible in the Merkle chain. Raw payload context is NOT
+        // recorded — only the SHA-256, matching the lease_issued
+        // event's privacy posture.
+        let denied_event = gvm_types::GVMEvent {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            trace_id: uuid::Uuid::new_v4().to_string(),
+            parent_event_id: None,
+            agent_id: body.agent_id.clone(),
+            token_id: None,
+            tenant_id: None,
+            session_id: String::new(),
+            timestamp: chrono::Utc::now(),
+            operation: "gvm.intent.lease_denied".to_string(),
+            resource: gvm_types::ResourceDescriptor {
+                service: body.host.clone(),
+                identifier: Some(body.path.clone()),
+                tier: gvm_types::ResourceTier::External,
+                sensitivity: gvm_types::Sensitivity::Medium,
+            },
+            context: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "payload_context_hash".to_string(),
+                    serde_json::Value::String(format!(
+                        "sha256:{}",
+                        hex::encode(payload_context_hash)
+                    )),
+                );
+                m.insert(
+                    "deny_reason".to_string(),
+                    serde_json::Value::String(reason.clone()),
+                );
+                if let Some(s) = &body.payload_hash {
+                    m.insert(
+                        "payload_hash".to_string(),
+                        serde_json::Value::String(s.clone()),
+                    );
+                }
+                m
+            },
+            transport: None,
+            decision: "Deny".to_string(),
+            decision_source: gvm_types::DecisionSource::CooperativeDeclaredOnly.into(),
+            matched_rule_id: srr_result.matched_description.clone(),
+            enforcement_point: "intent-preflight".to_string(),
+            status: gvm_types::EventStatus::Failed {
+                reason: reason.clone(),
+            },
+            payload: gvm_types::PayloadDescriptor::default(),
+            event_hash: None,
+            llm_trace: None,
+            default_caution: false,
+            config_integrity_ref: state.current_integrity_ref(),
+            operation_descriptor: None,
+        };
+        if let Err(e) = state.ledger.append_durable(&denied_event).await {
+            tracing::warn!(
+                error = %e,
+                "Failed to record lease_denied WAL event — Deny still surfaced to caller"
+            );
+        }
         return json_response(
             StatusCode::OK,
             &serde_json::json!({
@@ -1255,6 +1317,7 @@ pub async fn register_intent(
                 "decision_source": gvm_types::DecisionSource::CooperativeDeclaredOnly.as_str(),
                 "matched_rule": srr_result.matched_description,
                 "payload_context_hash": format!("sha256:{}", hex::encode(payload_context_hash)),
+                "reason": reason,
             }),
         );
     }

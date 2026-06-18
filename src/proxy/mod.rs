@@ -887,7 +887,25 @@ pub async fn proxy_handler(
     // is STRIPPED before the request is forwarded upstream. The token
     // is bearer material; leaking it to GitHub / Slack / Stripe would
     // let those endpoints replay it to GVM and impersonate the lease.
-    let cooperative_outcome = extract_and_claim_lease(&state, &mut request, &target, body_for_srr);
+    // The request's effective principal: JWT subject if a verified
+    // JWT identity exists, otherwise the X-GVM-Agent-Id header value.
+    // `extract_and_claim_lease` H8 check compares this against
+    // `claim.agent_id` and Denies (`cooperative.mismatch`) on
+    // disagreement, defeating the "agent A presents agent B's token"
+    // attack. Passing `None` skips the check — same legacy behaviour
+    // as before H8, used by deployments that haven't wired JWT yet.
+    let request_principal: Option<&str> = verified_identity
+        .as_ref()
+        .map(|v| v.agent_id.as_str())
+        .or_else(|| gvm_headers.as_ref().map(|h| h.agent_id.as_str()));
+
+    let cooperative_outcome = extract_and_claim_lease(
+        &state,
+        &mut request,
+        &target,
+        body_for_srr,
+        request_principal,
+    );
 
     // Strip the GVM-internal cooperative header NOW so every downstream
     // path (SRR check, upstream forward, error response) sees the
@@ -930,10 +948,7 @@ pub async fn proxy_handler(
     // because the closure form pulls the std::sync::RwLockReadGuard
     // into the captured set, breaking the Handler's Send bound.
     let (classification, is_default_caution) = match cooperative_outcome {
-        CooperativeOutcome::CrossChecked {
-            claim_id: _,
-            pinned,
-        } => {
+        CooperativeOutcome::CrossChecked { meta, pinned } => {
             let srr_result = {
                 let srr = match state.srr.read() {
                     Ok(g) => g,
@@ -966,12 +981,13 @@ pub async fn proxy_handler(
                     operation,
                     matched_rule_id: srr_result.matched_description,
                     pinned,
+                    cooperative: Some(meta),
                 },
                 srr_result.is_catch_all,
             )
         }
         CooperativeOutcome::DeclaredOnly {
-            claim_id: _,
+            meta,
             declared_body,
             pinned,
         } => {
@@ -1007,14 +1023,12 @@ pub async fn proxy_handler(
                     operation,
                     matched_rule_id: srr_result.matched_description,
                     pinned,
+                    cooperative: Some(meta),
                 },
                 srr_result.is_catch_all,
             )
         }
-        CooperativeOutcome::Mismatch {
-            claim_id: _,
-            reason,
-        } => (
+        CooperativeOutcome::Mismatch { meta, reason } => (
             Classification {
                 decision: gvm_types::EnforcementDecision::Deny { reason },
                 source: ClassificationSource::CooperativeMismatch,
@@ -1023,13 +1037,11 @@ pub async fn proxy_handler(
                     .map(|headers| build_operation_metadata(headers, &target)),
                 matched_rule_id: Some("cooperative.mismatch".to_string()),
                 pinned: false,
+                cooperative: Some(meta),
             },
             false,
         ),
-        CooperativeOutcome::Expired {
-            claim_id: _,
-            reason,
-        } => (
+        CooperativeOutcome::Expired { meta, reason } => (
             Classification {
                 decision: gvm_types::EnforcementDecision::Deny { reason },
                 source: ClassificationSource::CooperativeExpired,
@@ -1038,6 +1050,7 @@ pub async fn proxy_handler(
                     .map(|headers| build_operation_metadata(headers, &target)),
                 matched_rule_id: Some("cooperative.expired".to_string()),
                 pinned: false,
+                cooperative: Some(meta),
             },
             false,
         ),
@@ -1050,6 +1063,7 @@ pub async fn proxy_handler(
                     .map(|headers| build_operation_metadata(headers, &target)),
                 matched_rule_id: Some("cooperative.unbound".to_string()),
                 pinned: false,
+                cooperative: None,
             },
             false,
         ),
@@ -1086,6 +1100,7 @@ pub async fn proxy_handler(
                     operation,
                     matched_rule_id: srr_result.matched_description,
                     pinned: false,
+                    cooperative: None,
                 },
                 srr_result.is_catch_all,
             )
@@ -1763,27 +1778,36 @@ enum CooperativeOutcome {
     /// `release()` on WAL failure — otherwise the lease sits in
     /// `Claimed` until `CLAIM_TIMEOUT` and is then released back
     /// to `Active`, defeating single-use.
-    CrossChecked { claim_id: u64, pinned: bool },
+    CrossChecked {
+        meta: gvm_types::CooperativeMeta,
+        pinned: bool,
+    },
     /// Token claimed but no observed body (MITM-blind, no payload
     /// inspection enabled, or oversized buffer). Run SRR on the
-    /// declared `payload_context` instead. Same `claim_id` lifecycle
+    /// declared `payload_context` instead. Same `meta` lifecycle
     /// rule as `CrossChecked`.
     DeclaredOnly {
-        claim_id: u64,
+        meta: gvm_types::CooperativeMeta,
         declared_body: Bytes,
         pinned: bool,
     },
     /// Token claimed but observed body's hash did NOT match the
-    /// declared `payload_hash`. Always Deny. `claim_id` MUST still
-    /// be confirmed (= deleted) so the bad lease cannot be re-used
-    /// after CLAIM_TIMEOUT — a bad claim is still a claim.
-    Mismatch { claim_id: u64, reason: String },
+    /// declared `payload_hash`. Always Deny. `meta.claim_id` MUST
+    /// still be confirmed (= deleted) so the bad lease cannot be
+    /// re-used after CLAIM_TIMEOUT — a bad claim is still a claim.
+    Mismatch {
+        meta: gvm_types::CooperativeMeta,
+        reason: String,
+    },
     /// Token claimed but the lease's `policy_epoch` differs from
     /// the current integrity ref (the proxy reloaded since the
     /// lease was issued) and the lease did NOT opt in via
-    /// `allow_pinned_lease`. Always Deny. Same `claim_id` lifecycle
+    /// `allow_pinned_lease`. Always Deny. Same `meta` lifecycle
     /// rule as `Mismatch`.
-    Expired { claim_id: u64, reason: String },
+    Expired {
+        meta: gvm_types::CooperativeMeta,
+        reason: String,
+    },
     /// Token presented but no matching active lease found in the
     /// store. Re-use, forgery, or replay. No claim was taken
     /// (lookup returned None), so no confirm/release work.
@@ -1797,11 +1821,22 @@ impl CooperativeOutcome {
     /// pair this with `confirm()` (on Allow/Delay/Deny success) or
     /// `release()` (on WAL failure) — see the variant docs.
     fn claim_id(&self) -> Option<u64> {
+        self.meta().map(|m| m.claim_id)
+    }
+
+    /// H6 audit metadata. Returns `None` for `NoToken` / `Unbound`.
+    /// The proxy hot path threads this into
+    /// `Classification.cooperative` so `build_event` writes
+    /// `cooperative.intent_id` / `payload_context_hash` /
+    /// `observed_payload_hash` into the WAL event context — the
+    /// link-back fields a forensic auditor needs to connect this
+    /// decision to the earlier `gvm.intent.lease_issued` event.
+    fn meta(&self) -> Option<&gvm_types::CooperativeMeta> {
         match self {
-            CooperativeOutcome::CrossChecked { claim_id, .. }
-            | CooperativeOutcome::DeclaredOnly { claim_id, .. }
-            | CooperativeOutcome::Mismatch { claim_id, .. }
-            | CooperativeOutcome::Expired { claim_id, .. } => Some(*claim_id),
+            CooperativeOutcome::CrossChecked { meta, .. }
+            | CooperativeOutcome::DeclaredOnly { meta, .. }
+            | CooperativeOutcome::Mismatch { meta, .. }
+            | CooperativeOutcome::Expired { meta, .. } => Some(meta),
             CooperativeOutcome::NoToken | CooperativeOutcome::Unbound { .. } => None,
         }
     }
@@ -1823,6 +1858,7 @@ fn extract_and_claim_lease(
     request: &mut axum::http::Request<axum::body::Body>,
     target: &Target,
     observed_body: Option<&[u8]>,
+    request_principal: Option<&str>,
 ) -> CooperativeOutcome {
     use sha2::{Digest, Sha256};
 
@@ -1859,7 +1895,7 @@ fn extract_and_claim_lease(
     let request_method = request.method().as_str();
     if !request_method.eq_ignore_ascii_case(&claim.method) {
         return CooperativeOutcome::Mismatch {
-            claim_id: claim.claim_id,
+            meta: claim.to_audit_meta(None),
             reason: format!(
                 "method mismatch: declared {}, observed {}",
                 claim.method, request_method
@@ -1868,7 +1904,7 @@ fn extract_and_claim_lease(
     }
     if !target.host.eq_ignore_ascii_case(&claim.host) {
         return CooperativeOutcome::Mismatch {
-            claim_id: claim.claim_id,
+            meta: claim.to_audit_meta(None),
             reason: format!(
                 "host mismatch: declared {}, observed {}",
                 claim.host, target.host
@@ -1877,12 +1913,34 @@ fn extract_and_claim_lease(
     }
     if !target.path.starts_with(&claim.path_prefix) {
         return CooperativeOutcome::Mismatch {
-            claim_id: claim.claim_id,
+            meta: claim.to_audit_meta(None),
             reason: format!(
                 "path mismatch: declared prefix {}, observed {}",
                 claim.path_prefix, target.path
             ),
         };
+    }
+
+    // Step 2.5: principal binding (H8 from the regulated-target
+    // review). The lease was issued under `claim.agent_id`. If the
+    // request's effective principal (JWT subject > GVM-Agent-Id
+    // header) disagrees, this is the "agent A steals agent B's
+    // token" attack. Reject. We only enforce this when the request
+    // carries SOME principal — anonymous traffic doesn't get a
+    // free pass to consume someone else's lease, but agent-facing
+    // deployments that haven't wired JWT yet would otherwise see
+    // every request fail. The principal-less case is treated like
+    // a method/host/path-only match (legacy behaviour).
+    if let Some(req_principal) = request_principal {
+        if req_principal != claim.agent_id {
+            return CooperativeOutcome::Mismatch {
+                meta: claim.to_audit_meta(None),
+                reason: format!(
+                    "principal mismatch: lease issued for {}, request principal is {}",
+                    claim.agent_id, req_principal
+                ),
+            };
+        }
     }
 
     // Step 3: policy epoch check via the shared helper (single
@@ -1899,7 +1957,7 @@ fn extract_and_claim_lease(
         }
         crate::intent_store::LeaseEpochCheck::Stale => {
             return CooperativeOutcome::Expired {
-                claim_id: claim.claim_id,
+                meta: claim.to_audit_meta(None),
                 reason: "policy reloaded since lease was issued (epoch mismatch); \
                          set allow_pinned_lease=true at issuance to tolerate"
                     .to_string(),
@@ -1914,8 +1972,10 @@ fn extract_and_claim_lease(
     //   - `observed_body`, if the proxy buffered one (controlled by
     //     `state.payload_inspection`)
     // Both present and matching → CrossChecked. Lease provides hash
-    // but observed body unavailable → DeclaredOnly. Lease has neither
-    // → DeclaredOnly. Hash provided but observed mismatches → Mismatch.
+    // but observed body unavailable → DeclaredOnly (unless H5
+    // `requires_observed_body` was set, then Mismatch Deny). Lease
+    // has neither → DeclaredOnly. Hash provided but observed
+    // mismatches → Mismatch.
     let observed_body_hash: Option<[u8; 32]> = observed_body.map(|bytes| {
         let mut h = Sha256::new();
         h.update(bytes);
@@ -1924,13 +1984,27 @@ fn extract_and_claim_lease(
     if let (Some(declared_hash), Some(observed_hash)) = (claim.payload_hash, observed_body_hash) {
         if declared_hash != observed_hash {
             return CooperativeOutcome::Mismatch {
-                claim_id: claim.claim_id,
+                meta: claim.to_audit_meta(Some(observed_hash)),
                 reason: "observed body hash does not match declared payload_hash".to_string(),
             };
         }
         return CooperativeOutcome::CrossChecked {
-            claim_id: claim.claim_id,
+            meta: claim.to_audit_meta(Some(observed_hash)),
             pinned,
+        };
+    }
+
+    // H5 strict path: lease declared `payload_hash` AND opted in to
+    // `requires_observed_body`, but the proxy couldn't observe the
+    // body (chunked encoding without Content-Length, oversized
+    // buffer, MITM-blind path, or payload_inspection disabled).
+    if claim.requires_observed_body && claim.payload_hash.is_some() && observed_body_hash.is_none()
+    {
+        return CooperativeOutcome::Mismatch {
+            meta: claim.to_audit_meta(None),
+            reason: "lease required observed-body cross-check but the proxy could not buffer \
+                     the request body (chunked / streaming / oversized / inspection disabled)"
+                .to_string(),
         };
     }
 
@@ -1947,7 +2021,7 @@ fn extract_and_claim_lease(
         None => Bytes::new(),
     };
     CooperativeOutcome::DeclaredOnly {
-        claim_id: claim.claim_id,
+        meta: claim.to_audit_meta(None),
         declared_body,
         pinned,
     }
@@ -2009,7 +2083,7 @@ fn try_sandbox_binding(
         }
         crate::intent_store::LeaseEpochCheck::Stale => {
             return CooperativeOutcome::Expired {
-                claim_id: claim.claim_id,
+                meta: claim.to_audit_meta(None),
                 reason: "policy reloaded since sandbox-bound lease was issued (epoch mismatch); \
                          set allow_pinned_lease=true at issuance to tolerate"
                     .to_string(),
@@ -2026,15 +2100,27 @@ fn try_sandbox_binding(
     if let (Some(declared_hash), Some(observed_hash)) = (claim.payload_hash, observed_body_hash) {
         if declared_hash != observed_hash {
             return CooperativeOutcome::Mismatch {
-                claim_id: claim.claim_id,
+                meta: claim.to_audit_meta(Some(observed_hash)),
                 reason: "observed body hash does not match declared payload_hash \
                          (sandbox-bound lease)"
                     .to_string(),
             };
         }
         return CooperativeOutcome::CrossChecked {
-            claim_id: claim.claim_id,
+            meta: claim.to_audit_meta(Some(observed_hash)),
             pinned,
+        };
+    }
+
+    // H5 strict path on sandbox-binding: same rule as the token
+    // path. Lease asked for body cross-check; proxy can't observe.
+    if claim.requires_observed_body && claim.payload_hash.is_some() && observed_body_hash.is_none()
+    {
+        return CooperativeOutcome::Mismatch {
+            meta: claim.to_audit_meta(None),
+            reason: "lease required observed-body cross-check but the proxy could not buffer \
+                     the request body (sandbox-bound)"
+                .to_string(),
         };
     }
 
@@ -2047,7 +2133,7 @@ fn try_sandbox_binding(
         None => Bytes::new(),
     };
     CooperativeOutcome::DeclaredOnly {
-        claim_id: claim.claim_id,
+        meta: claim.to_audit_meta(None),
         declared_body,
         pinned,
     }

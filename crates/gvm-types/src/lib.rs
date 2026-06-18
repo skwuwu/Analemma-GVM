@@ -1894,6 +1894,35 @@ pub struct Classification {
     /// audit chain captures every stale-epoch enforcement.
     /// Default `false`; only the cooperative arms ever set it.
     pub pinned: bool,
+    /// H6: lease metadata for the final request WAL event. When a
+    /// cooperative lease was claimed (token or sandbox binding),
+    /// this carries the audit-relevant fields back to `build_event`
+    /// so the request decision is cryptographically + semantically
+    /// linked to the earlier `gvm.intent.lease_issued` event:
+    ///   - `intent_id` — primary key correlating both events
+    ///   - `payload_context_hash` — what the agent declared
+    ///   - `observed_payload_hash` — what the proxy actually saw
+    ///     (CrossChecked path only)
+    /// `None` for non-cooperative classifications.
+    pub cooperative: Option<CooperativeMeta>,
+}
+
+/// Audit metadata for a cooperative-lease-bound decision. Lives on
+/// `Classification` so the proxy hot path can carry it from
+/// `extract_and_claim_lease` (where the claim happens) to
+/// `build_event` (where the audit row is written) without threading
+/// extra parameters through every match arm.
+///
+/// Privacy: this struct only carries hashes and IDs — never raw
+/// payload bytes. The `payload_context_hash` is already a SHA-256
+/// over the operator-projected JSON; the `observed_payload_hash`
+/// is a SHA-256 over the observed body bytes.
+#[derive(Clone, Debug)]
+pub struct CooperativeMeta {
+    pub intent_id: u64,
+    pub claim_id: u64,
+    pub payload_context_hash: Option<[u8; 32]>,
+    pub observed_payload_hash: Option<[u8; 32]>,
 }
 
 /// Parsed GVM headers from SDK-routed requests

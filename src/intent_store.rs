@@ -142,6 +142,10 @@ struct Intent {
     /// epoch mismatch and tags the decision as pinned in the
     /// audit record rather than denying. Default false.
     allow_pinned_lease: bool,
+    /// H5 opt-in: when true AND `payload_hash` is set, the claim
+    /// path Denies (`cooperative.mismatch`) if the proxy could
+    /// not observe the body to cross-check. Default false.
+    requires_observed_body: bool,
 }
 
 impl Intent {
@@ -180,6 +184,7 @@ impl Intent {
             payload_hash: self.payload_hash,
             policy_epoch: self.policy_epoch.clone(),
             allow_pinned_lease: self.allow_pinned_lease,
+            requires_observed_body: self.requires_observed_body,
         }
     }
 }
@@ -241,6 +246,11 @@ pub struct LeaseClaim {
     /// the decision as pinned. The hot path reads this off the
     /// claim instead of re-locking the store.
     pub allow_pinned_lease: bool,
+    /// H5 opt-in flag mirrored from the lease. When true AND
+    /// `payload_hash` is set, the claim path Denies if the proxy
+    /// could not observe the body to cross-check (declared-only
+    /// is not acceptable for this lease).
+    pub requires_observed_body: bool,
 }
 
 /// Outcome of [`LeaseClaim::check_policy_epoch`]. Three states are
@@ -263,6 +273,24 @@ pub enum LeaseEpochCheck {
 }
 
 impl LeaseClaim {
+    /// H6: build the audit metadata snapshot the proxy hot path
+    /// will carry from `extract_and_claim_lease` through to
+    /// `build_event`. `observed_payload_hash` is set only on the
+    /// `CrossChecked` path where the proxy actually buffered and
+    /// hashed the body — for `DeclaredOnly` / `Mismatch` / `Expired`
+    /// it's `None` and the audit chain shows "no observation".
+    pub fn to_audit_meta(
+        &self,
+        observed_payload_hash: Option<[u8; 32]>,
+    ) -> gvm_types::CooperativeMeta {
+        gvm_types::CooperativeMeta {
+            intent_id: self.intent_id,
+            claim_id: self.claim_id,
+            payload_context_hash: self.payload_context_hash,
+            observed_payload_hash,
+        }
+    }
+
     /// Compare the lease's `policy_epoch` against the proxy's current
     /// integrity ref, honoring the lease's `allow_pinned_lease`
     /// opt-in. Single source of truth for the epoch-check logic that
@@ -343,6 +371,24 @@ pub struct IntentRequest {
     /// WAL preserves for audit.
     #[serde(default)]
     pub allow_pinned_lease: bool,
+
+    /// H5 opt-in: require the proxy to actually OBSERVE the request
+    /// body and confirm its SHA-256 matches `payload_hash`. When
+    /// set AND `payload_hash` is declared, the claim path will
+    /// `cooperative.mismatch` Deny if the proxy could not buffer
+    /// the body (chunked / streaming / oversized / MITM-blind).
+    /// Default `false` for back-compat: declared-only path is
+    /// allowed when no observation is possible.
+    ///
+    /// Use case: high-assurance leases on visible-HTTP paths where
+    /// the operator wants to guarantee cross-check happened, not
+    /// trust the declared payload context alone. Without this
+    /// flag, a malicious agent could declare a safe
+    /// payload_context, send the request as chunked encoding to
+    /// dodge the body buffer, and ride through on declared-only
+    /// evidence.
+    #[serde(default)]
+    pub requires_observed_body: bool,
 }
 
 fn default_agent() -> String {
@@ -430,6 +476,7 @@ impl IntentStore {
             payload_hash: None,
             policy_epoch: None,
             allow_pinned_lease: false,
+            requires_observed_body: false,
         };
 
         store.index.entry(key).or_default().push(intent_id);
@@ -539,6 +586,7 @@ impl IntentStore {
             payload_hash,
             policy_epoch: Some(policy_epoch),
             allow_pinned_lease: req.allow_pinned_lease,
+            requires_observed_body: req.requires_observed_body,
         };
 
         store.index.entry(key).or_default().push(intent_id);
@@ -1067,6 +1115,7 @@ mod tests {
             payload_hash: None,
             content_type: None,
             allow_pinned_lease: false,
+            requires_observed_body: false,
         }
     }
 
@@ -1262,6 +1311,7 @@ mod tests {
             payload_hash: None,
             content_type: None,
             allow_pinned_lease: false,
+            requires_observed_body: false,
         };
         let _ = store
             .register(&req)
@@ -1305,6 +1355,7 @@ mod tests {
             payload_hash: None,
             content_type: None,
             allow_pinned_lease: false,
+            requires_observed_body: false,
         };
         match store.register(&req2) {
             Ok(_) => {
