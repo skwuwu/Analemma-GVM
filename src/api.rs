@@ -389,7 +389,29 @@ fn resolve_cooperative_intent_identity(
         return Ok(verified.agent_id);
     }
 
-    // Step 3: nothing to verify against. Trust the body.
+    // Step 3: nothing to verify against. Strict guard for
+    // regulated deployments: when `require_verified_intent_identity`
+    // is set, the issuance MUST resolve to a verified identity (JWT
+    // subject or sandbox peer-IP). Falling through to body trust is
+    // the legacy / orchestrator path; deployments that explicitly
+    // opt in to strict mode reject it with 401.
+    if state.require_verified_intent_identity {
+        tracing::warn!(
+            agent = declared_agent_id,
+            ?peer_ip,
+            "Cooperative intent: require_verified_intent_identity=true \
+             and no JWT or sandbox identity could be verified — rejecting (401)"
+        );
+        return Err(json_response(
+            StatusCode::UNAUTHORIZED,
+            &serde_json::json!({
+                "error": "Cooperative intent issuance requires verified identity \
+                          (JWT Bearer or sandbox peer-IP). No verifiable identity \
+                          was presented."
+            }),
+        ));
+    }
+
     tracing::debug!(
         agent = declared_agent_id,
         ?peer_ip,

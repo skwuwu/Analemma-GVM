@@ -12,6 +12,40 @@ use axum::http::{Request, Response, StatusCode};
 use super::responses::{append_proxy_wal_event, error_response};
 use super::AppState;
 
+/// Build the `context` HashMap for a CONNECT WAL event from the
+/// lease's audit metadata. Mirrors what `headers::build_event`
+/// writes for HTTP-path events — `cooperative.intent_id` /
+/// `claim_id` / `payload_context_hash` link the CONNECT event
+/// back to the issuance event by `intent_id`. CONNECT cannot
+/// observe the body, so `observed_payload_hash` is never set.
+fn cooperative_meta_to_context(
+    meta: &gvm_types::CooperativeMeta,
+    pinned: bool,
+) -> std::collections::HashMap<String, serde_json::Value> {
+    let mut ctx = std::collections::HashMap::new();
+    ctx.insert(
+        "cooperative.intent_id".to_string(),
+        serde_json::Value::Number(meta.intent_id.into()),
+    );
+    ctx.insert(
+        "cooperative.claim_id".to_string(),
+        serde_json::Value::Number(meta.claim_id.into()),
+    );
+    if let Some(h) = meta.payload_context_hash {
+        ctx.insert(
+            "cooperative.payload_context_hash".to_string(),
+            serde_json::Value::String(format!("sha256:{}", hex::encode(h))),
+        );
+    }
+    if pinned {
+        ctx.insert(
+            "cooperative.pinned".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    ctx
+}
+
 /// Outcome of the cooperative-lease pre-check on a CONNECT request.
 /// CONNECT has no inner method or path visible to the proxy (both are
 /// encrypted inside the TLS tunnel that follows the CONNECT 200), so
@@ -30,31 +64,39 @@ pub enum ConnectLeaseOutcome {
     /// No `X-GVM-Context-Token` on the CONNECT — fall through to the
     /// existing domain-only SRR path. No claim taken.
     NoToken,
-    /// Lease bound and host matches. The fields populated here flow
-    /// into the WAL audit event so the audit chain captures the
-    /// declared agent and operation. `pinned` is true when the
-    /// lease was accepted across an epoch flip via
-    /// `allow_pinned_lease`. `claim_id` MUST be passed to
-    /// `intent_store.confirm()` after the CONNECT Allow WAL write
-    /// succeeds (or `release()` on WAL failure) — otherwise the
-    /// lease sits in `Claimed` until `CLAIM_TIMEOUT` and is then
-    /// released back to `Active`, defeating single-use.
+    /// Lease bound and host matches. `meta` carries the H6 audit
+    /// metadata (intent_id / claim_id / payload_context_hash) so
+    /// the CONNECT WAL Allow event links back to the matching
+    /// `gvm.intent.lease_issued` event by `intent_id` — auditor
+    /// chain stays intact through the blind-path. `pinned` is true
+    /// when the lease was accepted across an epoch flip via
+    /// `allow_pinned_lease`. `meta.claim_id` MUST be passed to
+    /// `intent_store.confirm()` after the Allow WAL write succeeds
+    /// (or `release()` on WAL failure) — otherwise the lease sits
+    /// in `Claimed` until `CLAIM_TIMEOUT` and is then released back
+    /// to `Active`, defeating single-use.
     Valid {
-        claim_id: u64,
+        meta: gvm_types::CooperativeMeta,
         agent_id: String,
         operation: String,
         pinned: bool,
     },
     /// Token bound but CONNECT host does not match the lease's
-    /// declared host. Always Deny. `claim_id` MUST still be
+    /// declared host. Always Deny. `meta.claim_id` MUST still be
     /// confirmed (= deleted) so the bad lease cannot be re-used
     /// after CLAIM_TIMEOUT.
-    Mismatch { claim_id: u64, reason: String },
+    Mismatch {
+        meta: gvm_types::CooperativeMeta,
+        reason: String,
+    },
     /// Token bound but the lease's `policy_epoch` differs from the
     /// proxy's current integrity ref AND the lease did NOT opt in to
-    /// `allow_pinned_lease`. Always Deny. Same `claim_id` lifecycle
+    /// `allow_pinned_lease`. Always Deny. Same `meta` lifecycle
     /// rule as `Mismatch`.
-    Expired { claim_id: u64, reason: String },
+    Expired {
+        meta: gvm_types::CooperativeMeta,
+        reason: String,
+    },
     /// Token presented but no matching active lease. Re-use, forgery,
     /// or replay. No claim was taken.
     Unbound { reason: String },
@@ -100,7 +142,7 @@ pub fn claim_connect_lease(
     // about to see).
     if !host.eq_ignore_ascii_case(&claim.host) {
         return ConnectLeaseOutcome::Mismatch {
-            claim_id: claim.claim_id,
+            meta: claim.to_audit_meta(None),
             reason: format!(
                 "host mismatch: declared {}, CONNECT target {}",
                 claim.host, host
@@ -122,7 +164,7 @@ pub fn claim_connect_lease(
         }
         crate::intent_store::LeaseEpochCheck::Stale => {
             return ConnectLeaseOutcome::Expired {
-                claim_id: claim.claim_id,
+                meta: claim.to_audit_meta(None),
                 reason: "policy reloaded since CONNECT lease was issued (epoch mismatch); \
                          set allow_pinned_lease=true at issuance to tolerate"
                     .to_string(),
@@ -130,8 +172,11 @@ pub fn claim_connect_lease(
         }
     };
 
+    // CONNECT cannot observe the body — there is no
+    // `observed_payload_hash` to record.
+    let meta = claim.to_audit_meta(None);
     ConnectLeaseOutcome::Valid {
-        claim_id: claim.claim_id,
+        meta,
         agent_id: claim.agent_id,
         operation: claim.operation,
         pinned,
@@ -217,7 +262,7 @@ async fn handle_connect_inner(
                     crate::intent_store::LeaseEpochCheck::PinnedAcrossReload => true,
                     crate::intent_store::LeaseEpochCheck::Stale => {
                         connect_lease = ConnectLeaseOutcome::Expired {
-                            claim_id: claim.claim_id,
+                            meta: claim.to_audit_meta(None),
                             reason: "policy reloaded since sandbox-bound CONNECT lease was \
                                      issued (epoch mismatch); set allow_pinned_lease=true at \
                                      issuance to tolerate"
@@ -230,8 +275,9 @@ async fn handle_connect_inner(
                     }
                 };
                 if matches!(connect_lease, ConnectLeaseOutcome::NoToken) {
+                    let meta = claim.to_audit_meta(None);
                     connect_lease = ConnectLeaseOutcome::Valid {
-                        claim_id: claim.claim_id,
+                        meta,
                         agent_id: claim.agent_id,
                         operation: claim.operation,
                         pinned,
@@ -241,11 +287,11 @@ async fn handle_connect_inner(
         }
     }
 
-    let (lease_agent_id, lease_operation, lease_pinned, lease_active, lease_claim_id) =
+    let (lease_agent_id, lease_operation, lease_pinned, lease_active, lease_meta) =
         match &connect_lease {
             ConnectLeaseOutcome::NoToken => (None, None, false, false, None),
             ConnectLeaseOutcome::Valid {
-                claim_id,
+                meta,
                 agent_id,
                 operation,
                 pinned,
@@ -254,10 +300,10 @@ async fn handle_connect_inner(
                 Some(operation.clone()),
                 *pinned,
                 true,
-                Some(*claim_id),
+                Some(meta.clone()),
             ),
-            ConnectLeaseOutcome::Mismatch { claim_id, reason }
-            | ConnectLeaseOutcome::Expired { claim_id, reason } => {
+            ConnectLeaseOutcome::Mismatch { meta, reason }
+            | ConnectLeaseOutcome::Expired { meta, reason } => {
                 let (source_str, decision_source) = match &connect_lease {
                     ConnectLeaseOutcome::Mismatch { .. } => ("Mismatch", "cooperative.mismatch"),
                     ConnectLeaseOutcome::Expired { .. } => ("Expired", "cooperative.expired"),
@@ -292,7 +338,15 @@ async fn handle_connect_inner(
                         status_code: None,
                     }),
                     resource: ResourceDescriptor::default(),
-                    context: Default::default(),
+                    // CONNECT Deny WAL event carries the lease's
+                    // audit metadata so an external auditor can
+                    // walk lease_issued → CONNECT Deny by the
+                    // same `intent_id` key. Without this, the
+                    // CONNECT Deny floats orphan from the
+                    // issuance chain (the H6 review item). Deny
+                    // outcomes never apply across-reload pinning,
+                    // so `pinned=false`.
+                    context: cooperative_meta_to_context(meta, false),
                     matched_rule_id: Some(decision_source.to_string()),
                     event_hash: None,
                     llm_trace: None,
@@ -315,9 +369,9 @@ async fn handle_connect_inner(
                 // a retry can re-claim and try WAL again. Same
                 // discipline as the HTTP path's Deny arm.
                 if wal_ok {
-                    state.intent_store.confirm(*claim_id);
+                    state.intent_store.confirm(meta.claim_id);
                 } else {
-                    state.intent_store.release(*claim_id);
+                    state.intent_store.release(meta.claim_id);
                 }
                 return Response::builder()
                     .status(StatusCode::FORBIDDEN)
@@ -525,11 +579,11 @@ async fn handle_connect_inner(
             // this, the lease lingers in Claimed, gets auto-released
             // after CLAIM_TIMEOUT, and the same agent could re-bind
             // to a freshly-allowed domain via the same lease.
-            if let Some(cid) = lease_claim_id {
+            if let Some(ref meta) = lease_meta {
                 if wal_ok {
-                    state.intent_store.confirm(cid);
+                    state.intent_store.confirm(meta.claim_id);
                 } else {
-                    state.intent_store.release(cid);
+                    state.intent_store.release(meta.claim_id);
                 }
             }
 
@@ -566,14 +620,19 @@ async fn handle_connect_inner(
             "proxy".to_string(),
         )
     };
-    let mut allow_context: std::collections::HashMap<String, serde_json::Value> =
-        std::collections::HashMap::new();
-    if lease_pinned {
-        allow_context.insert(
-            "cooperative.pinned".to_string(),
-            serde_json::Value::Bool(true),
-        );
-    }
+    // H6 lease metadata: when this CONNECT is bound to a
+    // cooperative lease, write `cooperative.intent_id`,
+    // `cooperative.claim_id`, `cooperative.payload_context_hash`,
+    // and (when applicable) `cooperative.pinned` into the audit
+    // event's context map. CONNECT is the blind-path entry, so
+    // this metadata IS the entire audit-chain link back to
+    // `gvm.intent.lease_issued`. Without it, the CONNECT Allow
+    // event floats orphan from the issuance event.
+    let allow_context = if let Some(ref meta) = lease_meta {
+        cooperative_meta_to_context(meta, lease_pinned)
+    } else {
+        std::collections::HashMap::new()
+    };
     let event = GVMEvent {
         event_id: uuid::Uuid::new_v4().to_string(),
         trace_id: uuid::Uuid::new_v4().to_string(),
@@ -619,11 +678,11 @@ async fn handle_connect_inner(
     // claim sits in `Claimed` until CLAIM_TIMEOUT elapses and is
     // then auto-released back to `Active`, defeating the
     // Phase 3b/3c single-use invariant for CONNECT tunnels.
-    if let Some(cid) = lease_claim_id {
+    if let Some(ref meta) = lease_meta {
         if wal_ok {
-            state.intent_store.confirm(cid);
+            state.intent_store.confirm(meta.claim_id);
         } else {
-            state.intent_store.release(cid);
+            state.intent_store.release(meta.claim_id);
         }
     }
 

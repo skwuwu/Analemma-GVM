@@ -141,6 +141,8 @@ pub async fn test_state() -> (AppState, TestWal) {
         per_sandbox_tls: Arc::new(dashmap::DashMap::new()),
         per_sandbox_metadata: Arc::new(dashmap::DashMap::new()),
         peer_ip_to_sandbox_id: Arc::new(dashmap::DashMap::new()),
+        require_verified_intent_identity: false,
+        allow_audit_mode: gvm_proxy::proxy::AuditMode::Performance,
         policy_link_template: None,
         payload_inspection: false,
         max_body_bytes: 65536,

@@ -324,6 +324,28 @@ pub struct SandboxMetadata {
     pub launched_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Allow-path audit profile.
+///
+/// `Performance` (default) is the legacy behaviour: forward
+/// upstream first, then group-commit the WAL append. Fast, but
+/// when both the primary and emergency WAL writes fail (rare —
+/// disk full, both paths inaccessible) the request reaches
+/// upstream without a durable audit row.
+///
+/// `EvidenceFirst` flips the order: write a `Pending` event to
+/// the WAL durably BEFORE forwarding, reject with `500` if that
+/// write fails. After the upstream responds, append a second
+/// `Confirmed` / `Failed` status event (best-effort). This costs
+/// one extra fsync per Allow request and rejects on WAL outages,
+/// but guarantees "no Allow without audit". Recommended for
+/// regulated deployments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AuditMode {
+    #[default]
+    Performance,
+    EvidenceFirst,
+}
+
 /// Shared application state passed to all handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -459,6 +481,23 @@ pub struct AppState {
     pub payload_inspection: bool,
     /// Maximum body bytes to buffer for payload inspection.
     pub max_body_bytes: usize,
+    /// Cooperative-intent strict-identity guard. When `true`,
+    /// `POST /gvm/intent` MUST resolve the agent_id from a
+    /// JWT-verified subject or a sandbox-peer identity — falling
+    /// through to `body.agent_id` returns `401`. Closes the
+    /// "deployments enable JWT but don't actually require it"
+    /// gap from the regulated-target review. Default `false`
+    /// keeps back-compat with the legacy / orchestrator path
+    /// where the requester carries no identity proof.
+    pub require_verified_intent_identity: bool,
+    /// Audit profile for cooperative-bound Allow decisions. The
+    /// default (`AuditMode::Performance`) forwards upstream first
+    /// and best-effort WAL appends afterward — fast, but can leak
+    /// an audit-less Allow on WAL failure. Operators running under
+    /// regulated audit obligations set this to `AuditMode::EvidenceFirst`
+    /// to require a durable Pending event BEFORE forwarding; WAL
+    /// failure on that path rejects the request with 500.
+    pub allow_audit_mode: AuditMode,
     /// IC-3 pending approval queue.
     /// Key: event_id. Value: oneshot sender for approval decision (true = approve, false = deny).
     /// When IC-3 is triggered, the proxy holds the HTTP response and waits for
@@ -1358,38 +1397,108 @@ pub async fn proxy_handler(
 
     match &classification.decision {
         EnforcementDecision::Allow => {
-            // Forward first, then WAL via group commit. Allow is a governance
-            // decision and MUST be in the Merkle audit chain for compliance
-            // and notarization. Group commit (~2ms batch window) keeps the
-            // overhead negligible against a 50-500ms upstream round-trip.
             let engine_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
-            let mut response = forward_request(&state, request, &target).await;
-
-            event.status = event_status_from_response(&response);
-            if let Err(e) = state.ledger.append_durable(&event).await {
-                // Response has already been returned upstream; we cannot
-                // retroactively reject. Log the WAL miss so operators can
-                // investigate audit gaps.
-                tracing::warn!(
-                    event_id = %event.event_id,
-                    error = %e,
-                    "Allow: WAL durable write failed (primary + emergency both down)"
-                );
+            match state.allow_audit_mode {
+                AuditMode::EvidenceFirst => {
+                    // WAL-first Allow path for regulated deployments.
+                    // Mirrors the IC-2 (Delay) discipline: write a
+                    // Pending row durably BEFORE the upstream sees
+                    // the request. WAL failure → reject 500, release
+                    // claims so a retry can re-acquire them. This
+                    // costs one extra fsync per Allow but guarantees
+                    // "no Allow without audit" — the regulated-target
+                    // review's load-bearing assurance gap.
+                    event.status = EventStatus::Pending;
+                    if let Err(e) = state.ledger.append_durable(&event).await {
+                        tracing::error!(
+                            event_id = %event.event_id,
+                            error = %e,
+                            "Allow (evidence_first): WAL Pending write failed — rejecting request"
+                        );
+                        if let Some(ref claim) = shadow_claim {
+                            state.intent_store.release(claim.claim_id);
+                        }
+                        if let Some(cid) = cooperative_claim_id {
+                            state.intent_store.release(cid);
+                        }
+                        return governance_block_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            GovernanceBlockResponse {
+                                blocked: true,
+                                decision: "InfrastructureFailure".to_string(),
+                                event_id: event.event_id.clone(),
+                                trace_id: event.trace_id.clone(),
+                                operation: event.operation.clone(),
+                                reason: "Audit log unavailable — request rejected for safety \
+                                         (audit.allow_mode = evidence_first)"
+                                    .to_string(),
+                                mode: state.on_block.infrastructure_failure.clone(),
+                                next_action: "Check proxy logs. WAL ledger may be full or \
+                                              the disk may be unavailable."
+                                    .to_string(),
+                                retry_after_secs: None,
+                                rollback_hint: Some(event.trace_id.clone()),
+                                matched_rule_id: None,
+                                policy_link: None,
+                                ic_level: 1,
+                                decision_source: None,
+                            },
+                        );
+                    }
+                    let mut response = forward_request(&state, request, &target).await;
+                    event.status = event_status_from_response(&response);
+                    // Best-effort status update — even if this fails
+                    // we already have the Pending row, so the audit
+                    // chain shows "Allowed, response status unknown"
+                    // rather than no record at all.
+                    let _ = state.ledger.append_durable(&event).await;
+                    if let Some(ref claim) = shadow_claim {
+                        state.intent_store.confirm(claim.claim_id);
+                    }
+                    if let Some(cid) = cooperative_claim_id {
+                        state.intent_store.confirm(cid);
+                    }
+                    inject_gvm_response_headers(
+                        response.headers_mut(),
+                        &event,
+                        &classification,
+                        engine_ms,
+                        0,
+                    );
+                    response
+                }
+                AuditMode::Performance => {
+                    // Legacy: forward first, then WAL via group commit. Allow
+                    // is a governance decision and MUST be in the Merkle audit
+                    // chain for compliance and notarization. Group commit
+                    // (~2ms batch window) keeps overhead negligible against
+                    // a 50-500ms upstream round-trip. WAL failure leaves a
+                    // log line; the request has already shipped.
+                    let mut response = forward_request(&state, request, &target).await;
+                    event.status = event_status_from_response(&response);
+                    if let Err(e) = state.ledger.append_durable(&event).await {
+                        tracing::warn!(
+                            event_id = %event.event_id,
+                            error = %e,
+                            "Allow: WAL durable write failed (primary + emergency both down)"
+                        );
+                    }
+                    if let Some(ref claim) = shadow_claim {
+                        state.intent_store.confirm(claim.claim_id);
+                    }
+                    if let Some(cid) = cooperative_claim_id {
+                        state.intent_store.confirm(cid);
+                    }
+                    inject_gvm_response_headers(
+                        response.headers_mut(),
+                        &event,
+                        &classification,
+                        engine_ms,
+                        0,
+                    );
+                    response
+                }
             }
-            if let Some(ref claim) = shadow_claim {
-                state.intent_store.confirm(claim.claim_id);
-            }
-            if let Some(cid) = cooperative_claim_id {
-                state.intent_store.confirm(cid);
-            }
-            inject_gvm_response_headers(
-                response.headers_mut(),
-                &event,
-                &classification,
-                engine_ms,
-                0,
-            );
-            response
         }
 
         EnforcementDecision::Delay { milliseconds } => {

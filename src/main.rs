@@ -610,6 +610,8 @@ async fn main() {
         per_sandbox_tls: Arc::new(dashmap::DashMap::new()),
         per_sandbox_metadata: Arc::new(dashmap::DashMap::new()),
         peer_ip_to_sandbox_id: Arc::new(dashmap::DashMap::new()),
+        require_verified_intent_identity: false,
+        allow_audit_mode: gvm_proxy::proxy::AuditMode::Performance,
         policy_link_template: config.enforcement.policy_link_template.clone(),
         payload_inspection: config.srr.payload_inspection,
         max_body_bytes: config.srr.max_body_bytes,

@@ -284,7 +284,9 @@ lease for Phase 2 to compare against.
   `decision_source = cooperative.declared_only`. Raw payload is
   NOT in the event.
 - Preflight Deny short-circuits: no token, no intent_id, no
-  lease_issued event.
+  `lease_issued` event. A separate `gvm.intent.lease_denied`
+  WAL event IS emitted (shipped v0.6.1); see "Preflight Deny
+  audit semantics" below for details.
 - `DecisionSource` enum added to gvm-types; existing
   `decision_source: String` field accepts the new dotted strings.
 
@@ -588,27 +590,34 @@ tests are cross-platform and pin the decision logic.
 
 ---
 
-## Why deny is logged but issuance is short-circuited
+## Preflight Deny audit semantics
 
-When the preflight SRR returns Deny:
+When the preflight SRR returns Deny on `POST /gvm/intent`:
 
-- **No `context_token` is issued.** Returning a token alongside a
-  Deny would be a footgun — orchestrators might inadvertently
+- **No `context_token` is issued.** Returning a token alongside
+  a Deny would be a footgun — orchestrators might inadvertently
   re-use it.
-- **No `intent_id` is allocated.** A Denied lease should not occupy
-  the intent store cap.
+- **No `intent_id` is allocated.** A Denied lease should not
+  occupy the intent store cap.
 - **No `gvm.intent.lease_issued` WAL event.** That event's
   semantics are "a lease exists in the system."
+- **A `gvm.intent.lease_denied` WAL event IS emitted** (shipped
+  in v0.6.1 per the H7 follow-up). The event records `agent_id`,
+  `decision = "Deny"`, the matched rule, the deny reason, and
+  the `payload_context_hash` — NOT the raw payload. Attempted
+  privilege-escalation patterns (agent declares a forbidden
+  action on a deny-listed rule) are reconstructible from the
+  Merkle chain via `gvm audit export | jq 'select(.operation
+  == "gvm.intent.lease_denied")'`.
 
-A separate audit-only path could record `gvm.intent.lease_denied`
-to surface attempted privilege escalations. **Phase 1 does not
-emit this event** to keep the first cut surface small. Operators
-who need denial visibility today should subscribe to the SRR
-event stream (`GET /gvm/events?decision=Deny`), which captures
-every Deny including the SRR rule that fired.
-
-This is a deferred decision; if real demand surfaces, the
-`lease_denied` event lands trivially in the existing handler.
+When the durable WAL write for `lease_denied` itself fails, the
+proxy logs a warning and still returns the Deny response to the
+caller. The Deny decision is the load-bearing answer; the audit
+row is best-effort on this specific path. A future
+`audit.deny_mode = "evidence_first"` symmetric to
+`audit.allow_mode` could promote this to 500 on WAL failure for
+regulated deployments that need a record of every refused
+issuance.
 
 ---
 
