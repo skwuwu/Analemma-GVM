@@ -28,27 +28,35 @@ use super::AppState;
 /// sees the body so cross-check is not possible.
 pub enum ConnectLeaseOutcome {
     /// No `X-GVM-Context-Token` on the CONNECT — fall through to the
-    /// existing domain-only SRR path.
+    /// existing domain-only SRR path. No claim taken.
     NoToken,
     /// Lease bound and host matches. The fields populated here flow
     /// into the WAL audit event so the audit chain captures the
     /// declared agent and operation. `pinned` is true when the
     /// lease was accepted across an epoch flip via
-    /// `allow_pinned_lease`.
+    /// `allow_pinned_lease`. `claim_id` MUST be passed to
+    /// `intent_store.confirm()` after the CONNECT Allow WAL write
+    /// succeeds (or `release()` on WAL failure) — otherwise the
+    /// lease sits in `Claimed` until `CLAIM_TIMEOUT` and is then
+    /// released back to `Active`, defeating single-use.
     Valid {
+        claim_id: u64,
         agent_id: String,
         operation: String,
         pinned: bool,
     },
     /// Token bound but CONNECT host does not match the lease's
-    /// declared host. Always Deny.
-    Mismatch { reason: String },
+    /// declared host. Always Deny. `claim_id` MUST still be
+    /// confirmed (= deleted) so the bad lease cannot be re-used
+    /// after CLAIM_TIMEOUT.
+    Mismatch { claim_id: u64, reason: String },
     /// Token bound but the lease's `policy_epoch` differs from the
     /// proxy's current integrity ref AND the lease did NOT opt in to
-    /// `allow_pinned_lease`. Always Deny.
-    Expired { reason: String },
+    /// `allow_pinned_lease`. Always Deny. Same `claim_id` lifecycle
+    /// rule as `Mismatch`.
+    Expired { claim_id: u64, reason: String },
     /// Token presented but no matching active lease. Re-use, forgery,
-    /// or replay. Always Deny.
+    /// or replay. No claim was taken.
     Unbound { reason: String },
 }
 
@@ -92,6 +100,7 @@ pub fn claim_connect_lease(
     // about to see).
     if !host.eq_ignore_ascii_case(&claim.host) {
         return ConnectLeaseOutcome::Mismatch {
+            claim_id: claim.claim_id,
             reason: format!(
                 "host mismatch: declared {}, CONNECT target {}",
                 claim.host, host
@@ -114,6 +123,7 @@ pub fn claim_connect_lease(
                 true
             } else {
                 return ConnectLeaseOutcome::Expired {
+                    claim_id: claim.claim_id,
                     reason: format!(
                         "policy reloaded since CONNECT lease was issued (epoch mismatch); \
                          set allow_pinned_lease=true at issuance to tolerate"
@@ -128,6 +138,7 @@ pub fn claim_connect_lease(
     };
 
     ConnectLeaseOutcome::Valid {
+        claim_id: claim.claim_id,
         agent_id: claim.agent_id,
         operation: claim.operation,
         pinned,
@@ -214,6 +225,7 @@ async fn handle_connect_inner(
                             true
                         } else {
                             connect_lease = ConnectLeaseOutcome::Expired {
+                                claim_id: claim.claim_id,
                                 reason: format!(
                                     "policy reloaded since sandbox-bound CONNECT lease was \
                                      issued (epoch mismatch); set allow_pinned_lease=true at \
@@ -228,6 +240,7 @@ async fn handle_connect_inner(
                 };
                 if matches!(connect_lease, ConnectLeaseOutcome::NoToken) {
                     connect_lease = ConnectLeaseOutcome::Valid {
+                        claim_id: claim.claim_id,
                         agent_id: claim.agent_id,
                         operation: claim.operation,
                         pinned,
@@ -237,84 +250,153 @@ async fn handle_connect_inner(
         }
     }
 
-    let (lease_agent_id, lease_operation, lease_pinned, lease_active) = match &connect_lease {
-        ConnectLeaseOutcome::NoToken => (None, None, false, false),
-        ConnectLeaseOutcome::Valid {
-            agent_id,
-            operation,
-            pinned,
-        } => (
-            Some(agent_id.clone()),
-            Some(operation.clone()),
-            *pinned,
-            true,
-        ),
-        ConnectLeaseOutcome::Mismatch { reason }
-        | ConnectLeaseOutcome::Expired { reason }
-        | ConnectLeaseOutcome::Unbound { reason } => {
-            let (source_str, decision_source) = match &connect_lease {
-                ConnectLeaseOutcome::Mismatch { .. } => ("Mismatch", "cooperative.mismatch"),
-                ConnectLeaseOutcome::Expired { .. } => ("Expired", "cooperative.expired"),
-                ConnectLeaseOutcome::Unbound { .. } => ("Unbound", "cooperative.unbound"),
-                _ => unreachable!(),
-            };
-            let peer_ip_for_anchor = request.extensions().get::<std::net::IpAddr>().copied();
-            let (anchor_agent_id, anchor_parent_event_id) =
-                match state.resolve_sandbox_anchor(peer_ip_for_anchor) {
-                    Some((agent, launch)) => (agent, Some(launch)),
-                    None => ("unknown".to_string(), None),
+    let (lease_agent_id, lease_operation, lease_pinned, lease_active, lease_claim_id) =
+        match &connect_lease {
+            ConnectLeaseOutcome::NoToken => (None, None, false, false, None),
+            ConnectLeaseOutcome::Valid {
+                claim_id,
+                agent_id,
+                operation,
+                pinned,
+            } => (
+                Some(agent_id.clone()),
+                Some(operation.clone()),
+                *pinned,
+                true,
+                Some(*claim_id),
+            ),
+            ConnectLeaseOutcome::Mismatch { claim_id, reason }
+            | ConnectLeaseOutcome::Expired { claim_id, reason } => {
+                let (source_str, decision_source) = match &connect_lease {
+                    ConnectLeaseOutcome::Mismatch { .. } => ("Mismatch", "cooperative.mismatch"),
+                    ConnectLeaseOutcome::Expired { .. } => ("Expired", "cooperative.expired"),
+                    _ => unreachable!(),
                 };
-            tracing::warn!(host = %host, source = source_str, reason = %reason,
-                "CONNECT cooperative lease rejected — denying tunnel");
-            let event = GVMEvent {
-                event_id: uuid::Uuid::new_v4().to_string(),
-                trace_id: uuid::Uuid::new_v4().to_string(),
-                agent_id: anchor_agent_id.clone(),
-                token_id: None,
-                operation: format!("connect:{}", host),
-                decision: "Deny".to_string(),
-                decision_source: decision_source.to_string(),
-                status: EventStatus::Failed {
-                    reason: reason.clone(),
-                },
-                enforcement_point: "proxy-cooperative".to_string(),
-                timestamp: chrono::Utc::now(),
-                payload: PayloadDescriptor::default(),
-                transport: Some(TransportInfo {
-                    method: "CONNECT".to_string(),
-                    host: host.to_string(),
-                    path: format!(":{}", port),
-                    status_code: None,
-                }),
-                resource: ResourceDescriptor::default(),
-                context: Default::default(),
-                matched_rule_id: Some(decision_source.to_string()),
-                event_hash: None,
-                llm_trace: None,
-                default_caution: false,
-                config_integrity_ref: state.current_integrity_ref(),
-                operation_descriptor: Some(crate::operation::connect(host)),
-                tenant_id: None,
-                parent_event_id: anchor_parent_event_id,
-                session_id: String::new(),
-            };
-            if let Err(e) = state.ledger.append_durable(&event).await {
-                tracing::warn!(
-                    event_id = %event.event_id,
-                    error = %e,
-                    "CONNECT cooperative Deny: WAL durable write failed"
-                );
+                let peer_ip_for_anchor = request.extensions().get::<std::net::IpAddr>().copied();
+                let (anchor_agent_id, anchor_parent_event_id) =
+                    match state.resolve_sandbox_anchor(peer_ip_for_anchor) {
+                        Some((agent, launch)) => (agent, Some(launch)),
+                        None => ("unknown".to_string(), None),
+                    };
+                tracing::warn!(host = %host, source = source_str, reason = %reason,
+                    "CONNECT cooperative lease rejected — denying tunnel");
+                let event = GVMEvent {
+                    event_id: uuid::Uuid::new_v4().to_string(),
+                    trace_id: uuid::Uuid::new_v4().to_string(),
+                    agent_id: anchor_agent_id.clone(),
+                    token_id: None,
+                    operation: format!("connect:{}", host),
+                    decision: "Deny".to_string(),
+                    decision_source: decision_source.to_string(),
+                    status: EventStatus::Failed {
+                        reason: reason.clone(),
+                    },
+                    enforcement_point: "proxy-cooperative".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    payload: PayloadDescriptor::default(),
+                    transport: Some(TransportInfo {
+                        method: "CONNECT".to_string(),
+                        host: host.to_string(),
+                        path: format!(":{}", port),
+                        status_code: None,
+                    }),
+                    resource: ResourceDescriptor::default(),
+                    context: Default::default(),
+                    matched_rule_id: Some(decision_source.to_string()),
+                    event_hash: None,
+                    llm_trace: None,
+                    default_caution: false,
+                    config_integrity_ref: state.current_integrity_ref(),
+                    operation_descriptor: Some(crate::operation::connect(host)),
+                    tenant_id: None,
+                    parent_event_id: anchor_parent_event_id,
+                    session_id: String::new(),
+                };
+                let wal_ok = state.ledger.append_durable(&event).await.is_ok();
+                if !wal_ok {
+                    tracing::warn!(
+                        event_id = %event.event_id,
+                        "CONNECT cooperative Deny: WAL durable write failed"
+                    );
+                }
+                // Confirm (= delete) on WAL ok so the lease is
+                // single-use even on Deny; release on WAL failure so
+                // a retry can re-claim and try WAL again. Same
+                // discipline as the HTTP path's Deny arm.
+                if wal_ok {
+                    state.intent_store.confirm(*claim_id);
+                } else {
+                    state.intent_store.release(*claim_id);
+                }
+                return Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header("X-GVM-Decision", "Deny")
+                    .header("X-GVM-Decision-Source", decision_source)
+                    .body(Body::from(format!("CONNECT denied: {}", reason)))
+                    .unwrap_or_else(|_| {
+                        error_response(StatusCode::FORBIDDEN, "CONNECT cooperative deny")
+                    });
             }
-            return Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .header("X-GVM-Decision", "Deny")
-                .header("X-GVM-Decision-Source", decision_source)
-                .body(Body::from(format!("CONNECT denied: {}", reason)))
-                .unwrap_or_else(|_| {
-                    error_response(StatusCode::FORBIDDEN, "CONNECT cooperative deny")
-                });
-        }
-    };
+            ConnectLeaseOutcome::Unbound { reason } => {
+                let peer_ip_for_anchor = request.extensions().get::<std::net::IpAddr>().copied();
+                let (anchor_agent_id, anchor_parent_event_id) =
+                    match state.resolve_sandbox_anchor(peer_ip_for_anchor) {
+                        Some((agent, launch)) => (agent, Some(launch)),
+                        None => ("unknown".to_string(), None),
+                    };
+                tracing::warn!(host = %host, source = "Unbound", reason = %reason,
+                    "CONNECT cooperative lease rejected — denying tunnel");
+                let event = GVMEvent {
+                    event_id: uuid::Uuid::new_v4().to_string(),
+                    trace_id: uuid::Uuid::new_v4().to_string(),
+                    agent_id: anchor_agent_id.clone(),
+                    token_id: None,
+                    operation: format!("connect:{}", host),
+                    decision: "Deny".to_string(),
+                    decision_source: "cooperative.unbound".to_string(),
+                    status: EventStatus::Failed {
+                        reason: reason.clone(),
+                    },
+                    enforcement_point: "proxy-cooperative".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    payload: PayloadDescriptor::default(),
+                    transport: Some(TransportInfo {
+                        method: "CONNECT".to_string(),
+                        host: host.to_string(),
+                        path: format!(":{}", port),
+                        status_code: None,
+                    }),
+                    resource: ResourceDescriptor::default(),
+                    context: Default::default(),
+                    matched_rule_id: Some("cooperative.unbound".to_string()),
+                    event_hash: None,
+                    llm_trace: None,
+                    default_caution: false,
+                    config_integrity_ref: state.current_integrity_ref(),
+                    operation_descriptor: Some(crate::operation::connect(host)),
+                    tenant_id: None,
+                    parent_event_id: anchor_parent_event_id,
+                    session_id: String::new(),
+                };
+                if let Err(e) = state.ledger.append_durable(&event).await {
+                    tracing::warn!(
+                        event_id = %event.event_id,
+                        error = %e,
+                        "CONNECT cooperative Deny: WAL durable write failed"
+                    );
+                }
+                // Unbound: no claim was taken (lookup returned None),
+                // so no confirm/release work.
+                return Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header("X-GVM-Decision", "Deny")
+                    .header("X-GVM-Decision-Source", "cooperative.unbound")
+                    .body(Body::from(format!("CONNECT denied: {}", reason)))
+                    .unwrap_or_else(|_| {
+                        error_response(StatusCode::FORBIDDEN, "CONNECT cooperative deny")
+                    });
+            }
+        };
 
     // Domain-level policy: CONNECT only cares "is this domain allowed?"
     // If ANY rule exists for this host (regardless of method/path), Allow the tunnel.
@@ -438,12 +520,26 @@ async fn handle_connect_inner(
             // audited. (Pre-existing bug: this path previously used
             // append_async which did not write to WAL at all, so Deny
             // decisions for HTTPS tunnels were silently lost.)
-            if let Err(e) = state.ledger.append_durable(&event).await {
+            let wal_ok = state.ledger.append_durable(&event).await.is_ok();
+            if !wal_ok {
                 tracing::warn!(
                     event_id = %event.event_id,
-                    error = %e,
                     "CONNECT Deny: WAL durable write failed"
                 );
+            }
+
+            // If a cooperative lease was bound at the top of this
+            // function but SRR then denied the domain, confirm /
+            // release the lease so single-use still holds. Without
+            // this, the lease lingers in Claimed, gets auto-released
+            // after CLAIM_TIMEOUT, and the same agent could re-bind
+            // to a freshly-allowed domain via the same lease.
+            if let Some(cid) = lease_claim_id {
+                if wal_ok {
+                    state.intent_store.confirm(cid);
+                } else {
+                    state.intent_store.release(cid);
+                }
             }
 
             return error_response(
@@ -517,12 +613,27 @@ async fn handle_connect_inner(
         parent_event_id: anchor_parent_event_id.clone(),
         session_id: String::new(),
     };
-    if let Err(e) = state.ledger.append_durable(&event).await {
+    let wal_ok = state.ledger.append_durable(&event).await.is_ok();
+    if !wal_ok {
         tracing::warn!(
             event_id = %event.event_id,
-            error = %e,
             "CONNECT Allow: WAL durable write failed"
         );
+    }
+
+    // Confirm or release the cooperative claim. WAL ok → confirm
+    // (single-use semantics — same token / sandbox-binding cannot
+    // re-claim after CLAIM_TIMEOUT). WAL fail → release so a retry
+    // can re-claim and try WAL again. Without this branch the
+    // claim sits in `Claimed` until CLAIM_TIMEOUT elapses and is
+    // then auto-released back to `Active`, defeating the
+    // Phase 3b/3c single-use invariant for CONNECT tunnels.
+    if let Some(cid) = lease_claim_id {
+        if wal_ok {
+            state.intent_store.confirm(cid);
+        } else {
+            state.intent_store.release(cid);
+        }
     }
 
     // MITM TLS inspection on CONNECT tunnel.

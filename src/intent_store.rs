@@ -968,6 +968,23 @@ impl IntentStore {
         let active = store.intents.values().filter(|i| i.is_active()).count();
         (total, active)
     }
+
+    /// Count of intents currently held by the store, regardless of
+    /// `Active` / `Claimed` state. Used by the lease-lifecycle
+    /// regression test to assert that `confirm()` actually removed
+    /// the intent — `stats()`'s "active" count excludes Claimed,
+    /// which would mask a confirm-not-called regression where the
+    /// lease lingers in Claimed and would auto-release after
+    /// `CLAIM_TIMEOUT`. `active_count` returns the raw store size:
+    /// after a confirmed claim the lease is gone (count drops),
+    /// after release it's still there (count unchanged).
+    pub fn active_count(&self) -> usize {
+        let store = match self.inner.lock() {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
+        store.intents.len()
+    }
 }
 
 #[cfg(test)]

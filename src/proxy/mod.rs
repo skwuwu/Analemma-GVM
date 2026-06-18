@@ -863,6 +863,17 @@ pub async fn proxy_handler(
         other => other,
     };
 
+    // Lift the lease's claim_id (if any was taken) BEFORE the match
+    // below moves `cooperative_outcome`. Each EnforcementDecision arm
+    // pairs this with `confirm()` (success / Deny + WAL ok) or
+    // `release()` (WAL failure) — same lifecycle the existing
+    // `shadow_claim` follows. Without this, every cooperative claim
+    // sits in `Claimed` state until `CLAIM_TIMEOUT` (10s) elapses
+    // and is then released back to `Active`, defeating the
+    // single-use invariant the Phase 2 / 3a / 3b tests pin (those
+    // tests all complete inside 10s, so they miss the regression).
+    let cooperative_claim_id: Option<u64> = cooperative_outcome.claim_id();
+
     // ── Step 2: Classify (IC determination) via SRR + cooperative fold-in ──
     //
     // Each Cooperative* arm picks its body source (observed vs declared)
@@ -871,7 +882,10 @@ pub async fn proxy_handler(
     // because the closure form pulls the std::sync::RwLockReadGuard
     // into the captured set, breaking the Handler's Send bound.
     let (classification, is_default_caution) = match cooperative_outcome {
-        CooperativeOutcome::CrossChecked { pinned } => {
+        CooperativeOutcome::CrossChecked {
+            claim_id: _,
+            pinned,
+        } => {
             let srr_result = {
                 let srr = match state.srr.read() {
                     Ok(g) => g,
@@ -909,6 +923,7 @@ pub async fn proxy_handler(
             )
         }
         CooperativeOutcome::DeclaredOnly {
+            claim_id: _,
             declared_body,
             pinned,
         } => {
@@ -948,7 +963,10 @@ pub async fn proxy_handler(
                 srr_result.is_catch_all,
             )
         }
-        CooperativeOutcome::Mismatch { reason } => (
+        CooperativeOutcome::Mismatch {
+            claim_id: _,
+            reason,
+        } => (
             Classification {
                 decision: gvm_types::EnforcementDecision::Deny { reason },
                 source: ClassificationSource::CooperativeMismatch,
@@ -960,7 +978,10 @@ pub async fn proxy_handler(
             },
             false,
         ),
-        CooperativeOutcome::Expired { reason } => (
+        CooperativeOutcome::Expired {
+            claim_id: _,
+            reason,
+        } => (
             Classification {
                 decision: gvm_types::EnforcementDecision::Deny { reason },
                 source: ClassificationSource::CooperativeExpired,
@@ -1123,6 +1144,9 @@ pub async fn proxy_handler(
                 // Release claimed intent — WAL unavailable, no audit possible
                 if let Some(ref claim) = shadow_claim {
                     state.intent_store.release(claim.claim_id);
+                }
+                if let Some(cid) = cooperative_claim_id {
+                    state.intent_store.release(cid);
                 }
                 tracing::error!(
                     consecutive_failures = wal_failures,
@@ -1295,6 +1319,9 @@ pub async fn proxy_handler(
             if let Some(ref claim) = shadow_claim {
                 state.intent_store.confirm(claim.claim_id);
             }
+            if let Some(cid) = cooperative_claim_id {
+                state.intent_store.confirm(cid);
+            }
             inject_gvm_response_headers(
                 response.headers_mut(),
                 &event,
@@ -1313,6 +1340,9 @@ pub async fn proxy_handler(
                 // Release claimed intent — WAL failed, intent must be restorable
                 if let Some(ref claim) = shadow_claim {
                     state.intent_store.release(claim.claim_id);
+                }
+                if let Some(cid) = cooperative_claim_id {
+                    state.intent_store.release(cid);
                 }
                 return governance_block_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1364,6 +1394,9 @@ pub async fn proxy_handler(
             if let Some(ref claim) = shadow_claim {
                 state.intent_store.confirm(claim.claim_id);
             }
+            if let Some(cid) = cooperative_claim_id {
+                state.intent_store.confirm(cid);
+            }
             inject_gvm_response_headers(
                 response.headers_mut(),
                 &event,
@@ -1384,8 +1417,16 @@ pub async fn proxy_handler(
                 if let Some(ref claim) = shadow_claim {
                     state.intent_store.release(claim.claim_id);
                 }
-            } else if let Some(ref claim) = shadow_claim {
-                state.intent_store.confirm(claim.claim_id);
+                if let Some(cid) = cooperative_claim_id {
+                    state.intent_store.release(cid);
+                }
+            } else {
+                if let Some(ref claim) = shadow_claim {
+                    state.intent_store.confirm(claim.claim_id);
+                }
+                if let Some(cid) = cooperative_claim_id {
+                    state.intent_store.confirm(cid);
+                }
             }
 
             let event_id = event.event_id.clone();
@@ -1552,8 +1593,22 @@ pub async fn proxy_handler(
                 if let Some(ref claim) = shadow_claim {
                     state.intent_store.release(claim.claim_id);
                 }
-            } else if let Some(ref claim) = shadow_claim {
-                state.intent_store.confirm(claim.claim_id);
+                if let Some(cid) = cooperative_claim_id {
+                    state.intent_store.release(cid);
+                }
+            } else {
+                if let Some(ref claim) = shadow_claim {
+                    state.intent_store.confirm(claim.claim_id);
+                }
+                // Confirm (= delete) the cooperative lease even on
+                // Deny. A consumed lease is consumed regardless of
+                // outcome: a Mismatch / Expired Deny must not leave
+                // the lease alive for a second attempt with the same
+                // token after `CLAIM_TIMEOUT`. This is the load-
+                // bearing single-use invariant.
+                if let Some(cid) = cooperative_claim_id {
+                    state.intent_store.confirm(cid);
+                }
             }
 
             tracing::warn!(
@@ -1594,6 +1649,9 @@ pub async fn proxy_handler(
                 if let Some(ref claim) = shadow_claim {
                     state.intent_store.release(claim.claim_id);
                 }
+                if let Some(cid) = cooperative_claim_id {
+                    state.intent_store.release(cid);
+                }
             }
 
             let engine_ms = engine_start.elapsed().as_secs_f64() * 1000.0;
@@ -1604,6 +1662,9 @@ pub async fn proxy_handler(
             // Confirm after second WAL write (best-effort status update)
             if let Some(ref claim) = shadow_claim {
                 state.intent_store.confirm(claim.claim_id);
+            }
+            if let Some(cid) = cooperative_claim_id {
+                state.intent_store.confirm(cid);
             }
 
             if matches!(alert_level, AlertLevel::Critical) {
@@ -1642,31 +1703,60 @@ pub async fn proxy_handler(
 /// presented" pass-through for the standard SRR path.
 enum CooperativeOutcome {
     /// No `X-GVM-Context-Token` header — proceed with the standard
-    /// network-observed enforcement path.
+    /// network-observed enforcement path. No claim taken; no
+    /// confirm/release work for the caller.
     NoToken,
     /// Token claimed AND observed body matched the declared
     /// `payload_hash`. Run SRR on the observed body; tag the
     /// classification as cross-checked. `pinned` is true when the
     /// lease was accepted under `allow_pinned_lease` despite an
-    /// epoch mismatch (recorded for audit; does not change SRR
-    /// evaluation).
-    CrossChecked { pinned: bool },
+    /// epoch mismatch. `claim_id` MUST be passed to
+    /// `intent_store.confirm()` after a successful WAL write, or
+    /// `release()` on WAL failure — otherwise the lease sits in
+    /// `Claimed` until `CLAIM_TIMEOUT` and is then released back
+    /// to `Active`, defeating single-use.
+    CrossChecked { claim_id: u64, pinned: bool },
     /// Token claimed but no observed body (MITM-blind, no payload
     /// inspection enabled, or oversized buffer). Run SRR on the
-    /// declared `payload_context` instead. `pinned` carries the
-    /// same meaning as on `CrossChecked`.
-    DeclaredOnly { declared_body: Bytes, pinned: bool },
+    /// declared `payload_context` instead. Same `claim_id` lifecycle
+    /// rule as `CrossChecked`.
+    DeclaredOnly {
+        claim_id: u64,
+        declared_body: Bytes,
+        pinned: bool,
+    },
     /// Token claimed but observed body's hash did NOT match the
-    /// declared `payload_hash`. Always Deny.
-    Mismatch { reason: String },
+    /// declared `payload_hash`. Always Deny. `claim_id` MUST still
+    /// be confirmed (= deleted) so the bad lease cannot be re-used
+    /// after CLAIM_TIMEOUT — a bad claim is still a claim.
+    Mismatch { claim_id: u64, reason: String },
     /// Token claimed but the lease's `policy_epoch` differs from
     /// the current integrity ref (the proxy reloaded since the
     /// lease was issued) and the lease did NOT opt in via
-    /// `allow_pinned_lease`. Always Deny.
-    Expired { reason: String },
+    /// `allow_pinned_lease`. Always Deny. Same `claim_id` lifecycle
+    /// rule as `Mismatch`.
+    Expired { claim_id: u64, reason: String },
     /// Token presented but no matching active lease found in the
-    /// store. Re-use, forgery, or replay. Always Deny.
+    /// store. Re-use, forgery, or replay. No claim was taken
+    /// (lookup returned None), so no confirm/release work.
     Unbound { reason: String },
+}
+
+impl CooperativeOutcome {
+    /// Extract the lease's `claim_id` when one was taken. Returns
+    /// `None` for `NoToken` (no lookup) and `Unbound` (lookup
+    /// returned None). For every other variant the caller MUST
+    /// pair this with `confirm()` (on Allow/Delay/Deny success) or
+    /// `release()` (on WAL failure) — see the variant docs.
+    fn claim_id(&self) -> Option<u64> {
+        match self {
+            CooperativeOutcome::CrossChecked { claim_id, .. }
+            | CooperativeOutcome::DeclaredOnly { claim_id, .. }
+            | CooperativeOutcome::Mismatch { claim_id, .. }
+            | CooperativeOutcome::Expired { claim_id, .. } => Some(*claim_id),
+            CooperativeOutcome::NoToken | CooperativeOutcome::Unbound { .. } => None,
+        }
+    }
 }
 
 /// Pull `X-GVM-Context-Token` off the request, hash it, claim the
@@ -1721,6 +1811,7 @@ fn extract_and_claim_lease(
     let request_method = request.method().as_str();
     if !request_method.eq_ignore_ascii_case(&claim.method) {
         return CooperativeOutcome::Mismatch {
+            claim_id: claim.claim_id,
             reason: format!(
                 "method mismatch: declared {}, observed {}",
                 claim.method, request_method
@@ -1729,6 +1820,7 @@ fn extract_and_claim_lease(
     }
     if !target.host.eq_ignore_ascii_case(&claim.host) {
         return CooperativeOutcome::Mismatch {
+            claim_id: claim.claim_id,
             reason: format!(
                 "host mismatch: declared {}, observed {}",
                 claim.host, target.host
@@ -1737,6 +1829,7 @@ fn extract_and_claim_lease(
     }
     if !target.path.starts_with(&claim.path_prefix) {
         return CooperativeOutcome::Mismatch {
+            claim_id: claim.claim_id,
             reason: format!(
                 "path mismatch: declared prefix {}, observed {}",
                 claim.path_prefix, target.path
@@ -1764,6 +1857,7 @@ fn extract_and_claim_lease(
                 true
             } else {
                 return CooperativeOutcome::Expired {
+                    claim_id: claim.claim_id,
                     reason: format!(
                         "policy reloaded since lease was issued (epoch mismatch); \
                          set allow_pinned_lease=true at issuance to tolerate"
@@ -1794,10 +1888,14 @@ fn extract_and_claim_lease(
     if let (Some(declared_hash), Some(observed_hash)) = (claim.payload_hash, observed_body_hash) {
         if declared_hash != observed_hash {
             return CooperativeOutcome::Mismatch {
+                claim_id: claim.claim_id,
                 reason: "observed body hash does not match declared payload_hash".to_string(),
             };
         }
-        return CooperativeOutcome::CrossChecked { pinned };
+        return CooperativeOutcome::CrossChecked {
+            claim_id: claim.claim_id,
+            pinned,
+        };
     }
 
     // Step 5: declared-only path. Serialize the projected
@@ -1813,6 +1911,7 @@ fn extract_and_claim_lease(
         None => Bytes::new(),
     };
     CooperativeOutcome::DeclaredOnly {
+        claim_id: claim.claim_id,
         declared_body,
         pinned,
     }
@@ -1876,6 +1975,7 @@ fn try_sandbox_binding(
                 true
             } else {
                 return CooperativeOutcome::Expired {
+                    claim_id: claim.claim_id,
                     reason: format!(
                         "policy reloaded since sandbox-bound lease was issued (epoch mismatch); \
                          set allow_pinned_lease=true at issuance to tolerate"
@@ -1898,12 +1998,16 @@ fn try_sandbox_binding(
     if let (Some(declared_hash), Some(observed_hash)) = (claim.payload_hash, observed_body_hash) {
         if declared_hash != observed_hash {
             return CooperativeOutcome::Mismatch {
+                claim_id: claim.claim_id,
                 reason: "observed body hash does not match declared payload_hash \
                          (sandbox-bound lease)"
                     .to_string(),
             };
         }
-        return CooperativeOutcome::CrossChecked { pinned };
+        return CooperativeOutcome::CrossChecked {
+            claim_id: claim.claim_id,
+            pinned,
+        };
     }
 
     let declared_body = match claim
@@ -1915,6 +2019,7 @@ fn try_sandbox_binding(
         None => Bytes::new(),
     };
     CooperativeOutcome::DeclaredOnly {
+        claim_id: claim.claim_id,
         declared_body,
         pinned,
     }

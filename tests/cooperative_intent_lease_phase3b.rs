@@ -114,7 +114,7 @@ async fn connect_with_host_mismatch_returns_mismatch() {
     // Lease was for api.bank.com; CONNECT target is api.evil.com.
     let outcome = claim_connect_lease(&state, &headers_with_token(&token), "api.evil.com");
     match outcome {
-        ConnectLeaseOutcome::Mismatch { reason } => {
+        ConnectLeaseOutcome::Mismatch { reason, .. } => {
             assert!(
                 reason.contains("host mismatch")
                     && reason.contains("api.bank.com")
@@ -141,6 +141,7 @@ async fn connect_with_matching_host_returns_valid() {
             agent_id,
             operation,
             pinned,
+            ..
         } => {
             assert_eq!(agent_id, "agent-phase3b");
             assert_eq!(operation, "bank.transfer.create");
@@ -189,7 +190,7 @@ async fn connect_epoch_mismatch_without_opt_in_returns_expired() {
     *state.active_integrity_ref.write().unwrap() = Some("epoch-B".to_string());
     let outcome = claim_connect_lease(&state, &headers_with_token(&token), "api.bank.com");
     match outcome {
-        ConnectLeaseOutcome::Expired { reason } => {
+        ConnectLeaseOutcome::Expired { reason, .. } => {
             assert!(
                 reason.contains("epoch mismatch"),
                 "expired reason must name the epoch mismatch, got: {reason}"
