@@ -1393,6 +1393,192 @@ fn bench_v3_checkpoint_root(c: &mut Criterion) {
 
 // ═══════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════
+// 19. Cooperative Intent Lease — Claim Hot Path
+//
+// Phase 2 / 3a / 3b / 3c add cooperative-lease claim paths on
+// proxy_handler and handle_connect_inner. The §3.1 hot-path budget
+// is < 1µs for policy evaluation, so the claim functions need a
+// fast lookup + state transition. These benches pin:
+//
+//   1. token-hash claim happy path (single Active lease, hit)
+//   2. token-hash claim under load (1K active leases, hit on one)
+//   3. sandbox-binding claim happy path (HTTP-shape, host+method+path)
+//   4. sandbox-binding host-only claim (CONNECT-shape)
+//   5. unbound token (lookup miss)
+//
+// All run on a fresh IntentStore with synthetic leases so the
+// numbers are reproducible across machines.
+// ═══════════════════════════════════════════════
+
+fn bench_cooperative_lease(c: &mut Criterion) {
+    use gvm_proxy::intent_store::{IntentRequest, IntentStore};
+    use sha2::{Digest, Sha256};
+
+    fn coop_request(agent: &str) -> IntentRequest {
+        IntentRequest {
+            method: "POST".to_string(),
+            host: "api.bank.com".to_string(),
+            path: "/transfer".to_string(),
+            operation: "bench.coop".to_string(),
+            agent_id: agent.to_string(),
+            ttl_secs: Some(300),
+            payload_context: Some(serde_json::json!({"amount": 100})),
+            payload_hash: None,
+            content_type: None,
+            allow_pinned_lease: false,
+        }
+    }
+
+    fn hash_token(token: &str) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(token.as_bytes());
+        h.finalize().into()
+    }
+
+    let mut group = c.benchmark_group("cooperative_lease");
+
+    // ── 1. Token-hash claim, single lease in store (hit) ──
+    //
+    // iter_batched_ref because each iteration consumes the claim
+    // (transitions Active → Claimed) — without re-registering we
+    // measure the second iteration's Unbound path, which isn't the
+    // hot path we care about. Batched ref lets the setup register
+    // a fresh lease per call without dominating the measurement.
+    group.bench_function("claim_by_token_hash_hit_single_lease", |b| {
+        b.iter_batched_ref(
+            || {
+                let store = IntentStore::new(30);
+                let (_id, token, _hex) = store
+                    .register_lease(
+                        &coop_request("agent-bench"),
+                        serde_json::json!({"amount": 100}),
+                        [0u8; 32],
+                        None,
+                        String::new(),
+                    )
+                    .expect("register_lease must succeed");
+                (store, hash_token(&token))
+            },
+            |(store, hash)| {
+                black_box(store.claim_by_token_hash(hash));
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    // ── 2. Token-hash claim with 1K other Active leases ──
+    //
+    // The find()-by-token-hash inside claim_by_token_hash is O(N)
+    // over active intents. 1K is realistic ceiling for production
+    // (sandboxes × concurrent declared intents). This bench
+    // measures the worst case where the matching lease is found
+    // last during the scan.
+    group.bench_function("claim_by_token_hash_hit_among_1k_active", |b| {
+        b.iter_batched_ref(
+            || {
+                let store = IntentStore::new(300);
+                // Register 999 distractor leases.
+                for i in 0..999 {
+                    let _ = store.register_lease(
+                        &coop_request(&format!("agent-distract-{i}")),
+                        serde_json::json!({"i": i}),
+                        [0u8; 32],
+                        None,
+                        String::new(),
+                    );
+                }
+                // Then the target lease.
+                let (_id, token, _hex) = store
+                    .register_lease(
+                        &coop_request("agent-target"),
+                        serde_json::json!({"amount": 100}),
+                        [0u8; 32],
+                        None,
+                        String::new(),
+                    )
+                    .expect("register_lease must succeed");
+                (store, hash_token(&token))
+            },
+            |(store, hash)| {
+                black_box(store.claim_by_token_hash(hash));
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    // ── 3. Unbound (token doesn't match any lease) ──
+    group.bench_function("claim_by_token_hash_miss_unbound", |b| {
+        let store = IntentStore::new(30);
+        let (_id, _token, _hex) = store
+            .register_lease(
+                &coop_request("agent-real"),
+                serde_json::json!({"amount": 100}),
+                [0u8; 32],
+                None,
+                String::new(),
+            )
+            .expect("register_lease must succeed");
+        let fake_hash = hash_token("ctx_does-not-exist");
+        b.iter(|| {
+            black_box(store.claim_by_token_hash(&fake_hash));
+        });
+    });
+
+    // ── 4. Sandbox-binding (HTTP-shape) ──
+    group.bench_function("claim_by_sandbox_binding_hit", |b| {
+        b.iter_batched_ref(
+            || {
+                let store = IntentStore::new(30);
+                let _ = store
+                    .register_lease(
+                        &coop_request("agent-sb"),
+                        serde_json::json!({"amount": 100}),
+                        [0u8; 32],
+                        None,
+                        String::new(),
+                    )
+                    .expect("register_lease must succeed");
+                store
+            },
+            |store| {
+                black_box(store.claim_by_sandbox_binding(
+                    "agent-sb",
+                    "POST",
+                    "api.bank.com",
+                    "/transfer",
+                ));
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    // ── 5. Sandbox-binding (CONNECT host-only) ──
+    group.bench_function("claim_by_sandbox_binding_host_hit", |b| {
+        b.iter_batched_ref(
+            || {
+                let store = IntentStore::new(30);
+                let _ = store
+                    .register_lease(
+                        &coop_request("agent-sb"),
+                        serde_json::json!({"amount": 100}),
+                        [0u8; 32],
+                        None,
+                        String::new(),
+                    )
+                    .expect("register_lease must succeed");
+                store
+            },
+            |store| {
+                black_box(store.claim_by_sandbox_binding_host("agent-sb", "api.bank.com"));
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
 // Native bench group — always built. Wasm benches are split out behind
 // `--features wasm` so the bench binary builds on default features without
 // pulling in `gvm_engine` (which is gated on the same flag).
@@ -1413,6 +1599,7 @@ criterion_group!(
     bench_v3_event_hash_dispatcher,
     bench_v3_seal_and_anchor,
     bench_v3_checkpoint_root,
+    bench_cooperative_lease,
 );
 
 #[cfg(feature = "wasm")]

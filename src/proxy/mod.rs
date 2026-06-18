@@ -435,6 +435,21 @@ pub struct AppState {
     /// Keeping the metadata here, in the proxy crate, preserves that
     /// dependency direction.
     pub per_sandbox_metadata: Arc<dashmap::DashMap<String, SandboxMetadata>>,
+    /// Reverse index: peer veth IP → `sandbox_id`. Populated lazily
+    /// on the first successful `resolve_sandbox_anchor` for a given
+    /// IP and invalidated implicitly on sandbox revoke (the
+    /// downstream `per_sandbox_metadata.get(sandbox_id)` miss makes
+    /// the entry self-correct).
+    ///
+    /// Without this cache, the cooperative-lease HTTP hot path
+    /// (`try_sandbox_binding`) and the CONNECT handler do a
+    /// per-request `lookup_sandbox_id_by_ip` — a `read_dir` over
+    /// `/run/gvm/` plus N JSON parses per active sandbox. That
+    /// violates the §3.1 hot-path budget ("no filesystem I/O during
+    /// policy evaluation"). The cache keeps the first request from
+    /// each peer at the same cost as before; every subsequent
+    /// request is O(1).
+    pub peer_ip_to_sandbox_id: Arc<dashmap::DashMap<std::net::IpAddr, String>>,
     /// `enforcement.policy_link_template` from gvm.toml. When `Some`,
     /// every block response gets an `X-GVM-Policy-Link` header with
     /// `{rule_id}` substituted. None disables the header. See
@@ -608,7 +623,7 @@ impl AppState {
         }
         #[cfg(target_os = "linux")]
         {
-            let sandbox_id = gvm_sandbox::lookup_sandbox_id_by_ip(&ip.to_string())?;
+            let sandbox_id = self.peer_ip_to_sandbox_id_cached(ip)?;
             let metadata = self.per_sandbox_metadata.get(&sandbox_id)?;
             Some((metadata.agent_id.clone(), metadata.launch_event_id.clone()))
         }
@@ -659,7 +674,7 @@ impl AppState {
         }
         #[cfg(target_os = "linux")]
         {
-            let sandbox_id = gvm_sandbox::lookup_sandbox_id_by_ip(&ip.to_string())?;
+            let sandbox_id = self.peer_ip_to_sandbox_id_cached(ip)?;
             let metadata = self.per_sandbox_metadata.get(&sandbox_id)?;
             Some(auth::VerifiedIdentity {
                 agent_id: metadata.agent_id.clone(),
@@ -675,6 +690,30 @@ impl AppState {
         }
     }
 
+    /// Cached `peer_ip → sandbox_id` lookup. See
+    /// [`Self::peer_ip_to_sandbox_id`] for the rationale. Returns
+    /// `None` on loopback / non-Linux / no matching sandbox.
+    #[cfg(target_os = "linux")]
+    fn peer_ip_to_sandbox_id_cached(&self, ip: std::net::IpAddr) -> Option<String> {
+        if let Some(entry) = self.peer_ip_to_sandbox_id.get(&ip) {
+            let cached = entry.value().clone();
+            // Verify the cache entry still corresponds to an active
+            // sandbox; stale entries (sandbox revoked) self-correct.
+            if self.per_sandbox_metadata.contains_key(&cached) {
+                return Some(cached);
+            }
+            drop(entry);
+            self.peer_ip_to_sandbox_id.remove(&ip);
+        }
+        let sandbox_id = gvm_sandbox::lookup_sandbox_id_by_ip(&ip.to_string())?;
+        // Only cache if the metadata is present too — otherwise a
+        // race between FS-scan and revoke would poison the cache.
+        if self.per_sandbox_metadata.contains_key(&sandbox_id) {
+            self.peer_ip_to_sandbox_id.insert(ip, sandbox_id.clone());
+        }
+        Some(sandbox_id)
+    }
+
     /// Revoke a sandbox: clear all derived state (TLS bundle cache,
     /// metadata), then drop its CA from the registry. Order matters
     /// — clear derived caches first so a concurrent
@@ -683,6 +722,15 @@ impl AppState {
     pub fn revoke_sandbox(&self, sandbox_id: &str) {
         self.per_sandbox_tls.remove(sandbox_id);
         self.per_sandbox_metadata.remove(sandbox_id);
+        // Drop every peer_ip → sandbox_id cache entry that targets
+        // this sandbox. Stale entries would self-correct on the next
+        // hot-path lookup (the downstream `per_sandbox_metadata.get`
+        // would miss), but proactively clearing makes the invariant
+        // "cache only contains live sandboxes" hold exactly. Linear
+        // scan over the DashMap is fine — revoke is not a hot path
+        // and the map is bounded by active-sandbox count.
+        self.peer_ip_to_sandbox_id
+            .retain(|_ip, sid| sid != sandbox_id);
         self.ca_registry.revoke(sandbox_id);
     }
 }
@@ -1837,38 +1885,26 @@ fn extract_and_claim_lease(
         };
     }
 
-    // Step 3: policy epoch check. If the lease was issued under a
-    // different config integrity ref, the proxy reloaded in between
-    // and the lease is stale. The lease's `allow_pinned_lease` opt-in
-    // (Phase 3a) downgrades the failure to a warning and tags the
-    // outcome `pinned` so the audit chain records that enforcement
-    // ran against a stale-epoch lease. Strict mode (the default)
-    // Denies as `cooperative.expired`.
+    // Step 3: policy epoch check via the shared helper (single
+    // source of truth for the strict-vs-`allow_pinned_lease` rule).
     let current_epoch = state.current_integrity_ref().unwrap_or_default();
-    let pinned = if let Some(issued_epoch) = &claim.policy_epoch {
-        if !issued_epoch.is_empty() && issued_epoch != &current_epoch {
-            if claim.allow_pinned_lease {
-                tracing::info!(
-                    intent_id = claim.intent_id,
-                    issued_epoch = %issued_epoch,
-                    current_epoch = %current_epoch,
-                    "Cooperative lease pinned across policy reload (allow_pinned_lease)"
-                );
-                true
-            } else {
-                return CooperativeOutcome::Expired {
-                    claim_id: claim.claim_id,
-                    reason: format!(
-                        "policy reloaded since lease was issued (epoch mismatch); \
-                         set allow_pinned_lease=true at issuance to tolerate"
-                    ),
-                };
-            }
-        } else {
-            false
+    let pinned = match claim.check_policy_epoch(&current_epoch) {
+        crate::intent_store::LeaseEpochCheck::Match => false,
+        crate::intent_store::LeaseEpochCheck::PinnedAcrossReload => {
+            tracing::info!(
+                intent_id = claim.intent_id,
+                "Cooperative lease pinned across policy reload (allow_pinned_lease)"
+            );
+            true
         }
-    } else {
-        false
+        crate::intent_store::LeaseEpochCheck::Stale => {
+            return CooperativeOutcome::Expired {
+                claim_id: claim.claim_id,
+                reason: "policy reloaded since lease was issued (epoch mismatch); \
+                         set allow_pinned_lease=true at issuance to tolerate"
+                    .to_string(),
+            };
+        }
     };
 
     // Step 4: optional body cross-check. Phase 3a wires the observed
@@ -1959,34 +1995,26 @@ fn try_sandbox_binding(
         return CooperativeOutcome::NoToken;
     };
 
-    // Policy epoch check — same rule as the token path. Epoch
-    // mismatch without `allow_pinned_lease` → Expired Deny; with
-    // opt-in → pinned acceptance.
+    // Policy epoch check via the shared helper — same rule as the
+    // token path, different reason wording for the audit log.
     let current_epoch = state.current_integrity_ref().unwrap_or_default();
-    let pinned = if let Some(issued_epoch) = &claim.policy_epoch {
-        if !issued_epoch.is_empty() && issued_epoch != &current_epoch {
-            if claim.allow_pinned_lease {
-                tracing::info!(
-                    intent_id = claim.intent_id,
-                    issued_epoch = %issued_epoch,
-                    current_epoch = %current_epoch,
-                    "Sandbox-bound lease pinned across policy reload (allow_pinned_lease)"
-                );
-                true
-            } else {
-                return CooperativeOutcome::Expired {
-                    claim_id: claim.claim_id,
-                    reason: format!(
-                        "policy reloaded since sandbox-bound lease was issued (epoch mismatch); \
-                         set allow_pinned_lease=true at issuance to tolerate"
-                    ),
-                };
-            }
-        } else {
-            false
+    let pinned = match claim.check_policy_epoch(&current_epoch) {
+        crate::intent_store::LeaseEpochCheck::Match => false,
+        crate::intent_store::LeaseEpochCheck::PinnedAcrossReload => {
+            tracing::info!(
+                intent_id = claim.intent_id,
+                "Sandbox-bound lease pinned across policy reload (allow_pinned_lease)"
+            );
+            true
         }
-    } else {
-        false
+        crate::intent_store::LeaseEpochCheck::Stale => {
+            return CooperativeOutcome::Expired {
+                claim_id: claim.claim_id,
+                reason: "policy reloaded since sandbox-bound lease was issued (epoch mismatch); \
+                         set allow_pinned_lease=true at issuance to tolerate"
+                    .to_string(),
+            };
+        }
     };
 
     // Body cross-check, identical to the token path.

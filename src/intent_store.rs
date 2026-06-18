@@ -159,6 +159,29 @@ impl Intent {
             && self.host.eq_ignore_ascii_case(host)
             && path.starts_with(&self.path_prefix)
     }
+
+    /// Project the internal `Intent` into the public `LeaseClaim`
+    /// snapshot returned by every `claim_by_*` method. The 12-field
+    /// copy was repeated verbatim in three places (`claim_by_token_hash`,
+    /// `claim_by_sandbox_binding`, `claim_by_sandbox_binding_host`);
+    /// keeping it in one helper makes adding a new lease field a
+    /// single-line edit instead of three.
+    fn to_lease_claim(&self, claim_id: u64) -> LeaseClaim {
+        LeaseClaim {
+            claim_id,
+            intent_id: self.intent_id,
+            method: self.method.clone(),
+            host: self.host.clone(),
+            path_prefix: self.path_prefix.clone(),
+            agent_id: self.agent_id.clone(),
+            operation: self.operation.clone(),
+            payload_context: self.payload_context.clone(),
+            payload_context_hash: self.payload_context_hash,
+            payload_hash: self.payload_hash,
+            policy_epoch: self.policy_epoch.clone(),
+            allow_pinned_lease: self.allow_pinned_lease,
+        }
+    }
 }
 
 /// Lookup index key: (METHOD, host, path_prefix)
@@ -218,6 +241,48 @@ pub struct LeaseClaim {
     /// the decision as pinned. The hot path reads this off the
     /// claim instead of re-locking the store.
     pub allow_pinned_lease: bool,
+}
+
+/// Outcome of [`LeaseClaim::check_policy_epoch`]. Three states are
+/// possible at the boundary between an issued lease and the current
+/// proxy config: the epoch matches (`Match`); the epoch differs but
+/// the lease opted in to outliving config reloads (`PinnedAcrossReload`);
+/// or the epoch differs and the lease did not opt in (`Stale`). The
+/// last is fatal — the caller MUST Deny with `cooperative.expired`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseEpochCheck {
+    /// `policy_epoch` matches the current `active_integrity_ref`,
+    /// or the lease was issued without an epoch (legacy / startup).
+    Match,
+    /// Epoch differs and `allow_pinned_lease=true` — proceed but
+    /// tag the audit event so the stale-epoch enforcement is
+    /// reconstructible from the WAL.
+    PinnedAcrossReload,
+    /// Epoch differs and the lease did NOT opt in. Caller must Deny.
+    Stale,
+}
+
+impl LeaseClaim {
+    /// Compare the lease's `policy_epoch` against the proxy's current
+    /// integrity ref, honoring the lease's `allow_pinned_lease`
+    /// opt-in. Single source of truth for the epoch-check logic that
+    /// previously lived in four near-identical copies across
+    /// `proxy/mod.rs` (`extract_and_claim_lease`,
+    /// `try_sandbox_binding`) and `proxy/connect.rs` (`claim_connect_lease`,
+    /// CONNECT sandbox-binding fallback). The caller emits the
+    /// "Expired" `reason` string with context-appropriate wording.
+    pub fn check_policy_epoch(&self, current_epoch: &str) -> LeaseEpochCheck {
+        match &self.policy_epoch {
+            Some(issued) if !issued.is_empty() && issued != current_epoch => {
+                if self.allow_pinned_lease {
+                    LeaseEpochCheck::PinnedAcrossReload
+                } else {
+                    LeaseEpochCheck::Stale
+                }
+            }
+            _ => LeaseEpochCheck::Match,
+        }
+    }
 }
 
 /// Request body for POST /gvm/intent.
@@ -655,21 +720,7 @@ impl IntentStore {
         let claim_id = self.next_claim_id.fetch_add(1, Ordering::Relaxed);
         let intent = store.intents.get_mut(&intent_id)?;
 
-        let claim = LeaseClaim {
-            claim_id,
-            intent_id,
-            method: intent.method.clone(),
-            host: intent.host.clone(),
-            path_prefix: intent.path_prefix.clone(),
-            agent_id: intent.agent_id.clone(),
-            operation: intent.operation.clone(),
-            payload_context: intent.payload_context.clone(),
-            payload_context_hash: intent.payload_context_hash,
-            payload_hash: intent.payload_hash,
-            policy_epoch: intent.policy_epoch.clone(),
-            allow_pinned_lease: intent.allow_pinned_lease,
-        };
-
+        let claim = intent.to_lease_claim(claim_id);
         intent.state = IntentState::Claimed {
             claim_id,
             at: Instant::now(),
@@ -748,21 +799,7 @@ impl IntentStore {
         let claim_id = self.next_claim_id.fetch_add(1, Ordering::Relaxed);
         let intent = store.intents.get_mut(&intent_id)?;
 
-        let claim = LeaseClaim {
-            claim_id,
-            intent_id,
-            method: intent.method.clone(),
-            host: intent.host.clone(),
-            path_prefix: intent.path_prefix.clone(),
-            agent_id: intent.agent_id.clone(),
-            operation: intent.operation.clone(),
-            payload_context: intent.payload_context.clone(),
-            payload_context_hash: intent.payload_context_hash,
-            payload_hash: intent.payload_hash,
-            policy_epoch: intent.policy_epoch.clone(),
-            allow_pinned_lease: intent.allow_pinned_lease,
-        };
-
+        let claim = intent.to_lease_claim(claim_id);
         intent.state = IntentState::Claimed {
             claim_id,
             at: Instant::now(),
@@ -813,21 +850,7 @@ impl IntentStore {
         let claim_id = self.next_claim_id.fetch_add(1, Ordering::Relaxed);
         let intent = store.intents.get_mut(&intent_id)?;
 
-        let claim = LeaseClaim {
-            claim_id,
-            intent_id,
-            method: intent.method.clone(),
-            host: intent.host.clone(),
-            path_prefix: intent.path_prefix.clone(),
-            agent_id: intent.agent_id.clone(),
-            operation: intent.operation.clone(),
-            payload_context: intent.payload_context.clone(),
-            payload_context_hash: intent.payload_context_hash,
-            payload_hash: intent.payload_hash,
-            policy_epoch: intent.policy_epoch.clone(),
-            allow_pinned_lease: intent.allow_pinned_lease,
-        };
-
+        let claim = intent.to_lease_claim(claim_id);
         intent.state = IntentState::Claimed {
             claim_id,
             at: Instant::now(),

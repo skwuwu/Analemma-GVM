@@ -108,33 +108,26 @@ pub fn claim_connect_lease(
         };
     }
 
-    // Policy epoch: same rule as the HTTP path. `allow_pinned_lease`
-    // is the opt-in introduced in Phase 3a.
+    // Policy epoch via the shared helper — same rule as the HTTP
+    // path, CONNECT-specific reason wording for the audit log.
     let current_epoch = state.current_integrity_ref().unwrap_or_default();
-    let pinned = if let Some(issued_epoch) = &claim.policy_epoch {
-        if !issued_epoch.is_empty() && issued_epoch != &current_epoch {
-            if claim.allow_pinned_lease {
-                tracing::info!(
-                    intent_id = claim.intent_id,
-                    issued_epoch = %issued_epoch,
-                    current_epoch = %current_epoch,
-                    "CONNECT cooperative lease pinned across policy reload (allow_pinned_lease)"
-                );
-                true
-            } else {
-                return ConnectLeaseOutcome::Expired {
-                    claim_id: claim.claim_id,
-                    reason: format!(
-                        "policy reloaded since CONNECT lease was issued (epoch mismatch); \
-                         set allow_pinned_lease=true at issuance to tolerate"
-                    ),
-                };
-            }
-        } else {
-            false
+    let pinned = match claim.check_policy_epoch(&current_epoch) {
+        crate::intent_store::LeaseEpochCheck::Match => false,
+        crate::intent_store::LeaseEpochCheck::PinnedAcrossReload => {
+            tracing::info!(
+                intent_id = claim.intent_id,
+                "CONNECT cooperative lease pinned across policy reload (allow_pinned_lease)"
+            );
+            true
         }
-    } else {
-        false
+        crate::intent_store::LeaseEpochCheck::Stale => {
+            return ConnectLeaseOutcome::Expired {
+                claim_id: claim.claim_id,
+                reason: "policy reloaded since CONNECT lease was issued (epoch mismatch); \
+                         set allow_pinned_lease=true at issuance to tolerate"
+                    .to_string(),
+            };
+        }
     };
 
     ConnectLeaseOutcome::Valid {
@@ -219,24 +212,22 @@ async fn handle_connect_inner(
                 .claim_by_sandbox_binding_host(&agent_id, host)
             {
                 let current_epoch = state.current_integrity_ref().unwrap_or_default();
-                let pinned = match &claim.policy_epoch {
-                    Some(issued) if !issued.is_empty() && issued != &current_epoch => {
-                        if claim.allow_pinned_lease {
-                            true
-                        } else {
-                            connect_lease = ConnectLeaseOutcome::Expired {
-                                claim_id: claim.claim_id,
-                                reason: format!(
-                                    "policy reloaded since sandbox-bound CONNECT lease was \
+                let pinned = match claim.check_policy_epoch(&current_epoch) {
+                    crate::intent_store::LeaseEpochCheck::Match => false,
+                    crate::intent_store::LeaseEpochCheck::PinnedAcrossReload => true,
+                    crate::intent_store::LeaseEpochCheck::Stale => {
+                        connect_lease = ConnectLeaseOutcome::Expired {
+                            claim_id: claim.claim_id,
+                            reason: "policy reloaded since sandbox-bound CONNECT lease was \
                                      issued (epoch mismatch); set allow_pinned_lease=true at \
                                      issuance to tolerate"
-                                ),
-                            };
-                            // skip the Valid path below
-                            false
-                        }
+                                .to_string(),
+                        };
+                        // Skip the Valid path below — the `Stale`
+                        // arm already routed connect_lease to
+                        // `Expired`.
+                        false
                     }
-                    _ => false,
                 };
                 if matches!(connect_lease, ConnectLeaseOutcome::NoToken) {
                     connect_lease = ConnectLeaseOutcome::Valid {

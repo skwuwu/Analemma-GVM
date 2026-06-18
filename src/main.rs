@@ -609,6 +609,7 @@ async fn main() {
         ca_registry: Arc::new(gvm_sandbox::ca::CARegistry::new()),
         per_sandbox_tls: Arc::new(dashmap::DashMap::new()),
         per_sandbox_metadata: Arc::new(dashmap::DashMap::new()),
+        peer_ip_to_sandbox_id: Arc::new(dashmap::DashMap::new()),
         policy_link_template: config.enforcement.policy_link_template.clone(),
         payload_inspection: config.srr.payload_inspection,
         max_body_bytes: config.srr.max_body_bytes,

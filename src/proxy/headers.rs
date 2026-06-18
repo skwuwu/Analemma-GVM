@@ -26,14 +26,10 @@ pub(super) fn inject_gvm_response_headers(
     safety_delay_ms: u64,
 ) {
     let decision_str = format!("{:?}", classification.decision);
-    let source_str = match classification.source {
-        ClassificationSource::SRR => "SRR",
-        ClassificationSource::CooperativeDeclaredOnly => "cooperative.declared_only",
-        ClassificationSource::CooperativeCrossChecked => "cooperative.cross_checked",
-        ClassificationSource::CooperativeMismatch => "cooperative.mismatch",
-        ClassificationSource::CooperativeExpired => "cooperative.expired",
-        ClassificationSource::CooperativeUnbound => "cooperative.unbound",
-    };
+    // Use the single source-of-truth mapping on the enum. Three
+    // call sites (header injection + WAL event build + response
+    // body) previously duplicated this match arm by arm.
+    let source_str = classification.source.as_str();
 
     // Always inject these headers
     if let Ok(v) = axum::http::HeaderValue::from_str(&decision_str) {
@@ -159,18 +155,7 @@ pub(super) fn build_event(
             status_code: None,
         }),
         decision: format!("{:?}", classification.decision),
-        decision_source: match classification.source {
-            ClassificationSource::SRR => "SRR".to_string(),
-            ClassificationSource::CooperativeDeclaredOnly => {
-                "cooperative.declared_only".to_string()
-            }
-            ClassificationSource::CooperativeCrossChecked => {
-                "cooperative.cross_checked".to_string()
-            }
-            ClassificationSource::CooperativeMismatch => "cooperative.mismatch".to_string(),
-            ClassificationSource::CooperativeExpired => "cooperative.expired".to_string(),
-            ClassificationSource::CooperativeUnbound => "cooperative.unbound".to_string(),
-        },
+        decision_source: classification.source.as_str().to_string(),
         matched_rule_id: classification.matched_rule_id.clone(),
         enforcement_point: match classification.source {
             ClassificationSource::SRR => "proxy".to_string(),
