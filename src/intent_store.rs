@@ -138,6 +138,10 @@ struct Intent {
     /// is set. Encoded as the same hex string the WAL already
     /// uses for `config_integrity_ref`.
     policy_epoch: Option<String>,
+    /// Phase 3 opt-in: when true, the claim path accepts an
+    /// epoch mismatch and tags the decision as pinned in the
+    /// audit record rather than denying. Default false.
+    allow_pinned_lease: bool,
 }
 
 impl Intent {
@@ -209,6 +213,11 @@ pub struct LeaseClaim {
     pub payload_context_hash: Option<[u8; 32]>,
     pub payload_hash: Option<[u8; 32]>,
     pub policy_epoch: Option<String>,
+    /// Phase 3 opt-in flag mirrored from the lease — when true,
+    /// the claim path tolerates `policy_epoch` mismatch and tags
+    /// the decision as pinned. The hot path reads this off the
+    /// claim instead of re-locking the store.
+    pub allow_pinned_lease: bool,
 }
 
 /// Request body for POST /gvm/intent.
@@ -255,6 +264,20 @@ pub struct IntentRequest {
     /// Used to pick the right canonical form during cross-check.
     #[serde(default)]
     pub content_type: Option<String>,
+
+    /// Phase 3 opt-in: accept this lease even after the proxy has
+    /// reloaded its config (policy epoch mismatch). Default is
+    /// `false` (strict: epoch mismatch → `cooperative.expired`
+    /// Deny). Operators set this when the orchestrator has
+    /// independently approved the action and the TTL alone is the
+    /// guard — e.g. a long-running batch where a mid-flight
+    /// config refresh shouldn't invalidate in-flight approvals.
+    /// When set, the claim path tags the source
+    /// `cooperative.declared_only` (or `cross_checked` when the
+    /// body matches) but ALSO writes a `pinned: true` flag the
+    /// WAL preserves for audit.
+    #[serde(default)]
+    pub allow_pinned_lease: bool,
 }
 
 fn default_agent() -> String {
@@ -341,6 +364,7 @@ impl IntentStore {
             payload_context_hash: None,
             payload_hash: None,
             policy_epoch: None,
+            allow_pinned_lease: false,
         };
 
         store.index.entry(key).or_default().push(intent_id);
@@ -449,6 +473,7 @@ impl IntentStore {
             payload_context_hash: Some(payload_context_hash),
             payload_hash,
             policy_epoch: Some(policy_epoch),
+            allow_pinned_lease: req.allow_pinned_lease,
         };
 
         store.index.entry(key).or_default().push(intent_id);
@@ -642,6 +667,7 @@ impl IntentStore {
             payload_context_hash: intent.payload_context_hash,
             payload_hash: intent.payload_hash,
             policy_epoch: intent.policy_epoch.clone(),
+            allow_pinned_lease: intent.allow_pinned_lease,
         };
 
         intent.state = IntentState::Claimed {
@@ -799,6 +825,7 @@ mod tests {
             payload_context: None,
             payload_hash: None,
             content_type: None,
+            allow_pinned_lease: false,
         }
     }
 
@@ -993,6 +1020,7 @@ mod tests {
             payload_context: None,
             payload_hash: None,
             content_type: None,
+            allow_pinned_lease: false,
         };
         let _ = store
             .register(&req)
@@ -1035,6 +1063,7 @@ mod tests {
             payload_context: None,
             payload_hash: None,
             content_type: None,
+            allow_pinned_lease: false,
         };
         match store.register(&req2) {
             Ok(_) => {

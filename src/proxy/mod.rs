@@ -830,7 +830,7 @@ pub async fn proxy_handler(
     // is STRIPPED before the request is forwarded upstream. The token
     // is bearer material; leaking it to GitHub / Slack / Stripe would
     // let those endpoints replay it to GVM and impersonate the lease.
-    let cooperative_outcome = extract_and_claim_lease(&state, &mut request, &target);
+    let cooperative_outcome = extract_and_claim_lease(&state, &mut request, &target, body_for_srr);
 
     // Strip the GVM-internal cooperative header NOW so every downstream
     // path (SRR check, upstream forward, error response) sees the
@@ -846,7 +846,7 @@ pub async fn proxy_handler(
     // because the closure form pulls the std::sync::RwLockReadGuard
     // into the captured set, breaking the Handler's Send bound.
     let (classification, is_default_caution) = match cooperative_outcome {
-        CooperativeOutcome::CrossChecked => {
+        CooperativeOutcome::CrossChecked { pinned } => {
             let srr_result = {
                 let srr = match state.srr.read() {
                     Ok(g) => g,
@@ -878,11 +878,15 @@ pub async fn proxy_handler(
                     source: ClassificationSource::CooperativeCrossChecked,
                     operation,
                     matched_rule_id: srr_result.matched_description,
+                    pinned,
                 },
                 srr_result.is_catch_all,
             )
         }
-        CooperativeOutcome::DeclaredOnly { declared_body } => {
+        CooperativeOutcome::DeclaredOnly {
+            declared_body,
+            pinned,
+        } => {
             let srr_result = {
                 let srr = match state.srr.read() {
                     Ok(g) => g,
@@ -914,6 +918,7 @@ pub async fn proxy_handler(
                     source: ClassificationSource::CooperativeDeclaredOnly,
                     operation,
                     matched_rule_id: srr_result.matched_description,
+                    pinned,
                 },
                 srr_result.is_catch_all,
             )
@@ -926,6 +931,7 @@ pub async fn proxy_handler(
                     .as_ref()
                     .map(|headers| build_operation_metadata(headers, &target)),
                 matched_rule_id: Some("cooperative.mismatch".to_string()),
+                pinned: false,
             },
             false,
         ),
@@ -937,6 +943,7 @@ pub async fn proxy_handler(
                     .as_ref()
                     .map(|headers| build_operation_metadata(headers, &target)),
                 matched_rule_id: Some("cooperative.expired".to_string()),
+                pinned: false,
             },
             false,
         ),
@@ -948,6 +955,7 @@ pub async fn proxy_handler(
                     .as_ref()
                     .map(|headers| build_operation_metadata(headers, &target)),
                 matched_rule_id: Some("cooperative.unbound".to_string()),
+                pinned: false,
             },
             false,
         ),
@@ -983,6 +991,7 @@ pub async fn proxy_handler(
                     source: ClassificationSource::SRR,
                     operation,
                     matched_rule_id: srr_result.matched_description,
+                    pinned: false,
                 },
                 srr_result.is_catch_all,
             )
@@ -1612,18 +1621,23 @@ enum CooperativeOutcome {
     NoToken,
     /// Token claimed AND observed body matched the declared
     /// `payload_hash`. Run SRR on the observed body; tag the
-    /// classification as cross-checked.
-    CrossChecked,
+    /// classification as cross-checked. `pinned` is true when the
+    /// lease was accepted under `allow_pinned_lease` despite an
+    /// epoch mismatch (recorded for audit; does not change SRR
+    /// evaluation).
+    CrossChecked { pinned: bool },
     /// Token claimed but no observed body (MITM-blind, no payload
     /// inspection enabled, or oversized buffer). Run SRR on the
-    /// declared `payload_context` instead.
-    DeclaredOnly { declared_body: Bytes },
+    /// declared `payload_context` instead. `pinned` carries the
+    /// same meaning as on `CrossChecked`.
+    DeclaredOnly { declared_body: Bytes, pinned: bool },
     /// Token claimed but observed body's hash did NOT match the
     /// declared `payload_hash`. Always Deny.
     Mismatch { reason: String },
     /// Token claimed but the lease's `policy_epoch` differs from
     /// the current integrity ref (the proxy reloaded since the
-    /// lease was issued). Always Deny.
+    /// lease was issued) and the lease did NOT opt in via
+    /// `allow_pinned_lease`. Always Deny.
     Expired { reason: String },
     /// Token presented but no matching active lease found in the
     /// store. Re-use, forgery, or replay. Always Deny.
@@ -1635,10 +1649,17 @@ enum CooperativeOutcome {
 /// should use. The caller MUST remove the header before forwarding —
 /// this function reads but does not strip (separation of concerns;
 /// the test surface here is the decision, not the header mutation).
+///
+/// `observed_body` is the buffered request body, when payload
+/// inspection is enabled and the body is small enough to materialise.
+/// `None` means MITM-blind / inspection disabled / oversize. Present
+/// alongside the lease's `payload_hash` enables the
+/// `cooperative.cross_checked` evidence tier (Phase 3a).
 fn extract_and_claim_lease(
     state: &AppState,
     request: &mut axum::http::Request<axum::body::Body>,
     target: &Target,
+    observed_body: Option<&[u8]>,
 ) -> CooperativeOutcome {
     use sha2::{Digest, Sha256};
 
@@ -1700,45 +1721,58 @@ fn extract_and_claim_lease(
 
     // Step 3: policy epoch check. If the lease was issued under a
     // different config integrity ref, the proxy reloaded in between
-    // and the lease is stale. Phase 2 hard-codes the strict policy
-    // (deny on mismatch); the `allow_pinned_lease` opt-in is Phase 3.
+    // and the lease is stale. The lease's `allow_pinned_lease` opt-in
+    // (Phase 3a) downgrades the failure to a warning and tags the
+    // outcome `pinned` so the audit chain records that enforcement
+    // ran against a stale-epoch lease. Strict mode (the default)
+    // Denies as `cooperative.expired`.
     let current_epoch = state.current_integrity_ref().unwrap_or_default();
-    if let Some(issued_epoch) = &claim.policy_epoch {
+    let pinned = if let Some(issued_epoch) = &claim.policy_epoch {
         if !issued_epoch.is_empty() && issued_epoch != &current_epoch {
-            return CooperativeOutcome::Expired {
-                reason: format!("policy reloaded since lease was issued (epoch mismatch)",),
-            };
+            if claim.allow_pinned_lease {
+                tracing::info!(
+                    intent_id = claim.intent_id,
+                    issued_epoch = %issued_epoch,
+                    current_epoch = %current_epoch,
+                    "Cooperative lease pinned across policy reload (allow_pinned_lease)"
+                );
+                true
+            } else {
+                return CooperativeOutcome::Expired {
+                    reason: format!(
+                        "policy reloaded since lease was issued (epoch mismatch); \
+                         set allow_pinned_lease=true at issuance to tolerate"
+                    ),
+                };
+            }
+        } else {
+            false
         }
-    }
+    } else {
+        false
+    };
 
-    // Step 4: optional body cross-check. Two inputs:
+    // Step 4: optional body cross-check. Phase 3a wires the observed
+    // body in from the proxy hot path. Two inputs:
     //   - `payload_hash` on the lease (operator-supplied at register
     //     time, optional)
-    //   - the observed body, if the proxy buffered one (controlled by
+    //   - `observed_body`, if the proxy buffered one (controlled by
     //     `state.payload_inspection`)
     // Both present and matching → CrossChecked. Lease provides hash
     // but observed body unavailable → DeclaredOnly. Lease has neither
     // → DeclaredOnly. Hash provided but observed mismatches → Mismatch.
-    let observed_body_hash: Option<[u8; 32]> = request
-        .headers()
-        .get(axum::http::header::CONTENT_LENGTH)
-        .and_then(|_| {
-            // The request body has been buffered into body_bytes by
-            // the caller earlier; we don't have direct access here, so
-            // we read it back from the request body. Phase 2 callers
-            // re-buffer if needed; this helper returns None when the
-            // body isn't materialised. The CrossChecked path is purely
-            // additive — without observation, we fall through to
-            // DeclaredOnly.
-            None::<[u8; 32]>
-        });
+    let observed_body_hash: Option<[u8; 32]> = observed_body.map(|bytes| {
+        let mut h = Sha256::new();
+        h.update(bytes);
+        h.finalize().into()
+    });
     if let (Some(declared_hash), Some(observed_hash)) = (claim.payload_hash, observed_body_hash) {
         if declared_hash != observed_hash {
             return CooperativeOutcome::Mismatch {
                 reason: "observed body hash does not match declared payload_hash".to_string(),
             };
         }
-        return CooperativeOutcome::CrossChecked;
+        return CooperativeOutcome::CrossChecked { pinned };
     }
 
     // Step 5: declared-only path. Serialize the projected
@@ -1753,7 +1787,10 @@ fn extract_and_claim_lease(
         Some(b) => Bytes::from(b),
         None => Bytes::new(),
     };
-    CooperativeOutcome::DeclaredOnly { declared_body }
+    CooperativeOutcome::DeclaredOnly {
+        declared_body,
+        pinned,
+    }
 }
 
 #[cfg(test)]

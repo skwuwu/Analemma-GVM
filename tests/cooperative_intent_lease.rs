@@ -46,6 +46,7 @@ fn lease_body(agent_id: &str, payload_context: serde_json::Value) -> IntentReque
         payload_context: Some(payload_context),
         payload_hash: None,
         content_type: None,
+        allow_pinned_lease: false,
     }
 }
 
@@ -230,6 +231,7 @@ async fn malformed_payload_hash_returns_400() {
         payload_context: Some(serde_json::json!({"op": "x"})),
         payload_hash: Some("not-a-hash".to_string()),
         content_type: None,
+        allow_pinned_lease: false,
     };
     let resp = gvm_proxy::api::register_intent(State(state.clone()), Json(body)).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -315,6 +317,7 @@ async fn legacy_url_only_intent_does_not_issue_context_token() {
         payload_context: None, // legacy URL-only path
         payload_hash: None,
         content_type: None,
+        allow_pinned_lease: false,
     };
     let resp = gvm_proxy::api::register_intent(State(state.clone()), Json(body)).await;
     assert_eq!(resp.status(), StatusCode::CREATED);

@@ -37,6 +37,7 @@ fn intent(method: &str, host: &str, path: &str, agent: &str) -> IntentRequest {
         payload_context: None,
         payload_hash: None,
         content_type: None,
+        allow_pinned_lease: false,
     }
 }
 

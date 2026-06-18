@@ -61,6 +61,12 @@ pub(super) fn inject_gvm_response_headers(
             headers.insert("X-GVM-Matched-Rule", v);
         }
     }
+    if classification.pinned {
+        headers.insert(
+            "X-GVM-Lease-Pinned",
+            axum::http::HeaderValue::from_static("true"),
+        );
+    }
 }
 
 /// Build OperationMetadata from SDK headers for audit trail recording.
@@ -132,11 +138,20 @@ pub(super) fn build_event(
             .as_ref()
             .map(|o| o.resource.clone())
             .unwrap_or_default(),
-        context: classification
-            .operation
-            .as_ref()
-            .map(|o| o.context.attributes.clone())
-            .unwrap_or_default(),
+        context: {
+            let mut attrs = classification
+                .operation
+                .as_ref()
+                .map(|o| o.context.attributes.clone())
+                .unwrap_or_default();
+            if classification.pinned {
+                attrs.insert(
+                    "cooperative.pinned".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+            }
+            attrs
+        },
         transport: Some(TransportInfo {
             method: "".to_string(), // Populated by proxy_handler after build_event
             host: target.host.clone(),

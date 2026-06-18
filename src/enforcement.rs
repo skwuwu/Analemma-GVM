@@ -58,6 +58,7 @@ pub fn classify(state: &AppState, input: &ClassifyInput<'_>) -> Result<ClassifyO
         source: ClassificationSource::SRR,
         operation,
         matched_rule_id: srr_result.matched_description,
+        pinned: false,
     };
 
     let agent_id = input

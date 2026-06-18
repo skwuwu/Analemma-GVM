@@ -122,6 +122,7 @@ fn lease_body() -> IntentRequest {
         payload_context: Some(serde_json::json!({"amount": 100, "currency": "USD"})),
         payload_hash: None,
         content_type: None,
+        allow_pinned_lease: false,
     }
 }
 

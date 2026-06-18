@@ -1886,6 +1886,14 @@ pub struct Classification {
     pub source: ClassificationSource,
     pub operation: Option<OperationMetadata>,
     pub matched_rule_id: Option<String>,
+    /// Phase 3a: true when the decision came from a cooperative
+    /// lease that was accepted across a policy reload (the lease
+    /// opted in via `allow_pinned_lease`). Exposed as the
+    /// `X-GVM-Lease-Pinned: true` response header and the
+    /// `cooperative.pinned=true` event context attribute so the
+    /// audit chain captures every stale-epoch enforcement.
+    /// Default `false`; only the cooperative arms ever set it.
+    pub pinned: bool,
 }
 
 /// Parsed GVM headers from SDK-routed requests

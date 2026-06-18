@@ -131,6 +131,85 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-06-18: Cooperative intent lease — Phase 3a observed-body cross-check + pinned leases (Tier-3 P3-c)
+
+Closes the two Phase 2 deferrals that did not require touching
+the sandbox crate or CONNECT path. Phase 3b (blind-path token
+delivery — CONNECT-visible token, sidecar / veth binding)
+remains deferred.
+
+**What changed.**
+
+- `src/proxy/mod.rs::extract_and_claim_lease` now takes
+  `observed_body: Option<&[u8]>`. When both the lease's
+  `payload_hash` and the buffered body are present, the helper
+  SHA-256s the observed bytes and compares. Match returns
+  `CooperativeOutcome::CrossChecked` (the highest cooperative
+  evidence tier); divergence returns `Mismatch`. The proxy hot
+  path passes its existing `body_for_srr` slice in — no extra
+  buffering work.
+- `src/intent_store.rs::IntentRequest` gains
+  `allow_pinned_lease: bool` (default `false`). Stored on
+  `Intent` and mirrored onto `LeaseClaim`. The opt-in is
+  per-lease so a single batch can pin its in-flight approvals
+  without weakening any other agent's enforcement.
+- `extract_and_claim_lease` reads the flag off the claim. When
+  the lease's `policy_epoch` differs from the proxy's current
+  `active_integrity_ref` AND the lease opted in, the path
+  returns `CrossChecked { pinned: true }` (or
+  `DeclaredOnly { pinned: true }`) instead of `Expired`. Without
+  the opt-in, default-strict behaviour from Phase 2 is preserved.
+- `crates/gvm-types/src/lib.rs::Classification` gains
+  `pinned: bool` (default `false`). The cooperative arms in
+  `proxy_handler` populate it from the matching outcome
+  variant; the SRR + non-cooperative arms hard-code `false`.
+- `src/proxy/headers.rs::inject_gvm_response_headers` emits
+  `X-GVM-Lease-Pinned: true` only when
+  `classification.pinned` is set. The Allow / Delay paths get
+  this on the response automatically; the Deny / IC-3 paths
+  never produce a `pinned=true` classification by construction
+  (Deny variants are mismatch / expired / unbound).
+- `src/proxy/headers.rs::build_event` adds
+  `cooperative.pinned = true` to the WAL event's context
+  attributes on pinned outcomes so the audit chain captures
+  every stale-epoch acceptance for reconstruction. Default-strict
+  events get nothing extra (the absence is meaningful).
+
+**Tests** (6, all passing — `tests/cooperative_intent_lease_phase3.rs`).
+
+- `observed_body_matches_declared_hash_yields_cross_checked` —
+  happy path; the upstream is hit with
+  `X-GVM-Decision-Source: cooperative.cross_checked`.
+- `observed_body_diverges_from_declared_hash_returns_mismatch_deny`
+  — **the load-bearing Phase 3a assertion**. Agent declares
+  body A at issuance; sends body B at request time; the cross-
+  check catches the lie, Denies with
+  `cooperative.mismatch`, and the divergent body never reaches
+  upstream (mock-upstream call count is 0).
+- `lease_without_payload_hash_falls_through_to_declared_only`
+  — guard against silent evidence-tier upgrade. Without a
+  declared `payload_hash`, the source stays
+  `cooperative.declared_only`.
+- `pinned_lease_survives_policy_reload_and_marks_pinned` —
+  `allow_pinned_lease=true` + epoch flip between issue and
+  claim → 200 OK + `X-GVM-Decision-Source:
+  cooperative.cross_checked` + `X-GVM-Lease-Pinned: true`.
+- `pinned_lease_without_opt_in_still_expires` — default-strict
+  behaviour from Phase 2 is unchanged. Without opt-in, epoch
+  mismatch → `cooperative.expired` even if the body matches.
+- `non_pinned_allow_does_not_set_pinned_header` — regression
+  guard against marker dilution.
+
+**Risk.** The classification-struct field is a new public field
+on a hot-path type. Every internal caller is updated. Outside
+the workspace nothing constructs `Classification` (verified by
+grep). The pinned response header is opt-in (only fires when
+the lease set `allow_pinned_lease=true` AND an epoch mismatch
+actually occurred), so existing agents see no behavioural
+change. The observed-body cross-check requires
+`payload_inspection=true` AND a declared `payload_hash` — both
+opt-in already.
+
 ### 2026-06-18: Cooperative intent lease — Phase 2 claim path (Tier-3 P3-c)
 
 Wires the issuance side from Phase 1 to the proxy hot path. A

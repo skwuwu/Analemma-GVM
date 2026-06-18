@@ -365,7 +365,56 @@ lease for Phase 2 to compare against.
   decision via the normal `proxy_handler` audit path; a separate
   lease-lifecycle event would be additive, not load-bearing.
 
-### Phase 3 — Blind-path token delivery (later)
+### Phase 3a — Observed body cross-check + pinned leases (shipped)
+
+The proxy hot path now buffers the request body (when
+`payload_inspection` is enabled), SHA-256s it inside
+`extract_and_claim_lease`, and compares against the
+operator-supplied `payload_hash` on the lease. Match → the
+classification is tagged `cooperative.cross_checked` — the
+highest cooperative evidence tier, equivalent to network-observed
+because the wire body itself confirmed the declaration.
+Mismatch → Deny tagged `cooperative.mismatch`. Without a declared
+`payload_hash`, the path falls through to
+`cooperative.declared_only` (no silent upgrade).
+
+`IntentRequest` gains an `allow_pinned_lease: bool` field. When
+the agent or orchestrator sets `true` at issuance, the claim
+path tolerates `policy_epoch` mismatch (proxy reloaded after the
+lease was minted) instead of denying. The `Classification`
+gains a `pinned: bool` field that propagates two surfaces:
+
+- **`X-GVM-Lease-Pinned: true` response header** — set only on
+  pinned successes so the agent and any human auditor can tell
+  at a glance that this enforcement ran against a stale
+  ruleset.
+- **`cooperative.pinned = true` in the WAL event context** —
+  the audit chain captures every stale-epoch acceptance so
+  policy-reload effects are reconstructable from the ledger.
+
+Default is strict (`allow_pinned_lease: false`); the epoch
+mismatch still produces `cooperative.expired` Deny. The opt-in
+is per-lease, not per-runtime, so a slow batch job can pin its
+in-flight approvals without weakening enforcement for any other
+agent.
+
+**Tests** (6, all passing — `tests/cooperative_intent_lease_phase3.rs`):
+
+- `observed_body_matches_declared_hash_yields_cross_checked`
+- `observed_body_diverges_from_declared_hash_returns_mismatch_deny`
+  — the highest-value Phase 3a assertion: agent declared body A,
+  sent body B; cross-check catches it before the request reaches
+  upstream
+- `lease_without_payload_hash_falls_through_to_declared_only`
+  — no silent evidence-tier upgrade when no `payload_hash` was
+  declared
+- `pinned_lease_survives_policy_reload_and_marks_pinned`
+- `pinned_lease_without_opt_in_still_expires` — default-strict
+  behaviour unchanged from Phase 2
+- `non_pinned_allow_does_not_set_pinned_header` — pinned marker
+  only fires on stale-epoch acceptance, never on a normal Allow
+
+### Phase 3b — Blind-path token delivery (later)
 
 - CONNECT-visible token: token presented on the CONNECT request
   line itself so the proxy can read it before the TLS tunnel
