@@ -414,15 +414,82 @@ agent.
 - `non_pinned_allow_does_not_set_pinned_header` — pinned marker
   only fires on stale-epoch acceptance, never on a normal Allow
 
-### Phase 3b — Blind-path token delivery (later)
+### Phase 3b — CONNECT-visible token (shipped)
 
-- CONNECT-visible token: token presented on the CONNECT request
-  line itself so the proxy can read it before the TLS tunnel
-  closes over.
-- Sidecar / out-of-band binding: token correlated to a sandbox-
-  scoped network event (e.g. veth source-IP + dest-host + time
-  window), removing the requirement that the agent set a header
-  at all.
+The cooperative lease now binds at the **CONNECT** boundary,
+covering HTTPS tunnels the proxy cannot MITM (cert pinning,
+mTLS, raw TCP relay). The agent presents
+`X-GVM-Context-Token` on the CONNECT line itself; the proxy
+claims the lease in `handle_connect_inner` before the TLS
+tunnel opens.
+
+What CONNECT can verify at this layer:
+
+- **host** — must match the lease's declared host. Method and
+  path are inside the TLS the proxy never sees, so they are
+  not checked here. Agents that want per-request enforcement
+  through a MITM-able CONNECT can still set a per-request
+  `X-GVM-Context-Token` on the inner HTTP request — the
+  Phase 2 path picks it up.
+- **policy_epoch** — same strict-vs-`allow_pinned_lease` rule
+  as the HTTP path (Phase 3a). Stale epoch + no opt-in →
+  `cooperative.expired` Deny.
+
+Outcomes:
+
+- **`NoToken`** — no `X-GVM-Context-Token` header → existing
+  CONNECT path (domain-only SRR + Shadow Mode). Unchanged.
+- **`Valid`** — lease binds and host matches. The CONNECT
+  proceeds; the audit event uses
+  `decision_source = cooperative.declared_only` and the
+  lease's declared `agent_id` / `operation` instead of the
+  veth-resolved anchor. When the lease was pinned across an
+  epoch flip, the context attribute
+  `cooperative.pinned = true` is recorded.
+- **`Mismatch`** — host declared at issuance differs from
+  CONNECT target → Deny with `cooperative.mismatch`. WAL
+  records the divergent observed host.
+- **`Expired`** — lease epoch differs and no opt-in → Deny
+  with `cooperative.expired`.
+- **`Unbound`** — token does not bind to any active lease
+  (re-use, forgery, replay, non-ASCII bytes) → Deny with
+  `cooperative.unbound`.
+
+**Token leakage.** CONNECT headers are consumed by the proxy
+and never re-sent — the bytes that follow the `200 OK` are a
+raw TCP relay or a MITM-terminated TLS stream. The token has
+no path by which to reach upstream, so the Phase 2 header-strip
+invariant has no analogue here.
+
+**Tests** (9, all passing — `tests/cooperative_intent_lease_phase3b.rs`).
+The integration tests exercise `claim_connect_lease` directly:
+
+- `connect_without_token_returns_no_token`
+- `connect_with_unknown_token_returns_unbound`
+- `connect_with_non_ascii_token_returns_unbound`
+- `connect_with_host_mismatch_returns_mismatch`
+- `connect_with_matching_host_returns_valid`
+- `connect_host_match_is_case_insensitive` — DNS-style
+  case folding, guarding against an agent normalising to
+  uppercase and tripping the mismatch arm
+- `connect_token_reuse_second_attempt_returns_unbound` —
+  single-use semantics
+- `connect_epoch_mismatch_without_opt_in_returns_expired` —
+  default-strict
+- `connect_epoch_mismatch_with_opt_in_returns_valid_pinned` —
+  `allow_pinned_lease` tolerance
+
+### Phase 3c — Sidecar / veth binding (later)
+
+- Token correlated to a sandbox-scoped network event
+  (e.g. veth source-IP + dest-host + time window), removing
+  the requirement that the agent set a header at all. The
+  proxy already resolves the connecting peer's IP to a
+  sandbox anchor (see `resolve_sandbox_anchor` and
+  `lookup_sandbox_id_by_ip`); Phase 3c indexes the active
+  leases by the same key so a CONNECT or HTTP request from
+  a known sandbox IP binds to the lease without the agent
+  having to plumb the token through TLS-pinned clients.
 - Documentation of the trust model for each delivery channel.
 
 ---

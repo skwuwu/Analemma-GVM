@@ -27,6 +27,15 @@ pub mod responses_for_test {
     pub use super::responses::build_policy_link;
 }
 
+/// Test-only re-export of CONNECT-side helpers so integration tests
+/// can exercise the cooperative-lease pre-check directly. The helper
+/// is unit-testable in isolation; the full `handle_connect` flow
+/// requires hyper's upgrade machinery which is heavy to stub.
+#[doc(hidden)]
+pub mod connect_for_test {
+    pub use super::connect::{claim_connect_lease, ConnectLeaseOutcome};
+}
+
 pub use connect::handle_connect;
 pub use headers::remove_gvm_headers;
 

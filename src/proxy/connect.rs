@@ -12,6 +12,128 @@ use axum::http::{Request, Response, StatusCode};
 use super::responses::{append_proxy_wal_event, error_response};
 use super::AppState;
 
+/// Outcome of the cooperative-lease pre-check on a CONNECT request.
+/// CONNECT has no inner method or path visible to the proxy (both are
+/// encrypted inside the TLS tunnel that follows the CONNECT 200), so
+/// the bindings checked here are reduced compared with
+/// [`super::CooperativeOutcome`]:
+///
+///   - **host** — must match the lease's declared host.
+///   - **policy_epoch** — same strict-vs-`allow_pinned_lease` rule
+///     as the HTTP path.
+///
+/// On `Valid`, the tunnel proceeds and the WAL event records
+/// `decision_source = cooperative.declared_only` — the lease made the
+/// agent's intent visible to the audit chain, but the proxy never
+/// sees the body so cross-check is not possible.
+pub enum ConnectLeaseOutcome {
+    /// No `X-GVM-Context-Token` on the CONNECT — fall through to the
+    /// existing domain-only SRR path.
+    NoToken,
+    /// Lease bound and host matches. The fields populated here flow
+    /// into the WAL audit event so the audit chain captures the
+    /// declared agent and operation. `pinned` is true when the
+    /// lease was accepted across an epoch flip via
+    /// `allow_pinned_lease`.
+    Valid {
+        agent_id: String,
+        operation: String,
+        pinned: bool,
+    },
+    /// Token bound but CONNECT host does not match the lease's
+    /// declared host. Always Deny.
+    Mismatch { reason: String },
+    /// Token bound but the lease's `policy_epoch` differs from the
+    /// proxy's current integrity ref AND the lease did NOT opt in to
+    /// `allow_pinned_lease`. Always Deny.
+    Expired { reason: String },
+    /// Token presented but no matching active lease. Re-use, forgery,
+    /// or replay. Always Deny.
+    Unbound { reason: String },
+}
+
+/// Pull `X-GVM-Context-Token` off a CONNECT request, hash it, claim
+/// the matching lease, and return the CONNECT-shaped outcome. Mirrors
+/// `super::extract_and_claim_lease` for HTTP, with the reduced set of
+/// bindings appropriate for CONNECT (host + epoch only).
+///
+/// The header is NOT stripped here — CONNECT requests are consumed by
+/// the proxy and never re-sent upstream, so there is no leak risk
+/// equivalent to the HTTP-path concern in Phase 2.
+pub fn claim_connect_lease(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    host: &str,
+) -> ConnectLeaseOutcome {
+    use sha2::{Digest, Sha256};
+
+    let Some(token_val) = headers.get("x-gvm-context-token") else {
+        return ConnectLeaseOutcome::NoToken;
+    };
+    let Ok(token_str) = token_val.to_str() else {
+        return ConnectLeaseOutcome::Unbound {
+            reason: "X-GVM-Context-Token contains non-ASCII bytes".to_string(),
+        };
+    };
+
+    let mut hasher = Sha256::new();
+    hasher.update(token_str.as_bytes());
+    let token_hash: [u8; 32] = hasher.finalize().into();
+
+    let Some(claim) = state.intent_store.claim_by_token_hash(&token_hash) else {
+        return ConnectLeaseOutcome::Unbound {
+            reason: "context token does not bind to any active lease (re-use, forgery, or replay)"
+                .to_string(),
+        };
+    };
+
+    // Host is the only declared field the proxy can verify on a
+    // CONNECT (method and path are inside the TLS the proxy is not
+    // about to see).
+    if !host.eq_ignore_ascii_case(&claim.host) {
+        return ConnectLeaseOutcome::Mismatch {
+            reason: format!(
+                "host mismatch: declared {}, CONNECT target {}",
+                claim.host, host
+            ),
+        };
+    }
+
+    // Policy epoch: same rule as the HTTP path. `allow_pinned_lease`
+    // is the opt-in introduced in Phase 3a.
+    let current_epoch = state.current_integrity_ref().unwrap_or_default();
+    let pinned = if let Some(issued_epoch) = &claim.policy_epoch {
+        if !issued_epoch.is_empty() && issued_epoch != &current_epoch {
+            if claim.allow_pinned_lease {
+                tracing::info!(
+                    intent_id = claim.intent_id,
+                    issued_epoch = %issued_epoch,
+                    current_epoch = %current_epoch,
+                    "CONNECT cooperative lease pinned across policy reload (allow_pinned_lease)"
+                );
+                true
+            } else {
+                return ConnectLeaseOutcome::Expired {
+                    reason: format!(
+                        "policy reloaded since CONNECT lease was issued (epoch mismatch); \
+                         set allow_pinned_lease=true at issuance to tolerate"
+                    ),
+                };
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    ConnectLeaseOutcome::Valid {
+        agent_id: claim.agent_id,
+        operation: claim.operation,
+        pinned,
+    }
+}
+
 // ─── CONNECT Tunnel (HTTPS Proxy) ────────────────────────────────────────────
 //
 // Blind relay: CONNECT host:port → domain-level policy check → TCP relay.
@@ -53,6 +175,99 @@ async fn handle_connect_inner(
         .nth(1)
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(443);
+
+    // ── Tier-3 P3-c Phase 3b: cooperative lease on CONNECT ──
+    //
+    // If the agent presented an `X-GVM-Context-Token` on the CONNECT
+    // itself, attempt to bind the lease at the tunnel boundary. The
+    // outcomes that short-circuit:
+    //   - Mismatch / Expired / Unbound → Deny outright with the
+    //     matching `cooperative.*` decision_source.
+    //   - Valid → fall through to the existing SRR domain check; the
+    //     final WAL audit event swaps `decision_source` to
+    //     `cooperative.declared_only` and uses the lease's declared
+    //     agent_id / operation (these are higher-fidelity than the
+    //     veth-resolved anchor).
+    //   - NoToken → proceed as before.
+    let connect_lease = claim_connect_lease(&state, request.headers(), host);
+    let (lease_agent_id, lease_operation, lease_pinned, lease_active) = match &connect_lease {
+        ConnectLeaseOutcome::NoToken => (None, None, false, false),
+        ConnectLeaseOutcome::Valid {
+            agent_id,
+            operation,
+            pinned,
+        } => (
+            Some(agent_id.clone()),
+            Some(operation.clone()),
+            *pinned,
+            true,
+        ),
+        ConnectLeaseOutcome::Mismatch { reason }
+        | ConnectLeaseOutcome::Expired { reason }
+        | ConnectLeaseOutcome::Unbound { reason } => {
+            let (source_str, decision_source) = match &connect_lease {
+                ConnectLeaseOutcome::Mismatch { .. } => ("Mismatch", "cooperative.mismatch"),
+                ConnectLeaseOutcome::Expired { .. } => ("Expired", "cooperative.expired"),
+                ConnectLeaseOutcome::Unbound { .. } => ("Unbound", "cooperative.unbound"),
+                _ => unreachable!(),
+            };
+            let peer_ip_for_anchor = request.extensions().get::<std::net::IpAddr>().copied();
+            let (anchor_agent_id, anchor_parent_event_id) =
+                match state.resolve_sandbox_anchor(peer_ip_for_anchor) {
+                    Some((agent, launch)) => (agent, Some(launch)),
+                    None => ("unknown".to_string(), None),
+                };
+            tracing::warn!(host = %host, source = source_str, reason = %reason,
+                "CONNECT cooperative lease rejected — denying tunnel");
+            let event = GVMEvent {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                trace_id: uuid::Uuid::new_v4().to_string(),
+                agent_id: anchor_agent_id.clone(),
+                token_id: None,
+                operation: format!("connect:{}", host),
+                decision: "Deny".to_string(),
+                decision_source: decision_source.to_string(),
+                status: EventStatus::Failed {
+                    reason: reason.clone(),
+                },
+                enforcement_point: "proxy-cooperative".to_string(),
+                timestamp: chrono::Utc::now(),
+                payload: PayloadDescriptor::default(),
+                transport: Some(TransportInfo {
+                    method: "CONNECT".to_string(),
+                    host: host.to_string(),
+                    path: format!(":{}", port),
+                    status_code: None,
+                }),
+                resource: ResourceDescriptor::default(),
+                context: Default::default(),
+                matched_rule_id: Some(decision_source.to_string()),
+                event_hash: None,
+                llm_trace: None,
+                default_caution: false,
+                config_integrity_ref: state.current_integrity_ref(),
+                operation_descriptor: Some(crate::operation::connect(host)),
+                tenant_id: None,
+                parent_event_id: anchor_parent_event_id,
+                session_id: String::new(),
+            };
+            if let Err(e) = state.ledger.append_durable(&event).await {
+                tracing::warn!(
+                    event_id = %event.event_id,
+                    error = %e,
+                    "CONNECT cooperative Deny: WAL durable write failed"
+                );
+            }
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header("X-GVM-Decision", "Deny")
+                .header("X-GVM-Decision-Source", decision_source)
+                .body(Body::from(format!("CONNECT denied: {}", reason)))
+                .unwrap_or_else(|_| {
+                    error_response(StatusCode::FORBIDDEN, "CONNECT cooperative deny")
+                });
+        }
+    };
 
     // Domain-level policy: CONNECT only cares "is this domain allowed?"
     // If ANY rule exists for this host (regardless of method/path), Allow the tunnel.
@@ -196,16 +411,45 @@ async fn handle_connect_inner(
 
     // WAL record for allowed CONNECT. Durable: Allow on a tunnel is the
     // audit anchor for everything that flows inside — must reach Merkle chain.
+    //
+    // Phase 3b: when the agent presented a valid `X-GVM-Context-Token`
+    // on the CONNECT, swap `decision_source` to
+    // `cooperative.declared_only` and overlay the lease's declared
+    // `agent_id` / `operation` onto the audit event. The veth-resolved
+    // anchor is still used as the fallback when no lease was present.
+    let (event_agent_id, event_operation, event_source, event_enforcement_point) = if lease_active {
+        (
+            lease_agent_id.unwrap_or_else(|| anchor_agent_id.clone()),
+            lease_operation.unwrap_or_else(|| format!("connect:{}", host)),
+            "cooperative.declared_only".to_string(),
+            "proxy-cooperative".to_string(),
+        )
+    } else {
+        (
+            anchor_agent_id.clone(),
+            format!("connect:{}", host),
+            "SRR".to_string(),
+            "proxy".to_string(),
+        )
+    };
+    let mut allow_context: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+    if lease_pinned {
+        allow_context.insert(
+            "cooperative.pinned".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
     let event = GVMEvent {
         event_id: uuid::Uuid::new_v4().to_string(),
         trace_id: uuid::Uuid::new_v4().to_string(),
-        agent_id: anchor_agent_id.clone(),
+        agent_id: event_agent_id,
         token_id: None,
-        operation: format!("connect:{}", host),
+        operation: event_operation,
         decision: format!("{:?}", decision),
-        decision_source: "SRR".to_string(),
+        decision_source: event_source,
         status: EventStatus::Confirmed,
-        enforcement_point: "proxy".to_string(),
+        enforcement_point: event_enforcement_point,
         timestamp: chrono::Utc::now(),
         payload: PayloadDescriptor::default(),
         transport: Some(TransportInfo {
@@ -215,7 +459,7 @@ async fn handle_connect_inner(
             status_code: None,
         }),
         resource: ResourceDescriptor::default(),
-        context: Default::default(),
+        context: allow_context,
         matched_rule_id: srr_result_matched.clone(),
         event_hash: None,
         llm_trace: None,

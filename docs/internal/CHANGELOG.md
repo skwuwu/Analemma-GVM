@@ -131,6 +131,94 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-06-18: Cooperative intent lease — Phase 3b CONNECT-visible token (Tier-3 P3-c)
+
+Extends cooperative lease binding to the **CONNECT** boundary:
+HTTPS tunnels the proxy cannot MITM (cert pinning, mTLS, raw TCP
+relay). The agent puts `X-GVM-Context-Token` on the CONNECT
+request line; the proxy claims the lease before the TLS tunnel
+opens and the WAL event that anchors the tunnel records
+`cooperative.declared_only` evidence with the lease's declared
+agent_id / operation.
+
+**What changed.**
+
+- `src/proxy/connect.rs` — new `claim_connect_lease(state,
+  headers, host) -> ConnectLeaseOutcome` mirrors
+  `extract_and_claim_lease` for the CONNECT shape: token-hash
+  lookup, host-match check, policy-epoch check with
+  `allow_pinned_lease` opt-in. CONNECT has no inner method or
+  path visible to the proxy (encrypted in the TLS that follows
+  the 200), so those bindings are deliberately NOT checked here;
+  agents that want per-request enforcement still set the token
+  on the inner request inside a MITM-able CONNECT (Phase 2
+  path).
+- `src/proxy/connect.rs::handle_connect_inner` — runs the
+  claim pre-check after target extraction and before the SRR
+  domain check. Mismatch / Expired / Unbound outcomes
+  short-circuit to a 403 with `X-GVM-Decision-Source:
+  cooperative.*` and write a Deny WAL event whose
+  `enforcement_point = "proxy-cooperative"`. Valid outcomes
+  fall through to the existing SRR + Shadow-Mode path; the
+  final Allow WAL event swaps `decision_source` to
+  `cooperative.declared_only`, uses the lease's declared
+  `agent_id` and `operation`, and adds
+  `cooperative.pinned = true` to the event context when the
+  lease was pinned across an epoch flip.
+- **Token leakage.** CONNECT headers are consumed by the proxy
+  and never re-sent — the bytes that follow `200 OK` are a raw
+  TCP relay or a MITM-terminated TLS stream — so the Phase 2
+  header-strip invariant has no analogue here. The token has
+  no path by which to reach upstream by construction.
+- `src/proxy/mod.rs` — new `connect_for_test` module
+  re-exports `claim_connect_lease` + `ConnectLeaseOutcome`
+  under `#[doc(hidden)]` so integration tests can exercise the
+  helper directly. The full `handle_connect` flow requires
+  hyper's upgrade machinery which is heavy to stub; unit-testing
+  the lease helper covers the decision logic.
+
+**Tests** (9, all passing — `tests/cooperative_intent_lease_phase3b.rs`).
+
+- `connect_without_token_returns_no_token` — back-compat: no
+  token → existing CONNECT path unchanged.
+- `connect_with_unknown_token_returns_unbound`
+- `connect_with_non_ascii_token_returns_unbound` — non-UTF-8
+  header bytes are rejected as unbound.
+- `connect_with_host_mismatch_returns_mismatch` — lease for
+  `api.bank.com`, CONNECT to `api.evil.com` → Deny.
+- `connect_with_matching_host_returns_valid` — happy path.
+- `connect_host_match_is_case_insensitive` — DNS-style case
+  folding, guards against an agent normalising to uppercase
+  and tripping the mismatch arm.
+- `connect_token_reuse_second_attempt_returns_unbound` —
+  single-use semantics (same Active → Claimed state machine
+  as the HTTP path).
+- `connect_epoch_mismatch_without_opt_in_returns_expired` —
+  default-strict.
+- `connect_epoch_mismatch_with_opt_in_returns_valid_pinned` —
+  `allow_pinned_lease` tolerance carries through to CONNECT.
+
+**Risk.** The CONNECT path was previously dual-purpose
+(domain-only SRR + Shadow Mode); the new lease pre-check sits
+before both and only changes behaviour when the agent presents
+an `X-GVM-Context-Token`. Production agents that don't set the
+header see no behavioural difference. The audit-event shape
+expands by overlaying lease-derived `agent_id` / `operation` on
+the Allow path, but the field set is unchanged — downstream
+parsers see the same schema. The `connect_for_test` re-export
+is marked `#[doc(hidden)]` so it does not show up in public
+crate docs.
+
+**Deferred to Phase 3c** (intentionally out of scope):
+
+- Sidecar / veth binding — token correlated to a sandbox-
+  scoped network event rather than a header. The proxy
+  already resolves a peer IP to a sandbox anchor
+  (`resolve_sandbox_anchor`, `lookup_sandbox_id_by_ip`);
+  Phase 3c indexes active leases by that key so requests from
+  a known sandbox IP bind to the lease without the agent
+  plumbing the header through cert-pinned clients.
+
 ### 2026-06-18: Cooperative intent lease — Phase 3a observed-body cross-check + pinned leases (Tier-3 P3-c)
 
 Closes the two Phase 2 deferrals that did not require touching
