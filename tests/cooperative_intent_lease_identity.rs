@@ -102,6 +102,7 @@ async fn jwt_match_body_agent_id_returns_created() {
     let resp = gvm_proxy::api::register_intent(
         State(state.clone()),
         auth_header(&token),
+        None,
         Json(lease_body("agent-A")),
     )
     .await;
@@ -127,6 +128,7 @@ async fn jwt_mismatch_body_agent_id_returns_403() {
     let resp = gvm_proxy::api::register_intent(
         State(state.clone()),
         auth_header(&token_for_a),
+        None,
         Json(lease_body("privileged-release-bot")),
     )
     .await;
@@ -165,9 +167,13 @@ async fn invalid_jwt_returns_401() {
         HeaderValue::from_static("Bearer this-is-not-a-valid-jwt"),
     );
 
-    let resp =
-        gvm_proxy::api::register_intent(State(state.clone()), headers, Json(lease_body("agent-A")))
-            .await;
+    let resp = gvm_proxy::api::register_intent(
+        State(state.clone()),
+        headers,
+        None,
+        Json(lease_body("agent-A")),
+    )
+    .await;
 
     assert_eq!(
         resp.status(),
@@ -195,6 +201,7 @@ async fn jwt_configured_but_no_bearer_falls_back_to_body() {
     let resp = gvm_proxy::api::register_intent(
         State(state.clone()),
         HeaderMap::new(), // no Authorization header
+        None,
         Json(lease_body("agent-orchestrator")),
     )
     .await;
@@ -216,6 +223,7 @@ async fn no_jwt_config_trusts_body_agent_id() {
     let resp = gvm_proxy::api::register_intent(
         State(state.clone()),
         HeaderMap::new(),
+        None,
         Json(lease_body("anything-i-want")),
     )
     .await;
@@ -224,5 +232,98 @@ async fn no_jwt_config_trusts_body_agent_id() {
         resp.status(),
         StatusCode::CREATED,
         "JWT not configured — body.agent_id is trusted as-is"
+    );
+}
+
+// ─── 6. Sandbox peer-IP binding ──────────────────────────────────────────
+
+#[tokio::test]
+async fn sandbox_peer_ip_match_body_agent_id_returns_created() {
+    // Simulate a sandbox-allocated peer: insert metadata for a
+    // veth IP keyed by sandbox_id, populate the peer_ip_to_sandbox_id
+    // cache, and present the IP via axum::Extension. The resolver
+    // should derive agent_id from the sandbox and accept it because
+    // it matches the body.
+    use gvm_proxy::proxy::SandboxMetadata;
+    let (state, _wal) = common::test_state().await;
+    let sandbox_id = "sb-A";
+    let agent_id = "agent-sandbox-A";
+    state.per_sandbox_metadata.insert(
+        sandbox_id.to_string(),
+        SandboxMetadata {
+            agent_id: agent_id.to_string(),
+            launch_event_id: "launch-A".to_string(),
+            launched_at: chrono::Utc::now(),
+        },
+    );
+    let peer: std::net::IpAddr = "10.42.0.7".parse().unwrap();
+    state
+        .peer_ip_to_sandbox_id
+        .insert(peer, sandbox_id.to_string());
+
+    let resp = gvm_proxy::api::register_intent(
+        State(state.clone()),
+        HeaderMap::new(),
+        Some(axum::Extension(peer)),
+        Json(lease_body(agent_id)),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "sandbox peer-IP resolves to agent-sandbox-A, body matches — must succeed"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_peer_ip_mismatch_body_agent_id_returns_403() {
+    // Same setup but body claims a different agent_id. The
+    // sandbox-derived identity wins and the issuance is rejected.
+    use gvm_proxy::proxy::SandboxMetadata;
+    let (state, _wal) = common::test_state().await;
+    state.per_sandbox_metadata.insert(
+        "sb-A".to_string(),
+        SandboxMetadata {
+            agent_id: "agent-sandbox-A".to_string(),
+            launch_event_id: "launch-A".to_string(),
+            launched_at: chrono::Utc::now(),
+        },
+    );
+    let peer: std::net::IpAddr = "10.42.0.7".parse().unwrap();
+    state.peer_ip_to_sandbox_id.insert(peer, "sb-A".to_string());
+
+    let resp = gvm_proxy::api::register_intent(
+        State(state.clone()),
+        HeaderMap::new(),
+        Some(axum::Extension(peer)),
+        Json(lease_body("attacker-claimed-agent-id")),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "sandbox-derived agent (sandbox-A) ≠ body (attacker-claimed) — must reject"
+    );
+}
+
+#[tokio::test]
+async fn loopback_peer_ip_falls_through_to_body_trust() {
+    // Loopback peer is NOT a sandbox (cooperative mode). The
+    // resolver must NOT treat 127.0.0.1 as a sandbox — fall through
+    // to the body-trust legacy path.
+    let (state, _wal) = common::test_state().await;
+    let peer: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+    let resp = gvm_proxy::api::register_intent(
+        State(state.clone()),
+        HeaderMap::new(),
+        Some(axum::Extension(peer)),
+        Json(lease_body("cooperative-mode-agent")),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "loopback peer + no JWT → body trust (cooperative-mode legacy)"
     );
 }

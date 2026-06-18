@@ -63,6 +63,7 @@ async fn lease_issuance_returns_opaque_context_token() {
     let resp = gvm_proxy::api::register_intent(
         State(state.clone()),
         axum::http::HeaderMap::new(),
+        None,
         Json(body),
     )
     .await;
@@ -94,6 +95,7 @@ async fn token_is_not_intent_id_or_claim_id() {
     let resp = gvm_proxy::api::register_intent(
         State(state.clone()),
         axum::http::HeaderMap::new(),
+        None,
         Json(lease_body("a", serde_json::json!({"op": "x"}))),
     )
     .await;
@@ -140,6 +142,7 @@ async fn two_leases_produce_unrelated_tokens() {
     let resp_a = gvm_proxy::api::register_intent(
         State(state.clone()),
         axum::http::HeaderMap::new(),
+        None,
         Json(lease_body("a", serde_json::json!({"op": "x"}))),
     )
     .await;
@@ -151,6 +154,7 @@ async fn two_leases_produce_unrelated_tokens() {
     let resp_b = gvm_proxy::api::register_intent(
         State(state.clone()),
         axum::http::HeaderMap::new(),
+        None,
         Json(lease_body("b", serde_json::json!({"op": "y"}))),
     )
     .await;
@@ -172,6 +176,7 @@ async fn response_records_payload_context_hash_not_raw_payload() {
     let resp = gvm_proxy::api::register_intent(
         State(state.clone()),
         axum::http::HeaderMap::new(),
+        None,
         Json(lease_body("a", payload.clone())),
     )
     .await;
@@ -203,6 +208,7 @@ async fn response_decision_source_is_cooperative_declared_only() {
     let resp = gvm_proxy::api::register_intent(
         State(state.clone()),
         axum::http::HeaderMap::new(),
+        None,
         Json(lease_body("a", serde_json::json!({"op": "x"}))),
     )
     .await;
@@ -222,6 +228,7 @@ async fn oversize_payload_context_returns_413() {
     let resp = gvm_proxy::api::register_intent(
         State(state.clone()),
         axum::http::HeaderMap::new(),
+        None,
         Json(body),
     )
     .await;
@@ -253,6 +260,7 @@ async fn malformed_payload_hash_returns_400() {
     let resp = gvm_proxy::api::register_intent(
         State(state.clone()),
         axum::http::HeaderMap::new(),
+        None,
         Json(body),
     )
     .await;
@@ -273,6 +281,7 @@ async fn preflight_deny_returns_no_token() {
     let resp = gvm_proxy::api::register_intent(
         State(state.clone()),
         axum::http::HeaderMap::new(),
+        None,
         Json(body),
     )
     .await;
@@ -350,6 +359,7 @@ async fn legacy_url_only_intent_does_not_issue_context_token() {
     let resp = gvm_proxy::api::register_intent(
         State(state.clone()),
         axum::http::HeaderMap::new(),
+        None,
         Json(body),
     )
     .await;

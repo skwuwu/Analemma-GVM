@@ -56,7 +56,8 @@ async fn issue_lease(state: &gvm_proxy::proxy::AppState, req: IntentRequest) -> 
     use axum::http::HeaderMap;
     use axum::Json;
     let resp =
-        gvm_proxy::api::register_intent(State(state.clone()), HeaderMap::new(), Json(req)).await;
+        gvm_proxy::api::register_intent(State(state.clone()), HeaderMap::new(), None, Json(req))
+            .await;
     assert_eq!(resp.status(), StatusCode::CREATED);
     let json = common::body_json(resp).await;
     json["context_token"]
@@ -376,6 +377,7 @@ async fn h7_preflight_deny_emits_lease_denied_event() {
     let resp = gvm_proxy::api::register_intent(
         State(state.clone()),
         HeaderMap::new(),
+        None,
         Json(lease("agent-deny", None, false)),
     )
     .await;

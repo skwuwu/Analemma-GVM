@@ -621,17 +621,9 @@ impl AppState {
         if ip.is_loopback() {
             return None;
         }
-        #[cfg(target_os = "linux")]
-        {
-            let sandbox_id = self.peer_ip_to_sandbox_id_cached(ip)?;
-            let metadata = self.per_sandbox_metadata.get(&sandbox_id)?;
-            Some((metadata.agent_id.clone(), metadata.launch_event_id.clone()))
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = ip; // avoid unused-var lint on Windows
-            None
-        }
+        let sandbox_id = self.peer_ip_to_sandbox_id_cached(ip)?;
+        let metadata = self.per_sandbox_metadata.get(&sandbox_id)?;
+        Some((metadata.agent_id.clone(), metadata.launch_event_id.clone()))
     }
 
     /// Synthesize a `VerifiedIdentity` for a sandboxed peer when the
@@ -672,28 +664,26 @@ impl AppState {
         if ip.is_loopback() {
             return None;
         }
-        #[cfg(target_os = "linux")]
-        {
-            let sandbox_id = self.peer_ip_to_sandbox_id_cached(ip)?;
-            let metadata = self.per_sandbox_metadata.get(&sandbox_id)?;
-            Some(auth::VerifiedIdentity {
-                agent_id: metadata.agent_id.clone(),
-                tenant_id: None,
-                token_id: format!("sandbox-peer:{}", sandbox_id),
-                gvm_role: None,
-            })
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = ip;
-            None
-        }
+        let sandbox_id = self.peer_ip_to_sandbox_id_cached(ip)?;
+        let metadata = self.per_sandbox_metadata.get(&sandbox_id)?;
+        Some(auth::VerifiedIdentity {
+            agent_id: metadata.agent_id.clone(),
+            tenant_id: None,
+            token_id: format!("sandbox-peer:{}", sandbox_id),
+            gvm_role: None,
+        })
     }
 
-    /// Cached `peer_ip → sandbox_id` lookup. See
-    /// [`Self::peer_ip_to_sandbox_id`] for the rationale. Returns
-    /// `None` on loopback / non-Linux / no matching sandbox.
-    #[cfg(target_os = "linux")]
+    /// Cached `peer_ip → sandbox_id` lookup. Cache hit works on
+    /// every platform — the lookup is a plain DashMap read. Cache
+    /// miss falls back to scanning `/run/gvm/*.state` files which
+    /// is Linux-only; on other platforms a miss returns `None`.
+    ///
+    /// Tests can populate the cache directly via
+    /// `state.peer_ip_to_sandbox_id.insert(ip, sandbox_id)` to
+    /// exercise the resolver without standing up real veth state
+    /// files. Production paths reach the FS fallback the first
+    /// time each peer IP is seen, then ride the cache.
     fn peer_ip_to_sandbox_id_cached(&self, ip: std::net::IpAddr) -> Option<String> {
         if let Some(entry) = self.peer_ip_to_sandbox_id.get(&ip) {
             let cached = entry.value().clone();
@@ -705,13 +695,20 @@ impl AppState {
             drop(entry);
             self.peer_ip_to_sandbox_id.remove(&ip);
         }
-        let sandbox_id = gvm_sandbox::lookup_sandbox_id_by_ip(&ip.to_string())?;
-        // Only cache if the metadata is present too — otherwise a
-        // race between FS-scan and revoke would poison the cache.
-        if self.per_sandbox_metadata.contains_key(&sandbox_id) {
-            self.peer_ip_to_sandbox_id.insert(ip, sandbox_id.clone());
+        #[cfg(target_os = "linux")]
+        {
+            let sandbox_id = gvm_sandbox::lookup_sandbox_id_by_ip(&ip.to_string())?;
+            // Only cache if the metadata is present too — otherwise a
+            // race between FS-scan and revoke would poison the cache.
+            if self.per_sandbox_metadata.contains_key(&sandbox_id) {
+                self.peer_ip_to_sandbox_id.insert(ip, sandbox_id.clone());
+            }
+            Some(sandbox_id)
         }
-        Some(sandbox_id)
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     }
 
     /// Revoke a sandbox: clear all derived state (TLS bundle cache,

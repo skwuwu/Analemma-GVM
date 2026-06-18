@@ -1,4 +1,6 @@
 //! `gvm anchor keygen` — generate an Ed25519 keypair for WAL anchor signing.
+//! `gvm anchor verify` — auditor-facing offline verification of every
+//!   signed anchor in a WAL against a known public key.
 //!
 //! Strategic-5: every WAL anchor record carries an Ed25519 signature
 //! produced by a key the operator generates here. Auditors hold only
@@ -10,7 +12,7 @@
 //! understands what they're holding.
 
 use anyhow::{bail, Context, Result};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use std::path::{Path, PathBuf};
 
@@ -216,6 +218,256 @@ fn write_public_file(path: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Aggregate result of `gvm anchor verify`. The CLI prints a
+/// per-anchor line + summary; tests assert against the struct.
+#[derive(Debug, Clone, Default)]
+pub struct VerifyReport {
+    pub total: usize,
+    pub signed_with_known_key: usize,
+    pub signed_with_other_key: usize,
+    pub unsigned: usize,
+    pub bad_hash: usize,
+    pub bad_signature: usize,
+}
+
+impl VerifyReport {
+    pub fn ok(&self) -> bool {
+        self.bad_hash == 0 && self.bad_signature == 0
+    }
+}
+
+/// Parse a public-key TOML file produced by `gvm anchor keygen`.
+/// Returns `(key_id, VerifyingKey)`. Errors on missing fields,
+/// wrong algorithm, or malformed hex.
+pub fn load_public_key(path: &Path) -> Result<(String, VerifyingKey)> {
+    let contents =
+        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let v: toml::Value = toml::from_str(&contents)
+        .with_context(|| format!("parse public key TOML {}", path.display()))?;
+    let key_id = v
+        .get("key_id")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow::anyhow!("public key TOML missing `key_id`"))?
+        .to_string();
+    let algorithm = v
+        .get("algorithm")
+        .and_then(|x| x.as_str())
+        .unwrap_or("ed25519");
+    if algorithm != "ed25519" {
+        bail!("only ed25519 is supported, got {algorithm}");
+    }
+    let public_hex = v
+        .get("public_hex")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| anyhow::anyhow!("public key TOML missing `public_hex`"))?;
+    let bytes = hex::decode(public_hex).context("public_hex is not valid hex")?;
+    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "public key must be exactly 32 bytes (got {} bytes)",
+            bytes.len()
+        )
+    })?;
+    let verifying = VerifyingKey::from_bytes(&arr)
+        .context("public_hex is not a valid Ed25519 verifying key")?;
+    Ok((key_id, verifying))
+}
+
+/// `gvm anchor verify` — scan a WAL file for `GvmStateAnchor` records
+/// and verify each signed anchor against the supplied public key.
+///
+/// What this proves:
+///   1. **Hash integrity** — every anchor's `anchor_hash` recomputes
+///      from its fields. Tampering with `batch_root` or any other
+///      sealed field shows up as `bad_hash`.
+///   2. **Signature authenticity** — anchors carrying
+///      `AnchorSignature::SelfSigned { key_id, signature }` where
+///      `key_id == expected_key_id` are verified against the public
+///      key. Mismatched key_ids are counted separately so a multi-key
+///      deployment (rotation in progress) is visible. HSM and TSA
+///      attestations are flagged unsupported here — those auditors
+///      hit the vendor verifier.
+///   3. **Unsigned anchors** — counted but not flagged as failure.
+///      An anchor produced before signing was enabled (or with
+///      `[anchor] enabled = false`) is a legitimate state, just less
+///      forensically valuable.
+///
+/// This is the auditor's offline workflow:
+///   * Receive `<anchor.key.pub>` from the operator via a trusted
+///     channel
+///   * Receive (or fetch) the WAL file
+///   * `gvm anchor verify --wal <path> --pub <pub.toml>`
+///   * If `ok()` returns true, the chain is intact and the
+///     `signed_with_known_key` count tells you how many anchors
+///     this key produced.
+pub fn verify(wal_path: &Path, pub_path: &Path) -> Result<VerifyReport> {
+    use gvm_types::{AnchorSignature, GvmStateAnchor};
+
+    let (expected_key_id, verifying_key) = load_public_key(pub_path)?;
+    let wal = std::fs::read_to_string(wal_path)
+        .with_context(|| format!("read WAL {}", wal_path.display()))?;
+
+    println!();
+    println!(
+        "  {BOLD}Verifying anchors against key_id {CYAN}{}{RESET}",
+        expected_key_id
+    );
+    println!("  {DIM}WAL: {}{RESET}", wal_path.display());
+    println!();
+
+    let mut report = VerifyReport::default();
+
+    for (lineno, line) in wal.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Same shape-test as the WAL replay path in ledger.rs:
+        // anchor lines carry both `anchor_hash` and `batch_root`.
+        if !(trimmed.contains("\"anchor_hash\"") && trimmed.contains("\"batch_root\"")) {
+            continue;
+        }
+        let Ok(anchor) = serde_json::from_str::<GvmStateAnchor>(trimmed) else {
+            continue;
+        };
+        report.total += 1;
+
+        // Hash integrity — recompute and compare.
+        let recomputed_bytes = GvmStateAnchor::compute_hash(
+            anchor.spec_version,
+            anchor.batch_id,
+            anchor.timestamp.timestamp(),
+            &anchor.batch_root,
+            &anchor.context_hash,
+            anchor.checkpoint_root.as_deref(),
+            anchor.prev_anchor.as_deref(),
+        );
+        let recomputed_hex = hex::encode(recomputed_bytes);
+        if recomputed_hex != anchor.anchor_hash {
+            report.bad_hash += 1;
+            println!(
+                "  {YELLOW}\u{2717}{RESET} batch_id={} line={}: anchor_hash mismatch \
+                 (stored={}, recomputed={})",
+                anchor.batch_id, lineno, anchor.anchor_hash, recomputed_hex
+            );
+            continue;
+        }
+
+        match &anchor.signature {
+            None => {
+                report.unsigned += 1;
+                println!(
+                    "  {DIM}\u{00b7}{RESET} batch_id={} line={}: unsigned (no AnchorSignature)",
+                    anchor.batch_id, lineno
+                );
+            }
+            Some(AnchorSignature::SelfSigned { key_id, signature }) => {
+                if key_id != &expected_key_id {
+                    report.signed_with_other_key += 1;
+                    println!(
+                        "  {YELLOW}?{RESET} batch_id={} line={}: signed by other key_id={} (expected {})",
+                        anchor.batch_id, lineno, key_id, expected_key_id
+                    );
+                    continue;
+                }
+                let sig_bytes: [u8; 64] = match signature.as_slice().try_into() {
+                    Ok(arr) => arr,
+                    Err(_) => {
+                        report.bad_signature += 1;
+                        println!(
+                            "  {YELLOW}\u{2717}{RESET} batch_id={} line={}: signature is not 64 bytes",
+                            anchor.batch_id, lineno
+                        );
+                        continue;
+                    }
+                };
+                let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+                let anchor_hash_bytes = match hex::decode(&anchor.anchor_hash) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        report.bad_signature += 1;
+                        continue;
+                    }
+                };
+                use ed25519_dalek::Verifier;
+                match verifying_key.verify(&anchor_hash_bytes, &sig) {
+                    Ok(_) => {
+                        report.signed_with_known_key += 1;
+                        println!(
+                            "  {GREEN}\u{2713}{RESET} batch_id={} line={}: signature OK",
+                            anchor.batch_id, lineno
+                        );
+                    }
+                    Err(_) => {
+                        report.bad_signature += 1;
+                        println!(
+                            "  {YELLOW}\u{2717}{RESET} batch_id={} line={}: signature verification FAILED",
+                            anchor.batch_id, lineno
+                        );
+                    }
+                }
+            }
+            Some(AnchorSignature::Hsm { key_id, .. }) => {
+                println!(
+                    "  {DIM}\u{00b7}{RESET} batch_id={} line={}: HSM attestation (key_id={}) — \
+                     hardware verifier required, skipped",
+                    anchor.batch_id, lineno, key_id
+                );
+            }
+            Some(AnchorSignature::Tsa { tsa_url, .. }) => {
+                println!(
+                    "  {DIM}\u{00b7}{RESET} batch_id={} line={}: TSA attestation ({}) — \
+                     RFC 3161 verifier required, skipped",
+                    anchor.batch_id, lineno, tsa_url
+                );
+            }
+        }
+    }
+
+    println!();
+    println!("  {BOLD}Summary:{RESET}");
+    println!("    {DIM}anchors found     :{RESET} {}", report.total);
+    println!(
+        "    {DIM}signed (known key):{RESET} {}",
+        report.signed_with_known_key
+    );
+    if report.signed_with_other_key > 0 {
+        println!(
+            "    {DIM}signed (other key):{RESET} {} {DIM}(possibly mid-rotation){RESET}",
+            report.signed_with_other_key
+        );
+    }
+    if report.unsigned > 0 {
+        println!(
+            "    {DIM}unsigned          :{RESET} {} {DIM}(pre-signing or [anchor].enabled=false){RESET}",
+            report.unsigned
+        );
+    }
+    println!(
+        "    {DIM}hash mismatches   :{RESET} {}{}",
+        if report.bad_hash > 0 { YELLOW } else { GREEN },
+        report.bad_hash
+    );
+    print!("{RESET}");
+    println!(
+        "    {DIM}bad signatures    :{RESET} {}{}",
+        if report.bad_signature > 0 {
+            YELLOW
+        } else {
+            GREEN
+        },
+        report.bad_signature
+    );
+    print!("{RESET}");
+    println!();
+    if report.ok() {
+        println!("  {GREEN}\u{2713}{RESET} {BOLD}Chain integrity OK{RESET}");
+    } else {
+        println!("  {YELLOW}!{RESET} {BOLD}Chain integrity FAILED{RESET} — see above");
+    }
+    println!();
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +540,197 @@ mod tests {
         let out = dir.path().join("anchor.key");
         let err = keygen(out.to_str().unwrap(), "key with space", false).unwrap_err();
         assert!(err.to_string().contains("whitespace"));
+    }
+
+    // ─── `gvm anchor verify` regression tests ─────────────────────
+
+    /// End-to-end: keygen → sign an anchor with the secret → write a
+    /// fake WAL with that anchor → verify with the `.pub` file. Must
+    /// report `signed_with_known_key == 1` and `ok() == true`.
+    #[test]
+    fn verify_round_trip_known_key_passes() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use gvm_types::{AnchorSignature, GvmStateAnchor};
+
+        let dir = TempDir::new().unwrap();
+        let key_out = dir.path().join("anchor.key");
+        keygen(key_out.to_str().unwrap(), "test-pub-1", false).unwrap();
+        let pub_path = key_out.with_extension("key.pub");
+
+        // Load the secret to sign with the same key the .pub file
+        // verifies against.
+        let secret_str = std::fs::read_to_string(&key_out).unwrap();
+        let secret_parsed: gvm_proxy::config::AnchorKeyFile = toml::from_str(&secret_str).unwrap();
+        let secret_bytes = hex::decode(&secret_parsed.secret_hex).unwrap();
+        let secret_arr: [u8; 32] = secret_bytes.try_into().unwrap();
+        let signing = SigningKey::from_bytes(&secret_arr);
+
+        // Build a fake anchor + sign its hash.
+        let timestamp = chrono::Utc::now();
+        let batch_root = "a".repeat(64);
+        let context_hash = "b".repeat(64);
+        let hash_bytes = GvmStateAnchor::compute_hash(
+            1,
+            42,
+            timestamp.timestamp(),
+            &batch_root,
+            &context_hash,
+            None,
+            None,
+        );
+        let sig = signing.sign(&hash_bytes);
+        let anchor = GvmStateAnchor {
+            spec_version: 1,
+            batch_id: 42,
+            timestamp,
+            batch_root,
+            context_hash,
+            checkpoint_root: None,
+            prev_anchor: None,
+            anchor_hash: hex::encode(hash_bytes),
+            signature: Some(AnchorSignature::SelfSigned {
+                key_id: "test-pub-1".to_string(),
+                signature: sig.to_bytes().to_vec(),
+            }),
+        };
+        let wal_path = dir.path().join("wal.log");
+        std::fs::write(&wal_path, serde_json::to_string(&anchor).unwrap() + "\n").unwrap();
+
+        let report = verify(&wal_path, &pub_path).unwrap();
+        assert_eq!(report.total, 1);
+        assert_eq!(report.signed_with_known_key, 1);
+        assert_eq!(report.bad_hash, 0);
+        assert_eq!(report.bad_signature, 0);
+        assert!(report.ok(), "round-trip anchor must verify clean");
+    }
+
+    /// Tampering with `batch_root` after signing must show up as a
+    /// hash mismatch — the canonical input changes, so the stored
+    /// `anchor_hash` no longer matches `compute_hash`.
+    #[test]
+    fn verify_tampered_batch_root_flags_bad_hash() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use gvm_types::{AnchorSignature, GvmStateAnchor};
+
+        let dir = TempDir::new().unwrap();
+        let key_out = dir.path().join("anchor.key");
+        keygen(key_out.to_str().unwrap(), "test-pub-2", false).unwrap();
+        let pub_path = key_out.with_extension("key.pub");
+
+        let secret_str = std::fs::read_to_string(&key_out).unwrap();
+        let secret_parsed: gvm_proxy::config::AnchorKeyFile = toml::from_str(&secret_str).unwrap();
+        let secret_arr: [u8; 32] = hex::decode(&secret_parsed.secret_hex)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let signing = SigningKey::from_bytes(&secret_arr);
+
+        let timestamp = chrono::Utc::now();
+        let original_root = "a".repeat(64);
+        let context_hash = "b".repeat(64);
+        let hash_bytes = GvmStateAnchor::compute_hash(
+            1,
+            7,
+            timestamp.timestamp(),
+            &original_root,
+            &context_hash,
+            None,
+            None,
+        );
+        let sig = signing.sign(&hash_bytes);
+        let mut anchor = GvmStateAnchor {
+            spec_version: 1,
+            batch_id: 7,
+            timestamp,
+            batch_root: original_root.clone(),
+            context_hash,
+            checkpoint_root: None,
+            prev_anchor: None,
+            anchor_hash: hex::encode(hash_bytes),
+            signature: Some(AnchorSignature::SelfSigned {
+                key_id: "test-pub-2".to_string(),
+                signature: sig.to_bytes().to_vec(),
+            }),
+        };
+        // Mutate batch_root post-signing. The stored anchor_hash now
+        // refers to the original, but the line claims the new root.
+        anchor.batch_root = "c".repeat(64);
+        let wal_path = dir.path().join("wal.log");
+        std::fs::write(&wal_path, serde_json::to_string(&anchor).unwrap() + "\n").unwrap();
+
+        let report = verify(&wal_path, &pub_path).unwrap();
+        assert_eq!(report.bad_hash, 1, "tampered batch_root must flag bad_hash");
+        assert!(!report.ok());
+    }
+
+    /// Anchor signed by a different key_id: legitimate during
+    /// rotation. Must NOT be a verification failure, just counted
+    /// in `signed_with_other_key`.
+    #[test]
+    fn verify_different_key_id_is_counted_not_failure() {
+        use ed25519_dalek::{Signer, SigningKey};
+        use gvm_types::{AnchorSignature, GvmStateAnchor};
+
+        let dir = TempDir::new().unwrap();
+        // Auditor's key.
+        let auditor_key_out = dir.path().join("auditor.key");
+        keygen(auditor_key_out.to_str().unwrap(), "auditor-key", false).unwrap();
+        let auditor_pub = auditor_key_out.with_extension("key.pub");
+
+        // Anchor was signed by a DIFFERENT key.
+        let other_signing = SigningKey::from_bytes(&[0xCD; 32]);
+        let timestamp = chrono::Utc::now();
+        let batch_root = "f".repeat(64);
+        let context_hash = "0".repeat(64);
+        let hash_bytes = GvmStateAnchor::compute_hash(
+            1,
+            99,
+            timestamp.timestamp(),
+            &batch_root,
+            &context_hash,
+            None,
+            None,
+        );
+        let sig = other_signing.sign(&hash_bytes);
+        let anchor = GvmStateAnchor {
+            spec_version: 1,
+            batch_id: 99,
+            timestamp,
+            batch_root,
+            context_hash,
+            checkpoint_root: None,
+            prev_anchor: None,
+            anchor_hash: hex::encode(hash_bytes),
+            signature: Some(AnchorSignature::SelfSigned {
+                key_id: "other-key".to_string(),
+                signature: sig.to_bytes().to_vec(),
+            }),
+        };
+        let wal_path = dir.path().join("wal.log");
+        std::fs::write(&wal_path, serde_json::to_string(&anchor).unwrap() + "\n").unwrap();
+
+        let report = verify(&wal_path, &auditor_pub).unwrap();
+        assert_eq!(report.signed_with_other_key, 1);
+        assert_eq!(report.signed_with_known_key, 0);
+        assert_eq!(report.bad_signature, 0);
+        // ok() — other-key isn't a verification failure, just a
+        // visibility gap on this auditor's side.
+        assert!(
+            report.ok(),
+            "anchors signed by other (legitimate) keys must not flag as failure"
+        );
+    }
+
+    #[test]
+    fn load_public_key_rejects_wrong_algorithm() {
+        let dir = TempDir::new().unwrap();
+        let pub_path = dir.path().join("bad.toml");
+        std::fs::write(
+            &pub_path,
+            "key_id = \"k\"\nalgorithm = \"rsa\"\npublic_hex = \"00\"\n",
+        )
+        .unwrap();
+        let err = load_public_key(&pub_path).unwrap_err();
+        assert!(err.to_string().contains("ed25519"));
     }
 }

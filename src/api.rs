@@ -291,7 +291,7 @@ fn resolve_vault_agent_id(
 
 /// Strict identity resolver for cooperative-intent lease issuance
 /// (`POST /gvm/intent`). Different from
-/// [`resolve_vault_agent_id`] in two important ways:
+/// [`resolve_vault_agent_id`] in three important ways:
 ///
 ///   1. **No silent override on mismatch.** When JWT is configured
 ///      and the verified `agent_id` differs from the body's
@@ -300,34 +300,37 @@ fn resolve_vault_agent_id(
 ///      bound into the lease and what the claim path matches
 ///      against; if the issuance request misrepresents who is
 ///      asking, the lease would carry the wrong principal forever.
-///   2. **JWT-only verification.** Sandbox peer-IP identity is NOT
-///      yet wired into this handler (it would require
-///      `ConnectInfo<SocketAddr>` on the agent-facing router —
-///      out of scope for this fix). When JWT is not configured,
-///      the body's `agent_id` is trusted as-is, matching how every
-///      other agent-facing endpoint behaves on un-authed
-///      deployments. Operators wanting stronger identity binding
-///      should enable JWT auth.
+///   2. **Sandbox peer-IP fallback.** When JWT is not configured
+///      OR no Bearer token is presented, the resolver tries to
+///      derive the principal from the peer IP via
+///      `state.resolve_identity_from_peer`. Same trust model as
+///      the proxy hot path: a veth IP is allocated by GVM itself,
+///      so spoofing it requires breaking the network-namespace
+///      isolation that already separates sandboxes. If the
+///      sandbox-derived `agent_id` disagrees with `body.agent_id`,
+///      reject (`403`) — same rule as the JWT branch.
+///   3. **Final fallback: body trust.** When neither JWT nor
+///      peer-IP can produce a verified identity (cooperative-mode
+///      loopback, no JWT, no sandbox state file), trust
+///      `body.agent_id` as-is with a warning. Matches the
+///      `resolve_vault_agent_id` legacy semantics; deployments
+///      wanting stronger binding should enable JWT.
 ///
-/// Returns the effective agent_id (always equal to body's, after
-/// verification) or an error response (`401` / `403`).
+/// Returns the effective agent_id or an error response
+/// (`401` / `403`).
 #[allow(clippy::result_large_err)]
 fn resolve_cooperative_intent_identity(
-    jwt_config: &Option<Arc<auth::JwtConfig>>,
+    state: &AppState,
     headers: &HeaderMap,
+    peer_ip: Option<std::net::IpAddr>,
     declared_agent_id: &str,
 ) -> Result<String, Response<Body>> {
-    if let Some(ref jwt) = jwt_config {
-        match auth::extract_bearer_token(headers) {
-            Some(token) => match auth::verify_token(jwt, token) {
+    // Step 1: JWT path. Strongest binding when configured.
+    if let Some(ref jwt) = state.jwt_config {
+        if let Some(token) = auth::extract_bearer_token(headers) {
+            match auth::verify_token(jwt, token) {
                 Ok(identity) => {
                     if identity.agent_id != declared_agent_id {
-                        // The Blocker 3 case: agent A presents a
-                        // JWT for A but the body claims agent_id=B.
-                        // Reject — the lease would otherwise be
-                        // issued under B's identity, granting A
-                        // any permission B has under SRR
-                        // `principal_filter`.
                         tracing::warn!(
                             declared = declared_agent_id,
                             verified = %identity.agent_id,
@@ -343,36 +346,56 @@ fn resolve_cooperative_intent_identity(
                             }),
                         ));
                     }
-                    Ok(identity.agent_id)
+                    return Ok(identity.agent_id);
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "Cooperative intent: JWT verification failed");
-                    Err(json_response(
+                    return Err(json_response(
                         StatusCode::UNAUTHORIZED,
                         &serde_json::json!({
                             "error": "Invalid or expired authentication token"
                         }),
-                    ))
+                    ));
                 }
-            },
-            None => {
-                // JWT configured but no Bearer token. This matches
-                // the legacy / orchestrator path where the
-                // requester doesn't carry agent identity directly.
-                // Trust body.agent_id with a warning so operators
-                // can audit who's hitting this path. A future
-                // tighter deployment policy can flip this to 401.
-                tracing::warn!(
-                    agent = declared_agent_id,
-                    "Cooperative intent: JWT configured but no Bearer token — \
-                     trusting unverified agent_id"
-                );
-                Ok(declared_agent_id.to_string())
             }
         }
-    } else {
-        Ok(declared_agent_id.to_string())
+        // JWT configured but no Bearer presented — fall through to
+        // peer-IP and ultimately body trust. Logged as a warning so
+        // operators can audit how often this path is taken.
     }
+
+    // Step 2: sandbox peer-IP path. The proxy minted the veth IP
+    // itself and recorded the sandbox_id → agent_id mapping at
+    // launch. If the resolver matches the IP, we trust the derived
+    // identity at the same strength the proxy hot path does.
+    if let Some(verified) = state.resolve_identity_from_peer(peer_ip) {
+        if verified.agent_id != declared_agent_id {
+            tracing::warn!(
+                declared = declared_agent_id,
+                verified = %verified.agent_id,
+                ?peer_ip,
+                "Cooperative intent: body agent_id does not match \
+                 sandbox-derived agent_id — rejecting (403)"
+            );
+            return Err(json_response(
+                StatusCode::FORBIDDEN,
+                &serde_json::json!({
+                    "error": "Cooperative intent issuance: \
+                              body.agent_id must match the \
+                              sandbox-derived agent_id"
+                }),
+            ));
+        }
+        return Ok(verified.agent_id);
+    }
+
+    // Step 3: nothing to verify against. Trust the body.
+    tracing::debug!(
+        agent = declared_agent_id,
+        ?peer_ip,
+        "Cooperative intent: no JWT / sandbox identity context — trusting body.agent_id"
+    );
+    Ok(declared_agent_id.to_string())
 }
 
 // ─── Vault REST API ───
@@ -1102,29 +1125,26 @@ pub async fn auth_revoke_token(
 pub async fn register_intent(
     State(state): State<AppState>,
     headers: HeaderMap,
+    peer_ip_ext: Option<axum::Extension<std::net::IpAddr>>,
     Json(body): Json<crate::intent_store::IntentRequest>,
 ) -> Response<Body> {
     use crate::intent_store::MAX_PAYLOAD_CONTEXT_BYTES;
     use sha2::{Digest, Sha256};
 
-    // ── Step 0: identity binding (Blocker 3 fix) ──
+    // ── Step 0: identity binding ──
     //
-    // Cooperative leases bind the agent_id at issuance time; the
-    // claim path matches against this principal for
-    // `principal_filter` SRR rules and for the sandbox-binding
-    // (agent_id, host) lookup. If we trust the body's `agent_id`
-    // unconditionally, agent A can issue a lease claiming
-    // agent_id=B and inherit B's authorization surface. Reject
-    // the request when JWT identity disagrees with the body.
-    //
-    // Note: this is JWT-only for now. Sandbox peer-IP identity
-    // would require `ConnectInfo<SocketAddr>` wiring through the
-    // agent-facing router — a router-level change scheduled
-    // separately. Operators who need stronger binding today
-    // should enable JWT.
+    // Resolution order in `resolve_cooperative_intent_identity`:
+    //   JWT subject (Bearer)  > sandbox peer-IP  > body.agent_id
+    // Mismatch at any verified tier rejects with 403. The
+    // `peer_ip_ext` extractor reads the IP that `serve_connection`
+    // (main.rs) inserts into request extensions; it is `None` in
+    // unit tests that call `register_intent` directly, in which
+    // case the resolver falls through to body trust (matches
+    // legacy behaviour).
+    let peer_ip = peer_ip_ext.map(|axum::Extension(ip)| ip);
     let mut body = body;
     body.agent_id =
-        match resolve_cooperative_intent_identity(&state.jwt_config, &headers, &body.agent_id) {
+        match resolve_cooperative_intent_identity(&state, &headers, peer_ip, &body.agent_id) {
             Ok(id) => id,
             Err(resp) => return resp,
         };

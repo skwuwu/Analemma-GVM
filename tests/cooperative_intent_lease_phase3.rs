@@ -67,6 +67,7 @@ async fn issue_lease(state: &gvm_proxy::proxy::AppState, req: IntentRequest) -> 
     let resp = gvm_proxy::api::register_intent(
         State(state.clone()),
         axum::http::HeaderMap::new(),
+        None,
         Json(req),
     )
     .await;

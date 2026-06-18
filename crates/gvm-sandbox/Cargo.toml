@@ -1,6 +1,6 @@
 [package]
 name = "gvm-sandbox"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2021"
 description = "Linux-native agent sandboxing — namespace, seccomp-BPF, and network isolation"
 license = "Apache-2.0"

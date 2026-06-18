@@ -582,6 +582,41 @@ enum AnchorAction {
         #[arg(long)]
         force: bool,
     },
+
+    /// Offline-verify every signed anchor in a WAL file against a
+    /// known public key. This is the auditor's workflow:
+    ///
+    ///   1. Operator hands you the `.pub` file produced by
+    ///      `gvm anchor keygen` via a trusted channel.
+    ///   2. Operator (or auditor) exports the WAL file.
+    ///   3. Run `gvm anchor verify --wal <wal> --pub <pub.toml>`.
+    ///
+    /// Output:
+    ///   * Per-anchor line: signature OK / FAILED / unsigned /
+    ///     wrong key_id (mid-rotation) / hash mismatch.
+    ///   * Summary count of each category.
+    ///   * Exit code 0 when no hash mismatches and no bad
+    ///     signatures; non-zero otherwise.
+    ///
+    /// What this does NOT do: HSM/TSA attestation verification.
+    /// Those are flagged "skipped" because they need vendor-
+    /// specific verifiers (the HSM's attestation report parser /
+    /// an RFC 3161 verifier). Self-signed Ed25519 anchors are
+    /// the common case and the only thing `gvm anchor keygen`
+    /// produces, so this command covers the operator-side path
+    /// end-to-end.
+    Verify {
+        /// Path to the WAL file (JSON-lines). Anchors are JSON
+        /// records that carry both `anchor_hash` and `batch_root`
+        /// — they sit interleaved among regular events.
+        #[arg(long)]
+        wal: String,
+
+        /// Path to the public-key TOML file produced by
+        /// `gvm anchor keygen` (the `<out>.pub` file).
+        #[arg(long, name = "pub")]
+        pub_key: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1285,6 +1320,13 @@ async fn main() -> anyhow::Result<()> {
         Commands::Anchor { action } => match action {
             AnchorAction::Keygen { out, key_id, force } => {
                 anchor::keygen(&out, &key_id, force)?;
+            }
+            AnchorAction::Verify { wal, pub_key } => {
+                let report =
+                    anchor::verify(std::path::Path::new(&wal), std::path::Path::new(&pub_key))?;
+                if !report.ok() {
+                    std::process::exit(1);
+                }
             }
         },
     }
