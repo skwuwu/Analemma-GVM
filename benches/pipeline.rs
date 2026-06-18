@@ -18,6 +18,7 @@ fn make_test_event(id: &str) -> GVMEvent {
         agent_id: "bench-agent".to_string(),
         tenant_id: None,
         session_id: "bench-session".to_string(),
+        token_id: None,
         timestamp: chrono::Utc::now(),
         operation: "gvm.bench.test".to_string(),
         resource: ResourceDescriptor::default(),

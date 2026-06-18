@@ -2,6 +2,19 @@
 
 **Tier-3 P3-c — body-aware policy enforcement when MITM is blind.**
 
+**Status:** complete (Phase 1 → 3c, all shipped). 5 phases, 5
+commits, 40 tests pinning the load-bearing invariants. See the
+[Phasing](#phasing) section for what each phase delivered and the
+[Implementation Log](internal/CHANGELOG.md) for per-commit detail.
+
+| Phase | Scope | Tests | Status |
+|---|---|---:|---|
+| **1** | Issuance — `IntentRequest` payload extension, opaque `ctx_…` token, hash-only storage, `gvm.intent.lease_issued` WAL event | 10 | shipped |
+| **2** | Claim path — proxy hot-path token extraction, host/method/path/epoch checks, **`X-GVM-Context-Token` strip before upstream forward** | 10 | shipped |
+| **3a** | Observed-body cross-check + `allow_pinned_lease` opt-in for stale-epoch acceptance | 6 | shipped |
+| **3b** | CONNECT-visible token — cooperative lease on the CONNECT line for blind HTTPS tunnels (cert pinning, mTLS, raw relay) | 9 | shipped |
+| **3c** | Sandbox-IP binding — implicit lease claim by veth identity for clients that cannot plumb custom headers | 15 | shipped |
+
 GVM's primary enforcement path is **network-observed**: the proxy
 decrypts (via MITM), parses the HTTP body, and runs the SRR engine
 against what it actually saw on the wire. For traffic the proxy can
