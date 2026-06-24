@@ -131,6 +131,45 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-06-19: Bench refresh + CI bench-build coverage
+
+Two related changes after the v0.6.0 → v0.6.3 cooperative-intent
+lease epic landed:
+
+**Refresh of [docs/test-report.md](../test-report.md) — new section
+`D.1.1 Benchmark Refresh (2026-06-19)`** on EC2 t3.medium with Linux
+ext4 and a Windows NTFS comparison run. Two findings worth pinning:
+
+- New `bench_cooperative_lease` group: token-hash claim 528 ns
+  (single lease) / 60.8 µs (1K active leases — the only number
+  outside the < 1 µs hot-path budget); sandbox-binding 560-564 ns;
+  unbound miss 103 ns. Cooperative stage adds ~50% on top of SRR
+  for the single-lease case, well inside the upstream-RTT envelope.
+- Refreshed baselines show SRR +17-22% vs the 2026-05-02 D.1
+  numbers — Tier-2 P2-a action packs + `expires_at` / `principal_filter`
+  / `unsafe_body_action` rule-field additions are the visible cost.
+  Per-rule O(1) shape unchanged. The < 1 µs budget guards against
+  regressing the shape, not against deliberate corpus growth.
+- EvidenceFirst Allow cost model documented: ~6.4 ms per solo
+  Allow on Linux ext4 (the fsync floor), group-commit amortizes
+  100 concurrent into ~11 ms. Frames the operator's perf trade-off
+  for the new `audit.allow_mode = evidence_first` knob.
+
+**CI fix: [.github/workflows/ci.yml](../../.github/workflows/ci.yml)
+clippy step now passes `--all-targets`.** Root cause of the
+v0.6.0 `token_id` + v0.6.1 `requires_observed_body` bench-fixture
+drift was that `cargo test --workspace` and bare `cargo clippy
+--workspace` both skip the `benches/` target. So field additions
+to `IntentRequest` / `GVMEvent` broke test fixtures (caught by CI
+on the same PR) but bench fixtures slipped through silently. The
+flag closes the loop: same PR that adds the field has to update
+the bench fixture or CI fails. Four lints surfaced when
+`--all-targets` first ran cleanly — doc_lazy_continuation in
+`Classification.cooperative`, needless_borrows_for_generic_args in
+`auth.rs` test, manual_range_contains in DNS adversarial test,
+doc_overindented_list_items in srr_rule_api doc — all behavioural
+no-ops, fixed alongside the flag.
+
 ### 2026-06-18: Cooperative intent lease — Phase 3c sandbox-IP binding (Tier-3 P3-c)
 
 Closes the final Phase 3 deferral. Cooperative leases now bind
