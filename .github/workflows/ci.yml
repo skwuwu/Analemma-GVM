@@ -47,7 +47,18 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace -- -D warnings
+      # --all-targets is load-bearing: without it, `cargo clippy
+      # --workspace` lints lib + bin + tests + examples but NOT
+      # benches. The bench target lives under `benches/` and uses
+      # its own constructors for `IntentRequest` / `GVMEvent` etc.
+      # When those types grow a required field, test fixtures break
+      # immediately (caught here) but bench fixtures slipped through
+      # silently — first reproduced when `cargo bench --no-run`
+      # failed weeks after the v0.6.0 token_id addition, and again
+      # after the v0.6.1 requires_observed_body addition. The
+      # `--all-targets` flag closes the loop: PR adds a field,
+      # bench fixture missing it, CI breaks on the same PR.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   fmt:
     name: Format

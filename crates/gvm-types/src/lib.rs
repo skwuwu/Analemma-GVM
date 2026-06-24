@@ -1899,10 +1899,12 @@ pub struct Classification {
     /// this carries the audit-relevant fields back to `build_event`
     /// so the request decision is cryptographically + semantically
     /// linked to the earlier `gvm.intent.lease_issued` event:
+    ///
     ///   - `intent_id` — primary key correlating both events
     ///   - `payload_context_hash` — what the agent declared
     ///   - `observed_payload_hash` — what the proxy actually saw
     ///     (CrossChecked path only)
+    ///
     /// `None` for non-cooperative classifications.
     pub cooperative: Option<CooperativeMeta>,
 }

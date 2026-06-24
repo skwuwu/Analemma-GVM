@@ -8,13 +8,17 @@
 //! workspace's end-to-end CI suite on EC2.
 //!
 //! Status-code contracts pinned:
-//!   * POST /gvm/srr/rule    → 201 on success
-//!                             → 400 on bad body / missing description
-//!                             → 409 on duplicate description
-//!                             → 429 on injected-rule cap
-//!   * DELETE /gvm/srr/rule  → 200 + removed=true if found
-//!                             → 404 if not found
-//!   * GET /gvm/srr/rule     → 200 with ids array
+//!
+//!   - POST /gvm/srr/rule
+//!     - 201 on success
+//!     - 400 on bad body / missing description
+//!     - 409 on duplicate description
+//!     - 429 on injected-rule cap
+//!   - DELETE /gvm/srr/rule
+//!     - 200 + removed=true if found
+//!     - 404 if not found
+//!   - GET /gvm/srr/rule
+//!     - 200 with ids array
 
 mod common;
 

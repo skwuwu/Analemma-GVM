@@ -1277,7 +1277,7 @@ mod tests {
             URL_SAFE_NO_PAD.encode(serde_json::to_string(&claims).unwrap().as_bytes());
         // Attach a junk signature — content does not matter because
         // verification must fail on the algorithm mismatch first.
-        let sig_b64 = URL_SAFE_NO_PAD.encode(&[0u8; 32]);
+        let sig_b64 = URL_SAFE_NO_PAD.encode([0u8; 32]);
         let token = format!("{}.{}.{}", header_b64, payload_b64, sig_b64);
         let result = verify_token(&cfg_ed, &token);
         assert!(

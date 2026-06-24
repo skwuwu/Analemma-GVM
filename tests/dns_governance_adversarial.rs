@@ -66,7 +66,7 @@ fn tier4_flood_global_threshold_triggers_after_burst() {
     let snapshot = gov.snapshot_state();
     let threshold = snapshot.tier4_threshold;
     assert!(
-        threshold >= 1 && threshold < 10_000,
+        (1..10_000).contains(&threshold),
         "tier4_threshold sanity: got {threshold}"
     );
 
@@ -99,7 +99,7 @@ fn tier3_anomalous_via_subdomain_burst() {
     let gov = fresh_engine();
     let threshold = gov.snapshot_state().tier3_threshold;
     assert!(
-        threshold >= 1 && threshold < 10_000,
+        (1..10_000).contains(&threshold),
         "tier3_threshold sanity: got {threshold}"
     );
 
