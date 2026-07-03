@@ -340,19 +340,19 @@ mod tests {
     #[test]
     fn lookup_blocked_mount() {
         // mount(2) is the canonical example used in our seccomp filter.
-        let n = libc::SYS_mount as i64;
+        let n = libc::SYS_mount;
         assert_eq!(name_for(n), Some("mount"));
     }
 
     #[test]
     fn lookup_blocked_ptrace() {
-        let n = libc::SYS_ptrace as i64;
+        let n = libc::SYS_ptrace;
         assert_eq!(name_for(n), Some("ptrace"));
     }
 
     #[test]
     fn lookup_blocked_bpf() {
-        let n = libc::SYS_bpf as i64;
+        let n = libc::SYS_bpf;
         assert_eq!(name_for(n), Some("bpf"));
     }
 
@@ -360,7 +360,7 @@ mod tests {
     fn lookup_allowed_read() {
         // Allowed syscalls are also in the table so error messages stay
         // useful when an agent dies on an unexpected syscall.
-        let n = libc::SYS_read as i64;
+        let n = libc::SYS_read;
         assert_eq!(name_for(n), Some("read"));
     }
 
@@ -373,7 +373,7 @@ mod tests {
     #[test]
     fn name_strips_sys_prefix() {
         // The macro strips "SYS_" so output is human-friendly.
-        let n = libc::SYS_openat as i64;
+        let n = libc::SYS_openat;
         assert_eq!(name_for(n), Some("openat"));
     }
 }
