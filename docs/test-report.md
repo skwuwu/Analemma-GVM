@@ -1303,21 +1303,55 @@ either commit.
   re-measured this run — the change is scoped strictly to
   `src/intent_store.rs`. Those numbers stay valid from D.1.1.
 
-### Why not attack sandbox_binding too?
+### Deferred perf optimizations (tracked follow-ups)
 
-Two Options were sketched during design (C: multi-field per-agent
-index, D: expiry heap for cleanup). Both deferred:
+Two additional Options were sketched during design (C: multi-
+field per-agent index for `claim_by_sandbox_binding*`, D: expiry
+priority queue for `cleanup_inner`). Both deliberately NOT
+shipped in this refresh — recorded here so they can be picked up
+when a real signal triggers them.
 
-- **Option C** would help only sandbox-IP-bound flows where the
-  token header is absent. Currently at 606-619 ns — well inside
-  the hot-path budget. The index maintenance (multi-key +
-  `.max_by_key(created_at)` ordering) adds real complexity for a
-  case that isn't near the ceiling. Revisit if a deployment
-  observes sandbox-IP claims dominating the p99.
-- **Option D** (expiry heap for `cleanup_inner`) is now obviated
-  by Option B — the sweep is amortized to ~zero cost in the
-  common case. Only worth revisiting if the "≥ MAX/2 full" branch
-  becomes frequent in practice.
+- **Option C — per-agent multi-field index for
+  `claim_by_sandbox_binding{,_host}`**
+  Shape: `HashMap<(agent_id, host), Vec<intent_id>>` (or
+  `(agent_id, method, host)` for the HTTP variant), with the
+  bucket kept sorted by `created_at` so `.max_by_key` becomes a
+  head-of-vec pick. Expected impact: 606-619 ns → ~200-300 ns
+  at any lease count.
+  Cost: multi-key insert/remove maintenance, ordered-Vec
+  discipline, more surface for index drift.
+  Payoff conditions — revisit when ANY of:
+    1. p99 latency profiling shows sandbox-binding claims
+       dominating cooperative claim cost in production
+    2. an operator reports > 1 000 sandbox-bound cooperative
+       leases per proxy in steady state
+    3. a benchmark demonstrates the sandbox-binding cases
+       climbing past ~1 µs (currently 606-619 ns, headroom
+       ~65% of the < 1 µs budget)
+
+- **Option D — expiry-ordered priority queue for cleanup**
+  Shape: `BinaryHeap<(Reverse<Instant>, intent_id)>` keyed on
+  `Active.expires_at` / `Claimed.at + CLAIM_TIMEOUT`, so
+  `cleanup_inner` peeks the head, pops if elapsed, and stops.
+  Expected impact: even the fallback O(N) sweep (Option B
+  bail-out branch at > MAX/2 full) becomes O(log N).
+  Cost: state transitions Active ↔ Claimed require heap
+  re-insertion — the intent's expiry key changes when it
+  transitions to Claimed, and again on release. This is the
+  reason it wasn't shipped: the store's state machine is more
+  active than the heap-maintenance overhead saves.
+  Payoff conditions — revisit when ANY of:
+    1. production observes the ≥ MAX_INTENTS / 2 (5 000) full
+       branch firing frequently — indicates the amortization
+       gate is being defeated by store pressure
+    2. someone actually benchmarks the fallback sweep path and
+       finds it dominating a workload's p99
+    3. `MAX_INTENTS` is raised past ~50 000 (5 K sweep is
+       manageable; 50 K sweep is not)
+
+Both are "correct to defer, not correct to forget" — no work is
+needed unless a signal above appears, but the design is documented
+so the next perf pass has a running start.
 
 ### Design invariants preserved
 

@@ -180,10 +180,16 @@ confirm-idempotency, cancel-issuance-rollback, and the 10 s
 
 Options **C** (per-agent multi-field index for
 `claim_by_sandbox_binding*`) and **D** (expiry priority queue for
-`cleanup_inner`) were sketched during design and deferred —
-sandbox-binding cases are already 606-619 ns (inside budget) and
-Option B renders D moot except in the pathological > 5K-full
-branch.
+`cleanup_inner`) were sketched during design and deferred. They
+are **recorded** — not forgotten — with explicit trigger
+conditions in [test-report.md § D.1.2 → "Deferred perf
+optimizations (tracked follow-ups)"](../test-report.md#deferred-perf-optimizations-tracked-follow-ups):
+sandbox-binding revisit if p99 shows it dominating cooperative
+claim cost, or a deployment observes > 1K sandbox-bound leases per
+proxy; expiry heap revisit if the > MAX/2 fallback branch starts
+firing frequently or `MAX_INTENTS` is raised past ~50K. Neither
+signal exists today (sandbox-binding is 606-619 ns, inside budget;
+Option B amortization keeps the cleanup path effectively free).
 
 ### 2026-06-19: Bench refresh + CI bench-build coverage
 
