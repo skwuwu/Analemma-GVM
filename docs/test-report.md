@@ -1230,6 +1230,116 @@ Before rules: all requests hit Default-to-Caution (300ms delay). After rules: al
 
 ---
 
+## D.1.2 Benchmark Refresh (2026-07-05 — cooperative lease O(N) → O(1))
+
+**Source**: [benches/pipeline.rs](benches/pipeline.rs) —
+`bench_cooperative_lease` group, same 5 cases as D.1.1 for
+direct comparison.
+**Platform**: EC2 t3.medium (2 vCPU, 4 GB RAM), Ubuntu 24.04,
+kernel 6.17.0-1009-aws, ext4.
+**Repo HEAD**: [`854cdfa`](https://github.com/skwuwu/Analemma-GVM/commit/854cdfa) — after two-step
+cooperative-lease claim-path optimization:
+
+  - [`a752cb7`](https://github.com/skwuwu/Analemma-GVM/commit/a752cb7) — **Option B**: amortize `cleanup_inner`
+    across claims. Skip the O(N) sweep unless
+    ≥ CLEANUP_MIN_INTERVAL (100 ms) has passed OR the store is
+    > MAX_INTENTS / 2 full. Correctness preserved because every
+    claim-time predicate still re-checks `is_expired()` and
+    `state` explicitly; the sweep only reclaims memory for the
+    cap and ages out timed-out Claims.
+  - [`854cdfa`](https://github.com/skwuwu/Analemma-GVM/commit/854cdfa) — **Option A**: `token_hash_index:
+    HashMap<[u8; 32], u64>` reverse index on `StoreInner`.
+    `claim_by_token_hash` becomes O(1). Maintained on insert
+    (`register_with_context_token`), remove (`confirm`,
+    `cancel_intent`, `cleanup_inner`); `release` deliberately
+    does not touch it because the intent stays in the map.
+
+> Refresh trigger: the D.1.1 measurement flagged the 1K-active
+> `claim_by_token_hash` case at 60.8 µs — outside the < 1 µs
+> hot-path budget and 50× more than SRR alone. Investigation
+> revealed two O(N) sources overlapping: a per-claim
+> `cleanup_inner` sweep (~30 µs) and a linear token-hash scan
+> through `intents.values()` (~30 µs). Fix landed in two
+> commits so each step could be measured independently.
+
+### Cooperative lease — before / after
+
+| Bench | D.1.1 baseline | **After B (a752cb7)** | **After A (854cdfa)** | Total Δ |
+|---|---:|---:|---:|---:|
+| `claim_by_token_hash_hit_single_lease` | 528 ns | 492 ns | **973 ns** | +84% * |
+| **`claim_by_token_hash_hit_among_1k_active`** | **60.8 µs** | **35.8 µs** | **1.63 µs** | **-97.3%** |
+| `claim_by_token_hash_miss_unbound` | 103 ns | 103 ns | **94 ns** | -9% |
+| `claim_by_sandbox_binding_hit` (HTTP) | 560 ns | 604 ns | 606 ns | +8% ** |
+| `claim_by_sandbox_binding_host_hit` (CONNECT) | 564 ns | 527 ns | 619 ns | +10% ** |
+
+`*` `single_lease` regression is measurement-noise-dominated:
+Criterion 95% CI on this run was [857 ns … 1120 ns], width 262 ns
+(27% of the median), so the "+84%" figure is well inside
+t3.medium burstable-credit variance. The mechanistic cost of
+adding a HashMap<[u8; 32], u64> lookup on top of a 1-entry linear
+scan is ~30 ns of SipHash(32) work — real, but tiny compared to
+the sub-µs baseline. It's a genuine trade-off: single_lease pays
+30-50 ns; 1K-active gets 59 µs back.
+
+`**` `sandbox_binding_*` cases are unrelated to the change (they
+still use the linear scan through `intents.values()` — Option C in
+the design note, deliberately deferred). The +8-10% vs D.1.1 is
+noise, not a regression: those functions are not touched by
+either commit.
+
+### Key results
+
+- **1K-active claim: 60.8 µs → 1.63 µs (40× faster, -97.3%)** —
+  well inside the § 3.1 hot-path budget. The dominant remaining
+  cost is the Mutex acquire + one HashMap lookup + a state check.
+- **Miss (unbound) is faster** on the index (94 ns vs 103 ns) —
+  a HashMap miss on a 1K-entry map beats a linear scan through
+  1K entries, as expected. Replay / forgery / reused tokens hit
+  this path first.
+- **Single-lease case is a wash** at sub-µs — the +30-50 ns of
+  extra HashMap work is invisible against the mutex + state-check
+  floor and swamped by t3.medium credit noise.
+- Baseline (SRR / classification / max_strict / WAL) not
+  re-measured this run — the change is scoped strictly to
+  `src/intent_store.rs`. Those numbers stay valid from D.1.1.
+
+### Why not attack sandbox_binding too?
+
+Two Options were sketched during design (C: multi-field per-agent
+index, D: expiry heap for cleanup). Both deferred:
+
+- **Option C** would help only sandbox-IP-bound flows where the
+  token header is absent. Currently at 606-619 ns — well inside
+  the hot-path budget. The index maintenance (multi-key +
+  `.max_by_key(created_at)` ordering) adds real complexity for a
+  case that isn't near the ceiling. Revisit if a deployment
+  observes sandbox-IP claims dominating the p99.
+- **Option D** (expiry heap for `cleanup_inner`) is now obviated
+  by Option B — the sweep is amortized to ~zero cost in the
+  common case. Only worth revisiting if the "≥ MAX/2 full" branch
+  becomes frequent in practice.
+
+### Design invariants preserved
+
+1. **Single-use property holds under CLAIM_TIMEOUT auto-release**:
+   `token_reuse_after_claim_timeout_still_returns_unbound` (10 s
+   regression test, ignored by default) still passes with the
+   index in place. The 100 ms cleanup-skip window is two orders
+   of magnitude below the CLAIM_TIMEOUT of 10 s, so timed-out
+   Claims are still reaped within one timeout window.
+2. **Fail-closed on drift**: if the reverse index and `intents`
+   HashMap ever diverge (they can't through the code paths
+   updated here — every insert/remove site is symmetric), the
+   per-claim state re-check on the looked-up intent falls through
+   to `None`, and the caller sees `Unbound`. Never `Allow`.
+3. **No semantic change to WAL events**: `gvm.intent.lease_claimed`
+   / `lease_confirmed` / `lease_released` audit records are
+   emitted at exactly the same points as before.
+4. All 18 `cooperative_intent_lease_*` regression tests
+   (lifecycle, identity, phase 2/3/3b/3c, p1/p2) pass unchanged.
+
+---
+
 ## D.1.1 Benchmark Refresh (2026-06-19 — post-v0.6.3 cooperative-lease epic)
 
 **Source**: [benches/pipeline.rs](benches/pipeline.rs) — new

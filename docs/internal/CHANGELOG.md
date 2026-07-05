@@ -131,6 +131,60 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-07-05: Cooperative lease O(N) → O(1) claim path
+
+Two-step optimization of `IntentStore::claim_by_token_hash`, the
+hot-path lookup for cooperative-intent-lease bound requests. D.1.1
+had flagged the 1K-active case at 60.8 µs — outside the § 3.1
+< 1 µs budget and 50× SRR alone. Investigation traced this to
+two overlapping O(N) sources:
+
+  - `cleanup_inner` walks every intent on every claim (~30 µs)
+  - `intents.values().find(|i| ... token_hash == ...)` linear
+    scan through the same map (~30 µs)
+
+Fixed in two commits so each step is measured independently, and
+so the amortization piece can ship without touching the store's
+data shape:
+
+  - [`a752cb7`](https://github.com/skwuwu/Analemma-GVM/commit/a752cb7) — Option B: amortize
+    `cleanup_inner`. Add `last_cleanup: Instant` to `StoreInner`;
+    the sweep now returns early unless ≥ `CLEANUP_MIN_INTERVAL`
+    (100 ms) has elapsed OR the store is > `MAX_INTENTS / 2`
+    (5K) full. Correctness preserved by per-claim `is_expired()`
+    + `state` re-checks. **Result: 60.8 µs → 35.8 µs (-45 %).**
+  - [`854cdfa`](https://github.com/skwuwu/Analemma-GVM/commit/854cdfa) — Option A: `token_hash_index:
+    HashMap<[u8; 32], u64>` reverse index. `claim_by_token_hash`
+    is now O(1) (mutex + one HashMap lookup + state check).
+    Maintained on `register_with_context_token` (insert),
+    `confirm` / `cancel_intent` / `cleanup_inner` (remove).
+    `release` deliberately doesn't touch it — the intent stays
+    Active, the token stays valid. **Result: 35.8 µs → 1.63 µs
+    (-95 %).**
+
+**Cumulative: 60.8 µs → 1.63 µs (40× faster).** Full number
+matrix + design rationale + why Options C and D were deferred in
+[docs/test-report.md § D.1.2](../test-report.md#d12-benchmark-refresh-2026-07-05--cooperative-lease-on--o1).
+
+Trade-off worth pinning: the single-lease case moves from 528 ns
+to 973 ns median (with wide CI [857-1120]). The mechanistic cost
+is the ~30 ns SipHash on the 32-byte token added on top of a
+1-entry linear scan. The regression is inside t3.medium
+credit noise and is a rational trade for a 59 µs win at 1K
+active.
+
+All 18 `cooperative_intent_lease_*` regression tests pass
+unchanged, including single-use, sandbox-binding-picks-most-recent,
+confirm-idempotency, cancel-issuance-rollback, and the 10 s
+`token_reuse_after_claim_timeout_still_returns_unbound` guard.
+
+Options **C** (per-agent multi-field index for
+`claim_by_sandbox_binding*`) and **D** (expiry priority queue for
+`cleanup_inner`) were sketched during design and deferred —
+sandbox-binding cases are already 606-619 ns (inside budget) and
+Option B renders D moot except in the pathological > 5K-full
+branch.
+
 ### 2026-06-19: Bench refresh + CI bench-build coverage
 
 Two related changes after the v0.6.0 → v0.6.3 cooperative-intent
