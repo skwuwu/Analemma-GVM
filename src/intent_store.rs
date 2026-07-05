@@ -200,6 +200,15 @@ fn make_key(method: &str, host: &str, path: &str) -> IndexKey {
 struct StoreInner {
     intents: HashMap<u64, Intent>,
     index: HashMap<IndexKey, Vec<u64>>,
+    /// Reverse index: SHA-256(context_token) → intent_id, for
+    /// O(1) cooperative-lease claim-by-token. Only cooperative
+    /// leases have a token, so entries are strictly a subset of
+    /// `intents`. Maintained on insert (register_with_context_token),
+    /// removal (confirm/cleanup/cancel), and NOT on release (the
+    /// entry stays, matching the lease's Active-again state).
+    /// Insertion is safe against collision because token_hash is
+    /// 256-bit random.
+    token_hash_index: HashMap<[u8; 32], u64>,
     /// Last time `cleanup_inner` ran a full sweep. Used to amortize
     /// the O(N) sweep across many claims — a Claim on a hot store
     /// checks this timestamp and skips the sweep unless it's been
@@ -440,6 +449,7 @@ impl IntentStore {
             inner: Mutex::new(StoreInner {
                 intents: HashMap::new(),
                 index: HashMap::new(),
+                token_hash_index: HashMap::new(),
                 last_cleanup: Instant::now(),
             }),
             default_ttl: Duration::from_secs(default_ttl_secs),
@@ -604,6 +614,7 @@ impl IntentStore {
         };
 
         store.index.entry(key).or_default().push(intent_id);
+        store.token_hash_index.insert(token_hash, intent_id);
         store.intents.insert(intent_id, intent);
 
         // Zeroize the local copy of the secret bytes before
@@ -766,18 +777,15 @@ impl IntentStore {
 
         self.cleanup_inner(&mut store);
 
-        // Find the lease whose token_hash matches AND is still
-        // Active. A Claimed lease yields None (the concurrent
-        // path lost the race).
-        let intent_id = store
-            .intents
-            .values()
-            .find(|i| {
-                matches!(i.state, IntentState::Active)
-                    && !i.is_expired()
-                    && i.context_token_hash.as_ref() == Some(token_hash)
-            })
-            .map(|i| i.intent_id)?;
+        // O(1) lookup via reverse index. The intent may still be
+        // Claimed (concurrent race) or expired (waiting for the
+        // next sweep) — check state and expiry per-claim, exactly
+        // as the previous linear-scan predicate did.
+        let intent_id = store.token_hash_index.get(token_hash).copied()?;
+        let intent = store.intents.get(&intent_id)?;
+        if !matches!(intent.state, IntentState::Active) || intent.is_expired() {
+            return None;
+        }
 
         let claim_id = self.next_claim_id.fetch_add(1, Ordering::Relaxed);
         let intent = store.intents.get_mut(&intent_id)?;
@@ -963,6 +971,9 @@ impl IntentStore {
                 store.index.remove(&key);
             }
         }
+        if let Some(hash) = intent.context_token_hash {
+            store.token_hash_index.remove(&hash);
+        }
         tracing::warn!(
             intent_id,
             "Intent cancelled (issuance rollback — no durable lease_issued audit record)"
@@ -997,6 +1008,9 @@ impl IntentStore {
                 if ids.is_empty() {
                     store.index.remove(&key);
                 }
+            }
+            if let Some(hash) = intent.context_token_hash {
+                store.token_hash_index.remove(&hash);
             }
             tracing::debug!(
                 intent_id = id,
@@ -1093,6 +1107,9 @@ impl IntentStore {
                     if ids.is_empty() {
                         store.index.remove(&key);
                     }
+                }
+                if let Some(hash) = intent.context_token_hash {
+                    store.token_hash_index.remove(&hash);
                 }
             }
         }
