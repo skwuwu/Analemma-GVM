@@ -264,6 +264,7 @@ gvm run my_agent.py
 | [Reference](docs/reference.md) | Config, CLI, API, CI/CD |
 | [Security Model](docs/security-model.md) | Threat model, known attack surface (not externally audited) |
 | [Governance Coverage](docs/governance-coverage.md) | Per-mode enforcement matrix |
+| [Test Report & Benchmarks](docs/test-report.md) | Criterion bench matrix (SRR, cooperative lease, WAL, max_strict), E2E test coverage, historical refreshes |
 | [Changelog](docs/internal/CHANGELOG.md) | Roadmap, implementation log |
 
 ---
