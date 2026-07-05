@@ -200,7 +200,20 @@ fn make_key(method: &str, host: &str, path: &str) -> IndexKey {
 struct StoreInner {
     intents: HashMap<u64, Intent>,
     index: HashMap<IndexKey, Vec<u64>>,
+    /// Last time `cleanup_inner` ran a full sweep. Used to amortize
+    /// the O(N) sweep across many claims — a Claim on a hot store
+    /// checks this timestamp and skips the sweep unless it's been
+    /// > CLEANUP_MIN_INTERVAL since the last one OR the store is
+    /// past half its cap. See `cleanup_inner`.
+    last_cleanup: Instant,
 }
+
+/// Minimum time between full sweeps. Chosen as 100 ms: shorter
+/// than CLAIM_TIMEOUT (10 s) by two orders of magnitude, so timed-out
+/// Claims still get released within one CLAIM_TIMEOUT window; longer
+/// than any single request's proxy hot path, so a happy-path claim
+/// almost never triggers a sweep on a warm store.
+const CLEANUP_MIN_INTERVAL: Duration = Duration::from_millis(100);
 
 // ── Public Types ─────────────────────────────────────────────────────────────
 
@@ -427,6 +440,7 @@ impl IntentStore {
             inner: Mutex::new(StoreInner {
                 intents: HashMap::new(),
                 index: HashMap::new(),
+                last_cleanup: Instant::now(),
             }),
             default_ttl: Duration::from_secs(default_ttl_secs),
             next_intent_id: AtomicU64::new(1),
@@ -1036,6 +1050,20 @@ impl IntentStore {
 
     /// Internal cleanup: remove expired Active intents, release timed-out Claims.
     fn cleanup_inner(&self, store: &mut StoreInner) {
+        // Amortization gate: on a warm store, most claims come well
+        // within CLEANUP_MIN_INTERVAL of each other, so the sweep is
+        // pure overhead — nothing to reap. Skip unless (a) enough
+        // time has passed OR (b) the store is > 50% of MAX_INTENTS,
+        // which forces us to reap so `register` can't be starved.
+        // Correctness is preserved because per-claim predicates
+        // still call `is_expired()` and check `state` explicitly;
+        // the sweep only reclaims memory for the store cap.
+        if store.last_cleanup.elapsed() < CLEANUP_MIN_INTERVAL
+            && store.intents.len() < MAX_INTENTS / 2
+        {
+            return;
+        }
+
         let mut to_remove = Vec::new();
 
         for (id, intent) in store.intents.iter_mut() {
@@ -1068,6 +1096,8 @@ impl IntentStore {
                 }
             }
         }
+
+        store.last_cleanup = Instant::now();
     }
 
     /// Get current store stats.
