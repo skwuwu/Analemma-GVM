@@ -1438,6 +1438,28 @@ fn bench_cooperative_lease(c: &mut Criterion) {
     }
 
     let mut group = c.benchmark_group("cooperative_lease");
+    // Tail-visible config for the claim hot path.
+    //   - sample_size 500 (vs default 100): p95/p99 need ~20 samples
+    //     in the tail bucket to be stable — 100 total gives 1-5, 500
+    //     gives 25 minimum.
+    //   - warm_up_time 5 s (vs default 3 s): t3.medium burstable CPU
+    //     credit takes ~4 s to stabilize from cold; longer warm-up
+    //     eliminates a systematic slow-first-samples bias.
+    //   - measurement_time 15 s (vs default 5 s): scales with sample
+    //     count so each sample still gets enough iterations for a
+    //     stable per-iter estimate.
+    //   - noise_threshold 0.05: Criterion will call any change < 5 %
+    //     "no change" instead of reporting "-1.7 %" jitter deltas.
+    //   - confidence_level 0.99 (vs default 0.95): wider CI, fewer
+    //     false regression alarms on the tail.
+    // These override Criterion's per-group defaults just for this
+    // group; other groups keep their existing config.
+    group
+        .sample_size(500)
+        .warm_up_time(std::time::Duration::from_secs(5))
+        .measurement_time(std::time::Duration::from_secs(15))
+        .noise_threshold(0.05)
+        .confidence_level(0.99);
 
     // ── 1. Token-hash claim, single lease in store (hit) ──
     //
