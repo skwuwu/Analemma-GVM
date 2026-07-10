@@ -174,17 +174,34 @@ fn resolve_dot_segments(path: &str) -> String {
     }
 }
 
-/// Normalize IPv6 host addresses to their canonical IPv4 equivalents.
+/// Normalize IPv6 host addresses so SSRF rules written for their
+/// canonical (usually IPv4) form still match.
 ///
-/// This prevents SSRF bypass via IPv6 variants:
-/// - `[::1]` → `localhost` (IPv6 loopback)
-/// - `[::ffff:127.0.0.1]` → `127.0.0.1` (IPv4-mapped IPv6)
-/// - `[0:0:0:0:0:ffff:127.0.0.1]` → `127.0.0.1` (full-form IPv4-mapped)
-/// - `[::ffff:7f00:1]` → `127.0.0.1` (hex IPv4-mapped)
-/// - `[fd00:ec2::254]` → `metadata.aws.ipv6` (AWS IPv6 metadata)
-/// - `[::ffff:169.254.169.254]` → `169.254.169.254` (cloud metadata IPv4-mapped)
+/// Coverage matrix (each row maps a class of IPv6 bypass attempt to
+/// a sentinel that SRR rules can pattern-match):
 ///
-/// Returns None if no normalization needed (host is already in canonical form).
+/// | Class | Example | Sentinel |
+/// |---|---|---|
+/// | Loopback | `[::1]`, `[0:0:0:0:0:0:0:1]` | `localhost` |
+/// | Unspecified | `[::]` | `unspecified.ipv6.invalid` |
+/// | IPv4-mapped | `[::ffff:127.0.0.1]`, `[::ffff:7f00:1]` | underlying IPv4 |
+/// | IPv4-compatible (deprecated) | `[::127.0.0.1]` | underlying IPv4 |
+/// | 6to4 encapsulation | `[2002:7f00:1::]` | underlying IPv4 |
+/// | Link-local | `[fe80::1]`, `[fe80::1%eth0]` | `link-local.ipv6.invalid` |
+/// | Unique Local (ULA) | `[fd12:3456:789a::1]`, `[fc00::1]` | `unique-local.ipv6.invalid` |
+/// | Multicast | `[ff02::1]`, `[ff05::1]` | `multicast.ipv6.invalid` |
+/// | Cloud metadata (AWS IPv6) | `[fd00:ec2::254]` | `169.254.169.254` |
+/// | Cloud metadata (IPv4-mapped) | `[::ffff:169.254.169.254]` | `169.254.169.254` |
+///
+/// The `.invalid` sentinels use RFC 2606's reserved TLD so they can
+/// never collide with a real domain. Operators are expected to add
+/// SRR deny rules that pattern-match these sentinels for the range
+/// classes; see [docs/security-model.md § 9](../../docs/security-model.md#9-ipv6-ssrf-mitigated)
+/// for the recommended starter rule pack.
+///
+/// Returns None if no normalization was applied (the host is either
+/// not an IPv6 address, or is a public IPv6 outside any of these
+/// classes).
 pub(super) fn normalize_host(host: &str) -> Option<String> {
     // Strip brackets if present: [::1] → ::1
     let inner = host
@@ -197,74 +214,153 @@ pub(super) fn normalize_host(host: &str) -> Option<String> {
 
     let ipv6 = inner?;
 
-    // Normalize: remove leading zeros, lowercase
-    let normalized = ipv6.to_lowercase();
+    // Strip zone ID (RFC 4007) — `fe80::1%eth0` → `fe80::1`. A zone
+    // ID is meaningful at the OS level but is not part of the IPv6
+    // address itself, and an attacker can slap one on to try to skip
+    // range detection.
+    let without_zone = ipv6.split('%').next().unwrap_or(ipv6);
 
-    // Check for loopback variants
-    if is_ipv6_loopback(&normalized) {
+    // Normalize: remove leading zeros, lowercase
+    let normalized = without_zone.to_lowercase();
+    let segments = expand_ipv6(&normalized);
+
+    // Check for loopback variants (::1)
+    if segments == [0, 0, 0, 0, 0, 0, 0, 1] {
         return Some("localhost".to_string());
     }
 
-    // Check for IPv4-mapped addresses: ::ffff:a.b.c.d or 0:0:0:0:0:ffff:a.b.c.d
-    if let Some(v4) = extract_ipv4_mapped(&normalized) {
+    // Unspecified :: — some stacks route this to loopback.
+    if segments == [0; 8] {
+        return Some("unspecified.ipv6.invalid".to_string());
+    }
+
+    // IPv4-mapped ::ffff:a.b.c.d (segments 0-4 zero, seg 5 = 0xffff)
+    if let Some(v4) = extract_ipv4_mapped(&normalized, &segments) {
         return Some(v4);
     }
 
-    // Check for known cloud metadata IPv6 addresses
-    if is_cloud_metadata_ipv6(&normalized) {
+    // IPv4-compatible ::a.b.c.d (deprecated RFC 4291 form: segs 0-5
+    // all zero, IPv4 in the low 32 bits). Some legacy resolvers still
+    // handle this even though it was deprecated in 2006 — treat as
+    // IPv4-mapped for range-check purposes.
+    if let Some(v4) = extract_ipv4_compatible(&normalized, &segments) {
+        return Some(v4);
+    }
+
+    // 6to4 encapsulation 2002:AABB:CCDD::/48 — segments 1 and 2
+    // hex-encode the public IPv4 the tunnel exits from. An attacker
+    // can craft `[2002:7f00:1::]` to embed 127.0.0.1 and evade the
+    // IPv4-mapped detector.
+    if let Some(v4) = extract_6to4_ipv4(&segments) {
+        return Some(v4);
+    }
+
+    // Known cloud metadata IPv6 addresses (currently AWS-specific).
+    if is_cloud_metadata_ipv6(&segments) {
         return Some("169.254.169.254".to_string());
+    }
+
+    // Range-class checks (return categorical sentinels rather than
+    // extracting an underlying IPv4 — these ranges don't embed one).
+    if is_ipv6_link_local(&segments) {
+        return Some("link-local.ipv6.invalid".to_string());
+    }
+    if is_ipv6_unique_local(&segments) {
+        return Some("unique-local.ipv6.invalid".to_string());
+    }
+    if is_ipv6_multicast(&segments) {
+        return Some("multicast.ipv6.invalid".to_string());
     }
 
     None
 }
 
-/// Check if an IPv6 address (without brackets) is a loopback.
-/// Covers: ::1, 0::1, 0:0:0:0:0:0:0:1 and all zero-compression variants.
-fn is_ipv6_loopback(addr: &str) -> bool {
-    // Parse by expanding :: and checking if result is 0:0:0:0:0:0:0:1
-    let expanded = expand_ipv6(addr);
-    expanded == [0, 0, 0, 0, 0, 0, 0, 1]
-}
-
-/// Extract IPv4 address from an IPv4-mapped IPv6 address.
-/// ::ffff:127.0.0.1 → Some("127.0.0.1")
-/// ::ffff:7f00:1 → Some("127.0.0.1")
-/// 0:0:0:0:0:ffff:a9fe:a9fe → Some("169.254.169.254")
-fn extract_ipv4_mapped(addr: &str) -> Option<String> {
-    let segments = expand_ipv6(addr);
-
+/// Extract IPv4 address from an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`).
+/// Preserves dotted-decimal notation when the original used it, otherwise
+/// reassembles from the hex segments.
+fn extract_ipv4_mapped(addr: &str, segments: &[u16; 8]) -> Option<String> {
     // IPv4-mapped: first 5 segments zero, 6th = 0xffff
     if segments[0..5] != [0, 0, 0, 0, 0] || segments[5] != 0xffff {
         return None;
     }
+    Some(ipv4_from_low32(addr, segments))
+}
 
-    // Check if the original has dotted-decimal notation (::ffff:1.2.3.4)
+/// Extract IPv4 from the deprecated IPv4-compatible IPv6 form `::a.b.c.d`
+/// (RFC 4291 §2.5.5.1, deprecated in RFC 4291 §2.5.5). Segments 0-5 all
+/// zero, IPv4 in the low 32 bits. Distinct from IPv4-mapped by seg 5:
+/// 0xffff for mapped, 0x0000 for compatible.
+fn extract_ipv4_compatible(addr: &str, segments: &[u16; 8]) -> Option<String> {
+    if segments[0..6] != [0, 0, 0, 0, 0, 0] {
+        return None;
+    }
+    // Exclude ::, ::1 which are unspecified/loopback and handled earlier.
+    if segments[6] == 0 && (segments[7] == 0 || segments[7] == 1) {
+        return None;
+    }
+    Some(ipv4_from_low32(addr, segments))
+}
+
+/// Extract IPv4 from 6to4 encapsulation `2002:AABB:CCDD::/48`.
+/// Segments 1 and 2 hex-encode the public IPv4 the tunnel exits from.
+fn extract_6to4_ipv4(segments: &[u16; 8]) -> Option<String> {
+    if segments[0] != 0x2002 {
+        return None;
+    }
+    let a = (segments[1] >> 8) as u8;
+    let b = (segments[1] & 0xff) as u8;
+    let c = (segments[2] >> 8) as u8;
+    let d = (segments[2] & 0xff) as u8;
+    Some(format!("{}.{}.{}.{}", a, b, c, d))
+}
+
+/// Reassemble an IPv4 dotted-decimal string from the low 32 bits of the
+/// IPv6 segments. Prefers the original dotted notation if the address
+/// used it — avoids re-encoding `[::ffff:127.0.0.1]` as `127.0.0.1`
+/// via hex (which is lossless but harder to audit-diff).
+fn ipv4_from_low32(addr: &str, segments: &[u16; 8]) -> String {
     if let Some(dot_pos) = addr.rfind('.') {
-        // Find the IPv4 part after the last colon before the dotted section
-        let colon_before_v4 = addr[..dot_pos].rfind(':')?;
-        let v4_str = &addr[colon_before_v4 + 1..];
-        if v4_str.contains('.') {
-            return Some(v4_str.to_string());
+        if let Some(colon_before_v4) = addr[..dot_pos].rfind(':') {
+            let v4_str = &addr[colon_before_v4 + 1..];
+            if v4_str.contains('.') {
+                return v4_str.to_string();
+            }
         }
     }
-
-    // Hex form: segments 6 and 7 encode the IPv4 address
     let a = (segments[6] >> 8) as u8;
     let b = (segments[6] & 0xff) as u8;
     let c = (segments[7] >> 8) as u8;
     let d = (segments[7] & 0xff) as u8;
-    Some(format!("{}.{}.{}.{}", a, b, c, d))
+    format!("{}.{}.{}.{}", a, b, c, d)
 }
 
-/// Check if an IPv6 address is a known cloud metadata endpoint.
-fn is_cloud_metadata_ipv6(addr: &str) -> bool {
-    let segments = expand_ipv6(addr);
+/// Link-local range `fe80::/10` (RFC 4291 §2.5.6). First 10 bits are
+/// `1111111010`. Common attack payloads target the default gateway
+/// (`[fe80::1]`) or neighbor-discovery services.
+fn is_ipv6_link_local(segments: &[u16; 8]) -> bool {
+    (segments[0] & 0xffc0) == 0xfe80
+}
+
+/// Unique Local Address (ULA) range `fc00::/7` (RFC 4193). First 7
+/// bits are `1111110`. Used for private internal networks; SSRF into
+/// these hits sandbox neighbors and internal services.
+fn is_ipv6_unique_local(segments: &[u16; 8]) -> bool {
+    (segments[0] & 0xfe00) == 0xfc00
+}
+
+/// Multicast range `ff00::/8` (RFC 4291 §2.7). First 8 bits are all 1.
+/// Includes all-nodes `[ff02::1]`, all-routers, site-local scopes.
+fn is_ipv6_multicast(segments: &[u16; 8]) -> bool {
+    (segments[0] & 0xff00) == 0xff00
+}
+
+/// Check if an IPv6 address is a known cloud metadata endpoint. AWS is
+/// the only cloud provider with a documented IPv6 metadata address
+/// (`fd00:ec2::254`); GCP and Azure metadata services are IPv4-only or
+/// DNS-resolved and are covered by the DNS-governance layer.
+fn is_cloud_metadata_ipv6(segments: &[u16; 8]) -> bool {
     // AWS IPv6 metadata: fd00:ec2::254
-    // Expanded: fd00:ec2:0:0:0:0:0:254 → [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
-    if segments == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254] {
-        return true;
-    }
-    false
+    *segments == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
 }
 
 /// Expand an IPv6 address string into 8 u16 segments.

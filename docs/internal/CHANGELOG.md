@@ -131,6 +131,93 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-07-10: IPv6 SSRF gap closure (7 new classes)
+
+Follow-up on a drift discovery: [security-model.md § 9](../security-model.md#9-ipv6-ssrf-mitigated)
+had claimed "IPv4-Mapped IPv6 Bypass (Fixed)" since v0.2, and the
+CHANGELOG's 2026-03-15 entry called it "IPv6 SSRF Normalization",
+but the actual coverage in `normalize_host()` was three narrow
+classes only: IPv6 loopback (`::1` and zero-compression variants),
+IPv4-mapped `::ffff:/96` addresses, and the specific AWS metadata
+sentinel `fd00:ec2::254`. Seven other IPv6 SSRF classes were open —
+correctly listed in test-report.md's gap table (P3, issue #7) but
+implicitly claimed as closed by the § 9 title.
+
+This entry closes issue #7 and reconciles the three drifted docs.
+
+**What changed** — [`src/srr/normalize.rs`](../src/srr/normalize.rs):
+
+Extended `normalize_host()` to detect and normalize 7 additional
+classes. Each detector returns a canonical sentinel that SRR rules
+can pattern-match:
+
+  - **Link-local (`fe80::/10`)** → `link-local.ipv6.invalid`
+    (default gateway `[fe80::1]`, neighbor discovery, `%eth0` zone
+    IDs stripped per RFC 4007)
+  - **Unique Local (`fc00::/7`, ULA)** → `unique-local.ipv6.invalid`
+    (RFC 4193 internal networks; AWS metadata `fd00:ec2::254`
+    still hits its earlier, more specific sentinel)
+  - **Multicast (`ff00::/8`)** → `multicast.ipv6.invalid`
+    (all-nodes `[ff02::1]`, all-routers, site-local scopes)
+  - **Unspecified (`::`)** → `unspecified.ipv6.invalid`
+    (some kernels route outbound `::` to loopback)
+  - **6to4 encapsulation (`2002::/16`)** → underlying IPv4
+    (extracts A.B.C.D from `[2002:AABB:CCDD::/48]`; `[2002:7f00:1::]`
+    reveals as `127.0.0.1` and hits existing loopback rules)
+  - **IPv4-compatible (`::a.b.c.d`, deprecated per RFC 4291)** →
+    underlying IPv4 (some legacy resolvers still handle this;
+    `[::127.0.0.1]` and `[::7f00:1]` both normalize to `127.0.0.1`)
+  - **Zone-ID strip (RFC 4007)** — happens before all detectors so
+    `[fe80::1%eth0]` and `[fe80::1]` are treated identically. Zone
+    IDs are OS-level metadata, an attacker can slap one on to try
+    to bypass range detection.
+
+The `.invalid` sentinels use RFC 2606's reserved TLD so they can
+never collide with a real domain. For the range-class sentinels
+(link-local, ULA, multicast, unspecified), operators must add SRR
+deny rules keyed on the sentinel — a starter rule pack is now
+documented in [security-model.md § 9](../security-model.md#9-ipv6-ssrf-mitigated).
+The IPv4-extracting classes (mapped, compatible, 6to4, AWS
+metadata) reuse existing IPv4-keyed rules — no operator action
+required for those.
+
+**Non-goal**: GCP and Azure metadata services are IPv4-only or
+DNS-resolved (`metadata.google.internal.`, no canonical IPv6
+address). The DNS-governance layer handles those paths; we don't
+add IPv6 sentinels for something that has no canonical IPv6 form.
+
+**Tests** — [`tests/boundary.rs`](../../tests/boundary.rs) § 3.5.b
+adds 6 regression tests exercising ~25 attack payload vectors:
+
+  - `ssrf_ipv6_link_local_blocked_by_srr` — 4 variants including
+    zone-ID-suffix form + public IPv6 negative case
+  - `ssrf_ipv6_ula_blocked_by_srr` — 4 variants spanning the
+    `fc00::/7` range + AWS-metadata precedence assertion
+  - `ssrf_ipv6_multicast_blocked_by_srr` — 5 variants across
+    scope classes (link, site, global)
+  - `ssrf_ipv6_6to4_encapsulation_blocked` — 3 embedded-private
+    IPv4 variants + public-IPv4-in-6to4 negative case
+  - `ssrf_ipv6_v4_compatible_deprecated_still_normalized` —
+    dotted and hex forms
+  - `ssrf_ipv6_unspecified_blocked_by_srr`
+
+All existing IPv6 SSRF tests (`ssrf_ipv6_loopback_*`,
+`ssrf_ipv6_mapped_v4_*`, `ssrf_ipv6_private_ranges_mapped_*`,
+`ssrf_ipv6_cloud_metadata_*`) continue to pass — the refactor
+didn't change any of the previously-covered paths, only added new
+detection branches after them.
+
+**Doc reconciliation**:
+
+  - [security-model.md § 9](../security-model.md#9-ipv6-ssrf-mitigated)
+    title changed from "IPv4-Mapped IPv6 Bypass (Fixed)" to
+    "IPv6 SSRF (Mitigated)" with an explicit 10-row coverage
+    matrix. Anchor `#9-ipv6-ssrf-mitigated` added for cross-linking.
+  - [test-report.md](../test-report.md) gap table row for
+    "IPv6 SSRF defense" now shows `~~P3~~ **CLOSED 2026-07-10**`
+    with links to § 9 and the test file.
+  - Issue #7 can be closed once these commits land on master.
+
 ### 2026-07-05: Cooperative lease O(N) → O(1) claim path
 
 Two-step optimization of `IntentStore::claim_by_token_hash`, the
@@ -5780,7 +5867,9 @@ WAL events form a binary Merkle tree per batch (intra-batch O(log N) verificatio
 
 ### IPv6 SSRF Normalization (2026-03-15)
 
-`normalize_host()` in `src/srr.rs` expands all IPv6 variants (zero-compression, bracket notation, IPv4-mapped) to canonical IPv4 before SRR matching. 13 attack variants tested across loopback, IPv4-mapped, cloud metadata, and private ranges — all correctly denied.
+`normalize_host()` in `src/srr.rs` expands **IPv6 loopback, IPv4-mapped, and AWS-metadata** variants (zero-compression, bracket notation, IPv4-mapped, `fd00:ec2::254`) to canonical IPv4 before SRR matching. 13 attack variants tested across those three classes — all correctly denied.
+
+> **Scope note (added 2026-07-10)**: this entry originally read "all IPv6 variants" which overclaimed the coverage. The actual v0.2 fix handled 3 classes (loopback + IPv4-mapped + AWS metadata). Seven other IPv6 SSRF classes (link-local, ULA, multicast, unspecified, 6to4, IPv4-compatible, zone-ID-suffixed) remained open until the [2026-07-10 gap closure](#2026-07-10-ipv6-ssrf-gap-closure-7-new-classes) — see that entry for the full coverage matrix.
 
 ### WASI Preview1 Fix (2026-03-15)
 

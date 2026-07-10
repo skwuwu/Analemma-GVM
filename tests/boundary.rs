@@ -834,6 +834,284 @@ fn ssrf_ipv6_private_ranges_mapped_blocked() {
     );
 }
 
+// ── 3.5.b Extended IPv6 SSRF: link-local, ULA, multicast, 6to4, compat, unspecified, zone-id ──
+//
+// D.1.1-era coverage matrix (loopback, IPv4-mapped, AWS-metadata) left
+// the following IPv6 SSRF vectors as an open gap (test-report.md #7):
+//
+//   - link-local (fe80::/10)  → gateway / neighbor discovery attacks
+//   - ULA (fc00::/7)          → private internal services
+//   - multicast (ff00::/8)    → link-scope broadcast
+//   - 6to4 (2002::/16)        → embed IPv4 in the middle segments,
+//                                bypasses IPv4-mapped detector
+//   - IPv4-compatible (::a.b.c.d, deprecated but resolver-supported)
+//   - unspecified (::)         → some stacks route to loopback
+//   - zone-ID suffix (%eth0)  → strip before normalization
+//
+// Each block below verifies the normalize_host sentinel (or extracted
+// IPv4) reaches the SRR path and matches the operator's deny rule.
+
+#[test]
+fn ssrf_ipv6_link_local_blocked_by_srr() {
+    let srr = srr_from_toml(
+        r#"
+        [[rules]]
+        method = "*"
+        pattern = "link-local.ipv6.invalid/{any}"
+        decision = { type = "Deny", reason = "SSRF: IPv6 link-local blocked" }
+
+        [[rules]]
+        method = "*"
+        pattern = "{any}"
+        decision = { type = "Allow" }
+    "#,
+    );
+
+    // fe80::/10 first 10 bits fixed; final 118 bits are the interface
+    // identifier. Verify a spread across the range.
+    let link_local_variants = [
+        "[fe80::1]",
+        "[fe80::200:5eff:fe00:5301]",
+        "[febf:ffff::1]", // last address in fe80::/10 (fe80..febf)
+        "[fe80::1%eth0]", // RFC 4007 zone ID must be stripped
+    ];
+
+    for host in &link_local_variants {
+        let d = srr.check("GET", host, "/router-admin", None).decision;
+        assert!(
+            matches!(d, EnforcementDecision::Deny { .. }),
+            "IPv6 link-local {} must normalize to sentinel and Deny, got {:?}",
+            host,
+            d
+        );
+    }
+
+    // Public IPv6 outside link-local must NOT collide with the sentinel.
+    let d = srr.check("GET", "[2001:db8::1]", "/api", None).decision;
+    assert!(
+        !matches!(d, EnforcementDecision::Deny { .. }),
+        "Public IPv6 must not match link-local sentinel"
+    );
+}
+
+#[test]
+fn ssrf_ipv6_ula_blocked_by_srr() {
+    let srr = srr_from_toml(
+        r#"
+        [[rules]]
+        method = "*"
+        pattern = "unique-local.ipv6.invalid/{any}"
+        decision = { type = "Deny", reason = "SSRF: IPv6 ULA blocked" }
+
+        [[rules]]
+        method = "*"
+        pattern = "{any}"
+        decision = { type = "Allow" }
+    "#,
+    );
+
+    // fc00::/7 covers fc00:: through fdff:...
+    let ula_variants = [
+        "[fc00::1]",
+        "[fd12:3456:789a::1]",
+        "[fdcc:dead:beef::1]",
+        "[fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]",
+    ];
+
+    for host in &ula_variants {
+        let d = srr.check("GET", host, "/internal", None).decision;
+        assert!(
+            matches!(d, EnforcementDecision::Deny { .. }),
+            "IPv6 ULA {} must normalize to sentinel and Deny, got {:?}",
+            host,
+            d
+        );
+    }
+
+    // AWS IPv6 metadata (fd00:ec2::254) IS a ULA but has a more specific
+    // sentinel (169.254.169.254) — verify the earlier cloud-metadata
+    // check wins, so operators writing a metadata rule are still
+    // protected even without a ULA rule.
+    let d = srr
+        .check("GET", "[fd00:ec2::254]", "/latest/meta-data", None)
+        .decision;
+    // With only the ULA rule active it matches "unique-local.ipv6.invalid"
+    // (not "169.254.169.254"), but should still Deny because
+    // is_cloud_metadata_ipv6 wins earlier in normalize_host. Assert on
+    // the Deny reason to confirm the correct sentinel path was chosen.
+    match d {
+        EnforcementDecision::Deny { reason, .. } => {
+            // Cloud-metadata check runs before ULA in normalize_host, so
+            // this ULA-address that IS metadata falls into the earlier
+            // branch — but there's no metadata rule active here, so it
+            // falls through to Allow. That's the correct precedence.
+            assert_ne!(
+                reason, "SSRF: IPv6 ULA blocked",
+                "AWS metadata should NOT match the ULA sentinel — it must \
+                 normalize to 169.254.169.254 first"
+            );
+        }
+        _ => {} // Falls through to Allow (no metadata rule) — expected
+    }
+}
+
+#[test]
+fn ssrf_ipv6_multicast_blocked_by_srr() {
+    let srr = srr_from_toml(
+        r#"
+        [[rules]]
+        method = "*"
+        pattern = "multicast.ipv6.invalid/{any}"
+        decision = { type = "Deny", reason = "SSRF: IPv6 multicast blocked" }
+
+        [[rules]]
+        method = "*"
+        pattern = "{any}"
+        decision = { type = "Allow" }
+    "#,
+    );
+
+    let multicast_variants = [
+        "[ff02::1]", // all-nodes on link
+        "[ff02::2]", // all-routers on link
+        "[ff05::1]", // site-local all-nodes
+        "[ff0e::1]", // global scope
+        "[ffff::1]", // last address in ff00::/8
+    ];
+
+    for host in &multicast_variants {
+        let d = srr.check("GET", host, "/", None).decision;
+        assert!(
+            matches!(d, EnforcementDecision::Deny { .. }),
+            "IPv6 multicast {} must normalize to sentinel and Deny, got {:?}",
+            host,
+            d
+        );
+    }
+}
+
+#[test]
+fn ssrf_ipv6_6to4_encapsulation_blocked() {
+    let srr = srr_from_toml(
+        r#"
+        [[rules]]
+        method = "*"
+        pattern = "127.0.0.1/{any}"
+        decision = { type = "Deny", reason = "SSRF: loopback via 6to4 blocked" }
+
+        [[rules]]
+        method = "*"
+        pattern = "10.0.0.1/{any}"
+        decision = { type = "Deny", reason = "SSRF: private via 6to4 blocked" }
+
+        [[rules]]
+        method = "*"
+        pattern = "169.254.169.254/{any}"
+        decision = { type = "Deny", reason = "SSRF: metadata via 6to4 blocked" }
+
+        [[rules]]
+        method = "*"
+        pattern = "{any}"
+        decision = { type = "Allow" }
+    "#,
+    );
+
+    // 6to4 layout: 2002:AABB:CCDD::/48 where A.B.C.D is the embedded
+    // IPv4. Attacker uses this to smuggle private/reserved IPs past
+    // the IPv4-mapped detector (which only matches ::ffff:/96).
+    let cases = [
+        ("[2002:7f00:1::]", "loopback"),   // 127.0.0.1
+        ("[2002:0a00:1::]", "private"),    // 10.0.0.1
+        ("[2002:a9fe:a9fe::]", "metadata"),// 169.254.169.254
+    ];
+
+    for (host, label) in &cases {
+        let d = srr.check("GET", host, "/admin", None).decision;
+        assert!(
+            matches!(d, EnforcementDecision::Deny { .. }),
+            "6to4-encapsulated {} address {} must be denied, got {:?}",
+            label,
+            host,
+            d
+        );
+    }
+
+    // Public IPv4 embedded in 6to4 must NOT be blocked by the private
+    // rules — verifies we're not just deny-listing 2002::/16 wholesale.
+    let d = srr.check("GET", "[2002:0808:0808::]", "/api", None).decision;
+    assert!(
+        !matches!(d, EnforcementDecision::Deny { .. }),
+        "Public IPv4 (8.8.8.8) via 6to4 must not match private-range \
+         rules — got {:?}",
+        d
+    );
+}
+
+#[test]
+fn ssrf_ipv6_v4_compatible_deprecated_still_normalized() {
+    let srr = srr_from_toml(
+        r#"
+        [[rules]]
+        method = "*"
+        pattern = "127.0.0.1/{any}"
+        decision = { type = "Deny", reason = "SSRF: v4-compat loopback blocked" }
+
+        [[rules]]
+        method = "*"
+        pattern = "{any}"
+        decision = { type = "Allow" }
+    "#,
+    );
+
+    // Deprecated IPv4-compatible IPv6 (RFC 4291 §2.5.5.1): ::a.b.c.d
+    // with segments 0-5 all zero. Distinct from IPv4-mapped by seg 5
+    // being 0x0000 instead of 0xffff. Some legacy resolvers still
+    // handle these — SSRF via `[::127.0.0.1]` was the historical
+    // attack vector before IPv4-mapped normalization landed.
+    let d = srr
+        .check("GET", "[::127.0.0.1]", "/internal", None)
+        .decision;
+    assert!(
+        matches!(d, EnforcementDecision::Deny { .. }),
+        "IPv4-compatible loopback [::127.0.0.1] must be denied, got {:?}",
+        d
+    );
+
+    // Hex form of the same address.
+    let d2 = srr.check("GET", "[::7f00:1]", "/internal", None).decision;
+    assert!(
+        matches!(d2, EnforcementDecision::Deny { .. }),
+        "IPv4-compatible loopback in hex [::7f00:1] must be denied, got {:?}",
+        d2
+    );
+}
+
+#[test]
+fn ssrf_ipv6_unspecified_blocked_by_srr() {
+    let srr = srr_from_toml(
+        r#"
+        [[rules]]
+        method = "*"
+        pattern = "unspecified.ipv6.invalid/{any}"
+        decision = { type = "Deny", reason = "SSRF: IPv6 unspecified blocked" }
+
+        [[rules]]
+        method = "*"
+        pattern = "{any}"
+        decision = { type = "Allow" }
+    "#,
+    );
+
+    // :: is technically the wildcard for bind(), but some kernels
+    // treat outbound :: as loopback. Belt-and-suspenders.
+    let d = srr.check("GET", "[::]", "/admin", None).decision;
+    assert!(
+        matches!(d, EnforcementDecision::Deny { .. }),
+        "IPv6 unspecified [::] must normalize to sentinel and Deny, got {:?}",
+        d
+    );
+}
+
 // ── 3.6 API key leak prevention: GVM headers stripped from outbound ──
 // Already tested in 2.4, but verify specifically that X-GVM headers
 // cannot leak API keys or internal info to upstream services.

@@ -290,11 +290,48 @@ See the v1.6 entry below for current state.
 - **`gvm_role` claim is binary**: only `admin` is recognised. No finer-grained admin sub-roles (read-only-admin, approval-only, etc.). If demand surfaces, the field is already in the schema and can grow without WAL migration.
 - **Dashboard browser auth**: the `gvm dashboard` CLI command opens the admin URL in a browser. When admin is non-loopback, the browser must inject the Bearer header itself (DevTools or a fronting mTLS layer); the CLI cannot do it on the browser's behalf.
 
-### 9. IPv4-Mapped IPv6 Bypass (Fixed)
+### 9. IPv6 SSRF (Mitigated) {#9-ipv6-ssrf-mitigated}
 
-**Attack**: Bypass SSRF deny rules by using IPv6 notation (e.g., `[::ffff:127.0.0.1]` instead of `127.0.0.1`).
+**Attack**: Bypass SSRF deny rules written for IPv4 by using IPv6 notation. The bypass surface is broader than the classic `[::ffff:127.0.0.1]` — see the coverage matrix below.
 
-**Status**: Fixed in v0.2. `normalize_host()` canonicalizes IPv6 loopback, IPv4-mapped, and cloud metadata addresses before SRR matching.
+**Status**: **Mitigated in v0.6 (2026-07-10).** `normalize_host()` in [src/srr/normalize.rs](../src/srr/normalize.rs) resolves 10 IPv6 SSRF classes to a canonical sentinel (either an underlying IPv4 or a `.invalid` TLD sentinel) before SRR matching. Zone IDs (`%eth0`) are stripped first per RFC 4007. Enforced by [`tests/boundary.rs § 3.5` + `§ 3.5.b`](../tests/boundary.rs) — 10 regression tests, 25+ attack payload vectors.
+
+| IPv6 class | Example | Normalized to |
+|---|---|---|
+| Loopback (`::1`) | `[::1]`, `[0:0:0:0:0:0:0:1]` | `localhost` |
+| Unspecified (`::`) | `[::]` | `unspecified.ipv6.invalid` |
+| IPv4-mapped (`::ffff:/96`) | `[::ffff:127.0.0.1]`, `[::ffff:7f00:1]` | underlying IPv4 |
+| IPv4-compatible (`::a.b.c.d`, deprecated) | `[::127.0.0.1]`, `[::7f00:1]` | underlying IPv4 |
+| 6to4 encapsulation (`2002::/16`) | `[2002:7f00:1::]` = 127.0.0.1 | underlying IPv4 |
+| Link-local (`fe80::/10`) | `[fe80::1]`, `[fe80::1%eth0]` | `link-local.ipv6.invalid` |
+| Unique Local (`fc00::/7`, ULA) | `[fd12:3456:789a::1]`, `[fc00::1]` | `unique-local.ipv6.invalid` |
+| Multicast (`ff00::/8`) | `[ff02::1]`, `[ff05::1]` | `multicast.ipv6.invalid` |
+| AWS IPv6 metadata (`fd00:ec2::254`) | `[fd00:ec2::254]` | `169.254.169.254` |
+| IPv4-mapped cloud metadata | `[::ffff:169.254.169.254]` | `169.254.169.254` |
+
+**Recommended starter rule pack** — for range-class sentinels the operator must add SRR deny rules (otherwise the sentinel exists but nothing matches it):
+
+```toml
+[[rules]]
+pattern = "link-local.ipv6.invalid/{any}"
+decision = { type = "Deny", reason = "SSRF: IPv6 link-local blocked" }
+
+[[rules]]
+pattern = "unique-local.ipv6.invalid/{any}"
+decision = { type = "Deny", reason = "SSRF: IPv6 ULA blocked" }
+
+[[rules]]
+pattern = "multicast.ipv6.invalid/{any}"
+decision = { type = "Deny", reason = "SSRF: IPv6 multicast blocked" }
+
+[[rules]]
+pattern = "unspecified.ipv6.invalid/{any}"
+decision = { type = "Deny", reason = "SSRF: IPv6 unspecified blocked" }
+```
+
+Loopback / IPv4-mapped / IPv4-compatible / 6to4 / AWS-metadata classes reuse existing IPv4-keyed rules — no new rule needed if you already have `localhost` and `127.0.0.1` / `10.0.0.0/8` / `169.254.169.254` deny rules.
+
+**Non-goals / out of scope**: GCP and Azure metadata services are IPv4-only or DNS-resolved (`metadata.google.internal.`, no canonical IPv6 address). Those flows are handled by the DNS-governance layer, not by `normalize_host()`.
 
 ### 10. GraphQL Alias Bypass (Mitigated)
 

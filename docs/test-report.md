@@ -1590,7 +1590,7 @@ The earlier `fuzz_policy_eval` target was removed when the ABAC
 | SRR hot-reload | P2 | [#4](https://github.com/skwuwu/Analemma-GVM/issues/4) |
 | TLS certificate handling | P3 | [#5](https://github.com/skwuwu/Analemma-GVM/issues/5) |
 | Docker containerization | P3 | [#6](https://github.com/skwuwu/Analemma-GVM/issues/6) |
-| IPv6 SSRF defense | P3 | [#7](https://github.com/skwuwu/Analemma-GVM/issues/7) |
+| IPv6 SSRF defense | ~~P3~~ **CLOSED 2026-07-10** — 10 classes normalized ([security-model.md § 9](security-model.md#9-ipv6-ssrf-mitigated), [`tests/boundary.rs § 3.5.b`](../tests/boundary.rs)) | [#7](https://github.com/skwuwu/Analemma-GVM/issues/7) |
 | End-to-end proxy forwarding | High | Requires test HTTP server |
 | Slowloris/connection flood | Low | Requires running proxy with timeouts |
 | Memory scan verification | Low | Valgrind/bytehound for key zeroing |
