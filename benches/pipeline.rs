@@ -103,25 +103,32 @@ fn bench_srr(c: &mut Criterion) {
 fn bench_max_strict(c: &mut Criterion) {
     let mut group = c.benchmark_group("max_strict");
 
+    // Both decisions are constructed OUTSIDE the timed region. The
+    // previous version built `Deny { reason: "blocked".to_string() }`
+    // inside `b.iter(|| ...)`, which added ~15 ns of String::to_string
+    // heap allocation per iteration and inflated the reported cost
+    // from ~7 ns to 21 ns (see docs/test-report.md § D.1.3, 2026-07-11
+    // integrity audit). max_strict itself borrows the inputs and
+    // returns by value; `.clone()` inside iter is a cheap enum copy
+    // (no heap) so the reported cost is now the actual combiner work.
+    let allow = EnforcementDecision::Allow;
+    let deny = EnforcementDecision::Deny {
+        reason: "blocked".to_string(),
+    };
+    let delay = EnforcementDecision::Delay { milliseconds: 300 };
+    let require = EnforcementDecision::RequireApproval {
+        urgency: ApprovalUrgency::Standard,
+    };
+
     group.bench_function("allow_vs_deny", |b| {
         b.iter(|| {
-            black_box(max_strict(
-                EnforcementDecision::Allow,
-                EnforcementDecision::Deny {
-                    reason: "blocked".to_string(),
-                },
-            ));
+            black_box(max_strict(allow.clone(), deny.clone()));
         });
     });
 
     group.bench_function("delay_vs_require_approval", |b| {
         b.iter(|| {
-            black_box(max_strict(
-                EnforcementDecision::Delay { milliseconds: 300 },
-                EnforcementDecision::RequireApproval {
-                    urgency: ApprovalUrgency::Standard,
-                },
-            ));
+            black_box(max_strict(delay.clone(), require.clone()));
         });
     });
 
@@ -256,25 +263,68 @@ fn bench_wal(c: &mut Criterion) {
 // ═══════════════════════════════════════════════
 
 fn bench_classification(c: &mut Criterion) {
+    // Full hot-path replication (matches src/enforcement.rs::classify):
+    //   1. std::sync::RwLock<NetworkSRR> read guard acquire
+    //   2. srr.check(method, host, path, body)
+    //   3. drop the guard
+    //   4. Construct Classification { decision, source, operation,
+    //      matched_rule_id, pinned, cooperative }
+    //
+    // The previous version of this bench called `srr.check` directly,
+    // making it identical to `bench_srr/*` and mislabelling the group
+    // "classification_e2e / SRR → max_strict". Two audit findings:
+    //   - max_strict has ZERO production callers since ABAC deletion —
+    //     the hot path is SRR-only (see src/enforcement.rs:3).
+    //   - RwLock<NetworkSRR> acquire is real hot-path overhead (~20 ns
+    //     uncontended) that was missing from every prior "E2E" number.
+    //
+    // Baseline `srr/*` benches (bench_srr above) time the raw check
+    // without RwLock. The delta between the two groups shows the
+    // hot-path overhead of the enforcement wrapper.
     let srr = NetworkSRR::load(Path::new("config/srr_network.toml"))
         .expect("valid SRR config must exist at config/srr_network.toml");
+    let srr_lock = std::sync::Arc::new(std::sync::RwLock::new(srr));
 
     let mut group = c.benchmark_group("classification_e2e");
 
-    // SRR classification (deny path)
-    group.bench_function("srr_deny_path", |b| {
+    // Full E2E, deny path.
+    group.bench_function("full_hot_path_deny", |b| {
         b.iter(|| {
-            let decision = srr.check("POST", "api.bank.com", "/transfer", None);
-            black_box(decision);
+            let srr = srr_lock
+                .read()
+                .expect("bench RwLock must not be poisoned");
+            let srr_result = srr.check("POST", "api.bank.com", "/transfer", None);
+            drop(srr);
+            let classification = Classification {
+                decision: srr_result.decision,
+                source: ClassificationSource::SRR,
+                operation: None,
+                matched_rule_id: srr_result.matched_description,
+                pinned: false,
+                cooperative: None,
+            };
+            black_box(classification);
         });
     });
 
-    // SRR classification with payload
-    group.bench_function("srr_with_payload", |b| {
+    // Full E2E, allow path (payload inspection triggered).
+    group.bench_function("full_hot_path_with_payload", |b| {
         let payload = br#"{"to":"user@example.com","subject":"Hello","body":"Test message"}"#;
         b.iter(|| {
-            let decision = srr.check("POST", "smtp.gmail.com", "/send", Some(payload));
-            black_box(decision);
+            let srr = srr_lock
+                .read()
+                .expect("bench RwLock must not be poisoned");
+            let srr_result = srr.check("POST", "smtp.gmail.com", "/send", Some(payload));
+            drop(srr);
+            let classification = Classification {
+                decision: srr_result.decision,
+                source: ClassificationSource::SRR,
+                operation: None,
+                matched_rule_id: srr_result.matched_description,
+                pinned: false,
+                cooperative: None,
+            };
+            black_box(classification);
         });
     });
 
@@ -1492,11 +1542,15 @@ fn bench_cooperative_lease(c: &mut Criterion) {
 
     // ── 2. Token-hash claim with 1K other Active leases ──
     //
-    // The find()-by-token-hash inside claim_by_token_hash is O(N)
-    // over active intents. 1K is realistic ceiling for production
-    // (sandboxes × concurrent declared intents). This bench
-    // measures the worst case where the matching lease is found
-    // last during the scan.
+    // Post-854cdfa (2026-07-05), claim_by_token_hash is O(1) via
+    // `token_hash_index: HashMap<[u8; 32], u64>`. This bench still
+    // measures the 1K-active case because the store's memory
+    // footprint under 1K leases is nontrivial — the HashMap has
+    // deeper bucketing, cache locality is worse, and the mutex
+    // contention window is longer. Comparing to
+    // claim_by_token_hash_hit_single_lease reveals only the
+    // scale-dependent overhead, not the O(N) → O(1) win itself
+    // (that comparison lives in test-report.md § D.1.2 vs D.1.1).
     group.bench_function("claim_by_token_hash_hit_among_1k_active", |b| {
         b.iter_batched_ref(
             || {
