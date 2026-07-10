@@ -678,7 +678,7 @@ above is the current authoritative number.
 | 1,000 | **179 ns** | **9.57 µs** | **912 ns** |
 | 10,000 | **179 ns** | **219 µs** | **11.10 µs** |
 
-**Key insight**: First-match is constant (~179 ns) regardless of rule count. Mid-rule match scales linearly. 10K fallthrough at 11 µs is within hot-path budget for most deployments.
+**Key insight**: First-match is constant (~179 ns) regardless of rule count — the check returns on the first matching rule. **Mid-rule and fallthrough scale linearly** with the number of rules the check has to walk past (219 µs mid-rule and 11.10 µs fallthrough at 10K are both >> the ~1 µs full-check target measured on the 68-rule production corpus in [§ D.1.3](#d13-benchmark-integrity-audit--true-e2e-2026-07-11)). Deployments approaching this rule count should profile the p99 match position: if agents predominantly hit fallthrough (i.e., default-to-caution is common), rule reordering (hot rules first) or pattern indexing per [GVM_CODE_STANDARDS §3.1](internal/GVM_CODE_STANDARDS.md#31-hot-path-budget) is warranted before the wall-clock crosses the operator's SLA.
 
 ### max_strict Decision Combiner
 
