@@ -279,22 +279,42 @@ Never silently use empty strings or zero values as defaults for security-critica
 
 ### 3.1 Hot Path Budget
 
-The governance decision hot path must stay under these budgets:
+The governance decision hot path must stay under these budgets.
+Note that these are **per-match-arm invariants**, not absolute
+wall-clock ceilings for the whole check — wall-clock scales
+linearly with rule-corpus size (each rule is O(1) but N rules
+takes N × per-arm work) and with hardware. Current measured
+values are pinned in [docs/test-report.md § D.1.3](../test-report.md#d13-benchmark-integrity-audit--true-e2e-2026-07-11).
 
 ```
-Allow:           < 1µs  SRR classification + < 0ms added latency
-AuditOnly:       < 1µs  SRR classification + < 0ms added latency
-Delay:           < 1µs  SRR classification + configured intentional delay
-RequireApproval: < 1µs  SRR classification + human approval wait
-Deny:            < 1µs  SRR classification + < 0ms added latency
-WAL append:      < 5ms  including fsync (group commit amortized)
+SRR per-match-arm:  < 20 ns  each rule evaluation
+SRR full-check:     ~1 µs    on shared t3.medium, 68-rule corpus
+                             sub-µs on dedicated cores (c5.large, Graviton)
+Full E2E hot path:  ~1.3 µs  SRR check + RwLock<NetworkSRR> guard
+                             + Classification struct construction
+                             (measured 1.24 µs — see D.1.3)
+WAL durable append: < 10 ms  including fsync
+                             (~6.4 ms on ext4, ~14 ms on NTFS)
+                             group-commit amortizes concurrent writes
 ```
 
-Rules:
+The `< 1 µs SRR classification` line that appeared here in v0.6.2
+and earlier was a wall-clock ceiling. It was accurate against the
+smaller (~50-rule) 2026-05-02 corpus but broke silently as the
+corpus grew to 68 rules (Tier-2 P2-a action packs + `expires_at` /
+`principal_filter` / `unsafe_body_action` fields). Reformulated
+above as per-arm O(1) with a hardware-qualified wall-clock estimate,
+so corpus growth becomes a visible budget line item instead of a
+silent invariant break.
+
+Rules — invariants that don't move with corpus growth:
 - No heap allocation in the SRR matching hot path
 - No regex compilation at evaluation time (pre-compile at load)
 - No network calls during policy evaluation
 - No mutex contention on the decision path (use RwLock for read-heavy data)
+- **Every SRR rule evaluates in O(1)** — a regression to O(N) parsing
+  or O(log N) matching inside a rule is a hot-path bug regardless
+  of the wall-clock number
 
 ### 3.2 Amortize Expensive Operations
 

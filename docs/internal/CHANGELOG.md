@@ -131,6 +131,82 @@ Audit + crypto:
 
 ## Implementation Log
 
+### 2026-07-11: Benchmark integrity audit + true E2E hot-path bench
+
+Reviewer audit identified three code/doc drift issues in the existing
+benchmark matrix, plus a stale `< 1 µs SRR` invariant in
+`GVM_CODE_STANDARDS.md § 3.1` and `README.md`. All fixed in one
+pass; full number matrix in
+[test-report.md § D.1.3](../test-report.md#d13-benchmark-integrity-audit--true-e2e-2026-07-11).
+
+Fixes shipped ([`850a8dc`](https://github.com/skwuwu/Analemma-GVM/commit/850a8dc)):
+
+  - **`bench_classification` was a duplicate, not an E2E**. The
+    prior `classification_e2e/srr_deny_path` and `srr_with_payload`
+    ran the same `srr.check(...)` operation as
+    `bench_srr/deny_bank_transfer` and `bench_srr/payload_inspection`
+    — no `RwLock` acquire, no struct construction, no
+    max_strict composition (max_strict has ZERO production callers
+    since ABAC deletion — see `src/enforcement.rs:3`). Group
+    heading "SRR → max_strict" was doubly wrong. Rewrote to
+    faithfully replicate `enforcement::classify`:
+    `RwLock<NetworkSRR>` read → `srr.check` → drop → build
+    `Classification { decision, source, operation,
+    matched_rule_id, pinned, cooperative }`. Renamed to
+    `full_hot_path_deny` / `full_hot_path_with_payload` so the
+    change is discoverable against D.1.1/D.1.2 numbers.
+
+  - **`bench_max_strict/allow_vs_deny` timed a String allocation**.
+    `EnforcementDecision::Deny { reason: "blocked".to_string() }`
+    was constructed inside `b.iter(|| ...)`, so the 21 ns
+    reported cost was mostly `String::to_string` heap alloc, not
+    the combiner branch. Hoisted the construction to outer scope.
+    The Deny variant still pays a `.clone()` per iter (max_strict
+    takes owned values), so the honest measurement is 26 ns for
+    "combiner + one String::clone". `delay_vs_require_approval`
+    at 7.5 ns (Copy variants, no heap) remains the pure-branch
+    number. Also noted in D.1.3: max_strict is dead code — the
+    bench is kept only as a regression guard for the day it
+    comes back.
+
+  - **Stale comment on `claim_by_token_hash_hit_among_1k_active`**.
+    Still described the internal work as an O(N) linear scan even
+    though 854cdfa (Option A) made it O(1). D.1.2 was correct;
+    the bench-file comment was drift. Comment refreshed to say
+    "O(1) HashMap lookup; the 1K case still measures HashMap
+    bucketing + cache locality + longer mutex window vs the
+    single-lease case".
+
+Documentation invariant reconciliation:
+
+  - **`GVM_CODE_STANDARDS.md § 3.1`** previously read "< 1 µs SRR
+    classification" as a per-check wall-clock ceiling. Current
+    EC2 measurements show 0.97-1.33 µs — most rule paths **over
+    1 µs**. Reformulated as `< 20 ns per-match-arm` + `~1 µs SRR
+    full check on shared t3.medium` + `~1.3 µs full E2E`. The
+    per-arm invariant survives corpus growth; the wall-clock
+    numbers scale with corpus size and hardware.
+
+  - **`README.md` "Policy evaluation < 1 µs" line** rephrased to
+    `~1 µs on shared t3.medium (per-arm O(1)); sub-µs on
+    dedicated cores`. Full E2E (1.24 µs) also called out. Both
+    now link to D.1.3 for the current matrix.
+
+New E2E measurement on EC2 t3.medium:
+
+  - Raw SRR (`srr/*`): 0.97-1.33 µs on the current 68-rule
+    production corpus
+  - Full hot path (`classification_e2e/full_hot_path_*`): 1.24 µs
+  - Delta = ~110 ns for RwLock<SRR> guard acquire (uncontended)
+    + Classification struct construction + drop
+
+Cooperative_lease numbers also refreshed as a side effect of the
+`sample_size(500)` + `noise_threshold(0.05)` tuning from
+[`b56a2e8`](https://github.com/skwuwu/Analemma-GVM/commit/b56a2e8) settling in — uniform 12-44 %
+improvement on single_lease / sandbox_binding / 1K-active tail
+without any intent_store code change. This is the tail-value
+stability fix producing its first refresh delta.
+
 ### 2026-07-10: IPv6 SSRF gap closure (7 new classes)
 
 Follow-up on a drift discovery: [security-model.md § 9](../security-model.md#9-ipv6-ssrf-mitigated)
