@@ -1,6 +1,26 @@
-# Nightly chaos stress test on the project's EC2 sandbox host.
+# Chaos stress test on a provisioned EC2 sandbox host.
 #
-# WHY THIS EXISTS
+# STATUS (2026-07-14) ─────────────────────────────────────────────
+# **Manual only.** The project's EC2 sandbox instance (i-07478286c163db5c1,
+# region ap-northeast-2, IP 43.201.62.93) was terminated 2026-07-14
+# after WSL2 on the operator's local i5-12400F / 32 GB workstation
+# verifiably reproduced every non-Docker sandbox scenario at equal
+# or better performance (SSRF 14/14, cooperative lease 18/18, bench
+# 15/15 groups running 32-46 % faster than the EC2 baseline). The
+# EBS root volume vol-06d3faa6ca88eb691 was deleted alongside the
+# instance (DeleteOnTermination = true).
+#
+# The weekly schedule trigger was removed because there is no EC2
+# for it to SSH into. `workflow_dispatch` is preserved so the
+# workflow can be re-armed manually if a chaos gate is later
+# needed against a fresh EC2 instance — see WHAT IT REQUIRES for
+# the re-provisioning checklist.
+#
+# For everyday chaos validation, run the same script directly on
+# WSL2 (or any Linux host):
+#     wsl -e bash -c 'cd ~/Analemma-GVM && sudo scripts/stress-test.sh'
+#
+# WHY THIS EXISTED
 # ───────────────────────────────────────────────────────────────────
 # The 60-minute chaos stress test (`scripts/stress-test.sh`) exercises
 # the full sandbox lifecycle: 3 OpenClaw agents in --sandbox mode,
@@ -14,38 +34,34 @@
 # hand. CI test counts went green every push while a NAT rule was
 # accumulating per session. This workflow closes that gap.
 #
-# WHAT IT REQUIRES
+# WHAT IT REQUIRES (to re-arm)
 # ───────────────────────────────────────────────────────────────────
-# Three repository secrets must be configured (Settings → Secrets →
-# Actions → New repository secret):
-#
-#   EC2_HOST        — hostname or IP, e.g. "43.201.62.93"
-#   EC2_USER        — SSH user, default "ubuntu" if unset
-#   EC2_SSH_KEY     — full PEM private key contents (BEGIN/END lines)
-#
-# The EC2 instance must already have:
-#   - ~/Analemma-GVM cloned and tracking origin/master
-#   - .env with ANTHROPIC_API_KEY
-#   - Rust toolchain (rustup default stable)
-#   - openclaw available in PATH (npm install -g openclaw)
-#   - tmux + iproute2 (for chaos network partition via tc)
+# 1. Provision an EC2 instance (Ubuntu 24.04, ≥ t3.small, security
+#    group allowing SSH from GitHub Actions IP ranges).
+# 2. On the instance:
+#      - clone ~/Analemma-GVM tracking origin/master
+#      - .env with ANTHROPIC_API_KEY
+#      - Rust toolchain (rustup default stable)
+#      - openclaw available in PATH (npm install -g openclaw)
+#      - tmux + iproute2 (for chaos network partition via tc)
+# 3. Configure three repository secrets (Settings → Secrets →
+#    Actions → New repository secret):
+#      EC2_HOST     — hostname or IP
+#      EC2_USER     — SSH user, default "ubuntu" if unset
+#      EC2_SSH_KEY  — full PEM private key contents (BEGIN/END lines)
+# 4. Re-add the weekly cron under `on.schedule` (removed 2026-07-14).
 #
 # COST AWARENESS
 # ───────────────────────────────────────────────────────────────────
 # Each run pins the EC2 instance for ~70 minutes (build cache hit makes
 # build cheap, then 60 min stress, then ~5 min cleanup + result scan).
-# Default schedule is **weekly** (Sunday 18:00 UTC = early Monday KST)
-# to keep cost bounded. Switch to nightly by uncommenting the daily
-# cron line below if budget allows.
+# A weekly cron on t3.medium is ~$30/month all-in — plan accordingly.
 
-name: Nightly Stress (EC2)
+name: Chaos Stress (EC2, manual)
 
 on:
-  schedule:
-    # Sunday 18:00 UTC — Monday 03:00 KST. Off-hours, low SSH contention.
-    - cron: '0 18 * * 0'
-    # Uncomment for nightly runs:
-    # - cron: '0 18 * * *'
+  # Weekly cron removed 2026-07-14 alongside EC2 termination. Re-add
+  # after re-provisioning per WHAT IT REQUIRES above.
   workflow_dispatch:
     inputs:
       duration:
